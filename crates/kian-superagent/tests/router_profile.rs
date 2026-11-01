@@ -156,7 +156,7 @@ struct FakeTools;
 
 impl ToolProvider for FakeTools {
     fn schemas(&self) -> Vec<ToolSchema> {
-        ["fs.read", "fs.write", "exec"]
+        ["fs_read", "fs_write", "exec"]
             .iter()
             .map(|name| ToolSchema {
                 name: (*name).into(),

@@ -60,7 +60,7 @@ agent:
     main:
       provider: router-mock
       model: mock-model
-  tools: ["fs.read"]
+  tools: ["fs_read"]
 agents:
   router:
     id: router
@@ -77,7 +77,7 @@ agents:
       main:
         provider: worker-mock
         model: mock-worker
-    tools: ["fs.read", "fs.write", "exec"]
+    tools: ["fs_read", "fs_write", "exec"]
 {worker_gate}superagent:
   router:
     session_id: "{ROUTER_SESSION}"

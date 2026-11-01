@@ -1762,7 +1762,7 @@ agent:
       fallback:
         - provider: openai
           model: gpt-fallback
-  tools: ["fs.read", "fs.write", "exec"]
+  tools: ["fs_read", "fs_write", "exec"]
   budgets:
     tokens: 100000
 providers:
@@ -1991,7 +1991,7 @@ agent:
     main:
       provider: openai
       model: gpt-test
-  tools: ["fs.read"]
+  tools: ["fs_read"]
 agents:
   router:
     id: router
@@ -2008,7 +2008,7 @@ agents:
       main:
         provider: openai
         model: gpt-worker
-    tools: ["fs.read", "fs.write", "exec"]
+    tools: ["fs_read", "fs_write", "exec"]
     evidence_gate:
       enabled: true
       checks:

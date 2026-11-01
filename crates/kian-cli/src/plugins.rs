@@ -40,7 +40,7 @@ use kian_llm::provider::{
 use kian_llm::turn::ProviderRegistry;
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_loop::react::{ReActConfig, ReActLoop};
-use kian_loop::tools::LocalTools;
+use kian_loop::tools::{FilteredTools, LocalTools, unmatched_tool_names};
 use kian_orchestrator::recovery::PolicyTable;
 use kian_plugin::{Ctx, Disposer, Plugin, PluginError};
 use kian_superagent::{
@@ -183,6 +183,17 @@ impl Plugin for ReActPlugin {
         let tools = ctx
             .resolve::<dyn ToolProvider>()
             .ok_or_else(|| apply_error("react-loop: ToolProvider not registered"))?;
+        // kian-61: the agent's `tools:` list is the mounted surface —
+        // fail-closed against the registered provider, then enforced at
+        // the tool edge (unlisted schemas never ride the request).
+        let unmatched = unmatched_tool_names(&self.agent.tools, &tools.schemas());
+        if !unmatched.is_empty() {
+            return Err(apply_error(format!(
+                "react-loop: agent `{}` lists tools not mounted by the tool provider: {unmatched:?}",
+                self.agent.id
+            )));
+        }
+        let tools = Arc::new(FilteredTools::new(tools, &self.agent.tools));
         let react = ReActLoop::with_evidence_gate(
             self.agent,
             registry,
@@ -566,6 +577,30 @@ impl Plugin for SuperAgentPlugin {
         // Worker loop: strong main slot, local tools shadowed by the
         // per-endpoint remote exec tools when configured, ungated here
         // (the worker wrapper owns the gate).
+        // kian-61: the worker template's `tools:` list filters the local
+        // built-in surface (the remote/async/recall surfaces are already
+        // config-gated) and is validated fail-closed against the loop's
+        // combined mounted surface — a typo'd name refuses boot.
+        let mut worker_mounted: Vec<kian_core::seams::ToolSchema> = Vec::new();
+        if let Some(remote) = &remote {
+            for tool in remote.tools() {
+                worker_mounted.extend(tool.schemas());
+            }
+        }
+        if let Some(pair) = &async_pair {
+            worker_mounted.extend(pair.schemas());
+        }
+        if self.recall.worker {
+            worker_mounted.extend(recall_tools.schemas());
+        }
+        worker_mounted.extend(local_tools.schemas());
+        let unmatched = unmatched_tool_names(&self.worker_agent.tools, &worker_mounted);
+        if !unmatched.is_empty() {
+            return Err(apply_error(format!(
+                "superagent worker agent `{}` lists tools not mounted on the worker loop: {unmatched:?}",
+                self.worker_agent.id
+            )));
+        }
         let mut worker_tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
         if let Some(remote) = &remote {
             for tool in remote.tools() {
@@ -583,7 +618,10 @@ impl Plugin for SuperAgentPlugin {
         if self.recall.worker {
             worker_tools.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
         }
-        worker_tools.push(local_tools.clone());
+        worker_tools.push(Arc::new(FilteredTools::new(
+            local_tools.clone(),
+            &self.worker_agent.tools,
+        )));
         let worker_loop = Arc::new(ReActLoop::with_config(
             self.worker_agent.clone(),
             registry.clone(),
@@ -608,11 +646,22 @@ impl Plugin for SuperAgentPlugin {
             None => crate::superagent::WorkerInnerDriver::React(worker_loop),
         };
 
-        // Plain-session loop: the default agent, with its own gate.
+        // Plain-session loop: the default agent, with its own gate. The
+        // agent's `tools:` list filters the local surface (kian-61,
+        // fail-closed like the worker's).
+        let default_agent = self.default_agent;
+        let unmatched = unmatched_tool_names(&default_agent.tools, &local_tools.schemas());
+        if !unmatched.is_empty() {
+            return Err(apply_error(format!(
+                "superagent default agent `{}` lists tools not mounted on the plain-session loop: {unmatched:?}",
+                default_agent.id
+            )));
+        }
+        let default_tools = Arc::new(FilteredTools::new(local_tools, &default_agent.tools));
         let default_loop = Arc::new(ReActLoop::with_evidence_gate(
-            self.default_agent,
+            default_agent,
             registry.clone(),
-            local_tools,
+            default_tools,
             Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),

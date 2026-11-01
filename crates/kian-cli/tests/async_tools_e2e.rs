@@ -166,7 +166,7 @@ agent:
     main:
       provider: router-mock
       model: mock-model
-  tools: ["fs.read"]
+  tools: ["fs_read"]
 agents:
   router:
     id: router
@@ -183,7 +183,7 @@ agents:
       main:
         provider: worker-mock
         model: mock-worker
-    tools: ["fs.read", "fs.write", "exec"]
+    tools: ["fs_read", "fs_write", "exec"]
 superagent:
   async_tools: true
   router:
@@ -439,18 +439,18 @@ async fn start_returns_fast_steer_interleaves_and_completion_lands() {
         },
         ScriptedResponse::ToolCall {
             id: "call-read-1".into(),
-            name: "fs.read".into(),
+            name: "fs_read".into(),
             arguments: serde_json::json!({"path": "note.txt"}),
         },
         ScriptedResponse::ToolCall {
             id: "call-read-2".into(),
-            name: "fs.read".into(),
+            name: "fs_read".into(),
             arguments: serde_json::json!({"path": "note.txt"}),
         },
         // GATED (request 4): the drain parks here while the job runs.
         ScriptedResponse::ToolCall {
             id: "call-read-3".into(),
-            name: "fs.read".into(),
+            name: "fs_read".into(),
             arguments: serde_json::json!({"path": "note.txt"}),
         },
         ScriptedResponse::Text("completion seen".into()),
@@ -591,7 +591,7 @@ async fn stop_mid_run_labels_cancelled_end_to_end() {
         // GATED (request 3): the cancelled completion lands meanwhile.
         ScriptedResponse::ToolCall {
             id: "call-read-1".into(),
-            name: "fs.read".into(),
+            name: "fs_read".into(),
             arguments: serde_json::json!({"path": "note.txt"}),
         },
         ScriptedResponse::Text("cancel completion seen".into()),

@@ -23,7 +23,7 @@ pub use kian_core::seams::{ModelChunk, ModelProvider, ModelRequest, ProviderErro
 
 pub use provider::{
     ChatMessage, FROZEN_CHAT_BODY_SHA256, OpenAiCompatConfig, OpenAiCompatProvider, PersistError,
-    PersistSink, PersistedRequest,
+    PersistSink, PersistedRequest, WireFunctionCall, WireToolCall,
 };
 pub use slots::{
     FallbackCursor, FallbackSwitch, SessionSlots, SlotBinding, SlotError, SlotMigration,

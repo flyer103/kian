@@ -35,7 +35,7 @@ pub fn agent_def() -> AgentDef {
                 fallback: Vec::new(),
             },
         )]),
-        tools: vec!["fs.read".into(), "fs.write".into(), "exec".into()],
+        tools: vec!["fs_read".into(), "fs_write".into(), "exec".into()],
         budgets: Budgets {
             tokens: None,
             wall_clock_ms: None,

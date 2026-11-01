@@ -152,14 +152,14 @@ async fn scripted_provider_drives_multi_turn_task_to_completion_replayable() {
             text_chunk("checking the file"),
             tool_call_chunk(
                 "call-1",
-                "fs.write",
+                "fs_write",
                 json!({"path": "out.txt", "content": "42"}),
             ),
         ],
         // Turn 2: read it back.
         vec![tool_call_chunk(
             "call-2",
-            "fs.read",
+            "fs_read",
             json!({"path": "out.txt"}),
         )],
         // Turn 3: final answer.

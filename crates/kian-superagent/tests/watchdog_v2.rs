@@ -159,9 +159,12 @@ fn tool_call_chunk(
 }
 
 /// The first thread id found in any prior tool result of the request
-/// body (`output.threads[0].thread_id` from `list_threads`,
-/// `output.thread_id` from `read_progress`) — the watchdog's dynamic
-/// turns read the runtime-minted thread id this way.
+/// body (`threads[0].thread_id` from `list_threads`, `thread_id` from
+/// `read_progress`) — the watchdog's dynamic turns read the
+/// runtime-minted thread id this way. Dialect v2 (kian-61): a
+/// `role:"tool"` message's content is the serialized tool output
+/// itself; the legacy v1 shape wrapped it as `{"call_id","output"}` —
+/// both accepted here.
 fn thread_id_from_request(req: &ModelRequest) -> Option<String> {
     let messages = req.body.get("messages")?.as_array()?;
     for message in messages {
@@ -176,14 +179,18 @@ fn thread_id_from_request(req: &ModelRequest) -> Option<String> {
         ) else {
             continue;
         };
-        if let Some(id) = content.pointer("/output/thread_id").and_then(Value::as_str) {
-            return Some(id.to_string());
-        }
-        if let Some(id) = content
-            .pointer("/output/threads/0/thread_id")
-            .and_then(Value::as_str)
+        let candidates = [
+            content.pointer("/thread_id"),
+            content.pointer("/output/thread_id"),
+            content.pointer("/threads/0/thread_id"),
+            content.pointer("/output/threads/0/thread_id"),
+        ];
+        if let Some(id) = candidates
+            .into_iter()
+            .flatten()
+            .find_map(|v| v.as_str().map(str::to_string))
         {
-            return Some(id.to_string());
+            return Some(id);
         }
     }
     None

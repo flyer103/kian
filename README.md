@@ -547,7 +547,7 @@ agent:                       # the single-agent definition Phase 1 used (always 
     main:
       provider: my-provider
       model: gpt-4o-mini
-  tools: ["fs.read"]
+  tools: ["fs_read"]
 agents:                      # the bundle's named agent templates (additive)
   router:
     id: router
@@ -564,7 +564,7 @@ agents:                      # the bundle's named agent templates (additive)
       main:
         provider: my-provider
         model: gpt-4o-mini
-    tools: ["fs.read", "fs.write", "exec"]
+    tools: ["fs_read", "fs_write", "exec"]
 superagent:
   router:
     session_id: "00000000-0000-0000-0000-000000000001"

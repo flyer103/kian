@@ -75,11 +75,57 @@ where
 // Frozen request serialization (constraint 3)
 // ---------------------------------------------------------------------------
 
+/// One assistant tool call in the strict openai wire shape
+/// (`messages[n].tool_calls[m]`, card kian-61 / dialect v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFunctionCall {
+    pub name: String,
+    /// The arguments as a JSON-encoded string (the wire form; kian's
+    /// event stream keeps them as an object and converts at the edge).
+    pub arguments: String,
+}
+
+/// One tool-call entry: `{"id", "type": "function", "function"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: WireFunctionCall,
+}
+
 /// One chat message in the openai-compat request body.
+///
+/// Dialect v2 (kian-61): plain messages stay exactly `{"content", "role"}`
+/// — byte-identical to dialect v1 — while tool round trips use the strict
+/// openai wire shape: an assistant tool-call turn carries `tool_calls`
+/// (and `content: null` when the turn had no text), and a `role:"tool"`
+/// result carries `tool_call_id`. Strict OpenAI-compatible endpoints
+/// (real DeepSeek verified, OpenAI documents the same shape) reject the
+/// v1 dialect with HTTP 400/422 after any tool round trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    /// String content, or `null` for a purely tool-calling assistant turn.
+    pub content: Option<String>,
+    /// Present only on `role:"tool"` results (the wire `tool_call_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Present only on assistant tool-call turns (the wire `tool_calls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<WireToolCall>>,
+}
+
+impl ChatMessage {
+    /// A plain `{role, content}` message (dialect v1 shape, unchanged).
+    #[must_use]
+    pub fn plain(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
 }
 
 /// SHA-256 of the golden request body asserted by
@@ -89,8 +135,14 @@ pub struct ChatMessage {
 /// contract below (or this hash) invalidates provider prefix cache for
 /// every session and is a constraint-3 event: it requires a DESIGN note
 /// and an observable invalidation-cause record.
+///
+/// v2 (kian-61): strict openai tool wire shape — assistant `tool_calls`,
+/// `role:"tool"` results with `tool_call_id`, dotless tool names. The v1
+/// body (`4a1dad31…d7ce`) was rejected by strict OpenAI-compatible
+/// endpoints (HTTP 400 dotted names / 422 missing `tool_call_id`) after
+/// any tool round trip.
 pub const FROZEN_CHAT_BODY_SHA256: &str =
-    "4a1dad31d2e377be6f5268514841045a7b94b3210a344f75247e9ffbd284d7ce";
+    "b743584d30f65086566739871e1fc26f4967f587b1ed72923f7549f605207708";
 
 /// Build the openai-compat chat-completions request body.
 ///
@@ -105,7 +157,10 @@ pub const FROZEN_CHAT_BODY_SHA256: &str =
 ///   logical body always serializes to identical bytes.
 /// - Top-level fields: exactly `messages`, `model`, `stream` (always
 ///   `true`) and — only when at least one tool is supplied — `tools`.
-/// - Message objects: exactly `content` and `role`.
+/// - Message objects (dialect v2, kian-61): `content` and `role` always;
+///   `tool_calls` only on assistant tool-call turns; `tool_call_id` only
+///   on `role:"tool"` results. Plain messages are byte-identical to the
+///   v1 shape.
 /// - Tool entries: `{"function": {description, name, parameters},
 ///   "type": "function"}`. **The `tools` array preserves caller-supplied
 ///   order** and is part of the prompt prefix: callers must pass a
@@ -512,7 +567,8 @@ mod tests {
 
     use super::{
         ChatMessage, OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink,
-        PersistedRequest, ProviderError, build_chat_body, serialize_request_body,
+        PersistedRequest, ProviderError, WireFunctionCall, WireToolCall, build_chat_body,
+        serialize_request_body,
     };
 
     /// AGENTS gotcha: the macOS system proxy intercepts localhost — every
@@ -617,14 +673,7 @@ mod tests {
     fn sample_request(model: &str) -> ModelRequest {
         ModelRequest {
             slot: SlotName("main".into()),
-            body: build_chat_body(
-                model,
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
-                &[],
-            ),
+            body: build_chat_body(model, &[ChatMessage::plain("user", "hello")], &[]),
         }
     }
 
@@ -873,28 +922,48 @@ mod tests {
     /// The same logical request serializes to identical bytes twice, and
     /// those bytes match the golden hash. Changing the constant below is a
     /// constraint-3 event (prefix-cache invalidation for every session).
+    ///
+    /// Dialect v2 (kian-61): the golden body now carries one full tool
+    /// round trip in the strict openai wire shape — an assistant
+    /// `tool_calls` turn (with `content: null`) followed by a
+    /// `role:"tool"` result with `tool_call_id` — and dotless tool names
+    /// (`fs_read`, `fs_write`), the shape strict OpenAI-compatible
+    /// endpoints accept.
     #[test]
     fn same_logical_request_serializes_to_identical_bytes_golden_hash() {
         let tools = vec![
             ToolSchema {
-                name: "fs.read".into(),
+                name: "fs_read".into(),
                 description: "read a file".into(),
                 parameters: json!({"type": "object"}),
             },
             ToolSchema {
-                name: "fs.write".into(),
+                name: "fs_write".into(),
                 description: "write a file".into(),
                 parameters: json!({"type": "object"}),
             },
         ];
         let messages = vec![
+            ChatMessage::plain("system", "you are kian"),
+            ChatMessage::plain("user", "hello"),
             ChatMessage {
-                role: "system".into(),
-                content: "you are kian".into(),
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![WireToolCall {
+                    id: "call-1".into(),
+                    r#type: "function".into(),
+                    function: WireFunctionCall {
+                        name: "fs_read".into(),
+                        arguments: "{\"path\":\"notes.txt\"}".into(),
+                    },
+                }]),
             },
             ChatMessage {
-                role: "user".into(),
-                content: "hello".into(),
+                role: "tool".into(),
+                content: Some("{\"content\":\"hello kian\"}".into()),
+                tool_call_id: Some("call-1".into()),
+                tool_calls: None,
             },
         ];
         let a = build_chat_body("kimi-k2", &messages, &tools);
@@ -909,19 +978,69 @@ mod tests {
         );
     }
 
+    /// Dialect v2 (kian-61): the wire shape of a tool round trip is
+    /// exactly the strict openai form — `tool_calls` with string
+    /// `function.arguments` and a `tool_call_id` on the result — and
+    /// plain messages stay byte-identical to the v1 shape (no extra
+    /// keys).
+    #[test]
+    fn tool_round_trip_serializes_to_the_strict_openai_wire_shape() {
+        let round_trip = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![WireToolCall {
+                    id: "call-9".into(),
+                    r#type: "function".into(),
+                    function: WireFunctionCall {
+                        name: "fs_read".into(),
+                        arguments: "{\"path\":\"a.txt\"}".into(),
+                    },
+                }]),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("{\"content\":\"x\"}".into()),
+                tool_call_id: Some("call-9".into()),
+                tool_calls: None,
+            },
+        ];
+        let body = build_chat_body("m1", &round_trip, &[]);
+        let wire = serialize_request_body(&body).unwrap();
+        let v: Value = serde_json::from_slice(&wire).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"path\":\"a.txt\"}"),
+            "wire arguments are a JSON-encoded string"
+        );
+        assert_eq!(msgs[0]["content"], Value::Null);
+        assert_eq!(msgs[1]["tool_call_id"], json!("call-9"));
+        // Plain messages carry exactly the two v1 keys.
+        let plain = serialize_request_body(&build_chat_body(
+            "m1",
+            &[ChatMessage::plain("user", "hi")],
+            &[],
+        ))
+        .unwrap();
+        let v: Value = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(
+            v["messages"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["content", "role"]
+        );
+    }
+
     /// Serialization is independent of the source order the JSON value was
     /// assembled in (serde_json sorts object keys; arrays keep caller
     /// order).
     #[test]
     fn body_serialization_is_source_key_order_independent() {
-        let built = build_chat_body(
-            "m1",
-            &[ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            &[],
-        );
+        let built = build_chat_body("m1", &[ChatMessage::plain("user", "hi")], &[]);
         let hand_written = json!({
             "stream": true,
             "model": "m1",

@@ -1,0 +1,5 @@
+# Demo state: the sqlite event store, tools root, serve log/pid.
+.state*/
+# Audit exports produced by the walkthrough.
+audit.json
+audit-*.json

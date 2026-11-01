@@ -357,6 +357,23 @@ the event stream. Rules:
   hash is pinned by `kian-llm::provider::FROZEN_CHAT_BODY_SHA256`; changing the serialization
   contract is a constraint-3 event (prefix-cache invalidation for every session) and must update
   the hash and this section in the same change.
+- **Wire dialect v2 (kian-61, constraint-3 event)**: strict OpenAI-compatible endpoints (real
+  DeepSeek verified live; OpenAI documents the same shapes) rejected the v1 dialect after any tool
+  round trip — HTTP 400 for tool names outside `^[a-zA-Z0-9_-]+$` (the built-ins were
+  `fs.list`/`fs.read`/`fs.write`) and HTTP 422 for `role:"tool"` results with no wire-level
+  `tool_call_id`. Dialect v2, in one deliberate invalidation: (1) built-in tool names are dotless
+  (`fs_list`/`fs_read`/`fs_write`; the dotted spellings remain *invocable* — never advertised — so
+  pre-rename history replays); (2) `to_chat_message` emits the strict wire shape: assistant
+  tool-call turns carry `tool_calls` (string `function.arguments`, `content: null` when textless)
+  and tool results carry `tool_call_id` with the serialized output as content; (3) the per-call
+  `tool/call` transcript duplicates are dropped from request bodies (the enclosing assistant
+  turn's `tool_calls` already carries the call id). Plain `{content, role}` messages are
+  byte-identical to v1, and the event-stream payload contracts (C4/C11) are untouched — only the
+  request dialect changed. Consequences, accepted: every session crossing the upgrade counts one
+  `unexpected_prefix_change` invalidation (the observable cause record; pre-v2 sessions with tool
+  round trips no longer replay byte-identical), and the golden hash moved to
+  `b743584d…7708` (from `4a1dad31…d7ce`). Alongside, `AgentDef.tools` became the enforced mounted
+  surface (`FilteredTools`, fail-closed at assembly: a listed-but-unmounted name refuses boot).
 
 **C4 payload contracts (frozen after merge, additions-only)**: the context-bearing kinds —
 `input/admitted`, `assistant/message`, `tool/call`, `tool/result` — carry a message payload in

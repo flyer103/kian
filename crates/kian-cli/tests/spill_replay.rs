@@ -107,7 +107,7 @@ async fn session_replay_rederives_streams_containing_the_spill_pair() {
     // as the loop would derive it (A2 byte-identity is then checkable).
     let pre_turn = ctx.events().await.expect("pre-turn events");
     let messages = kian_core::context::derive_model_context(&pre_turn).expect("derive context");
-    let chat: Vec<_> = messages.iter().map(to_chat_message).collect();
+    let chat: Vec<_> = messages.iter().filter_map(to_chat_message).collect();
     // The sidecar stayed out of the model-visible request body.
     assert!(
         !serde_json::to_string(&chat)

@@ -373,14 +373,7 @@ mod tests {
 
         let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
             slot: SlotName("main".into()),
-            body: build_chat_body(
-                &t.model,
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
-                &[],
-            ),
+            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
         });
 
         let stream = complete_turn(
@@ -471,14 +464,7 @@ mod tests {
 
         let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
             slot: SlotName("main".into()),
-            body: build_chat_body(
-                &t.model,
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
-                &[],
-            ),
+            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
         });
 
         let stream = complete_turn(
@@ -564,14 +550,7 @@ mod tests {
 
         let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
             slot: SlotName("main".into()),
-            body: build_chat_body(
-                &t.model,
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
-                &[],
-            ),
+            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
         });
 
         let stream = complete_turn(
@@ -610,14 +589,7 @@ mod tests {
 
         let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
             slot: SlotName("main".into()),
-            body: build_chat_body(
-                &t.model,
-                &[ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                }],
-                &[],
-            ),
+            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
         });
 
         let out: Vec<_> = complete_turn(

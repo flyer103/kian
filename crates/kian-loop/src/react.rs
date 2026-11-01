@@ -59,7 +59,7 @@ use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
     ToolCall, ToolProvider, ToolResult,
 };
-use kian_llm::provider::{ChatMessage, build_chat_body};
+use kian_llm::provider::{ChatMessage, WireFunctionCall, WireToolCall, build_chat_body};
 use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
 use kian_orchestrator::{DrainCtx, EngineError};
@@ -419,7 +419,7 @@ impl Inner {
         // array order — C8 serialization contract).
         let mut schemas = self.tools.schemas();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
-        let chat: Vec<ChatMessage> = messages.iter().map(to_chat_message).collect();
+        let chat: Vec<ChatMessage> = messages.iter().filter_map(to_chat_message).collect();
 
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called.
@@ -625,10 +625,23 @@ fn assemble_delta(delta: &Value, text: &mut String, calls: &mut BTreeMap<u64, Ca
     }
 }
 
-/// Converts a projected [`Message`] into the request-body chat shape.
-/// String content passes through; structured content (tool transcripts)
-/// is serialized compactly — deterministic under the frozen C8
-/// serialization (lexicographic keys).
+/// Converts a projected [`Message`] into the request-body chat shape
+/// (dialect v2, kian-61). Plain string content passes through unchanged
+/// (byte-identical to dialect v1); structured content is translated to
+/// the strict openai wire shape — anything else is serialized compactly,
+/// deterministic under the frozen C8 serialization (lexicographic keys).
+///
+/// - `role:"tool"` `{call_id, output, is_error}` → `{role:"tool",
+///   tool_call_id, content: <output as a JSON string>}` (the `is_error`
+///   flag stays in the event stream; the wire carries the output only,
+///   the shape verified live against the real DeepSeek API).
+/// - assistant `{"text", "tool_calls": [...]}` → `{role:"assistant",
+///   content: <text or null>, tool_calls: [{id, type:"function",
+///   function:{name, arguments: <JSON string>}}]}`.
+/// - assistant `{"id", "name", "arguments"}` (the per-call `tool/call`
+///   transcript duplicate) → **dropped**: the enclosing assistant turn's
+///   `tool_calls` already carries the same call id, and strict endpoints
+///   reject the duplicate. Returns `None`.
 ///
 /// Public (card C14): `kian session replay` re-derives the model context
 /// from the event stream and must rebuild the *exact* chat shape the
@@ -636,15 +649,105 @@ fn assemble_delta(delta: &Value, text: &mut String, calls: &mut BTreeMap<u64, Ca
 /// This conversion is part of the frozen request-serialization contract
 /// (constraint 3) — changing it invalidates every replay comparison and
 /// every provider prefix cache.
-pub fn to_chat_message(m: &Message) -> ChatMessage {
-    let content = match &m.content {
+pub fn to_chat_message(m: &Message) -> Option<ChatMessage> {
+    match m.role.as_str() {
+        "tool" => Some(tool_result_message(&m.content)),
+        "assistant" => assistant_message(&m.content),
+        _ => Some(string_or_compact(&m.role, &m.content)),
+    }
+}
+
+/// `{role, content}` from a plain string, or the compact serialization
+/// of any other JSON shape (the v1 fallback, unchanged).
+fn string_or_compact(role: &str, content: &Value) -> ChatMessage {
+    let text = match content {
         Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     };
     ChatMessage {
-        role: m.role.clone(),
-        content,
+        role: role.to_owned(),
+        content: Some(text),
+        tool_call_id: None,
+        tool_calls: None,
     }
+}
+
+/// A `tool/result` payload `{call_id, output, is_error}` → the strict
+/// wire shape. A foreign shape still maps to a `role:"tool"` message
+/// (with an empty `tool_call_id`) so nothing is silently swallowed.
+fn tool_result_message(content: &Value) -> ChatMessage {
+    if let Some(obj) = content.as_object()
+        && let Some(call_id) = obj.get("call_id").and_then(Value::as_str)
+    {
+        let output = obj.get("output").cloned().unwrap_or(Value::Null);
+        return ChatMessage {
+            role: "tool".into(),
+            content: Some(serde_json::to_string(&output).unwrap_or_default()),
+            tool_call_id: Some(call_id.to_owned()),
+            tool_calls: None,
+        };
+    }
+    ChatMessage {
+        role: "tool".into(),
+        content: Some(serde_json::to_string(content).unwrap_or_default()),
+        tool_call_id: Some(String::new()),
+        tool_calls: None,
+    }
+}
+
+/// An assistant payload: a tool-call turn, its per-call transcript
+/// duplicate (`None` — dropped from the wire), a bare `{"text": …}`, or
+/// the compact fallback.
+fn assistant_message(content: &Value) -> Option<ChatMessage> {
+    let Some(obj) = content.as_object() else {
+        return Some(string_or_compact("assistant", content));
+    };
+    if obj.contains_key("tool_calls") {
+        let calls: Option<Vec<WireToolCall>> =
+            obj.get("tool_calls").and_then(Value::as_array).map(|list| {
+                list.iter()
+                    .filter_map(|tc| {
+                        let id = tc.get("id").and_then(Value::as_str)?;
+                        let name = tc.get("name").and_then(Value::as_str)?;
+                        let arguments = tc.get("arguments").cloned().unwrap_or(Value::Null);
+                        Some(WireToolCall {
+                            id: id.to_owned(),
+                            r#type: "function".into(),
+                            function: WireFunctionCall {
+                                name: name.to_owned(),
+                                arguments: serde_json::to_string(&arguments).unwrap_or_default(),
+                            },
+                        })
+                    })
+                    .collect()
+            });
+        return Some(ChatMessage {
+            role: "assistant".into(),
+            // Empty text serializes as `content: null` (the strict shape
+            // verified live: a purely tool-calling assistant turn).
+            content: obj
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
+            tool_call_id: None,
+            tool_calls: calls,
+        });
+    }
+    // The per-call `tool/call` transcript duplicate: the enclosing
+    // assistant turn's tool_calls already carries this call id.
+    if obj.contains_key("id") && obj.contains_key("name") && obj.contains_key("arguments") {
+        return None;
+    }
+    if let Some(text) = obj.get("text").and_then(Value::as_str) {
+        return Some(ChatMessage {
+            role: "assistant".into(),
+            content: Some(text.to_owned()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+    }
+    Some(string_or_compact("assistant", content))
 }
 
 /// Maps a provider error onto the classifier's class names (C10
@@ -682,8 +785,96 @@ fn action_note(action: Option<RecoveryAction>) -> String {
 mod tests {
     use crate::react::{
         CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop, assemble_delta, consult_policy,
+        to_chat_message,
     };
     use crate::test_support::{NoopPolicy, NoopTools, agent_def};
+    use kian_core::context::Message;
+    use serde_json::json;
+
+    fn msg(role: &str, content: serde_json::Value) -> Message {
+        Message {
+            role: role.into(),
+            content,
+            synthetic: false,
+        }
+    }
+
+    /// Dialect v2 (kian-61): a projected tool round trip maps to the
+    /// strict openai wire shape, and the per-call `tool/call` transcript
+    /// duplicate is dropped (the assistant turn's tool_calls already
+    /// carries the id).
+    #[test]
+    fn tool_round_trip_projects_to_the_strict_wire_shape() {
+        let assistant = msg(
+            "assistant",
+            json!({
+                "text": "",
+                "tool_calls": [
+                    {"id": "call-1", "name": "fs_read", "arguments": {"path": "a.txt"}}
+                ]
+            }),
+        );
+        let chat = to_chat_message(&assistant).unwrap();
+        assert_eq!(chat.role, "assistant");
+        assert_eq!(chat.content, None, "empty text serializes as null");
+        let tc = &chat.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(tc.id, "call-1");
+        assert_eq!(tc.r#type, "function");
+        assert_eq!(tc.function.name, "fs_read");
+        assert_eq!(tc.function.arguments, "{\"path\":\"a.txt\"}");
+
+        // Non-empty text rides along as string content.
+        let with_text = msg(
+            "assistant",
+            json!({"text": "checking", "tool_calls": [
+                {"id": "call-2", "name": "exec", "arguments": {"argv": ["true"]}}
+            ]}),
+        );
+        let chat = to_chat_message(&with_text).unwrap();
+        assert_eq!(chat.content.as_deref(), Some("checking"));
+
+        // The tool/call transcript duplicate: dropped.
+        let dup = msg(
+            "assistant",
+            json!({"id": "call-1", "name": "fs_read", "arguments": {"path": "a.txt"}}),
+        );
+        assert!(to_chat_message(&dup).is_none());
+
+        // The tool result: role tool + tool_call_id + serialized output.
+        let result = msg(
+            "tool",
+            json!({"call_id": "call-1", "output": {"content": "x"}, "is_error": false}),
+        );
+        let chat = to_chat_message(&result).unwrap();
+        assert_eq!(chat.role, "tool");
+        assert_eq!(chat.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(chat.content.as_deref(), Some("{\"content\":\"x\"}"));
+        assert!(chat.tool_calls.is_none());
+    }
+
+    /// Dialect v2: plain messages keep the exact v1 `{content, role}`
+    /// shape (no new keys), and bare `{"text": …}` assistant content
+    /// unwraps to the string.
+    #[test]
+    fn plain_messages_keep_the_v1_shape() {
+        let user = msg("user", json!("hello"));
+        let chat = to_chat_message(&user).unwrap();
+        assert_eq!(chat.role, "user");
+        assert_eq!(chat.content.as_deref(), Some("hello"));
+        assert!(chat.tool_call_id.is_none() && chat.tool_calls.is_none());
+
+        let bare = msg("assistant", json!({"text": "hi"}));
+        assert_eq!(
+            to_chat_message(&bare).unwrap().content.as_deref(),
+            Some("hi")
+        );
+
+        // A foreign tool shape still maps (empty tool_call_id) — nothing
+        // is silently swallowed.
+        let foreign = msg("tool", json!({"odd": true}));
+        let chat = to_chat_message(&foreign).unwrap();
+        assert_eq!(chat.tool_call_id.as_deref(), Some(""));
+    }
 
     // -- pure-unit sections ---------------------------------------------------
 

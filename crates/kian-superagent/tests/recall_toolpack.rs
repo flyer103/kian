@@ -162,8 +162,10 @@ fn tool_call_chunk(
 }
 
 /// Extracts the `output.thread_id` of a prior tool result from the
-/// request body (tool transcripts serialize as JSON strings inside
-/// `role:"tool"` messages — the frozen C8 chat shape).
+/// request body. Dialect v2 (kian-61): a `role:"tool"` message's content
+/// is the serialized tool output itself (with the wire `tool_call_id`
+/// beside it), so the thread id sits at `/thread_id`; the legacy v1
+/// shape wrapped it as `{"call_id","output"}` — both accepted here.
 fn thread_id_from_request(req: &ModelRequest) -> Option<String> {
     let messages = req.body.get("messages")?.as_array()?;
     for message in messages {
@@ -178,7 +180,11 @@ fn thread_id_from_request(req: &ModelRequest) -> Option<String> {
         ) else {
             continue;
         };
-        if let Some(tid) = content.pointer("/output/thread_id").and_then(Value::as_str) {
+        let tid = content
+            .pointer("/thread_id")
+            .or_else(|| content.pointer("/output/thread_id"))
+            .and_then(Value::as_str);
+        if let Some(tid) = tid {
             return Some(tid.to_string());
         }
     }
@@ -195,7 +201,7 @@ struct FakeTools;
 
 impl ToolProvider for FakeTools {
     fn schemas(&self) -> Vec<ToolSchema> {
-        ["fs.read", "fs.write", "exec"]
+        ["fs_read", "fs_write", "exec"]
             .iter()
             .map(|name| ToolSchema {
                 name: (*name).into(),

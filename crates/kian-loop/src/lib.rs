@@ -38,4 +38,6 @@ pub use react::{
     CLASS_EMPTY_RESPONSE, DEFAULT_MAX_ITERATIONS, LoopError, ReActConfig, ReActLoop,
     to_chat_message,
 };
-pub use tools::{DEFAULT_EXEC_TIMEOUT_MS, LocalExecBackend, LocalTools};
+pub use tools::{
+    DEFAULT_EXEC_TIMEOUT_MS, FilteredTools, LocalExecBackend, LocalTools, unmatched_tool_names,
+};

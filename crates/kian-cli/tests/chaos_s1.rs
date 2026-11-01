@@ -75,7 +75,12 @@ const DETECTION_BOUND_MS: u128 = LEASE_TTL_MS as u128 + 2 * HEARTBEAT_MS as u128
 /// one concurrent batch so the claim→take window spans tens of ms.
 const AFTER_CLAIM_INPUTS: usize = 64;
 /// Attempts for the race-y poll-catch boundary (fresh session each).
-const CATCH_ATTEMPTS: u32 = 20;
+/// The claim→first-turn window is scheduler-timing-dependent (its width
+/// is the first take-sweep, sub-millisecond; kian-61's binary-layout
+/// shift alone moved wake timing enough to miss it at 20×3ms polling),
+/// so: poll fast and retry generously — a miss is cheap, a false
+/// catch is impossible (the stage predicate is exact).
+const CATCH_ATTEMPTS: u32 = 60;
 const SEED_BASE: u64 = 0xC15;
 
 fn tuning() -> ConfigTuning {
@@ -637,7 +642,7 @@ async fn kill_at_stage(
                         last_note = format!("attempt {attempt} timed out: {:?}", kinds_of(&events));
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 // Stage not captured on this session: let it settle and
                 // retry on a fresh one.

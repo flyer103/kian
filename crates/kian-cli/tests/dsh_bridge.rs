@@ -84,7 +84,7 @@ agents:
       main:
         provider: mock
         model: mock-worker
-    tools: ["fs.read", "fs.write", "exec"]
+    tools: ["fs_read", "fs_write", "exec"]
 providers:
   mock:
     base_url: "{provider_base}"

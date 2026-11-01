@@ -5,7 +5,7 @@
 //!
 //! - **Log-before-execute** is enforced by the loop (it appends the
 //!   `tool/call` event *before* invoking this provider); side-effecting
-//!   built-ins (`fs.write`, `exec`) rely on that ordering for their audit
+//!   built-ins (`fs_write`, `exec`) rely on that ordering for their audit
 //!   trail.
 //! - **Never block a tokio worker**: every fs operation and every local
 //!   process runs inside `spawn_blocking`, so a sleeping tool cannot stall
@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -168,9 +169,16 @@ impl ReaderThread {
 ///
 /// - `exec` — `{ "argv": [..], "cwd"?: string, "timeout_ms"?: u64 }`
 ///   (side-effecting; runs via [`LocalExecBackend`]).
-/// - `fs.list` — `{ "path": string }` (relative to `root`)
-/// - `fs.read` — `{ "path": string }`
-/// - `fs.write` — `{ "path": string, "content": string }` (side-effecting)
+/// - `fs_list` — `{ "path": string }` (relative to `root`)
+/// - `fs_read` — `{ "path": string }`
+/// - `fs_write` — `{ "path": string, "content": string }` (side-effecting)
+///
+/// Tool names are dotless (kian-61): strict OpenAI-compatible endpoints
+/// validate `tools[n].function.name` against `^[a-zA-Z0-9_-]+$` and
+/// reject the pre-rename dotted spelling (`fs.list` et al.) with HTTP
+/// 400. The dotted legacy names are still ACCEPTED by [`ToolProvider::
+/// invoke`] (but never advertised) so sessions recorded before the
+/// rename keep working when replayed.
 ///
 /// Tool schemas are exposed sorted by name — the request-body
 /// serialization freezes the `tools` array order (C8 contract), so the
@@ -225,7 +233,7 @@ impl LocalTools {
                 }),
             },
             ToolSchema {
-                name: "fs.list".into(),
+                name: "fs_list".into(),
                 description: "List entries of a directory under the workspace root.".into(),
                 parameters: json!({
                     "type": "object",
@@ -234,7 +242,7 @@ impl LocalTools {
                 }),
             },
             ToolSchema {
-                name: "fs.read".into(),
+                name: "fs_read".into(),
                 description: "Read a text file under the workspace root.".into(),
                 parameters: json!({
                     "type": "object",
@@ -243,7 +251,7 @@ impl LocalTools {
                 }),
             },
             ToolSchema {
-                name: "fs.write".into(),
+                name: "fs_write".into(),
                 description: "Write a text file under the workspace root (side-effecting).".into(),
                 parameters: json!({
                     "type": "object",
@@ -289,13 +297,15 @@ impl ToolProvider for LocalTools {
         // only the I/O side goes to the blocking pool.
         let parsed: Result<ParsedCall, ToolError> = match call.name.as_str() {
             "exec" => parse_exec(&call.arguments).map(ParsedCall::Exec),
-            "fs.list" => parse_path_only(&call.arguments)
+            // Dotted legacy spellings (pre-kian-61 history) stay invocable
+            // but are never advertised in `schemas()`.
+            "fs_list" | "fs.list" => parse_path_only(&call.arguments)
                 .and_then(confine)
                 .map(ParsedCall::List),
-            "fs.read" => parse_path_only(&call.arguments)
+            "fs_read" | "fs.read" => parse_path_only(&call.arguments)
                 .and_then(confine)
                 .map(ParsedCall::Read),
-            "fs.write" => parse_write(&call.arguments)
+            "fs_write" | "fs.write" => parse_write(&call.arguments)
                 .and_then(|(p, c)| confine(p).map(|p| (p, c)))
                 .map(|(p, c)| ParsedCall::Write(p, c)),
             other => Err(ToolError::InvalidCall(format!("unknown tool {other:?}"))),
@@ -369,6 +379,75 @@ enum ParsedCall {
     Write(String, String),
 }
 
+// ---------------------------------------------------------------------------
+// FilteredTools (kian-61: config-filterable mounted surface)
+// ---------------------------------------------------------------------------
+
+/// A config-driven allowlist over another [`ToolProvider`] (kian-61).
+///
+/// `AgentDef.tools` names the agent's mounted surface; this wrapper
+/// enforces it at the provider edge: schemas not in the list are hidden
+/// from the request body (prefix minimization — the model never sees
+/// tools the agent may not call), and invoking a hidden name is an
+/// honest [`ToolError::InvalidCall`], never a silent passthrough.
+///
+/// The wrapper is *narrow*: it only ever removes from the inner
+/// surface, so the caller-supplied schema order (the frozen C8 tools
+/// array order) is preserved.
+#[derive(Clone)]
+pub struct FilteredTools {
+    inner: Arc<dyn ToolProvider>,
+    allow: std::collections::BTreeSet<String>,
+}
+
+impl FilteredTools {
+    /// Wraps `inner` so only `allow`-listed tool names are visible.
+    /// Names in `allow` that the inner provider does not mount are
+    /// harmless (they simply never surface); use
+    /// [`unmatched_tool_names`] for the assembly-time fail-closed check.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ToolProvider>, allow: &[String]) -> Self {
+        Self {
+            inner,
+            allow: allow.iter().cloned().collect(),
+        }
+    }
+}
+
+impl ToolProvider for FilteredTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        self.inner
+            .schemas()
+            .into_iter()
+            .filter(|s| self.allow.contains(&s.name))
+            .collect()
+    }
+
+    fn invoke(&self, call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+        if !self.allow.contains(&call.name) {
+            return Box::pin(std::future::ready(Err(ToolError::InvalidCall(format!(
+                "tool {:?} is not in this agent's mounted surface",
+                call.name
+            )))));
+        }
+        self.inner.invoke(call)
+    }
+}
+
+/// The `listed` tool names that appear nowhere in `mounted` — the
+/// assembly-time fail-closed check for `AgentDef.tools`: a typo'd name
+/// refuses boot instead of silently shrinking the agent's surface.
+#[must_use]
+pub fn unmatched_tool_names(listed: &[String], mounted: &[ToolSchema]) -> Vec<String> {
+    let mounted_names: std::collections::BTreeSet<&str> =
+        mounted.iter().map(|s| s.name.as_str()).collect();
+    listed
+        .iter()
+        .filter(|n| !mounted_names.contains(n.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// `Value` helper carrying the honest error flag through the match arms.
 trait WithErrorFlag {
     fn with_error_flag(self, is_error: bool) -> (Value, bool);
@@ -435,7 +514,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use super::{LocalExecBackend, LocalTools};
+    use super::{FilteredTools, LocalExecBackend, LocalTools, unmatched_tool_names};
     use kian_core::seams::{ExecBackend, ExecCommand, ToolCall, ToolProvider};
 
     fn temp_root() -> PathBuf {
@@ -460,7 +539,7 @@ mod tests {
         let write = tools
             .invoke(call(
                 "c1",
-                "fs.write",
+                "fs_write",
                 serde_json::json!({"path": "notes/a.txt", "content": "hello kian"}),
             ))
             .await
@@ -469,7 +548,7 @@ mod tests {
         let read = tools
             .invoke(call(
                 "c2",
-                "fs.read",
+                "fs_read",
                 serde_json::json!({"path": "notes/a.txt"}),
             ))
             .await
@@ -479,13 +558,46 @@ mod tests {
             Some("hello kian")
         );
         let list = tools
-            .invoke(call("c3", "fs.list", serde_json::json!({"path": "notes"})))
+            .invoke(call("c3", "fs_list", serde_json::json!({"path": "notes"})))
             .await
             .unwrap();
         assert_eq!(
             list.output.get("entries"),
             Some(&serde_json::json!(["a.txt"]))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// kian-61: pre-rename history carries the dotted spellings — they
+    /// stay invocable (never advertised) so replayed sessions work.
+    #[tokio::test]
+    async fn dotted_legacy_tool_names_stay_invocable() {
+        let root = temp_root();
+        let tools = LocalTools::new(&root);
+        let write = tools
+            .invoke(call(
+                "c1",
+                "fs.write",
+                serde_json::json!({"path": "legacy.txt", "content": "old dialect"}),
+            ))
+            .await
+            .unwrap();
+        assert!(!write.is_error);
+        let read = tools
+            .invoke(call(
+                "c2",
+                "fs.read",
+                serde_json::json!({"path": "legacy.txt"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            read.output.get("content").and_then(|v| v.as_str()),
+            Some("old dialect")
+        );
+        // ...but the advertised surface is dotless only.
+        let advertised: Vec<String> = tools.schemas().into_iter().map(|s| s.name).collect();
+        assert!(!advertised.contains(&"fs.read".to_string()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -496,7 +608,7 @@ mod tests {
         let err = tools
             .invoke(call(
                 "c1",
-                "fs.read",
+                "fs_read",
                 serde_json::json!({"path": "../escape.txt"}),
             ))
             .await
@@ -512,7 +624,7 @@ mod tests {
         let res = tools
             .invoke(call(
                 "c1",
-                "fs.read",
+                "fs_read",
                 serde_json::json!({"path": "nope.txt"}),
             ))
             .await
@@ -574,12 +686,32 @@ mod tests {
         let tools = LocalTools::new(temp_root());
         let schemas = tools.schemas();
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["exec", "fs.list", "fs.read", "fs.write"]);
+        assert_eq!(names, ["exec", "fs_list", "fs_read", "fs_write"]);
         assert_eq!(names, {
             let mut sorted = names.clone();
             sorted.sort();
             sorted
         });
+    }
+
+    /// kian-61 regression: strict OpenAI-compatible endpoints validate
+    /// `tools[n].function.name` against `^[a-zA-Z0-9_-]{1,64}$` and
+    /// answer HTTP 400 otherwise (verified live against real DeepSeek).
+    /// Every advertised built-in name must match.
+    #[test]
+    fn advertised_tool_names_match_the_strict_endpoint_pattern() {
+        let tools = LocalTools::new(temp_root());
+        for s in tools.schemas() {
+            assert!(
+                !s.name.is_empty()
+                    && s.name.len() <= 64
+                    && s.name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "tool name {:?} violates ^[a-zA-Z0-9_-]{{1,64}}$",
+                s.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -593,7 +725,7 @@ mod tests {
         );
         assert!(
             tools
-                .invoke(call("c2", "fs.read", serde_json::json!({"path": 3})))
+                .invoke(call("c2", "fs_read", serde_json::json!({"path": 3})))
                 .await
                 .is_err()
         );
@@ -602,6 +734,52 @@ mod tests {
                 .invoke(call("c3", "exec", serde_json::json!({"argv": []})))
                 .await
                 .is_err()
+        );
+    }
+
+    // -- FilteredTools (kian-61) --------------------------------------------
+
+    #[test]
+    fn filtered_tools_hides_unlisted_schemas_and_preserves_order() {
+        let local = Arc::new(LocalTools::new(temp_root()));
+        let allow = vec!["exec".to_string(), "fs_read".to_string()];
+        let filtered = FilteredTools::new(local.clone() as Arc<dyn ToolProvider>, &allow);
+        let names: Vec<String> = filtered.schemas().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["exec", "fs_read"], "inner (sorted) order kept");
+    }
+
+    #[tokio::test]
+    async fn filtered_tools_invoke_is_fail_closed_for_hidden_names() {
+        let local = Arc::new(LocalTools::new(temp_root()));
+        let allow = vec!["fs_read".to_string()];
+        let filtered = FilteredTools::new(local as Arc<dyn ToolProvider>, &allow);
+        // Listed name passes through to the inner provider.
+        assert!(
+            filtered
+                .invoke(call("c1", "fs_read", serde_json::json!({"path": 3})))
+                .await
+                .is_err(),
+            "inner validation still applies"
+        );
+        // Hidden name: honest InvalidCall, never a silent passthrough.
+        let err = filtered
+            .invoke(call("c2", "exec", serde_json::json!({"argv": ["true"]})))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            kian_core::seams::ToolError::InvalidCall(ref m) if m.contains("mounted surface")
+        ));
+    }
+
+    #[test]
+    fn unmatched_tool_names_flags_typos_for_fail_closed_boot() {
+        let mounted = LocalTools::new(temp_root()).schemas();
+        assert!(unmatched_tool_names(&["exec".into()], &mounted).is_empty());
+        // The pre-rename dotted spelling no longer exists — flagged.
+        assert_eq!(
+            unmatched_tool_names(&["fs.read".into()], &mounted),
+            vec!["fs.read".to_string()]
         );
     }
 }

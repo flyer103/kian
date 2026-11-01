@@ -230,7 +230,7 @@ fn worker_turn(train_len: usize) -> DynamicTurn {
         // honest bail-out if a marker were ever lost.
         vec![tool_call_chunk(
             "call-read",
-            "fs.read",
+            "fs_read",
             json!({"path": "stage.log"}),
         )]
     })
@@ -246,7 +246,7 @@ struct FakeTools;
 
 impl ToolProvider for FakeTools {
     fn schemas(&self) -> Vec<ToolSchema> {
-        ["fs.read", "fs.write", "exec"]
+        ["fs_read", "fs_write", "exec"]
             .iter()
             .map(|name| ToolSchema {
                 name: (*name).into(),

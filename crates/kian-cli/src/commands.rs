@@ -323,7 +323,9 @@ pub fn check_model_context(events: &[Event]) -> ModelContextCheck {
         };
         let derived = match derive_model_context(&events[..bracket]) {
             Ok(msgs) => {
-                let chat: Vec<_> = msgs.iter().map(to_chat_message).collect();
+                // Dialect v2 (kian-61): tool transcripts map to the strict
+                // wire shape; the per-call duplicates drop out.
+                let chat: Vec<_> = msgs.iter().filter_map(to_chat_message).collect();
                 // Canonical form only: the recorded body round-tripped
                 // through `serde_json::Value` (lexicographic keys — the
                 // frozen C8 serialization), so both sides are compared

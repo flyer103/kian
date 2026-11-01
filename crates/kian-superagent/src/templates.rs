@@ -34,8 +34,10 @@ pub const CHANNEL_TOOLS: [&str; 2] = ["reply", "deliver_structured"];
 
 /// The worker's built-in toolset: fs + exec. `exec` is also the remote
 /// endpoint's tool schema (C20 `RemoteExecTool` implements the same
-/// schema), so "full tools incl. remote exec" is one name.
-pub const WORKER_TOOLS: [&str; 3] = ["fs.read", "fs.write", "exec"];
+/// schema), so "full tools incl. remote exec" is one name. Dotless
+/// spellings (kian-61): strict OpenAI-compatible endpoints reject
+/// dotted tool names.
+pub const WORKER_TOOLS: [&str; 3] = ["fs_read", "fs_write", "exec"];
 
 /// The async `start()`/`stop()` pair (C37, ADR-008). Mounted on the
 /// Router profile and the worker template **config-gated, default
