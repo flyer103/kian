@@ -1245,7 +1245,17 @@ mod tests {
             store.startup_scan(T0).await.unwrap().is_empty(),
             "nothing eligible remains (NoLostWork)"
         );
-        assert!(!eng.is_draining(&a) && !eng.is_draining(&b));
+        // Teardown race: the projection reports Completed as soon as the
+        // final event is appended, but the drain task clears its draining
+        // flag after that append — poll until the flags settle rather than
+        // asserting immediately.
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&a) && !eng.is_draining(&b)
+            })
+            .await,
+            "draining flags cleared after both sessions complete"
+        );
         cleanup(&path);
     }
 
