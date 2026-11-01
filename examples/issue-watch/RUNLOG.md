@@ -217,3 +217,74 @@ Workspace gates at this commit: `cargo fmt --check`, `cargo build
 --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` (exit 0) — all green.
 
+## 6. kian-62: the re-arm run — a dead resident Router comes back on reboot (2026-11-02)
+
+The §2 footnote gap, closed. Two ways a resident Router can die, two
+honest recoveries, one mechanism (DESIGN §4.6 "Resident re-arm",
+landed in commits `0924b6c` → `a76544c`):
+
+- **Soft-failed** (`turn/end{outcome:"soft_failure"}` →
+  `session/ended{reason:"failed"}`) projects *idle*: the next admitted
+  input re-opens the **same pinned session**. No successor, no re-arm.
+- **Terminally ended** (`session/ended{reason:"completed"}` — e.g. the
+  lifetime iteration budget exhausting, which is exactly what froze
+  the §5 router `…c060` at seq 211) is frozen forever: the consumed
+  bootstrap row can never re-wake it. On boot, the server walks the
+  deterministic successor chain `uuid5(s, "kian:resident:re-arm")`,
+  binds the resolved live session everywhere the pinned id went, and
+  the successor bootstraps under the per-generation idempotency key
+  `<prefix>:re-arm:<uuid>` with a cause-carrying prompt. Zero new
+  event kinds — the re-arm is observable as the successor's first
+  `input/admitted`, and (new in this commit) as a boot log line now
+  that `kian serve` actually installs a tracing subscriber
+  (`RUST_LOG`, default `warn`).
+
+### The acceptance run (`./demo-rearm.sh`, DRY_RUN=1, 02:33–02:37 CST)
+
+All numbers are programmatic queries against the demo stores
+(`.state-rearm-{a,b}/kian.db`); full transcript in
+`.state-rearm-run.log`.
+
+**Act A — forced soft failure, kill -9, reboot (pinned `…c062`).**
+`flaky-proxy.py` (stdlib-only, forwards to DeepSeek) killed router
+judge request #2 *mid-stream* — HTTP 200, SSE content-type, a few real
+bytes, abrupt close (the first attempt's proxy died on
+`import requests`, so its failure was connection-refused; this one is
+the genuine C60/C61 flavor). The loop recorded exactly 1
+`turn/end{soft_failure}` and `session/ended{failed}` at seq 13 —
+honest. Then `kill -9` (true crash, no flush) and a reboot *direct*
+against DeepSeek on the same store: the next tick re-opened the SAME
+pinned session — judge turn at seq 16 (> 13), and a **completed
+(`final_answer`) judge turn at seq 27**: the watch is judging again
+with no operator action. Successor-of-pinned events: **0** — a soft
+failure is not a succession.
+
+**Act B — the real C61 frozen store (pinned `…c060`, 211 events,
+tail `session/ended{completed}`).** Boot on a copy of `.state/kian.db`:
+
+- Boot log: `superagent: resident Router re-armed onto a successor
+  session pinned=…c060 live=e43eb465-bff4-5b5f-9273-c0d8aed9a30b
+  ended=1` — the deterministic `uuid5(c060, "kian:resident:re-arm")`.
+- The successor's first `input/admitted` (seq 3) is the observable
+  cause: *"[re-arm] This session re-arms the resident Router;
+  predecessor session(s) ended and are frozen: …c060 (completed) …"*.
+- The timer restarts tick numbering per boot, so ticks 1–15 were
+  re-delivered — and **honestly re-judged**: the successor ran green
+  judge turns back-to-back (16 `final_answer` turns by capture;
+  tick-16 admitted at seq 90, continuing past the frozen run's 15),
+  with exactly **1 tool call total** (the re-arm issue poll) and
+  **zero duplicate worker dispatches** — the frozen workers stayed at
+  their C61 event counts (19/79), no new poll/draft sessions.
+- The frozen predecessor is byte-identical: still 211 events.
+
+Known limitation (documented in DESIGN §4.6): a resident still ends
+`{completed}` each time its lifetime iteration budget exhausts — until
+that budget is revisited, residents simply chain successors at each
+exhaustion, one per reboot. The demo configs raise `max_iterations`
+to 500 so the successor outlives the demo window.
+
+Workspace gates at this commit: `cargo fmt --check`, `cargo build
+--workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (exit 0, pg-gated suites included) — all
+green.
+

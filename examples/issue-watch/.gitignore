@@ -1,5 +1,8 @@
 # Demo state: the sqlite event store, tools root, serve log/pid.
 .state*/
+.state-rearm-run.log
+# Generated at demo runtime by demo-rearm.sh from config.yaml.
+config-rearm-*.yaml
 # Audit exports produced by the walkthrough.
 audit.json
 audit-*.json

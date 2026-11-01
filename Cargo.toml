@@ -51,6 +51,7 @@ hmac = "0.12"
 serde_yaml = "0.9"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
+    "env-filter",
 ] }
 
 # Internal crates (DESIGN §7 as landed).

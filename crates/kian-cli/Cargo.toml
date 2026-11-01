@@ -32,6 +32,9 @@ kian-sdk.workspace = true
 # pinned in the workspace).
 sha2.workspace = true
 hmac.workspace = true
+# kian-62: the serve binary installs a tracing subscriber (RUST_LOG,
+# default warn) so the resident re-arm succession note has an audience.
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true

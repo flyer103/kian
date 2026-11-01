@@ -72,6 +72,14 @@ fn main() -> ExitCode {
 }
 
 fn serve(args: &[String]) -> ExitCode {
+    // kian-62: `serve` is a long-lived resident — without a subscriber
+    // its tracing lines (including the resident re-arm succession note)
+    // go nowhere and operators have no boot evidence. Default to warn;
+    // RUST_LOG overrides (the kian-62 demo runs with RUST_LOG=info to
+    // capture the re-arm line in serve.log).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     let mut config_path = std::path::PathBuf::from("kian.yaml");
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
