@@ -927,6 +927,62 @@ mod tests {
 
     // -- startup scan -----------------------------------------------------------
 
+    /// FIFO inside one `eligible_at` millisecond follows admission
+    /// order, never the random-uuid tie-break. C57 live-run finding:
+    /// the inbox ordered same-ms rows by `id` (a random uuid), so a
+    /// task/steer pair admitted in the same millisecond could consume
+    /// the steer first — and the worker-template classification (which
+    /// reads the *first* input) misrouted the session to the default
+    /// agent. The ids here are crafted so the uuid tie-break orders
+    /// them backwards: admission order must win.
+    #[tokio::test]
+    async fn same_millisecond_inputs_consume_in_admission_order() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+
+        let first = InputRow {
+            id: Uuid::parse_str("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap(),
+            session: sid,
+            payload: json!({ "n": 1 }),
+            admitted_at: T0,
+            eligible_at: T0,
+            idempotency_key: Some("first".to_owned()),
+        };
+        let second = InputRow {
+            id: Uuid::parse_str("00000000-0000-4000-8000-000000000000").unwrap(),
+            session: sid,
+            payload: json!({ "n": 2 }),
+            admitted_at: T0,
+            eligible_at: T0,
+            idempotency_key: Some("second".to_owned()),
+        };
+        store.admit(first.clone()).await.expect("admit first");
+        store.admit(second.clone()).await.expect("admit second");
+
+        let rows = store.eligible_inputs(sid, T0).await.expect("eligible");
+        assert_eq!(rows.len(), 2, "both same-ms inputs are eligible");
+        assert_eq!(
+            rows[0].id, first.id,
+            "same-ms inputs must consume in admission order (not uuid order)"
+        );
+        assert_eq!(rows[1].id, second.id);
+
+        // The startup inbox rebuild keeps the same order per session.
+        let scan = store.startup_scan(T0).await.expect("startup scan");
+        let ours = scan
+            .iter()
+            .find(|s| s.session == sid)
+            .expect("session in startup scan");
+        assert_eq!(
+            ours.eligible.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![first.id, second.id],
+            "startup scan must list same-ms inputs in admission order"
+        );
+
+        store.close().await;
+        cleanup(&path);
+    }
+
     /// The startup inbox scan finds every session with
     /// eligible-but-unconsumed inputs in a DB seeded with half-consumed
     /// sessions, and skips future-eligible and fully-consumed ones

@@ -181,14 +181,18 @@ pub(crate) async fn head(pool: &SqlitePool, session: SessionId) -> Result<Head, 
 
 /// Durable admit keyed by `(session, idempotency_key)`: the unique index
 /// makes the insert a no-op on a key collision; NULL keys never collide,
-/// so keyless admits always insert.
-const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)\nON CONFLICT (session, idempotency_key) DO NOTHING";
+/// so keyless admits always insert. The admission ordinal
+/// (`admitted_seq`, v2) is `max+1` computed inside the same statement —
+/// sqlite serializes whole write statements, so concurrent admits
+/// cannot observe the same max, and the take queries' same-millisecond
+/// tie-break is the admission order, never the random uuid.
+const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key, admitted_seq)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(admitted_seq), 0) + 1 FROM inputs))\nON CONFLICT (session, idempotency_key) DO NOTHING";
 
 const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND idempotency_key = ?2";
 
-const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, id ASC";
+const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, admitted_seq ASC";
 
-const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, id ASC";
+const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// Consumption is event-driven by construction: the row is touched only
 /// when the referenced event row already exists in the same session's

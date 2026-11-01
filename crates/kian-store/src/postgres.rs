@@ -191,14 +191,17 @@ pub(crate) async fn head(pool: &PgPool, session: SessionId) -> Result<Head, Stor
 // -- inbox ------------------------------------------------------------------
 
 /// Same shape as sqlite's ADMIT (NULL keys never collide: pg unique
-/// indexes treat NULLs as distinct, exactly like sqlite).
+/// indexes treat NULLs as distinct, exactly like sqlite). The admission
+/// ordinal (`admitted_seq`, v2) is the identity column's sequence — the
+/// database assigns it, so the take queries' same-millisecond
+/// tie-break is the admission order, never the random uuid.
 const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nVALUES ($1::text, $2::text, $3::text, $4::bigint, $5::bigint, $6::text)\nON CONFLICT (session, idempotency_key) DO NOTHING";
 
 const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND idempotency_key = $2::text";
 
-const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND consumed_by_seq IS NULL AND eligible_at <= $2::bigint ORDER BY eligible_at ASC, id ASC";
+const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND consumed_by_seq IS NULL AND eligible_at <= $2::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
-const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= $1::bigint ORDER BY eligible_at ASC, id ASC";
+const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= $1::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// Dialect-identical to sqlite's CONSUME modulo placeholders (pg reuses
 /// `$1`/`$3` positionally, so each distinct parameter binds once).
