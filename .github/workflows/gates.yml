@@ -1,0 +1,87 @@
+# The four gates (AGENTS.md) on every push and PR.
+#
+# Test parallelism note: crates with process-spawning e2e suites
+# (kian-cli, kiand) run in their own job to avoid port/temp-dir
+# collisions with concurrent suite runs — the same discipline the
+# local round gates use.
+
+name: gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Build and clippy are safe to share a job; the full test suite
+      # runs alone below so failure output stays readable.
+      - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+        env:
+          NO_PROXY: 127.0.0.1,localhost
+          no_proxy: 127.0.0.1,localhost
+
+  # Postgres surfaces are env-gated (KIAN_PG_URL) and skip — never
+  # fail — when the env is absent. This job supplies a real postgres
+  # so the gated suites (kian-store, kian-exec, kian-cli postgres_serve
+  # and the S8 multi-replica e2e) actually run.
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: kian
+          POSTGRES_DB: kian_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kian"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: postgres-gated suites (must run, not skip)
+        run: |
+          set -euo pipefail
+          export KIAN_PG_URL="postgres://kian@localhost:5432/kian_ci"
+          export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+          for t in "kian-store --test postgres" "kian-exec --test postgres" \
+                   "kian-cli --test postgres_serve" "kian-cli --test postgres_s8"; do
+            echo "== cargo test -p $t =="
+            cargo test --locked -p $t 2>&1 | tee /tmp/out.log
+            grep -q "test result: ok" /tmp/out.log
+            ! grep -q "SKIP:" /tmp/out.log
+          done
+      - name: default gates stay green without any env
+        run: cargo test --locked --workspace
+        env:
+          NO_PROXY: 127.0.0.1,localhost
