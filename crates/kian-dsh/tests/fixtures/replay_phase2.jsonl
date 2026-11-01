@@ -1,0 +1,16 @@
+{"op":"send","frame":{"v":0,"type":"ready","logical_format":0}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/start","payload":{},"ts":1761900000001}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"system/message","payload":{"content":"You are the deploy agent."},"ts":1761900000002}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"user/message","payload":{"content":{"text":"deploy the service"}},"ts":1761900000003}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/start","payload":{},"ts":1761900000004}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/attempt","payload":{"status":"succeeded","request":{"model":"dsh-model","messages":[{"role":"system","content":"You are the deploy agent."},{"role":"user","content":{"text":"deploy the service"}}],"tools":[]}},"ts":1761900000005}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/message","payload":{"content":{"text":"running build","tool_calls":[{"id":"call-1","name":"run_build","arguments":{"target":"api"}}]}},"ts":1761900000006}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"tool/call","payload":{"id":"call-1","name":"run_build","arguments":{"target":"api"}},"ts":1761900000007}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"tool/result","payload":{"call_id":"call-1","output":{"ok":true},"is_error":false},"ts":1761900000008}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/end","payload":{"outcome":"tool_calls","tool_calls":1},"ts":1761900000009}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/start","payload":{},"ts":1761900000010}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/attempt","payload":{"status":"succeeded","request":{"model":"dsh-model","messages":[{"role":"system","content":"You are the deploy agent."},{"role":"user","content":{"text":"deploy the service"}},{"role":"assistant","content":{"text":"running build","tool_calls":[{"id":"call-1","name":"run_build","arguments":{"target":"api"}}]}},{"role":"tool","content":{"call_id":"call-1","output":{"ok":true},"is_error":false}}],"tools":[]}},"ts":1761900000011}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/message","payload":{"content":{"text":"deployed"}},"ts":1761900000012}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/end","payload":{"outcome":"final"},"ts":1761900000013}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/end","payload":{},"ts":1761900000014}}}
+{"op":"eof"}

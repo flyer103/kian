@@ -1,0 +1,28 @@
+[package]
+name = "kian-dsh"
+description = "S6 dsh bridge: the LoopDriver that drives a dsh --profile sdk child process over stdio JSON-lines (C54, ADR-010)"
+version.workspace = true
+edition.workspace = true
+
+# DESIGN §7 (C54): the bridge crate sits on the narrow waist — its ONLY
+# kian dependency is `kian-core` (the seam types `LoopDriver`/
+# `LoopOutcome` plus the shared event/model vocabulary the C53 mapping
+# selects from). It must never depend on kian-store, kian-orchestrator
+# or kian-loop: the drain surface it needs is the crate-local `DshCtx`
+# port, which assembly (kian-cli) implements over the real `DrainCtx`.
+# Enforced by tests/narrow_waist.rs (`cargo tree -p kian-dsh`).
+#
+# The C53 mapping contract (moved from kian-superagent, re-exported
+# there so every existing import keeps compiling) lives in `mapping`.
+
+[dependencies]
+kian-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
