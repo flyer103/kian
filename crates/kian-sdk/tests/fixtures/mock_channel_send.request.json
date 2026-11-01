@@ -1,0 +1,1 @@
+{"id":1,"jsonrpc":"2.0","method":"mock_channel_send","params":{"channel":"mock-im","payload":{"text":"hello"},"topic":"pr-9"}}
