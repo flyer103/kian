@@ -330,7 +330,10 @@ async fn startup_rebuild_reconstructs_the_spill_index() {
 
     // The startup rebuild: index fills from the streams alone.
     let recall = StoreRecall::new(store.clone());
-    recall.rebuild_spill_index(router).await.expect("rebuild");
+    recall
+        .rebuild_spill_index(&[router])
+        .await
+        .expect("rebuild");
     assert_eq!(
         recall.spill_location("evt-router-1").await.unwrap(),
         Some((router, 2))
@@ -349,7 +352,7 @@ async fn startup_rebuild_reconstructs_the_spill_index() {
     // pure projection, never authoritative).
     let rebuilt = StoreRecall::new(store.clone());
     rebuilt
-        .rebuild_spill_index(router)
+        .rebuild_spill_index(&[router])
         .await
         .expect("re-rebuild");
     for id in ["evt-router-1", "evt-worker-1", "evt-worker-2"] {

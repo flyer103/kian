@@ -27,6 +27,13 @@ pub enum ScriptedResponse {
         name: String,
         arguments: serde_json::Value,
     },
+    /// A stream that dies mid-flight (kian-62): HTTP 200, SSE
+    /// content-type, one partial content frame — then the connection
+    /// ends before the promised content-length is satisfied. The
+    /// provider surfaces a mid-turn stream error (the honest soft
+    /// failure), never a complete answer.
+    #[allow(dead_code)]
+    DieMidStream,
 }
 
 /// A mock openai-compat chat-completions endpoint. It speaks the real
@@ -75,7 +82,7 @@ pub fn sse_tool_call_body(id: &str, name: &str, arguments: &str) -> String {
 async fn completions(
     State(mock): State<Arc<MockProvider>>,
     body: axum::body::Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let n = mock.requests.fetch_add(1, Ordering::SeqCst) + 1;
     let gated = n <= mock.gated || (mock.gate_at != 0 && n == mock.gate_at);
     if gated && !mock.released.load(Ordering::SeqCst) {
@@ -89,28 +96,44 @@ async fn completions(
         }
     }
     let _ = body;
-    let body = match mock
+    let (extra_content_length, body): (Option<usize>, String) = match mock
         .script
         .get(n - 1)
         .unwrap_or(mock.script.last().expect("non-empty script"))
     {
-        ScriptedResponse::Text(text) => sse_completion_body(text),
+        ScriptedResponse::Text(text) => (None, sse_completion_body(text)),
         ScriptedResponse::ToolCall {
             id,
             name,
             arguments,
-        } => sse_tool_call_body(
-            id,
-            name,
-            &serde_json::to_string(arguments).expect("tool arguments serialize"),
+        } => (
+            None,
+            sse_tool_call_body(
+                id,
+                name,
+                &serde_json::to_string(arguments).expect("tool arguments serialize"),
+            ),
         ),
+        ScriptedResponse::DieMidStream => {
+            // One partial frame, then the body stops short of the
+            // promised content-length — the reader dies mid-stream.
+            let partial =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_string();
+            (Some(partial.len() + 128), partial)
+        }
     };
     mock.delivered.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        [("content-type", "text/event-stream")],
-        body,
-    )
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    if let Some(len) = extra_content_length
+        && let Ok(value) = axum::http::HeaderValue::from_str(&len.to_string())
+    {
+        response.headers_mut().insert("content-length", value);
+    }
+    response
 }
 
 /// Spawns the mock provider on an ephemeral port; returns its base URL

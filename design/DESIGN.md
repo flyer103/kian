@@ -656,6 +656,43 @@ raw, a sibling event, a worker's summary) is one recall hop away, audited as a `
 the Router's stream. No capability may push global state into Router context — that is the
 cache-byte-stability and cost discipline of §3.2/§4.1 applied to the super-agent layer.
 
+### 4.6 Resident re-arm (kian-62)
+
+A resident session (the Router, the watchdog) can end **terminally** — `session/ended{completed}`
+(freeze) — most mundanely because the loop's iteration budget is *lifetime*-scoped (the counter
+counts every `turn/start` ever committed), so a long-lived resident exhausts it and the engine's
+`Stopped → Completed` path freezes the stream. Once terminal, the engine's drain projects
+`Terminal` forever: later inputs stay pending, and the (already consumed) idempotent bootstrap
+row cannot re-wake the session. A **soft failure** (`session/ended{failed}`) is the other story:
+it projects back to `idle` (§2.2) and the *next admitted input* re-opens the same session — no
+re-arm needed and none happens.
+
+Re-arm semantics (zero new event kinds; the chain is derivable from persisted state):
+
+- **Successor chain.** `successor(s) = uuid5(s, "kian:resident:re-arm")` — the name string is
+  frozen contract (constraint-3 spirit: changing it orphans every existing chain). At boot,
+  assembly walks from the config-pinned session down the chain: every link whose stream projects
+  terminal is recorded (session + end reason) and skipped; the first empty-or-live link is the
+  **live** session and is bound everywhere the pinned id used to go (bootstrap target, inbox
+  residency counter, worker completion reports, subscription fallback, driver routing, and the
+  timer rule's `Route::Session` target for the watchdog). The walk refuses to boot (fail-closed)
+  past 64 ended links — at that point the chain is growing faster than any honest watch.
+- **Observable cause.** Generation 0 bootstraps byte-identically to the pre-kian-62 behavior
+  (legacy key `router:bootstrap` / `watchdog:bootstrap`, plain judge prompt). A successor
+  generation bootstraps under the per-generation key `"<prefix>:re-arm:<successor uuid>"`
+  (deterministic successor ids ⇒ every reboot dedupes onto the same row) with the judge prompt
+  prefixed by `[re-arm] … predecessor session(s) ended and are frozen: <uuid> (<reason>), …` —
+  the cause is on the stream as the successor's first `input/admitted`, derivable, replay-stable.
+- **Rebuilds span the chain.** The passthrough-registry and spill-index rebuilds scan every
+  frozen predecessor stream plus the live session (predecessors still carry `thread/started`
+  lineage and spill envelopes).
+- **Honesty unchanged.** No fake completions, no catch-up ticks: inputs that arrived while the
+  predecessor was terminal were never consumed and stay honestly pending on the frozen stream.
+  The successor starts with a fresh in-context view (one possible re-draft across the succession
+  boundary — observable, not hidden). Known interaction: with the lifetime iteration budget
+  unchanged, a resident Router will chain successors at every budget exhaustion; moving the
+  budget to per-episode for resident loops is a follow-up (tracked), not a contract change here.
+
 ## 5. Control-plane protocol (P5 protocolized)
 
 Unified semantics (portable across harnesses/channels):
