@@ -1,0 +1,16 @@
+[package]
+name = "kian-store"
+description = "EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kian-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
