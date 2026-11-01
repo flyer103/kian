@@ -42,6 +42,7 @@
 | [005](decisions/ADR-005-fencing-via-expectedseq.md) | Safety = fencing (epoch + expectedSeq CAS); lease is only liveness | Lease TTL only | NoSplitBrainWrite must not depend on detection timeliness | core, storage |
 | [006](decisions/ADR-006-model-slots.md) | Declarative model slots (slot→provider/model/fallback), immutable at runtime | Free runtime model switching | A3 cache-byte stability; P6 determinism | llm seam |
 | [007](decisions/ADR-007-kiand-delivery-semantics.md) | kiand delivery: server-side durable queue, at-least-once, command-id correlation | Exactly-once via endpoint state; fail-fast offline; queue-as-events | Endpoint stays stateless (brain–hand separation); offline park is S5's core semantic; queue rows are pre-event state, not session facts | exec seam |
+| [008](decisions/ADR-008-async-tool-completion-admitted-input.md) | Async `start()`/`stop()`: completion is an admitted input; job rows are pre-event durable state; `stop()` is honest cancellation | Completion-as-event; second dispatch queue; blocking drain | Full-duplex without loop changes; invariant-1 ordering; default-off tool pair | exec seam |
 
 ## 1. Architecture overview
 
@@ -218,7 +219,11 @@ boundary it appends one `input/admitted` event carrying the §3.2 message payloa
 (`{"role","content","synthetic"?}`) and binds the row to that event's seq via the C6
 event-driven consumption guard. The input-payload convention: a plain row's payload *is* the
 message content; a steer row wraps it as `{"synthetic": true, "content": X}` so the strippable
-marker survives the inbox round-trip. Promote-boundary enforcement lives in the drain-context
+marker survives the inbox round-trip. The C32 spill envelope extends this row-level convention: a
+row payload of exactly `{"content": X, "spill": Y}` consumes as **two events in one fenced write
+batch** — `input/admitted` carrying `{"role": "user", "content": X}` exactly as the bare content
+would have produced, followed immediately by `input/spilled` carrying the opaque sidecar verbatim —
+while rows without the envelope consume byte-identically to before. Promote-boundary enforcement lives in the drain-context
 surface handed to the `LoopDriver` seam (`LoopDriver::Ctx`): input-taking is refused while a
 provider turn is in flight, and every drain write carries the claim's epoch under expectedSeq
 CAS (seq-mismatch from a fenced-out concurrent writer is repaired by re-reading the head; a
@@ -309,13 +314,20 @@ actually settles.
 | Durable events | turn/start, step/request, assistant/message (sent bytes), tool/call, tool/result, input/admitted, drain/claimed, session/ended | ✅ append-only | Truth and replay |
 | Live events | streaming chunks, heartbeats, progress notifications | ❌ not persisted | UI/observability (derived from durable events or via a side channel) |
 
-The durable kind set is exactly nineteen (C18): the fifteen kinds frozen through Phase 1
+The durable kind set is exactly twenty (C18 + C31): the fifteen kinds frozen through Phase 1
 (fourteen by C2 + the additive C14 `recovery/budget-reset`) plus the four Phase-2 additions —
-`thread/started`, `thread/completed`, `evidence/verdict`, `channel/delivered` — all
-additions-only (no renames, no reformats of existing kinds) and all non-context-bearing:
-thread lineage, evidence verdicts and delivery receipts are audit data that never enter the
-model context. `thread/started` is state-preserving in `idle`/`running`/`recoverable`
-(§2.2); the other three are drain activity.
+`thread/started`, `thread/completed`, `evidence/verdict`, `channel/delivered` — and the Phase-3
+addition `input/spilled`, all additions-only (no renames, no reformats of existing kinds) and all
+non-context-bearing: thread lineage, evidence verdicts and delivery receipts are audit data that
+never enter the model context. `thread/started` is state-preserving in `idle`/`running`/`recoverable`
+(§2.2); the other Phase-2 kinds and `input/spilled` are drain activity. The spilled raw is the
+verbatim channel payload kept in-stream but out of context — the Inline form of the same input
+(the excerpt carried by its sibling `input/admitted`) is what the model sees, while the full raw
+stays in the stream as the audit/recall copy (constraint 1: the event log remains the sole truth;
+any spill index is a disposable projection over it). The pair is produced by the C32 consumption
+write: the `{"content", "spill"}` envelope is a **row-level convention** riding in the existing
+inbox row `payload` — not an event-payload change; the C4 frozen event payload contracts are
+untouched, and the envelope never appears in any committed event.
 
 ### 3.2 Model-context projection (the implementation core of A2/A3)
 
@@ -411,10 +423,56 @@ graph TB
   the chaos of multiple sessions replying independently).
 - **Subscription passthrough**: subscription rules may carry a passthrough flag (e.g. CI events of
   a PR created by a Worker flow straight into that Worker's inbox without Router judgment) — the
-  load-reduction device validated by the article.
+  load-reduction device validated by the article. The registry is many-to-many (C38): a topic maps
+  to the *set* of worker sessions that served it, and one event admits one durable row per
+  subscriber (idempotent per `(session, event_id)`; a mid-set write failure is retried per
+  subscriber), so workers sharing a topic observe each other's events and self-resolve conflicts
+  without peer links — the Router stays the cross-task rendezvous, and only an empty set falls
+  back to it.
+- **Two-level filtering** (article §3.1, C36): the *Fast Path* is an admission taxonomy over
+  provenance — a config-level `classes:` table keys `(channel, topic?, sender?)` to
+  `candidate | explicit-only | ignore` with most-specific-wins resolution, evaluated in code
+  **before** the rule set and before any model call (`ignore` and `explicit-only`-without-signal
+  drops are audit lines + counters, no row, no wake; absent classes = today's behavior). The
+  *Slow Path* is the Router's judge prompt (C26): it is the natural-language policy extension
+  point — admission semantics that would need semantic judgment are edited as prompt text, not
+  code.
+- **Admission Inline/Spill shaping** (C33): the additive `superagent.shaping:` config carries
+  `inline_cap_bytes` (absent = infinity, hence byte-identical legacy behavior), `first_chars`
+  (default 50), and `neighbor_fields`. The subscription service applies it exactly once, after
+  routing and immediately before the inbox row exists. At or below the serialized-raw byte cap,
+  the existing `channel_event` wrapper is unchanged. Over the cap, `content` instead carries an
+  Inline view (a strictly shorter excerpt, canonical `topic`/`event_id`, and any configured
+  top-level scalar association ids), `"spill": true`, and `continuation: {event_id}`; the C32 row
+  envelope carries the verbatim raw as its sidecar, producing the atomic admitted/spilled pair at
+  the ordinary consumption write. Idempotent `(session, event_id)` admission still dedupes the
+  whole pair. There is no retroactive re-shaper: committed context remains immutable and
+  `derive_model_context` stays verbatim. Neighbor inlining v1 reads only fields on this payload;
+  it never fetches cross-event IM history (that is a C35 recall hop).
 - **Batching**: the Router drain batches naturally (a drain has "drain the queue" semantics —
   eligible inputs are consumed in one sweep) — matching the article §7.2 batch-merge experimental
-  conclusion.
+  conclusion. The §7.2 observability shape is bundle-owned counters (C41), recorded by the
+  resident Router's driver around each judge turn and snapshotted on the merged `/metrics` route
+  as `superagent.router_batching`: `judge_turns`, `inputs_consumed` (batch size),
+  `turn_duration_ms_total` / `mean_turn_duration_ms` (per-request wall duration),
+  `amortized_ms_per_input` (duration/inputs — per-decision amortized latency), the bounded
+  `batch_histogram` (buckets 1…128 plus overflow) and `last_turn`.
+- **Speculation** (article §3.4, as a policy pattern over existing primitives): the Router may
+  dispatch a worker on a *weak* signal by calling `spawn_worker` with `speculative: true`. The
+  delegation wrapper gains one additive, model-visible field — `"speculative": true` inside the
+  task `content` — so the worker's first message honestly says it was spawned on a weak signal,
+  and the marker is audit-visible forever (the wrapper bytes live in both streams; legacy wrappers
+  parse and replay byte-identically). The Router profile's `speculation: {max_outstanding: n,
+  label: …}` config bounds concurrent speculative threads: the spawner enforces the cap with an
+  honest tool error the Router model sees and reacts to (never a silent refusal), and the
+  outstanding count is *derived from the Router's event stream* (`thread/started` without a
+  consumed completion report — a pure projection, so the budget survives Router restarts).
+  The article's silent-repro delivery policy ships as a **prompt template** on the Router profile
+  (deliver only after the bug is confirmed *and* a simple fix found; otherwise stay quiet) — a
+  config artifact, not code. Deliver-or-discard is the existing channel-policy gate: a discarded
+  speculation simply never calls `reply` (no `channel/delivered`), while the speculative worker's
+  own stream still audits every token spent — honest by construction. Per-session budgets (A5)
+  are untouched; the cap is the Router-profile speculation budget.
 
 ### 4.2 Channel bandwidth matching (output policy)
 
@@ -431,6 +489,7 @@ send.
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
 | Email/docs | Structured summary drafting |
 | Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the S4 IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
+| Lark/Feishu | the first *real* adapter (C44): IM row — same ImPolicy (≤100 words) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default (C43) |
 
 ### 4.3 BYOM endpoint (kiand daemon / endpoint SDK)
 
@@ -474,6 +533,40 @@ graph LR
 - **The two axes of separation**: where execution runs (ExecBackend provider: local /
   remote-endpoint / sandbox / cloud machine) and who the loop is (LoopDriver seam, see §6.2) —
   independently pluggable.
+- **Async `start()`/`stop()` tool pattern (C37, ADR-008)**: the article's §4.1 per-session
+  full-duplex in kian-native shape. `start` enqueues through the same durable queue and returns
+  immediately with `{"status":"started","job_id":…}` (the drain is never blocked; the loop is
+  untouched); an `async_jobs` row — pre-event durable state per ADR-007's pattern, committed
+  before dispatch, job id = command id derived from the tool-call id — records *who to notify*.
+  On settle, the kian-cli completion bridge admits a provenance-wrapped
+  `{"kian":{"type":"async_result",…}}` envelope to the originating session's inbox and wakes it
+  (invariant 1); the completion is promoted at the next safe boundary as a normal message.
+  `stop` marks the job `cancelled` and kills best-effort (the v0 wire has no kill frame); the
+  cancelled completion still lands, labeled `cancelled`. Completions to terminal sessions drop
+  with an audit line. The pair mounts on the Router/Worker profiles config-gated
+  (`superagent.async_tools`, default off).
+- **Watchdog Session v2 (C40)**: the article's §6 progress judge — a *model-in-the-loop* resident
+  session, not a health poll. It is a worker-template agent (own strong `main` slot) whose tools
+  are exactly the read/intervene surface: `list_threads` / `read_progress` over `RecallPort`
+  (thread status, last assistant message, age of outstanding threads), `intervene(thread_id,
+  text)` — which admits a steer-marked `{"synthetic":true,"content":…}` row to the stuck worker
+  through `InboxWriter` (control-plane-legal, no engine API; durable before the wake, consumed
+  at the worker's next provider-turn safe boundary) — and `escalate(channel, text)`, a normal
+  reply under the IM policy (≤100 words, `channel/delivered`). Each input is a timer tick; the
+  drain is one judge turn, and every outcome — no-op (the default), nudge, escalate — is honestly
+  in the watchdog session's own stream. **The timer input source is a channel** (`TimerChannel`,
+  a production `ChannelAdapter` beside `MockChannel`, emitting
+  `ChannelEvent{channel:"timer", topic:"watchdog", event_id:"tick-<n>", payload:{"tick":n}}` on a
+  configurable, clock-injected cadence) routed to the fixed session by an ordinary subscription
+  rule through the additive `Route::Session(SessionId)` variant (config-addressed, generic —
+  nothing in the vocabulary names a watchdog). Rejected alternatives: an in-process interval
+  admitting rows directly (ticks would leave no durable audit, bypass the pipeline's `event_id`
+  idempotency, and fork the admission path) and a `TimerSource` core seam (constraint 10 —
+  nothing generic justifies a seam). Ticks are idempotent by `event_id`, so a restart that
+  re-emits `tick-3` dedupes against the committed row; ticks missed while the server was down
+  simply never happened (the stream honestly shows no check ran); `emit_on_start: true` fires one
+  immediate first check after restart. The v1 heartbeat watchdog (C21, above) is untouched —
+  endpoint health and worker progress are orthogonal loops.
 
 ### 4.4 Security boundary (Phase 3+, stake planted)
 
@@ -481,6 +574,45 @@ Risks from article §8.4 are accepted as-is: a compromised cloud-side agent loop
 endpoint; endpoint credentials entering the model context leak. Kian's response roadmap: the exec
 seam's data-egress tiering (A8) + credential-less use (future) + endpoint execution approval
 policy (policy plugin).
+
+### 4.5 The recall toolpack (Chain of Recall, C35)
+
+The super-agent's working set is a **reference graph**: Trigger (a channel event), Thread (a
+delegation) and Worker (a session) are objects that carry ids — the event id on the admitted
+wrapper's Inline view, the thread id on `thread/started`, the worker session on both. Nothing
+copies another object's content into a session's own context: recall *walks the graph on demand*
+through three read-only `ToolProvider` tools mounted on the Router profile (config-gated,
+default on) and per worker template (opt-in, `superagent.recall`):
+
+- `recall_event(event_id)` — surfaces a spilled channel raw: the Inline/Spill-shaped view plus
+  next-hop ids (the locality tool, the topic);
+- `recall_neighbors(event_id)` — the locality view: channel events on the same topic within a seq
+  window around the anchor, each entry Inline-shaped with its event id as the next hop;
+- `recall_thread(thread_id)` — the thread's task, its status (from the worker's
+  `thread/completed`, else `outstanding`) and the final summary, with the worker session as the
+  next hop.
+
+Every result is itself Inline/Spill-shaped — summaries + ids, reusing the C33 shaping vocabulary
+(`first_chars` excerpts, `neighbor_fields` association ids) — so **multi-hop recall composes**:
+each hop returns bounded views and the ids of the next hops, never a full context transfer. The
+verbatim-in-one-output bound is the toolpack's own `output_cap_bytes` (default 8 KiB): above it a
+surfaced value becomes the Inline view (excerpt + continuation handle) — no unbounded raw
+re-injection, and the cap applies to tool outputs exactly as it applies to admission. Untrusted
+hygiene (C43) survives every hop: a surfaced raw re-wraps through the `raw_view` marker keyed off
+its sibling admitted content.
+
+Results land as ordinary `tool/result` events appended at the tail by the unmodified built-in
+loop — persisted before use, byte-stable thereafter, never reordering prior context (constraint
+3; the log-before-execute `tool/call` discipline already holds). Reads go exclusively through the
+`RecallPort` (C34): the spill index is the fast path, and a raw spilled after the startup rebuild
+is found by scanning the Router stream and the workers it names — the stream stays the sole truth
+and the index stays a disposable cache (constraint 1).
+
+**Router global observability rides the event stream via recall, not Router context.** The
+Router's own context stays the cheap Inline views + ids of what arrived; anything more (a spilled
+raw, a sibling event, a worker's summary) is one recall hop away, audited as a `tool/result` on
+the Router's stream. No capability may push global state into Router context — that is the
+cache-byte-stability and cost discipline of §3.2/§4.1 applied to the super-agent layer.
 
 ## 5. Control-plane protocol (P5 protocolized)
 
@@ -589,6 +721,11 @@ Every seam names three roles: **Service Definition** (the trait) / **Provider** 
 | `RecoveryPolicySource` | `table() -> Vec<PolicyRule>` | config file | any |
 | `WatchdogSource` | `health() -> Stream<HealthEvent>` | kiand heartbeat | any |
 
+The async exec pattern (C37, ADR-008) adds no new seam: `AsyncResultSink` is a narrow
+assembly callback (kian-exec → kian-cli completion bridge), not a provider/plugin
+extension point — the `ToolProvider` role already covers the model-visible `start`/`stop`
+pair, and the completion path is the ordinary Admit→Wake→Promote cycle, not a channel.
+
 ### 6.3 Footprint Ladder (capability growth ladder)
 
 A new capability is attempted in order of core footprint, smallest first:
@@ -648,8 +785,12 @@ One bundle edge crosses the loop crate: `kian-superagent` depends on `kian-loop`
 evidence-gate evaluation (`evaluate_evidence_gate`, `CheckSpec`, the verdict payload — card C24's
 public, pure functions consumed by C25's `WorkerLoopDriver` instead of duplicating gate semantics).
 Types and pure functions only — no execution surface flows along that edge, and the bundle still
-reaches the server exclusively through its ports (`InboxWriter`, `StreamPort`), enforced by the
-crate-level iron-rule test.
+reaches the server exclusively through its ports (`InboxWriter`, `StreamPort`, and — as of C34,
+Phase 3 — `RecallPort`, the read-only cross-session port: `read_events` over a seq window,
+`list_threads` derived from `thread/started`, and the spill-index lookup. Assembly implements it
+over the store's public scan; the spill index itself is a disposable `event_id → (session, seq)`
+location cache rebuilt at startup from `input/spilled` events — a pure projection, the raws live
+only in the streams), enforced by the crate-level iron-rule test.
 
 Seam trait **definitions** (`ModelProvider`, `LoopDriver`, `ToolProvider`, `ExecBackend`,
 `RecoveryPolicySource`, and — as of C18, Phase 2 — `ChannelAdapter` and `WatchdogSource`)
