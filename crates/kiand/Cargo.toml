@@ -1,0 +1,30 @@
+[package]
+name = "kiand"
+description = "Endpoint daemon: kian-endpoint's Endpoint + LocalExecutor behind a thin, fail-closed main (card C22)"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiand"
+path = "src/main.rs"
+
+[dependencies]
+kian-core.workspace = true
+kian-endpoint.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+futures.workspace = true
+# Not in the card's dep list but unavoidable: typed fail-closed config
+# errors (the same pattern every sibling crate uses).
+thiserror.workspace = true
+
+[dev-dependencies]
+# The C19 client — the e2e suite pairs the real daemon binary against it
+# over real TCP (production-free dependency: tests only).
+kian-exec.workspace = true
