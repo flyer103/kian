@@ -6,10 +6,17 @@
 //! Routing (DESIGN §4.1): `router` rules admit to the configured
 //! resident Router session; `passthrough` rules correlate the event's
 //! topic through [`PassthroughRegistry`], admitting straight into the
-//! owning worker's inbox without Router judgment. A passthrough topic
-//! with no registered worker falls back to the Router (the bootstrap
-//! path: the Router judges the first event of an unknown topic and the
-//! spawner binds the worker; both transitions leave an audit log line).
+//! owning worker's inbox without Router judgment. Since C38 the
+//! registry is many-to-many: **one row per subscriber** is admitted
+//! (idempotent per `(session, event_id)` — the store's dedupe index is
+//! per-session), so workers sharing a topic observe each other's
+//! events. A mid-set write failure does not prevent the remaining
+//! subscribers' rows: the loop continues, the error is returned for the
+//! adapter's idempotent retry, and every admission and every drop is
+//! named in the audit log. A passthrough topic with an **empty**
+//! subscriber set falls back to the Router (the bootstrap path: the
+//! Router judges the first event of an unknown topic and the spawner
+//! binds the worker; both transitions leave an audit log line).
 //!
 //! Events matching no rule are dropped with an audit log line and no
 //! inbox row — an honest no-op, never a silent swallow.
@@ -23,23 +30,50 @@ use tracing::info;
 use tracing::warn;
 
 use crate::inbox::{InboxWriteError, InboxWriter};
-use crate::provenance::channel_input_payload;
+use crate::provenance::{ShapingConfig, shape_channel_input_marked};
 use crate::registry::PassthroughRegistry;
-use crate::rules::{Route, SubscriptionRuleSet};
+use crate::rules::{
+    AdmissionClass, AdmissionClassTable, Route, SubscriptionRuleSet, event_has_explicit_signal,
+};
 
 /// What handling one channel event concluded — the auditable decision,
 /// returned to callers and asserted in tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingOutcome {
     /// Admitted to `session` (durable row, then wake). `deduplicated`
     /// is true when the event's id had already been admitted — exactly
-    /// one row exists either way.
+    /// one row exists either way. The single-target outcome: `router`
+    /// routes, the empty-set Router fallback, and a passthrough topic
+    /// with exactly one subscriber.
     Routed {
         session: SessionId,
         deduplicated: bool,
     },
+    /// Fan-out (C38): the event was admitted to every subscriber of
+    /// the passthrough topic — one record per durable row, in
+    /// subscriber-set (sorted) order. Returned only for sets of two or
+    /// more.
+    FannedOut { admitted: Vec<FanoutAdmission> },
     /// No rule matched: audit-logged, no inbox row, no wake.
     DroppedNoRule,
+    /// C36 admission class `ignore`: the event's provenance resolved
+    /// to Ignore — audit-logged and counted, no inbox row, no wake,
+    /// decided before the rule set and before any model call.
+    DroppedIgnored,
+    /// C36 admission class `explicit-only` without an explicit-request
+    /// signal (no @-mention, no adapter-declared `explicit: true`):
+    /// audit-logged and counted, no inbox row, no wake.
+    DroppedNotExplicit,
+}
+
+/// One subscriber's admission inside a [`RoutingOutcome::FannedOut`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutAdmission {
+    /// The subscriber whose inbox holds the durable row.
+    pub session: SessionId,
+    /// True when this subscriber already held a row for the event id
+    /// (idempotent per `(session, event_id)`).
+    pub deduplicated: bool,
 }
 
 /// The subscription service over one rule set and one inbox port.
@@ -51,6 +85,12 @@ pub enum RoutingOutcome {
 pub struct SubscriptionService {
     router_session: SessionId,
     rules: SubscriptionRuleSet,
+    classes: AdmissionClassTable,
+    shaping: ShapingConfig,
+    /// C43: channels whose events wrap with the untrusted bit. Empty
+    /// (the default) marks nothing — every wrapper stays byte-for-byte
+    /// the legacy form.
+    untrusted_channels: std::collections::BTreeSet<String>,
     registry: RwLock<PassthroughRegistry>,
     inbox: Arc<dyn InboxWriter>,
 }
@@ -64,9 +104,48 @@ impl SubscriptionService {
         Self {
             router_session,
             rules,
+            classes: AdmissionClassTable::default(),
+            shaping: ShapingConfig::default(),
+            untrusted_channels: std::collections::BTreeSet::new(),
             registry: RwLock::new(PassthroughRegistry::new()),
             inbox,
         }
+    }
+
+    /// [`SubscriptionService::new`] plus the C36 admission-class
+    /// table: the provenance-keyed Fast Path evaluated **before** the
+    /// rule set. An empty table is exactly `new` (today's behavior).
+    pub fn with_classes(
+        router_session: SessionId,
+        rules: SubscriptionRuleSet,
+        classes: AdmissionClassTable,
+        inbox: Arc<dyn InboxWriter>,
+    ) -> Self {
+        Self {
+            router_session,
+            rules,
+            classes,
+            shaping: ShapingConfig::default(),
+            untrusted_channels: std::collections::BTreeSet::new(),
+            registry: RwLock::new(PassthroughRegistry::new()),
+            inbox,
+        }
+    }
+
+    /// Sets the C33 admission-time shaping policy. The default (infinite
+    /// cap) is byte-identical to the legacy single-row wrapper.
+    pub fn with_shaping(mut self, shaping: ShapingConfig) -> Self {
+        self.shaping = shaping;
+        self
+    }
+
+    /// Sets the C43 untrusted-channel list (prompt-injection
+    /// hygiene): events from these channels admit with
+    /// `"untrusted": true` inside the wrapper's `content`. Honest
+    /// labeling only — routing, classes and rules are unchanged.
+    pub fn with_untrusted_channels(mut self, channels: std::collections::BTreeSet<String>) -> Self {
+        self.untrusted_channels = channels;
+        self
     }
 
     /// The configured resident Router session.
@@ -100,16 +179,48 @@ impl SubscriptionService {
     }
 
     /// Handles one inbound channel event: rule match → route →
-    /// durable admit (idempotent per `event_id`) → wake.
+    /// durable admit (idempotent per `(session, event_id)`) → wake.
     ///
-    /// Ordering is the point (invariant 1): the `admit` future is
-    /// awaited to completion — the row durably committed — *before*
-    /// `wake` is invoked. A failed admit returns the error without any
-    /// wake, mirroring the engine's own discipline.
+    /// Ordering is the point (invariant 1): each subscriber's `admit`
+    /// future is awaited to completion — the row durably committed —
+    /// *before* its `wake` is invoked. A failed admit wakes nothing;
+    /// in a fan-out the remaining subscribers are still admitted (the
+    /// per-`(session, event_id)` idempotency means the adapter's retry
+    /// fills only the gap) and the first error is returned.
     pub async fn handle_event(
         &self,
         event: ChannelEvent,
     ) -> Result<RoutingOutcome, InboxWriteError> {
+        // C36 Fast Path first: the admission class over provenance
+        // decides in code, before the rule set and before any model
+        // call could be spent. `Candidate` (and an absent table) falls
+        // through unchanged; both drop shapes are honest no-ops —
+        // audit line, no row, no wake (the DroppedNoRule discipline).
+        match self.classes.resolve(&event) {
+            AdmissionClass::Ignore => {
+                info!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    topic = event.topic.as_deref().unwrap_or(""),
+                    "subscription audit: event dropped by admission class `ignore`"
+                );
+                return Ok(RoutingOutcome::DroppedIgnored);
+            }
+            AdmissionClass::ExplicitOnly if !event_has_explicit_signal(&event) => {
+                info!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    topic = event.topic.as_deref().unwrap_or(""),
+                    "subscription audit: event dropped by admission class `explicit-only` \
+                     (no explicit-request signal)"
+                );
+                return Ok(RoutingOutcome::DroppedNotExplicit);
+            }
+            AdmissionClass::Candidate | AdmissionClass::ExplicitOnly => {}
+        }
+
         let Some(rule) = self.rules.first_match(&event) else {
             info!(
                 target: "kian::subscriptions",
@@ -120,16 +231,26 @@ impl SubscriptionService {
             return Ok(RoutingOutcome::DroppedNoRule);
         };
 
-        let (target, unbound_topic) = match &rule.route {
-            Route::Router => (self.router_session, false),
-            Route::Passthrough { .. } => match event.topic.as_deref().and_then(|t| {
-                self.registry
-                    .read()
-                    .expect("passthrough registry lock")
-                    .resolve(t)
-            }) {
-                Some(worker) => (worker, false),
-                None => {
+        // The subscriber set for the matched rule. `router` routes (and
+        // the empty-set fallback) are the single target; passthrough
+        // resolves the topic's set — zero (fallback), one, or many.
+        // `session` (C40) pins the event to one config-addressed fixed
+        // session — the timer's ticks reach the watchdog this way.
+        let targets: Vec<SessionId> = match &rule.route {
+            Route::Router => vec![self.router_session],
+            Route::Session(session) => vec![*session],
+            Route::Passthrough { .. } => {
+                let subscribers = event
+                    .topic
+                    .as_deref()
+                    .map(|t| {
+                        self.registry
+                            .read()
+                            .expect("passthrough registry lock")
+                            .resolve(t)
+                    })
+                    .unwrap_or_default();
+                if subscribers.is_empty() {
                     warn!(
                         target: "kian::subscriptions",
                         channel = %event.channel,
@@ -137,24 +258,72 @@ impl SubscriptionService {
                         topic = event.topic.as_deref().unwrap_or(""),
                         "subscription audit: passthrough topic unbound, falling back to router"
                     );
-                    (self.router_session, true)
+                    vec![self.router_session]
+                } else {
+                    subscribers.into_iter().collect()
                 }
-            },
+            }
         };
-        let _ = unbound_topic; // audited above; the outcome records the session
 
-        let payload = channel_input_payload(&event);
-        // Invariant 1: durable row first — the admit future resolves
-        // only on commit — and the wake strictly after.
-        let receipt = self
-            .inbox
-            .admit(target, payload, Some(event.event_id.clone()))
-            .await?;
-        self.inbox.wake(target);
-        Ok(RoutingOutcome::Routed {
-            session: target,
-            deduplicated: receipt.deduplicated,
-        })
+        // C33: shape exactly once here, before any inbox row exists.
+        // Committed events are never re-read or re-shaped. C43: the
+        // untrusted bit is decided by channel config at this same
+        // pre-admission point — labeling, never filtering.
+        let untrusted = self.untrusted_channels.contains(&event.channel);
+        let payload = shape_channel_input_marked(&event, &self.shaping, untrusted);
+        // Invariant 1 per subscriber: the admit future resolves only
+        // on commit, and that subscriber's wake strictly after. The
+        // set is sorted, so a fan-out admits in deterministic order.
+        let mut admitted: Vec<FanoutAdmission> = Vec::new();
+        let mut first_err: Option<InboxWriteError> = None;
+        for target in targets {
+            match self
+                .inbox
+                .admit(target, payload.clone(), Some(event.event_id.clone()))
+                .await
+            {
+                Ok(receipt) => {
+                    self.inbox.wake(target);
+                    info!(
+                        target: "kian::subscriptions",
+                        session = %target.0,
+                        event_id = %event.event_id,
+                        deduplicated = receipt.deduplicated,
+                        "subscription audit: event admitted"
+                    );
+                    admitted.push(FanoutAdmission {
+                        session: target,
+                        deduplicated: receipt.deduplicated,
+                    });
+                }
+                Err(e) => {
+                    // The audit log names the drop; the subscriber is
+                    // left to the adapter's idempotent retry.
+                    warn!(
+                        target: "kian::subscriptions",
+                        session = %target.0,
+                        event_id = %event.event_id,
+                        error = %e,
+                        "subscription audit: admit failed, subscriber left to the retry"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        if admitted.len() == 1 {
+            let only = admitted.pop().expect("len checked above");
+            Ok(RoutingOutcome::Routed {
+                session: only.session,
+                deduplicated: only.deduplicated,
+            })
+        } else {
+            Ok(RoutingOutcome::FannedOut { admitted })
+        }
     }
 
     /// Spawns one consumer task per adapter: each subscribes and feeds
@@ -258,6 +427,8 @@ mod tests {
             channel: channel.into(),
             event_id: event_id.into(),
             topic: topic.map(str::to_string),
+            sender: None,
+            group: None,
             payload: json!({"text": "hello"}),
             ts_ms: 1,
         }
@@ -403,7 +574,11 @@ mod tests {
         let mut rebuilt = PassthroughRegistry::new();
         rebuilt.register("pr-9", worker);
         service.install_registry(rebuilt);
-        assert_eq!(service.registry_snapshot().resolve("pr-9"), Some(worker));
+        // C38: resolve returns the subscriber set (singleton here).
+        assert_eq!(
+            service.registry_snapshot().resolve("pr-9"),
+            std::collections::BTreeSet::from([worker])
+        );
         let outcome = service
             .handle_event(event("ci", "evt-6", Some("pr-9")))
             .await
@@ -416,5 +591,430 @@ mod tests {
             }
         );
         assert_eq!(service.router_session(), router);
+    }
+
+    /// C38-only port: per-`(session, event_id)` dedup plus a mutable
+    /// single-subscriber failure, leaving the Phase-2 `ScriptedInbox`
+    /// fixture unchanged.
+    struct FanoutInbox {
+        admits: Mutex<Vec<(SessionId, Option<String>)>>,
+        wakes: Mutex<Vec<SessionId>>,
+        committed: Mutex<std::collections::BTreeSet<(SessionId, Option<String>)>>,
+        fail_for: Mutex<Option<SessionId>>,
+    }
+
+    impl FanoutInbox {
+        fn new() -> Arc<Self> {
+            Self::failing(None)
+        }
+
+        fn failing(fail_for: Option<SessionId>) -> Arc<Self> {
+            Arc::new(Self {
+                admits: Mutex::new(Vec::new()),
+                wakes: Mutex::new(Vec::new()),
+                committed: Mutex::new(std::collections::BTreeSet::new()),
+                fail_for: Mutex::new(fail_for),
+            })
+        }
+    }
+
+    impl InboxWriter for FanoutInbox {
+        fn admit(
+            &self,
+            session: SessionId,
+            _payload: Value,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+            self.admits
+                .lock()
+                .unwrap()
+                .push((session, idempotency_key.clone()));
+            let fail = *self.fail_for.lock().unwrap() == Some(session);
+            let deduplicated = if fail {
+                false
+            } else {
+                !self
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .insert((session, idempotency_key))
+            };
+            Box::pin(async move {
+                if fail {
+                    Err(InboxWriteError::Write("scripted fan-out failure".into()))
+                } else {
+                    Ok(AdmitReceipt { deduplicated })
+                }
+            })
+        }
+
+        fn wake(&self, session: SessionId) -> WakeOutcome {
+            self.wakes.lock().unwrap().push(session);
+            WakeOutcome::Folded
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_admits_one_durable_row_per_subscriber() {
+        // C38: one topic, two registered workers — one event admits one
+        // row per subscriber (same event id key, per session), each
+        // with its own wake, in deterministic set order; a single
+        // registered worker keeps the Routed outcome (asserted above).
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let worker_a = sid(20);
+        let worker_b = sid(21);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        service.register_topic("pr-9", worker_a);
+        service.register_topic("pr-9", worker_b);
+        let outcome = service
+            .handle_event(event("ci", "evt-fan", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::FannedOut {
+                admitted: vec![
+                    super::FanoutAdmission {
+                        session: worker_a,
+                        deduplicated: false
+                    },
+                    super::FanoutAdmission {
+                        session: worker_b,
+                        deduplicated: false
+                    }
+                ]
+            }
+        );
+        // One admit + wake per subscriber, key shared, order sorted.
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(
+            admits,
+            vec![
+                (worker_a, Some("evt-fan".into())),
+                (worker_b, Some("evt-fan".into())),
+            ]
+        );
+        assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker_a, worker_b]);
+    }
+
+    #[tokio::test]
+    async fn fanout_partial_failure_still_admits_and_wakes_the_others() {
+        // C38 retry semantics: subscriber A's admit fails mid-set — the
+        // loop continues, B's row is durable and B wakes, A never
+        // wakes, and the error surfaces for the adapter's idempotent
+        // retry (which then admits only A's missing row).
+        let inbox = FanoutInbox::failing(Some(sid(20)));
+        let router = sid(1);
+        let worker_a = sid(20);
+        let worker_b = sid(21);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        service.register_topic("pr-9", worker_a);
+        service.register_topic("pr-9", worker_b);
+        let err = service
+            .handle_event(event("ci", "evt-partial", Some("pr-9")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InboxWriteError::Write(_)));
+        // Both admits were attempted (A failed, B committed)…
+        assert_eq!(inbox.admits.lock().unwrap().len(), 2);
+        // …but only B woke.
+        assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker_b]);
+
+        // The retry (failure cleared) fills A's gap; B deduplicates.
+        *inbox.fail_for.lock().unwrap() = None;
+        let outcome = service
+            .handle_event(event("ci", "evt-partial", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::FannedOut {
+                admitted: vec![
+                    super::FanoutAdmission {
+                        session: worker_a,
+                        deduplicated: false
+                    },
+                    super::FanoutAdmission {
+                        session: worker_b,
+                        deduplicated: true
+                    }
+                ]
+            }
+        );
+        assert_eq!(
+            *inbox.wakes.lock().unwrap(),
+            vec![worker_b, worker_a, worker_b]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // C43: untrusted-input marking end-to-end through the service
+    // -----------------------------------------------------------------
+
+    /// C43-only port: records the admitted payload bytes (the Phase-2
+    /// `ScriptedInbox` fixture discards them and stays untouched).
+    struct MarkingInbox {
+        payloads: Mutex<Vec<(SessionId, Value)>>,
+    }
+
+    impl MarkingInbox {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                payloads: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl InboxWriter for MarkingInbox {
+        fn admit(
+            &self,
+            session: SessionId,
+            payload: Value,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+            self.payloads.lock().unwrap().push((session, payload));
+            Box::pin(async move {
+                Ok(AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+
+        fn wake(&self, _session: SessionId) -> WakeOutcome {
+            WakeOutcome::Folded
+        }
+    }
+
+    /// Table-driven (config): an event from a listed channel admits
+    /// with the bit inside `content`; every unlisted channel admits
+    /// byte-identical to the legacy wrapper — the field is omitted,
+    /// not spelled `false`.
+    #[tokio::test]
+    async fn untrusted_channels_admit_with_the_bit_and_trusted_ones_do_not() {
+        struct Case {
+            channel: &'static str,
+            listed: bool,
+        }
+        let cases = [
+            Case {
+                channel: "lark",
+                listed: true,
+            },
+            Case {
+                channel: "webhook-feed",
+                listed: true,
+            },
+            Case {
+                channel: "mock-im",
+                listed: false,
+            },
+        ];
+        for case in cases {
+            let inbox = MarkingInbox::new();
+            let mut set = std::collections::BTreeSet::new();
+            set.insert("lark".to_string());
+            set.insert("webhook-feed".to_string());
+            // A router rule for the case's own channel, so every case
+            // admits (the marking axis is under test, not routing).
+            let case_rules = SubscriptionRuleSet::new(vec![SubscriptionRule {
+                channel: case.channel.into(),
+                matcher: RuleMatcher::Always,
+                route: Route::Router,
+            }]);
+            let service = SubscriptionService::new(
+                sid(1),
+                case_rules,
+                Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+            )
+            .with_untrusted_channels(set);
+            service
+                .handle_event(event(case.channel, "evt-mark", None))
+                .await
+                .unwrap();
+            let payloads = inbox.payloads.lock().unwrap().clone();
+            assert_eq!(payloads.len(), 1, "{}", case.channel);
+            let payload = &payloads[0].1;
+            if case.listed {
+                assert_eq!(
+                    payload["kian"]["untrusted"],
+                    json!(true),
+                    "{}: listed channels wrap with the bit",
+                    case.channel
+                );
+            } else {
+                assert!(
+                    payload["kian"].get("untrusted").is_none(),
+                    "{}: unlisted channels omit the field",
+                    case.channel
+                );
+                // Byte-identical to the legacy wrapper bytes.
+                assert_eq!(
+                    serde_json::to_vec(payload).unwrap(),
+                    serde_json::to_vec(&crate::provenance::channel_input_payload(&{
+                        let mut ev = event(case.channel, "evt-mark", None);
+                        ev.channel = case.channel.into();
+                        ev
+                    }))
+                    .unwrap(),
+                    "{}: the trusted wrapper bytes are the legacy bytes",
+                    case.channel
+                );
+            }
+        }
+    }
+
+    /// The default service (no list configured) marks nothing — the
+    /// pre-C43 behavior, byte-for-byte.
+    #[tokio::test]
+    async fn absent_untrusted_config_is_byte_identical_to_legacy() {
+        let inbox = MarkingInbox::new();
+        let service =
+            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        service
+            .handle_event(event("mock-im", "evt-legacy", None))
+            .await
+            .unwrap();
+        let payloads = inbox.payloads.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].1["kian"].get("untrusted").is_none());
+    }
+
+    /// Marking is labeling, not filtering: a listed channel's event
+    /// routes exactly where the same event routes unlisted (same
+    /// outcome, same target, same wake) — the only difference is the
+    /// bit inside `content`.
+    #[tokio::test]
+    async fn marking_never_changes_the_drop_or_allow_decision() {
+        for listed in [false, true] {
+            let inbox = MarkingInbox::new();
+            let mut set = std::collections::BTreeSet::new();
+            if listed {
+                set.insert("mock-im".to_string());
+            }
+            let service = SubscriptionService::new(
+                sid(1),
+                rules(),
+                Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+            )
+            .with_untrusted_channels(set);
+            let outcome = service
+                .handle_event(event("mock-im", "evt-same", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RoutingOutcome::Routed {
+                    session: sid(1),
+                    deduplicated: false
+                },
+                "listed = {listed}"
+            );
+            // And an unmatched channel still drops, listed or not.
+            let dropped = service
+                .handle_event(event("github", "evt-drop", None))
+                .await
+                .unwrap();
+            assert_eq!(dropped, RoutingOutcome::DroppedNoRule, "listed = {listed}");
+            assert_eq!(inbox.payloads.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// Over-cap + listed channel: the Inline view carries the bit and
+    /// the spill sidecar stays the exact C32 shape with the raw
+    /// verbatim (the marker rides content only).
+    #[tokio::test]
+    async fn over_cap_untrusted_event_marks_the_inline_view_and_keeps_the_sidecar_verbatim() {
+        let inbox = MarkingInbox::new();
+        let mut set = std::collections::BTreeSet::new();
+        set.insert("mock-im".to_string());
+        let service =
+            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
+                .with_untrusted_channels(set)
+                .with_shaping(crate::provenance::ShapingConfig {
+                    inline_cap_bytes: Some(4),
+                    first_chars: 2,
+                    neighbor_fields: vec![],
+                });
+        service
+            .handle_event(event("mock-im", "evt-spill", None))
+            .await
+            .unwrap();
+        let payloads = inbox.payloads.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1);
+        let payload = &payloads[0].1;
+        assert_eq!(payload["content"]["kian"]["untrusted"], json!(true));
+        assert_eq!(payload["content"]["kian"]["spill"], json!(true));
+        assert_eq!(
+            payload["spill"]["raw"],
+            json!({"text": "hello"}),
+            "the sidecar raw is verbatim"
+        );
+        assert!(payload["spill"].get("untrusted").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // C40: the session route
+    // -----------------------------------------------------------------
+
+    /// A `Route::Session` rule admits to the configured fixed session
+    /// (not the Router), provenance-wrapped, durable before the wake —
+    /// the single-target path the timer's ticks take.
+    #[tokio::test]
+    async fn session_route_admits_to_the_configured_fixed_session() {
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let watchdog = sid(42);
+        let rules = SubscriptionRuleSet::new(vec![SubscriptionRule {
+            channel: "timer".into(),
+            matcher: RuleMatcher::Topic("watchdog".into()),
+            route: Route::Session(watchdog),
+        }]);
+        let service =
+            SubscriptionService::new(router, rules, Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let outcome = service
+            .handle_event(event("timer", "tick-1", Some("watchdog")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: watchdog,
+                deduplicated: false
+            }
+        );
+        // Durable row keyed by the tick id, then the wake — invariant 1.
+        assert_eq!(
+            inbox.admits.lock().unwrap().clone(),
+            vec![(watchdog, Some("tick-1".into()))]
+        );
+        assert_eq!(*inbox.wakes.lock().unwrap(), vec![watchdog]);
+
+        // Re-handling the same tick id (a restart's re-emission) leaves
+        // exactly one row: the dedupe the timer's per-process counter
+        // relies on.
+        let again = service
+            .handle_event(event("timer", "tick-1", Some("watchdog")))
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            RoutingOutcome::Routed {
+                session: watchdog,
+                deduplicated: true
+            }
+        );
+        assert_eq!(
+            inbox.admits.lock().unwrap().len(),
+            2,
+            "the admit was attempted (and deduped), never skipped"
+        );
+        assert_eq!(
+            inbox.committed.lock().unwrap().len(),
+            1,
+            "exactly one durable row exists"
+        );
     }
 }

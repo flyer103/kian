@@ -19,12 +19,18 @@
 //! - [`rules`] — declarative `SubscriptionRule` set (config, DESIGN §4.1)
 //! - [`provenance`] — the channel-event wrapper riding inside the input
 //!   payload's `content` (the frozen C4 payload contract stays untouched)
-//! - [`registry`] — the passthrough worker registry: a disposable
-//!   projection rebuilt from event streams (constraint 1)
+//! - [`registry`] — the passthrough worker registry (C38: topic →
+//!   *set* of worker sessions, the many-to-many fan-out projection):
+//!   disposable, rebuilt from event streams (constraint 1)
 //! - [`subscriptions`] — the subscription service consuming
-//!   `ChannelAdapter` streams, matching rules, admitting + waking
+//!   `ChannelAdapter` streams, matching rules, admitting + waking —
+//!   one durable row per passthrough subscriber (C38)
 //! - [`mock`] — `MockChannel`: the production-quality in-memory channel
 //!   (the S4 IM stand-in and the framework's reference implementation)
+//! - [`lark`] — `LarkChannel`: the first *real* channel adapter (C44),
+//!   over the Feishu/Lark open APIs — chat-history poll receive (the
+//!   adapter-side, webhook-free ingestion), IM send, env-gated
+//!   credentials filled by assembly
 //! - [`worker`] — Thread delegation (C25): `WorkerSpawner`,
 //!   `WorkerLoopDriver` (a `LoopDriver` decorator adding thread lineage
 //!   and the evidence-gated completion report), the delegation wrapper,
@@ -38,19 +44,54 @@
 //!   bootstrap, `RouterTools` (spawn_worker / reply /
 //!   deliver_structured), the `RouterDriver` residency decorator, and
 //!   the channel registry
+//! - [`metrics`] — `RouterMetrics` (C41): the article-§7.2 batching
+//!   observability over the Router drain — per judge turn, batch size,
+//!   wall duration and amortized per-decision latency; counters + a
+//!   bounded batch histogram, `RouterDriver`-recorded, assembly-snapshotted
+//! - [`recall`] — the `RecallPort` read port (C34): cross-session
+//!   reads (`read_events`, `list_threads`) plus the disposable spill
+//!   index — assembly-implemented over the store's public scan; reads
+//!   only, the bundle names no store
+//! - [`toolpack`] — the recall toolpack (C35): `recall_event` /
+//!   `recall_neighbors` / `recall_thread` as one read-only
+//!   `ToolProvider` over `RecallPort`; every output Inline/Spill-shaped
+//!   under its own caps so multi-hop recall composes (the Chain of
+//!   Recall)
+//! - [`timer`] — `TimerChannel` (C40): the timer input source as a
+//!   production channel adapter — numbered ticks on a configurable
+//!   cadence (clock-injected, `ManualTurnClock`-testable), inbound-only
+//! - [`watchdog`] — Watchdog Session v2 (C40): the model-in-the-loop
+//!   progress judge — a resident worker-template agent whose tools are
+//!   exactly the read/intervene surface (`list_threads`,
+//!   `read_progress` over `RecallPort`; `intervene` as a steer row via
+//!   `InboxWriter`; `escalate` under the IM policy)
 
 pub mod inbox;
+pub mod lark;
+pub mod metrics;
 pub mod mock;
 pub mod policy;
 pub mod provenance;
+pub mod recall;
 pub mod registry;
 pub mod router;
 pub mod rules;
 pub mod subscriptions;
 pub mod templates;
+pub mod timer;
+pub mod toolpack;
+pub mod watchdog;
 pub mod worker;
 
 pub use inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
+pub use lark::{
+    DEFAULT_API_BASE, DEFAULT_POLL_INTERVAL, LARK_CHANNEL_TYPE, LarkChannel, LarkConfig, LarkError,
+    SUBSCRIBER_CAPACITY,
+};
+pub use metrics::{
+    ManualTurnClock, ROUTER_BATCH_BUCKETS, RouterMetrics, RouterTurnRecorder, SystemTurnClock,
+    TurnClock, TurnRecord,
+};
 pub use mock::{CapturedDelivery, MockChannel};
 pub use policy::{
     DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME, ImPolicy,
@@ -58,19 +99,39 @@ pub use policy::{
     structured_delivered_payload,
 };
 pub use provenance::{
-    CHANNEL_EVENT_TYPE, ChannelEventMarker, channel_input_payload, parse_channel_marker,
+    CHANNEL_EVENT_TYPE, ChannelEventMarker, ShapingConfig, channel_event_untrusted,
+    channel_input_payload, is_untrusted_view, parse_channel_marker, raw_view, shape_channel_input,
+    shape_channel_input_marked, wrap_channel_event, wrap_channel_event_marked,
 };
+pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, worker_sessions};
 pub use router::{
     ChannelRegistry, DEFAULT_PARK_TICK_MS, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE,
     JudgePrompt, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox,
-    RouterProfile, RouterTools, outstanding_threads,
+    RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy, enforce_speculation_cap,
+    outstanding_threads,
 };
-pub use rules::{CorrelateBy, Route, RuleMatcher, SubscriptionRule, SubscriptionRuleSet};
-pub use subscriptions::{RoutingOutcome, SubscriptionService};
+pub use rules::{
+    AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
+    SubscriptionRule, SubscriptionRuleSet, event_has_explicit_signal,
+};
+pub use subscriptions::{FanoutAdmission, RoutingOutcome, SubscriptionService};
 pub use templates::{
-    CHANNEL_TOOLS, ProfileError, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile, WORKER_TOOLS,
-    empty_tool_parameters, is_channel_tool, router_template, worker_template,
+    ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
+    WORKER_TOOLS, empty_tool_parameters, is_channel_tool, mount_async_tools, mount_recall_tools,
+    mount_watchdog_tools, router_template, worker_template,
+};
+pub use timer::{
+    DEFAULT_TIMER_TOPIC, TIMER_CHANNEL, TIMER_QUEUE_CAPACITY, TimerChannel, TimerConfig,
+};
+pub use toolpack::{
+    DEFAULT_NEIGHBOR_WINDOW, DEFAULT_OUTPUT_CAP_BYTES, RECALL_EVENT_TOOL, RECALL_NEIGHBORS_TOOL,
+    RECALL_THREAD_TOOL, RECALL_TOOLS, RecallToolConfig, RecallTools,
+};
+pub use watchdog::{
+    ESCALATE_TOOL, INTERVENE_TOOL, LIST_THREADS_TOOL, READ_PROGRESS_TOOL, WATCHDOG_BOOTSTRAP_KEY,
+    WATCHDOG_PROMPT_TEMPLATE, WATCHDOG_TOOLS, WatchdogProfile, WatchdogPrompt, WatchdogTools,
+    watchdog_template,
 };
 pub use worker::{
     Delegation, DelegationPair, LineagePlan, PortFor, SpawnError, SpawnedWorker, StreamPort,

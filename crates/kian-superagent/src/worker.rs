@@ -11,10 +11,21 @@
 //! ## The delegation wrapper (model-visible by design)
 //!
 //! The task input's message `content` is the wrapper
-//! `{"thread_id", "correlation"?, "task": <actual user content>}`. The
-//! worker's first user message honestly says what spawned it and why;
-//! it is verbatim-passed JSON that is never rewritten afterward
-//! (constraint 3 — rewriting it would destroy provider prefix cache).
+//! `{"thread_id", "correlation"?, "task": <actual user content>,
+//! "speculative"?}`. The worker's first user message honestly says what
+//! spawned it and why; it is verbatim-passed JSON that is never
+//! rewritten afterward (constraint 3 — rewriting it would destroy
+//! provider prefix cache).
+//!
+//! The `"speculative": true` marker (C39) is additive and optional:
+//! [`delegation_content`] never emits it (legacy bytes are unchanged,
+//! golden-tested) and [`speculative_delegation_content`] adds exactly
+//! one key. The marker is model-visible by design — the worker's first
+//! message *is* the wrapper, so a speculatively spawned worker reads
+//! that it was spawned on a weak signal — and audit-visible forever:
+//! the wrapper bytes live in both streams (the Router-side and
+//! worker-side `thread/started` payloads embed the task message, and
+//! the worker's `input/admitted` carries the wrapper itself).
 //!
 //! ## Lineage events (the C18 additions-only kinds)
 //!
@@ -111,6 +122,13 @@ pub fn delegation_content(thread_id: Uuid, correlation: Option<Value>, task: Val
     wrapper
 }
 
+/// The speculative marker key (C39): present (and `true`) iff the
+/// delegation was spawned on a weak signal. An additive optional field
+/// inside the wrapper `content` — the frozen fields
+/// (`thread_id`/`correlation`/`task`) and every legacy wrapper byte are
+/// unchanged.
+pub const SPECULATIVE_MARKER: &str = "speculative";
+
 /// Parses a delegation wrapper out of a message `content` (the inverse
 /// of [`delegation_content`]). Returns `None` for any content that is
 /// not a delegation wrapper — plain user text and channel-event
@@ -128,6 +146,33 @@ pub fn parse_delegation(content: &Value) -> Option<Delegation> {
         correlation: obj.get("correlation").cloned(),
         task,
     })
+}
+
+/// True iff `content` is a delegation wrapper carrying the C39
+/// speculative marker (`"speculative": true`). The companion of
+/// [`parse_delegation`] for the one additive wrapper field: the
+/// [`Delegation`] struct itself stays exactly its frozen shape, so
+/// every existing parse path (and test) is byte-identical.
+#[must_use]
+pub fn delegation_is_speculative(content: &Value) -> bool {
+    content
+        .as_object()
+        .is_some_and(|obj| obj.get(SPECULATIVE_MARKER) == Some(&Value::Bool(true)))
+}
+
+/// The speculative delegation wrapper (C39): exactly
+/// [`delegation_content`] plus `"speculative": true` — the marker that
+/// tells the worker (model-visible, in its first message) that it was
+/// spawned on a weak signal and may be discarded without delivery.
+#[must_use]
+pub fn speculative_delegation_content(
+    thread_id: Uuid,
+    correlation: Option<Value>,
+    task: Value,
+) -> Value {
+    let mut wrapper = delegation_content(thread_id, correlation, task);
+    wrapper[SPECULATIVE_MARKER] = Value::Bool(true);
+    wrapper
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +298,21 @@ pub struct SpawnedWorker {
 pub enum SpawnError {
     #[error("worker spawn: inbox admit failed: {0}")]
     Inbox(#[from] InboxWriteError),
+    /// The Router-profile speculation budget is exhausted (C39): the
+    /// honest refusal the Router model sees and reacts to — never a
+    /// silent drop. The outstanding count behind it is stream-derived
+    /// (unmatched `thread/started`), so the decision survives Router
+    /// restarts.
+    #[error(
+        "worker spawn: speculation cap `{label}` reached: \
+             {outstanding} outstanding thread(s), max {max} — wait for a \
+             thread completion before speculating again"
+    )]
+    SpeculationCap {
+        label: String,
+        outstanding: usize,
+        max: usize,
+    },
 }
 
 /// Mints a `Thread` and creates the worker session by admitting its
@@ -285,13 +345,43 @@ impl WorkerSpawner {
         task: Value,
         correlation: Option<Value>,
     ) -> Result<SpawnedWorker, SpawnError> {
+        self.spawn_inner(task, correlation, false).await
+    }
+
+    /// Spawns one worker **speculatively** (C39): identical mechanics
+    /// to [`WorkerSpawner::spawn`], except the delegation wrapper
+    /// carries `"speculative": true` — the model-visible, audit-forever
+    /// marker that this thread was minted on a weak signal and may be
+    /// discarded without delivery (the worker's own stream still audits
+    /// every token spent). The caller (the Router profile's tool layer)
+    /// enforces the speculation cap *before* calling this — the spawn
+    /// itself is honest and uncapped so the refusal always happens
+    /// where the Router model can see it.
+    pub async fn spawn_speculative(
+        &self,
+        task: Value,
+        correlation: Option<Value>,
+    ) -> Result<SpawnedWorker, SpawnError> {
+        self.spawn_inner(task, correlation, true).await
+    }
+
+    async fn spawn_inner(
+        &self,
+        task: Value,
+        correlation: Option<Value>,
+        speculative: bool,
+    ) -> Result<SpawnedWorker, SpawnError> {
         let thread = Thread {
             id: Uuid::new_v4(),
             parent_session: self.router,
             pinned_version: self.pinned_version,
         };
         let worker_session = SessionId::new();
-        let wrapper = delegation_content(thread.id, correlation, task);
+        let wrapper = if speculative {
+            speculative_delegation_content(thread.id, correlation, task)
+        } else {
+            delegation_content(thread.id, correlation, task)
+        };
         let task_message = json!({"role": "user", "content": wrapper});
         // The admitted payload *is* the message content (the server's
         // consumption write wraps it as {"role","content"}).
@@ -807,11 +897,14 @@ where
 mod tests {
     use kian_core::model::Epoch;
     use serde_json::json;
+    use std::sync::Arc;
 
     use super::{
-        Delegation, DelegationPair, LineagePlan, SpawnError, StreamPortError, completion_summary,
-        delegation_content, delegation_pairs, lineage_plan, parse_delegation, parse_thread_report,
-        thread_completed_payload, thread_report_content, thread_started_payload,
+        Delegation, DelegationPair, LineagePlan, SPECULATIVE_MARKER, SpawnError, StreamPortError,
+        WorkerSpawner, completion_summary, delegation_content, delegation_is_speculative,
+        delegation_pairs, lineage_plan, parse_delegation, parse_thread_report,
+        speculative_delegation_content, thread_completed_payload, thread_report_content,
+        thread_started_payload,
     };
     use crate::templates::worker_template;
     use kian_core::events::{Event, EventKind};
@@ -868,6 +961,159 @@ mod tests {
         assert!(parse_delegation(&json!({"thread_id": "not-a-uuid", "task": 1})).is_none());
         assert!(parse_delegation(&json!({"thread_id": tid(1).to_string()})).is_none());
         assert!(parse_delegation(&serde_json::Value::Null).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Speculative delegation wrapper (C39)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn speculative_wrapper_round_trips_with_the_marker() {
+        let content = speculative_delegation_content(
+            tid(0x5a),
+            Some(json!("weak-evt-1")),
+            json!("maybe fix the flaky signal"),
+        );
+        // Exactly delegation_content + one additive key: the frozen
+        // fields round-trip unchanged and the marker reads back true.
+        assert_eq!(
+            content,
+            json!({
+                "thread_id": tid(0x5a).to_string(),
+                "correlation": "weak-evt-1",
+                "task": "maybe fix the flaky signal",
+                "speculative": true,
+            })
+        );
+        let back = parse_delegation(&content).expect("parses as a delegation");
+        assert_eq!(back.thread_id, tid(0x5a));
+        assert_eq!(back.correlation, Some(json!("weak-evt-1")));
+        assert_eq!(back.task, json!("maybe fix the flaky signal"));
+        assert!(delegation_is_speculative(&content));
+    }
+
+    #[test]
+    fn legacy_wrapper_bytes_are_unchanged_additive_golden() {
+        // The legacy builder emits no marker key at all (absent, never
+        // false/null) and its serialized bytes are exactly the C25
+        // golden — the addition is purely additive.
+        let content = delegation_content(tid(0x5b), Some(json!("evt-9")), json!("do the thing"));
+        assert!(content.get(SPECULATIVE_MARKER).is_none());
+        assert!(!delegation_is_speculative(&content));
+        let serialized = content.to_string();
+        let expected = format!(
+            "{{\"correlation\":\"evt-9\",\"task\":\"do the thing\",\"thread_id\":\"{}\"}}",
+            tid(0x5b)
+        );
+        assert_eq!(serialized, expected);
+        // An explicit false marker is not a speculative delegation.
+        let explicit_false = json!({
+            "thread_id": tid(0x5c).to_string(),
+            "task": "x",
+            "speculative": false,
+        });
+        assert!(parse_delegation(&explicit_false).is_some());
+        assert!(!delegation_is_speculative(&explicit_false));
+    }
+
+    /// An inbox capturing full admit payloads (the wrapper bytes).
+    struct CapturingInbox {
+        admits: std::sync::Mutex<Vec<(SessionId, serde_json::Value, Option<String>)>>,
+    }
+
+    impl CapturingInbox {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self {
+                admits: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl crate::InboxWriter for CapturingInbox {
+        fn admit(
+            &self,
+            session: SessionId,
+            payload: serde_json::Value,
+            idempotency_key: Option<String>,
+        ) -> futures::future::BoxFuture<'static, Result<crate::AdmitReceipt, crate::InboxWriteError>>
+        {
+            self.admits
+                .lock()
+                .unwrap()
+                .push((session, payload, idempotency_key));
+            Box::pin(async {
+                Ok(crate::AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+        fn wake(&self, _session: SessionId) -> kian_orchestrator::WakeOutcome {
+            kian_orchestrator::WakeOutcome::Folded
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_speculative_admits_the_marked_wrapper_durably() {
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        let spawned = spawner
+            .spawn_speculative(json!("check the anomaly"), Some(json!("evt-1")))
+            .await
+            .expect("speculative spawn");
+
+        // The durable row (the admitted payload) IS the marked wrapper,
+        // keyed idempotently per thread (invariant 1 shape unchanged).
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        assert_eq!(admits[0].0, spawned.worker_session);
+        assert_eq!(
+            admits[0].2.as_deref(),
+            Some(format!("thread:{}", spawned.thread.id).as_str())
+        );
+        assert!(delegation_is_speculative(&admits[0].1));
+        assert_eq!(
+            parse_delegation(&admits[0].1).map(|d| d.task),
+            Some(json!("check the anomaly"))
+        );
+        // The task message embedded in both streams' thread/started
+        // carries the marker too (audit-visible forever).
+        assert!(delegation_is_speculative(&spawned.task_message["content"]));
+    }
+
+    #[tokio::test]
+    async fn plain_spawn_still_admits_an_unmarked_wrapper() {
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        spawner.spawn(json!("plain work"), None).await.unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        assert!(!delegation_is_speculative(&admits[0].1));
+    }
+
+    #[test]
+    fn speculation_cap_error_is_honest_data() {
+        let e = SpawnError::SpeculationCap {
+            label: "weak-signal".into(),
+            outstanding: 2,
+            max: 2,
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains("speculation cap `weak-signal` reached"),
+            "{text}"
+        );
+        assert!(text.contains("2 outstanding thread(s), max 2"), "{text}");
+        assert!(text.contains("wait for a thread completion"), "{text}");
     }
 
     // ------------------------------------------------------------------

@@ -37,6 +37,66 @@ pub const CHANNEL_TOOLS: [&str; 2] = ["reply", "deliver_structured"];
 /// schema), so "full tools incl. remote exec" is one name.
 pub const WORKER_TOOLS: [&str; 3] = ["fs.read", "fs.write", "exec"];
 
+/// The async `start()`/`stop()` pair (C37, ADR-008). Mounted on the
+/// Router profile and the worker template **config-gated, default
+/// off** (the article's own "not default-on"); the sync `exec` tool
+/// is untouched either way.
+pub const ASYNC_TOOLS: [&str; 2] = ["start", "stop"];
+
+/// Mounts (or leaves off) the async pair on an agent definition.
+/// Idempotent, and the append order is stable (`start` then `stop`) —
+/// tool lists are prompt-prefix content (constraint 3's gate), so the
+/// same config always yields the same list. With `enabled = false`
+/// the definition is returned byte-identical (the default-off
+/// regression is structural, not incidental).
+pub fn mount_async_tools(agent: &mut AgentDef, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for tool in ASYNC_TOOLS {
+        if !agent.tools.iter().any(|t| t == tool) {
+            agent.tools.push(tool.to_string());
+        }
+    }
+}
+
+/// Mounts (or leaves off) the C35 recall toolpack
+/// ([`crate::toolpack::RECALL_TOOLS`]) on an agent definition. Same
+/// discipline as [`mount_async_tools`]: idempotent, stable sorted
+/// append order, byte-identical definition when `enabled = false`.
+/// Assembly mounts it default-on for the Router profile and opt-in
+/// per worker template (the `superagent.recall` config section) — the
+/// mount itself is explicit so the default-off regression stays
+/// structural. Recall tools are read-only; they are not channel tools
+/// ([`is_channel_tool`]) and never violate the structural profile
+/// rules.
+pub fn mount_recall_tools(agent: &mut AgentDef, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for tool in crate::toolpack::RECALL_TOOLS {
+        if !agent.tools.iter().any(|t| t == tool) {
+            agent.tools.push(tool.to_string());
+        }
+    }
+}
+
+/// Mounts (or leaves off) the C40 watchdog surface
+/// ([`crate::watchdog::WATCHDOG_TOOLS`]) on an agent definition. Same
+/// discipline: idempotent, stable sorted append order, byte-identical
+/// definition when `enabled = false`. Assembly mounts it on the
+/// configured watchdog agent when `superagent.watchdog` is present.
+pub fn mount_watchdog_tools(agent: &mut AgentDef, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for tool in crate::watchdog::WATCHDOG_TOOLS {
+        if !agent.tools.iter().any(|t| t == tool) {
+            agent.tools.push(tool.to_string());
+        }
+    }
+}
+
 /// Whether `name` belongs to the Router's dispatch/channel surface —
 /// the tool names a worker profile must never carry.
 #[must_use]
@@ -246,5 +306,107 @@ mod tests {
         let p = empty_tool_parameters();
         assert_eq!(p["type"], "object");
         assert_eq!(p["additionalProperties"], false);
+    }
+
+    #[test]
+    fn async_pair_mount_is_gated_idempotent_and_stable_ordered() {
+        use super::{ASYNC_TOOLS, mount_async_tools};
+        // Default off: byte-identical definitions (the regression is
+        // structural, not incidental).
+        let mut w = worker();
+        let before = w.clone();
+        mount_async_tools(&mut w, false);
+        assert_eq!(w, before);
+        let mut r = router();
+        let before = r.clone();
+        mount_async_tools(&mut r, false);
+        assert_eq!(r, before);
+
+        // On: the pair lands on BOTH profiles, start then stop, and
+        // re-mounting changes nothing (idempotent, stable order).
+        for mut agent in [worker(), router()] {
+            mount_async_tools(&mut agent, true);
+            for tool in ASYNC_TOOLS {
+                assert!(agent.tools.contains(&tool.to_string()));
+            }
+            let start = agent.tools.iter().position(|t| t == "start").unwrap();
+            let stop = agent.tools.iter().position(|t| t == "stop").unwrap();
+            assert_eq!(stop, start + 1, "start immediately followed by stop");
+            let once = agent.clone();
+            mount_async_tools(&mut agent, true);
+            assert_eq!(agent, once, "idempotent re-mount");
+        }
+
+        // The mounted worker still satisfies the structural profile
+        // rules (start/stop are not channel tools).
+        let mut w = worker();
+        mount_async_tools(&mut w, true);
+        SuperAgentProfile::new(router(), w).expect("async-mounted worker is a valid profile");
+    }
+
+    #[test]
+    fn recall_mount_is_gated_idempotent_and_stable_ordered() {
+        use super::mount_recall_tools;
+        use crate::toolpack::RECALL_TOOLS;
+
+        // Default off (opt-in): byte-identical definitions.
+        for mut agent in [worker(), router()] {
+            let before = agent.clone();
+            mount_recall_tools(&mut agent, false);
+            assert_eq!(agent, before);
+        }
+
+        // On: the three tools land in the stable sorted order, and
+        // re-mounting changes nothing.
+        for mut agent in [worker(), router()] {
+            mount_recall_tools(&mut agent, true);
+            for tool in RECALL_TOOLS {
+                assert!(agent.tools.contains(&tool.to_string()), "lacks {tool}");
+                assert!(!is_channel_tool(tool), "{tool} must not be a channel tool");
+            }
+            let positions: Vec<usize> = RECALL_TOOLS
+                .iter()
+                .map(|tool| agent.tools.iter().position(|t| t == tool).unwrap())
+                .collect();
+            let mut sorted = positions.clone();
+            sorted.sort_unstable();
+            assert_eq!(positions, sorted, "stable sorted append order");
+            let once = agent.clone();
+            mount_recall_tools(&mut agent, true);
+            assert_eq!(agent, once, "idempotent re-mount");
+        }
+
+        // A recall-mounted worker still satisfies the structural
+        // profile rules (recall tools are read-only, not channel tools).
+        let mut w = worker();
+        mount_recall_tools(&mut w, true);
+        SuperAgentProfile::new(router(), w).expect("recall-mounted worker is a valid profile");
+    }
+
+    #[test]
+    fn watchdog_mount_is_gated_idempotent_and_stable_sorted() {
+        use super::mount_watchdog_tools;
+        use crate::watchdog::WATCHDOG_TOOLS;
+
+        // Default off: byte-identical definitions.
+        for mut agent in [worker(), router()] {
+            let before = agent.clone();
+            mount_watchdog_tools(&mut agent, false);
+            assert_eq!(agent, before);
+        }
+
+        // On: the four tools land in the stable sorted order, and
+        // re-mounting changes nothing (idempotent).
+        for mut agent in [worker(), router()] {
+            mount_watchdog_tools(&mut agent, true);
+            let tools: Vec<String> = WATCHDOG_TOOLS.iter().map(|t| (*t).to_string()).collect();
+            assert_eq!(
+                agent.tools[agent.tools.len() - WATCHDOG_TOOLS.len()..],
+                tools
+            );
+            let once = agent.clone();
+            mount_watchdog_tools(&mut agent, true);
+            assert_eq!(agent, once, "idempotent re-mount");
+        }
     }
 }

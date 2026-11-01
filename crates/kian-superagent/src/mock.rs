@@ -106,6 +106,8 @@ impl MockChannel {
             channel: self.channel.clone(),
             event_id: uuid::Uuid::new_v4().to_string(),
             topic: topic.map(str::to_string),
+            sender: None,
+            group: None,
             payload,
             ts_ms: now_ms(),
         };
@@ -183,6 +185,8 @@ mod tests {
             channel: "mock-im".into(),
             event_id: event_id.into(),
             topic: topic.map(str::to_string),
+            sender: None,
+            group: None,
             payload: json!({"text": "ping"}),
             ts_ms: 42,
         }

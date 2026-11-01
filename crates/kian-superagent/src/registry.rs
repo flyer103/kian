@@ -1,8 +1,12 @@
-//! Passthrough worker registry: `topic → worker session`.
+//! Passthrough worker registry: `topic → set of worker sessions`
+//! (card C38: many-to-many fan-out).
 //!
 //! A **disposable projection** (constraint 1): nothing authoritative
-//! lives here. At runtime C25's spawner registers fresh workers; after
-//! a restart the mapping is *rebuilt* from event streams alone by
+//! lives here. At runtime the spawner registers fresh workers
+//! (`register` *adds* to the set — workers sharing a topic observe each
+//! other's events and self-resolve conflicts without peer links; the
+//! Router stays the cross-task rendezvous); after a restart the mapping
+//! is *rebuilt* from event streams alone by
 //! [`PassthroughRegistry::rebuild`] — `thread/started` events name the
 //! worker sessions (and may carry the spawning topic in the delegated
 //! task's content), and the workers' own `input/admitted` payloads
@@ -16,12 +20,12 @@ use kian_core::model::SessionId;
 
 use crate::provenance::parse_channel_marker;
 
-/// The runtime projection: routing topic → the worker session that owns
-/// it. Guarded by a lock at the call site; cheap to rebuild and safe to
-/// discard.
+/// The runtime projection: routing topic → the *set* of worker sessions
+/// subscribed to it (C38 fan-out). Guarded by a lock at the call site;
+/// cheap to rebuild and safe to discard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassthroughRegistry {
-    topics: BTreeMap<String, SessionId>,
+    topics: BTreeMap<String, BTreeSet<SessionId>>,
 }
 
 impl PassthroughRegistry {
@@ -29,16 +33,19 @@ impl PassthroughRegistry {
         Self::default()
     }
 
-    /// Registers (or re-binds) a topic. Called at runtime by the worker
-    /// spawner (C25); restarts re-derive the same entries via
-    /// [`PassthroughRegistry::rebuild`] instead.
+    /// Adds a subscriber to a topic's set. Called at runtime by the
+    /// worker spawner (C25); a second worker on the same topic joins
+    /// the set — both then observe the topic's events. Restarts
+    /// re-derive the same entries via [`PassthroughRegistry::rebuild`]
+    /// instead.
     pub fn register(&mut self, topic: impl Into<String>, worker: SessionId) {
-        self.topics.insert(topic.into(), worker);
+        self.topics.entry(topic.into()).or_default().insert(worker);
     }
 
-    /// The worker session owning `topic`, if any.
-    pub fn resolve(&self, topic: &str) -> Option<SessionId> {
-        self.topics.get(topic).copied()
+    /// The set of worker sessions subscribed to `topic` — empty means
+    /// unbound (the subscription service's Router fallback).
+    pub fn resolve(&self, topic: &str) -> BTreeSet<SessionId> {
+        self.topics.get(topic).cloned().unwrap_or_default()
     }
 
     /// Sorted topic list (deterministic iteration for tests/inspection).
@@ -67,8 +74,11 @@ impl PassthroughRegistry {
     ///    to serve (binds immediately).
     /// 2. `input/admitted` on a *worker* session — a message content
     ///    carrying the channel-event wrapper proves that worker served
-    ///    that topic (binds; later events win, so the newest binding
-    ///    survives replay).
+    ///    that topic (binds).
+    ///
+    /// Both sources *add* to each topic's set: every worker that ever
+    /// served the topic is a subscriber (the fan-out semantics), and a
+    /// topic bound by several workers rebuilds to exactly their set.
     pub fn rebuild<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
         let events: Vec<&Event> = events.into_iter().collect();
 
@@ -82,7 +92,7 @@ impl PassthroughRegistry {
             }
         }
 
-        let mut topics: BTreeMap<String, SessionId> = BTreeMap::new();
+        let mut topics: BTreeMap<String, BTreeSet<SessionId>> = BTreeMap::new();
         for ev in &events {
             if ev.kind != EventKind::ThreadStarted {
                 continue;
@@ -99,7 +109,7 @@ impl PassthroughRegistry {
                 .and_then(parse_channel_marker)
                 && let Some(topic) = marker.topic
             {
-                topics.insert(topic, worker);
+                topics.entry(topic).or_default().insert(worker);
             }
         }
         for ev in &events {
@@ -109,7 +119,7 @@ impl PassthroughRegistry {
             if let Some(marker) = ev.bytes.get("content").and_then(parse_channel_marker)
                 && let Some(topic) = marker.topic
             {
-                topics.insert(topic, ev.session);
+                topics.entry(topic).or_default().insert(ev.session);
             }
         }
         Self { topics }
@@ -139,7 +149,7 @@ fn bytes_worker(bytes: &serde_json::Value) -> Option<SessionId> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     use super::{PassthroughRegistry, worker_sessions};
     use crate::provenance::{channel_input_payload, wrap_channel_event};
@@ -186,12 +196,15 @@ mod tests {
             channel: "ci".into(),
             event_id: "evt-0".into(),
             topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
             payload: json!({"build": "ok"}),
             ts_ms: 1,
         });
         let task = json!({"role": "user", "content": marker});
         let registry = PassthroughRegistry::rebuild([&thread_started(router, worker, task)]);
-        assert_eq!(registry.resolve("pr-9"), Some(worker));
+        // C38: a single binding rebuilds to the singleton set.
+        assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
         assert_eq!(registry.len(), 1);
     }
 
@@ -209,6 +222,8 @@ mod tests {
             channel: "ci".into(),
             event_id: "evt-7".into(),
             topic: Some("pr-10".into()),
+            sender: None,
+            group: None,
             payload: json!({"build": "failed"}),
             ts_ms: 2,
         });
@@ -219,7 +234,54 @@ mod tests {
             json!({"role": "user", "content": payload}),
         ));
         let registry = PassthroughRegistry::rebuild(&events);
-        assert_eq!(registry.resolve("pr-10"), Some(worker));
+        assert_eq!(registry.resolve("pr-10"), BTreeSet::from([worker]));
+    }
+
+    #[test]
+    fn rebuild_derives_the_fanout_set_from_both_sources() {
+        // C38: two workers on one topic — one bound by its delegation
+        // task's channel marker (source 1), the other by a channel
+        // input on its own stream (source 2). Rebuild yields the set
+        // of both: every worker that served the topic is a subscriber.
+        let router = sid(1);
+        let worker_a = sid(2);
+        let worker_b = sid(3);
+        let marker = wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-spawn-a".into(),
+            topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
+            payload: json!({"spawn": true}),
+            ts_ms: 1,
+        });
+        let mut events = vec![
+            thread_started(router, worker_a, json!({"role": "user", "content": marker})),
+            // B is a worker (thread/started names it) but its task
+            // carries no topic — its binding comes from its own stream.
+            thread_started(router, worker_b, json!({"role": "user", "content": "task"})),
+        ];
+        let payload = channel_input_payload(&kian_core::seams::ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-b".into(),
+            topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
+            payload: json!({"build": "ok"}),
+            ts_ms: 2,
+        });
+        events.push(event(
+            worker_b,
+            4,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": payload}),
+        ));
+        let registry = PassthroughRegistry::rebuild(&events);
+        assert_eq!(
+            registry.resolve("pr-9"),
+            BTreeSet::from([worker_a, worker_b])
+        );
+        assert_eq!(registry.len(), 1, "one topic, two subscribers");
     }
 
     #[test]
@@ -231,6 +293,8 @@ mod tests {
             channel: "mock-im".into(),
             event_id: "evt-8".into(),
             topic: Some("chat".into()),
+            sender: None,
+            group: None,
             payload: json!({"text": "hi"}),
             ts_ms: 3,
         });
@@ -272,15 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn runtime_register_and_rebind() {
+    fn runtime_register_accumulates_workers_into_a_set() {
+        // C38: registering a second worker on a topic adds it to the
+        // set (no re-bind, no eviction) — both subscribers stay.
         let mut r = PassthroughRegistry::new();
         assert!(r.is_empty());
         r.register("ci", sid(7));
-        assert_eq!(r.resolve("ci"), Some(sid(7)));
+        assert_eq!(r.resolve("ci"), BTreeSet::from([sid(7)]));
         r.register("ci", sid(8));
-        assert_eq!(r.resolve("ci"), Some(sid(8)));
+        assert_eq!(r.resolve("ci"), BTreeSet::from([sid(7), sid(8)]));
+        // Re-registering an existing subscriber is idempotent.
+        r.register("ci", sid(7));
+        assert_eq!(r.resolve("ci"), BTreeSet::from([sid(7), sid(8)]));
         assert_eq!(r.topics(), vec!["ci".to_string()]);
-        // Deterministic map shape keeps debug output stable.
-        let _: BTreeMap<String, SessionId> = BTreeMap::new();
+        // An unknown topic resolves to the empty set (unbound → the
+        // subscription service's Router fallback).
+        assert!(r.resolve("unknown").is_empty());
     }
 }
