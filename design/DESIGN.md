@@ -156,6 +156,21 @@ Rules:
 3. recoverable is entered only from running; idle holds no lease and safely waits for the next
    wake.
 
+C3 refinement (event→trigger mapping; the projection's contract): the projection folds events
+through an explicit transition table. `session/created`→create; `drain/claimed`→claim — initial,
+resume, or takeover: a second claim with no end write in between is the crash-recovery stream
+shape and projects `running→running` (safety against true double-claims is the store's epoch
+fence, not the projection); `session/ended{reason}`→end write, where `completed`/`cancelled` are
+terminal and freeze the stream, while `interrupted`/`failed` release ownership cleanly and return
+the session to `idle` (honest labeling lives in the events; resume = new claim; the final end
+write records the final outcome); `input/admitted` preserves `idle`/`running`/`recoverable`;
+every other kind is drain activity, legal only while `running`. EndReason first-write-wins holds
+within one drain episode: a second `session/ended` before the next claim is a named projection
+error (the projection-side mirror of the store's end-write CAS race). `recoverable` (lease
+expiry — a liveness observation overlaid from the expired-lease query) and `archived` (ops
+action) are table edges with no v0 event trigger; later event kinds may drive them
+(additions-only).
+
 ### 2.3 Admit → Wake → Drain → Promote
 
 ```mermaid
@@ -192,6 +207,24 @@ The six semantic invariants (inherited in full; resident as debug_assert + test 
 6. **Settle on abort**: before releasing ownership, an interrupting drain re-evaluates the inbox;
    if pending work exists it keeps pendingWake registered.
 
+C9 refinement (the drain's consumption and promote-boundary mechanics, as implemented by
+`kian-orchestrator`): the drain is the *sole* writer of `input/admitted` **events** — the
+control plane (`admit`/`steer`) only writes inbox rows. When the drain takes a row at a safe
+boundary it appends one `input/admitted` event carrying the §3.2 message payload
+(`{"role","content","synthetic"?}`) and binds the row to that event's seq via the C6
+event-driven consumption guard. The input-payload convention: a plain row's payload *is* the
+message content; a steer row wraps it as `{"synthetic": true, "content": X}` so the strippable
+marker survives the inbox round-trip. Promote-boundary enforcement lives in the drain-context
+surface handed to the `LoopDriver` seam (`LoopDriver::Ctx`): input-taking is refused while a
+provider turn is in flight, and every drain write carries the claim's epoch under expectedSeq
+CAS (seq-mismatch from a fenced-out concurrent writer is repaired by re-reading the head; a
+stale-epoch rejection abandons the drain — it never fights the fence). The "steer resets the
+allowance once per steer batch" invariant reads: a newly eligible batch observed at a settle
+point grants exactly one more driver episode. An end write with reason
+`interrupted`/`failed` returns the session to `idle` with pendingWake deliberately kept
+registered for the resumer (invariants 5/6); a drain that finds the projection terminal
+releases without appending anything (terminal streams freeze).
+
 ### 2.4 Three-layer recovery (A4/A5)
 
 ```mermaid
@@ -215,11 +248,53 @@ graph TB
     L1 -->|store failure| L3
 ```
 
-- Error classification is a **pure function** (unit-testable, table-drivable); recovery policy is
-  a **declarative table** (config-driven, disposition owned by the caller, A4).
+- Error classification is a **pure function** (unit-testable, table-drivable); recovery policy is a
+  **declarative table** (config-driven, disposition owned by the caller, A4).
 - Every recovery kind has a one-shot guard (the recovery loop itself cannot run away); recovery
   consumption counts against a budget with refund semantics = unused remainder returned on task
   completion (A5).
+
+C10 refinement (the implementation contract, `kian-orchestrator::recovery`):
+- The class vocabulary is closed and string-keyed for the policy table: `provider_down`,
+  `rate_limited`, `context_overflow`, `tool_failed`, `store_failure`, `budget_exhausted`,
+  `validation_failed`, `empty_response` (the constraint-7 soft failure), `unknown`. Wrapping the
+  typed seam/store errors (`ProviderError`, `ToolError`, `StoreError`, `InboxError`) means
+  classification never parses error strings.
+- Policy resolution is **first-match-wins** in declaration order (deterministic); a class no rule
+  covers fails honestly — the runner never invents a default action. `kian.yaml` parsing is
+  fail-closed (unknown class or action names refuse to load). The config-default table is the only
+  hardcoded policy set.
+- Disposition is caller-owned (A4): the bounded runner (`run_with_recovery`) only classifies,
+  resolves, guards, budgets and sequences; side-effecting actions run through caller-supplied
+  `RecoveryReactor` hooks (`compact`/`failover`/`ask`). `compress_then_retry` requires the reactor
+  to append the observable `compact` event **before** invalidating the prefix (constraint 3).
+- Ordering inside the runner: one-shot guard *before* budget — a repeated kind escalates
+  regardless of remaining tokens. Retry-class actions consume `retry_cost_tokens` first; denial
+  escalates with a distinguishable token/wall-clock cause.
+- Escalation (L1 → L2) is an outcome, not an internal state change: the caller responds to
+  `EscalatedToSession` by releasing the claim *without* an end write, so the session lands in
+  `recoverable` via lease-expiry detection (ADR-005 liveness) and a fresh drain replays and
+  continues. The loop is bounded by construction: ≤ one fire per class (≤ `ALL.len() + 1`
+  operation invocations) and ≤ `tokens / retry_cost` retry actions.
+- Budget counters (`consumed`/`refunded`/`returned`) are observable snapshots; `settle()` (task
+  completion, A5) returns the unused remainder exactly once — the data source for the C14
+  `recovery budget reset` command.
+
+C15 refinement (session-layer recovery as implemented by `kian-orchestrator` + `kian serve`,
+proven by the S1 chaos suite): the engine exposes `Engine::recovery_sweep()` — the §2.4-R4
+liveness loop over the C6 expired-lease query — which wakes every session whose lease is past its
+TTL *and* whose stream projects `running`; `kian serve` runs it on a ticker whose period equals
+`drain.heartbeat_interval_ms`, so detection is bounded by `last_heartbeat + lease_ttl_ms +
+heartbeat_interval_ms` (the §13 target plus at most one heartbeat of kill-to-last-heartbeat skew;
+safety never depends on the timing — the takeover claim's epoch fences any lingering old owner,
+ADR-005). The drain episode recognizes a *takeover*: a stream that already projects `running`
+under a fresh claim belongs to a drain that died mid-episode, so the taker re-drives the loop to
+an honest settle **even when the inbox is empty** (the killed episode consumed its inputs; the
+startup inbox scan cannot see those sessions — without the takeover re-drive they would sit in
+`running` forever while the sweep churned). Honesty is preserved end to end: the killed session
+never projects `completed`/`failed` across the kill window (only `running`, overlaid
+`recoverable` by the lease query), and the final end write lands exactly once, after the re-drive
+actually settles.
 
 ## 3. Event model and schema evolution
 
@@ -241,6 +316,45 @@ the event stream. Rules:
   compressed range when it encounters the event. Compression must emit an event (observable, A3).
 - **Synthetic messages are strippable** (A6): steer-injected synthetic user messages carry a
   `synthetic=true` marker; replay/export can strip them to restore the "real" context.
+- **Request serialization is frozen (C8)**: model request bodies are serialized with `serde_json`
+  compact output — object keys in lexicographic order (the workspace does **not** enable
+  `preserve_order`; enabling it would silently change every request's bytes), while arrays keep
+  caller-supplied order (the built-in loop passes tools in a deterministic order). The golden body
+  hash is pinned by `kian-llm::provider::FROZEN_CHAT_BODY_SHA256`; changing the serialization
+  contract is a constraint-3 event (prefix-cache invalidation for every session) and must update
+  the hash and this section in the same change.
+
+**C4 payload contracts (frozen after merge, additions-only)**: the context-bearing kinds —
+`input/admitted`, `assistant/message`, `tool/call`, `tool/result` — carry a message payload in
+`bytes`: `{"role": <non-empty string>, "content": <any JSON>, "synthetic"?: true}`; `content`
+passes through verbatim and is never reformatted. A `compact` event carries
+`{"from_seq": a, "to_seq": b, "summary": <message payload>}` with `a < b <= seq(compact)` and
+pairwise-disjoint ranges; the projection emits the summary at the position of `from_seq` and skips
+context-bearing events with seq in `[a,b)` exactly (skipped payloads are never parsed). The
+canonical projection byte form (`context_to_bytes`: serde_json compact output, message fields in
+declaration order `role`, `content`, `synthetic` only when true, object keys lexicographic —
+`preserve_order` must stay disabled) is frozen stable content, as is the tool-schema serialization
+owned by the provider (C8 `build_chat_body` above): both are prompt-prefix bytes, and changing
+either is a constraint-3 event (observable invalidation + golden-hash update).
+
+**C11 loop conventions (built-in ReAct loop, frozen after merge, additions-only)**: the built-in
+loop (kian-loop) is a passenger inside the drain — it interacts with the engine only through the
+`DrainCtx` surface (append, begin/end turn with payload, take eligible inputs at safe boundaries,
+read the committed stream). Its event payloads extend the C4 contracts: `turn/start`/`turn/end`
+carry `{"iteration": n}` where the counter is *derived from the stream* (count of prior
+`turn/start` events — no resident loop state); `step/request` carries
+`{"slot", "provider", "model", "iteration", "body"}` as the A2 audit copy appended before the
+provider is called (the C8 provider-level `PersistSink` additionally covers fallback-request bytes
+at the HTTP edge); `tool/call` content is `{"id", "name", "arguments"}` (role `assistant`, logged
+before execution) and `tool/result` content is `{"call_id", "output", "is_error"}` (role `tool`).
+An empty model response (or a `ProviderError::EmptyResponse`) is a soft failure: the loop consults
+the declarative recovery table for class `empty_response` and reports `SoftFailed` — the engine
+settles `failed`, never `completed`; the loop itself never retries (disposition is one-shot-guarded
+and caller-owned, §2.4). Local tool execution (fs + exec) runs entirely inside `spawn_blocking`,
+so a sleeping tool cannot stall concurrent drains; the built-in exec tool kills the child on
+timeout and reports `timed_out` as an honest error result. Wiring: kian-loop depends on
+kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resolution +
+`complete_turn`), matching the §7 crate map edge `KLD → KO`.
 
 ### 3.3 Schema versioning
 
@@ -351,6 +465,63 @@ Unified semantics (portable across harnesses/channels):
 Implementation: JSON-RPC over HTTP (axum) + SSE event stream. All control-plane operations **only
 write the inbox / read projections** (the layered iron rule), never touching execution directly.
 
+C13 refinement (the Phase-1 surface, as implemented by `kian-cli`): the wire is `POST /rpc` carrying
+`{jsonrpc, id, method, params}` with the method set `create_session`, `submit`, `steer`, `queue`,
+`interrupt`, `projection` (standard JSON-RPC error codes; unknown session = -32001), plus
+`GET /sessions/{id}/events` — SSE frames `event: kian` (one per store event, interval-poll of the
+event stream, strictly increasing seq), `event: done` after `session/ended`, `event: error` for an
+unknown session. `confirm` is Phase 2+ and deliberately absent. The iron rule is enforced
+structurally: the HTTP module sees only a `ControlPlane` trait (`create_session` / `submit` /
+`steer` / `queue` / `interrupt` / `projection` / `session_events` — inbox writes and reads only);
+`kian-cli::server` implements it over the engine, and a resident test greps the handler module for
+execution symbols. `queue` and `submit` share the admit path (identical durable row; a drain in
+flight folds the wake — the C16 same-sweep batch semantics); `steer` wraps the payload with the
+strippable `synthetic` marker. Assembly: `kian.yaml` (listen, storage.sqlite, agent model
+slots/tools/budgets, providers with `api_key_env` — secrets only ever read from the environment at
+startup, fail-closed; drain lease/heartbeat/iteration/slot tuning; tools root; SSE poll; the
+`recovery:` section parsed by C10's `PolicyConfig`) loads via the `kian-cli` config module with
+`deny_unknown_fields` everywhere; the three built-in plugins (`openai-compat`, `local-tools`,
+`react-loop` — the loop declares the other two as dependencies) activate through
+`kian_plugins![...]` into the C7 `Ctx`, the loop resolves out of the activated `Ctx`, and the
+engine runs the inbox rebuild **before** the listener accepts traffic (NoLostWork across restarts).
+
+C17 refinement (S3 observability, as implemented by `kian-cli`): `GET /metrics` is a read-only
+observability route merged into the serve router **outside** the `ControlPlane` handler module
+(it names neither execution nor store-write APIs; it snapshots the C9 engine counters and derives
+the S3 cache report). The S3 report is a pure projection over `step/request` audit copies: for
+each consecutive request pair within a session, the message prefix must be byte-identical (the
+provider-independent prefix-cache hit-rate proxy); the only counted invalidation cause is
+`compact` — any other prefix change surfaces under `unexpected_prefix_change` and is a
+constraint-3 violation. The same report is exposed by `kian cache-stats [--config <path>]
+[--session <uuid>] [--json]`; the live-provider run is env-gated (`KIAN_API_KEY`), excluded from
+CI, and recorded in the README run log.
+
+C14 refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
+commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session
+replay <id>`, `kian session export <id> [--since/--until]`, `kian lease inspect`) open the sqlite
+file **read-only in-process** (`EventStore::open_read_only` — no migrations, no write path ever
+held by the CLI) and derive everything from the event stream (constraint 1); resource resolution
+is fail-closed (`--db`/`--url` else `kian.yaml`). Mutating commands talk to a running `serve`
+through a dedicated **operational plane**, `POST /ops/rpc` (`wake_now`, `recovery_budget_reset`),
+mounted on the serve router outside the `ControlPlane` handler module behind its own
+trait-isolated `OpsPlane` — the C13 wire surface and semantics stay untouched, and the resident
+iron-rule test greps the ops handler module with the same forbidden-token table. `recovery budget
+reset` appends an explicit additive event kind `recovery/budget-reset` (payload
+`{"reason": string}`) through the normal epoch/expectedSeq-fenced store append — never a silent
+counter wipe; the kind is projection-neutral in effect (state-preserving while running, contributes
+no model-context message) and C3's additions-only default maps it to drain activity, so the ops
+plane guards it: unknown → -32001, draining → -32002, terminal → -32003, idle → -32004 (an idle
+session never consumed a recovery budget). `session replay` re-derives state, runs the C3
+invariant predicates, optionally diffs the derived state against the live server projection
+(`--url`), and verifies A2 end-to-end: for every `step/request` event it re-derives
+`derive_model_context` over the pre-`turn/start` prefix (exactly what the built-in loop derived)
+and asserts the canonical serialization is byte-identical to the recorded request body's messages
+(reusing the frozen `to_chat_message` conversion, now public for exactly this comparison). `session
+export` emits the stored envelopes one-per-line (JSONL; inclusive seq bounds); re-importing a
+package into a fresh store appends under each event's own fence and projects the identical state
+(S7 audit shape). All commands support `--json`; the schemas are frozen and documented in
+`kian_cli::commands` module docs.
+
 ## 6. Plugin system (Cordis-inspired, Rust-ized)
 
 ### 6.1 Design mapping
@@ -421,7 +592,7 @@ graph TB
 
 | crate | Responsibility | Key interfaces |
 |-------|----------------|----------------|
-| kian-core | Concept model, session state machine, six-invariant assertions | `SessionId`, `EventKind`, `Projection` |
+| kian-core | Concept model, session state machine, six-invariant assertions | `SessionId`, `EventKind`, `Projection`, `seams::*` |
 | kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
@@ -436,6 +607,12 @@ graph TB
 Dependency direction (the crate form of the layered iron rule): `kian-orchestrator` depends only
 on core + store + seam traits; every provider/channel implementation is assembled through
 `kian-plugin` and never enters the orchestrator dependency tree.
+
+Seam trait **definitions** (`ModelProvider`, `LoopDriver`, `ToolProvider`, `ExecBackend`,
+`RecoveryPolicySource`) live in `kian-core::seams`; the implementation crates listed above
+(kian-llm, kian-loop, kian-exec, …) implement and re-export them. Phase-1 decision (round-1 plan,
+risk 1): hosting the traits in the core keeps the orchestrator dependency tree free of provider
+crates while the built-in impls stay swappable.
 
 ## 8. Data flow (example: IM message → PR delivery)
 
