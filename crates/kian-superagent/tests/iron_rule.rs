@@ -1,9 +1,11 @@
 //! Crate-level iron-rule test (card C23, the C13 pattern): the bundle
 //! never references an execution API. `kian-superagent` reaches the
-//! server exclusively through the `InboxWriter` port — the only
-//! permitted `kian-orchestrator` surface is the pure `WakeOutcome` type
-//! used in the port's signature (the "types only via a narrow port"
-//! rule). Enforced textually over every module under `src/`.
+//! server exclusively through its ports — `InboxWriter` (write),
+//! `StreamPort` (per-hold, own-session) and `RecallPort` (C34,
+//! cross-session read-only) — the only permitted `kian-orchestrator`
+//! surface is the pure `WakeOutcome` type used in the port's signature
+//! (the "types only via a narrow port" rule). Enforced textually over
+//! every module under `src/`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -95,7 +97,7 @@ fn bundle_references_no_execution_api() {
     assert!(
         failures.is_empty(),
         "kian-superagent src/ references execution symbols:\n{failures:#?}\n\
-         the bundle reaches the server only through the InboxWriter and StreamPort ports"
+         the bundle reaches the server only through the InboxWriter, StreamPort and RecallPort ports"
     );
 }
 
@@ -112,6 +114,44 @@ fn the_only_orchestrator_surface_is_the_wake_outcome_type() {
             }
         }
     }
+}
+
+#[test]
+fn channel_shaper_is_only_called_before_inbox_admission() {
+    let sources = src_sources();
+    for (path, src) in &sources {
+        let file = path.file_name().and_then(|name| name.to_str()).unwrap();
+        if !matches!(file, "provenance.rs" | "subscriptions.rs" | "lib.rs") {
+            assert!(
+                !src.contains("shape_channel_input"),
+                "C33 shaper leaked into {}: shaping is admission-time only",
+                path.display()
+            );
+        }
+    }
+
+    let (path, subscriptions) = sources
+        .iter()
+        .find(|(path, _)| path.ends_with("subscriptions.rs"))
+        .expect("subscription service source");
+    // C43 renamed the shaper entry point to carry the untrusted bit;
+    // the admission-time-only invariant this test guards is unchanged.
+    let shape = subscriptions
+        .find("shape_channel_input_marked(&event, &self.shaping, untrusted)")
+        .expect("the one admission-time shaper call");
+    let admit = subscriptions[shape..]
+        .find(".admit(")
+        .map(|offset| shape + offset)
+        .expect("inbox admission follows shaping");
+    assert!(shape < admit);
+    assert_eq!(
+        subscriptions
+            .matches("shape_channel_input_marked(&event, &self.shaping, untrusted)")
+            .count(),
+        1,
+        "exactly one shaping call may feed inbox admission in {}",
+        path.display()
+    );
 }
 
 #[test]
@@ -135,6 +175,36 @@ fn inbox_writer_port_exposes_exactly_admit_and_wake() {
         assert!(
             !src.contains(banned),
             "InboxWriter grew beyond admit+wake: `{banned}` found in {}",
+            path.display()
+        );
+    }
+}
+
+/// C34: the read port is exactly a read port — cross-session reads and
+/// the spill-index lookup, nothing that writes, wakes or steers.
+#[test]
+fn recall_port_exposes_exactly_the_read_surface() {
+    let (path, src) = src_sources()
+        .into_iter()
+        .find(|(p, _)| p.ends_with("recall.rs"))
+        .expect("src/recall.rs exists");
+    assert!(src.contains("pub trait RecallPort"), "port trait missing");
+    for method in ["fn read_events", "fn list_threads", "fn spill_location"] {
+        assert!(src.contains(method), "port missing `{method}`");
+    }
+    // No write capability smuggled onto the read port.
+    for banned in [
+        "fn admit",
+        "fn wake",
+        "fn emit",
+        "fn append",
+        "fn steer",
+        "fn create",
+        "fn interrupt",
+    ] {
+        assert!(
+            !src.contains(banned),
+            "RecallPort grew beyond reads: `{banned}` found in {}",
             path.display()
         );
     }

@@ -28,8 +28,16 @@ serde_json.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# C44: the lark channel adapter dials the Feishu open APIs over HTTP.
+# The dependency lives in the bundle (Footprint-Ladder level 2 plugin
+# code), never in the core; the crate's iron rule is unaffected (the
+# adapter reaches no execution surface).
+reqwest.workspace = true
 
 [dev-dependencies]
 kian-store.workspace = true
 kian-llm.workspace = true
 tracing-subscriber.workspace = true
+# C44: the scripted-HTTP-mock lark tests serve canned Feishu responses
+# from an in-process axum server (no credentials, no network).
+axum.workspace = true

@@ -3,7 +3,7 @@
 //! `InboxWriter` port only, exactly the way assembly (C27) will wire
 //! it. No credentials, no network; everything local.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -97,6 +97,8 @@ impl LoopDriver for TestDriver {
                     channel: "ci".into(),
                     event_id: format!("spawn-{thread_id}"),
                     topic: Some(topic),
+                    sender: None,
+                    group: None,
                     payload: json!({"spawn": true}),
                     ts_ms: 0,
                 });
@@ -330,6 +332,8 @@ async fn inbox_row_is_durable_before_wake_fires() {
             channel: "mock-im".into(),
             event_id: "evt-ordering".into(),
             topic: None,
+            sender: None,
+            group: None,
             payload: json!({"text": "hi"}),
             ts_ms: 1,
         })
@@ -392,7 +396,8 @@ async fn passthrough_routes_to_the_worker_not_the_router() {
     let router_events = store.rebuild(router).await.unwrap();
     let worker_events = store.rebuild(worker).await.unwrap();
     let registry = PassthroughRegistry::rebuild(router_events.iter().chain(worker_events.iter()));
-    assert_eq!(registry.resolve("pr-9"), Some(worker));
+    // C38: resolve returns the subscriber set (singleton here).
+    assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
 
     let service = SubscriptionService::new(
         router,
@@ -406,6 +411,8 @@ async fn passthrough_routes_to_the_worker_not_the_router() {
             channel: "ci".into(),
             event_id: "evt-ci".into(),
             topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
             payload: json!({"build": "passed"}),
             ts_ms: 2,
         })
@@ -477,6 +484,8 @@ async fn unmatched_event_dropped_with_audit_log_and_no_row() {
             channel: "github".into(), // no rule for this channel
             event_id: "evt-unmatched".into(),
             topic: None,
+            sender: None,
+            group: None,
             payload: json!({"text": "irrelevant"}),
             ts_ms: 3,
         })
@@ -519,6 +528,8 @@ async fn admit_is_idempotent_per_event_id_key() {
         channel: "mock-im".into(),
         event_id: "evt-dup".into(),
         topic: None,
+        sender: None,
+        group: None,
         payload: json!({"text": "twice"}),
         ts_ms: 4,
     };
@@ -599,6 +610,8 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
             channel: "ci".into(),
             event_id: "evt-rebuild".into(),
             topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
             payload: json!({"build": "ok"}),
             ts_ms: 5,
         })
@@ -625,7 +638,8 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
             .iter()
             .chain(store.rebuild(worker).await.unwrap().iter()),
     );
-    assert_eq!(rebuilt.resolve("pr-9"), Some(worker));
+    // C38: resolve returns the subscriber set (singleton here).
+    assert_eq!(rebuilt.resolve("pr-9"), BTreeSet::from([worker]));
     assert_eq!(rebuilt.topics(), vec!["pr-9".to_string()]);
 
     // The rebuilt registry routes exactly like the pre-restart one.
@@ -640,6 +654,8 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
             channel: "ci".into(),
             event_id: "evt-after-restart".into(),
             topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
             payload: json!({"build": "still ok"}),
             ts_ms: 6,
         })
@@ -759,4 +775,330 @@ async fn mock_channel_round_trip_through_the_subscription_pipeline() {
     assert_eq!(captured[0].delivery, delivery);
     assert_eq!(captured[0].receipt, receipt);
     assert!(!receipt.message_id.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// C38: many-to-many passthrough fan-out
+// ---------------------------------------------------------------------------
+
+/// C38-only driver: appends both delegations on the Router's drain and
+/// settles every worker drain. The Phase-2 `TestDriver` stays untouched.
+struct FanoutDriver {
+    router: SessionId,
+    workers: Vec<(SessionId, Uuid)>,
+    topic: String,
+}
+
+impl LoopDriver for FanoutDriver {
+    type Ctx = DrainCtx;
+
+    fn drive(&self, ctx: DrainCtx) -> futures::stream::BoxStream<'static, LoopOutcome> {
+        let router = self.router;
+        let workers = self.workers.clone();
+        let topic = self.topic.clone();
+        once(async move {
+            if ctx.session() == router {
+                for (worker, thread_id) in workers {
+                    let marker = wrap_channel_event(&ChannelEvent {
+                        channel: "ci".into(),
+                        event_id: format!("spawn-{thread_id}"),
+                        topic: Some(topic.clone()),
+                        sender: None,
+                        group: None,
+                        payload: json!({"spawn": true}),
+                        ts_ms: 0,
+                    });
+                    ctx.append(
+                        EventKind::ThreadStarted,
+                        json!({
+                            "thread_id": thread_id.to_string(),
+                            "parent": ctx.session().0.to_string(),
+                            "worker": worker.0.to_string(),
+                            "pinned_version": 1,
+                            "task": {"role": "user", "content": marker},
+                        }),
+                    )
+                    .await
+                    .expect("append fan-out thread/started");
+                }
+            }
+            LoopOutcome::Settled
+        })
+        .boxed()
+    }
+}
+
+/// An inbox that fails admits for one scripted session until the flag
+/// is cleared — the mid-set write-failure shape (test machinery only).
+struct FlakyInbox<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    inner: EngineInbox<D>,
+    fail_for: Mutex<Option<SessionId>>,
+}
+
+impl<D> InboxWriter for FlakyInbox<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    fn admit(
+        &self,
+        session: SessionId,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        if *self.fail_for.lock().unwrap() == Some(session) {
+            return Box::pin(async {
+                Err(InboxWriteError::Write("scripted mid-set flake".into()))
+            });
+        }
+        self.inner.admit(session, payload, idempotency_key)
+    }
+
+    fn wake(&self, session: SessionId) -> WakeOutcome {
+        self.inner.wake(session)
+    }
+}
+
+/// C38 acceptance: one topic, two registered workers — one channel
+/// event yields one durable row per subscriber, each row carrying its
+/// own provenance wrapper; the rebuild (and a drop-and-replay after
+/// consumption) re-derives the same set from streams alone; the Router
+/// stream never sees the event. (The audit-log naming of every
+/// admission and drop is asserted in `tests/fanout_audit.rs`, which
+/// owns its process-global log capture — thread-local `set_default`
+/// capture is order-parasitic on whichever test touched the library
+/// callsites first and is not used here.)
+#[tokio::test]
+async fn fanout_one_topic_two_workers_both_get_durable_rows() {
+    let store = temp_store().await;
+    let router = SessionId::new();
+    let worker_a = SessionId::new();
+    let worker_b = SessionId::new();
+    let driver = Arc::new(FanoutDriver {
+        router,
+        workers: vec![(worker_a, Uuid::new_v4()), (worker_b, Uuid::new_v4())],
+        topic: "pr-9".into(),
+    });
+    let engine = Engine::new(store.clone(), Arc::clone(&driver), EngineConfig::default());
+
+    // One router drain dispatches delegations onto BOTH workers on
+    // topic pr-9 (source 1 of the rebuild: thread/started markers).
+    engine
+        .admit(
+            router,
+            json!({"role": "user", "content": "dispatch both"}),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_events(
+        &store,
+        router,
+        "thread/started for both workers",
+        |events| {
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::ThreadStarted)
+                .count()
+                == 2
+        },
+    )
+    .await;
+
+    // The rebuild derives the two-subscriber set from streams alone.
+    let mut all = store.rebuild(router).await.unwrap();
+    for worker in [worker_a, worker_b] {
+        all.extend(store.rebuild(worker).await.unwrap());
+    }
+    let registry = PassthroughRegistry::rebuild(&all);
+    assert_eq!(
+        registry.resolve("pr-9"),
+        BTreeSet::from([worker_a, worker_b])
+    );
+
+    let service = SubscriptionService::new(
+        router,
+        router_rules(),
+        Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
+    );
+    service.install_registry(registry);
+
+    let outcome = service
+        .handle_event(ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-fanout".into(),
+            topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
+            payload: json!({"build": "fan-out ok"}),
+            ts_ms: 7,
+        })
+        .await
+        .unwrap();
+    let RoutingOutcome::FannedOut { admitted } = outcome else {
+        panic!("expected a fan-out outcome, got {outcome:?}")
+    };
+    let mut sessions: Vec<SessionId> = admitted.iter().map(|a| a.session).collect();
+    sessions.sort();
+    let mut expected = vec![worker_a, worker_b];
+    expected.sort();
+    assert_eq!(sessions, expected);
+    assert!(
+        admitted.iter().all(|a| !a.deduplicated),
+        "first delivery: {admitted:?}"
+    );
+
+    // Both workers get durable rows consumed on their own streams,
+    // each with its own provenance wrapper naming the same event id.
+    for worker in [worker_a, worker_b] {
+        wait_for_events(
+            &store,
+            worker,
+            "worker consumed the fan-out input",
+            |events| events.iter().any(|e| e.kind == EventKind::InputAdmitted),
+        )
+        .await;
+        let events = store.rebuild(worker).await.unwrap();
+        let input = events
+            .iter()
+            .find(|e| e.kind == EventKind::InputAdmitted)
+            .unwrap();
+        let marker = input
+            .bytes
+            .get("content")
+            .and_then(parse_channel_marker)
+            .expect("per-row provenance wrapper");
+        assert_eq!(marker.event_id, "evt-fanout");
+        assert_eq!(marker.topic.as_deref(), Some("pr-9"));
+    }
+
+    // The Router stream never sees the fan-out event.
+    let router_events = store.rebuild(router).await.unwrap();
+    assert_eq!(
+        router_events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .filter(|e| {
+                e.bytes
+                    .get("content")
+                    .and_then(parse_channel_marker)
+                    .is_some_and(|m| m.event_id == "evt-fanout")
+            })
+            .count(),
+        0,
+        "the fan-out event must never reach the Router stream"
+    );
+
+    // The audit-log naming of both admissions lives in
+    // `tests/fanout_audit.rs` (own process, own global capture).
+
+    // Drop-and-replay equivalence: a fresh rebuild over the streams
+    // that now ALSO carry both workers' channel inputs (source 2)
+    // re-derives exactly the same set.
+    let mut replay_source = store.rebuild(router).await.unwrap();
+    for worker in [worker_a, worker_b] {
+        replay_source.extend(store.rebuild(worker).await.unwrap());
+    }
+    let replayed = PassthroughRegistry::rebuild(&replay_source);
+    assert_eq!(
+        replayed.resolve("pr-9"),
+        BTreeSet::from([worker_a, worker_b])
+    );
+}
+
+/// C38 retry semantics against the real store: one subscriber's admit
+/// fails mid-set — the other's row is durable and consumed anyway; the
+/// idempotent retry fills only the gap (failed subscriber gets its
+/// row, the successful one deduplicates); each stream ends with
+/// exactly one wrapper for the event.
+#[tokio::test]
+async fn fanout_partial_write_failure_is_retried_per_subscriber() {
+    let store = temp_store().await;
+    let driver = Arc::new(TestDriver {
+        behaviors: Mutex::new(HashMap::new()),
+    });
+    let engine = Engine::new(store.clone(), Arc::clone(&driver), EngineConfig::default());
+    let router = engine.create_session().await.unwrap();
+    let worker_a = SessionId::new();
+    let worker_b = SessionId::new();
+
+    let inbox = Arc::new(FlakyInbox {
+        inner: EngineInbox(Arc::clone(&engine)),
+        fail_for: Mutex::new(Some(worker_a)),
+    });
+    let service = SubscriptionService::new(
+        router,
+        router_rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    );
+    service.register_topic("pr-9", worker_a);
+    service.register_topic("pr-9", worker_b);
+
+    let event = ChannelEvent {
+        channel: "ci".into(),
+        event_id: "evt-partial-fanout".into(),
+        topic: Some("pr-9".into()),
+        sender: None,
+        group: None,
+        payload: json!({"build": "flake"}),
+        ts_ms: 8,
+    };
+    let err = service.handle_event(event.clone()).await.unwrap_err();
+    assert!(matches!(err, InboxWriteError::Write(_)));
+
+    // B's row was admitted and consumed despite A's failure; A's
+    // stream never materialized (no row, no drain, no wrapper).
+    wait_for_events(
+        &store,
+        worker_b,
+        "worker b consumed its row despite a's failure",
+        |events| events.iter().any(|e| e.kind == EventKind::InputAdmitted),
+    )
+    .await;
+    assert!(
+        store.rebuild(worker_a).await.unwrap().is_empty(),
+        "the failed subscriber must hold no row before the retry"
+    );
+
+    // The adapter's retry (same event id): A's gap is filled, B
+    // deduplicates against its committed row.
+    *inbox.fail_for.lock().unwrap() = None;
+    let outcome = service.handle_event(event).await.unwrap();
+    let RoutingOutcome::FannedOut { admitted } = outcome else {
+        panic!("expected a fan-out outcome, got {outcome:?}")
+    };
+    let find = |s: SessionId| {
+        admitted
+            .iter()
+            .find(|a| a.session == s)
+            .unwrap_or_else(|| panic!("missing admission for {s:?} in {admitted:?}"))
+    };
+    assert!(!find(worker_a).deduplicated);
+    assert!(find(worker_b).deduplicated);
+
+    wait_for_events(
+        &store,
+        worker_a,
+        "worker a consumed its row after the retry",
+        |events| events.iter().any(|e| e.kind == EventKind::InputAdmitted),
+    )
+    .await;
+
+    // Exactly one wrapper per worker stream, both naming the event.
+    for worker in [worker_a, worker_b] {
+        let events = store.rebuild(worker).await.unwrap();
+        let wrappers: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .filter(|e| {
+                e.bytes
+                    .get("content")
+                    .and_then(parse_channel_marker)
+                    .is_some_and(|m| m.event_id == "evt-partial-fanout")
+            })
+            .collect();
+        assert_eq!(wrappers.len(), 1, "exactly one row per subscriber");
+    }
 }

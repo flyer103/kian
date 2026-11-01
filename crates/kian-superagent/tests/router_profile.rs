@@ -25,8 +25,8 @@ use kian_orchestrator::{Clock, DrainCtx, Engine, EngineConfig, SystemClock, Wake
 use kian_store::EventStore;
 use kian_superagent::{
     AdmitReceipt, ChannelRegistry, InboxWriteError, InboxWriter, MockChannel, RouterDriver,
-    RouterHold, RouterInbox, RouterProfile, RouterTools, RuleMatcher, StreamPort, StreamPortError,
-    SubscriptionRule, SubscriptionRuleSet, SubscriptionService, WorkerSpawner,
+    RouterHold, RouterInbox, RouterProfile, RouterTools, RuleMatcher, ShapingConfig, StreamPort,
+    StreamPortError, SubscriptionRule, SubscriptionRuleSet, SubscriptionService, WorkerSpawner,
     channel_input_payload, router_template, worker_template,
 };
 use kian_superagent::{CorrelateBy, Route};
@@ -51,11 +51,11 @@ async fn wait_for_events(
     session: SessionId,
     desc: &str,
     pred: impl Fn(&[Event]) -> bool,
-) {
+) -> Vec<Event> {
     for _ in 0..800 {
         let events = store.rebuild(session).await.expect("rebuild");
         if pred(&events) {
-            return;
+            return events;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -81,6 +81,7 @@ type ScriptedChunks = Vec<Result<ModelChunk, kian_core::seams::ProviderError>>;
 struct ScriptedProvider {
     turns: Mutex<VecDeque<ScriptedChunks>>,
     call_count: std::sync::atomic::AtomicUsize,
+    requests: Mutex<Vec<ModelRequest>>,
 }
 
 impl ScriptedProvider {
@@ -88,19 +89,25 @@ impl ScriptedProvider {
         Self {
             turns: Mutex::new(turns.into()),
             call_count: std::sync::atomic::AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
     fn request_count(&self) -> usize {
         self.call_count.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn requests(&self) -> Vec<ModelRequest> {
+        self.requests.lock().unwrap().clone()
+    }
 }
 
 impl ModelProvider for ScriptedProvider {
     fn complete(
         &self,
-        _req: ModelRequest,
+        req: ModelRequest,
     ) -> BoxStream<'static, Result<ModelChunk, kian_core::seams::ProviderError>> {
+        self.requests.lock().unwrap().push(req);
         let n = self
             .call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -390,6 +397,8 @@ fn channel_event_input(event_id: &str, text: &str) -> Value {
         channel: "mock-im".into(),
         event_id: event_id.into(),
         topic: None,
+        sender: None,
+        group: None,
         payload: json!({"text": text}),
         ts_ms: 42,
     })
@@ -827,4 +836,120 @@ async fn passthrough_event_reaches_worker_inbox_zero_router_events() {
         "router stream must carry zero events, got {router_events:#?}"
     );
     assert_eq!(h.router_script.request_count(), 0);
+}
+
+/// C33: the admission wrapper spills exactly once. The committed pair
+/// carries only the Inline view into context and the verbatim raw into
+/// its non-context-bearing sibling; a duplicate event id adds no row.
+#[tokio::test]
+async fn over_cap_admission_commits_one_pair_and_router_sees_only_the_excerpt() {
+    let h = build_harness(
+        vec![vec![text_chunk("judged the inline view")]],
+        vec![vec![text_chunk("unused worker turn")]],
+    )
+    .await;
+    let rules = SubscriptionRuleSet::new(vec![SubscriptionRule {
+        channel: "mock-im".into(),
+        matcher: RuleMatcher::Always,
+        route: Route::Router,
+    }]);
+    let service = SubscriptionService::new(
+        h.router,
+        rules,
+        h.router_inbox.clone() as Arc<dyn InboxWriter>,
+    )
+    .with_shaping(ShapingConfig {
+        inline_cap_bytes: Some(32),
+        first_chars: 24,
+        neighbor_fields: vec!["reply_to".into()],
+    });
+
+    let full_text = "FULL_OVER_CAP_RAW_abcdefghijklmnopqrstuvwxyz_MUST_NOT_REACH_THE_ROUTER";
+    let raw = json!({"text": full_text, "reply_to": "msg-parent-7"});
+    let event = ChannelEvent {
+        channel: "mock-im".into(),
+        event_id: "evt-over-cap".into(),
+        topic: Some("room-9".into()),
+        sender: None,
+        group: None,
+        payload: raw.clone(),
+        ts_ms: 42,
+    };
+    let first = service.handle_event(event.clone()).await.unwrap();
+    assert!(matches!(
+        first,
+        kian_superagent::RoutingOutcome::Routed {
+            deduplicated: false,
+            ..
+        }
+    ));
+    // Shaped-once means idempotent admission, not a second shaping pass
+    // over anything committed: the same event id dedupes to the one pair.
+    let duplicate = service.handle_event(event).await.unwrap();
+    assert!(matches!(
+        duplicate,
+        kian_superagent::RoutingOutcome::Routed {
+            deduplicated: true,
+            ..
+        }
+    ));
+
+    let events = wait_for_events(&h.store, h.router, "spill pair and judge turn", |events| {
+        count_kind(events, EventKind::InputSpilled) == 1
+            && count_kind(events, EventKind::AssistantMessage) == 1
+    })
+    .await;
+    assert_eq!(count_kind(&events, EventKind::InputAdmitted), 1);
+    assert_eq!(count_kind(&events, EventKind::InputSpilled), 1);
+
+    let serialized = serde_json::to_string(&raw).unwrap();
+    let excerpt: String = serialized.chars().take(24).collect();
+    let admitted = events
+        .iter()
+        .find(|e| e.kind == EventKind::InputAdmitted)
+        .unwrap();
+    let kian = &admitted.bytes["content"]["kian"];
+    assert_eq!(kian["inline"]["excerpt"], json!(excerpt));
+    assert_eq!(kian["inline"]["neighbors"]["topic"], json!("room-9"));
+    assert_eq!(
+        kian["inline"]["neighbors"]["event_id"],
+        json!("evt-over-cap")
+    );
+    assert_eq!(
+        kian["inline"]["neighbors"]["reply_to"],
+        json!("msg-parent-7")
+    );
+    assert_eq!(kian["spill"], json!(true));
+    assert_eq!(kian["continuation"]["event_id"], json!("evt-over-cap"));
+    assert!(
+        kian.get("raw").is_none(),
+        "the raw left model-visible content"
+    );
+
+    let spilled = events
+        .iter()
+        .find(|e| e.kind == EventKind::InputSpilled)
+        .unwrap();
+    assert_eq!(
+        spilled.bytes,
+        json!({
+            "event_id": "evt-over-cap",
+            "channel": "mock-im",
+            "topic": "room-9",
+            "raw": raw,
+        })
+    );
+
+    // The provider capture is the actual model-bound request, not merely
+    // a projection assertion: it contains the excerpt and never the raw.
+    let requests = h.router_script.requests();
+    assert_eq!(requests.len(), 1, "the duplicate adds no judge turn");
+    let body = serde_json::to_string(&requests[0].body).unwrap();
+    let content = requests[0].body["messages"][0]["content"]
+        .as_str()
+        .expect("channel input message content");
+    let model_content: Value = serde_json::from_str(content).expect("model content is JSON");
+    assert_eq!(model_content["kian"]["inline"]["excerpt"], json!(excerpt));
+    assert!(!body.contains(full_text), "full raw leaked: {body}");
+    assert!(!body.contains("MUST_NOT_REACH_THE_ROUTER"));
 }
