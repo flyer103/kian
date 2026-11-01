@@ -43,6 +43,7 @@
 | [006](decisions/ADR-006-model-slots.md) | Declarative model slots (slot→provider/model/fallback), immutable at runtime | Free runtime model switching | A3 cache-byte stability; P6 determinism | llm seam |
 | [007](decisions/ADR-007-kiand-delivery-semantics.md) | kiand delivery: server-side durable queue, at-least-once, command-id correlation | Exactly-once via endpoint state; fail-fast offline; queue-as-events | Endpoint stays stateless (brain–hand separation); offline park is S5's core semantic; queue rows are pre-event state, not session facts | exec seam |
 | [008](decisions/ADR-008-async-tool-completion-admitted-input.md) | Async `start()`/`stop()`: completion is an admitted input; job rows are pre-event durable state; `stop()` is honest cancellation | Completion-as-event; second dispatch queue; blocking drain | Full-duplex without loop changes; invariant-1 ordering; default-off tool pair | exec seam |
+| [009](decisions/ADR-009-multi-replica-claim-admission.md) | Conditional claim admission (no row / expired / same holder); unique holders under postgres; wake transport advisory | Unconditional claim + fencing only; distributed lock | No multi-replica epoch ping-pong livelock; single-replica behavior byte-identical; lease never grants write permission (ADR-005 intact) | core, storage |
 
 ## 1. Architecture overview
 
@@ -305,6 +306,15 @@ never projects `completed`/`failed` across the kill window (only `running`, over
 `recoverable` by the lease query), and the final end write lands exactly once, after the re-drive
 actually settles.
 
+C47 refinement (multi-replica claim admission, ADR-009): claiming is *conditional* — the claim lands only when no
+claims row exists, the row's lease is expired, or the claiming holder already owns the row; a fresh lease held by a
+different holder is refused with the typed `InboxError::ClaimRejected` (nothing written, epoch floor unchanged) and the
+engine treats it as an honest no-op drain exit — the live holder's sweep or the advisory wake transport (C52) services
+the input, never a retry loop. Same-holder claims still bump the epoch, so single-replica behavior (back-to-back
+drains) is byte-identical; write acceptance never consults lease state (ADR-005 unchanged — this conditions claiming
+only). Postgres mode requires an explicit unique `drain.holder` (fail-closed at startup, C51): two replicas sharing a
+holder string would defeat the same-holder condition.
+
 ## 3. Event model and schema evolution
 
 ### 3.1 Event classification (borrowing dsh's durable/live split)
@@ -386,6 +396,15 @@ kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resol
 - Adjacent migration chain (vN→vN+1 = one migration crate module), borrowing dsh's generation
   mechanism: committed generations are never renamed, replaced or deleted; a new generation is
   published exclusively.
+- C50 (dual-backend store): one chain per backend with the *same versions and names* — sqlite
+  (`?N` dialect, frozen v0/v1) and postgres (`$N` dialect, TEXT/BIGINT, same partial index, same
+  `_kian_migrations` runner dispatched per backend). Envelope columns stay verbatim TEXT on both,
+  so the same stream exports byte-identically from either backend (the export-parity golden).
+  pg dialect notes: the claim floor max is `GREATEST(...)` (pg `MAX` is aggregate-only); the
+  batch append is one CTE statement (all rows land or none); a concurrent same-session append
+  that passes the fence snapshot and loses the primary-key race is turned into zero rows
+  (`ON CONFLICT DO NOTHING`) or a caught 23505 and classified through the same HEAD re-read as
+  every other CAS refusal (`StaleEpoch` vs `SeqMismatch`).
 
 ## 4. Super-agent reference architecture (bundle, not core)
 
@@ -487,6 +506,7 @@ send.
 |---------|-------------------------------------------|
 | IM | ≤100-word hard rule; only direct questions / short conclusions; notify only when a decision or acceptance is needed |
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
+| GitHub (adapter, C48) | the second *real* adapter beside lark, the S4 "group-chat message + CI events" family (`issues`/`issue_comment`/`pull_request`/`push`/`check_run`/`status`): receive is webhook-shaped deliveries verified by the C49 receiver surface (HMAC precedes parsing) and handed to the adapter, which maps each delivery to one provenance-carrying `ChannelEvent` (delivery id → `event_id` idempotency, repo → `group`, `owner/repo` or an exact `owner/repo#N` key → `topic` from the config table — the table is the receive allowlist —, verbatim sender, adapter-declared `explicit` on @-mentions in human text); send is PR review comment / issue comment / PR description via the REST API, resolving only on 2xx + id acceptance, structured content rendered as markdown sections; token env-only (`KIAN_GITHUB_TOKEN`, fail-closed when send is configured; receive needs none); the channel is untrusted by default (C43) |
 | Email/docs | Structured summary drafting |
 | Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the S4 IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
 | Lark/Feishu | the first *real* adapter (C44): IM row — same ImPolicy (≤100 words) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default (C43) |
@@ -683,10 +703,31 @@ invariant predicates, optionally diffs the derived state against the live server
 `derive_model_context` over the pre-`turn/start` prefix (exactly what the built-in loop derived)
 and asserts the canonical serialization is byte-identical to the recorded request body's messages
 (reusing the frozen `to_chat_message` conversion, now public for exactly this comparison). `session
-export` emits the stored envelopes one-per-line (JSONL; inclusive seq bounds); re-importing a
+`session export` emits the stored envelopes one-per-line (JSONL; inclusive seq bounds); re-importing a
 package into a fresh store appends under each event's own fence and projects the identical state
 (S7 audit shape). All commands support `--json`; the schemas are frozen and documented in
 `kian_cli::commands` module docs.
+
+C49 refinement (inbound webhook receiver, as implemented by `kian-cli`): `POST /webhooks/github` is
+the **fourth server surface** (beside the C13 control plane, the C14 ops plane and the C17 metrics
+route; ADR-011), mounted on the serve router only when the route is configured (a `type: github`
+channel under `superagent.channels`; otherwise the path 404s) — outside the `ControlPlane` handler
+module, behind its own trait-isolated `WebhookPlane` (`ingest_verified_github` — verify-then-hand-off
+is its only capability; webhook → admit is an inbox write, the same control-plane legality as the
+subscription service). Verification order: size cap (router-level body limit — 413 *before any
+signature work*) and content-type gate (415, `application/json` only); HMAC-SHA256 over the raw body
+against `X-Hub-Signature-256`, constant-time compare, secret env-only
+(`KIAN_GITHUB_WEBHOOK_SECRET`, fail-closed at startup when the route is configured — never a
+signature-less receiver, never a secret in `kian.yaml`); per-source in-memory token bucket (429;
+v1 per-process bound, bucket keyed on the connection peer, limits `kian.yaml`-tunable with zero
+refused); then — and only then — parse and hand the verified `(event type, delivery id, body)`
+triple to the github adapter's `ingest_delivery`. Verification precedes any parsing
+(untrusted-by-default, the C43/C44 discipline applied to the transport); delivery-id dedupe is
+deliberately not the receiver's — the delivery id is the event id, so the subscription pipeline's
+existing `(session, event_id)` idempotency is the durable guard. Rejections are honest 4xx
+responses with `kian::webhook` audit lines — no event, no row, no parse — and the resident
+iron-rule test greps the webhook module with the same forbidden-token table as the other handler
+modules (the module names no execution or store-write symbol).
 
 ## 6. Plugin system (Cordis-inspired, Rust-ized)
 
@@ -715,7 +756,7 @@ Every seam names three roles: **Service Definition** (the trait) / **Provider** 
 |------|----------------------|-------------------|-----------------------|
 | `ModelProvider` | `complete(req: ModelRequest) -> Stream<ModelChunk>` | openai-compat (covers OR/kimi/ds) | any |
 | `ExecBackend` | `exec(cmd, env) -> ExecResult` | local / remote-endpoint (kiand, endpoint SDK) | sandbox/cloud machines |
-| `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | dsh loop (being-integrated), custom loops |
+| `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | **dsh bridge (`kian-dsh`, C54: a `dsh --profile sdk` child over stdio JSON-lines, ADR-010 mapping)**, custom loops |
 | `ChannelAdapter` | `subscribe() -> Stream<ChannelEvent>`; `send(out) -> Future<SendReceipt>` | — | lark/im/github |
 | `ToolProvider` | `schemas() -> Vec<ToolSchema>`; `invoke(call)` | built-in fs/exec/kiand | any |
 | `RecoveryPolicySource` | `table() -> Vec<PolicyRule>` | config file | any |
@@ -750,7 +791,7 @@ graph TB
         KEP[kian-endpoint<br/>endpoint SDK library (KiandProto endpoint side)]
         KSA[kian-superagent<br/>Router/Worker bundle + channel templates]
         KCL[kian-cli<br/>serve/run/inspect/replay/export]
-        KSDK[kian-sdk<br/>embedded SDK]
+        KSDK[kian-sdk<br/>wire-only embedded SDK]
         KDD[kiand<br/>endpoint daemon = kian-endpoint + main]
     end
     KC --> KS
@@ -758,15 +799,16 @@ graph TB
     KL & KP & KLD --> KO
     KE --> KC & KS
     KSA --> KP & KO & KLD
-    KCL & KSDK --> KO
+    KCL --> KO
     KDD --> KEP
     KE -.->|dials over TCP| KEP
+    KSDK -.->|C13/C14 JSON-RPC + SSE over HTTP| KCL
 ```
 
 | crate | Responsibility | Key interfaces |
 |-------|----------------|----------------|
 | kian-core | Concept model, session state machine, six-invariant assertions | `SessionId`, `EventKind`, `Projection`, `seams::*` |
-| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild | `append(carrying epoch, expected_seq)`, `scan`, `project` |
+| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild. C50: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines commands and correlates results by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. C20 adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations, `RemoteExecBackend` (enqueue-first `ExecBackend`: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`), and `RemoteExecTool` (the same `exec` tool schema as the local built-in, routed through a configured endpoint). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `ExecStore` |
@@ -774,8 +816,18 @@ graph TB
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies | profile assembly |
-| kian-cli / kian-sdk | CLI and embedded SDK | `create_session`, `submit`, `steer`, `interrupt`, `events` |
+| kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
+| kian-sdk | Wire-only embedded SDK (C46): the frozen C13/C14 client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
+| kian-dsh | The S6 dsh bridge (C54, ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the C53 mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
+
+**SDK freeze and versioning (C46).** The `kian-sdk` public surface *is* the frozen C13/C14 wire
+contract: after card C46 it is **additive-only** — removing or reshaping a method, param, response
+field, or error code is a breaking change and requires a new plan round (the event-kinds rule
+applied to the API). The crate carries its own version (`0.1.0`), decoupled from the workspace
+bump cadence; publishing to crates.io happens only when the owner asks. Golden wire fixtures in
+`crates/kian-sdk/tests/fixtures/` pin the request/response bytes of every method (the C8
+serialization-freeze discipline applied to the client).
 
 Dependency direction (the crate form of the layered iron rule): `kian-orchestrator` depends only
 on core + store + seam traits; every provider/channel implementation is assembled through
@@ -841,6 +893,24 @@ sequenceDiagram
 - The drain executor is a tokio task; model streaming responses use `Stream` + bounded-channel
   backpressure.
 - Epoch/lease safety comes from store CAS; no cross-session global lock in-process.
+- **Wake transport (C52, postgres)**: wakes stay advisory — LISTEN/NOTIFY
+  (`kian_wake` channel, payload = session uuid) only *accelerates* the
+  admit→wake hint across replicas. The notify flies as its own statement after
+  the input INSERT committed (a received notification implies a visible row);
+  each replica relays through a `PgListener` on one dedicated pooled connection
+  firing its local engine `wake`. A listener gap (reconnect, replica down) is a
+  losable-wake window bounded by the recovery sweep ticker and each replica's
+  startup inbox scan — correctness never depends on the transport (invariant 6).
+  sqlite runs no transport: the in-process wake registry is the whole story.
+- **Exec queue row leases (C52, ADR-009)**: `exec_queue`/`async_jobs` rows are
+  owned while driven — a single-statement lease (`claimed_by`/`claimed_until_ms`,
+  claimed before any row mutation, heartbeated by the owner's drive loop,
+  re-drivable by any replica after expiry). Liveness only: the lease bounds
+  duplicate dispatch across replicas and never gates accepting a result — the
+  command-id correlation (ADR-007) is the safety net. Endpoints themselves stay
+  dialable by any replica (v1: duplicate dialing is harmless under at-least-once
+  + command-id dedupe; the registry's `last_heartbeat` is written by whichever
+  replica holds the connection).
 - A kiand connection = one TCP connection carrying JSON-lines KiandProto frames with pipelined
   commands; the endpoint-side execution concurrency cap is configurable. **v1 topology (C22): the
   endpoint listens, the server dials.** quinn/quic and websocket-over-TLS remain the Phase-3
@@ -872,6 +942,22 @@ sequenceDiagram
 - v0 single machine: `kian serve` (one binary + sqlite). Docker optional.
 - v1 multi-replica: postgres EventStore + lease/fencing (claim row + epoch CAS); executor scale-out
   = a stateless worker pool claiming sessions.
+- Multi-replica proof (C52, ADR-009 completed): the S8 acceptance e2e — two
+  `kian serve` replicas over one postgres database, the drain owner `kill -9`'d
+  mid-provider-turn, the survivor's recovery sweep takes over the expired lease
+  (conditional claim, C47) and completes with zero lost work, exactly one end
+  write, and a stale-epoch probe write from the dead replica's frozen epoch
+  rejected by the store fence (NoSplitBrainWrite at multi-process scale; S1's
+  guarantee lifted between processes). Env-gated on `KIAN_PG_URL`; default CI
+  needs no postgres.
+- Postgres assembly (C51): `kian.yaml` `storage.event_store: sqlite | postgres`. One server, one
+  database — under postgres the event store and the exec tables (`endpoint_registry`,
+  `exec_queue`, `async_jobs`) share one pg pool. The URL is env-only (`storage.postgres.url_env`
+  names the variable; the value may carry a password but never lives in the config — the C13
+  secrets rule) and a missing variable refuses to start. Postgres mode also **requires** an
+  explicit unique `drain.holder` (the shared default refuses to start — same-holder claim
+  admission, C47/ADR-009 condition (c), must not be defeat-able by two replicas sharing a name).
+  sqlite mode keeps today's defaults byte-identically.
 - Endpoint side: kiand single binary (systemd/launchd managed) + watchdog.
 - Hosted control plane (commercial layer, not in the open-source core): multi-replica hosting,
   audit console, evidence-gate reports — see the BP.
@@ -887,6 +973,12 @@ sequenceDiagram
 
 Kian's own availability target (single machine): after a drain crash, recoverable detection ≤
 lease TTL + heartbeat interval; NoLostWork is guaranteed by inbox rebuild.
+
+Multi-replica (C47/ADR-009, the hosted substrate Phase 4 builds): claim admission is conditional
+— a fresh lease held by another holder refuses the claim (no epoch ping-pong livelock), so a live
+drain on any replica is never displaced; takeover after a holder's death keeps the single-machine
+bound (recoverable detection ≤ lease TTL + heartbeat interval, then the expired-lease claim). The
+wake transport (C52) is an advisory accelerator — availability never depends on it.
 
 ## 14. Security and privacy
 
@@ -908,8 +1000,25 @@ lease TTL + heartbeat interval; NoLostWork is guaranteed by inbox rebuild.
 ## 16. Migration and compatibility
 
 - v0 event schema JSON + envelope version; adjacent migration chain.
-- dsh being-integrated: the dsh loop as a Worker (Phase 3): a mapping protocol between harness
+- dsh being-integrated: the dsh loop as a Worker (Phase 3→4): a mapping protocol between harness
   session-log semantics and the Kian EventStore (harness events → a Kian durable-event subset).
+  The contract is fixed by [ADR-010](decisions/ADR-010-dsh-session-mapping.md) and lives
+  bundle-level (`kian-superagent::dsh`): dsh durable `user/message`/`system/message` →
+  `input/admitted` (role rides verbatim), `assistant/message` → `assistant/message`,
+  `assistant/attempt` → `step/request` (the attempt's assembled request bytes ride `body`
+  verbatim; an attempt with no following `assistant/message` *is* the honest failure trace),
+  `tool/call`/`tool/result` → the same kinds in the loop's frozen payload shapes,
+  `step/start`/`step/end` → `turn/start`/`turn/end` (a dsh step is one provider request cycle),
+  and the dsh `turn/*` episode envelope is absorbed into the drain episode the orchestrator
+  already owns (explicitly reported, never silently dropped). Zero new kinds. dsh session
+  generations are decoded to current logical events *before* mapping — Kian never stores foreign
+  generations (a foreign logical-format handshake is refused). Persist-what-you-send holds across
+  the process boundary: the peer must deliver the step's assembled request bytes before the
+  response is offered, or the bridge stops at a documented negative result — never a best-effort
+  post-hoc logger. The C53 conformance fixture (`dsh-fixture-peer` over scripted JSONL, no
+  Node/dsh dependency) proves both mapping directions, the steer/interrupt translation and the
+  pre-flight ordering rule in default CI; C54's `kian-dsh` driver implements the same contract,
+  which is also the bar any dsh-side plugin must clear to be kian-compatible.
 - Sync with the Feishu design doc: this document is its Rust implementation design; the upstream
   doc's "why the agent loop is not enough" TODO section is argued by this document's §1/§2
   (write-back to upstream is the owner's call).
