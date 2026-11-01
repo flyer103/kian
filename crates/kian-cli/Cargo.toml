@@ -1,0 +1,32 @@
+[package]
+name = "kian-cli"
+description = "CLI and embedded SDK: serve/run/inspect/replay/export"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kian-core.workspace = true
+kian-store.workspace = true
+kian-orchestrator.workspace = true
+kian-llm.workspace = true
+kian-loop.workspace = true
+kian-endpoint.workspace = true
+kian-plugin.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[[bin]]
+name = "kian"
+path = "src/main.rs"
