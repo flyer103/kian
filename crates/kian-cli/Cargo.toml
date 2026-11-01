@@ -23,6 +23,8 @@ thiserror.workspace = true
 tracing.workspace = true
 futures.workspace = true
 serde_yaml.workspace = true
+kian-superagent.workspace = true
+kian-exec.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true

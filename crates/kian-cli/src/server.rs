@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use kian_core::events::Event;
 use kian_core::model::SessionId;
 use kian_core::state::SessionState;
+use kian_exec::ExecStore;
 use kian_llm::provider::OpenAiCompatConfig;
 use kian_loop::react::{ReActConfig, ReActLoop};
 use kian_orchestrator::recovery::PolicyTable;
@@ -30,8 +31,11 @@ use kian_store::EventStore;
 
 use crate::api::{ControlError, ControlPlane};
 use crate::config::ServeConfig;
-use crate::ops::{OpsError, OpsPlane, ResetReceipt, WakeReceipt};
-use crate::plugins::{LocalToolsPlugin, OpenAiCompatPlugin, ReActPlugin};
+use crate::ops::{MockSendReceipt, OpsError, OpsPlane, ResetReceipt, WakeReceipt};
+use crate::plugins::{
+    LocalToolsPlugin, OpenAiCompatPlugin, ReActPlugin, RemoteExecPlugin, SuperAgentPlugin,
+};
+use crate::superagent::{ServeLoopDriver, SuperAgentRuntime, SuperAgentServices};
 
 /// Everything assembling `kian serve` can fail with. All of them refuse
 /// to start — none degrade to defaults.
@@ -51,12 +55,17 @@ pub enum ServeError {
 
 /// The assembled single-machine server.
 pub struct Server {
-    engine: Arc<Engine<ReActLoop>>,
+    engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
     sse_poll_ms: u64,
     /// Recovery-sweep period (C15). Equals `drain.heartbeat_interval_ms`;
     /// see [`Server::serve`] for the documented bound.
     recovery_tick_ms: u64,
+    /// The super-agent runtime (present iff the `superagent:` section
+    /// is configured): mock channels, metrics surfaces, watchdog.
+    superagent: Option<Arc<SuperAgentRuntime>>,
+    /// This assembly's recorded startup sequence (the C27 test hook).
+    startup_order: crate::superagent::StartupOrder,
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (C7 disposer).
     _plugin_disposer: Disposer,
@@ -73,7 +82,17 @@ impl Server {
     }
 
     /// Full assembly from an already-loaded config.
+    ///
+    /// Startup order is load-bearing (C27): config → providers →
+    /// plugins → store → engine → **inbox rebuild** → superagent
+    /// services (registry rebuild, subscription consumers, watchdog) →
+    /// the caller binds the listener. The subscription engine is never
+    /// started before `startup_rebuild` returned (asserted by
+    /// `tests/superagent_serve.rs` via [`Server::startup_order`]).
     pub async fn from_config(config: ServeConfig) -> Result<Self, ServeError> {
+        // The startup-order log for THIS assembly (test hook).
+        let startup_order = crate::superagent::new_startup_order();
+
         // -- 1. providers: resolve secrets from the environment ----------
         // (fail-closed: a configured provider without its key refuses to
         // start; secrets never live in kian.yaml)
@@ -95,28 +114,113 @@ impl Server {
 
         // -- 2. plugin activation (ADR-004: static, compile-time) --------
         let policy = Arc::new(config.policy()?.table());
+        let superagent_cfg = config.superagent.as_ref();
+        let has_remote = !config.endpoints.is_empty();
+
+        // The exec store opens before activation (plugin apply is sync).
+        let exec_store = if has_remote {
+            let store = ExecStore::open(&config.storage.sqlite)
+                .await
+                .map_err(|e| ServeError::Assembly(format!("exec store: {e}")))?;
+            Some(store)
+        } else {
+            None
+        };
+
         let mut ctx = PluginCtx::new();
-        let plugins = kian_plugin::kian_plugins![
+        let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
                 root: config.tools.root.clone().into(),
                 exec_timeout_ms: config.tools.exec_timeout_ms,
             },
-            ReActPlugin {
+        ];
+        if let Some(store) = exec_store {
+            plugins.register(RemoteExecPlugin {
+                store,
+                endpoints: config.endpoints.clone(),
+            });
+        }
+        let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
+            // Super-agent mode: the bundle plugin builds all three
+            // loops (router/worker/plain); `react-loop` is absent.
+            let router_agent = config
+                .named_agent_def(&sa.router.agent)
+                .ok_or_else(|| ServeError::Assembly("router agent missing".into()))?;
+            let worker_agent = config
+                .named_agent_def(&sa.worker.agent)
+                .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
+            let worker_gate = config
+                .named_agent(&sa.worker.agent)
+                .map(|agent| agent.evidence_gate.clone())
+                .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
+            let router_session = kian_core::model::SessionId(
+                uuid::Uuid::parse_str(&sa.router.session_id)
+                    .map_err(|_| ServeError::Assembly("router session id is not a uuid".into()))?,
+            );
+            let rules = sa.subscription_rules().map_err(ServeError::Config)?;
+            let inbox = crate::superagent::EngineInbox::new();
+
+            // Mock channels by configured name (v1's only adapter type).
+            let mut mock_channels = std::collections::BTreeMap::new();
+            for (name, channel) in &sa.channels {
+                if channel.channel_type == "mock-im" {
+                    mock_channels.insert(
+                        name.clone(),
+                        Arc::new(kian_superagent::MockChannel::new(name.clone())),
+                    );
+                }
+            }
+
+            plugins.register(SuperAgentPlugin {
+                router_agent,
+                worker_agent,
+                default_agent: config.agent_def(),
+                router_session,
+                router_slot: sa.router.slot.clone(),
+                max_iterations: config.drain.max_iterations,
+                policy: Arc::clone(&policy),
+                rules,
+                mock_channels,
+                worker_gate,
+                default_gate: config.agent.evidence_gate.clone(),
+                inbox: Arc::clone(&inbox),
+                has_remote,
+            });
+            None // services resolve from the Ctx after activation
+        } else {
+            // Phase-1 mode: exactly the round-1 loop plugin.
+            plugins.register(ReActPlugin {
                 agent: config.agent_def(),
                 policy: Arc::clone(&policy) as Arc<PolicyTable>,
                 config: ReActConfig {
                     slot: kian_core::model::SlotName(config.drain.slot.clone()),
                     max_iterations: config.drain.max_iterations,
                 },
-            },
-        ];
+                gate: config.agent.evidence_gate.clone(),
+            });
+            None
+        };
         let plugin_disposer = plugins.activate(&mut ctx)?;
-        let driver = ctx
-            .resolve::<ReActLoop>()
-            .ok_or_else(|| ServeError::Assembly("react-loop plugin did not register".into()))?;
 
-        // -- 3. store, engine --------------------------------------------
+        // -- 3. driver resolution -----------------------------------------
+        let (driver, services) = if superagent_cfg.is_some() {
+            let services = ctx
+                .resolve::<SuperAgentServices>()
+                .ok_or_else(|| ServeError::Assembly("superagent plugin did not register".into()))?;
+            (
+                Arc::new(ServeLoopDriver::SuperAgent(Arc::clone(&services.driver))),
+                Some(services),
+            )
+        } else {
+            let loop_ = ctx
+                .resolve::<ReActLoop>()
+                .ok_or_else(|| ServeError::Assembly("react-loop plugin did not register".into()))?;
+            (Arc::new(ServeLoopDriver::Plain(loop_)), None)
+        };
+        let _ = superagent_services;
+
+        // -- 4. store, engine ----------------------------------------------
         let store = EventStore::open(&config.storage.sqlite).await?;
         let engine_config = EngineConfig {
             holder: config.drain.holder.clone(),
@@ -125,19 +229,72 @@ impl Server {
         };
         let engine = Engine::new(store.clone(), driver, engine_config);
 
+        // The bundle's inbox port learns the engine (the C23 cycle
+        // breaker closes here, before any wake can fire).
+        let superagent = match services {
+            Some(services) => {
+                if services.inbox.install(Arc::clone(&engine)).is_err() {
+                    return Err(ServeError::Assembly(
+                        "engine inbox already installed".into(),
+                    ));
+                }
+                Some(Arc::clone(&services))
+            }
+            None => None,
+        };
+
         let server = Self {
             engine,
             store,
             sse_poll_ms: config.sse.poll_interval_ms,
             recovery_tick_ms: config.drain.heartbeat_interval_ms,
+            superagent: None,
+            startup_order: Arc::clone(&startup_order),
             _plugin_disposer: plugin_disposer,
         };
 
-        // -- 4. NoLostWork: inbox rebuild BEFORE serving traffic ---------
+        // -- 5. NoLostWork: inbox rebuild BEFORE anything else runs ------
         let sessions = server.engine.startup_rebuild().await?;
         tracing::info!(sessions, "startup inbox rebuild complete");
+        crate::superagent::record_rebuild_done(&startup_order);
+
+        // -- 6. superagent services start (registry → subscriptions →
+        //       watchdog → router bootstrap), strictly AFTER the rebuild.
+        let superagent = match superagent {
+            Some(services) => Some(
+                crate::superagent::start_services(
+                    services,
+                    Arc::clone(&server.engine),
+                    server.store.clone(),
+                    Arc::clone(&startup_order),
+                )
+                .await
+                .map_err(ServeError::Assembly)?,
+            ),
+            None => None,
+        };
+        let mut server = server;
+        server.superagent = superagent.map(Arc::new);
 
         Ok(server)
+    }
+
+    /// This assembly's recorded startup sequence (the C27 acceptance
+    /// hook: subscription/watchdog starts must follow
+    /// `startup_rebuild_done`).
+    pub fn startup_order(&self) -> Vec<&'static str> {
+        self.startup_order
+            .lock()
+            .expect("startup order lock")
+            .clone()
+    }
+
+    /// The super-agent runtime handle (present iff a `superagent:`
+    /// section assembled this server). Embedders and the S4 e2e tests
+    /// reach the mock channels (delivery capture) through this — the
+    /// same handle the ops plane's `mock_channel_send` uses.
+    pub fn superagent_runtime(&self) -> Option<&Arc<SuperAgentRuntime>> {
+        self.superagent.as_ref()
     }
 
     /// The HTTP router for this server. The control-plane handlers see
@@ -427,6 +584,44 @@ impl OpsPlane for Server {
             Ok(ResetReceipt { seq, epoch, ts })
         })
     }
+
+    fn mock_channel_send(
+        &self,
+        channel: String,
+        topic: Option<String>,
+        payload: serde_json::Value,
+    ) -> BoxFuture<'_, Result<MockSendReceipt, OpsError>> {
+        Box::pin(async move {
+            // Demo/S4 injection (C27): one event onto a configured mock
+            // channel; the subscription engine does the rest. Only the
+            // superagent assembly carries channels — anything else is
+            // an honest error, never a silent no-op.
+            let runtime = self.superagent.as_ref().ok_or_else(|| {
+                OpsError::Internal(
+                    "mock_channel_send requires the superagent assembly \
+                     (no `superagent:` section in kian.yaml)"
+                        .into(),
+                )
+            })?;
+            let mock = runtime.mock_channel(&channel).ok_or_else(|| {
+                OpsError::Internal(format!(
+                    "channel `{channel}` is not a configured mock channel (configured: {})",
+                    runtime
+                        .channels
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            let event = mock.inject(topic.as_deref(), payload);
+            Ok(MockSendReceipt {
+                event_id: event.event_id.clone(),
+                channel,
+                topic,
+            })
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +636,9 @@ fn metrics_router(server: Arc<Server>) -> axum::Router {
 
 /// Read-only observability: engine counters (C9) plus the S3
 /// cache-byte stability report (C17) derived from the event stream —
-/// a pure projection, so it is as durable as the log itself.
+/// a pure projection, so it is as durable as the log itself. With the
+/// superagent assembly mounted, the C27 fragment adds evidence-verdict,
+/// subscription, channel-policy and watchdog counters.
 async fn metrics_handler(
     axum::extract::State(server): axum::extract::State<Arc<Server>>,
 ) -> axum::response::Response {
@@ -453,12 +650,17 @@ async fn metrics_handler(
         Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
         Err(e) => serde_json::json!({"error": e.to_string()}),
     };
+    let superagent = match &server.superagent {
+        Some(runtime) => runtime.metrics_report(&server.store).await,
+        None => serde_json::Value::Null,
+    };
     (
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({
             "engine": engine,
             "pending_wake_depth": server.engine.pending_wake_depth(),
             "cache": cache,
+            "superagent": superagent,
         })),
     )
         .into_response()

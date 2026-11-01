@@ -1,0 +1,959 @@
+//! Super-agent assembly (card C27): the wiring that mounts the
+//! `kian-superagent` bundle and `kian-exec` server half onto the real
+//! engine, behind the same fail-closed discipline as the Phase-1
+//! assembly.
+//!
+//! This module is assembly-layer code — the peer of [`crate::server`],
+//! not of the HTTP handler modules. It names the engine, the store and
+//! the drivers on purpose (that is what assembly is for); the layered
+//! iron rule still holds at its edges: HTTP handlers reach any of this
+//! only through the [`crate::api::ControlPlane`] / [`crate::ops::OpsPlane`]
+//! traits, and the bundle reaches the server only through its
+//! [`InboxWriter`] port (implemented here over the engine — the C23
+//! cycle breaker is a late-bound engine slot).
+//!
+//! Composition (one engine, one driver — the C26 pattern):
+//!
+//! - the configured resident Router session runs under
+//!   [`RouterDriver`] (port install + residency parking over a ReAct
+//!   loop whose tools are the bundle's dispatch/channel tools);
+//! - sessions with Thread lineage (a first input carrying the
+//!   delegation wrapper, or an existing `thread/started`) run under
+//!   [`WorkerLoopDriver`] (lineage + evidence gate + completion
+//!   report);
+//! - every other session is a plain Phase-1 session and runs the
+//!   default agent's loop unchanged.
+//!
+//! Startup order is load-bearing (the card's acceptance): inbox
+//! rebuild → watchdog/subscription start → listener accepts traffic.
+//! [`startup_order_log`] records the sequence so the integration test
+//! can assert it.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+use futures::stream::{BoxStream, StreamExt};
+use kian_core::events::{Event, EventKind};
+use kian_core::model::SessionId;
+use kian_core::seams::{
+    ChannelAdapter, LoopDriver, LoopOutcome, ToolCall, ToolError, ToolProvider, ToolResult,
+    ToolSchema, WatchdogSource,
+};
+use kian_exec::watchdog::{Clock as ExecClock, SystemClock as ExecSystemClock};
+use kian_exec::{EndpointRegistryRow, ExecStore, HeartbeatWatchdog, WatchdogConfig};
+use kian_loop::evidence::EvidenceGateConfig;
+use kian_loop::react::ReActLoop;
+use kian_orchestrator::{DrainCtx, Engine, WakeOutcome};
+use kian_store::EventStore;
+use kian_superagent::{
+    AdmitReceipt, InboxWriteError, InboxWriter, LineagePlan, MockChannel, PassthroughRegistry,
+    PortFor, RouterDriver, RouterInbox, RouterProfile, StreamPort, StreamPortError,
+    SubscriptionService, WorkerLoopDriver, lineage_plan, worker_sessions,
+};
+
+use crate::config::EndpointConfig;
+
+// ---------------------------------------------------------------------------
+// Startup order log (per-assembly; the C27 acceptance assertion)
+// ---------------------------------------------------------------------------
+
+/// The recorded startup sequence of one assembly. Purely observable
+/// state for `tests/superagent_serve.rs`; production code never reads
+/// it beyond recording.
+pub type StartupOrder = Arc<Mutex<Vec<&'static str>>>;
+
+/// A fresh, empty order log for one `Server::from_config` run.
+pub fn new_startup_order() -> StartupOrder {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn record(order: &StartupOrder, step: &'static str) {
+    order.lock().expect("startup order lock").push(step);
+}
+
+/// Records that `startup_rebuild` returned (called by
+/// `Server::from_config` between the rebuild and any service start).
+pub fn record_rebuild_done(order: &StartupOrder) {
+    record(order, "startup_rebuild_done");
+}
+
+// ---------------------------------------------------------------------------
+// The InboxWriter port over the real engine (the C23 cycle breaker)
+// ---------------------------------------------------------------------------
+
+/// [`InboxWriter`] implemented over the engine's own admit + wake: the
+/// row is durable when `admit` resolves (the engine resolves its admit
+/// future only on commit — invariant 1), and the wake is strictly
+/// after.
+///
+/// The engine is installed **after** the port exists (the engine needs
+/// a driver, the driver's tools need this port): a late-bound slot,
+/// filled exactly once by [`crate::server::Server::from_config`] before
+/// the first wake can fire.
+pub struct EngineInbox {
+    engine: OnceLock<Arc<Engine<ServeLoopDriver>>>,
+}
+
+impl EngineInbox {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            engine: OnceLock::new(),
+        })
+    }
+
+    /// Installs the engine. Fails (returns the engine back) if one is
+    /// already installed — exactly one engine per port, ever.
+    pub fn install(
+        &self,
+        engine: Arc<Engine<ServeLoopDriver>>,
+    ) -> Result<(), Arc<Engine<ServeLoopDriver>>> {
+        self.engine.set(engine)
+    }
+}
+
+impl Default for EngineInbox {
+    fn default() -> Self {
+        Self {
+            engine: OnceLock::new(),
+        }
+    }
+}
+
+impl InboxWriter for EngineInbox {
+    fn admit(
+        &self,
+        session: SessionId,
+        payload: serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        let engine = self
+            .engine
+            .get()
+            .expect("engine installed before the first admit")
+            .clone();
+        Box::pin(async move {
+            let outcome = engine
+                .admit(session, payload, idempotency_key)
+                .await
+                .map_err(|e| InboxWriteError::Write(e.to_string()))?;
+            Ok(AdmitReceipt {
+                deduplicated: outcome.deduplicated,
+            })
+        })
+    }
+
+    fn wake(&self, session: SessionId) -> WakeOutcome {
+        self.engine
+            .get()
+            .expect("engine installed before the first wake")
+            .wake(session)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The per-hold StreamPort over DrainCtx (the C25/C26 shape)
+// ---------------------------------------------------------------------------
+
+/// Assembly's [`StreamPort`]: one per execution hold, built from the
+/// hold's [`DrainCtx`]. Writes carry the hold's epoch, so a stale
+/// port's writes are fenced out by the store (NoSplitBrainWrite).
+struct DrainCtxPort(DrainCtx);
+
+impl StreamPort for DrainCtxPort {
+    fn session(&self) -> SessionId {
+        self.0.session()
+    }
+
+    fn emit(
+        &self,
+        kind: EventKind,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'static, Result<(), StreamPortError>> {
+        let ctx = self.0.clone();
+        Box::pin(async move {
+            ctx.append(kind, bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| StreamPortError(e.to_string()))
+        })
+    }
+
+    fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, StreamPortError>> {
+        let ctx = self.0.clone();
+        Box::pin(async move {
+            ctx.events()
+                .await
+                .map_err(|e| StreamPortError(e.to_string()))
+        })
+    }
+}
+
+/// The per-hold [`StreamPort`] factory (public: the plugins build the
+/// Router/Worker decorators with it).
+pub fn port_for_ctx() -> PortFor<DrainCtx> {
+    Arc::new(|ctx: &DrainCtx| Arc::new(DrainCtxPort(ctx.clone())) as Arc<dyn StreamPort>)
+}
+
+// ---------------------------------------------------------------------------
+// The assembled driver
+// ---------------------------------------------------------------------------
+
+/// The driver every assembled engine runs: the Phase-1 plain loop, or
+/// the super-agent three-way router (Phase-1 behavior with the bundle
+/// mounted). Both variants share `Ctx = DrainCtx`.
+pub enum ServeLoopDriver {
+    /// Phase-1: one loop, the default agent (unchanged behavior).
+    Plain(Arc<ReActLoop>),
+    /// Super-agent: resident Router / spawned workers / plain sessions.
+    SuperAgent(Arc<SuperAgentDriver>),
+}
+
+impl LoopDriver for ServeLoopDriver {
+    type Ctx = DrainCtx;
+
+    fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
+        match self {
+            Self::Plain(loop_) => loop_.drive(ctx),
+            Self::SuperAgent(driver) => driver.drive(ctx),
+        }
+    }
+}
+
+/// One engine, one driver, three routings:
+///
+/// - the configured Router session → [`RouterDriver`] (residency);
+/// - a session with Thread lineage → [`WorkerLoopDriver`] (lineage,
+///   evidence gate, completion report);
+/// - anything else → the default agent's loop (Phase-1 semantics for
+///   plain sessions).
+///
+/// Worker lineage is decided from the stream itself (constraint 1: no
+/// resident routing state), so a restarted server classifies a
+/// takeover hold identically.
+pub struct SuperAgentDriver {
+    router: SessionId,
+    worker_version: u64,
+    router_side: RouterDriver<ReActLoop>,
+    worker_side: WorkerLoopDriver<ReActLoop>,
+    default_side: Arc<ReActLoop>,
+}
+
+impl SuperAgentDriver {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        router: SessionId,
+        worker_version: u64,
+        router_side: RouterDriver<ReActLoop>,
+        worker_side: WorkerLoopDriver<ReActLoop>,
+        default_side: Arc<ReActLoop>,
+    ) -> Self {
+        Self {
+            router,
+            worker_version,
+            router_side,
+            worker_side,
+            default_side,
+        }
+    }
+}
+
+impl LoopDriver for SuperAgentDriver {
+    type Ctx = DrainCtx;
+
+    fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
+        if ctx.session() == self.router {
+            return self.router_side.drive(ctx);
+        }
+        // Classify by stream content before the first provider turn:
+        // worker streams carry the delegation wrapper (or already carry
+        // thread/started); plain sessions see the default agent.
+        let worker = self.worker_side.clone();
+        let default = Arc::clone(&self.default_side);
+        let router = self.router;
+        let worker_version = self.worker_version;
+        let session = ctx.session();
+        futures::stream::once(async move {
+            let events = ctx.events().await.unwrap_or_default();
+            match lineage_plan(&events, session, router, worker_version) {
+                LineagePlan::PassThrough => default.drive(ctx).boxed(),
+                LineagePlan::Emit { .. } | LineagePlan::Resume { .. } => worker.drive(ctx).boxed(),
+            }
+        })
+        .flatten()
+        .boxed()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool composition
+// ---------------------------------------------------------------------------
+
+/// A [`ToolProvider`] over an ordered list of providers: schemas are
+/// the union with **first-wins** deduplication by tool name, and
+/// invocations route to the first provider owning the name.
+///
+/// Assembly uses the ordering `[remote-exec…, local-tools]` for worker
+/// agents, so the remote `exec` tool (same schema as the local built-in,
+/// C20) shadows the local one when endpoints are configured — one
+/// uniform `exec` surface for the model either way.
+pub struct CombinedTools {
+    providers: Vec<Arc<dyn ToolProvider>>,
+}
+
+impl CombinedTools {
+    pub fn new(providers: Vec<Arc<dyn ToolProvider>>) -> Self {
+        Self { providers }
+    }
+}
+
+impl ToolProvider for CombinedTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for provider in &self.providers {
+            for schema in provider.schemas() {
+                if seen.insert(schema.name.clone()) {
+                    out.push(schema);
+                }
+            }
+        }
+        out
+    }
+
+    fn invoke(&self, call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+        // First provider whose schema set contains the call's name.
+        for provider in &self.providers {
+            if provider
+                .schemas()
+                .iter()
+                .any(|schema| schema.name == call.name)
+            {
+                return provider.invoke(call);
+            }
+        }
+        Box::pin(async move {
+            Err(ToolError::InvalidCall(format!(
+                "no provider serves tool `{}`",
+                call.name
+            )))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription metrics (the consumer loop is assembly-owned so the
+// outcomes are observable)
+// ---------------------------------------------------------------------------
+
+/// Counters for the subscription engine (routed/dropped/deduplicated).
+/// Plain atomics — cheap to read from `/metrics`.
+#[derive(Debug, Default)]
+pub struct SubscriptionMetrics {
+    routed: std::sync::atomic::AtomicU64,
+    routed_deduplicated: std::sync::atomic::AtomicU64,
+    dropped_no_rule: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+}
+
+impl SubscriptionMetrics {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
+        serde_json::json!({
+            "routed": self.routed.load(Ordering::Relaxed),
+            "routed_deduplicated": self.routed_deduplicated.load(Ordering::Relaxed),
+            "dropped_no_rule": self.dropped_no_rule.load(Ordering::Relaxed),
+            "failures": self.failures.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// Spawns one consumer per adapter, feeding the subscription service
+/// and recording outcomes (the assembly-owned variant of
+/// `SubscriptionService::spawn` — same semantics, observable).
+pub fn spawn_subscription_consumers(
+    service: Arc<SubscriptionService>,
+    adapters: Vec<Arc<dyn ChannelAdapter>>,
+    metrics: Arc<SubscriptionMetrics>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    use kian_superagent::RoutingOutcome;
+    adapters
+        .into_iter()
+        .map(|adapter| {
+            let service = Arc::clone(&service);
+            let metrics = Arc::clone(&metrics);
+            let mut stream = adapter.subscribe();
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    match service.handle_event(event).await {
+                        Ok(RoutingOutcome::Routed { deduplicated, .. }) => {
+                            SubscriptionMetrics::bump(&metrics.routed);
+                            if deduplicated {
+                                SubscriptionMetrics::bump(&metrics.routed_deduplicated);
+                            }
+                        }
+                        Ok(RoutingOutcome::DroppedNoRule) => {
+                            SubscriptionMetrics::bump(&metrics.dropped_no_rule);
+                        }
+                        Err(_) => {
+                            SubscriptionMetrics::bump(&metrics.failures);
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog wiring: health edges → admitted inputs for affected sessions
+// ---------------------------------------------------------------------------
+
+/// The endpoint-health input payload admitted to a session holding
+/// queued commands on the endpoint that went offline. A normal message
+/// payload whose content embeds a `kian.endpoint_health` marker — the
+/// same content-embedding discipline as channel provenance (the frozen
+/// C4 payload contract is untouched).
+pub fn endpoint_health_payload(
+    endpoint_id: &str,
+    status: &str,
+    detail: Option<&str>,
+    queued: usize,
+    ts_ms: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kian": {
+            "type": "endpoint_health",
+            "endpoint": endpoint_id,
+            "status": status,
+            "detail": detail,
+            "queued_commands": queued,
+            "ts_ms": ts_ms,
+        },
+        "text": format!(
+            "execution endpoint `{endpoint_id}` is {status}; {queued} queued command(s) affected"
+        ),
+    })
+}
+
+/// Sessions whose streams carry a `tool/call` with one of the given
+/// call ids — the sessions holding the queued commands. Derived purely
+/// from the event log (constraint 1) via the store's pool; the `kind`
+/// column and the envelope's call id do the matching.
+async fn sessions_for_tool_calls(
+    store: &EventStore,
+    tool_call_refs: &BTreeSet<String>,
+) -> Result<BTreeSet<SessionId>, String> {
+    let mut sessions = BTreeSet::new();
+    for call_id in tool_call_refs {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT session FROM events \
+             WHERE kind = 'tool/call' \
+               AND json_extract(envelope, '$.bytes.content.id') = ?",
+        )
+        .bind(call_id)
+        .fetch_all(store.pool())
+        .await
+        .map_err(|e| format!("endpoint-health session lookup: {e}"))?;
+        for (session,) in rows {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&session) {
+                sessions.insert(SessionId(uuid));
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+/// Spawns the watchdog bridge: subscribes to the [`WatchdogSource`]
+/// health stream to learn which endpoints are (still) offline, then
+/// **periodically re-examines** every offline endpoint for sessions
+/// holding queued commands — one durable health input row per affected
+/// session, admitted and woken.
+///
+/// Why the tick beside the edges: an endpoint that is offline *before*
+/// a command is enqueued (registered-but-stale at startup, or the
+/// offline edge arriving between polls) would otherwise never be
+/// re-examined — the edge fired once and the queue row landed after
+/// it. The re-examination is idempotent per offline episode: the admit
+/// key embeds the episode's `ts_ms`, so repeated sweeps deduplicate at
+/// the inbox row. Online edges drop the endpoint from the sweep set
+/// (reconnects re-drive the queue on their own, C20 semantics).
+pub fn spawn_watchdog_bridge(
+    watchdog: Arc<HeartbeatWatchdog>,
+    exec_store: ExecStore,
+    event_store: EventStore,
+    inbox: Arc<dyn InboxWriter>,
+) -> tokio::task::JoinHandle<()> {
+    use kian_core::seams::EndpointHealth;
+    use std::collections::BTreeMap;
+    tokio::spawn(async move {
+        let mut health = watchdog.health();
+        // endpoint → (offline since ts_ms, detail) — the live sweep set.
+        let mut offline: BTreeMap<String, (u64, Option<String>)> = BTreeMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                event = health.next() => {
+                    let Some(event) = event else { break };
+                    match event.status {
+                        EndpointHealth::Offline => {
+                            tracing::info!(
+                                endpoint = %event.endpoint_id,
+                                "watchdog: endpoint offline"
+                            );
+                            offline.insert(
+                                event.endpoint_id.clone(),
+                                (event.ts_ms, event.detail.clone()),
+                            );
+                        }
+                        EndpointHealth::Online => {
+                            tracing::info!(
+                                endpoint = %event.endpoint_id,
+                                "watchdog: endpoint back online; queue re-drives itself"
+                            );
+                            offline.remove(&event.endpoint_id);
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    for (endpoint, (ts_ms, detail)) in offline.clone() {
+                        sweep_offline_endpoint(
+                            &exec_store,
+                            &event_store,
+                            inbox.as_ref(),
+                            &endpoint,
+                            ts_ms,
+                            detail.as_deref(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// One idempotent sweep of a currently-offline endpoint: sessions
+/// holding queued commands on it get one durable health input row.
+async fn sweep_offline_endpoint(
+    exec_store: &ExecStore,
+    event_store: &EventStore,
+    inbox: &dyn InboxWriter,
+    endpoint_id: &str,
+    offline_since_ms: u64,
+    detail: Option<&str>,
+) {
+    let queued = match exec_store.drivable(endpoint_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, endpoint = %endpoint_id, "watchdog bridge: cannot read queued commands");
+            return;
+        }
+    };
+    let refs: BTreeSet<String> = queued
+        .iter()
+        .filter_map(|row| row.tool_call_ref.clone())
+        .collect();
+    if refs.is_empty() {
+        return;
+    }
+    let sessions = match sessions_for_tool_calls(event_store, &refs).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!(error = %e, "watchdog bridge: session lookup failed");
+            return;
+        }
+    };
+    for session in sessions {
+        let payload =
+            endpoint_health_payload(endpoint_id, "offline", detail, refs.len(), offline_since_ms);
+        let key = format!("endpoint-health:{endpoint_id}:offline:{offline_since_ms}");
+        match inbox.admit(session, payload, Some(key)).await {
+            Ok(receipt) => {
+                inbox.wake(session);
+                if !receipt.deduplicated {
+                    tracing::info!(
+                        session = %session.0,
+                        endpoint = %endpoint_id,
+                        queued = refs.len(),
+                        "watchdog bridge: health input admitted"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session = %session.0,
+                    "watchdog bridge: health input admit failed (wake skipped)"
+                );
+            }
+        }
+    }
+}
+
+/// Registers the configured endpoints in the durable registry so a
+/// never-connected endpoint is observable (registered-but-stale is an
+/// actionable offline edge — C21 semantics).
+async fn seed_endpoint_registry(
+    exec_store: &ExecStore,
+    endpoints: &[EndpointConfig],
+) -> Result<(), String> {
+    for ep in endpoints {
+        exec_store
+            .upsert_endpoint(&ep.id, &ep.addr, 0, "offline")
+            .await
+            .map_err(|e| format!("seed endpoint registry `{}`: {e}", ep.id))?;
+    }
+    Ok(())
+}
+
+/// Reads the registry back (used by assembly logging/tests).
+pub async fn endpoint_registry(exec_store: &ExecStore) -> Result<Vec<EndpointRegistryRow>, String> {
+    exec_store
+        .endpoints()
+        .await
+        .map_err(|e| format!("endpoint registry read: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// The assembled runtime
+// ---------------------------------------------------------------------------
+
+/// The running super-agent services the [`crate::server::Server`]
+/// holds: everything with a background task or a metrics surface. The
+/// server's `ControlPlane`/`OpsPlane` impls reach the bundle only
+/// through this handle (mock-channel injection needs the channel map;
+/// `/metrics` needs the counters).
+pub struct SuperAgentRuntime {
+    /// The configured resident Router session.
+    pub router: SessionId,
+    /// Channel name → mock adapter (the S4 injection surface; v1 only
+    /// mock channels exist).
+    pub channels: BTreeMap<String, Arc<MockChannel>>,
+    /// The worker's evidence gate (shared counters = the verdict
+    /// metrics surface).
+    pub worker_gate: EvidenceGateConfig,
+    /// Subscription outcome counters.
+    pub subscription_metrics: Arc<SubscriptionMetrics>,
+    /// The heartbeat watchdog (when endpoints are configured).
+    pub watchdog: Option<Arc<HeartbeatWatchdog>>,
+    /// The remote-exec services (when endpoints are configured).
+    pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+    /// Consumer + bridge tasks; kept alive for the server's lifetime.
+    pub tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SuperAgentRuntime {
+    /// The mock channel registered under `name`.
+    pub fn mock_channel(&self, name: &str) -> Option<Arc<MockChannel>> {
+        self.channels.get(name).cloned()
+    }
+
+    /// The `/metrics` superagent fragment: evidence-verdict,
+    /// subscription, channel-policy (a pure projection of the Router
+    /// stream — workers never deliver; policies are Router-side) and
+    /// watchdog counters.
+    pub async fn metrics_report(&self, store: &EventStore) -> serde_json::Value {
+        let verdicts = self.worker_gate.counters.snapshot();
+        let subscriptions = self.subscription_metrics.snapshot();
+
+        // Channel-policy counts derive from the Router's committed
+        // stream: `channel/delivered` events carry policy/words/truncated.
+        let mut delivered = 0u64;
+        let mut im = 0u64;
+        let mut structured = 0u64;
+        let mut truncated = 0u64;
+        if let Ok(events) = store.rebuild(self.router).await {
+            for event in &events {
+                if event.kind != EventKind::ChannelDelivered {
+                    continue;
+                }
+                delivered += 1;
+                match event.bytes.get("policy").and_then(|p| p.as_str()) {
+                    Some("im") => im += 1,
+                    Some("structured") => structured += 1,
+                    _ => {}
+                }
+                if event.bytes.get("truncated") == Some(&serde_json::json!(true)) {
+                    truncated += 1;
+                }
+            }
+        }
+
+        let watchdog = self.watchdog.as_ref().map(|watchdog| {
+            let metrics = watchdog.metrics();
+            serde_json::json!({
+                "offline_transitions": metrics.offline_transitions(),
+                "online_transitions": metrics.online_transitions(),
+                "mean_detection_latency_ms": metrics.mean_detection_latency_ms(),
+            })
+        });
+
+        serde_json::json!({
+            "router_session": self.router.0,
+            "evidence_verdicts": {
+                "passed": verdicts.passed,
+                "failed": verdicts.failed,
+            },
+            "subscriptions": subscriptions,
+            "channel_policy": {
+                "delivered": delivered,
+                "im": im,
+                "structured": structured,
+                "truncated": truncated,
+            },
+            "watchdog": watchdog,
+        })
+    }
+}
+
+/// Everything the assembled server needs from the activated
+/// `superagent` plugin before the engine exists.
+pub struct SuperAgentServices {
+    /// The assembled three-way driver.
+    pub driver: Arc<SuperAgentDriver>,
+    /// The late-bound engine slot (server installs the engine).
+    pub inbox: Arc<EngineInbox>,
+    /// The mounted router inbox (residency signal; also the spawner's
+    /// and the worker wrapper's port).
+    pub router_inbox: Arc<RouterInbox>,
+    /// The resident Router profile (bootstrap is called post-rebuild).
+    pub profile: RouterProfile,
+    /// The subscription service (registry installed post-rebuild).
+    pub subscriptions: Arc<SubscriptionService>,
+    /// Mock channels by configured name (injection surface).
+    pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
+    /// Adapters in config order (consumer spawn order).
+    pub adapters: Vec<Arc<dyn ChannelAdapter>>,
+    /// The worker's evidence gate config (shared counters).
+    pub worker_gate: EvidenceGateConfig,
+    /// Subscription outcome counters.
+    pub subscription_metrics: Arc<SubscriptionMetrics>,
+    /// Pre-opened exec services when endpoints are configured.
+    pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+}
+
+/// Post-`startup_rebuild` services start (the card's load-bearing
+/// order): registry rebuild → subscription consumers → watchdog +
+/// bridge → Router bootstrap. Called by [`crate::server::Server::from_config`]
+/// **after** the inbox rebuild returned; every step lands in `order`.
+pub async fn start_services(
+    services: Arc<SuperAgentServices>,
+    engine: Arc<Engine<ServeLoopDriver>>,
+    store: EventStore,
+    order: StartupOrder,
+) -> Result<SuperAgentRuntime, String> {
+    let router = services.profile.session;
+
+    // 1. Rebuild the passthrough registry from event streams (the
+    //    NoLostWork analog for subscriptions; nothing authoritative
+    //    survives only in memory).
+    let mut events = store
+        .rebuild(router)
+        .await
+        .map_err(|e| format!("passthrough registry rebuild: {e}"))?;
+    for worker in worker_sessions(&events) {
+        let worker_events = store
+            .rebuild(worker)
+            .await
+            .map_err(|e| format!("passthrough registry rebuild (worker): {e}"))?;
+        events.extend(worker_events);
+    }
+    let registry = PassthroughRegistry::rebuild(&events);
+    tracing::info!(
+        topics = registry.len(),
+        "superagent: passthrough registry rebuilt from streams"
+    );
+    services.subscriptions.install_registry(registry);
+
+    // 2. Subscription consumers (AFTER the rebuild — no event is
+    //    routed against an empty registry).
+    let consumers = spawn_subscription_consumers(
+        Arc::clone(&services.subscriptions),
+        services.adapters.clone(),
+        Arc::clone(&services.subscription_metrics),
+    );
+    record(&order, "subscriptions_started");
+
+    // 3. Watchdog + bridge (needs the engine-backed inbox).
+    let mut watchdog = None;
+    let mut bridge = Vec::new();
+    if let Some(remote) = &services.remote {
+        seed_endpoint_registry(remote.backend.store(), &remote.endpoints).await?;
+        let offline_after = remote
+            .endpoints
+            .iter()
+            .map(|ep| ep.offline_after_ms)
+            .min()
+            .unwrap_or(30_000);
+        // Detection bound = offline_after + poll_interval; keep the
+        // poll a fraction of the bound, capped at 1s.
+        let poll = (offline_after / 4).clamp(50, 1_000);
+        let config = WatchdogConfig {
+            offline_after: Duration::from_millis(offline_after),
+            poll_interval: Duration::from_millis(poll),
+        };
+        let clock: Arc<dyn ExecClock> = Arc::new(ExecSystemClock);
+        let wd = HeartbeatWatchdog::start(remote.backend.store().clone(), config, clock);
+        bridge.push(spawn_watchdog_bridge(
+            Arc::clone(&wd),
+            remote.backend.store().clone(),
+            store.clone(),
+            Arc::clone(&services.router_inbox) as Arc<dyn InboxWriter>,
+        ));
+        watchdog = Some(wd);
+        record(&order, "watchdog_started");
+    }
+
+    // 4. Bootstrap the resident Router (idempotent admit + wake; the
+    //    first hold appends `session/created`).
+    services
+        .profile
+        .bootstrap(services.router_inbox.as_ref())
+        .await
+        .map_err(|e| format!("router bootstrap: {e}"))?;
+    engine.wake(router);
+    record(&order, "router_bootstrapped");
+
+    let mut tasks = consumers;
+    tasks.extend(bridge);
+    Ok(SuperAgentRuntime {
+        router,
+        channels: services.mock_channels.clone(),
+        worker_gate: clone_gate(&services.worker_gate),
+        subscription_metrics: Arc::clone(&services.subscription_metrics),
+        watchdog,
+        remote: services.remote.clone(),
+        tasks,
+    })
+}
+
+/// Clones the gate config while sharing its counters (the metrics
+/// surface is the same handle the worker wrapper records into).
+pub fn clone_gate(gate: &EvidenceGateConfig) -> EvidenceGateConfig {
+    EvidenceGateConfig {
+        enabled: gate.enabled,
+        checks: gate.checks.clone(),
+        max_retries: gate.max_retries,
+        counters: Arc::clone(&gate.counters),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (pure pieces only — the wiring is exercised by
+// tests/superagent_serve.rs over the real engine)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn combined_tools_dedupe_first_wins_and_route_by_name() {
+        use kian_core::seams::ToolSchema;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct FixedTools {
+            names: Vec<&'static str>,
+            hits: Arc<AtomicU64>,
+        }
+        impl ToolProvider for FixedTools {
+            fn schemas(&self) -> Vec<ToolSchema> {
+                self.names
+                    .iter()
+                    .map(|n| ToolSchema {
+                        name: (*n).into(),
+                        description: String::new(),
+                        parameters: serde_json::json!({"type": "object"}),
+                    })
+                    .collect()
+            }
+            fn invoke(&self, call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(ToolResult {
+                        call_id: call.id,
+                        output: serde_json::json!({"from": call.name}),
+                        is_error: false,
+                    })
+                })
+            }
+        }
+
+        let first_hits = Arc::new(AtomicU64::new(0));
+        let second_hits = Arc::new(AtomicU64::new(0));
+        let first = Arc::new(FixedTools {
+            names: vec!["exec", "only_first"],
+            hits: Arc::clone(&first_hits),
+        });
+        let second = Arc::new(FixedTools {
+            names: vec!["exec", "fs.read"],
+            hits: Arc::clone(&second_hits),
+        });
+        let combined = CombinedTools::new(vec![
+            Arc::clone(&first) as Arc<dyn ToolProvider>,
+            Arc::clone(&second) as Arc<dyn ToolProvider>,
+        ]);
+
+        // Schema union: one `exec`, plus each side's unique names.
+        let mut names: Vec<String> = combined.schemas().iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["exec", "fs.read", "only_first"]);
+
+        // `exec` routes to the FIRST provider (remote shadows local).
+        let result = combined
+            .invoke(ToolCall {
+                id: "c1".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .expect("exec routes");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(result.output["from"], "exec");
+
+        // A name neither serves is an honest error.
+        let err = combined
+            .invoke(ToolCall {
+                id: "c2".into(),
+                name: "nope".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .expect_err("unknown tool");
+        assert!(err.to_string().contains("no provider serves tool `nope`"));
+    }
+
+    #[test]
+    fn endpoint_health_payload_embeds_the_marker() {
+        let payload = endpoint_health_payload("ep1", "offline", Some("stale"), 2, 42);
+        assert_eq!(payload["kian"]["type"], "endpoint_health");
+        assert_eq!(payload["kian"]["endpoint"], "ep1");
+        assert_eq!(payload["kian"]["status"], "offline");
+        assert_eq!(payload["kian"]["queued_commands"], 2);
+        assert!(payload["text"].as_str().unwrap().contains("ep1"));
+    }
+
+    #[tokio::test]
+    async fn engine_inbox_requires_install_before_use() {
+        use kian_superagent::InboxWriter as _;
+        let inbox = EngineInbox::new();
+        let session = SessionId::new();
+        // Before install: the admit future panics on use (documented);
+        // wake would too. Use catch_unwind to assert the contract
+        // without poisoning the test thread's output.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(inbox.admit(session, serde_json::json!(1), None))
+        }));
+        assert!(result.is_err(), "admit before install must panic");
+    }
+}

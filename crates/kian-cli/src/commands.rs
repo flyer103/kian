@@ -667,6 +667,41 @@ pub async fn run_wake_now(
     ))
 }
 
+/// `kian mock-channel-send <channel> [--text S | --payload JSON]
+/// [--topic T] [--url <base>] [--json]`: the C27 demo/S4 injection —
+/// one event onto a configured mock channel via `POST /ops/rpc`; the
+/// running server's subscription engine routes it per the configured
+/// rules.
+pub async fn run_mock_channel_send(
+    config_path: &Path,
+    url: Option<&str>,
+    channel: &str,
+    topic: Option<&str>,
+    payload: Value,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let mut params = json!({"channel": channel, "payload": payload});
+    if let Some(t) = topic {
+        params["topic"] = json!(t);
+    }
+    let result = client
+        .ops("mock_channel_send", params)
+        .await
+        .map_err(|e| format!("mock-channel-send: {e}"))?;
+    if json {
+        return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+    }
+    let event_id = result
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let topic = result.get("topic").and_then(Value::as_str).unwrap_or("-");
+    Ok(format!(
+        "channel              {channel}\ntopic                {topic}\nevent               {event_id}\nnext                the subscription engine routes it per kian.yaml\n"
+    ))
+}
+
 /// `kian recovery budget reset <id> [--reason S]`: appends the
 /// explicit `recovery/budget-reset` event via `POST /ops/rpc`.
 pub async fn run_budget_reset(

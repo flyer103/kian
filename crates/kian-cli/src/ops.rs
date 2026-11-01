@@ -1,15 +1,17 @@
-//! Operational plane (card C14): the server surface behind
-//! `kian wake-now` and `kian recovery budget reset`.
+//! Operational plane (card C14 + the C27 `mock_channel_send` demo
+//! injection): the server surface behind `kian wake-now`,
+//! `kian recovery budget reset` and `kian mock-channel-send`.
 //!
 //! This module is deliberately **separate** from [`crate::api`] (the
 //! C13 control plane): the control plane obeys the layered iron rule —
 //! inbox writes and projection reads only — while these are explicit
-//! *operator* mutations (trigger a wake; append a recovery-budget-reset
-//! event). The C13 wire and its semantics are untouched; the ops lane
-//! mounts at `POST /ops/rpc` and mirrors the same structural
-//! discipline: handlers speak JSON and call **nothing but** the
-//! [`OpsPlane`] trait — no engine, no store, no execution symbols (the
-//! extended iron-rule test greps this module too).
+//! *operator* actions (trigger a wake; append a recovery-budget-reset
+//! event; inject a demo event onto a configured mock channel). The C13
+//! wire and its semantics are untouched; the ops lane mounts at
+//! `POST /ops/rpc` and mirrors the same structural discipline: handlers
+//! speak JSON and call **nothing but** the [`OpsPlane`] trait — no
+//! engine, no store, no execution symbols (the extended iron-rule test
+//! greps this module too).
 //!
 //! Wire (JSON-RPC 2.0, same error-code table as the control plane):
 //!
@@ -20,6 +22,10 @@
 //!   `{"seq": u64, "epoch": u64, "ts": u64}` — the appended
 //!   `recovery/budget-reset` event's position. The reset is an explicit
 //!   event; there is no silent counter wipe.
+//! - `mock_channel_send {channel, topic?, payload}` (C27, demo/S4
+//!   injection; DESIGN §5 note) → `{"event_id", "channel", "topic?}` —
+//!   one event onto the named mock channel; the subscription engine
+//!   routes it per the configured rules.
 
 use std::sync::Arc;
 
@@ -50,6 +56,17 @@ pub trait OpsPlane: Send + Sync {
         session: SessionId,
         reason: Option<String>,
     ) -> BoxFuture<'_, Result<ResetReceipt, OpsError>>;
+
+    /// Inject one demo event onto a configured mock channel (C27, the
+    /// S4 stand-in path). The subscription engine routes it per the
+    /// configured rules — this method only hands the event to the
+    /// channel.
+    fn mock_channel_send(
+        &self,
+        channel: String,
+        topic: Option<String>,
+        payload: Value,
+    ) -> BoxFuture<'_, Result<MockSendReceipt, OpsError>>;
 }
 
 /// Outcome of an operator wake.
@@ -76,6 +93,16 @@ pub struct ResetReceipt {
     pub seq: u64,
     pub epoch: u64,
     pub ts: u64,
+}
+
+/// Receipt of a demo channel injection (C27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockSendReceipt {
+    /// The injected event's id (the subscription admit's idempotency
+    /// key — re-injecting the same id can never double-admit).
+    pub event_id: String,
+    pub channel: String,
+    pub topic: Option<String>,
 }
 
 /// Operational-plane failures.
@@ -197,9 +224,41 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
                 .map_err(ops_err)?;
             Ok(json!({"seq": receipt.seq, "epoch": receipt.epoch, "ts": receipt.ts}))
         }
+        "mock_channel_send" => {
+            let channel = params
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    (
+                        CODE_INVALID_PARAMS,
+                        "missing `channel` (name string)".to_string(),
+                    )
+                })?
+                .to_owned();
+            let topic = params
+                .get("topic")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let payload = params
+                .get("payload")
+                .cloned()
+                .ok_or_else(|| (CODE_INVALID_PARAMS, "missing `payload`".to_string()))?;
+            let receipt = state
+                .plane
+                .mock_channel_send(channel, topic, payload)
+                .await
+                .map_err(ops_err)?;
+            Ok(json!({
+                "event_id": receipt.event_id,
+                "channel": receipt.channel,
+                "topic": receipt.topic,
+            }))
+        }
         other => Err((
             CODE_METHOD_NOT_FOUND,
-            format!("unknown method `{other}` (ops set: wake_now, recovery_budget_reset)"),
+            format!(
+                "unknown method `{other}` (ops set: wake_now, recovery_budget_reset, mock_channel_send)"
+            ),
         )),
     }
 }
@@ -321,6 +380,7 @@ mod tests {
     pub struct FakePlane {
         pub wake_calls: Mutex<Vec<SessionId>>,
         pub reset_calls: Mutex<Vec<(SessionId, Option<String>)>>,
+        pub mock_sends: Mutex<Vec<(String, Option<String>, serde_json::Value)>>,
     }
 
     impl OpsPlane for FakePlane {
@@ -343,5 +403,53 @@ mod tests {
                 })
             })
         }
+
+        fn mock_channel_send(
+            &self,
+            channel: String,
+            topic: Option<String>,
+            payload: serde_json::Value,
+        ) -> BoxFuture<'_, Result<super::MockSendReceipt, OpsError>> {
+            self.mock_sends
+                .lock()
+                .unwrap()
+                .push((channel.clone(), topic.clone(), payload));
+            Box::pin(async move {
+                Ok(super::MockSendReceipt {
+                    event_id: "evt-1".into(),
+                    channel,
+                    topic,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ops_dispatch_injects_through_the_trait() {
+        let plane = Arc::new(FakePlane::default());
+        let state = AppState {
+            plane: plane.clone(),
+        };
+        let out = dispatch(
+            &state,
+            "mock_channel_send",
+            &json!({
+                "channel": "mock-im",
+                "topic": "pr-9",
+                "payload": {"text": "hello"}
+            }),
+        )
+        .await
+        .expect("mock send dispatch");
+        assert_eq!(out["event_id"], "evt-1");
+        assert_eq!(out["channel"], "mock-im");
+        assert_eq!(out["topic"], "pr-9");
+        assert_eq!(plane.mock_sends.lock().unwrap().len(), 1);
+
+        // Missing payload is a parameter error.
+        let (code, _) = dispatch(&state, "mock_channel_send", &json!({"channel": "mock-im"}))
+            .await
+            .expect_err("missing payload");
+        assert_eq!(code, -32602);
     }
 }

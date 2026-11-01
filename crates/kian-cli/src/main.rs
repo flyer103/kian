@@ -40,6 +40,9 @@ const USAGE: &str = "usage:
                                          epoch/TTL/holder of every lease (C14)
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event (C14)
+  kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
+                                  [--url <base>] [--config <path>] [--json]
+                                         demo/S4 channel injection via ops (C27)
   kian --version                        print the version
 ";
 
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         Some("cache-stats") => cache_stats(&args[2..]),
         Some("session") => session(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
+        Some("mock-channel-send") => mock_channel_send(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
@@ -401,6 +405,97 @@ fn wake_now(args: &[String]) -> ExitCode {
             parsed.json,
         ),
         "wake-now",
+    )
+}
+
+/// `kian mock-channel-send <channel> [--text S | --payload JSON]
+/// [--topic T] [--url <base>] [--json]` (C27 demo injection).
+fn mock_channel_send(args: &[String]) -> ExitCode {
+    let mut channel: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut payload_json: Option<String> = None;
+    let mut topic: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--url" => match iter.next() {
+                Some(u) => url = Some(u.clone()),
+                None => {
+                    eprintln!("kian: --url requires a base URL\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--topic" => match iter.next() {
+                Some(t) => topic = Some(t.clone()),
+                None => {
+                    eprintln!("kian: --topic requires a topic\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--text" => match iter.next() {
+                Some(t) => text = Some(t.clone()),
+                None => {
+                    eprintln!("kian: --text requires a string\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--payload" => match iter.next() {
+                Some(p) => payload_json = Some(p.clone()),
+                None => {
+                    eprintln!("kian: --payload requires JSON\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown flag `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other if channel.is_none() => channel = Some(other.to_owned()),
+            other => {
+                eprintln!("kian: unexpected argument `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(channel) = channel else {
+        eprintln!("kian: mock-channel-send requires a channel name\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let payload = match (payload_json, text) {
+        (Some(raw), _) => match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("kian: --payload is not valid JSON: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        (None, Some(t)) => serde_json::json!({ "text": t }),
+        (None, None) => {
+            eprintln!("kian: mock-channel-send requires --text or --payload\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    run_command(
+        kian_cli::commands::run_mock_channel_send(
+            &config,
+            url.as_deref(),
+            &channel,
+            topic.as_deref(),
+            payload,
+            json,
+        ),
+        "mock-channel-send",
     )
 }
 

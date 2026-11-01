@@ -114,3 +114,49 @@ fn adr_series_is_contiguous_from_001() {
         assert!(seen.contains(&n), "ADR-{n:03} missing from the series");
     }
 }
+
+/// Every workspace crate is mapped in the docs (Phase-2 closeout): the
+/// crate map in DESIGN §7 and the README must each name all of
+/// `crates/*` — Phase 2 added `kian-exec`, `kian-superagent` and
+/// `kiand`, and a future crate that forgets the docs map fails here
+/// rather than silently disappearing from the documentation.
+#[test]
+fn every_workspace_crate_is_mapped_in_the_docs() {
+    let root = repo_root();
+    let design = std::fs::read_to_string(root.join("design/DESIGN.md")).expect("DESIGN.md");
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
+
+    let mut crates: Vec<String> = std::fs::read_dir(root.join("crates"))
+        .expect("crates dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .filter(|name| root.join("crates").join(name).is_dir())
+        .collect();
+    crates.sort();
+
+    assert!(
+        crates.len() >= 11,
+        "expected the 11-member Phase-2 workspace, found {crates:?}"
+    );
+    let mut failures = Vec::new();
+    for name in &crates {
+        if !design.contains(name.as_str()) {
+            failures.push(format!(
+                "{name}: missing from design/DESIGN.md (§7 crate map)"
+            ));
+        }
+        if !readme.contains(name.as_str()) {
+            failures.push(format!("{name}: missing from README.md"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "docs map out of sync with the workspace: {}",
+        failures.join("; ")
+    );
+}

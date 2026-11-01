@@ -42,6 +42,12 @@ Promote engine, three-layer recovery), `kian-llm` (openai-compat provider, slots
 persist-before-send), `kian-loop` (built-in ReAct driver), `kian-plugin` (static plugin system),
 `kian-endpoint` (KiandProto endpoint-side SDK), `kian-cli` (`kian serve` control plane + CLI).
 
+Phase 2 (super-agent bundle + BYOM endpoints) implemented on top: three more members —
+`kian-exec` (KiandProto server half: connection manager, durable command queue, watchdog),
+`kian-superagent` (Router/Worker bundle: subscriptions, channels, output policies), and `kiand`
+(the endpoint daemon binary) — assembled into `kian serve` by the additive `superagent:` /
+`endpoints:` config surface (see [Phase 2](#phase-2-super-agent-bundle--byom-endpoints) below).
+
 ## Quickstart
 
 Prerequisites: a recent Rust toolchain (stable, 1.85+ for let-chains); nothing else — Phase 1 is
@@ -146,3 +152,122 @@ KIAN_API_KEY=sk-... cargo test -p kian-cli --test live_provider -- --ignored --n
 
 Unit-level underpinnings: A2 golden-bytes and A3 compact-prefix tests in `kian-core`
 (`context.rs`), the frozen request-serialization golden hash in `kian-llm` (`FROZEN_CHAT_BODY_SHA256`).
+
+## Phase 2 (super-agent bundle + BYOM endpoints)
+
+Phase 2 turns the Phase-1 runtime into the super-agent reference architecture: event
+subscriptions + channels, a resident Router judging work and dispatching Workers via Thread
+delegation (evidence-gated completion), and BYOM execution endpoints — a `kiand` daemon the
+server dials over KiandProto (TCP + JSON lines), with a server-side durable command queue
+(at-least-once, command-id dedupe — [ADR-007](design/decisions/ADR-007-kiand-delivery-semantics.md))
+and a heartbeat watchdog that admits offline health inputs to affected worker sessions.
+
+### Build (S4 + S5)
+
+```bash
+cargo build --workspace   # 11 members: Phase-1 eight + kian-exec, kian-superagent, kiand
+```
+
+### kiand — the execution endpoint daemon (S5)
+
+```bash
+# terminal 1: the endpoint. Prints exactly one registration line on stdout:
+#   kiand: endpoint kiand listening on 127.0.0.1:7401
+cargo run -p kiand -- --listen 127.0.0.1:7401 --heartbeat-ms 1000
+```
+
+Flags > `KIAND_*` env > optional `./kiand.yaml` > defaults (`--help` lists them; unknown keys,
+malformed values and zero/negative numbers refuse to start). `SIGTERM`/`SIGINT` drain in-flight
+commands and exit 0.
+
+### Serve with the super-agent assembly (S4 + S5)
+
+```bash
+# terminal 2: the control plane. Additive config; a Phase-1 kian.yaml still boots identically.
+cat > kian.yaml <<'EOF'
+listen: "127.0.0.1:7433"
+storage:
+  sqlite: "./kian.db"
+agents:
+  router:
+    id: router
+    version: 1
+    model_slots:
+      router:
+        provider: my-provider
+        model: gpt-4o-mini
+    tools: ["spawn_worker", "reply", "deliver_structured"]
+  worker:
+    id: worker
+    version: 1
+    model_slots:
+      main:
+        provider: my-provider
+        model: gpt-4o-mini
+    tools: ["fs.read", "fs.write", "exec"]
+superagent:
+  router:
+    session_id: "00000000-0000-0000-0000-000000000001"
+    agent: router
+    slot: router
+  worker:
+    agent: worker
+  subscriptions:
+    - channel: mock-im
+      match: always
+      route: router
+  channels:
+    mock-im:
+      type: mock-im
+endpoints:
+  - id: dev-box
+    addr: "127.0.0.1:7401"
+    queue_timeout_ms: 30000
+    offline_after_ms: 5000
+providers:
+  my-provider:
+    base_url: "https://api.openai.com/v1"
+    api_key_env: MY_PROVIDER_KEY
+plugins: ["openai-compat", "local-tools", "superagent", "remote-exec"]
+EOF
+cargo run -p kian-cli --bin kian -- serve
+```
+
+Endpoint timing has a documented detection-bound relationship: the watchdog declares an endpoint
+offline when `now - last_heartbeat > offline_after_ms`, polling the registry every
+`clamp(offline_after_ms / 4, 50, 1000)` ms, and the bridge sweeps offline endpoints every 250 ms —
+so offline detection lands within `offline_after_ms + poll + tick`. `offline_after_ms` must exceed
+the endpoint's heartbeat cadence (`--heartbeat-ms`), and `queue_timeout_ms` is the caller's honest
+wait bound: on expiry the tool result is an honest `Timeout` and the queue row is `abandoned`
+(never a fake success).
+
+### Demo
+
+```bash
+# S4: inject a mock-IM work request; the Router judges it, dispatches a Worker via Thread
+# delegation, the Worker executes (evidence-gated) and the Router delivers the reply +
+# structured report back onto the channel.
+cargo run -p kian-cli --bin kian -- mock-channel-send mock-im --text "deploy please"
+
+# S5: the Worker's `exec` tool runs on the kiand endpoint. Kill -9 the daemon while a command
+# is queued: the watchdog admits a health input to the worker's session, the queue row parks
+# durably, and a restarted kiand (same port) reconnects and drains it — or the queue timeout
+# resolves honestly. Watch it live:
+curl -s localhost:7433/metrics | jq .superagent   # evidence/subscription/channel/watchdog counters
+```
+
+The scripted, no-credentials versions of both scenarios run in CI: S4 in
+`crates/kian-cli/tests/superagent_serve.rs` (C27/C28 assemblies over mock providers + the mock
+channel) and S5 in `crates/kian-cli/tests/s5_byom_e2e.rs` (the real `kiand` binary as a child
+process, paired with the assembled server).
+
+## Phase-2 acceptance checklist (S4–S5)
+
+| Scenario | Card | Status | Proof |
+|----------|------|--------|-------|
+| S4 super-agent demo (mock-IM → Router judges → Worker completes → ≤100-word reply + structured delivery) | C28 | **done** | `s4_superagent_demo.rs` (7 tests over the assembled serve, mock channel + scripted providers): `s4_router_judges_and_dispatches`, `s4_worker_completes_with_evidence`, `s4_reply_within_word_limit`, `s4_structured_delivery`, `s4_delegation_audit_export_replays`, `s4_readme_demo_cli_mock_channel_send_against_serve`, and the negative path `s4_gate_failed_worker_never_reaches_delivered_done_reply`; mechanics covered by `superagent_serve.rs` (C27 assembly: serve smoke, watchdog→health-input, startup order, Phase-1 compat) |
+| S5 BYOM (cloud loop + kiand execution + watchdog detects endpoint offline) | C29 | **done** | `s5_byom_e2e.rs`: `s5_exec_on_kiand_round_trip` (exec → durable row → dial → real `tool/result` → completion), `s5_offline_queue_parks_durable` (kill -9 while queued → row parks, no fake result), `s5_watchdog_detects_offline_within_bound` (durable health input within `offline_after + poll + tick` + slack), `s5_reconnect_drains_queue` (restart same port → reconnect drains → result flows → completion strictly after the real result), `s5_honesty_across_offline_window` (queue timeout first → honest `Timeout`, row `abandoned`, completion only after the honest error) |
+
+Phase-2 final four-gate run (card C29 closeout, 2026-11-01): `cargo build --workspace`,
+`cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --all -- --check`
+— all green; recorded per-card in the kanban handoffs.

@@ -22,11 +22,16 @@
 //!   `--json` schemas
 //! - [`config`] — `kian.yaml` loading, fail-closed on malformed config
 //! - [`ops`] — the C14 operational plane (`POST /ops/rpc`: `wake_now`,
-//!   `recovery_budget_reset`), trait-isolated like the control plane
+//!   `recovery_budget_reset`, and the C27 demo injection
+//!   `mock_channel_send`), trait-isolated like the control plane
 //! - [`plugins`] — built-in static plugins (openai-compat, local-tools,
-//!   react-loop) registered via `kian_plugins![...]`
+//!   react-loop; C27 adds superagent and remote-exec) registered via
+//!   `kian_plugins![...]`
 //! - [`server`] — assembly (plugins → Ctx → engine → inbox rebuild) and
 //!   the `ControlPlane` / `OpsPlane` implementations
+//! - [`superagent`] — the C27 super-agent assembly: the three-way
+//!   Router/Worker/plain driver, the `InboxWriter` port over the
+//!   engine, subscription consumers, watchdog wiring and metrics
 pub mod api;
 pub mod cache_metrics;
 pub mod client;
@@ -35,6 +40,7 @@ pub mod config;
 pub mod ops;
 pub mod plugins;
 pub mod server;
+pub mod superagent;
 
 #[cfg(test)]
 mod tests {
