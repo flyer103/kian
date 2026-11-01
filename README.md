@@ -55,6 +55,28 @@ shaping + the recall toolpack, two-level admission filtering, async `start()`/`s
 the ablation benchmark, untrusted-input marking, and the real lark channel adapter (see
 [Phase 3](#phase-3-article-sync-recall-admission-economics-real-channels) below).
 
+Phase 4 (round 4, the hosted foundation) opens with a twelfth crate: `kian-sdk` — the wire-only
+embedded SDK extracted from `kian-cli`'s client (card C46). It speaks the frozen C13/C14 wire
+contract (JSON-RPC control/ops planes + the `events` SSE stream) with typed methods and matchable
+error codes, depends on **no kian crate** (reqwest/serde/serde_json/futures/thiserror only), and
+carries its own version (`0.1.0`) decoupled from the workspace bump cadence. Its public surface is
+**frozen additive-only** after this card — a breaking change requires a new plan round, exactly
+like event kinds; golden wire fixtures (`crates/kian-sdk/tests/fixtures/`) pin the request/response
+bytes of every method. `kian-cli` re-exports `KianClient` from it, so the CLI is unchanged.
+Round 4's thirteenth crate is `kian-dsh` — the S6 dsh bridge (card C54): a `LoopDriver` that drives
+a `dsh --profile sdk` child over stdio JSON-lines with the C53/ADR-010 mapping (zero new event
+kinds), mounted on the worker template config-gated (`superagent.harness.dsh`, default off). It
+depends on `kian-core` only (narrow waist) and is proven in CI against the scripted fixture peer;
+the live run is env-gated (`KIAN_DSH_BIN`, see the
+[run log](#live-dsh-bridge-run-log-manual-env-gated)).
+
+Phase 4 also landed the hosted foundation itself — the postgres dual-backend store and
+multi-replica lease/fencing semantics (S8, ADR-009) — plus the GitHub channel with its verified
+webhook receiver (ADR-011); zero new event kinds this round (the durable set stays 20). The
+operator surface for all of it is the
+[Phase 4](#phase-4-hosted-foundation-postgres-multi-replica-sdk-freeze-ecosystem-surfaces)
+section below.
+
 ## Quickstart
 
 Prerequisites: a recent Rust toolchain (stable, 1.85+ for let-chains); nothing else — Phase 1 is
@@ -201,6 +223,26 @@ All unit/integration coverage runs against a scripted in-process HTTP mock with 
 - **2026-11-01 (C44)**: *not executed* — no `KIAN_LARK_APP_ID` was available in the working
   environment. The test is in place; the first executed run should be recorded here with the
   sent `message_id` and the first received event id.
+
+## Live dsh-bridge run log (manual, env-gated)
+
+The C54 S6 live smoke is excluded from CI and runs only when a real dsh install is present
+(`KIAN_DSH_BIN` absent → the test skips, it never fails):
+
+```bash
+KIAN_DSH_BIN=/path/to/dsh cargo test -p kian-dsh --test live -- --nocapture
+```
+
+The mounted bridge is config-gated and default-off (`superagent.harness.dsh` in `kian.yaml`;
+the command may come from config or `KIAN_DSH_BIN` — neither refuses to start, fail-closed).
+All default-CI coverage runs against the C53 scripted fixture peer with zero Node/dsh present:
+the driver suite (`crates/kian-dsh/tests/driver_bridge.rs`) and the mounted e2e — spawn/steer/
+complete, kill-9 takeover continuation, and honest child-crash failure
+(`crates/kian-cli/tests/dsh_bridge.rs`).
+
+- **2026-11-01 (C54)**: *not executed* — no dsh install was available in the working
+  environment. The bridge, fixture-driven CI proof and the smoke are in place; the first
+  executed live run should be recorded here with its session stream and replay report.
 
 ## Phase-1 acceptance checklist (S1–S3)
 
@@ -502,3 +544,207 @@ The S4 scenario's extended legs and the S7 record. Scenario wording lives in
 Phase-3 final four-gate run (card C45 closeout, 2026-11-01): `cargo build --workspace`,
 `cargo test --workspace` (with `NO_PROXY=127.0.0.1,localhost`), `cargo clippy --workspace --
 -D warnings`, `cargo fmt --all -- --check` — all green; recorded per-card in the kanban handoffs.
+
+## Phase 4 (hosted foundation: postgres, multi-replica, SDK freeze, ecosystem surfaces)
+
+Phase 4 (round 4, cards C46–C54, closeout C55) lands the hosted substrate on the now
+**13-crate** workspace: the postgres dual-backend store with multi-replica lease/fencing (S8,
+[ADR-009](design/decisions/ADR-009-multi-replica-claim-admission.md)), the frozen wire-only
+`kian-sdk` (C46), the GitHub channel + verified webhook receiver
+([ADR-011](design/decisions/ADR-011-inbound-webhook-plane.md)), and the S6 dsh bridge
+(`kian-dsh`, [ADR-010](design/decisions/ADR-010-dsh-session-mapping.md)). **Zero new event
+kinds this round** — the durable set stays 20; the dsh mapping selects from existing kinds
+only. sqlite stays the default backend; every omitted config section is byte-identical
+previous-round behavior.
+
+### Environment contract
+
+Default CI needs none of these — every gated suite **skips with a log line, never fails**:
+
+| Env var | Used by | Absent behavior |
+|---------|---------|-----------------|
+| `KIAN_PG_URL` | `kian-store`/`kian-exec` pg suites, `kian-cli` `postgres_serve`/`postgres_s8` | skip with a log line |
+| `KIAN_DSH_BIN` | the dsh live smoke; also the default command source for a configured `superagent.harness.dsh` | smoke skips; a mounted harness without `command` or the env var refuses to start (fail-closed) |
+| `KIAN_GITHUB_TOKEN` | github channel **send** | `send: true` configured → refuses to start (receive-only needs none) |
+| `KIAN_GITHUB_WEBHOOK_SECRET` | webhook receiver HMAC verification | a `type: github` channel mounts the route → refuses to start |
+| `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` / `KIAN_LARK_CHAT_ID` / `KIAN_LARK_POLL_CHAT` | lark live smoke | skip |
+| `KIAN_API_KEY` | live-provider smoke | skip |
+
+Secrets and URLs are **env-only, never a config value** (the C13 secrets rule); provider keys
+additionally follow each provider's `api_key_env` name from `kian.yaml`.
+
+### Postgres setup (dual-backend store)
+
+`storage.event_store: postgres` switches the event store, inbox and exec tables
+(`endpoint_registry`, `exec_queue`, `async_jobs`) to one postgres database — one server, one
+database, one shared pool. The URL is env-only (`url_env` *names* the variable; the value may
+carry a password but never lives in the file), and postgres mode **requires an explicit unique
+`drain.holder`** — the shared default refuses to start, because two replicas sharing a holder
+would defeat same-holder claim admission (C47/ADR-009). Both rules fail closed at startup.
+
+A local postgres via docker (documented recipe; not a CI gate):
+
+```bash
+docker run -d --name kian-pg -e POSTGRES_PASSWORD=kian -p 5432:5432 postgres:16
+docker exec kian-pg createdb -U postgres kian
+export KIAN_PG_URL="postgres://postgres:kian@127.0.0.1:5432/kian"
+```
+
+```yaml
+# kian.yaml (postgres mode)
+listen: "127.0.0.1:7433"
+storage:
+  event_store: postgres
+  postgres:
+    url_env: KIAN_PG_URL      # names the env var holding the URL
+drain:
+  holder: replica-a           # explicit + unique per replica (required under postgres)
+```
+
+The env-gated postgres suites then run for real (migrations, CAS fences, batch atomicity,
+claim admission, export parity, exec park/re-drive, the assembled serve, and S8 below):
+
+```bash
+KIAN_PG_URL=postgres://postgres:kian@127.0.0.1:5432/kian \
+NO_PROXY=127.0.0.1,localhost cargo test --workspace
+```
+
+Export parity is the compat golden: the same event stream exported from sqlite and from
+postgres produces byte-identical JSONL (S7's shape holds across backends).
+
+### Multi-replica and S8
+
+The semantics (C47 + C52, [ADR-009](design/decisions/ADR-009-multi-replica-claim-admission.md)):
+
+- **Conditional claim admission** — a claim lands only when no claims row exists, the lease has
+  expired, or the holder is the same process. A rejected claim is an honest no-op drain exit;
+  epochs stay monotonic.
+- **LISTEN/NOTIFY wake transport** (postgres only) — an advisory accelerator, never a
+  correctness mechanism: the notify fires *after* the input INSERT commits, and the sweep
+  ticker + startup scan bound any missed-notify window (wakes stay losable by invariant).
+- **Exec row leases** — `exec_queue`/`async_jobs` rows are claimed by a single-statement lease,
+  heartbeated by the owner, re-drivable by any replica after expiry. **Liveness only**: write
+  acceptance never consults lease state; safety stays with epoch fencing (ADR-005 intact).
+
+S8 — the acceptance e2e (`crates/kian-cli/tests/postgres_s8.rs`):
+`s8_two_replicas_kill9_takeover_no_split_brain` runs two `kian serve` replicas over one
+postgres database, `kill -9`s the drain owner mid-turn, and asserts the survivor's recovery
+sweep takes over, exactly one end write lands, and a stale-epoch probe write issued with the
+dead replica's frozen epoch is rejected — NoSplitBrainWrite between processes. Env-gated on
+`KIAN_PG_URL`; default CI never needs postgres.
+
+### GitHub channel and webhook receiver
+
+Configuring a `type: github` channel (C48 adapter) is what mounts the `POST /webhooks/github`
+receiver route (C49); the topic-mapping table doubles as the receive allowlist — a delivery
+from an unmapped repository is an honest drop:
+
+```yaml
+superagent:
+  channels:
+    github:
+      type: github
+      github:
+        topics:                 # owner/repo (or owner/repo#N) → topic; also the allowlist
+          "flyer103/kian": "kian-repo"
+        events: []              # empty = every supported type (issues, issue_comment,
+                                #   pull_request, push, check_run, status)
+        send: true              # reply half (issue/PR comments); requires KIAN_GITHUB_TOKEN
+        webhook:                # receiver limits (defaults shown)
+          max_body_bytes: 1048576
+          rate_capacity: 60
+          rate_refill_per_second: 2
+```
+
+Credentials never live in `kian.yaml`: the send token comes from `KIAN_GITHUB_TOKEN` and the
+webhook secret from `KIAN_GITHUB_WEBHOOK_SECRET` (fail-closed at startup when the
+corresponding capability is configured). The receiver verifies **before it parses**
+(ADR-011): body-size cap (413) and content-type gate (415) precede any signature work;
+HMAC-SHA256 over the raw body with a constant-time compare (401 on mismatch — zero parses);
+then the per-source token bucket (429 with an audit line); only then is the verified delivery
+handed to the subscription pipeline, whose `(session, event_id)` idempotency dedupes
+delivery-id replays. GitHub payloads are attacker-influenced text — the channel is
+untrusted-by-default (C43). All coverage runs against scripted HTTP/body fixtures with zero
+credentials and zero network (`crates/kian-superagent/tests/github_channel.rs`,
+`crates/kian-cli/tests/webhook_receiver.rs`).
+
+### SDK quickstart (`kian-sdk`)
+
+The wire-only embedded SDK (C46): speaks the frozen C13/C14 contract (JSON-RPC over
+`POST /rpc` + `POST /ops/rpc`, the `events` SSE stream) and depends on **no kian crate**
+(reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere a Rust HTTP client
+runs. The surface is **frozen additive-only**; a breaking change requires a new plan round.
+
+```toml
+[dependencies]
+kian-sdk = { path = "crates/kian-sdk" }   # versioned 0.1.0, decoupled from the workspace
+```
+
+```rust
+use kian_sdk::KianClient;
+
+let client = KianClient::new("http://127.0.0.1:7433");
+let session = client.create_session().await?.session;
+client.submit(&session, json!("investigate the CI failure"), None).await?;
+client.steer(&session, json!("switch to plan B"), None).await?;   // lands at a safe boundary
+client.interrupt(&session).await?;
+let projection = client.projection(&session).await?;
+
+// live event stream: parsed SseFrames until the server closes after done/error
+use futures::StreamExt;
+let mut stream = client.events(&session).await?;
+while let Some(frame) = stream.next().await {
+    let frame = frame?; // typed errors: match on ClientError, never string-parse
+}
+
+// ops plane: wake_now / recovery_budget_reset / mock_channel_send
+client.wake_now(&session).await?;
+```
+
+Golden wire fixtures (`crates/kian-sdk/tests/fixtures/`) pin the request/response bytes of
+every method.
+
+### dsh bridge config (S6)
+
+The bridge (C54) is mounted on the worker template, config-gated and **default off**
+(`superagent.harness.dsh`); the command comes from config or `KIAN_DSH_BIN`, and neither being
+present refuses to start (fail-closed). When mounted, the worker's loop is driven by a
+`dsh --profile sdk` child over stdio JSON-lines — dsh keeps its interaction model, kian owns
+durability (every mapped event rides the ordinary fenced append path; steers promote as inbox
+rows at safe boundaries; the ADR-010 mapping is the only translation):
+
+```yaml
+superagent:
+  harness:
+    dsh:                        # absent = the built-in loop, unchanged
+      command: /usr/local/bin/dsh   # or export KIAN_DSH_BIN=/usr/local/bin/dsh
+      args: ["--profile", "sdk"]    # default
+      slot: main                   # audit facts stamped into mapped step/request envelopes
+      provider: openai-compat
+      model: dsh
+      max_steps: 32                # mapped-step budget across the session
+```
+
+CI proves the bridge against the C53 scripted fixture peer with zero Node/dsh present:
+`crates/kian-dsh/tests/driver_bridge.rs` (driver), `crates/kian-superagent/tests/dsh_conformance.rs`
+(the C53 mapping conformance suite), and the mounted e2e `crates/kian-cli/tests/dsh_bridge.rs`
+— spawn/steer/complete, kill-9 takeover continuation, honest `interrupted` on child crash. The
+live run is env-gated and recorded in the
+[run log](#live-dsh-bridge-run-log-manual-env-gated) above.
+
+## Phase-4 acceptance checklist (S8 + S6)
+
+Scenario wording lives in [SPEC §2.5](docs/SPEC.md); proof is by the named tests.
+
+| Scenario | Card | Status | Proof |
+|----------|------|--------|-------|
+| S8 multi-replica takeover (two replicas, kill -9 mid-drain, no split-brain) | C47 + C52 | **demonstrated** (env-gated `KIAN_PG_URL`; default CI excluded) | `crates/kian-cli/tests/postgres_s8.rs::s8_two_replicas_kill9_takeover_no_split_brain` (real `kian serve` children, real kill -9, stale-epoch probe rejected); store/exec pg semantics suites in `kian-store`/`kian-exec` `tests/postgres.rs` |
+| S6 harness integration (dsh interaction unchanged, made durable) | C53 + C54 | **demonstrated — pending live run** | fixture-proven in CI: `kian-dsh/tests/driver_bridge.rs` + `kian-superagent/tests/dsh_conformance.rs` (every mapping row, replay byte-parity, pre-flight ordering, honest unknown-kind errors) and `kian-cli/tests/dsh_bridge.rs` (mounted e2e: spawn/steer/complete, kill-9 takeover, child crash → `interrupted`); the live run is env-gated (`KIAN_DSH_BIN`) and honestly recorded as *not executed* in the [run log](#live-dsh-bridge-run-log-manual-env-gated) — not claimed as CI-proven |
+| SDK freeze (wire-only client, golden bytes) | C46 | done | `crates/kian-sdk/tests/` — every typed method round-trips against a scripted server with golden request bytes; matchable typed errors |
+| GitHub channel + webhook receiver (verify-then-parse, admit-only) | C48 + C49 | done | `crates/kian-superagent/tests/github_channel.rs` (mapping, send honesty, fail-closed token) + `crates/kian-cli/tests/webhook_receiver.rs` (signature matrix, 413/415-before-signature, 429 + audit, idempotent replay) + the iron-rule grep in `tests/iron_rule.rs` |
+| Postgres export parity (S7 shape across backends) | C50 | done (env-gated) | `kian-store/tests/postgres.rs` — byte-identical JSONL export vs a sqlite store seeded with the same stream |
+
+Phase-4 final four-gate run (card C55 closeout, 2026-11-01): `cargo build --workspace`,
+`cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --all --
+--check` — all green with the gated env vars absent (postgres/dsh/github suites skip with log
+lines); recorded per-card in the kanban handoffs.

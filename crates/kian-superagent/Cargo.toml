@@ -33,6 +33,10 @@ tracing.workspace = true
 # code), never in the core; the crate's iron rule is unaffected (the
 # adapter reaches no execution surface).
 reqwest.workspace = true
+# C54: the S6 dsh mapping contract (C53) moved into the bridge crate
+# and is re-exported from `kian_superagent::dsh` — types only, the
+# bundle never drives the bridge (assembly mounts it config-gated).
+kian-dsh.workspace = true
 
 [dev-dependencies]
 kian-store.workspace = true

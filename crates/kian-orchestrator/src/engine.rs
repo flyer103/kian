@@ -671,6 +671,23 @@ where
         // Constraint 6: the row is durable BEFORE the wake fires. On
         // any store failure we return without touching the registry.
         let outcome = self.store.admit(input).await?;
+        // C52 wake transport (ADR-009 decision 4): publish the advisory
+        // cross-replica hint. The admit INSERT above is a single
+        // statement, so it has *committed* by the time we get here —
+        // the notify can never be observed before its row is visible
+        // (durable-before-wake holds for remote replicas too). The
+        // notify is best-effort: a failure is logged and skipped (a
+        // wake is losable by invariant; the sweep ticker and each
+        // replica's startup scan bound the miss). sqlite is a no-op —
+        // the in-process registry below is the single-process
+        // transport.
+        if let Err(e) = self.store.notify_wake(session).await {
+            tracing::warn!(
+                session = %session.0,
+                error = %e,
+                "wake notify failed (advisory — sweep/startup scan bounds the miss)"
+            );
+        }
         self.wake(session);
         Ok(outcome)
     }
@@ -781,19 +798,45 @@ where
     /// Per-session drain task: claim → heartbeat → episodes → end
     /// write → release, repeating while folded wakes remain. On
     /// interrupt, ownership is released with pendingWake deliberately
-    /// left registered (settle-on-abort, invariant 6).
+    /// left registered (settle-on-abort, invariant 6). A rejected claim
+    /// (fresh lease held by another holder, C47/ADR-009) is an honest
+    /// no-op exit: nothing was appended and the folded wake is left for
+    /// the live holder's sweep — never a retry loop (constraint 8).
     async fn drain_task(self: Arc<Self>, session: SessionId, interrupt: Arc<AtomicBool>) {
         let started_at = self.clock.now_ms();
         self.metrics.on_drain_started();
         let mut terminal_seen = false;
+        let mut claim_rejected = false;
         loop {
             match self.drain_once(&session, &interrupt).await {
                 Ok(DrainOutcome::Terminal) => terminal_seen = true,
                 Ok(_) => {}
                 Err(e) => {
-                    // A fenced-out (stale-epoch) or failed attempt: the
-                    // stream is left to the epoch winner — never guessed.
-                    tracing::warn!(session = %session.0, error = %e, "drain attempt ended");
+                    if matches!(
+                        &e,
+                        EngineError::Inbox(kian_store::InboxError::ClaimRejected { .. })
+                    ) {
+                        // C47 (ADR-009): another holder owns a fresh
+                        // lease. Honest no-op exit — the claim failed
+                        // before any append, so this drain wrote
+                        // nothing, and the live holder's sweep or wake
+                        // transport will service the input. Retrying
+                        // would ping-pong the epoch between replicas
+                        // (constraint 8: never a retry loop), so the
+                        // folded wake is deliberately left registered
+                        // and not re-taken here.
+                        claim_rejected = true;
+                        tracing::info!(
+                            session = %session.0,
+                            error = %e,
+                            "claim rejected: session freshly held elsewhere — no-op drain exit"
+                        );
+                    } else {
+                        // A fenced-out (stale-epoch) or failed attempt:
+                        // the stream is left to the epoch winner —
+                        // never guessed.
+                        tracing::warn!(session = %session.0, error = %e, "drain attempt ended");
+                    }
                 }
             }
             if terminal_seen {
@@ -804,6 +847,9 @@ where
             self.drains.remove(&session);
             if interrupt.load(Ordering::Acquire) {
                 break; // keep pendingWake registered for the resumer
+            }
+            if claim_rejected {
+                break; // advisory pending wake stays for the holder's sweep
             }
             if !terminal_seen && self.wakes.take(&session) {
                 tracing::debug!(session = %session.0, "folded wake: re-draining");
@@ -1096,10 +1142,11 @@ mod tests {
         WakeOutcome,
     };
     use crate::metrics::Metrics;
-    use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
+    use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
     use kian_core::model::{Epoch, InputRow, SessionId};
     use kian_core::seams::{LoopDriver, LoopOutcome};
     use kian_core::state::{SessionState, project};
+    use kian_store::AppendGuard;
     use kian_store::EventStore;
 
     const T0: u64 = 1_761_900_000_000;
@@ -2017,6 +2064,94 @@ mod tests {
         cleanup(&path);
     }
 
+    // -- C47: conditional claim admission at the engine (ADR-009) -----------
+
+    /// A second engine with a *different* holder waking a session whose
+    /// fresh lease is held by a live drain (mid-provider-turn, frozen
+    /// clock so the lease never expires) is an honest no-op exit: the
+    /// rejected claim precedes every append (nothing is written), the
+    /// drain task releases promptly — an unbounded retry loop would
+    /// keep the drain entry alive forever — and the live holder still
+    /// completes the work afterwards.
+    #[tokio::test]
+    async fn claim_rejected_drain_exits_as_noop_without_appending_or_retrying() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let clock = Arc::new(ManualClock::new(T0));
+        let driver = Arc::new(ScriptedDriver::scripted(vec![vec![
+            Step::BeginTurn,
+            Step::Gate(Arc::clone(&gate)),
+            Step::EndTurn,
+            Step::Outcome(LoopOutcome::TurnDone),
+            Step::TakeInputs,
+            Step::Outcome(LoopOutcome::Settled),
+        ]]));
+        let eng_a = Engine::with_clock(
+            store.clone(),
+            Arc::clone(&driver),
+            EngineConfig {
+                holder: "replica-a".into(),
+                lease_ttl_ms: 30_000,
+                heartbeat_interval_ms: 10_000,
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        let sid = eng_a.create_session().await.unwrap();
+        eng_a
+            .admit(sid, json!("input-1"), Some("i1".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await,
+            "A in provider turn with a fresh lease"
+        );
+
+        // Engine B — a different holder on the same DB — wakes. The
+        // lease is fresh (the clock is frozen), so admission refuses.
+        let eng_b = Engine::with_clock(
+            store.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig {
+                holder: "replica-b".into(),
+                lease_ttl_ms: 30_000,
+                heartbeat_interval_ms: 10_000,
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        let before = events_of(&store, sid).await.len();
+        assert_eq!(eng_b.wake(sid), WakeOutcome::Started);
+        assert!(
+            wait_for(5_000, || async { !eng_b.is_draining(&sid) }).await,
+            "rejected claim exits the drain — never a retry loop"
+        );
+        assert_eq!(
+            events_of(&store, sid).await.len(),
+            before,
+            "the rejected drain appended nothing"
+        );
+
+        // The live holder's drain finishes the work: no lost input.
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the live holder serviced the input"
+        );
+        assert!(
+            !eng_a.is_draining(&sid) && !eng_b.is_draining(&sid),
+            "both engines released"
+        );
+        cleanup(&path);
+    }
+
     // -- invariant 5: interrupt targets only the active chain ---------------
     /// (5) Interrupt of an idle or missing session is a no-op: no
     /// events, no drain, no state change.
@@ -2524,5 +2659,191 @@ mod tests {
         assert_eq!(store.head(sid).await.unwrap(), head, "no events appended");
         assert_eq!(eng.pending_wake_depth(), 0, "spurious wake dropped");
         cleanup(&path);
+    }
+
+    // -- C52: wake transport (postgres, env-gated) --------------------------
+
+    /// True when the env-gated postgres tests run (the C44/C50 pattern:
+    /// `KIAN_PG_URL` absent → SKIP with a log line, never fail).
+    fn pg_gated() -> bool {
+        match std::env::var("KIAN_PG_URL") {
+            Ok(url) if !url.is_empty() => true,
+            _ => {
+                eprintln!(
+                    "SKIP: KIAN_PG_URL is not set — postgres wake-transport tests disabled (C52 env gate)"
+                );
+                false
+            }
+        }
+    }
+
+    /// `postgres://…/db?opts` → `postgres://…/<other-db>?opts`.
+    fn pg_with_db(base: &str, db: &str) -> String {
+        let (path_part, query) = match base.split_once('?') {
+            Some((p, q)) => (p, format!("?{q}")),
+            None => (base, String::new()),
+        };
+        let scheme_end = path_part.find("://").map(|i| i + 3).unwrap_or(0);
+        let rest = &path_part[scheme_end..];
+        let root = match rest.find('/') {
+            Some(i) => path_part[..scheme_end + i].to_string(),
+            None => path_part.to_string(),
+        };
+        format!("{root}/{db}{query}")
+    }
+
+    /// One throwaway postgres database per gated test, opened as an
+    /// [`EventStore`] and dropped on finish.
+    async fn pg_test_store() -> Option<(EventStore, sqlx::postgres::PgPool, String)> {
+        if !pg_gated() {
+            return None;
+        }
+        let base = std::env::var("KIAN_PG_URL").unwrap();
+        let db = format!("kian_orch_c52_{}", Uuid::new_v4().simple());
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&base)
+            .await
+            .expect("connect KIAN_PG_URL");
+        sqlx::query(&format!("CREATE DATABASE {db}"))
+            .execute(&admin)
+            .await
+            .expect("create throwaway database");
+        let url = pg_with_db(&base, &db);
+        let store = EventStore::open_postgres(&url)
+            .await
+            .expect("open pg store");
+        Some((store, admin, url))
+    }
+
+    /// Drops the throwaway database behind [`pg_test_store`].
+    async fn pg_finish(admin: &sqlx::postgres::PgPool, url: &str) {
+        let db = url.rsplit('/').next().unwrap_or("");
+        let db = db.split('?').next().unwrap_or("");
+        let _ = sqlx::query(&format!("DROP DATABASE {db}"))
+            .execute(admin)
+            .await;
+    }
+
+    /// Seeds one event directly through the store (the dead replica's
+    /// own writes, replayed for the test).
+    async fn pg_seed_event(store: &EventStore, sid: SessionId, seq: u64, epoch: Epoch) {
+        let event = Event {
+            seq,
+            session: sid,
+            epoch,
+            ts: T0 + seq,
+            kind: if seq == 1 {
+                EventKind::SessionCreated
+            } else {
+                EventKind::DrainClaimed
+            },
+            bytes: json!({}),
+            version: SCHEMA_VERSION,
+        };
+        store
+            .append(
+                sid,
+                event,
+                AppendGuard {
+                    epoch,
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("seed append");
+    }
+
+    /// A notify the listener never saw (a simulated listener gap —
+    /// reconnect window, or the recipient replica was down) is still
+    /// serviced within one sweep period: the recovery sweep wakes the
+    /// expired-lease session, the C47 conditional claim admits the
+    /// takeover, and the drain completes the work. Correctness never
+    /// depends on the transport (invariant 6; ADR-009 decision 4) —
+    /// this is the named listener-gap recovery test, on postgres, with
+    /// a manual clock (no sleep-races).
+    #[tokio::test]
+    async fn pg_dropped_notify_is_serviced_within_one_sweep_period() {
+        let Some((store, admin, url)) = pg_test_store().await else {
+            return;
+        };
+        let ttl = 1_000u64;
+        let clock = Arc::new(ManualClock::new(T0));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig {
+                holder: "replica-b".into(),
+                lease_ttl_ms: ttl,
+                heartbeat_interval_ms: 25,
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+
+        // Replica A's world, seeded directly through the store: a
+        // running session (created + claimed), a durable input its
+        // admit parked, and a claim whose lease will expire. A's notify
+        // to replica B was dropped — B never listens in this test.
+        let sid = SessionId::new();
+        pg_seed_event(&store, sid, 1, Epoch(1)).await;
+        pg_seed_event(&store, sid, 2, Epoch(1)).await;
+        store
+            .admit(row(sid, 9001, json!("task-A")))
+            .await
+            .expect("replica A's durable admit");
+        store
+            .claim(sid, "replica-a", ttl, T0)
+            .await
+            .expect("replica A's claim");
+
+        // A dies silently. One sweep period later (clock-past-TTL — the
+        // exact ManualClock lease control the card asks for) B sweeps.
+        clock.advance(ttl + 1);
+        let woken = eng.recovery_sweep().await.expect("sweep");
+        assert_eq!(
+            woken,
+            vec![sid],
+            "the sweep surfaces the dead owner's session"
+        );
+
+        // Within that same sweep the takeover drain finishes the work.
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+                    && !eng.is_draining(&sid)
+            })
+            .await,
+            "the dropped notify's work must complete via the sweep takeover"
+        );
+        let events = events_of(&store, sid).await;
+        let ended: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::SessionEnded { .. }))
+            .collect();
+        assert_eq!(ended.len(), 1, "exactly one end write: {:?}", events);
+        assert!(matches!(
+            ended[0].kind,
+            EventKind::SessionEnded {
+                reason: EndReason::Completed
+            }
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::InputAdmitted)
+                .count(),
+            1,
+            "the parked input was consumed (NoLostWork): {:?}",
+            events
+        );
+        let epochs: Vec<u64> = events.iter().map(|e| e.epoch.0).collect();
+        assert!(
+            epochs.windows(2).all(|w| w[0] <= w[1]),
+            "epochs monotone across the takeover: {epochs:?}"
+        );
+
+        store.close().await;
+        pg_finish(&admin, &url).await;
+        admin.close().await;
     }
 }

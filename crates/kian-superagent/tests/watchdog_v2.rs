@@ -324,6 +324,10 @@ fn port_for_ctx() -> PortFor<DrainCtx> {
 /// `StoreRecall` shape).
 struct StoreRecallPort {
     store: EventStore,
+    /// Constructed for shape parity with the kian-cli recall port; this
+    /// suite never reads the index (pre-existing at C47: clippy 1.98
+    /// `dead_code`, fixed lint-only).
+    #[expect(dead_code)]
     spill: Mutex<SpillIndex>,
 }
 
@@ -410,6 +414,10 @@ struct Harness {
     engine: Arc<Engine<HarnessDriver>>,
     router: SessionId,
     watchdog: SessionId,
+    /// Kept for debug symmetry with worker/watchdog scripts; no test in
+    /// this suite reads it (pre-existing at C47: clippy 1.98 `dead_code`,
+    /// fixed lint-only).
+    #[expect(dead_code)]
     router_script: Arc<ScriptedProvider>,
     worker_script: Arc<ScriptedProvider>,
     watchdog_script: Arc<ScriptedProvider>,
@@ -615,7 +623,7 @@ fn trigger_event(event_id: &str, text: &str) -> ChannelEvent {
 fn fire_tick(h: &Harness, n: u64) {
     h.timer_clock
         .advance(n * TIMER_INTERVAL_MS + 1 - h.timer_clock.now_ms());
-    assert!(h.timer_clock.now_ms() >= n * TIMER_INTERVAL_MS + 1);
+    assert!(h.timer_clock.now_ms() > n * TIMER_INTERVAL_MS);
 }
 
 /// Adapts the engine to the `InboxWriter` port for the bootstrap test

@@ -1,0 +1,11 @@
+{"op":"send","frame":{"v":0,"type":"ready","logical_format":0}}
+{"op":"expect","frame":{"v":0,"type":"input","content":{"text":"deploy the service"}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/start","payload":{},"ts":1761900000001}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"system/message","payload":{"content":"You are the deploy agent."},"ts":1761900000002}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"user/message","payload":{"content":{"text":"deploy the service"}},"ts":1761900000003}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/start","payload":{},"ts":1761900000004}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/attempt","payload":{"status":"cancelled","request":{"model":"dsh-model","messages":[{"role":"system","content":"You are the deploy agent."},{"role":"user","content":{"text":"deploy the service"}}],"tools":[]}},"ts":1761900000005}}}
+{"op":"expect","frame":{"v":0,"type":"interrupt"}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/end","payload":{"outcome":"cancelled"},"ts":1761900000006}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/end","payload":{},"ts":1761900000007}}}
+{"op":"eof"}

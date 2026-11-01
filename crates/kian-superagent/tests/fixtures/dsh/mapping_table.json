@@ -1,0 +1,26 @@
+{
+  "rows": [
+    {"dsh": {"kind": "turn/start", "payload": {}, "ts": 1761900000001}, "absorbed": true},
+    {"dsh": {"kind": "system/message", "payload": {"content": "You are the deploy agent."}, "ts": 1761900000002}, "kian": "input/admitted"},
+    {"dsh": {"kind": "user/message", "payload": {"content": {"text": "deploy the service"}}, "ts": 1761900000003}, "kian": "input/admitted"},
+    {"dsh": {"kind": "turn/end", "payload": {}, "ts": 1761900000004}, "absorbed": true},
+    {"dsh": {"kind": "step/start", "payload": {}, "ts": 1761900000005}, "kian": "turn/start"},
+    {"dsh": {"kind": "assistant/attempt", "payload": {"status": "succeeded", "request": {"model": "dsh-model", "messages": [{"role": "system", "content": "You are the deploy agent."}, {"role": "user", "content": {"text": "deploy the service"}}], "tools": []}}, "ts": 1761900000006}, "kian": "step/request"},
+    {"dsh": {"kind": "assistant/message", "payload": {"content": {"text": "running build", "tool_calls": [{"id": "call-1", "name": "run_build", "arguments": {"target": "api"}}]}}, "ts": 1761900000007}, "kian": "assistant/message"},
+    {"dsh": {"kind": "tool/call", "payload": {"id": "call-1", "name": "run_build", "arguments": {"target": "api"}}, "ts": 1761900000008}, "kian": "tool/call"},
+    {"dsh": {"kind": "tool/result", "payload": {"call_id": "call-1", "output": {"ok": true}, "is_error": false}, "ts": 1761900000009}, "kian": "tool/result"},
+    {"dsh": {"kind": "step/end", "payload": {"outcome": "tool_calls", "tool_calls": 1}, "ts": 1761900000010}, "kian": "turn/end"},
+    {"dsh": {"kind": "user/message", "payload": {"content": {"text": "switch to plan B"}, "synthetic": true}, "ts": 1761900000011}, "kian": "input/admitted"},
+    {"dsh": {"kind": "step/start", "payload": {}, "ts": 1761900000012}, "kian": "turn/start"},
+    {"dsh": {"kind": "assistant/attempt", "payload": {"status": "failed", "request": {"model": "dsh-model", "messages": [{"role": "user", "content": {"text": "switch to plan B"}}], "tools": []}}, "ts": 1761900000013}, "kian": "step/request"},
+    {"dsh": {"kind": "step/end", "payload": {"outcome": "error"}, "ts": 1761900000014}, "kian": "turn/end"}
+  ],
+  "projected_context": [
+    {"role": "system", "content": "You are the deploy agent."},
+    {"role": "user", "content": {"text": "deploy the service"}},
+    {"role": "assistant", "content": {"text": "running build", "tool_calls": [{"id": "call-1", "name": "run_build", "arguments": {"target": "api"}}]}},
+    {"role": "assistant", "content": {"id": "call-1", "name": "run_build", "arguments": {"target": "api"}}},
+    {"role": "tool", "content": {"call_id": "call-1", "output": {"ok": true}, "is_error": false}},
+    {"role": "user", "content": {"text": "switch to plan B"}, "synthetic": true}
+  ]
+}

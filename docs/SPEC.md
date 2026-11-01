@@ -74,7 +74,10 @@ Kian is **not**:
 ```yaml
 # kian.yaml — single-file configuration (narrow waist)
 storage:
-  event_store: sqlite        # v0: sqlite | postgres
+  event_store: sqlite        # v0: sqlite | postgres (postgres implemented C51:
+                             #   requires storage.postgres.url_env — env-only URLs,
+                             #   never a config value — and an explicit unique
+                             #   drain.holder; both refuse to start otherwise)
   projections: sqlite
 
 models:                      # model slots (P6: determinism in Kian)
@@ -138,6 +141,10 @@ let events = session.events(..).await;         // audit = an event-stream interv
 | S5 BYOM | Endpoint daemon execution | Local repository commands | Cloud loop + endpoint execution; watchdog detects endpoint offline |
 | S6 harness integration | dsh loop as a worker | Harness config | dsh interaction unchanged, made durable |
 | S7 audit export | Event-stream interval export | Time/causal interval | A replayable audit package (byte-identical) |
+| S8 multi-replica takeover | S1 lifted to multi-process scale (defined round 4) | Two `kian serve` replicas over one postgres DB; the drain owner is `kill -9`'d mid-drain | The survivor's recovery sweep takes over the expired lease and completes: zero lost work, exactly one end write, a stale-epoch probe write from the dead replica rejected (NoSplitBrainWrite between processes) |
+
+S8 status: **demonstrated** via C52's env-gated evidence (`KIAN_PG_URL`-gated e2e, default CI
+excluded) — the definition lives here, once; the proof is recorded in §5's Phase-4 table.
 
 ## 3. Operations Interface
 
@@ -213,15 +220,36 @@ definitions S1–S7 in §2.5 are unchanged — only status is recorded here.
 | Plugin SDK + Footprint Ladder | Static plugin system + Footprint Ladder landed across Phases 1–3; SDK extraction → Phase 4 (below) | partial |
 | Audit export/replay tooling (S7) | `session export`/re-import (byte-identical, C14) + delegation-audit replay assertions (C28) — demonstrated by prior rounds, recorded here at closeout (C45); no new work | **demonstrated** |
 
-### Phase 4 (deferred from Phase 3)
+### Phase 4 (hosted foundation + SDK freeze + ecosystem surfaces, landed 2026-11-01)
 
-| Item | Reason (round-3 plan §3, summarized) |
-|------|--------------------------------------|
-| Postgres EventStore + multi-replica lease/fencing | No Phase-3 acceptance scenario requires it (S1–S5 are sqlite-proven; everything this round ran single-machine); effort XL, and mid-round store churn would destabilize exactly the goldens the recall/ablation cards depend on. DESIGN §12 already assigns multi-replica to the hosted layer; constraint 4 anticipates the one-statement end write |
-| S6 dsh harness integration | Ecosystem-gated: depends on dsh's own session-log semantics staying stable and touches an external repo; nothing in the article-sync backlog depends on it. Opens Phase 4 after `kian-sdk` so the embedding contract freezes once |
-| kian-sdk | The thin client extraction is small, but publishing an SDK freezes the control-plane API — do it after the Phase-3 additions (async completion inputs, recall surfaces, admission classes) settle so the freeze happens once |
-| GitHub adapter | Needs an inbound webhook HTTP surface + an auth/verification model — a new server-surface class, not just an adapter; no acceptance scenario beyond S4's shape that mock + lark don't already cover |
-| A2A boundaries | Remains exploration; the context-sharing boundary is the Session/Thread boundary |
+Round 4 (cards C46–C54, closeout C55) landed the items Phase 3 deferred. Scenario definitions
+S1–S8 in §2.5 are unchanged — only status is recorded here. Zero new event kinds this round;
+the durable set stays 20.
+
+| Item | Contents (card) | Status |
+|------|-----------------|--------|
+| Postgres EventStore + inbox (dual-backend) | `kian-store` backend dispatch (`Sqlite \| Postgres` enum, identical public surface); postgres dialect SQL (single-statement end write, CTE batch, PK-race classification through the HEAD path); export parity vs sqlite is the compat golden (C50) | landed |
+| Postgres exec + assembly | `kian-exec` dual-backend; `storage.event_store: postgres` with env-only URL (`storage.postgres.url_env`) and an explicit unique `drain.holder`, both fail-closed; one server, one database (C51) | landed |
+| Multi-replica lease/fencing | Conditional claim admission + unique holders (C47), postgres LISTEN/NOTIFY advisory wake transport (notify-after-commit; sweep + startup scan bound loss) and exec row leases (C52) — [ADR-009](../design/decisions/ADR-009-multi-replica-claim-admission.md). **S8 demonstrated** by the env-gated e2e (`KIAN_PG_URL`, default CI excluded) | landed |
+| kian-sdk | The wire-only embedded SDK (frozen C13/C14 surface, typed methods, SSE helper, matchable errors, golden wire fixtures); **frozen additive-only** after C46 — a breaking change requires a new plan round | landed |
+| GitHub adapter | Channel mapping + structured send (C48, untrusted-by-default, env-only token) and the verified webhook receiver — a fourth server surface, verify-then-parse, admit-only (C49, [ADR-011](../design/decisions/ADR-011-inbound-webhook-plane.md)) | landed |
+| S6 dsh harness integration | The dsh SessionEvent → existing-kind mapping contract + conformance fixture (C53, [ADR-010](../design/decisions/ADR-010-dsh-session-mapping.md)) and the `kian-dsh` bridge LoopDriver (C54, `superagent.harness.dsh`, default off) | **demonstrated — pending live run** (fixture-proven in CI; the live run is env-gated `KIAN_DSH_BIN` and recorded in the README run log, not claimed as CI-proven) |
+| A2A boundaries | The exploration note below — no cards this round | parked (note) |
+
+#### A2A boundary note (exploration; round-4 verdict, no cards)
+
+The context-sharing boundary in kian is the **Session/Thread boundary**: a Session is the
+maximal context-sharing unit, and Threads cross it only with explicit, auditable lineage. Any
+cross-instance A2A experiment (agents on different kian deployments, or a kian agent talking to
+a foreign agent) crosses that boundary with unshared context and distinct permission
+boundaries; it is therefore a *new surface class*, not an adapter, and has no acceptance
+scenario behind it yet. **Preconditions any future experiment must state before a card
+exists**: (1) the authenticated channel — how the remote party authenticates and how event
+provenance survives the hop (anything arriving over it is untrusted-marked by default, the C43
+rule); (2) the trust model — whose permission boundary evaluates whose actions, and how a
+foreign action is labeled in the audit stream; (3) the failure/honesty model — interrupt and
+recovery semantics across the boundary (interrupted ≠ failed applies unchanged). An experiment
+that skips stating these freezes speculation; none was attempted this round.
 
 ### Deferred (unchanged)
 | Item | Reason |

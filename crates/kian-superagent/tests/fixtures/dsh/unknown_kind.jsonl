@@ -1,0 +1,5 @@
+{"op":"send","frame":{"v":0,"type":"ready","logical_format":0}}
+{"op":"expect","frame":{"v":0,"type":"input","content":{"text":"deploy the service"}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"user/message","payload":{"content":{"text":"deploy the service"}},"ts":1761900000001}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"request/header","payload":{"reason":"series"},"ts":1761900000002}}}
+{"op":"eof"}

@@ -31,6 +31,23 @@
 //!   over the Feishu/Lark open APIs — chat-history poll receive (the
 //!   adapter-side, webhook-free ingestion), IM send, env-gated
 //!   credentials filled by assembly
+//! - [`github`] — `GitHubChannel`: the second *real* channel adapter
+//!   (C48), the S4 "group-chat message + CI events" family —
+//!   webhook-shaped receive (delivery id = the idempotency key;
+//!   verification lives in the C49 receiver surface, the adapter maps
+//!   only verified deliveries), REST-API send (PR review comment /
+//!   issue comment / PR description, resolving only on acceptance),
+//!   token env-only (`KIAN_GITHUB_TOKEN`; receive needs none),
+//!   untrusted by default (C43)
+//! - [`dsh`] — the S6 dsh mapping contract (C53, ADR-010, DESIGN §16):
+//!   dsh durable session events → the existing Kian durable-event subset
+//!   (bundle-level; no `kian-core` kind changes), the generation rule
+//!   (decode-before-map; foreign generations refused), the pre-flight
+//!   persist-what-you-send rule across the process boundary (request
+//!   bytes before the response is offered, or the bridge stops at an
+//!   honest negative result), and the steer/interrupt control
+//!   translation — the contract C54's bridge implements and any
+//!   dsh-side plugin must satisfy
 //! - [`worker`] — Thread delegation (C25): `WorkerSpawner`,
 //!   `WorkerLoopDriver` (a `LoopDriver` decorator adding thread lineage
 //!   and the evidence-gated completion report), the delegation wrapper,
@@ -66,6 +83,8 @@
 //!   `read_progress` over `RecallPort`; `intervene` as a steer row via
 //!   `InboxWriter`; `escalate` under the IM policy)
 
+pub mod dsh;
+pub mod github;
 pub mod inbox;
 pub mod lark;
 pub mod metrics;
@@ -83,6 +102,15 @@ pub mod toolpack;
 pub mod watchdog;
 pub mod worker;
 
+pub use dsh::{
+    BRIDGE_CONTRACT_VERSION, ContractError, ControlFrame, DshEvent, DshMapper, MapCtx, Mapped,
+    PeerFrame, PeerSession, SUPPORTED_LOGICAL_FORMAT, control_line, parse_peer_frame,
+};
+pub use github::{
+    API_VERSION, DEFAULT_API_BASE as GITHUB_DEFAULT_API_BASE, GITHUB_CHANNEL_TYPE, GitHubChannel,
+    GitHubConfig, GitHubError, SUBSCRIBER_CAPACITY as GITHUB_SUBSCRIBER_CAPACITY,
+    SUPPORTED_EVENT_TYPES,
+};
 pub use inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 pub use lark::{
     DEFAULT_API_BASE, DEFAULT_POLL_INTERVAL, LARK_CHANNEL_TYPE, LarkChannel, LarkConfig, LarkError,

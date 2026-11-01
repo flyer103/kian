@@ -889,23 +889,28 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "hmac",
  "kian-core",
+ "kian-dsh",
  "kian-endpoint",
  "kian-exec",
  "kian-llm",
  "kian-loop",
  "kian-orchestrator",
  "kian-plugin",
+ "kian-sdk",
  "kian-store",
  "kian-superagent",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sqlx",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -917,6 +922,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "kian-dsh"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kian-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -995,6 +1014,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlx",
  "thiserror",
  "tokio",
  "tracing",
@@ -1012,6 +1032,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kian-sdk"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1036,6 +1068,7 @@ dependencies = [
  "axum",
  "futures",
  "kian-core",
+ "kian-dsh",
  "kian-llm",
  "kian-loop",
  "kian-orchestrator",

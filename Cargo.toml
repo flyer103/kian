@@ -10,6 +10,8 @@ members = [
     "crates/kian-exec",
     "crates/kian-plugin",
     "crates/kian-superagent",
+    "crates/kian-sdk",
+    "crates/kian-dsh",
     "crates/kian-cli",
     "crates/kiand",
 ]
@@ -24,7 +26,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
@@ -41,12 +43,17 @@ futures = "0.3"
 dashmap = "6"
 wiremock = "0.6"
 sha2 = "0.10"
+# C49: HMAC-SHA256 verification of GitHub webhook deliveries
+# (RustCrypto, beside the existing sha2 — pinned to the 0.12 line so
+# the digest traits line up with sha2 0.10). Receiver-surface code in
+# kian-cli only — never in a core crate.
+hmac = "0.12"
 serde_yaml = "0.9"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
 ] }
 
-# Internal crates (DESIGN §7 as landed; kian-sdk is still ahead).
+# Internal crates (DESIGN §7 as landed).
 kian-core = { path = "crates/kian-core" }
 kian-store = { path = "crates/kian-store" }
 kian-orchestrator = { path = "crates/kian-orchestrator" }
@@ -56,6 +63,10 @@ kian-endpoint = { path = "crates/kian-endpoint" }
 kian-exec = { path = "crates/kian-exec" }
 kian-plugin = { path = "crates/kian-plugin" }
 kian-superagent = { path = "crates/kian-superagent" }
+# Wire-only SDK: own version (0.1.0), never a kian dependency inside.
+kian-sdk = { path = "crates/kian-sdk" }
+# C54: the S6 dsh bridge — depends on kian-core only (narrow waist).
+kian-dsh = { path = "crates/kian-dsh" }
 kian-cli = { path = "crates/kian-cli" }
 kiand = { path = "crates/kiand" }
 
