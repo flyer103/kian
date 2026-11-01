@@ -115,6 +115,12 @@ fn is_context_bearing(kind: &EventKind) -> bool {
         | EventKind::ThreadCompleted
         | EventKind::EvidenceVerdict
         | EventKind::ChannelDelivered => false,
+        // C31 Phase-3 addition: the spilled raw is deliberately kept
+        // out of the model context — the Inline form carried by its
+        // sibling `input/admitted` is what the model sees. Named here
+        // (not silently in the catch-all) per the C18 guard pattern: a
+        // future context-bearing addition must edit this match.
+        EventKind::InputSpilled => false,
         _ => false,
     }
 }
@@ -602,6 +608,52 @@ mod tests {
             json!({"role": "user", "content": "no"}),
         );
         assert_eq!(derive_model_context(&only_new.build()).unwrap(), Vec::new());
+    }
+
+    /// C31: `input/spilled` is non-context-bearing — a stream containing
+    /// it derives a byte-identical context to the same stream without it
+    /// (the spilled raw is audit data for the recall path, never a
+    /// context mutation; the Inline form in its sibling
+    /// `input/admitted` is what the model sees), and its payload is
+    /// never parsed even when message-shaped.
+    #[test]
+    fn input_spilled_leaves_model_context_unchanged() {
+        let spill = json!({
+            "event_id": "evt-91",
+            "channel": "mock-im",
+            "topic": "worker-1",
+            "raw": {"text": "@kian deploy", "attachments": [{"type": "file", "size": 4821}]}
+        });
+
+        let mut with = started();
+        with.user("hello");
+        with.push(EventKind::InputSpilled, spill.clone());
+        with.assistant(json!("working"));
+        // A second spill directly between context-bearing messages —
+        // position must not matter, only the kind does.
+        with.push(EventKind::InputSpilled, spill);
+
+        let mut without = started();
+        without.user("hello");
+        without.assistant(json!("working"));
+
+        let ctx_with = derive_model_context(&with.build()).unwrap();
+        let ctx_without = derive_model_context(&without.build()).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(
+            context_to_bytes(&ctx_with),
+            context_to_bytes(&ctx_without),
+            "input/spilled must not change a single context byte"
+        );
+
+        // A message-shaped spill payload is skipped unparsed — even a
+        // payload that would be malformed for a context-bearing kind
+        // must not error here.
+        let mut shaped = started();
+        shaped.user("q");
+        shaped.push(EventKind::InputSpilled, json!({"no_role": true}));
+        let ctx = derive_model_context(&shaped.build()).unwrap();
+        assert_eq!(ctx, vec![user_msg("q")]);
     }
 
     /// A2: assistant/message bytes are the truth — content passes through

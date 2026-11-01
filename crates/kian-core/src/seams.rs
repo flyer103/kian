@@ -235,6 +235,18 @@ pub struct ChannelEvent {
     pub event_id: String,
     /// Optional routing topic (subscription rules may match on it).
     pub topic: Option<String>,
+    /// Optional sender provenance (adapter-defined identity — the id,
+    /// name, or object the channel reports). Opaque to the core; the
+    /// bundle's admission-class vocabulary keys on it (C36).
+    /// `#[serde(default)]`: old JSON parses unchanged with `None`.
+    #[serde(default)]
+    pub sender: Option<Value>,
+    /// Optional group/chat provenance (adapter-defined — the chat or
+    /// group the event arrived in, when distinct from the routing
+    /// topic). Opaque to the core (C36).
+    /// `#[serde(default)]`: old JSON parses unchanged with `None`.
+    #[serde(default)]
+    pub group: Option<String>,
     /// Verbatim event payload, opaque to the core.
     pub payload: Value,
     /// Observed at, unix epoch milliseconds.
@@ -370,6 +382,8 @@ mod tests {
             channel: "mock-im".into(),
             event_id: "evt-7".into(),
             topic: Some("worker-1".into()),
+            sender: Some(json!({"id": "u-42", "name": "yifei"})),
+            group: Some("chat-9".into()),
             payload: json!({"text": "@kian deploy"}),
             ts_ms: 1_762_000_000_000,
         };
@@ -414,6 +428,36 @@ mod tests {
         // Errors stay display-stable (classification reads kinds, not
         // strings, but the messages are human-facing).
         assert_eq!(ChannelError::Timeout.to_string(), "delivery timed out");
+    }
+
+    /// Old `ChannelEvent` JSON (pre-C36, no `sender`/`group`) parses
+    /// unchanged with `None` defaults for the new fields, and the new
+    /// fields serialize as explicit nulls — additive, never breaking.
+    #[test]
+    fn old_channel_event_json_parses_with_default_provenance() {
+        use super::ChannelEvent;
+
+        let old = json!({
+            "channel": "mock-im",
+            "event_id": "evt-legacy",
+            "topic": null,
+            "payload": {"text": "hi"},
+            "ts_ms": 1_762_000_000_000u64,
+        });
+        let event: ChannelEvent = serde_json::from_value(old).unwrap();
+        assert_eq!(event.channel, "mock-im");
+        assert_eq!(event.event_id, "evt-legacy");
+        assert_eq!(event.topic, None);
+        assert_eq!(event.sender, None);
+        assert_eq!(event.group, None);
+
+        // The new fields serialize as nulls (serde default visibility):
+        // a round trip preserves equality either way.
+        let ser = serde_json::to_value(&event).unwrap();
+        assert_eq!(ser["sender"], serde_json::Value::Null);
+        assert_eq!(ser["group"], serde_json::Value::Null);
+        let back: ChannelEvent = serde_json::from_value(ser).unwrap();
+        assert_eq!(back, event);
     }
 
     /// The seam support types round-trip through JSON; policy rules come

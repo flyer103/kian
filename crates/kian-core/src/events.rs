@@ -180,6 +180,19 @@ pub enum EventKind {
     #[serde(rename = "channel/delivered")]
     ChannelDelivered,
 
+    /// Spilled raw channel payload (C31, Phase 3): the verbatim channel
+    /// payload kept in-stream but out of context. Payload schema (owned
+    /// by C31): `{"event_id": str, "channel": str, "topic": str|null,
+    /// "raw": <verbatim channel payload>}`. Appended by the drain's
+    /// consumption write in the same fenced batch as its sibling
+    /// `input/admitted` (the Inline form is what the model sees; this
+    /// event is what recall reads back from the stream — constraint 1:
+    /// the stream stays the sole truth, no side store owns the raw).
+    /// Drain activity (the additions-only default mapping); not
+    /// context-bearing.
+    #[serde(rename = "input/spilled")]
+    InputSpilled,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -209,6 +222,7 @@ impl EventKind {
             Self::ThreadCompleted => "thread/completed",
             Self::EvidenceVerdict => "evidence/verdict",
             Self::ChannelDelivered => "channel/delivered",
+            Self::InputSpilled => "input/spilled",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -276,6 +290,7 @@ mod tests {
                 EventKind::ChannelDelivered,
                 r#"{"kind":"channel/delivered"}"#,
             ),
+            (EventKind::InputSpilled, r#"{"kind":"input/spilled"}"#),
             (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
@@ -289,11 +304,12 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the nineteen kinds above (the
+        // The durable set is exactly the twenty kinds above (the
         // fourteen frozen by C2 + the additive C14
-        // `recovery/budget-reset` + the four additive C18 Phase-2 kinds;
-        // additions-only, no renames).
-        assert_eq!(cases.len(), 19);
+        // `recovery/budget-reset` + the four additive C18 Phase-2 kinds
+        // + the additive C31 `input/spilled`; additions-only, no
+        // renames).
+        assert_eq!(cases.len(), 20);
     }
 
     /// Additions-only regression (C18): every pre-existing kind's golden
@@ -342,6 +358,63 @@ mod tests {
             let back: EventKind = serde_json::from_str(golden).unwrap();
             assert_eq!(&back, kind);
         }
+    }
+
+    /// Additions-only regression (C31): the four C18 Phase-2 kinds' golden
+    /// bytes are frozen exactly as they landed in Phase 2. Together with
+    /// the Phase-1 frozen set above this pins every one of the nineteen
+    /// pre-C31 kinds, independently of the growing `cases` array, so the
+    /// C31 addition cannot disturb a single existing serialization byte.
+    #[test]
+    fn additions_only_regression_phase2_kind_bytes_are_frozen() {
+        let frozen_phase2: [(EventKind, &str); 4] = [
+            (EventKind::ThreadStarted, r#"{"kind":"thread/started"}"#),
+            (EventKind::ThreadCompleted, r#"{"kind":"thread/completed"}"#),
+            (EventKind::EvidenceVerdict, r#"{"kind":"evidence/verdict"}"#),
+            (
+                EventKind::ChannelDelivered,
+                r#"{"kind":"channel/delivered"}"#,
+            ),
+        ];
+        for (kind, golden) in &frozen_phase2 {
+            assert_eq!(
+                &serde_json::to_string(kind).unwrap(),
+                golden,
+                "pre-existing kind {:?} changed bytes (additions-only violated)",
+                kind
+            );
+            let back: EventKind = serde_json::from_str(golden).unwrap();
+            assert_eq!(&back, kind);
+        }
+    }
+
+    /// The C31 `input/spilled` kind round-trips through the full envelope
+    /// with a payload of its tabled schema (§2 of the round-3 plan) riding
+    /// opaquely in `bytes` (JSONL-export shape, the C14 replay path).
+    #[test]
+    fn input_spilled_envelope_round_trips_with_tabled_payload() {
+        let payload = json!({
+            "event_id": "evt-91",
+            "channel": "mock-im",
+            "topic": "worker-1",
+            "raw": {"text": "@kian deploy", "attachments": [{"type": "file", "size": 4821}]}
+        });
+        let ev = Event {
+            seq: 5,
+            session: SessionId(Uuid::nil()),
+            epoch: Epoch(2),
+            ts: 1_762_000_000_000,
+            kind: EventKind::InputSpilled,
+            bytes: payload.clone(),
+            version: SCHEMA_VERSION,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        let back: Event = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, ev);
+        assert_eq!(tag_of(&line), "input/spilled");
+        // The verbatim raw survives the round trip byte-identically —
+        // the spill is the audit copy the recall path reads back.
+        assert_eq!(back.bytes, payload);
     }
 
     /// Each C18 Phase-2 kind round-trips through the full envelope with

@@ -828,6 +828,74 @@ mod tests {
         assert_eq!(project(&b.build()), Ok(Completed));
     }
 
+    /// C31: `input/spilled` maps to drain activity via the additions-only
+    /// default — it owns no trigger-table row (no state transition of its
+    /// own; it rides the drain's consumption write).
+    #[test]
+    fn trigger_mapping_for_input_spilled_is_the_additions_only_default() {
+        use super::TransitionTrigger as T;
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::InputSpilled),
+            T::DrainActivity
+        );
+    }
+
+    /// The C31 spill shape: `input/spilled` is appended mid-drain by the
+    /// consumption write right after its sibling `input/admitted` and
+    /// the stream projects through to a terminal end.
+    #[test]
+    fn project_input_spilled_legal_mid_drain_after_its_sibling_admitted() {
+        let mut b = StreamBuilder::new(27);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::InputAdmitted)
+            .push(EventKind::InputSpilled)
+            .push(EventKind::StepRequest)
+            .push(EventKind::AssistantMessage)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            });
+        assert_eq!(project(&b.build()), Ok(Completed));
+    }
+
+    /// `input/spilled` defaults to drain activity, so it is rejected
+    /// while `idle` — the spill is a drain-time write, never a
+    /// control-plane inbox write.
+    #[test]
+    fn project_input_spilled_rejected_while_idle() {
+        let mut b = StreamBuilder::new(28);
+        b.push(EventKind::SessionCreated)
+            .push(EventKind::InputAdmitted)
+            .push(EventKind::InputSpilled);
+        assert_eq!(
+            project(&b.build()),
+            Err(ProjectionError::Illegal(super::IllegalTransition {
+                from: Some(Idle),
+                on: DrainActivity,
+            }))
+        );
+    }
+
+    /// Terminal states are frozen: `input/spilled` after a terminal end
+    /// write is an illegal transition.
+    #[test]
+    fn project_input_spilled_rejected_from_terminal() {
+        let mut b = StreamBuilder::new(29);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            })
+            .push(EventKind::InputSpilled);
+        assert_eq!(
+            project(&b.build()),
+            Err(ProjectionError::Illegal(super::IllegalTransition {
+                from: Some(Completed),
+                on: DrainActivity,
+            }))
+        );
+    }
+
     #[test]
     fn project_empty_stream_is_an_error() {
         assert_eq!(project(&[]), Err(ProjectionError::EmptyStream));
