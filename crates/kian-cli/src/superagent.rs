@@ -51,7 +51,7 @@ use kian_orchestrator::{DrainCtx, Engine, WakeOutcome};
 use kian_store::EventStore;
 use kian_superagent::{
     AdmitReceipt, InboxWriteError, InboxWriter, LineagePlan, MockChannel, PassthroughRegistry,
-    PortFor, RouterDriver, RouterInbox, RouterProfile, StreamPort, StreamPortError,
+    PortFor, RouterDriver, RouterInbox, RouterMetrics, RouterProfile, StreamPort, StreamPortError,
     SubscriptionService, WorkerLoopDriver, lineage_plan, worker_sessions,
 };
 
@@ -199,6 +199,118 @@ pub fn port_for_ctx() -> PortFor<DrainCtx> {
 }
 
 // ---------------------------------------------------------------------------
+// The RecallPort over the store's public scan (the C34 read surface)
+// ---------------------------------------------------------------------------
+
+/// Assembly's [`kian_superagent::RecallPort`]: cross-session reads
+/// served over the store's existing public scan API — reads only, no
+/// execution surface, no writes. Holds the disposable spill index (a
+/// location cache rebuilt at startup; the spilled raws themselves live
+/// only in the streams — constraint 1).
+pub struct StoreRecall {
+    store: EventStore,
+    spill: Mutex<kian_superagent::SpillIndex>,
+}
+
+impl StoreRecall {
+    /// A fresh port over `store` with an empty spill index (the
+    /// startup rebuild fills it).
+    pub fn new(store: EventStore) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            spill: Mutex::new(kian_superagent::SpillIndex::new()),
+        })
+    }
+
+    /// Rebuilds the spill index at startup: scan the Router stream,
+    /// then every worker stream it names (the [`worker_sessions`]
+    /// derivation — the same universe `PassthroughRegistry::rebuild`
+    /// scans), and fold every `input/spilled` event into the index.
+    /// Idempotent and disposable: drop the index and run it again over
+    /// the same log and the same map comes back.
+    ///
+    /// v1 boundary (C34): the scanned sessions are the bundle's whole
+    /// channel-fed universe. `input/spilled` events are written only by
+    /// the drain's consumption of a spill envelope row, and those rows
+    /// are admitted only by the subscription service — to the Router
+    /// or to spawned workers. A spill on a session unreachable from
+    /// the Router stream therefore cannot exist today; if a future
+    /// route widens admission, this scan list widens with it.
+    pub async fn rebuild_spill_index(&self, router: SessionId) -> Result<(), String> {
+        let mut events = self
+            .store
+            .rebuild(router)
+            .await
+            .map_err(|e| format!("spill index rebuild (router): {e}"))?;
+        for worker in worker_sessions(&events) {
+            let worker_events = self
+                .store
+                .rebuild(worker)
+                .await
+                .map_err(|e| format!("spill index rebuild (worker): {e}"))?;
+            events.extend(worker_events);
+        }
+        let index = kian_superagent::SpillIndex::rebuild(&events);
+        tracing::info!(
+            spills = index.len(),
+            "superagent: spill index rebuilt from streams"
+        );
+        *self.spill.lock().expect("spill index lock") = index;
+        Ok(())
+    }
+}
+
+impl kian_superagent::RecallPort for StoreRecall {
+    fn read_events(
+        &self,
+        session: SessionId,
+        since_seq: u64,
+        until_seq: u64,
+    ) -> BoxFuture<'static, Result<Vec<Event>, kian_superagent::RecallPortError>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            if since_seq >= until_seq {
+                // An empty window is an honest empty result, not an
+                // error — the port refuses nothing read-only.
+                return Ok(Vec::new());
+            }
+            store
+                .scan(session, since_seq..until_seq)
+                .await
+                .map_err(|e| kian_superagent::RecallPortError::Read(e.to_string()))
+        })
+    }
+
+    fn list_threads(
+        &self,
+        parent: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<(String, SessionId)>, kian_superagent::RecallPortError>>
+    {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let events = store
+                .rebuild(parent)
+                .await
+                .map_err(|e| kian_superagent::RecallPortError::Read(e.to_string()))?;
+            Ok(kian_superagent::thread_bindings(&events))
+        })
+    }
+
+    fn spill_location(
+        &self,
+        event_id: &str,
+    ) -> BoxFuture<'static, Result<Option<(SessionId, u64)>, kian_superagent::RecallPortError>>
+    {
+        let located = self
+            .spill
+            .lock()
+            .expect("spill index lock")
+            .lookup(event_id);
+        Box::pin(async move { Ok(located) })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The assembled driver
 // ---------------------------------------------------------------------------
 
@@ -240,6 +352,11 @@ pub struct SuperAgentDriver {
     router_side: RouterDriver<ReActLoop>,
     worker_side: WorkerLoopDriver<ReActLoop>,
     default_side: Arc<ReActLoop>,
+    /// The resident watchdog session (C40), when configured: routed to
+    /// its own driver (the same residency shape as the Router's) so
+    /// each admitted tick is one judge turn.
+    watchdog: Option<SessionId>,
+    watchdog_side: Option<RouterDriver<ReActLoop>>,
 }
 
 impl SuperAgentDriver {
@@ -257,7 +374,19 @@ impl SuperAgentDriver {
             router_side,
             worker_side,
             default_side,
+            watchdog: None,
+            watchdog_side: None,
         }
+    }
+
+    /// Attaches the resident watchdog session and its driver (C40).
+    /// Additive: unconfigured (the default) keeps the pre-C40 routing
+    /// exactly.
+    #[must_use]
+    pub fn with_watchdog(mut self, session: SessionId, side: RouterDriver<ReActLoop>) -> Self {
+        self.watchdog = Some(session);
+        self.watchdog_side = Some(side);
+        self
     }
 }
 
@@ -267,6 +396,11 @@ impl LoopDriver for SuperAgentDriver {
     fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
         if ctx.session() == self.router {
             return self.router_side.drive(ctx);
+        }
+        if let (Some(watchdog), Some(side)) = (self.watchdog, &self.watchdog_side)
+            && ctx.session() == watchdog
+        {
+            return side.drive(ctx);
         }
         // Classify by stream content before the first provider turn:
         // worker streams carry the delegation wrapper (or already carry
@@ -356,6 +490,10 @@ pub struct SubscriptionMetrics {
     routed: std::sync::atomic::AtomicU64,
     routed_deduplicated: std::sync::atomic::AtomicU64,
     dropped_no_rule: std::sync::atomic::AtomicU64,
+    /// C36 admission-class `ignore` drops (the DroppedNoRule shape).
+    dropped_ignored: std::sync::atomic::AtomicU64,
+    /// C36 `explicit-only` drops without an explicit-request signal.
+    dropped_not_explicit: std::sync::atomic::AtomicU64,
     failures: std::sync::atomic::AtomicU64,
 }
 
@@ -370,6 +508,8 @@ impl SubscriptionMetrics {
             "routed": self.routed.load(Ordering::Relaxed),
             "routed_deduplicated": self.routed_deduplicated.load(Ordering::Relaxed),
             "dropped_no_rule": self.dropped_no_rule.load(Ordering::Relaxed),
+            "dropped_ignored": self.dropped_ignored.load(Ordering::Relaxed),
+            "dropped_not_explicit": self.dropped_not_explicit.load(Ordering::Relaxed),
             "failures": self.failures.load(Ordering::Relaxed),
         })
     }
@@ -399,8 +539,26 @@ pub fn spawn_subscription_consumers(
                                 SubscriptionMetrics::bump(&metrics.routed_deduplicated);
                             }
                         }
+                        // C38 fan-out: one routed counter tick per
+                        // admitted subscriber, dedup per row.
+                        Ok(RoutingOutcome::FannedOut { admitted }) => {
+                            for admission in admitted {
+                                SubscriptionMetrics::bump(&metrics.routed);
+                                if admission.deduplicated {
+                                    SubscriptionMetrics::bump(&metrics.routed_deduplicated);
+                                }
+                            }
+                        }
                         Ok(RoutingOutcome::DroppedNoRule) => {
                             SubscriptionMetrics::bump(&metrics.dropped_no_rule);
+                        }
+                        // C36 fast-path drops: audit line by the
+                        // service, counter here (the DroppedNoRule shape).
+                        Ok(RoutingOutcome::DroppedIgnored) => {
+                            SubscriptionMetrics::bump(&metrics.dropped_ignored);
+                        }
+                        Ok(RoutingOutcome::DroppedNotExplicit) => {
+                            SubscriptionMetrics::bump(&metrics.dropped_not_explicit);
                         }
                         Err(_) => {
                             SubscriptionMetrics::bump(&metrics.failures);
@@ -643,10 +801,22 @@ pub struct SuperAgentRuntime {
     pub worker_gate: EvidenceGateConfig,
     /// Subscription outcome counters.
     pub subscription_metrics: Arc<SubscriptionMetrics>,
+    /// Router judge-turn batching metrics (C41: batch size, wall
+    /// duration, amortized per-decision latency — recorded by
+    /// `RouterDriver`, read-only here).
+    pub router_metrics: Arc<RouterMetrics>,
     /// The heartbeat watchdog (when endpoints are configured).
     pub watchdog: Option<Arc<HeartbeatWatchdog>>,
     /// The remote-exec services (when endpoints are configured).
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+    /// The completion bridge's counters (C37; present when the async
+    /// pair is mounted).
+    pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
+    /// The cross-session read port (C34): `read_events` /
+    /// `list_threads` / `spill_location` over the store's public scan,
+    /// with the startup-rebuilt spill index. Read-only by
+    /// construction; the recall toolpack (C35) mounts on it.
+    pub recall: Arc<StoreRecall>,
     /// Consumer + bridge tasks; kept alive for the server's lifetime.
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -659,11 +829,13 @@ impl SuperAgentRuntime {
 
     /// The `/metrics` superagent fragment: evidence-verdict,
     /// subscription, channel-policy (a pure projection of the Router
-    /// stream — workers never deliver; policies are Router-side) and
-    /// watchdog counters.
+    /// stream — workers never deliver; policies are Router-side),
+    /// router batching (C41: the §7.2 series the resident Router's
+    /// driver records) and watchdog counters.
     pub async fn metrics_report(&self, store: &EventStore) -> serde_json::Value {
         let verdicts = self.worker_gate.counters.snapshot();
         let subscriptions = self.subscription_metrics.snapshot();
+        let router_batching = self.router_metrics.snapshot();
 
         // Channel-policy counts derive from the Router's committed
         // stream: `channel/delivered` events carry policy/words/truncated.
@@ -704,6 +876,7 @@ impl SuperAgentRuntime {
                 "failed": verdicts.failed,
             },
             "subscriptions": subscriptions,
+            "router_batching": router_batching,
             "channel_policy": {
                 "delivered": delivered,
                 "im": im,
@@ -711,6 +884,7 @@ impl SuperAgentRuntime {
                 "truncated": truncated,
             },
             "watchdog": watchdog,
+            "async_bridge": self.async_metrics.as_ref().map(|m| m.snapshot()),
         })
     }
 }
@@ -731,14 +905,37 @@ pub struct SuperAgentServices {
     pub subscriptions: Arc<SubscriptionService>,
     /// Mock channels by configured name (injection surface).
     pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
+    /// Lark channels by configured name (C44) — the real Feishu
+    /// adapters, registered alongside the mocks.
+    pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
     /// Adapters in config order (consumer spawn order).
     pub adapters: Vec<Arc<dyn ChannelAdapter>>,
     /// The worker's evidence gate config (shared counters).
     pub worker_gate: EvidenceGateConfig,
     /// Subscription outcome counters.
     pub subscription_metrics: Arc<SubscriptionMetrics>,
+    /// Router judge-turn batching metrics (C41) — the handle the
+    /// driver records into and `/metrics` snapshots.
+    pub router_metrics: Arc<RouterMetrics>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+    /// The async-jobs engine (C37), present when `superagent.async_tools`
+    /// is on. The startup sweep re-drives and redelivers after the
+    /// inbox rebuild.
+    pub async_jobs: Option<Arc<kian_exec::AsyncJobs>>,
+    /// The completion bridge's counters (C37), for `/metrics`.
+    pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
+    /// The cross-session read port (C34): reads over the store's
+    /// public scan plus the disposable spill index, rebuilt by
+    /// `start_services` after the inbox rebuild.
+    pub recall: Arc<StoreRecall>,
+    /// The timer input sources (C40): their run tasks spawn in
+    /// `start_services` after the subscription consumers (a timer with
+    /// no consumer would emit ticks into the void).
+    pub timers: Vec<Arc<kian_superagent::TimerChannel>>,
+    /// The resident watchdog profile (C40), when configured: bootstrapped
+    /// (idempotent prompt admit + wake) in `start_services`.
+    pub watchdog: Option<kian_superagent::WatchdogProfile>,
 }
 
 /// Post-`startup_rebuild` services start (the card's load-bearing
@@ -774,6 +971,15 @@ pub async fn start_services(
     );
     services.subscriptions.install_registry(registry);
 
+    // 1b. Rebuild the disposable spill index (C34) over the same
+    //     scanned universe — a pure location projection, reads only.
+    services
+        .recall
+        .rebuild_spill_index(router)
+        .await
+        .map_err(|e| format!("spill index rebuild: {e}"))?;
+    record(&order, "spill_index_rebuilt");
+
     // 2. Subscription consumers (AFTER the rebuild — no event is
     //    routed against an empty registry).
     let consumers = spawn_subscription_consumers(
@@ -782,6 +988,10 @@ pub async fn start_services(
         Arc::clone(&services.subscription_metrics),
     );
     record(&order, "subscriptions_started");
+
+    // 2b. C40: the timers' run tasks spawn in step 4b below —
+    //     strictly after the consumers exist (a tick emitted before
+    //     any subscriber is a tick nobody hears).
 
     // 3. Watchdog + bridge (needs the engine-backed inbox).
     let mut watchdog = None;
@@ -813,6 +1023,18 @@ pub async fn start_services(
         record(&order, "watchdog_started");
     }
 
+    // 3b. C37: the async bridge's startup sweep, strictly after the
+    //     inbox rebuild (admitted completions must never race an empty
+    //     wake registry): re-offer settled rows (a crash between settle
+    //     and deliver loses nothing — the admit key dedupes), then
+    //     re-drive pending/inflight jobs (observers re-attach through
+    //     the C20 queue; one row, one dispatch, ever).
+    if let Some(jobs) = &services.async_jobs {
+        jobs.redeliver_settled().await;
+        jobs.redrive_pending().await;
+        record(&order, "async_jobs_redriven");
+    }
+
     // 4. Bootstrap the resident Router (idempotent admit + wake; the
     //    first hold appends `session/created`).
     services
@@ -824,14 +1046,39 @@ pub async fn start_services(
     record(&order, "router_bootstrapped");
 
     let mut tasks = consumers;
+
+    // 4b. C40: bootstrap the resident watchdog session (idempotent
+    //     prompt admit + wake; the first hold appends
+    //     `session/created`), then start the timers' run tasks —
+    //     after this point every emitted tick reaches a live consumer
+    //     and a bootstrapped judge.
+    if let Some(watchdog_profile) = &services.watchdog {
+        watchdog_profile
+            .bootstrap(services.router_inbox.as_ref())
+            .await
+            .map_err(|e| format!("watchdog bootstrap: {e}"))?;
+        engine.wake(watchdog_profile.session);
+        record(&order, "watchdog_bootstrapped");
+    }
+    for timer in &services.timers {
+        let poll = (timer.config().interval_ms / 20).clamp(10, 1_000);
+        tasks.push(timer.spawn(Duration::from_millis(poll)));
+    }
+    if !services.timers.is_empty() {
+        record(&order, "timers_started");
+    }
+
     tasks.extend(bridge);
     Ok(SuperAgentRuntime {
         router,
         channels: services.mock_channels.clone(),
         worker_gate: clone_gate(&services.worker_gate),
         subscription_metrics: Arc::clone(&services.subscription_metrics),
+        router_metrics: Arc::clone(&services.router_metrics),
         watchdog,
         remote: services.remote.clone(),
+        async_metrics: services.async_metrics.clone(),
+        recall: Arc::clone(&services.recall),
         tasks,
     })
 }
@@ -955,5 +1202,110 @@ mod tests {
             futures::executor::block_on(inbox.admit(session, serde_json::json!(1), None))
         }));
         assert!(result.is_err(), "admit before install must panic");
+    }
+
+    /// C36: the consumer loop counts admission-class drops in the
+    /// `DroppedNoRule` shape — `ignore` bumps `dropped_ignored`,
+    /// `explicit-only` without a signal bumps `dropped_not_explicit`,
+    /// and nothing is routed.
+    #[tokio::test]
+    async fn admission_class_drops_bump_their_counters() {
+        use kian_superagent::{
+            AdmissionClass, AdmissionClassRule, AdmissionClassTable, Route, RuleMatcher,
+            SubscriptionRule, SubscriptionRuleSet,
+        };
+
+        struct CountingInbox;
+        impl InboxWriter for CountingInbox {
+            fn admit(
+                &self,
+                _session: SessionId,
+                _payload: serde_json::Value,
+                _key: Option<String>,
+            ) -> futures::future::BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>>
+            {
+                Box::pin(async {
+                    Ok(AdmitReceipt {
+                        deduplicated: false,
+                    })
+                })
+            }
+            fn wake(&self, _session: SessionId) -> WakeOutcome {
+                WakeOutcome::Folded
+            }
+        }
+
+        let channel = Arc::new(kian_superagent::MockChannel::new("mock-im"));
+        let rules = SubscriptionRuleSet::new(vec![SubscriptionRule {
+            channel: "mock-im".into(),
+            matcher: RuleMatcher::Always,
+            route: Route::Router,
+        }]);
+        let classes = AdmissionClassTable::new(vec![AdmissionClassRule {
+            channel: "mock-im".into(),
+            topic: None,
+            sender: None,
+            class: AdmissionClass::ExplicitOnly,
+        }]);
+        let service = Arc::new(kian_superagent::SubscriptionService::with_classes(
+            SessionId::new(),
+            rules,
+            classes,
+            Arc::new(CountingInbox) as Arc<dyn InboxWriter>,
+        ));
+        let metrics = Arc::new(SubscriptionMetrics::default());
+        let tasks = super::spawn_subscription_consumers(
+            Arc::clone(&service),
+            vec![Arc::clone(&channel) as Arc<dyn ChannelAdapter>],
+            Arc::clone(&metrics),
+        );
+
+        // A non-mention event drops (explicit-only without a signal);
+        // a mention is admitted.
+        channel.inject(None, serde_json::json!({"text": "just chatting"}));
+        channel.inject(None, serde_json::json!({"text": "hey @kian deploy"}));
+        for _ in 0..200 {
+            let snap = metrics.snapshot();
+            if snap["dropped_not_explicit"] == 1 && snap["routed"] == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let snap = metrics.snapshot();
+        assert_eq!(snap["dropped_not_explicit"], 1);
+        assert_eq!(snap["routed"], 1);
+        assert_eq!(snap["dropped_ignored"], 0);
+
+        // Now an Ignore channel: the ignore counter bumps instead.
+        let ignored_channel = Arc::new(kian_superagent::MockChannel::new("mock-im"));
+        let ignored_service = Arc::new(kian_superagent::SubscriptionService::with_classes(
+            SessionId::new(),
+            SubscriptionRuleSet::new(vec![]),
+            kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
+                channel: "mock-im".into(),
+                topic: None,
+                sender: None,
+                class: kian_superagent::AdmissionClass::Ignore,
+            }]),
+            Arc::new(CountingInbox) as Arc<dyn InboxWriter>,
+        ));
+        let ignored_metrics = Arc::new(SubscriptionMetrics::default());
+        let ignored_tasks = super::spawn_subscription_consumers(
+            Arc::clone(&ignored_service),
+            vec![Arc::clone(&ignored_channel) as Arc<dyn ChannelAdapter>],
+            Arc::clone(&ignored_metrics),
+        );
+        ignored_channel.inject(None, serde_json::json!({"text": "noise"}));
+        for _ in 0..200 {
+            if ignored_metrics.snapshot()["dropped_ignored"] == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(ignored_metrics.snapshot()["dropped_ignored"], 1);
+        assert_eq!(ignored_metrics.snapshot()["routed"], 0);
+        for task in tasks.into_iter().chain(ignored_tasks) {
+            task.abort();
+        }
     }
 }

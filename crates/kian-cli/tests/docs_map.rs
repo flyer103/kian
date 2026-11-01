@@ -160,3 +160,64 @@ fn every_workspace_crate_is_mapped_in_the_docs() {
         failures.join("; ")
     );
 }
+
+/// Phase-3 closeout (C45): the SPEC §5 Phase-3 table must name every
+/// capability the round landed, and the Phase-4 deferral table must
+/// carry the moved items. The SPEC is the contract — a capability
+/// that ships without a row here has silently left the contract, and
+/// a deferred item that stays in the Phase-3 table misstates scope.
+#[test]
+fn spec_phase3_table_names_each_landed_capability() {
+    let root = repo_root();
+    let spec = std::fs::read_to_string(root.join("docs/SPEC.md")).expect("SPEC.md");
+
+    // The §5 Phase-3 section: from its heading to the next heading of
+    // any level (Phase 4 / Deferred are separate sections).
+    let start = spec.find("### Phase 3").expect("SPEC §5 Phase-3 heading");
+    let end = spec[start..]
+        .find("\n#")
+        .map(|i| start + i)
+        .unwrap_or(spec.len());
+    let section = &spec[start..end];
+
+    // One keyword per landed round-3 card (C31–C44) plus the S7
+    // record; each must appear in the Phase-3 section's text.
+    let landed = [
+        "Inline/Spill",
+        "Recall toolpack",
+        "Two-level",
+        "`start()`/`stop()`",
+        "fan-out",
+        "Speculative",
+        "Watchdog Session v2",
+        "Batching metrics",
+        "Ablation",
+        "Untrusted-input marking",
+        "lark channel adapter",
+        "(S7)",
+    ];
+    let missing: Vec<&str> = landed
+        .iter()
+        .copied()
+        .filter(|c| !section.contains(c))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SPEC §5 Phase-3 table is missing landed capabilities: {missing:?}"
+    );
+    assert!(
+        section.contains("**demonstrated**"),
+        "S7 must be recorded as demonstrated in the Phase-3 table"
+    );
+
+    // The Phase-4 deferral table carries the moved items with their
+    // justifications (round-3 plan §3).
+    let phase4_start = spec.find("### Phase 4").expect("SPEC Phase-4 heading");
+    let phase4 = &spec[phase4_start..];
+    for item in ["Postgres", "dsh", "kian-sdk", "GitHub adapter", "A2A"] {
+        assert!(
+            phase4.contains(item),
+            "SPEC Phase-4 deferral table is missing `{item}`"
+        );
+    }
+}

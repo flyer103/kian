@@ -33,6 +33,7 @@
 //!   Router/Worker/plain driver, the `InboxWriter` port over the
 //!   engine, subscription consumers, watchdog wiring and metrics
 pub mod api;
+pub mod async_bridge;
 pub mod cache_metrics;
 pub mod client;
 pub mod commands;

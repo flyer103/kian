@@ -43,6 +43,11 @@ pub struct MockProvider {
     pub script: Vec<ScriptedResponse>,
     /// Requests with number <= `gated` hold until `released`.
     pub gated: usize,
+    /// C37: additionally hold exactly this request number until
+    /// `released` (0 = off). Lets a test park a drain mid-provider-turn
+    /// while an async job settles, then release on durable evidence —
+    /// deterministic, no sleeps. Existing `gated` semantics unchanged.
+    pub gate_at: usize,
     pub released: AtomicBool,
 }
 
@@ -72,7 +77,8 @@ async fn completions(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let n = mock.requests.fetch_add(1, Ordering::SeqCst) + 1;
-    if n <= mock.gated && !mock.released.load(Ordering::SeqCst) {
+    let gated = n <= mock.gated || (mock.gate_at != 0 && n == mock.gate_at);
+    if gated && !mock.released.load(Ordering::SeqCst) {
         // Hold (bounded well above any test timeout) until released or
         // the (soon-to-be-killed) client disconnects.
         for _ in 0..600 {
@@ -120,12 +126,25 @@ pub async fn spawn_scripted_provider(
     script: Vec<ScriptedResponse>,
     gated: usize,
 ) -> (String, Arc<MockProvider>) {
+    spawn_scripted_provider_gated_at(script, gated, 0).await
+}
+
+/// [`spawn_scripted_provider`] with an additional single-request gate
+/// (`gate_at`, 0 = off) — the C37 async-completion tests park one
+/// provider turn until the completion input is durable.
+#[allow(dead_code)] // each integration test compiles this module separately
+pub async fn spawn_scripted_provider_gated_at(
+    script: Vec<ScriptedResponse>,
+    gated: usize,
+    gate_at: usize,
+) -> (String, Arc<MockProvider>) {
     assert!(!script.is_empty(), "mock script must be non-empty");
     let mock = Arc::new(MockProvider {
         requests: AtomicUsize::new(0),
         delivered: AtomicUsize::new(0),
         script,
         gated,
+        gate_at,
         released: AtomicBool::new(false),
     });
     let app = Router::new()

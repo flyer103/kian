@@ -71,6 +71,13 @@ pub struct Server {
     _plugin_disposer: Disposer,
 }
 
+/// Reads one lark credential from the environment, treating blank as
+/// absent (a blank KIAN_LARK_APP_ID is a missing credential, not an
+/// empty-string app id).
+fn lark_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 impl Server {
     /// Full assembly from a config file (fail-closed on every step).
     pub async fn from_config_file(
@@ -128,6 +135,10 @@ impl Server {
         };
 
         let mut ctx = PluginCtx::new();
+        // The event store opens before activation too: the C37
+        // completion bridge (inside the superagent plugin) reads
+        // session projections and committed `tool/call` events.
+        let store = EventStore::open(&config.storage.sqlite).await?;
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
@@ -150,6 +161,16 @@ impl Server {
             let worker_agent = config
                 .named_agent_def(&sa.worker.agent)
                 .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
+            // C37: the async pair mounts on BOTH profiles, config-gated
+            // (default off — the AgentDefs are untouched when off).
+            let mut router_agent = router_agent;
+            let mut worker_agent = worker_agent;
+            kian_superagent::mount_async_tools(&mut router_agent, sa.async_tools);
+            kian_superagent::mount_async_tools(&mut worker_agent, sa.async_tools);
+            // C35: the recall toolpack — default on for the Router
+            // profile, opt-in per worker template (config-gated).
+            kian_superagent::mount_recall_tools(&mut router_agent, sa.recall.router);
+            kian_superagent::mount_recall_tools(&mut worker_agent, sa.recall.worker);
             let worker_gate = config
                 .named_agent(&sa.worker.agent)
                 .map(|agent| agent.evidence_gate.clone())
@@ -158,17 +179,82 @@ impl Server {
                 uuid::Uuid::parse_str(&sa.router.session_id)
                     .map_err(|_| ServeError::Assembly("router session id is not a uuid".into()))?,
             );
+            // C40: the resident watchdog binding (optional). The agent
+            // is worker-template shaped; the read/intervene surface
+            // mounts on it the same way the async/recall pairs mount.
+            let watchdog = match &sa.watchdog {
+                Some(watchdog) => {
+                    let session = kian_core::model::SessionId(
+                        uuid::Uuid::parse_str(&watchdog.session_id).map_err(|_| {
+                            ServeError::Assembly("watchdog session id is not a uuid".into())
+                        })?,
+                    );
+                    let mut agent = config
+                        .named_agent_def(&watchdog.agent)
+                        .ok_or_else(|| ServeError::Assembly("watchdog agent missing".into()))?;
+                    kian_superagent::mount_watchdog_tools(&mut agent, true);
+                    Some(kian_superagent::WatchdogProfile::new(session, agent))
+                }
+                None => None,
+            };
             let rules = sa.subscription_rules().map_err(ServeError::Config)?;
+            let classes = sa.admission_classes().map_err(ServeError::Config)?;
+            // C43 + C44: the configured list plus every lark-typed
+            // channel (real channels are untrusted by default).
+            let untrusted_channels = sa.runtime_untrusted_set().map_err(ServeError::Config)?;
             let inbox = crate::superagent::EngineInbox::new();
 
-            // Mock channels by configured name (v1's only adapter type).
+            // Mock channels by configured name; C44 lark channels read
+            // their credentials from the environment here (fail-closed:
+            // a lark channel without KIAN_LARK_APP_ID/KIAN_LARK_APP_SECRET
+            // refuses to start — tokens never live in kian.yaml).
             let mut mock_channels = std::collections::BTreeMap::new();
+            let mut lark_channels = std::collections::BTreeMap::new();
+            // C40: the timer input sources (a channel like any other —
+            // the system clock times the cadence).
+            let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
             for (name, channel) in &sa.channels {
-                if channel.channel_type == "mock-im" {
-                    mock_channels.insert(
-                        name.clone(),
-                        Arc::new(kian_superagent::MockChannel::new(name.clone())),
-                    );
+                match channel.channel_type.as_str() {
+                    "mock-im" => {
+                        mock_channels.insert(
+                            name.clone(),
+                            Arc::new(kian_superagent::MockChannel::new(name.clone())),
+                        );
+                    }
+                    "timer" => {
+                        let section = channel.timer.as_ref().ok_or_else(|| {
+                            ServeError::Config(crate::config::ConfigError::Invalid(format!(
+                                "superagent.channels `{name}` (type timer) requires a `timer:` section"
+                            )))
+                        })?;
+                        let runtime = section.to_runtime(name).map_err(ServeError::Config)?;
+                        timer_channels.push(Arc::new(kian_superagent::TimerChannel::new(
+                            name.clone(),
+                            runtime,
+                            Arc::new(kian_superagent::SystemTurnClock),
+                        )));
+                    }
+                    "lark" => {
+                        let section = channel.lark.as_ref().ok_or_else(|| {
+                            ServeError::Config(crate::config::ConfigError::Invalid(format!(
+                                "superagent.channels `{name}` (type lark) requires a `lark:` section"
+                            )))
+                        })?;
+                        let runtime = section
+                            .to_runtime(
+                                name,
+                                lark_env("KIAN_LARK_APP_ID"),
+                                lark_env("KIAN_LARK_APP_SECRET"),
+                            )
+                            .map_err(ServeError::Config)?;
+                        let adapter = kian_superagent::LarkChannel::new(name.clone(), runtime)
+                            .map_err(|e| {
+                                ServeError::Assembly(format!("lark channel `{name}`: {e}"))
+                            })?;
+                        lark_channels.insert(name.clone(), Arc::new(adapter));
+                    }
+                    // Unknown types were rejected at parse time.
+                    _ => {}
                 }
             }
 
@@ -178,14 +264,34 @@ impl Server {
                 default_agent: config.agent_def(),
                 router_session,
                 router_slot: sa.router.slot.clone(),
+                speculation: sa
+                    .router
+                    .speculation
+                    .as_ref()
+                    .map(|s| s.to_policy())
+                    .transpose()
+                    .map_err(ServeError::Config)?,
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,
+                classes,
+                shaping: sa
+                    .shaping
+                    .as_ref()
+                    .map(|shaping| shaping.to_runtime())
+                    .unwrap_or_default(),
+                untrusted_channels,
                 mock_channels,
+                lark_channels,
+                timer_channels,
+                watchdog,
                 worker_gate,
                 default_gate: config.agent.evidence_gate.clone(),
                 inbox: Arc::clone(&inbox),
                 has_remote,
+                async_tools: sa.async_tools,
+                recall: sa.recall.clone(),
+                event_store: store.clone(),
             });
             None // services resolve from the Ctx after activation
         } else {
@@ -220,8 +326,7 @@ impl Server {
         };
         let _ = superagent_services;
 
-        // -- 4. store, engine ----------------------------------------------
-        let store = EventStore::open(&config.storage.sqlite).await?;
+        // -- 4. engine ------------------------------------------------------
         let engine_config = EngineConfig {
             holder: config.drain.holder.clone(),
             lease_ttl_ms: config.drain.lease_ttl_ms,

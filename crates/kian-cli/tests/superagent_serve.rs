@@ -326,6 +326,105 @@ async fn serve_smoke_mock_channel_send_observes_router_drain() {
 }
 
 // ---------------------------------------------------------------------------
+// /metrics exposes the C41 router-batching series (article §7.2 shape)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_route_exposes_the_router_batching_series() {
+    force_no_proxy();
+    let dir = temp_dir("c41-router-batching");
+
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            ScriptedResponse::Text("batch noted".into()),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+
+    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false);
+    let (base, _server) = spawn_server(&config).await;
+    let client = reqwest::Client::new();
+
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+    wait_for_router(&read_only, "bootstrap judge turn", |events| {
+        count_kind(events, EventKind::TurnStart) >= 1
+            && count_kind(events, EventKind::AssistantMessage) >= 1
+    })
+    .await;
+
+    // One injected channel event → a second judge turn (batch 1).
+    let out = ops_rpc(
+        &client,
+        &base,
+        "mock_channel_send",
+        serde_json::json!({"channel": "mock-im", "payload": {"text": "please summarize"}}),
+    )
+    .await;
+    assert!(out["result"]["event_id"].as_str().is_some());
+    wait_for_router(&read_only, "batch judge turn", |events| {
+        count_kind(events, EventKind::TurnStart) >= 2 && count_kind(events, EventKind::TurnEnd) >= 2
+    })
+    .await;
+
+    // The judge-turn record lands as the parked turn closes; poll the
+    // route until it shows both turns.
+    let mut sa = serde_json::Value::Null;
+    for _ in 0..200 {
+        let metrics: serde_json::Value = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics")
+            .json()
+            .await
+            .expect("metrics json");
+        sa = metrics["superagent"].clone();
+        if sa["router_batching"]["judge_turns"].as_u64().unwrap_or(0) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let rb = &sa["router_batching"];
+    assert!(
+        rb["judge_turns"].as_u64().unwrap_or(0) >= 2,
+        "router_batching must record the judge turns: {sa}"
+    );
+    assert!(
+        rb["inputs_consumed"].as_u64().unwrap_or(0) >= 2,
+        "bootstrap input + injected event: {sa}"
+    );
+    // The existing naming scheme: snake_case series keys plus the
+    // bounded, fully materialized batch histogram.
+    for key in ["1", "2", "4", "8", "16", "32", "64", "128", "128+"] {
+        assert!(
+            rb["batch_histogram"].get(key).is_some(),
+            "bucket `{key}` missing from {sa}"
+        );
+    }
+    assert!(
+        rb["batch_histogram"]["1"].as_u64().unwrap_or(0) >= 2,
+        "both turns were batches of 1: {sa}"
+    );
+    assert!(rb["turn_duration_ms_total"].as_u64().is_some());
+    assert!(rb["mean_turn_duration_ms"].as_f64().is_some());
+    assert!(rb["amortized_ms_per_input"].as_f64().is_some());
+    assert!(
+        rb["last_turn"]["batch"].as_u64().unwrap_or(0) >= 1,
+        "last_turn records the most recent batch: {sa}"
+    );
+    assert!(rb["last_turn"]["duration_ms"].as_u64().is_some());
+    assert!(rb["last_turn"]["amortized_ms"].as_f64().is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // Watchdog: offline endpoint → health input admitted to the affected
 // worker session (the durable-row acceptance of C27)
 // ---------------------------------------------------------------------------

@@ -823,6 +823,90 @@ async fn s4_readme_demo_cli_mock_channel_send_against_serve() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// C33: the YAML knob reaches the real assembled subscription service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s4_shaping_config_spills_over_cap_channel_event_on_assembled_server() {
+    force_no_proxy();
+    let dir = temp_dir("c33-assembled-shaping");
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            ScriptedResponse::Text("inline noted".into()),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+    let config = write_s4_config(&dir, &router_base, &worker_base, "");
+    let yaml = std::fs::read_to_string(&config)
+        .unwrap()
+        .replacen(
+            "  channels:",
+            "  shaping:\n    inline_cap_bytes: 24\n    first_chars: 18\n    neighbor_fields: [reply_to]\n  channels:",
+            1,
+        );
+    std::fs::write(&config, yaml).unwrap();
+    let (base, _server) = spawn_server(&config).await;
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+    wait_for_session(
+        &read_only,
+        router_session(),
+        "bootstrap judge turn",
+        |events| count_kind(events, EventKind::TurnStart) >= 1,
+    )
+    .await;
+
+    let raw = serde_json::json!({
+        "text": "C33_FULL_RAW_OVER_THE_CONFIGURED_CAP",
+        "reply_to": "msg-config-parent"
+    });
+    let client = reqwest::Client::new();
+    let out = ops_rpc(
+        &client,
+        &base,
+        "mock_channel_send",
+        serde_json::json!({"channel": "mock-im", "payload": raw.clone()}),
+    )
+    .await;
+    let event_id = out["result"]["event_id"].as_str().unwrap().to_owned();
+    let events = wait_for_session(
+        &read_only,
+        router_session(),
+        "configured spill pair judged",
+        |events| {
+            count_kind(events, EventKind::InputSpilled) == 1
+                && count_kind(events, EventKind::TurnEnd) >= 2
+        },
+    )
+    .await;
+    let admitted = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::InputAdmitted
+                && event.bytes.pointer("/content/kian/type")
+                    == Some(&serde_json::json!("channel_event"))
+        })
+        .unwrap();
+    let kian = &admitted.bytes["content"]["kian"];
+    assert_eq!(kian["event_id"], serde_json::json!(event_id));
+    assert_eq!(kian["spill"], serde_json::json!(true));
+    assert!(kian.get("raw").is_none());
+    assert_eq!(
+        kian["inline"]["neighbors"]["reply_to"],
+        serde_json::json!("msg-config-parent")
+    );
+    let spilled = events
+        .iter()
+        .find(|event| event.kind == EventKind::InputSpilled)
+        .unwrap();
+    assert_eq!(spilled.bytes["raw"], raw);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // S4 negative path: a gate-failed worker never reaches a delivered
 // "done" reply (honesty mapping)

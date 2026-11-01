@@ -310,14 +310,30 @@ pub struct SuperAgentPlugin {
     pub router_session: SessionId,
     /// The Router's slot name.
     pub router_slot: String,
+    /// The Router profile's speculation budget (C39): `None` disables
+    /// speculation (speculative spawns refused honestly at the tool).
+    pub speculation: Option<kian_superagent::SpeculationPolicy>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
     pub policy: Arc<PolicyTable>,
     /// The converted subscription rule set (config, fail-closed).
     pub rules: kian_superagent::SubscriptionRuleSet,
+    /// The converted admission-class table (C36 config, fail-closed;
+    /// empty = today's behavior).
+    pub classes: kian_superagent::AdmissionClassTable,
+    /// C33 admission-time shaping (infinite cap = legacy behavior).
+    pub shaping: kian_superagent::ShapingConfig,
+    /// C43 untrusted-channel set (prompt-injection hygiene): events
+    /// from these channels admit with the untrusted bit inside the
+    /// provenance wrapper. Empty = every channel trusted.
+    pub untrusted_channels: std::collections::BTreeSet<String>,
     /// Mock channels by configured name (v1's only adapter type).
     pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
+    /// Lark channels by configured name (C44): built by the server
+    /// from env-gated credentials, registered into the channel
+    /// registry and the subscription consumers exactly like mocks.
+    pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
     /// The worker's evidence gate (mounts on the worker wrapper).
     pub worker_gate: EvidenceGateConfig,
     /// The default agent's evidence gate (mounts on the plain loop).
@@ -326,6 +342,28 @@ pub struct SuperAgentPlugin {
     pub inbox: Arc<crate::superagent::EngineInbox>,
     /// Whether endpoints are configured (dependency on `remote-exec`).
     pub has_remote: bool,
+    /// Mount the async `start()`/`stop()` pair (C37, ADR-008) on the
+    /// Router and Worker loops. Requires `has_remote` (fail-closed in
+    /// config). Default off.
+    pub async_tools: bool,
+    /// The recall toolpack gates and caps (C35): `router` default on,
+    /// `worker` default off. The toolpack reads through the same
+    /// `StoreRecall` port the runtime exposes (the shared instance is
+    /// built once, below).
+    pub recall: crate::config::RecallConfig,
+    /// The timer input sources (C40), built by the server over the
+    /// system clock; registered into the channel registry and the
+    /// consumer spawn exactly like mocks. Their run tasks start in
+    /// `start_services`, after the consumers exist.
+    pub timer_channels: Vec<Arc<kian_superagent::TimerChannel>>,
+    /// The resident watchdog profile (C40), when configured. The loop
+    /// and driver are built below; the bootstrap happens in
+    /// `start_services`.
+    pub watchdog: Option<kian_superagent::WatchdogProfile>,
+    /// The event store (the completion bridge reads session
+    /// projections and resolves invoking sessions from committed
+    /// `tool/call` events). Only used when `async_tools` is on.
+    pub event_store: kian_store::EventStore,
 }
 
 impl Plugin for SuperAgentPlugin {
@@ -357,6 +395,42 @@ impl Plugin for SuperAgentPlugin {
             None
         };
 
+        // C37: the async `start()`/`stop()` pair, config-gated (default
+        // off). The engine shares the C20 backend (no second dispatch
+        // system); the completion bridge admits through the same
+        // late-bound inbox port the bundle uses, and resolves invoking
+        // sessions from committed `tool/call` events.
+        let mut async_jobs = None;
+        let mut async_metrics = None;
+        let mut async_pair: Option<Arc<dyn ToolProvider>> = None;
+        if self.async_tools {
+            let remote = remote.as_ref().ok_or_else(|| {
+                apply_error("superagent.async_tools requires the remote-exec plugin")
+            })?;
+            let endpoint = remote
+                .endpoints
+                .first()
+                .map(|ep| ep.id.clone())
+                .ok_or_else(|| apply_error("superagent.async_tools requires an endpoint"))?;
+            let metrics = Arc::new(crate::async_bridge::AsyncBridgeMetrics::default());
+            let sink = crate::async_bridge::CompletionBridge::new(
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                self.event_store.clone(),
+                Arc::clone(&metrics),
+            );
+            let jobs = kian_exec::AsyncJobs::new(
+                Arc::clone(&remote.backend),
+                endpoint,
+                sink,
+                crate::async_bridge::session_for_call(self.event_store.clone()),
+            );
+            async_pair =
+                Some(Arc::new(kian_exec::AsyncToolPair::new(Arc::clone(&jobs)))
+                    as Arc<dyn ToolProvider>);
+            async_jobs = Some(jobs);
+            async_metrics = Some(metrics);
+        }
+
         // The structural profile rules are assembly-time assertions:
         // a worker smuggling a channel tool or a router without the
         // dispatch tool refuses to start.
@@ -365,7 +439,10 @@ impl Plugin for SuperAgentPlugin {
             self.worker_agent.clone(),
         )
         .map_err(|e| apply_error(format!("superagent profile: {e}")))?;
-        let profile = RouterProfile::new(self.router_session, profile.router);
+        // C39: the Router profile carries the configured speculation
+        // budget (None = disabled, speculative spawns refused honestly).
+        let mut profile = RouterProfile::new(self.router_session, profile.router);
+        profile.speculation = self.speculation.clone();
 
         // The mounted inbox: admits counted for Router residency.
         let router_inbox = RouterInbox::new(
@@ -380,13 +457,64 @@ impl Plugin for SuperAgentPlugin {
             Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
         ));
         let mut channels = kian_superagent::ChannelRegistry::new();
-        let mut adapters = Vec::with_capacity(self.mock_channels.len());
+        let mut adapters = Vec::with_capacity(
+            self.mock_channels.len() + self.lark_channels.len() + self.timer_channels.len(),
+        );
         for (name, mock) in &self.mock_channels {
             channels.register(name.clone(), Arc::clone(mock) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(mock) as Arc<dyn ChannelAdapter>);
         }
+        // C44: real lark adapters ride the same registry + consumer
+        // spawn (the adapter is a plugin over the seam — nothing in
+        // the subscription engine knows Feishu exists).
+        for (name, lark) in &self.lark_channels {
+            channels.register(name.clone(), Arc::clone(lark) as Arc<dyn ChannelAdapter>);
+            adapters.push(Arc::clone(lark) as Arc<dyn ChannelAdapter>);
+        }
+        // C40: the timers ride the same registry + consumer spawn (a
+        // timer is a channel — nothing here knows a watchdog exists).
+        for timer in &self.timer_channels {
+            let name = timer.channel_name().to_string();
+            channels.register(name, Arc::clone(timer) as Arc<dyn ChannelAdapter>);
+            adapters.push(Arc::clone(timer) as Arc<dyn ChannelAdapter>);
+        }
         let hold = kian_superagent::RouterHold::shared();
-        let router_tools = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+        let router_tools = Arc::new(RouterTools::new(
+            spawner,
+            channels.clone(),
+            &profile,
+            hold.clone(),
+        ));
+        // C35: the recall toolpack reads through the one `StoreRecall`
+        // port the runtime also exposes (the spill index it holds is
+        // rebuilt by `start_services`). Config-gated: default on for
+        // the Router, opt-in per worker template.
+        let recall_port = crate::superagent::StoreRecall::new(self.event_store.clone());
+        let recall_tools = kian_superagent::RecallTools::new(
+            recall_port.clone() as Arc<dyn kian_superagent::RecallPort>,
+            self.router_session,
+            self.shaping.clone(),
+            self.recall.to_runtime(),
+        );
+        // C37 + C35: the Router's combined provider — async pair (when
+        // on), dispatch/channel tools, then recall. All names are
+        // unique, so the first-wins union shadows nothing; the request
+        // prefix order is the loop's name sort (stable either way).
+        let mut router_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+        if let Some(pair) = &async_pair {
+            router_providers.push(Arc::clone(pair));
+        }
+        router_providers.push(router_tools as Arc<dyn ToolProvider>);
+        if self.recall.router {
+            router_providers.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
+        }
+        let router_tools: Arc<dyn ToolProvider> = match router_providers.len() {
+            0 | 1 => router_providers
+                .into_iter()
+                .next()
+                .expect("the dispatch provider is always present"),
+            _ => Arc::new(crate::superagent::CombinedTools::new(router_providers)),
+        };
 
         // Router loop: cheap slot, dispatch tools, ungated (a resident
         // judge never settles; a gate would be meaningless).
@@ -411,6 +539,16 @@ impl Plugin for SuperAgentPlugin {
                 worker_tools.push(provider);
             }
         }
+        // C37: the worker template mounts the pair when gated on.
+        if let Some(pair) = &async_pair {
+            worker_tools.push(Arc::clone(pair));
+        }
+        // C35: the worker template mounts the recall toolpack when
+        // opted in (config-gated, default off — after the async pair,
+        // before the local tools; stable order, unique names).
+        if self.recall.worker {
+            worker_tools.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
+        }
         worker_tools.push(local_tools.clone());
         let worker_loop = Arc::new(ReActLoop::with_config(
             self.worker_agent.clone(),
@@ -426,7 +564,7 @@ impl Plugin for SuperAgentPlugin {
         // Plain-session loop: the default agent, with its own gate.
         let default_loop = Arc::new(ReActLoop::with_evidence_gate(
             self.default_agent,
-            registry,
+            registry.clone(),
             local_tools,
             Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
             ReActConfig {
@@ -436,12 +574,60 @@ impl Plugin for SuperAgentPlugin {
             self.default_gate,
         ));
 
-        // The three-way driver.
-        let router_side = kian_superagent::RouterDriver::new(
+        // C40: the resident watchdog loop (when configured) — a
+        // worker-template agent whose tools are exactly the
+        // read/intervene surface, over the same recall port, the
+        // engine inbox, the shared channel registry (escalation) and
+        // its own hold. Driven by the Router's residency shape: one
+        // judge turn per admitted tick, parked between ticks.
+        let watchdog_side = self.watchdog.as_ref().map(|profile| {
+            // One hold shared by the driver (per-hold port install)
+            // and the tools (the channel/delivered surface).
+            let watchdog_hold = kian_superagent::RouterHold::shared();
+            let tools = kian_superagent::WatchdogTools::new(
+                recall_port.clone() as Arc<dyn kian_superagent::RecallPort>,
+                self.router_session,
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                channels.clone(),
+                kian_superagent::ImPolicy::default(),
+                watchdog_hold.clone(),
+                Arc::new(kian_superagent::SystemTurnClock),
+            );
+            let watchdog_inbox = RouterInbox::new(
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                profile.session,
+            );
+            let watchdog_loop = Arc::new(ReActLoop::with_config(
+                profile.agent.clone(),
+                registry.clone(),
+                Arc::new(tools) as Arc<dyn ToolProvider>,
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+                ReActConfig {
+                    slot: kian_core::model::SlotName("main".into()),
+                    max_iterations: self.max_iterations,
+                },
+            ));
+            kian_superagent::RouterDriver::new(
+                watchdog_loop,
+                watchdog_hold,
+                crate::superagent::port_for_ctx(),
+                watchdog_inbox,
+            )
+        });
+
+        // The three-way driver. The Router side mounts judge-turn
+        // metrics (C41): batch size + wall duration per judge turn,
+        // bundle-owned counters the /metrics route snapshots.
+        let router_metrics = kian_superagent::RouterMetrics::shared();
+        let router_side = kian_superagent::RouterDriver::with_metrics(
             router_loop,
             hold,
             crate::superagent::port_for_ctx(),
             router_inbox.clone(),
+            kian_superagent::RouterTurnRecorder::new(
+                Arc::clone(&router_metrics),
+                Arc::new(kian_superagent::SystemTurnClock),
+            ),
         );
         let worker_side = kian_superagent::WorkerLoopDriver::new(
             worker_loop,
@@ -453,19 +639,32 @@ impl Plugin for SuperAgentPlugin {
             },
             crate::superagent::port_for_ctx(),
         );
-        let driver = Arc::new(crate::superagent::SuperAgentDriver::new(
+        let mut driver = crate::superagent::SuperAgentDriver::new(
             self.router_session,
             self.worker_agent.version,
             router_side,
             worker_side,
             default_loop,
-        ));
+        );
+        if let Some(profile) = &self.watchdog {
+            driver = driver.with_watchdog(
+                profile.session,
+                watchdog_side
+                    .expect("the watchdog side is built exactly when the profile is present"),
+            );
+        }
+        let driver = Arc::new(driver);
 
-        let subscriptions = Arc::new(SubscriptionService::new(
-            self.router_session,
-            self.rules,
-            Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
-        ));
+        let subscriptions = Arc::new(
+            SubscriptionService::with_classes(
+                self.router_session,
+                self.rules,
+                self.classes,
+                Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+            )
+            .with_shaping(self.shaping)
+            .with_untrusted_channels(self.untrusted_channels),
+        );
         let subscription_metrics = Arc::new(crate::superagent::SubscriptionMetrics::default());
 
         let services = Arc::new(crate::superagent::SuperAgentServices {
@@ -475,10 +674,19 @@ impl Plugin for SuperAgentPlugin {
             profile,
             subscriptions,
             mock_channels: self.mock_channels,
+            lark_channels: self.lark_channels,
             adapters,
             worker_gate: self.worker_gate,
             subscription_metrics,
+            router_metrics,
             remote,
+            async_jobs,
+            async_metrics,
+            // The one shared recall port: the toolpack and the runtime
+            // surface (and the startup spill-index rebuild) all use it.
+            recall: recall_port,
+            timers: self.timer_channels,
+            watchdog: self.watchdog.clone(),
         });
         ctx.provide::<crate::superagent::SuperAgentServices>(services)
     }

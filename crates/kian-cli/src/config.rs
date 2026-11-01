@@ -13,7 +13,8 @@ use kian_core::model::{AgentDef, Budgets, SlotName, SlotSpec, SlotTarget};
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_orchestrator::recovery::PolicyConfig;
 use kian_superagent::rules::{
-    CorrelateBy, Route, RuleMatcher, SubscriptionRule, SubscriptionRuleSet,
+    AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
+    SubscriptionRule, SubscriptionRuleSet,
 };
 use serde::{Deserialize, Serialize};
 
@@ -299,10 +300,160 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::subscription_rules`].
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionRuleDef>,
+    /// Admission classes (C36, the article §3.1 Fast Path): a
+    /// provenance-keyed filter evaluated *before* the rule set and
+    /// before any model call. Wire form: `{channel, topic?, sender?,
+    /// class: candidate | explicit-only | ignore}`; converted
+    /// fail-closed to the bundle's [`AdmissionClassTable`] by
+    /// [`SuperAgentConfig::admission_classes`]. Absent = today's
+    /// behavior, unchanged.
+    #[serde(default)]
+    pub classes: Vec<AdmissionClassDef>,
+    /// C33 admission-time Inline/Spill shaping. Absent preserves the
+    /// pre-C33 infinite cap and byte-identical legacy wrapper.
+    #[serde(default)]
+    pub shaping: Option<ChannelShapingConfig>,
+    /// C43 untrusted-input marking (prompt-injection hygiene):
+    /// channels whose events admit with `"untrusted": true` inside
+    /// the provenance wrapper's `content`. Honest labeling only —
+    /// never a drop/allow decision. Real channels (lark, C44) belong
+    /// here; absent = every channel trusted (today's behavior).
+    /// Every entry must be declared in `channels:` (fail-closed
+    /// cross-reference).
+    #[serde(default)]
+    pub untrusted_channels: Vec<String>,
     /// Channel name → channel config. Every rule's `channel` must be a
     /// key here (fail-closed cross-reference).
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelConfig>,
+    /// Mount the async `start()`/`stop()` tool pair on the Router
+    /// profile and the worker template (C37, ADR-008). Default off —
+    /// the article's own "not default-on". Requires a non-empty
+    /// `endpoints:` list (the pair routes through the C20 queue);
+    /// enabling it without endpoints refuses to start (fail-closed).
+    #[serde(default)]
+    pub async_tools: bool,
+    /// The recall toolpack (C35, the Chain of Recall): read-only
+    /// `recall_event` / `recall_neighbors` / `recall_thread` tools.
+    /// Default: mounted on the Router profile, opt-in per worker
+    /// template, with bounded tool-output caps.
+    #[serde(default)]
+    pub recall: RecallConfig,
+    /// Watchdog Session v2 (C40): the resident model-in-the-loop
+    /// progress judge. Absent (the default) = no watchdog session, no
+    /// change to today's behavior. Present = assembly mounts the
+    /// watchdog loop on the fixed session and bootstraps its judge
+    /// prompt; ticks reach it through an ordinary subscription rule
+    /// (`route: {session: <uuid>}`) over a `type: timer` channel.
+    #[serde(default)]
+    pub watchdog: Option<WatchdogConfig>,
+}
+
+/// The additive `superagent.watchdog:` section (C40): the resident
+/// watchdog session binding. The timer input source itself is a
+/// channel (`superagent.channels.<name>` with `type: timer`); this
+/// section names the judge session and its agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogConfig {
+    /// The configured fixed watchdog session id (a uuid — the
+    /// `Route::Session` target of the timer rule). Bootstrapped by
+    /// admitting to this id; must differ from the Router session.
+    pub session_id: String,
+    /// Id of the watchdog's agent definition in `agents:` (a
+    /// worker-template shape: its own strong `main` slot; the
+    /// read/intervene tool surface is mounted by assembly).
+    pub agent: String,
+}
+
+/// The additive `superagent.recall:` section (C35): the recall
+/// toolpack's mount gates and caps. `router` defaults on (the Router
+/// is the global-observability seat and rides the event stream via
+/// recall, not via its own context), `worker` defaults off (opt-in
+/// per worker template). The caps bound what one recall tool output
+/// may re-inject verbatim — recall reuses the C33 shaping vocabulary
+/// for excerpts and association ids, but its verbatim bound is its
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecallConfig {
+    /// Mount the toolpack on the Router profile (default true).
+    #[serde(default = "default_recall_router")]
+    pub router: bool,
+    /// Mount the toolpack on the worker template (default false).
+    #[serde(default)]
+    pub worker: bool,
+    /// Maximum serialized bytes of one value surfaced verbatim in a
+    /// recall output; above it the output carries the Inline view
+    /// (excerpt + continuation). Default 8192.
+    #[serde(default = "default_recall_output_cap_bytes")]
+    pub output_cap_bytes: usize,
+    /// Channel events within this many seq positions on either side
+    /// of an anchor (same topic) form the locality view. Default 3.
+    #[serde(default = "default_recall_neighbor_window")]
+    pub neighbor_window: u64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            router: default_recall_router(),
+            worker: false,
+            output_cap_bytes: default_recall_output_cap_bytes(),
+            neighbor_window: default_recall_neighbor_window(),
+        }
+    }
+}
+
+impl RecallConfig {
+    /// Converts to the bundle's runtime caps (fail-closed shape only —
+    /// the mount booleans are consumed by assembly wiring).
+    pub fn to_runtime(&self) -> kian_superagent::RecallToolConfig {
+        kian_superagent::RecallToolConfig {
+            output_cap_bytes: self.output_cap_bytes,
+            neighbor_window: self.neighbor_window,
+        }
+    }
+}
+
+fn default_recall_router() -> bool {
+    true
+}
+
+fn default_recall_output_cap_bytes() -> usize {
+    kian_superagent::DEFAULT_OUTPUT_CAP_BYTES
+}
+
+fn default_recall_neighbor_window() -> u64 {
+    kian_superagent::DEFAULT_NEIGHBOR_WINDOW
+}
+
+/// The additive `superagent.shaping:` section (C33). The cap applies to
+/// the serialized raw channel payload at admission, never to committed
+/// context. Omitted cap = infinity; omitted excerpt length = 50 chars.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelShapingConfig {
+    #[serde(default)]
+    pub inline_cap_bytes: Option<usize>,
+    #[serde(default = "default_shaping_first_chars")]
+    pub first_chars: usize,
+    #[serde(default)]
+    pub neighbor_fields: Vec<String>,
+}
+
+fn default_shaping_first_chars() -> usize {
+    50
+}
+
+impl ChannelShapingConfig {
+    pub fn to_runtime(&self) -> kian_superagent::ShapingConfig {
+        kian_superagent::ShapingConfig {
+            inline_cap_bytes: self.inline_cap_bytes,
+            first_chars: self.first_chars,
+            neighbor_fields: self.neighbor_fields.clone(),
+        }
+    }
 }
 
 /// The resident Router binding.
@@ -319,6 +470,58 @@ pub struct SuperAgentRouterConfig {
     /// `model_slots`).
     #[serde(default = "default_router_slot")]
     pub slot: String,
+    /// The Router profile's speculation budget (C39). Absent (the
+    /// default) disables speculation: `spawn_worker` with
+    /// `speculative: true` is refused with an honest tool error.
+    #[serde(default)]
+    pub speculation: Option<SpeculationDef>,
+}
+
+/// The `superagent.router.speculation` section (C39):
+/// `{max_outstanding, label, silent_repro?}` — the Router profile's
+/// speculation budget plus the silent-repro prompt template (a config
+/// artifact: prose, editable without code).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeculationDef {
+    /// Maximum outstanding (started, unresolved) threads a speculative
+    /// spawn is admitted at. Must be ≥ 1 (fail-closed).
+    pub max_outstanding: usize,
+    /// Budget label, surfaced in the honest cap refusal and the audit.
+    /// Must be non-empty (fail-closed).
+    pub label: String,
+    /// Optional override of the bundle's default silent-repro prompt
+    /// template.
+    #[serde(default)]
+    pub silent_repro: Option<String>,
+}
+
+impl SpeculationDef {
+    /// Converts to the bundle policy (C39), fail-closed: a zero cap or
+    /// an empty label is a config error, never a silent default.
+    pub fn to_policy(&self) -> Result<kian_superagent::SpeculationPolicy, ConfigError> {
+        if self.max_outstanding == 0 {
+            return Err(invalid(
+                "superagent.router.speculation.max_outstanding must be > 0",
+            ));
+        }
+        if self.label.trim().is_empty() {
+            return Err(invalid(
+                "superagent.router.speculation.label must be non-empty",
+            ));
+        }
+        let mut policy =
+            kian_superagent::SpeculationPolicy::new(self.max_outstanding, self.label.clone());
+        if let Some(silent_repro) = &self.silent_repro {
+            if silent_repro.trim().is_empty() {
+                return Err(invalid(
+                    "superagent.router.speculation.silent_repro must be non-empty when set",
+                ));
+            }
+            policy.silent_repro = silent_repro.clone();
+        }
+        Ok(policy)
+    }
 }
 
 fn default_router_slot() -> String {
@@ -337,13 +540,136 @@ pub struct SuperAgentWorkerConfig {
     pub pinned_version: Option<u64>,
 }
 
-/// One channel entry. The map key is the channel name (`mock-im` in the
-/// DESIGN §4.1 examples); `type` selects the adapter.
+/// One channel entry. The map key is the channel name (`mock-im` in
+/// the DESIGN §4.1 examples); `type` selects the adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     #[serde(rename = "type")]
     pub channel_type: String,
+    /// The C44 lark section — required when (and only when)
+    /// `type: lark` (fail-closed both directions, validated in
+    /// [`ServeConfig::parse`]).
+    #[serde(default)]
+    pub lark: Option<LarkChannelSection>,
+    /// The C40 timer section — required when (and only when)
+    /// `type: timer` (fail-closed both directions, validated in
+    /// [`ServeConfig::parse`]).
+    #[serde(default)]
+    pub timer: Option<TimerChannelSection>,
+}
+
+/// The `superagent.channels.<name>.timer:` section (C40): the timer
+/// input source's cadence. The adapter emits
+/// `ChannelEvent{channel:<name>, topic, event_id:"tick-<n>",
+/// payload:{"tick":n}}` every `interval_ms`; `emit_on_start` fires one
+/// immediate tick after startup (an immediate first progress check
+/// after a restart).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimerChannelSection {
+    /// Milliseconds between ticks (must be > 0, fail-closed).
+    pub interval_ms: u64,
+    /// One immediate tick at startup. Default false.
+    #[serde(default)]
+    pub emit_on_start: bool,
+    /// The routing topic every tick carries (subscription rules match
+    /// on it; the watchdog convention is `watchdog`).
+    #[serde(default = "default_timer_topic")]
+    pub topic: String,
+}
+
+fn default_timer_topic() -> String {
+    kian_superagent::DEFAULT_TIMER_TOPIC.to_string()
+}
+
+impl TimerChannelSection {
+    /// Converts to the bundle's runtime config, fail-closed on the
+    /// cadence: a zero interval or an empty topic is a config error,
+    /// never a silent default.
+    pub fn to_runtime(&self, name: &str) -> Result<kian_superagent::TimerConfig, ConfigError> {
+        if self.interval_ms == 0 {
+            return Err(invalid(format!(
+                "superagent.channels `{name}` (type timer).timer.interval_ms must be > 0"
+            )));
+        }
+        if self.topic.trim().is_empty() {
+            return Err(invalid(format!(
+                "superagent.channels `{name}` (type timer).timer.topic must be non-empty"
+            )));
+        }
+        Ok(kian_superagent::TimerConfig {
+            interval_ms: self.interval_ms,
+            topic: self.topic.clone(),
+            emit_on_start: self.emit_on_start,
+        })
+    }
+}
+
+/// The `superagent.channels.<name>.lark:` section (C44). Credentials
+/// are deliberately absent: `app_id`/`app_secret` come from the
+/// environment (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`) at assembly
+/// — tokens never live in `kian.yaml` (the C13 secrets discipline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LarkChannelSection {
+    /// Feishu open-apis base (overridable for private deployments).
+    #[serde(default = "default_lark_api_base")]
+    pub api_base: String,
+    /// Receive poll cadence, milliseconds (must be > 0).
+    #[serde(default = "default_lark_poll_ms")]
+    pub poll_interval_ms: u64,
+    /// chat id → routing topic. The keys are exactly the chats the
+    /// adapter polls; at least one entry is required (fail-closed).
+    pub topics: BTreeMap<String, String>,
+}
+
+fn default_lark_api_base() -> String {
+    kian_superagent::DEFAULT_API_BASE.to_string()
+}
+
+fn default_lark_poll_ms() -> u64 {
+    kian_superagent::DEFAULT_POLL_INTERVAL.as_millis() as u64
+}
+
+impl LarkChannelSection {
+    /// Converts to the bundle's runtime config, fail-closed on
+    /// credentials: absent or blank `KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`
+    /// is a startup error naming the env vars — never a silent default
+    /// and never a config-file token (C13/C44).
+    pub fn to_runtime(
+        &self,
+        name: &str,
+        app_id: Option<String>,
+        app_secret: Option<String>,
+    ) -> Result<kian_superagent::LarkConfig, ConfigError> {
+        let missing = |what: &str| {
+            invalid(format!(
+                "superagent.channels `{name}` (type lark) requires {what} in the environment \
+                 (KIAN_LARK_APP_ID / KIAN_LARK_APP_SECRET) — lark credentials never live in \
+                 kian.yaml"
+            ))
+        };
+        let app_id = app_id
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| missing("KIAN_LARK_APP_ID"))?;
+        let app_secret = app_secret
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| missing("KIAN_LARK_APP_SECRET"))?;
+        let config = kian_superagent::LarkConfig {
+            app_id,
+            app_secret,
+            api_base: self.api_base.clone(),
+            topics: self.topics.clone(),
+            poll_interval: std::time::Duration::from_millis(self.poll_interval_ms),
+        };
+        config
+            .validate()
+            .map_err(|e| invalid(format!("superagent.channels `{name}` (type lark): {e}")))?;
+        Ok(config)
+    }
 }
 
 /// Wire form of a subscription rule's match condition (the natural
@@ -359,13 +685,15 @@ pub enum RuleMatcherDef {
     Topic { topic: String },
 }
 
-/// Wire form of a rule's route: the bare keyword `router`, or
-/// `{passthrough: {correlate_by: topic}}`.
+/// Wire form of a rule's route: the bare keyword `router`,
+/// `{passthrough: {correlate_by: topic}}`, or — C40, additive —
+/// `{session: <uuid>}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RouteDef {
     Keyword(String),
     Passthrough { passthrough: CorrelateByWire },
+    Session { session: String },
 }
 
 /// Wire form of `{correlate_by: topic}` (v1 vocabulary: `topic` only).
@@ -392,7 +720,62 @@ pub struct SubscriptionRuleDef {
     pub route: RouteDef,
 }
 
+/// One admission-class entry (C36 wire form): a provenance key
+/// `(channel, topic?, sender?)` → `class`. `topic`/`sender` are
+/// optional pins; the class keyword is validated fail-closed in
+/// [`SuperAgentConfig::admission_classes`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionClassDef {
+    pub channel: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Adapter-declared sender provenance (any JSON value, compared by
+    /// equality at resolution).
+    #[serde(default)]
+    pub sender: Option<serde_json::Value>,
+    /// `candidate | explicit-only | ignore` (validated fail-closed).
+    pub class: String,
+}
+
 impl SuperAgentConfig {
+    /// Converts the wire-form admission classes into the bundle's
+    /// [`AdmissionClassTable`], fail-closed: unknown class keywords
+    /// and empty channel/topic strings are errors, never defaults.
+    pub fn admission_classes(&self) -> Result<AdmissionClassTable, ConfigError> {
+        let mut rules = Vec::with_capacity(self.classes.len());
+        for (i, def) in self.classes.iter().enumerate() {
+            if def.channel.is_empty() {
+                return Err(invalid(format!(
+                    "superagent.classes[{i}].channel must not be empty"
+                )));
+            }
+            if def.topic.as_deref().is_some_and(str::is_empty) {
+                return Err(invalid(format!(
+                    "superagent.classes[{i}].topic must not be empty"
+                )));
+            }
+            let class = match def.class.as_str() {
+                "candidate" => AdmissionClass::Candidate,
+                "explicit-only" => AdmissionClass::ExplicitOnly,
+                "ignore" => AdmissionClass::Ignore,
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.classes[{i}].class `{other}` is not one of \
+                         candidate | explicit-only | ignore"
+                    )));
+                }
+            };
+            rules.push(AdmissionClassRule {
+                channel: def.channel.clone(),
+                topic: def.topic.clone(),
+                sender: def.sender.clone(),
+                class,
+            });
+        }
+        Ok(AdmissionClassTable::new(rules))
+    }
+
     /// Converts the wire-form rules into the bundle's
     /// [`SubscriptionRuleSet`], fail-closed: unknown keywords, unknown
     /// correlation keys and empty strings are errors, never defaults.
@@ -424,10 +807,19 @@ impl SuperAgentConfig {
                 } => Route::Passthrough {
                     correlate_by: CorrelateBy::Topic,
                 },
+                // C40: a config-addressed fixed session (the timer's
+                // ticks → the watchdog). Fail-closed on the uuid.
+                RouteDef::Session { session } => Route::Session(kian_core::model::SessionId(
+                    uuid::Uuid::parse_str(session).map_err(|_| {
+                        invalid(format!(
+                            "superagent.subscriptions[{i}].route.session `{session}` is not a uuid"
+                        ))
+                    })?,
+                )),
                 other => {
                     return Err(invalid(format!(
                         "superagent.subscriptions[{i}].route `{other:?}` is not one of \
-                         router | {{passthrough: {{correlate_by: topic}}}}"
+                         router | {{passthrough: {{correlate_by: topic}}}} | {{session: uuid}}"
                     )));
                 }
             };
@@ -439,11 +831,54 @@ impl SuperAgentConfig {
         }
         Ok(SubscriptionRuleSet::new(rules))
     }
+
+    /// Converts the C43 `untrusted_channels` list into the runtime
+    /// set, fail-closed: empty entries, duplicates and channels not
+    /// declared in `channels` are errors, never defaults.
+    pub fn untrusted_channel_set(&self) -> Result<std::collections::BTreeSet<String>, ConfigError> {
+        let mut set = std::collections::BTreeSet::new();
+        for (i, channel) in self.untrusted_channels.iter().enumerate() {
+            if channel.trim().is_empty() {
+                return Err(invalid(format!(
+                    "superagent.untrusted_channels[{i}] must not be empty"
+                )));
+            }
+            if !self.channels.contains_key(channel) {
+                return Err(invalid(format!(
+                    "superagent.untrusted_channels[{i}] references channel `{channel}` which is \
+                     not declared in superagent.channels"
+                )));
+            }
+            if !set.insert(channel.clone()) {
+                return Err(invalid(format!(
+                    "superagent.untrusted_channels[{i}] duplicates channel `{channel}`"
+                )));
+            }
+        }
+        Ok(set)
+    }
+
+    /// The runtime untrusted set (C43 + C44): the configured
+    /// `untrusted_channels` list **plus every lark-typed channel** —
+    /// real IM input is attacker-controllable text, so the real
+    /// channel is untrusted by default (listing it again is harmless;
+    /// opting out is deliberately not offered this round — trust must
+    /// be a considered change, not a missing default).
+    pub fn runtime_untrusted_set(&self) -> Result<std::collections::BTreeSet<String>, ConfigError> {
+        let mut set = self.untrusted_channel_set()?;
+        for (name, channel) in &self.channels {
+            if channel.channel_type == kian_superagent::LARK_CHANNEL_TYPE {
+                set.insert(name.clone());
+            }
+        }
+        Ok(set)
+    }
 }
 
-/// Every channel adapter type `serve` knows how to build (C27 v1: the
-/// first-class mock only — real lark/GitHub adapters stay deferred).
-pub const KNOWN_CHANNEL_TYPES: [&str; 1] = ["mock-im"];
+/// Every channel adapter type `serve` knows how to build (C27 v1:
+/// the first-class mock; C44 adds the real lark adapter — the GitHub
+/// adapter stays a Phase-4 placeholder).
+pub const KNOWN_CHANNEL_TYPES: [&str; 3] = ["mock-im", "lark", "timer"];
 
 /// One remote execution endpoint (over the C20 durable queue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -568,6 +1003,14 @@ impl ServeConfig {
                  must be enabled together",
             ));
         }
+        // C37: the async pair routes through the C20 queue — gating it
+        // on without endpoints would mount tools with nowhere to run.
+        if self.superagent.as_ref().is_some_and(|sa| sa.async_tools) && self.endpoints.is_empty() {
+            return Err(invalid(
+                "`superagent.async_tools` requires a non-empty `endpoints:` list \
+                 (the async start/stop pair routes through the remote-exec queue)",
+            ));
+        }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
             return Err(invalid(
                 "plugin `react-loop` is the Phase-1 loop; with the \
@@ -634,6 +1077,67 @@ impl ServeConfig {
                         KNOWN_CHANNEL_TYPES.join(", ")
                     )));
                 }
+                // C44: the `lark:` section is presence-locked to
+                // `type: lark` in both directions, and its contents
+                // validate fail-closed (a lark channel is unusable
+                // without a real topic map and a positive cadence).
+                match (&channel.lark, channel.channel_type.as_str()) {
+                    (Some(section), "lark") => {
+                        if section.topics.is_empty() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.lark.topics must declare at \
+                                 least one chat id → topic entry"
+                            )));
+                        }
+                        for (chat_id, topic) in &section.topics {
+                            if chat_id.trim().is_empty() || topic.trim().is_empty() {
+                                return Err(invalid(format!(
+                                    "superagent.channels `{name}`.lark.topics entries must be \
+                                     non-empty (`{chat_id}`)"
+                                )));
+                            }
+                        }
+                        if section.poll_interval_ms == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.lark.poll_interval_ms must be > 0"
+                            )));
+                        }
+                    }
+                    (Some(_), other) => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}`: the `lark:` section belongs to \
+                             `type: lark` channels only (this channel is `type: {other}`)"
+                        )));
+                    }
+                    (None, "lark") => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}` (type lark) requires a `lark:` section \
+                             (api_base?, poll_interval_ms?, topics)"
+                        )));
+                    }
+                    (None, _) => {}
+                }
+                // C40: the `timer:` section is presence-locked to
+                // `type: timer` in both directions; its cadence
+                // validates fail-closed.
+                match (&channel.timer, channel.channel_type.as_str()) {
+                    (Some(section), "timer") => {
+                        section.to_runtime(name)?;
+                    }
+                    (Some(_), other) => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}`: the `timer:` section belongs to \
+                             `type: timer` channels only (this channel is `type: {other}`)"
+                        )));
+                    }
+                    (None, "timer") => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}` (type timer) requires a `timer:` section \
+                             (interval_ms, emit_on_start?, topic?)"
+                        )));
+                    }
+                    (None, _) => {}
+                }
             }
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
@@ -652,6 +1156,11 @@ impl ServeConfig {
                     "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
                     sa.router.slot, sa.router.agent
                 )));
+            }
+            // The speculation section must convert cleanly (C39:
+            // fail-closed — a zero cap or empty label refuses to start).
+            if let Some(speculation) = &sa.router.speculation {
+                speculation.to_policy()?;
             }
             let worker_agent = self.agents.get(&sa.worker.agent).ok_or_else(|| {
                 invalid(format!(
@@ -680,6 +1189,53 @@ impl ServeConfig {
             // Wire-form rules must convert cleanly (unknown matcher/route
             // spellings refuse to start).
             sa.subscription_rules()?;
+            // C36: classes cross-reference declared channels and convert
+            // cleanly (unknown class keywords refuse to start).
+            for (i, class) in sa.classes.iter().enumerate() {
+                if !sa.channels.contains_key(&class.channel) {
+                    return Err(invalid(format!(
+                        "superagent.classes[{i}] references channel `{}` which is not \
+                         declared in superagent.channels",
+                        class.channel
+                    )));
+                }
+            }
+            sa.admission_classes()?;
+            // C43: the untrusted-channel list cross-references the
+            // declared channels and converts cleanly (fail-closed).
+            sa.untrusted_channel_set()?;
+            // C40: the watchdog binding cross-references convert
+            // cleanly — a fixed session uuid distinct from the Router
+            // session, an agent that exists and carries a strong
+            // `main` slot (the worker-template shape).
+            if let Some(watchdog) = &sa.watchdog {
+                let session = uuid::Uuid::parse_str(&watchdog.session_id).map_err(|_| {
+                    invalid(format!(
+                        "superagent.watchdog.session_id `{}` is not a uuid",
+                        watchdog.session_id
+                    ))
+                })?;
+                if session.to_string() == sa.router.session_id {
+                    return Err(invalid(
+                        "superagent.watchdog.session_id must differ from \
+                         superagent.router.session_id (the watchdog judges the Router's \
+                         threads — it cannot be the Router)",
+                    ));
+                }
+                let watchdog_agent = self.agents.get(&watchdog.agent).ok_or_else(|| {
+                    invalid(format!(
+                        "superagent.watchdog.agent `{}` is not defined in agents",
+                        watchdog.agent
+                    ))
+                })?;
+                if !watchdog_agent.model_slots.contains_key("main") {
+                    return Err(invalid(format!(
+                        "superagent.watchdog.agent `{}` has no `main` model slot (the \
+                         watchdog is worker-template shaped: one strong main slot)",
+                        watchdog.agent
+                    )));
+                }
+            }
         }
 
         // Degenerate timing constants that would make liveness meaningless.
@@ -1085,6 +1641,488 @@ recovery:
         assert_eq!(cfg.agent_def().id, "default");
     }
 
+    // -------------------------------------------------------------------
+    // C40: watchdog + timer configuration
+    // -------------------------------------------------------------------
+
+    const WATCHDOG_SESSION: &str = "99999999-8888-7777-6666-555555555555";
+
+    /// The golden profile plus the C40 surface: a watchdog agent and
+    /// binding, a `type: timer` channel, and a session-routed rule.
+    fn watchdog_yaml() -> String {
+        superagent_yaml()
+            .replacen(
+                "agents:\n",
+                "agents:\n  watchdog:\n    id: watchdog\n    version: 1\n    model_slots:\n      main:\n        provider: openai\n        model: gpt-watchdog\n    tools: []\n",
+                1,
+            )
+            .replacen(
+                "superagent:\n",
+                format!(
+                    "superagent:\n  watchdog:\n    session_id: \"{WATCHDOG_SESSION}\"\n    agent: watchdog\n"
+                )
+                .as_str(),
+                1,
+            )
+            .replacen(
+                "  subscriptions:",
+                // The timer rule routes the watchdog topic to the fixed
+                // session (interpolated — this arm needs the uuid).
+                format!(
+                    "  subscriptions:\n    - channel: timer\n      match:\n        topic: watchdog\n      route:\n        session: \"{WATCHDOG_SESSION}\""
+                )
+                .as_str(),
+                1,
+            )
+            .replacen(
+                "  channels:",
+                "  channels:\n    timer:\n      type: timer\n      timer:\n        interval_ms: 60000\n        emit_on_start: true",
+                1,
+            )
+    }
+
+    #[test]
+    fn watchdog_and_timer_config_parse_and_convert() {
+        let cfg = ServeConfig::parse(&watchdog_yaml()).expect("watchdog config parses");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+
+        // The watchdog binding.
+        let watchdog = sa.watchdog.as_ref().expect("watchdog binding");
+        assert_eq!(watchdog.session_id, WATCHDOG_SESSION);
+        assert_eq!(watchdog.agent, "watchdog");
+
+        // The timer channel: type + section, with defaults filled.
+        let timer = sa.channels.get("timer").expect("timer channel");
+        assert_eq!(timer.channel_type, "timer");
+        let section = timer.timer.as_ref().expect("timer section");
+        assert_eq!(section.interval_ms, 60_000);
+        assert!(section.emit_on_start);
+        assert_eq!(
+            section.topic,
+            kian_superagent::DEFAULT_TIMER_TOPIC,
+            "topic defaults to `watchdog`"
+        );
+        let runtime = section.to_runtime("timer").expect("converts");
+        assert_eq!(runtime.interval_ms, 60_000);
+        assert!(runtime.emit_on_start);
+        assert_eq!(runtime.topic, "watchdog");
+
+        // The session-routed rule converts to Route::Session.
+        let rules = sa.subscription_rules().expect("rules convert");
+        let session_rule = rules
+            .0
+            .iter()
+            .find(|r| r.channel == "timer")
+            .expect("the timer rule");
+        assert_eq!(
+            session_rule.route,
+            kian_superagent::Route::Session(kian_core::model::SessionId(
+                uuid::Uuid::parse_str(WATCHDOG_SESSION).unwrap()
+            ))
+        );
+
+        // The golden profile without the additions still parses
+        // (additive: absence is today's behavior).
+        let plain = ServeConfig::parse(&superagent_yaml()).expect("plain golden parses");
+        assert!(plain.superagent.as_ref().unwrap().watchdog.is_none());
+    }
+
+    #[test]
+    fn timer_channel_section_is_fail_closed() {
+        // Zero interval refuses to start.
+        let zero = watchdog_yaml().replace("interval_ms: 60000", "interval_ms: 0");
+        let err = ServeConfig::parse(&zero).unwrap_err();
+        assert!(err.to_string().contains("interval_ms must be > 0"), "{err}");
+
+        // A timer channel without its section refuses to start.
+        let missing = watchdog_yaml().replacen(
+            "    timer:\n      type: timer\n      timer:\n        interval_ms: 60000\n        emit_on_start: true",
+            "    timer:\n      type: timer",
+            1,
+        );
+        let err = ServeConfig::parse(&missing).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a `timer:` section"),
+            "{err}"
+        );
+
+        // The section on a non-timer channel refuses to start.
+        let misapplied = watchdog_yaml().replacen(
+            "    mock-im:\n      type: mock-im",
+            "    mock-im:\n      type: mock-im\n      timer:\n        interval_ms: 1000",
+            1,
+        );
+        let err = ServeConfig::parse(&misapplied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to `type: timer` channels only"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn watchdog_binding_is_fail_closed() {
+        // A malformed session uuid (the binding's occurrence only —
+        // the route references the same literal later in the file).
+        let bad_uuid = watchdog_yaml().replacen(WATCHDOG_SESSION, "not-a-uuid", 1);
+        let err = ServeConfig::parse(&bad_uuid).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session_id `not-a-uuid` is not a uuid"),
+            "{err}"
+        );
+
+        // The watchdog session must differ from the Router session.
+        let same = watchdog_yaml().replace(WATCHDOG_SESSION, ROUTER_SESSION);
+        let err = ServeConfig::parse(&same).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must differ from superagent.router.session_id"),
+            "{err}"
+        );
+
+        // An unknown agent reference.
+        let unknown_agent = watchdog_yaml().replace("agent: watchdog", "agent: ghost");
+        let err = ServeConfig::parse(&unknown_agent).unwrap_err();
+        assert!(
+            err.to_string().contains("`ghost` is not defined in agents"),
+            "{err}"
+        );
+
+        // An agent without a main slot (router-shaped, not worker-shaped).
+        let no_main = watchdog_yaml().replacen(
+            "  watchdog:\n    id: watchdog\n    version: 1\n    model_slots:\n      main:",
+            "  watchdog:\n    id: watchdog\n    version: 1\n    model_slots:\n      judge:",
+            1,
+        );
+        let err = ServeConfig::parse(&no_main).unwrap_err();
+        assert!(
+            err.to_string().contains("has no `main` model slot"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn session_route_with_a_bad_uuid_is_rejected() {
+        let bad = watchdog_yaml().replacen(
+            &format!("        session: \"{WATCHDOG_SESSION}\""),
+            "        session: \"nope\"",
+            1,
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("route.session `nope` is not a uuid"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn superagent_shaping_is_additive_and_defaults_to_legacy_behavior() {
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  shaping:\n    inline_cap_bytes: 2048\n    first_chars: 80\n    neighbor_fields: [reply_to, thread_id]\n  channels:",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("shaping config parses");
+        let shaping = cfg.superagent.unwrap().shaping.unwrap();
+        assert_eq!(shaping.inline_cap_bytes, Some(2048));
+        assert_eq!(shaping.first_chars, 80);
+        assert_eq!(shaping.neighbor_fields, ["reply_to", "thread_id"]);
+
+        let legacy = ServeConfig::parse(&superagent_yaml()).expect("legacy config parses");
+        assert!(legacy.superagent.unwrap().shaping.is_none());
+
+        let defaults = ServeConfig::parse(&superagent_yaml().replacen(
+            "  channels:",
+            "  shaping: {}\n  channels:",
+            1,
+        ))
+        .expect("defaulted shaping parses");
+        let shaping = defaults.superagent.unwrap().shaping.unwrap();
+        assert_eq!(shaping.inline_cap_bytes, None);
+        assert_eq!(shaping.first_chars, 50);
+        assert!(shaping.neighbor_fields.is_empty());
+    }
+
+    /// C35: the `superagent.recall:` section is additive — a legacy
+    /// config parses with the toolpack default-on for the Router and
+    /// off for workers (the Default impl agrees with the serde
+    /// defaults), and an explicit section converts to the bundle caps.
+    #[test]
+    fn superagent_recall_section_is_additive_with_router_default_on() {
+        // Legacy (no recall section): defaults, not absence.
+        let legacy = ServeConfig::parse(&superagent_yaml()).expect("legacy config parses");
+        let recall = legacy.superagent.unwrap().recall;
+        assert_eq!(recall, super::RecallConfig::default());
+        assert!(recall.router, "the Router mounts recall by default");
+        assert!(!recall.worker, "worker templates opt in");
+        assert_eq!(
+            recall.output_cap_bytes,
+            kian_superagent::DEFAULT_OUTPUT_CAP_BYTES
+        );
+        assert_eq!(
+            recall.neighbor_window,
+            kian_superagent::DEFAULT_NEIGHBOR_WINDOW
+        );
+
+        // Explicit section: worker opt-in plus custom caps.
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  recall:\n    worker: true\n    output_cap_bytes: 512\n    neighbor_window: 7\n  channels:",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("recall config parses");
+        let recall = cfg.superagent.unwrap().recall;
+        assert!(recall.router);
+        assert!(recall.worker);
+        let runtime = recall.to_runtime();
+        assert_eq!(runtime.output_cap_bytes, 512);
+        assert_eq!(runtime.neighbor_window, 7);
+
+        // Router opt-out is explicit and parseable.
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  recall:\n    router: false\n  channels:",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("router opt-out parses");
+        assert!(!cfg.superagent.unwrap().recall.router);
+
+        // Unknown keys still refuse (fail-closed).
+        let bad = superagent_yaml().replacen(
+            "  channels:",
+            "  recall:\n    neighbor_windowx: 3\n  channels:",
+            1,
+        );
+        assert!(ServeConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn superagent_shaping_rejects_unknown_fields() {
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  shaping:\n    inline_cap_byte: 1024\n  channels:",
+            1,
+        );
+        let error = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "unexpected error: {error}");
+        assert!(error.contains("inline_cap_byte"));
+    }
+
+    /// C43: the untrusted-channel list parses, defaults to empty
+    /// (every channel trusted = today's behavior), and converts to
+    /// the runtime set.
+    #[test]
+    fn superagent_untrusted_channels_parse_and_convert() {
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  untrusted_channels: [mock-im, ci]\n  channels:",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("untrusted channels parse");
+        let sa = cfg.superagent.unwrap();
+        assert_eq!(sa.untrusted_channels, ["mock-im", "ci"]);
+        assert_eq!(
+            sa.untrusted_channel_set().unwrap(),
+            std::collections::BTreeSet::from(["ci".to_string(), "mock-im".to_string()])
+        );
+
+        // Absent = empty = every channel trusted.
+        let legacy = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = legacy.superagent.unwrap();
+        assert!(sa.untrusted_channels.is_empty());
+        assert!(sa.untrusted_channel_set().unwrap().is_empty());
+    }
+
+    /// C43 fail-closed: an entry naming an undeclared channel refuses
+    /// to start, as do empty entries and duplicates.
+    #[test]
+    fn superagent_untrusted_channels_cross_reference_declared_channels() {
+        let undeclared = superagent_yaml().replacen(
+            "  channels:",
+            "  untrusted_channels: [lark]\n  channels:",
+            1,
+        );
+        let error = ServeConfig::parse(&undeclared).unwrap_err().to_string();
+        assert!(
+            error.contains("untrusted_channels[0] references channel `lark`"),
+            "unexpected error: {error}"
+        );
+
+        let duplicate = superagent_yaml().replacen(
+            "  channels:",
+            "  untrusted_channels: [mock-im, mock-im]\n  channels:",
+            1,
+        );
+        let error = ServeConfig::parse(&duplicate).unwrap_err().to_string();
+        assert!(
+            error.contains("duplicates channel `mock-im`"),
+            "unexpected error: {error}"
+        );
+
+        let empty = superagent_yaml().replacen(
+            "  channels:",
+            "  untrusted_channels: [\"\"]\n  channels:",
+            1,
+        );
+        assert!(ServeConfig::parse(&empty).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // C44: the lark channel wire layer
+    // -----------------------------------------------------------------------
+
+    /// A lark channel declaration spliced into the golden fixture (the
+    /// section carries no credentials — they are env-only).
+    fn lark_yaml(extra: &str) -> String {
+        superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            &format!("  channels:\n    lark:\n      type: lark\n{extra}    mock-im:"),
+            1,
+        )
+    }
+
+    #[test]
+    fn lark_channel_config_parses_with_defaults() {
+        let yaml = lark_yaml(
+            "      lark:\n        topics:\n          oc_chat1: ci\n          oc_chat2: ops\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("lark config parses");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let lark = sa.channels["lark"].lark.as_ref().expect("lark section");
+        assert_eq!(lark.api_base, "https://open.feishu.cn");
+        assert_eq!(lark.poll_interval_ms, 5_000);
+        assert_eq!(
+            lark.topics,
+            BTreeMap::from([
+                ("oc_chat1".to_string(), "ci".to_string()),
+                ("oc_chat2".to_string(), "ops".to_string())
+            ])
+        );
+
+        // Explicit overrides parse.
+        let yaml = lark_yaml(
+            "      lark:\n        api_base: \"https://feishu.private\"\n        poll_interval_ms: 500\n        topics:\n          oc_chat1: ci\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("lark overrides parse");
+        let lark = cfg.superagent.as_ref().unwrap().channels["lark"]
+            .lark
+            .as_ref()
+            .unwrap();
+        assert_eq!(lark.api_base, "https://feishu.private");
+        assert_eq!(lark.poll_interval_ms, 500);
+    }
+
+    #[test]
+    fn lark_channel_config_fails_closed_both_directions() {
+        // `type: lark` without a `lark:` section.
+        let error = ServeConfig::parse(&lark_yaml("")).unwrap_err().to_string();
+        assert!(
+            error.contains("requires a `lark:` section"),
+            "unexpected error: {error}"
+        );
+
+        // A `lark:` section on a non-lark channel.
+        let misplaced = superagent_yaml().replacen(
+            "    mock-im:\n      type: mock-im",
+            "    mock-im:\n      type: mock-im\n      lark:\n        topics:\n          oc_chat1: ci",
+            1,
+        );
+        let error = ServeConfig::parse(&misplaced).unwrap_err().to_string();
+        assert!(
+            error.contains("belongs to `type: lark` channels only"),
+            "unexpected error: {error}"
+        );
+
+        // Empty topic table / empty entries / zero cadence.
+        for (extra, needle) in [
+            ("      lark:\n        topics: {}\n", "at least one chat id"),
+            (
+                "      lark:\n        topics:\n          \"\": ci\n",
+                "must be non-empty",
+            ),
+            (
+                "      lark:\n        poll_interval_ms: 0\n        topics:\n          oc_chat1: ci\n",
+                "poll_interval_ms must be > 0",
+            ),
+        ] {
+            let error = ServeConfig::parse(&lark_yaml(extra))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn lark_credentials_fail_closed_at_startup() {
+        let cfg = ServeConfig::parse(&lark_yaml(
+            "      lark:\n        topics:\n          oc_chat1: ci\n",
+        ))
+        .expect("config parses (credentials are checked at conversion)");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let section = sa.channels["lark"].lark.as_ref().unwrap();
+
+        // Absent credentials → a startup error naming the env vars.
+        let error = section
+            .to_runtime("lark", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("KIAN_LARK_APP_ID") && error.contains("never live in kian.yaml"),
+            "unexpected error: {error}"
+        );
+        // Blank app id is a missing credential; same for the secret.
+        let error = section
+            .to_runtime("lark", Some("  ".into()), Some("s".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("KIAN_LARK_APP_ID"),
+            "unexpected error: {error}"
+        );
+        let error = section
+            .to_runtime("lark", Some("cli_x".into()), Some("".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("KIAN_LARK_APP_SECRET"),
+            "unexpected error: {error}"
+        );
+
+        // Present credentials convert to a validated runtime config.
+        let runtime = section
+            .to_runtime("lark", Some("cli_x".into()), Some("sec".into()))
+            .expect("credentials build");
+        assert_eq!(runtime.app_id, "cli_x");
+        assert_eq!(runtime.topics["oc_chat1"], "ci");
+        assert_eq!(runtime.poll_interval.as_millis(), 5_000);
+    }
+
+    #[test]
+    fn lark_channels_are_untrusted_by_default() {
+        let yaml = lark_yaml("      lark:\n        topics:\n          oc_chat1: ci\n");
+        let cfg = ServeConfig::parse(&yaml).expect("lark config parses");
+        let sa = cfg.superagent.as_ref().unwrap();
+
+        // Not listed in untrusted_channels…
+        assert!(sa.untrusted_channels.is_empty());
+        // …but the runtime set (what assembly passes to the bundle)
+        // includes the lark-typed channel, and only it.
+        let set = sa.runtime_untrusted_set().expect("runtime set converts");
+        assert_eq!(
+            set,
+            std::collections::BTreeSet::from(["lark".to_string()]),
+            "real channels are untrusted by default (C43+C44)"
+        );
+
+        // Without any lark channel the runtime set equals the legacy
+        // configured set exactly (C43 behavior unchanged).
+        let plain = ServeConfig::parse(&superagent_yaml()).expect("golden parses");
+        let sa = plain.superagent.as_ref().unwrap();
+        assert!(sa.runtime_untrusted_set().unwrap().is_empty());
+    }
+
     #[test]
     fn superagent_defaults_slot_and_pin() {
         let yaml = superagent_yaml()
@@ -1096,6 +2134,79 @@ recovery:
         assert_eq!(sa.worker.pinned_version, None);
         let worker = cfg.named_agent("worker").unwrap();
         assert_eq!(worker.version, 7, "agent version is the pin");
+    }
+
+    /// C36: the `classes:` wire layer parses, converts fail-closed to
+    /// the bundle's table, resolves most-specific-wins through the
+    /// converted form, and unknown spellings/undeclared channels
+    /// refuse to start.
+    #[test]
+    fn admission_classes_parse_convert_and_fail_closed() {
+        use kian_superagent::rules::AdmissionClass;
+
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  classes:\n\
+             \x20   - channel: mock-im\n\
+             \x20     class: explicit-only\n\
+             \x20   - channel: ci\n\
+             \x20     topic: ci-noise\n\
+             \x20     class: ignore\n\
+             \x20   - channel: ci\n\
+             \x20     topic: ci-noise\n\
+             \x20     sender:\n\
+             \x20       id: u-1\n\
+             \x20     class: candidate\n\
+             \x20 channels:",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("classes parse");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        cfg.validate().expect("classes validate");
+        let table = sa.admission_classes().expect("classes convert");
+        assert_eq!(table.0.len(), 3);
+        assert_eq!(table.0[0].class, AdmissionClass::ExplicitOnly);
+        assert_eq!(table.0[0].topic, None);
+        assert_eq!(table.0[1].topic.as_deref(), Some("ci-noise"));
+        assert_eq!(table.0[2].sender, Some(serde_json::json!({"id": "u-1"})));
+
+        // Resolution sanity through the converted table: the pinned
+        // sender in the pinned topic wins over the topic-only ignore.
+        let event = kian_core::seams::ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-cfg".into(),
+            topic: Some("ci-noise".into()),
+            sender: Some(serde_json::json!({"id": "u-1"})),
+            group: None,
+            payload: serde_json::json!({}),
+            ts_ms: 1,
+        };
+        assert_eq!(table.resolve(&event), AdmissionClass::Candidate);
+
+        // Fail-closed: an unknown class keyword refuses to load.
+        let bad = superagent_yaml().replacen(
+            "  channels:",
+            "  classes:\n    - channel: mock-im\n      class: silence\n  channels:",
+            1,
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("not one of candidate | explicit-only | ignore"),
+            "{err}"
+        );
+
+        // Fail-closed: a class keying an undeclared channel refuses
+        // validation.
+        let undeclared = superagent_yaml().replacen(
+            "  channels:",
+            "  classes:\n    - channel: lark\n      class: ignore\n  channels:",
+            1,
+        );
+        let err = ServeConfig::parse(&undeclared).unwrap_err().to_string();
+        assert!(
+            err.contains("superagent.classes[0] references channel `lark`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1122,9 +2233,13 @@ recovery:
 
     #[test]
     fn superagent_unknown_channel_type_is_rejected() {
-        let err = ServeConfig::parse(&superagent_yaml().replace("type: mock-im", "type: lark"))
+        // C44 note: the fixture originally used `lark` as the unknown
+        // type; lark is a real adapter now, so the probe rides a
+        // still-unknown spelling (github is the parked Phase-4 adapter,
+        // not a `serve`-buildable type today).
+        let err = ServeConfig::parse(&superagent_yaml().replace("type: mock-im", "type: github"))
             .unwrap_err();
-        assert!(err.to_string().contains("unknown type `lark`"), "{}", err);
+        assert!(err.to_string().contains("unknown type `github`"), "{}", err);
     }
 
     #[test]
@@ -1284,5 +2399,83 @@ recovery:
         assert!(cfg.agents.is_empty());
         assert!(cfg.endpoints.is_empty());
         assert!(!cfg.agent.evidence_gate.enabled);
+    }
+
+    // ------------------------------------------------------------------
+    // C39: the speculation section
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn speculation_section_parses_and_converts() {
+        let yaml = superagent_yaml().replace(
+            "  router:\n    session_id:",
+            "  router:\n    speculation:\n      max_outstanding: 3\n      label: weak-signal\n    session_id:",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("speculation config");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let policy = sa.router.speculation.as_ref().unwrap().to_policy().unwrap();
+        assert_eq!(policy.max_outstanding, 3);
+        assert_eq!(policy.label, "weak-signal");
+        assert_eq!(
+            policy.silent_repro,
+            kian_superagent::SILENT_REPRO_TEMPLATE,
+            "silent-repro defaults to the bundle template"
+        );
+
+        // An override replaces the template (a config artifact).
+        let yaml = yaml.replace(
+            "      label: weak-signal\n",
+            "      label: weak-signal\n      silent_repro: custom policy prose\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("speculation override");
+        let policy = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .router
+            .speculation
+            .as_ref()
+            .unwrap()
+            .to_policy()
+            .unwrap();
+        assert_eq!(policy.silent_repro, "custom policy prose");
+    }
+
+    #[test]
+    fn speculation_defaults_to_absent_and_degenerate_values_fail_closed() {
+        // The unmodified fixture: no speculation section, spec disabled.
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        assert!(cfg.superagent.unwrap().router.speculation.is_none());
+
+        // Zero cap / empty label refuse to start (never a silent default).
+        let zero = superagent_yaml().replace(
+            "  router:\n    session_id:",
+            "  router:\n    speculation:\n      max_outstanding: 0\n      label: x\n    session_id:",
+        );
+        let err = ServeConfig::parse(&zero).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("speculation.max_outstanding must be > 0"),
+            "{err}"
+        );
+
+        let empty_label = superagent_yaml().replace(
+            "  router:\n    session_id:",
+            "  router:\n    speculation:\n      max_outstanding: 2\n      label: \"\"\n    session_id:",
+        );
+        let err = ServeConfig::parse(&empty_label).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("speculation.label must be non-empty"),
+            "{err}"
+        );
+
+        // Unknown keys inside speculation fail closed like the rest of
+        // the config surface.
+        let unknown = superagent_yaml().replace(
+            "  router:\n    session_id:",
+            "  router:\n    speculation:\n      max_outstanding: 2\n      label: x\n      budget: 9\n    session_id:",
+        );
+        assert!(ServeConfig::parse(&unknown).is_err());
     }
 }
