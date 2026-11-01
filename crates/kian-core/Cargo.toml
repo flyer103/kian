@@ -1,0 +1,12 @@
+[package]
+name = "kian-core"
+description = "Concept model, session state machine, six-invariant assertions"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+futures.workspace = true
