@@ -41,6 +41,7 @@
 | [004](decisions/ADR-004-cordis-inspired-plugin.md) | Plugin mechanism borrowed from Cordis (service keys/injection/reversible registration); Rust uses traits + registries | dylib dynamic loading | Stability first; compile-time plugin set | plugins |
 | [005](decisions/ADR-005-fencing-via-expectedseq.md) | Safety = fencing (epoch + expectedSeq CAS); lease is only liveness | Lease TTL only | NoSplitBrainWrite must not depend on detection timeliness | core, storage |
 | [006](decisions/ADR-006-model-slots.md) | Declarative model slots (slot→provider/model/fallback), immutable at runtime | Free runtime model switching | A3 cache-byte stability; P6 determinism | llm seam |
+| [007](decisions/ADR-007-kiand-delivery-semantics.md) | kiand delivery: server-side durable queue, at-least-once, command-id correlation | Exactly-once via endpoint state; fail-fast offline; queue-as-events | Endpoint stays stateless (brain–hand separation); offline park is S5's core semantic; queue rows are pre-event state, not session facts | exec seam |
 
 ## 1. Architecture overview
 
@@ -163,8 +164,11 @@ shape and projects `running→running` (safety against true double-claims is the
 fence, not the projection); `session/ended{reason}`→end write, where `completed`/`cancelled` are
 terminal and freeze the stream, while `interrupted`/`failed` release ownership cleanly and return
 the session to `idle` (honest labeling lives in the events; resume = new claim; the final end
-write records the final outcome); `input/admitted` preserves `idle`/`running`/`recoverable`;
-every other kind is drain activity, legal only while `running`. EndReason first-write-wins holds
+write records the final outcome); `input/admitted` and `thread/started` (C18, Phase 2)
+preserve `idle`/`running`/`recoverable` — `thread/started` is appended to the worker's
+stream after `session/created` but before the first `drain/claimed`, and to the Router's
+stream mid-drain; every other kind is drain activity, legal only while `running`. EndReason
+first-write-wins holds
 within one drain episode: a second `session/ended` before the next claim is a named projection
 error (the projection-side mirror of the store's end-write CAS race). `recoverable` (lease
 expiry — a liveness observation overlaid from the expired-lease query) and `archived` (ops
@@ -305,6 +309,14 @@ actually settles.
 | Durable events | turn/start, step/request, assistant/message (sent bytes), tool/call, tool/result, input/admitted, drain/claimed, session/ended | ✅ append-only | Truth and replay |
 | Live events | streaming chunks, heartbeats, progress notifications | ❌ not persisted | UI/observability (derived from durable events or via a side channel) |
 
+The durable kind set is exactly nineteen (C18): the fifteen kinds frozen through Phase 1
+(fourteen by C2 + the additive C14 `recovery/budget-reset`) plus the four Phase-2 additions —
+`thread/started`, `thread/completed`, `evidence/verdict`, `channel/delivered` — all
+additions-only (no renames, no reformats of existing kinds) and all non-context-bearing:
+thread lineage, evidence verdicts and delivery receipts are audit data that never enter the
+model context. `thread/started` is state-preserving in `idle`/`running`/`recoverable`
+(§2.2); the other three are drain activity.
+
 ### 3.2 Model-context projection (the implementation core of A2/A3)
 
 `derive_model_context(session) -> Vec<Message>`: projects the next model request's messages from
@@ -389,7 +401,10 @@ graph TB
 ```
 
 - **Router session**: a resident session (idle long-lived); event judging uses the `router` slot
-  (cheap fast model); it emits dispatch-decision events.
+  (cheap fast model); it emits dispatch-decision events. Residency is mechanical (C26): the
+  Router's loop driver parks between provider turns — while delegated threads are outstanding
+  and while the inbox is empty — instead of settling, so the session never freezes after an idle
+  final answer; completion reports and new channel events re-drive it in place.
 - **Worker session**: derived via `Thread { parent_session: router, pinned_version }` delegation;
   context-isolated, full tools, `main` slot strong model. Workers never reply on the channel
   directly — completion events report back to the Router, which aggregates and replies (avoiding
@@ -403,11 +418,19 @@ graph TB
 
 ### 4.2 Channel bandwidth matching (output policy)
 
+Policies shape the reply **before the send** (`ChannelDelivery` carries already
+policy-shaped content); the adapter delivers what it is given. Policy code lives in the
+bundle (`kian-superagent`), never in a channel adapter and never in the core. Every
+successful send is followed by a `channel/delivered` event; a policy rejection (e.g. a
+structured payload missing a section) is an honest error to the loop — never a silent
+send.
+
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
 | IM | ≤100-word hard rule; only direct questions / short conclusions; notify only when a decision or acceptance is needed |
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
 | Email/docs | Structured summary drafting |
+| Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the S4 IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
 
 ### 4.3 BYOM endpoint (kiand daemon / endpoint SDK)
 
@@ -416,14 +439,15 @@ graph LR
     subgraph cloud["Kian (cloud/server)"]
         ORCH[orchestrator<br/>runs LoopDriver inside drains]
         SEAM[exec seam<br/>ExecBackend]
+        WD[watchdog v1<br/>server-side heartbeat monitor]
     end
     subgraph endpoint["Endpoint machines (two forms)"]
         KD[kiand<br/>daemon binary]
         EP[kian-endpoint SDK<br/>embedded in any process]
-        WD[watchdog<br/>health monitoring]
     end
     ORCH --> SEAM
     SEAM <-->|KiandProto bidirectional stream:<br/>cmd/result + heartbeat| KD & EP
+    WD -.->|heartbeat freshness over the endpoint registry| KD & EP
     WD -.->|health events → Admit| ORCH
 ```
 
@@ -436,8 +460,15 @@ graph LR
 
 - The endpoint **keeps no session state** (brain-hand separation): it only executes commands and
   returns results; session logs live in Kian's EventStore.
-- The watchdog emits health events (endpoint offline / anomaly self-healing) → they flow through
-  Admit into the related session inbox (event-driven self-healing).
+- **The v1 watchdog is the server-side heartbeat monitor** (kian-exec, C21): a dead daemon cannot
+  report its own death, so the authoritative health view is the server's heartbeat-absence
+  observation over the endpoint registry — offline when `now - last_heartbeat > offline_after_ms`,
+  online again on a fresh heartbeat; edge-triggered (one event per state change, no flapping), and
+  freshness-based even when the transport is still up (a silent-but-connected endpoint is offline).
+  Endpoint-side self-checks / anomaly self-healing remain **Phase 3**.
+- The watchdog emits health events (endpoint offline) → they flow through
+  Admit into the related session inbox (event-driven self-healing); the watchdog itself never
+  writes session streams.
 - Intermittent endpoint presence is the norm: commands queue in durable state and are consumed
   after the endpoint reconnects (BYOM's offline-tolerant semantics).
 - **The two axes of separation**: where execution runs (ExecBackend provider: local /
@@ -502,7 +533,10 @@ replay <id>`, `kian session export <id> [--since/--until]`, `kian lease inspect`
 file **read-only in-process** (`EventStore::open_read_only` — no migrations, no write path ever
 held by the CLI) and derive everything from the event stream (constraint 1); resource resolution
 is fail-closed (`--db`/`--url` else `kian.yaml`). Mutating commands talk to a running `serve`
-through a dedicated **operational plane**, `POST /ops/rpc` (`wake_now`, `recovery_budget_reset`),
+through a dedicated **operational plane**, `POST /ops/rpc` (`wake_now`,
+`recovery_budget_reset`, and — added in Phase 2, C27 — the demo/S4 injection
+`mock_channel_send {channel, topic?, payload}`, which places one event onto a configured mock
+channel and lets the subscription engine route it per `kian.yaml`),
 mounted on the serve router outside the `ControlPlane` handler module behind its own
 trait-isolated `OpsPlane` — the C13 wire surface and semantics stay untouched, and the resident
 iron-rule test greps the ops handler module with the same forbidden-token table. `recovery budget
@@ -550,7 +584,7 @@ Every seam names three roles: **Service Definition** (the trait) / **Provider** 
 | `ModelProvider` | `complete(req: ModelRequest) -> Stream<ModelChunk>` | openai-compat (covers OR/kimi/ds) | any |
 | `ExecBackend` | `exec(cmd, env) -> ExecResult` | local / remote-endpoint (kiand, endpoint SDK) | sandbox/cloud machines |
 | `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | dsh loop (being-integrated), custom loops |
-| `ChannelAdapter` | `subscribe() -> Stream<ChannelEvent>`; `send(out)` | — | lark/im/github |
+| `ChannelAdapter` | `subscribe() -> Stream<ChannelEvent>`; `send(out) -> Future<SendReceipt>` | — | lark/im/github |
 | `ToolProvider` | `schemas() -> Vec<ToolSchema>`; `invoke(call)` | built-in fs/exec/kiand | any |
 | `RecoveryPolicySource` | `table() -> Vec<PolicyRule>` | config file | any |
 | `WatchdogSource` | `health() -> Stream<HealthEvent>` | kiand heartbeat | any |
@@ -573,7 +607,7 @@ graph TB
         KS[kian-store<br/>EventStore / Inbox / projection engine]
         KO[kian-orchestrator<br/>Admit→Wake→Drain→Promote<br/>+ recovery subsystem]
         KL[kian-llm<br/>ModelProvider seam + openai-compat]
-        KE[kian-exec<br/>ExecBackend seam + local<br/>+ KiandProto]
+        KE[kian-exec<br/>KiandProto server half:<br/>ConnectionManager<br/>+ durable queue]
         KP[kian-plugin<br/>Ctx/Plugin/Disposer/dispatch]
         KLD[kian-loop<br/>LoopDriver seam + built-in ReAct]
         KEP[kian-endpoint<br/>endpoint SDK library (KiandProto endpoint side)]
@@ -584,10 +618,12 @@ graph TB
     end
     KC --> KS
     KO --> KC & KS
-    KL & KE & KP & KLD --> KO
-    KSA --> KP & KO
+    KL & KP & KLD --> KO
+    KE --> KC & KS
+    KSA --> KP & KO & KLD
     KCL & KSDK --> KO
-    KDD --> KEP --> KE
+    KDD --> KEP
+    KE -.->|dials over TCP| KEP
 ```
 
 | crate | Responsibility | Key interfaces |
@@ -596,7 +632,7 @@ graph TB
 | kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
-| kian-exec | ExecBackend seam, KiandProto (bidirectional stream + heartbeat), offline queueing | `ExecBackend`, `KiandProto` |
+| kian-exec | KiandProto server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines commands and correlates results by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. C20 adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations, `RemoteExecBackend` (enqueue-first `ExecBackend`: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`), and `RemoteExecTool` (the same `exec` tool schema as the local built-in, routed through a configured endpoint). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
@@ -608,11 +644,31 @@ Dependency direction (the crate form of the layered iron rule): `kian-orchestrat
 on core + store + seam traits; every provider/channel implementation is assembled through
 `kian-plugin` and never enters the orchestrator dependency tree.
 
+One bundle edge crosses the loop crate: `kian-superagent` depends on `kian-loop` for the reusable
+evidence-gate evaluation (`evaluate_evidence_gate`, `CheckSpec`, the verdict payload — card C24's
+public, pure functions consumed by C25's `WorkerLoopDriver` instead of duplicating gate semantics).
+Types and pure functions only — no execution surface flows along that edge, and the bundle still
+reaches the server exclusively through its ports (`InboxWriter`, `StreamPort`), enforced by the
+crate-level iron-rule test.
+
 Seam trait **definitions** (`ModelProvider`, `LoopDriver`, `ToolProvider`, `ExecBackend`,
-`RecoveryPolicySource`) live in `kian-core::seams`; the implementation crates listed above
+`RecoveryPolicySource`, and — as of C18, Phase 2 — `ChannelAdapter` and `WatchdogSource`)
+live in `kian-core::seams`; the implementation crates listed above
 (kian-llm, kian-loop, kian-exec, …) implement and re-export them. Phase-1 decision (round-1 plan,
 risk 1): hosting the traits in the core keeps the orchestrator dependency tree free of provider
-crates while the built-in impls stay swappable.
+crates while the built-in impls stay swappable. The Phase-2 seams follow the same rule:
+`ChannelAdapter` and `WatchdogSource` are definition-only in core (no impls, no new
+dependencies); their impls land in the bundle (`kian-superagent`) and `kian-exec`
+respectively (ADR-003: super-agent semantics stay out of the core).
+
+The KiandProto wire contract is deliberately declared **twice, once per half**:
+`kian-endpoint` and `kian-exec` each carry their own golden-pinned frame types and
+share no protocol code — two independent implementations of one contract, with the
+golden tests asserting byte-identical frames and the pairing tests asserting both
+`PROTOCOL_VERSION`s match. Any wire change is a same-commit dual update with a
+version bump on both sides. `kian-exec` therefore has **no production dependency**
+on `kian-endpoint` (it dials the endpoint over TCP; `kian-endpoint` appears only as
+a dev-dependency for the real-TCP pairing tests).
 
 ## 8. Data flow (example: IM message → PR delivery)
 
@@ -644,8 +700,10 @@ sequenceDiagram
 - The drain executor is a tokio task; model streaming responses use `Stream` + bounded-channel
   backpressure.
 - Epoch/lease safety comes from store CAS; no cross-session global lock in-process.
-- A kiand connection = one bidirectional stream (quinn/quic or websocket over TLS) with pipelined
-  commands; the endpoint-side execution concurrency cap is configurable.
+- A kiand connection = one TCP connection carrying JSON-lines KiandProto frames with pipelined
+  commands; the endpoint-side execution concurrency cap is configurable. **v1 topology (C22): the
+  endpoint listens, the server dials.** quinn/quic and websocket-over-TLS remain the Phase-3
+  transport upgrade path.
 
 ## 10. Error-handling strategy
 
