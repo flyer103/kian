@@ -11,13 +11,18 @@
 //! eligibility away while destroying the row — the inbox row itself is
 //! durable and audit-visible forever.
 //!
+//! C50: the inbox surface dispatches over the same
+//! [`EventStore`](crate::event_store::EventStore) enum as the event
+//! store — identical method names and signatures, per-backend SQL in
+//! [`crate::sqlite`] and [`crate::postgres`], shared decode and typed
+//! error classification here.
+//!
 //! The store keeps zero background tasks: every time-sensitive query
 //! takes `now_ms` from the caller (clocks, timers and wake registries
 //! belong to the orchestrator, cards C9+).
 
 use kian_core::events::Event;
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
-use kian_core::state::{ProjectionError, SessionState, project};
 use uuid::Uuid;
 
 use crate::event_store::{EventStore, StoreError};
@@ -73,7 +78,22 @@ pub enum InboxError {
     #[error("projection of session {session:?} failed while filtering expired leases")]
     Projection {
         session: SessionId,
-        source: ProjectionError,
+        source: kian_core::state::ProjectionError,
+    },
+    /// Conditional claim admission (C47/ADR-009): the claims row holds a
+    /// *fresh* lease owned by a *different* holder. Nothing was written —
+    /// the store's epoch floor is unchanged — and the live holder's sweep
+    /// or wake transport will service the input. A typed fact for the
+    /// caller, never a session event (a rejected claim is not session
+    /// state, DESIGN §2 additions-only contract).
+    #[error(
+        "claim rejected: session {session:?} is freshly held by {holder:?} at epoch {epoch:?} until {expires_at_ms} ms"
+    )]
+    ClaimRejected {
+        session: SessionId,
+        holder: String,
+        epoch: Epoch,
+        expires_at_ms: u64,
     },
     #[error("u64 field {field} overflows sqlite's i64")]
     IntOverflow { field: &'static str },
@@ -85,56 +105,16 @@ pub enum InboxError {
     Store(#[from] StoreError),
 }
 
-fn to_i64(v: u64, field: &'static str) -> Result<i64, InboxError> {
+pub(crate) fn to_i64(v: u64, field: &'static str) -> Result<i64, InboxError> {
     i64::try_from(v).map_err(|_| InboxError::IntOverflow { field })
 }
 
-/// Durable admit keyed by `(session, idempotency_key)`: the unique
-/// index makes the insert a no-op on a key collision; NULL keys never
-/// collide, so keyless admits always insert.
-const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)\nON CONFLICT (session, idempotency_key) DO NOTHING";
-
-const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND idempotency_key = ?2";
-
-const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, id ASC";
-
-const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, id ASC";
-
-/// Consumption is event-driven by construction: the row is touched only
-/// when the referenced event row already exists in the same session's
-/// stream. The input row is never removed.
-const CONSUME_SQL: &str = "UPDATE inputs SET consumed_by_seq = ?3\nWHERE session = ?1 AND id = ?2\n  AND consumed_by_seq IS NULL\n  AND EXISTS (SELECT 1 FROM events WHERE session = ?1 AND seq = ?3)";
-
-const EVENT_EXISTS_SQL: &str = "SELECT COUNT(*) FROM events WHERE session = ?1 AND seq = ?2";
-
-const CONSUMED_STATE_SQL: &str =
-    "SELECT consumed_by_seq FROM inputs WHERE session = ?1 AND id = ?2";
-
-/// Monotonic epoch issuance in one statement (sqlite serializes
-/// writers, so concurrent claims execute this atomically in order).
-/// The floor is max(claims.epoch, events epoch floor): the claims row
-/// is the durable high-water mark across restarts, and the events floor
-/// closes the claim-issued-but-not-yet-appended window C5 flagged.
-/// In the conflict branch `excluded.epoch` was computed against the
-/// pre-statement claims row, so it is strictly greater than the stored
-/// epoch — epochs never repeat.
-const CLAIM_SQL: &str = "INSERT INTO claims (session, epoch, holder, ttl_ms, last_heartbeat)\nVALUES (?1,\n        MAX(COALESCE((SELECT MAX(epoch) FROM claims WHERE session = ?2), 0),\n             COALESCE((SELECT MAX(epoch) FROM events WHERE session = ?3), 0)) + 1,\n        ?4, ?5, ?6)\nON CONFLICT(session) DO UPDATE SET\n    epoch = excluded.epoch,\n    holder = excluded.holder,\n    ttl_ms = excluded.ttl_ms,\n    last_heartbeat = excluded.last_heartbeat\nRETURNING epoch";
-
-const HEARTBEAT_SQL: &str = "UPDATE claims SET last_heartbeat = ?2 WHERE session = ?1";
-
-/// Expired = `now - ttl > last_heartbeat`, written as a subtraction so
-/// neither side of the comparison can overflow i64.
-const EXPIRED_SQL: &str = "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims WHERE (?1 - ttl_ms) > last_heartbeat ORDER BY session ASC";
-
-/// Every claims row (C14 `lease inspect`): no filtering, epoch order.
-const ALL_LEASES_SQL: &str =
-    "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims ORDER BY epoch ASC";
-
 type InputCols = (String, String, String, i64, i64, Option<String>);
 
-/// Decodes one stored inbox row. Any decode failure is a typed
-/// [`InboxError::CorruptRow`] — never a panic, never silently skipped.
-fn decode_input(row: InputCols) -> Result<InputRow, InboxError> {
+/// Decodes one stored inbox row (identical column shape on both
+/// backends). Any decode failure is a typed [`InboxError::CorruptRow`] —
+/// never a panic, never silently skipped.
+pub(crate) fn decode_input(row: InputCols) -> Result<InputRow, InboxError> {
     let (id, session, payload, admitted_at, eligible_at, key) = row;
     let corrupt = |reason: String| {
         let sid = Uuid::parse_str(&session).unwrap_or_else(|_| Uuid::nil());
@@ -167,49 +147,10 @@ impl EventStore {
     /// `deduplicated: true` — first write wins, exactly one row exists.
     /// Rows without a key are always inserted.
     pub async fn admit(&self, input: InputRow) -> Result<AdmitOutcome, InboxError> {
-        let payload = serde_json::to_string(&input.payload)?;
-        let session_key = input.session.0.to_string();
-        let result = sqlx::query(ADMIT_SQL)
-            .bind(input.id.to_string())
-            .bind(&session_key)
-            .bind(&payload)
-            .bind(to_i64(input.admitted_at, "admitted_at")?)
-            .bind(to_i64(input.eligible_at, "eligible_at")?)
-            .bind(input.idempotency_key.as_deref())
-            .execute(self.pool())
-            .await?;
-        if result.rows_affected() == 1 {
-            return Ok(AdmitOutcome {
-                input,
-                deduplicated: false,
-            });
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::admit(pool, input).await,
+            EventStore::Postgres(pool) => crate::postgres::admit(pool, input).await,
         }
-        // Zero rows: the (session, idempotency_key) index already held a
-        // row. Read it back — first write wins.
-        let Some(key) = input.idempotency_key.clone() else {
-            return Err(InboxError::CorruptRow {
-                session: input.session,
-                input_id: input.id,
-                reason: "insert skipped without an idempotency key".into(),
-            });
-        };
-        let existing: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
-            .bind(&session_key)
-            .bind(&key)
-            .fetch_optional(self.pool())
-            .await?;
-        existing
-            .map(decode_input)
-            .transpose()?
-            .map(|input| AdmitOutcome {
-                input,
-                deduplicated: true,
-            })
-            .ok_or(InboxError::CorruptRow {
-                session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
-                input_id: Uuid::nil(),
-                reason: "unique index reported a collision but no row was found".into(),
-            })
     }
 
     /// The session's inputs that are eligible (`eligible_at <= now_ms`)
@@ -220,12 +161,12 @@ impl EventStore {
         session: SessionId,
         now_ms: u64,
     ) -> Result<Vec<InputRow>, InboxError> {
-        let rows: Vec<InputCols> = sqlx::query_as(ELIGIBLE_SQL)
-            .bind(session.0.to_string())
-            .bind(to_i64(now_ms, "now_ms")?)
-            .fetch_all(self.pool())
-            .await?;
-        rows.into_iter().map(decode_input).collect()
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::eligible_inputs(pool, session, now_ms).await,
+            EventStore::Postgres(pool) => {
+                crate::postgres::eligible_inputs(pool, session, now_ms).await
+            }
+        }
     }
 
     /// Marks one input consumed *by an already-committed event*: the
@@ -240,50 +181,13 @@ impl EventStore {
         input_id: Uuid,
         consumed_by_seq: u64,
     ) -> Result<(), InboxError> {
-        let session_key = session.0.to_string();
-        let seq = to_i64(consumed_by_seq, "consumed_by_seq")?;
-        let result = sqlx::query(CONSUME_SQL)
-            .bind(&session_key)
-            .bind(input_id.to_string())
-            .bind(seq)
-            .execute(self.pool())
-            .await?;
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        // The guarded write refused: classify which condition failed.
-        let committed: i64 = sqlx::query_scalar(EVENT_EXISTS_SQL)
-            .bind(&session_key)
-            .bind(seq)
-            .fetch_one(self.pool())
-            .await?;
-        if committed == 0 {
-            return Err(InboxError::MissingConsumptionEvent {
-                session,
-                input_id,
-                seq: consumed_by_seq,
-            });
-        }
-        let state: Option<Option<i64>> = sqlx::query_scalar(CONSUMED_STATE_SQL)
-            .bind(&session_key)
-            .bind(input_id.to_string())
-            .fetch_optional(self.pool())
-            .await?;
-        match state {
-            None => Err(InboxError::UnknownInput { session, input_id }),
-            Some(Some(prev)) if prev == seq => Ok(()),
-            Some(Some(prev)) => Err(InboxError::AlreadyConsumed {
-                session,
-                input_id,
-                consumed_by_seq: prev as u64,
-                seq: consumed_by_seq,
-            }),
-            Some(None) => Err(InboxError::CorruptRow {
-                session,
-                input_id,
-                reason: "guarded consume refused on an unconsumed row with a committed event"
-                    .into(),
-            }),
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::mark_consumed(pool, session, input_id, consumed_by_seq).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::mark_consumed(pool, session, input_id, consumed_by_seq).await
+            }
         }
     }
 
@@ -292,8 +196,20 @@ impl EventStore {
     /// floor) + 1`, so epochs strictly increase per session across
     /// process restarts (the claims row is a durable high-water mark)
     /// and across the claim-issued-but-not-yet-appended window C5
-    /// flagged. Single statement — concurrent claims serialize and get
+    /// flagged. One statement — concurrent claims serialize and get
     /// consecutive epochs. Liveness only (ADR-005).
+    ///
+    /// C47 (ADR-009) — conditional admission: the claim lands only when
+    /// (a) no claims row exists, (b) the row's lease is expired
+    /// (`now - ttl > last_heartbeat`), or (c) `holder` already owns the
+    /// row (same process re-claiming for its next drain episode — every
+    /// single-replica behavior, including back-to-back drains, is
+    /// byte-identical to pre-C47). A fresh lease held by a different
+    /// holder is refused with the typed [`InboxError::ClaimRejected`]
+    /// carrying the live holder; nothing is written, so the store's
+    /// epoch floor is unchanged. This conditions *claiming* only —
+    /// write acceptance never consults lease state (ADR-005, round-4
+    /// rule 10).
     pub async fn claim(
         &self,
         session: SessionId,
@@ -301,41 +217,22 @@ impl EventStore {
         ttl_ms: u64,
         now_ms: u64,
     ) -> Result<LeaseRecord, InboxError> {
-        let session_key = session.0.to_string();
-        let epoch: i64 = sqlx::query_scalar(CLAIM_SQL)
-            .bind(&session_key)
-            .bind(&session_key)
-            .bind(&session_key)
-            .bind(holder)
-            .bind(to_i64(ttl_ms, "ttl_ms")?)
-            .bind(to_i64(now_ms, "now_ms")?)
-            .fetch_one(self.pool())
-            .await?;
-        Ok(LeaseRecord {
-            session,
-            epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
-                session,
-                input_id: Uuid::nil(),
-                reason: format!("claims table returned a negative epoch ({epoch})"),
-            })?),
-            holder: holder.to_string(),
-            ttl_ms,
-            last_heartbeat: now_ms,
-        })
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::claim(pool, session, holder, ttl_ms, now_ms).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::claim(pool, session, holder, ttl_ms, now_ms).await
+            }
+        }
     }
 
     /// Extends the lease (liveness only). Typed [`InboxError::NoLease`]
     /// when no claims row exists.
     pub async fn heartbeat(&self, session: SessionId, now_ms: u64) -> Result<(), InboxError> {
-        let result = sqlx::query(HEARTBEAT_SQL)
-            .bind(session.0.to_string())
-            .bind(to_i64(now_ms, "now_ms")?)
-            .execute(self.pool())
-            .await?;
-        if result.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(InboxError::NoLease { session })
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::heartbeat(pool, session, now_ms).await,
+            EventStore::Postgres(pool) => crate::postgres::heartbeat(pool, session, now_ms).await,
         }
     }
 
@@ -346,39 +243,10 @@ impl EventStore {
     /// writes. `running` is derived from the event projection
     /// (constraint 1), never from a column.
     pub async fn expired_leases(&self, now_ms: u64) -> Result<Vec<LeaseRecord>, InboxError> {
-        let rows: Vec<(String, i64, String, i64, i64)> = sqlx::query_as(EXPIRED_SQL)
-            .bind(to_i64(now_ms, "now_ms")?)
-            .fetch_all(self.pool())
-            .await?;
-        let mut out = Vec::new();
-        for (session_key, epoch, holder, ttl_ms, last_heartbeat) in rows {
-            let sid = Uuid::parse_str(&session_key)
-                .map_err(|e| InboxError::CorruptRow {
-                    session: SessionId(Uuid::nil()),
-                    input_id: Uuid::nil(),
-                    reason: format!("claims row session id: {e}"),
-                })
-                .map(SessionId)?;
-            // State comes from the event projection only (constraint 1):
-            // terminal, idle and recoverable sessions never surface as
-            // expired leases.
-            let events = self.rebuild(sid).await?;
-            let state = project(&events).map_err(|source| InboxError::Projection {
-                session: sid,
-                source,
-            })?;
-            if state != SessionState::Running {
-                continue;
-            }
-            out.push(LeaseRecord {
-                session: sid,
-                epoch: Epoch(epoch as u64),
-                holder,
-                ttl_ms: ttl_ms as u64,
-                last_heartbeat: last_heartbeat as u64,
-            });
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::expired_leases(pool, now_ms).await,
+            EventStore::Postgres(pool) => crate::postgres::expired_leases(pool, now_ms).await,
         }
-        Ok(out)
     }
 
     /// The full-replay source: every event of the session, seq order,
@@ -394,31 +262,10 @@ impl EventStore {
     /// including leases of sessions that are no longer draining (the
     /// claims row is the durable epoch high-water mark, ADR-005).
     pub async fn leases(&self) -> Result<Vec<LeaseRecord>, InboxError> {
-        let rows: Vec<(String, i64, String, i64, i64)> = sqlx::query_as(ALL_LEASES_SQL)
-            .fetch_all(self.pool())
-            .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (session_key, epoch, holder, ttl_ms, last_heartbeat) in rows {
-            let session = Uuid::parse_str(&session_key)
-                .map_err(|e| InboxError::CorruptRow {
-                    session: SessionId(Uuid::nil()),
-                    input_id: Uuid::nil(),
-                    reason: format!("claims row session id: {e}"),
-                })
-                .map(SessionId)?;
-            out.push(LeaseRecord {
-                session,
-                epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
-                    session,
-                    input_id: Uuid::nil(),
-                    reason: format!("claims table returned a negative epoch ({epoch})"),
-                })?),
-                holder,
-                ttl_ms: ttl_ms.max(0) as u64,
-                last_heartbeat: last_heartbeat.max(0) as u64,
-            });
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::leases(pool).await,
+            EventStore::Postgres(pool) => crate::postgres::leases(pool).await,
         }
-        Ok(out)
     }
 
     /// The startup inbox scan: every session holding at least one
@@ -427,25 +274,10 @@ impl EventStore {
     /// orchestrator's wake-registry rebuild consumes so NoLostWork
     /// holds across restarts.
     pub async fn startup_scan(&self, now_ms: u64) -> Result<Vec<SessionInbox>, InboxError> {
-        let rows: Vec<InputCols> = sqlx::query_as(STARTUP_SQL)
-            .bind(to_i64(now_ms, "now_ms")?)
-            .fetch_all(self.pool())
-            .await?;
-        // Rows arrive ordered by (eligible_at, id); sessions may
-        // interleave, so group by first-seen session, preserving that
-        // order across the groups.
-        let mut inboxes: Vec<SessionInbox> = Vec::new();
-        for row in rows {
-            let input = decode_input(row)?;
-            match inboxes.iter_mut().find(|i| i.session == input.session) {
-                Some(inbox) => inbox.eligible.push(input),
-                None => inboxes.push(SessionInbox {
-                    session: input.session,
-                    eligible: vec![input],
-                }),
-            }
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::startup_scan(pool, now_ms).await,
+            EventStore::Postgres(pool) => crate::postgres::startup_scan(pool, now_ms).await,
         }
-        Ok(inboxes)
     }
 }
 
@@ -757,20 +589,30 @@ mod tests {
     /// Epochs strictly increase per session, including across a
     /// simulated process restart (close + reopen the DB file) — the
     /// claims row is a durable high-water mark (card C6 acceptance).
+    /// C47 note: successive claims use *different* holders, so each must
+    /// arrive past the previous lease's TTL (expired admission) — the
+    /// takeover path — which is exactly how distinct replicas or a
+    /// restarted successor take over.
     #[tokio::test]
     async fn claim_issues_strictly_increasing_epochs_across_restart() {
         let (store, path) = test_store().await;
         let sid = SessionId::new();
+        let ttl = 1_000u64;
 
-        let e1 = store.claim(sid, "holder-a", 1_000, T0).await.unwrap().epoch;
-        let e2 = store.claim(sid, "holder-b", 1_000, T0).await.unwrap().epoch;
+        let e1 = store.claim(sid, "holder-a", ttl, T0).await.unwrap().epoch;
+        // Past holder-a's TTL the lease is expired: holder-b takes over.
+        let e2 = store
+            .claim(sid, "holder-b", ttl, T0 + ttl + 1)
+            .await
+            .unwrap()
+            .epoch;
         assert!(e2 > e1, "epochs must strictly increase ({e1:?} → {e2:?})");
 
         // Simulated restart: same file, fresh pool.
         store.close().await;
         let reopened = EventStore::open(&path).await.expect("reopen");
         let e3 = reopened
-            .claim(sid, "holder-c", 1_000, T0)
+            .claim(sid, "holder-c", ttl, T0 + 2 * ttl + 2)
             .await
             .unwrap()
             .epoch;
@@ -785,7 +627,7 @@ mod tests {
         reopened.close().await;
         let reopened2 = EventStore::open(&path).await.expect("reopen 2");
         let e4 = reopened2
-            .claim(sid, "holder-d", 1_000, T0)
+            .claim(sid, "holder-d", ttl, T0 + 3 * ttl + 3)
             .await
             .unwrap()
             .epoch;
@@ -817,7 +659,12 @@ mod tests {
     }
 
     /// Two concurrent claims serialize: both succeed with consecutive,
-    /// distinct epochs — exactly one holder can be current.
+    /// distinct epochs — exactly one holder can be current. C47 note:
+    /// both claims carry the *same* holder (a single process's racing
+    /// drain episodes — condition (c)); a cross-holder claim against a
+    /// fresh lease is `ClaimRejected` by the conditional admission tests
+    /// below, so the serialization/monotonicity property is what this
+    /// test pins.
     #[tokio::test]
     async fn concurrent_claims_get_consecutive_distinct_epochs() {
         let (store, path) = test_store().await;
@@ -826,7 +673,7 @@ mod tests {
         let b = store.clone();
         let (ra, rb) = futures::join!(
             async move { a.claim(sid, "h1", 1_000, T0).await },
-            async move { b.claim(sid, "h2", 1_000, T0).await }
+            async move { b.claim(sid, "h1", 1_000, T0).await }
         );
         let ea = ra.expect("claim a").epoch;
         let eb = rb.expect("claim b").epoch;
@@ -835,6 +682,135 @@ mod tests {
             ea.0.abs_diff(eb.0) == 1,
             "expected consecutive epochs, got {ea:?} and {eb:?}"
         );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    // -- C47: conditional claim admission (ADR-009) --------------------------
+
+    /// Admission condition (a): no claims row exists — the claim lands
+    /// and issues epoch 1 (or the events-floor epoch when the stream
+    /// already carries higher).
+    #[tokio::test]
+    async fn claim_of_session_with_no_claims_row_succeeds() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let lease = store.claim(sid, "first", 1_000, T0).await.unwrap();
+        assert_eq!(lease.epoch, Epoch(1));
+        assert_eq!(lease.holder, "first");
+
+        // No claims row, but events committed at epoch 7: the events
+        // floor holds (issuance arithmetic unchanged, C6).
+        let other = SessionId::new();
+        append_ok(&store, other, 1, Epoch(7), EventKind::SessionCreated).await;
+        let lease = store.claim(other, "first", 1_000, T0).await.unwrap();
+        assert_eq!(lease.epoch, Epoch(8));
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// Admission condition (b): an expired lease admits a *different*
+    /// holder with the next epoch — the S1 takeover path, unchanged
+    /// from pre-C47 (the sweep's semantics rest on it).
+    #[tokio::test]
+    async fn claim_takeover_of_expired_lease_by_different_holder_issues_next_epoch() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let ttl = 1_000u64;
+        let first = store.claim(sid, "zombie", ttl, T0).await.unwrap();
+        assert_eq!(first.epoch, Epoch(1));
+
+        // Inside the TTL window a different holder is refused…
+        let err = store
+            .claim(sid, "recoverer", ttl, T0 + ttl)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, InboxError::ClaimRejected { holder, .. } if holder == "zombie"),
+            "expected ClaimRejected from the zombie, got {err:?}"
+        );
+        // …past it (elapsed ttl+1 > ttl) the takeover lands with epoch+1.
+        let takeover = store
+            .claim(sid, "recoverer", ttl, T0 + ttl + 1)
+            .await
+            .unwrap();
+        assert_eq!(takeover.epoch, Epoch(2));
+        assert_eq!(takeover.holder, "recoverer");
+        assert_eq!(takeover.last_heartbeat, T0 + ttl + 1);
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// Admission refusal: a *fresh* lease held by a *different* holder
+    /// is `ClaimRejected` carrying the live holder, its epoch and its
+    /// lease expiry — and the store's epoch floor is unchanged (the
+    /// refused claim wrote nothing).
+    #[tokio::test]
+    async fn claim_rejected_while_lease_fresh_and_holder_differs() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let ttl = 1_000u64;
+        let live = store.claim(sid, "replica-a", ttl, T0).await.unwrap();
+        assert_eq!(live.epoch, Epoch(1));
+        // A heartbeat pushes the deadline out: still fresh later.
+        store.heartbeat(sid, T0 + 500).await.unwrap();
+
+        let err = store
+            .claim(sid, "replica-b", ttl, T0 + 900)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                InboxError::ClaimRejected {
+                    session: s,
+                    holder,
+                    epoch: Epoch(1),
+                    expires_at_ms,
+                } if *s == sid && holder == "replica-a" && *expires_at_ms == T0 + 500 + ttl
+            ),
+            "expected ClaimRejected carrying the live holder, got {err:?}"
+        );
+
+        // Nothing was written: the claims row is byte-for-byte the live
+        // holder's (epoch floor unchanged).
+        assert_eq!(
+            store.leases().await.unwrap(),
+            vec![LeaseRecord {
+                session: sid,
+                epoch: Epoch(1),
+                holder: "replica-a".into(),
+                ttl_ms: ttl,
+                last_heartbeat: T0 + 500,
+            }]
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// Admission condition (c): the *same* holder re-claiming a fresh
+    /// lease succeeds and still bumps the epoch — the single-replica
+    /// back-to-back-drain behavior, byte-identical to pre-C47.
+    #[tokio::test]
+    async fn claim_by_same_holder_on_fresh_lease_succeeds_and_bumps_epoch() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let ttl = 1_000u64;
+        let first = store
+            .claim(sid, "kian-orchestrator", ttl, T0)
+            .await
+            .unwrap();
+        let second = store
+            .claim(sid, "kian-orchestrator", ttl, T0 + 100)
+            .await
+            .unwrap();
+        assert_eq!(first.epoch, Epoch(1));
+        assert_eq!(
+            second.epoch,
+            Epoch(2),
+            "same-holder claims still bump the epoch"
+        );
+        assert_eq!(second.last_heartbeat, T0 + 100);
         store.close().await;
         cleanup(&path);
     }
@@ -1089,8 +1065,13 @@ mod tests {
             last_heartbeat: T0,
         }));
 
-        // A takeover claim rewrites the row with the next epoch.
-        let takeover = store.claim(a, "holder-a2", 30_000, T0 + 100).await.unwrap();
+        // A takeover claim rewrites the row with the next epoch. C47
+        // note: holder-a2 differs from holder-a, so the claim arrives
+        // past the 30 s TTL — the expired-lease takeover path.
+        let takeover = store
+            .claim(a, "holder-a2", 30_000, T0 + 30_001)
+            .await
+            .unwrap();
         assert_eq!(takeover.epoch, Epoch(2));
         let leases = store.leases().await.unwrap();
         assert_eq!(leases.len(), 2, "claims are keyed by session");

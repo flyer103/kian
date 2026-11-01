@@ -1,4 +1,4 @@
-//! Append-only events table (card C5).
+//! Append-only events table (card C5) and its dual-backend dispatch (C50).
 //!
 //! `append(session, event, { epoch, expected_seq })` as a single atomic
 //! CAS write rejecting stale epochs and seq mismatches (ADR-005);
@@ -11,9 +11,18 @@
 //! atomic append: the terminal state transition is *projected* from that
 //! single row, never written separately (NoHalfTerminated, constraint 4).
 //!
+//! C50: the public [`EventStore`] is a small dispatching enum —
+//! `Sqlite(..) | Postgres(..)` — exposing the same method names and
+//! signatures on both backends (sqlx cannot usefully genericize over the
+//! two dialects; dispatch, not generics, is the plan of record). The
+//! per-backend SQL lives in [`crate::sqlite`] and [`crate::postgres`];
+//! guard/event coherence and envelope serialization are shared here so
+//! both backends see byte-identical inputs. `open(path)` stays sqlite
+//! construction; `open_postgres(url)` is the pg entry point.
+//!
 //! Schema versioning: the table carries the envelope `version` column and
-//! is created by the adjacent migration chain in [`crate::migrations`]
-//! (DESIGN §3.3).
+//! is created by the adjacent migration chains in [`crate::migrations`]
+//! (DESIGN §3.3) — one chain per backend, same versions and names.
 
 use std::ops::Range;
 use std::path::Path;
@@ -21,6 +30,8 @@ use std::time::Duration;
 
 use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, SessionId};
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -88,49 +99,55 @@ pub enum StoreError {
     Serde(#[from] serde_json::Error),
 }
 
-/// The single-statement CAS append (ADR-005: "a sqlite transaction / a
-/// single postgres statement suffices").
-///
-/// The insert lands only when both fences hold at statement time:
-/// - epoch fence: the session's epoch floor (MAX(epoch) over committed
-///   events) must not exceed the write's epoch — stale-epoch writes are
-///   always rejected, lease state is never consulted (lease = liveness
-///   only);
-/// - seq fence: the stream head must be exactly `expected_seq - 1`, so
-///   the primary key can never collide and seqs stay contiguous.
-///
-/// Anything else inserts zero rows and is classified into a typed error.
-const APPEND_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nSELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7\nWHERE (SELECT COALESCE(MAX(epoch), 0) FROM events WHERE session = ?8) <= ?9\n  AND (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?10) = ?11 - 1";
+/// Classifies a refused CAS write from the committed head: which fence
+/// tripped. Shared by both backends — on sqlite it explains zero rows
+/// from the WHERE fence; on postgres it additionally explains the
+/// PK-race outcomes (`ON CONFLICT DO NOTHING` zero rows / sqlstate
+/// 23505) that sqlite's writer serialization makes impossible (C50 §3).
+pub(crate) fn classify_cas_rejection(
+    session: SessionId,
+    guard: AppendGuard,
+    epoch_floor: i64,
+    max_seq: i64,
+) -> StoreError {
+    if guard.epoch.0 < epoch_floor as u64 {
+        StoreError::StaleEpoch {
+            session,
+            event_epoch: guard.epoch,
+            current_epoch: Epoch(epoch_floor as u64),
+        }
+    } else {
+        StoreError::SeqMismatch {
+            session,
+            expected_seq: guard.expected_seq,
+            actual_next: max_seq as u64 + 1,
+        }
+    }
+}
 
-/// The tail rows of a batch append ride the first row's CAS: the guarded
-/// first insert holds sqlite's writer lock for the whole transaction, so
-/// no concurrent writer can interleave between the fence check and these
-/// plain inserts.
-const BATCH_TAIL_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
-
-const HEAD_SQL: &str =
-    "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
-
-const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? AND seq >= ? AND seq < ? ORDER BY seq ASC";
-
-fn to_i64(v: u64, field: &'static str) -> Result<i64, StoreError> {
+pub(crate) fn to_i64(v: u64, field: &'static str) -> Result<i64, StoreError> {
     i64::try_from(v).map_err(|_| StoreError::IntOverflow { field })
 }
 
-/// The sqlite EventStore (Phase 1; postgres is Phase 2+ and will mirror
-/// these semantics in single statements).
+/// The dual-backend EventStore (C50): a small dispatching enum over the
+/// sqlite and postgres implementations. Every method carries the same
+/// name and signature the pre-C50 sqlite store had, so callers and tests
+/// are unchanged; construction picks the backend (`open` = sqlite,
+/// `open_postgres` = postgres).
 ///
-/// All access goes through the sqlx pool — the sqlite driver owns its
-/// background thread, so no tokio worker ever blocks on a query (AGENTS
-/// environment gotcha).
+/// All access goes through the sqlx pool — both drivers own their
+/// background connection handling, so no tokio worker ever blocks on a
+/// query (AGENTS environment gotcha).
 #[derive(Clone)]
-pub struct EventStore {
-    pool: SqlitePool,
+pub enum EventStore {
+    Sqlite(SqlitePool),
+    Postgres(PgPool),
 }
 
 impl EventStore {
-    /// Opens (creating if needed) a database file, applies the migration
-    /// chain, and returns a pooled store.
+    /// Opens (creating if needed) a sqlite database file, applies the
+    /// sqlite migration chain, and returns a pooled store. This stays
+    /// *the* `open` — sqlite remains the default backend.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
@@ -145,17 +162,31 @@ impl EventStore {
             .max_connections(8)
             .connect_with(opts)
             .await?;
-        let store = Self { pool };
-        migrations::migrate(&store.pool).await?;
-        Ok(store)
+        migrations::migrate(&pool).await?;
+        Ok(Self::Sqlite(pool))
     }
 
-    /// The underlying pool (C6's inbox/lease tables share it).
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Opens a postgres database by URL, applies the pg migration chain
+    /// (same versions and names as the sqlite chain, pg DDL — DESIGN
+    /// §3.3), and returns a pooled store. The URL is env-sourced by the
+    /// caller (C51 assembly); it may carry a password, but never lands in
+    /// a config value (the C13 secrets rule).
+    pub async fn open_postgres(url: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
+        migrations::migrate_pg(&pool).await?;
+        Ok(Self::Postgres(pool))
     }
 
-    /// Opens an existing database file **read-only** (card C14: the
+    /// Adopts an already-open postgres pool and applies the pg migration
+    /// chain — the counterpart of [`EventStore::from_pool`]-style
+    /// adoption, used by the C51 assembly so the event store and the
+    /// exec store share ONE pool (one server, one database).
+    pub async fn from_pg_pool(pool: PgPool) -> Result<Self, StoreError> {
+        migrations::migrate_pg(&pool).await?;
+        Ok(Self::Postgres(pool))
+    }
+
+    /// Opens an existing sqlite database file **read-only** (card C14: the
     /// audit reader behind `kian session inspect/replay/export` and
     /// `kian lease inspect`).
     ///
@@ -174,13 +205,51 @@ impl EventStore {
             .max_connections(4)
             .connect_with(opts)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::Sqlite(pool))
+    }
+
+    /// Opens a postgres database by URL **without migrating** — the pg
+    /// counterpart of [`EventStore::open_read_only`]. Read-only-ness is a
+    /// property of the role behind the URL, not a client flag, on
+    /// postgres: point this at a role without schema privileges and the
+    /// store can read what it is granted and refuses every mutation
+    /// (including migrations — see the C50 pg suite).
+    pub async fn open_postgres_read_only(url: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new().max_connections(4).connect(url).await?;
+        Ok(Self::Postgres(pool))
+    }
+
+    /// The underlying sqlite pool (C6's inbox/lease tables share it).
+    ///
+    /// C50 note: this is the *sqlite-only* accessor. The postgres variant
+    /// carries no sqlite pool by construction, so calling it there is a
+    /// programming error and panics with this message. Production code
+    /// paths are backend-dispatched since C51; remaining callers are
+    /// sqlite-only by construction (tests and sqlite-file readers).
+    pub fn pool(&self) -> &SqlitePool {
+        match self {
+            EventStore::Sqlite(pool) => pool,
+            EventStore::Postgres(_) => panic!(
+                "EventStore::pool() is the sqlite-only pool accessor; this store is postgres-backed (C50; C51 migrates the remaining sqlite-only surfaces)"
+            ),
+        }
+    }
+
+    /// The underlying postgres pool when this store is postgres-backed.
+    pub fn pg_pool(&self) -> Option<&PgPool> {
+        match self {
+            EventStore::Sqlite(_) => None,
+            EventStore::Postgres(pool) => Some(pool),
+        }
     }
 
     /// Closes the pool; queued work is dropped. Reopening the same file
-    /// rebuilds everything from the committed stream.
+    /// (or URL) rebuilds everything from the committed stream.
     pub async fn close(self) {
-        self.pool.close().await;
+        match self {
+            EventStore::Sqlite(pool) => pool.close().await,
+            EventStore::Postgres(pool) => pool.close().await,
+        }
     }
 
     /// Appends one event as a single-statement CAS transaction. Returns
@@ -192,13 +261,36 @@ impl EventStore {
         event: Event,
         guard: AppendGuard,
     ) -> Result<(), StoreError> {
+        Self::validate_append(&session, &event, guard)?;
+        // Persist-what-you-send: the envelope column holds the exact
+        // serialized bytes (frozen v0 shape from C2), so replay and audit
+        // exports are byte-identical — on either backend (the C50 export
+        // parity golden).
+        let envelope = serde_json::to_string(&event)?;
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::append(pool, session, &event, &envelope, guard).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::append(pool, session, &event, &envelope, guard).await
+            }
+        }
+    }
+
+    /// Guard/event coherence is backend-independent: checked once here,
+    /// rejected before any driver is touched.
+    fn validate_append(
+        session: &SessionId,
+        event: &Event,
+        guard: AppendGuard,
+    ) -> Result<(), StoreError> {
         if event.version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedVersion {
                 found: event.version,
                 current: SCHEMA_VERSION,
             });
         }
-        if event.session != session {
+        if event.session != *session {
             return Err(StoreError::GuardMismatch(
                 "event.session disagrees with the session argument",
             ));
@@ -213,49 +305,7 @@ impl EventStore {
                 "guard.expected_seq disagrees with event.seq",
             ));
         }
-        // Persist-what-you-send: the envelope column holds the exact
-        // serialized bytes (frozen v0 shape from C2), so replay and audit
-        // exports are byte-identical.
-        let envelope = serde_json::to_string(&event)?;
-        let session_key = session.0.to_string();
-        let result = sqlx::query(APPEND_SQL)
-            .bind(&session_key)
-            .bind(to_i64(event.seq, "seq")?)
-            .bind(to_i64(event.epoch.0, "epoch")?)
-            .bind(to_i64(event.ts, "ts")?)
-            .bind(event.kind.as_str())
-            .bind(i64::from(event.version))
-            .bind(&envelope)
-            // Fence inputs are bound again: sqlite parameters are
-            // positional per index, and repeating ?N inline reads worse
-            // than rebinding.
-            .bind(&session_key)
-            .bind(to_i64(event.epoch.0, "epoch")?)
-            .bind(&session_key)
-            .bind(to_i64(event.seq, "seq")?)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 1 {
-            return Ok(());
-        }
-        // The CAS refused the write: classify which fence tripped.
-        let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
-            .bind(&session_key)
-            .fetch_one(&self.pool)
-            .await?;
-        if guard.epoch.0 < epoch_floor as u64 {
-            Err(StoreError::StaleEpoch {
-                session,
-                event_epoch: guard.epoch,
-                current_epoch: Epoch(epoch_floor as u64),
-            })
-        } else {
-            Err(StoreError::SeqMismatch {
-                session,
-                expected_seq: guard.expected_seq,
-                actual_next: max_seq as u64 + 1,
-            })
-        }
+        Ok(())
     }
 
     /// The end write: session end + state transition as exactly one
@@ -278,22 +328,26 @@ impl EventStore {
         self.append(session, event, guard).await
     }
 
-    /// Appends a contiguous batch of events as ONE atomic CAS transaction
+    /// Appends a contiguous batch of events as ONE atomic CAS write
     /// (C32): the batch shares a single fence decision — the first event
     /// takes the CAS position and every event carries the guard's epoch —
     /// so a rejected write (stale epoch, seq mismatch) commits NOTHING.
     /// Used when two events are one logical fact (the spill sidecar's
     /// `input/admitted` + `input/spilled` pair): half a pair must never
     /// become durable (NoSplitBrainWrite over the whole batch).
+    ///
+    /// C50: on sqlite the batch is a guarded first-row CAS + tail inserts
+    /// in one transaction; on postgres it is a single CTE statement —
+    /// all rows land or none on both backends.
     pub async fn append_batch(
         &self,
         session: SessionId,
         events: &[Event],
         guard: AppendGuard,
     ) -> Result<(), StoreError> {
-        let Some(first) = events.first() else {
+        if events.is_empty() {
             return Err(StoreError::GuardMismatch("empty batch append"));
-        };
+        }
         for (i, event) in events.iter().enumerate() {
             if event.version > SCHEMA_VERSION {
                 return Err(StoreError::UnsupportedVersion {
@@ -317,60 +371,18 @@ impl EventStore {
                 ));
             }
         }
-
-        let session_key = session.0.to_string();
-        let mut tx = self.pool.begin().await?;
-        // The first row is the same single-statement CAS as `append`:
-        // either both fences hold and the batch proceeds (holding the
-        // writer lock until commit), or zero rows land and the typed
-        // error classifies which fence tripped.
-        let result = sqlx::query(APPEND_SQL)
-            .bind(&session_key)
-            .bind(to_i64(first.seq, "seq")?)
-            .bind(to_i64(first.epoch.0, "epoch")?)
-            .bind(to_i64(first.ts, "ts")?)
-            .bind(first.kind.as_str())
-            .bind(i64::from(first.version))
-            .bind(serde_json::to_string(first)?)
-            .bind(&session_key)
-            .bind(to_i64(first.epoch.0, "epoch")?)
-            .bind(&session_key)
-            .bind(to_i64(first.seq, "seq")?)
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() != 1 {
-            let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
-                .bind(&session_key)
-                .fetch_one(&mut *tx)
-                .await?;
-            return if guard.epoch.0 < epoch_floor as u64 {
-                Err(StoreError::StaleEpoch {
-                    session,
-                    event_epoch: guard.epoch,
-                    current_epoch: Epoch(epoch_floor as u64),
-                })
-            } else {
-                Err(StoreError::SeqMismatch {
-                    session,
-                    expected_seq: guard.expected_seq,
-                    actual_next: max_seq as u64 + 1,
-                })
-            };
+        let envelopes = events
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::append_batch(pool, session, events, &envelopes, guard).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::append_batch(pool, session, events, &envelopes, guard).await
+            }
         }
-        for event in &events[1..] {
-            sqlx::query(BATCH_TAIL_SQL)
-                .bind(&session_key)
-                .bind(to_i64(event.seq, "seq")?)
-                .bind(to_i64(event.epoch.0, "epoch")?)
-                .bind(to_i64(event.ts, "ts")?)
-                .bind(event.kind.as_str())
-                .bind(i64::from(event.version))
-                .bind(serde_json::to_string(event)?)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Reads a session's events back in seq order over `[start, end)`.
@@ -381,40 +393,18 @@ impl EventStore {
         session: SessionId,
         range: Range<u64>,
     ) -> Result<Vec<Event>, StoreError> {
-        let start = range.start;
-        // Clamp the upper bound to sqlite's i64 domain so "everything"
-        // can be expressed as 0..i64::MAX.
-        let end = range.end.min(i64::MAX as u64);
-        let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_SQL)
-            .bind(session.0.to_string())
-            .bind(to_i64(start, "seq")?)
-            .bind(to_i64(end, "seq")?)
-            .fetch_all(&self.pool)
-            .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for (version_col, envelope) in rows {
-            let event: Event = serde_json::from_str(&envelope)?;
-            if i64::from(event.version) != version_col || event.session != session {
-                return Err(StoreError::CorruptRow {
-                    session,
-                    seq: event.seq,
-                });
-            }
-            events.push(event);
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::scan(pool, session, range).await,
+            EventStore::Postgres(pool) => crate::postgres::scan(pool, session, range).await,
         }
-        Ok(events)
     }
 
     /// The session's stream position: next free seq and epoch floor.
     pub async fn head(&self, session: SessionId) -> Result<Head, StoreError> {
-        let (epoch, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
-            .bind(session.0.to_string())
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(Head {
-            next_seq: max_seq as u64 + 1,
-            epoch: Epoch(epoch as u64),
-        })
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::head(pool, session).await,
+            EventStore::Postgres(pool) => crate::postgres::head(pool, session).await,
+        }
     }
 }
 

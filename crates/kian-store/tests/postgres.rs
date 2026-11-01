@@ -1,0 +1,883 @@
+//! Env-gated postgres suite (card C50).
+//!
+//! `KIAN_PG_URL` absent → every test in this file SKIPS with a log line
+//! and never fails (the C44 pattern): default CI needs no postgres.
+//! With the env var set (pointing at a throwaway database — e.g. the
+//! docker recipe C55 documents), each test creates its own private
+//! database `kian_store_test_<uuid>` off the URL so parallel runs never
+//! collide and nothing outside those databases is touched.
+//!
+//! Coverage is the store's core semantics on postgres: CAS fences, batch
+//! atomicity, the single-statement end write (constraint 4), conditional
+//! claim admission (C47), inbox consume + startup scan, the
+//! concurrent-append PK-race classification (C50 §3), export parity
+//! against a sqlite store seeded with the same stream, and the
+//! read-only role refusing migrations.
+
+use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
+use kian_core::model::{Epoch, InputRow, SessionId};
+use serde_json::json;
+use uuid::Uuid;
+
+use kian_store::migrations;
+use kian_store::{AppendGuard, EventStore, Head, InboxError, StoreError};
+
+const T0: u64 = 1_761_900_000_000;
+
+/// True when the suite should run; prints the skip line otherwise.
+fn gated() -> bool {
+    match std::env::var("KIAN_PG_URL") {
+        Ok(url) if !url.is_empty() => true,
+        _ => {
+            eprintln!("SKIP: KIAN_PG_URL is not set — postgres suite disabled (C50 env gate)");
+            false
+        }
+    }
+}
+
+/// `postgres://…/db?opts` → `postgres://…/<other-db>?opts`.
+fn with_db(base: &str, db: &str) -> String {
+    let (path_part, query) = match base.split_once('?') {
+        Some((p, q)) => (p, format!("?{q}")),
+        None => (base, String::new()),
+    };
+    let scheme_end = path_part.find("://").map(|i| i + 3).unwrap_or(0);
+    let rest = &path_part[scheme_end..];
+    let root = match rest.find('/') {
+        Some(i) => path_part[..scheme_end + i].to_string(),
+        None => path_part.to_string(),
+    };
+    format!("{root}/{db}{query}")
+}
+
+/// One throwaway database per test: created from the maintenance URL,
+/// migrated by `open_postgres`, dropped by [`PgStore::finish`].
+struct PgStore {
+    store: EventStore,
+    base_url: String,
+    db: String,
+}
+
+impl PgStore {
+    async fn open() -> Self {
+        let base = std::env::var("KIAN_PG_URL").expect("checked by gated()");
+        let db = format!("kian_store_test_{}", Uuid::new_v4().simple());
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base)
+            .await
+            .expect("KIAN_PG_URL maintenance connection");
+        sqlx::raw_sql(&format!("CREATE DATABASE \"{db}\""))
+            .execute(&admin)
+            .await
+            .expect("create throwaway test database");
+        admin.close().await;
+        let store = EventStore::open_postgres(&with_db(&base, &db))
+            .await
+            .expect("open postgres store");
+        Self {
+            store,
+            base_url: base,
+            db,
+        }
+    }
+
+    fn url(&self) -> String {
+        with_db(&self.base_url, &self.db)
+    }
+
+    /// Closes the store pool and drops the throwaway database. Tests call
+    /// this on their success path; a panicking test may leak its (empty,
+    /// inert) `kian_store_test_*` database — the recipe environment is
+    /// disposable by contract.
+    async fn finish(self) {
+        self.store.close().await;
+        if let Ok(admin) = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.base_url)
+            .await
+        {
+            // WITH (FORCE) drops lingering pool connections first.
+            let _ = sqlx::raw_sql(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.db))
+                .execute(&admin)
+                .await;
+            admin.close().await;
+        }
+    }
+}
+
+// -- helpers -----------------------------------------------------------------
+
+fn ev(session: SessionId, seq: u64, epoch: Epoch, kind: EventKind) -> Event {
+    Event {
+        seq,
+        session,
+        epoch,
+        ts: T0 + seq,
+        kind,
+        bytes: json!({ "n": seq }),
+        version: SCHEMA_VERSION,
+    }
+}
+
+async fn append_ok(
+    store: &EventStore,
+    session: SessionId,
+    seq: u64,
+    epoch: Epoch,
+    kind: EventKind,
+) {
+    store
+        .append(
+            session,
+            ev(session, seq, epoch, kind),
+            AppendGuard {
+                epoch,
+                expected_seq: seq,
+            },
+        )
+        .await
+        .expect("append");
+}
+
+async fn seed(store: &EventStore, session: SessionId, upto: u64, epoch: Epoch) {
+    for seq in 1..=upto {
+        let kind = if seq == 1 {
+            EventKind::SessionCreated
+        } else {
+            EventKind::TurnStart
+        };
+        append_ok(store, session, seq, epoch, kind).await;
+    }
+}
+
+fn all() -> std::ops::Range<u64> {
+    0..i64::MAX as u64
+}
+
+fn input(
+    session: SessionId,
+    key: Option<&str>,
+    eligible_at: u64,
+    payload: serde_json::Value,
+) -> InputRow {
+    InputRow {
+        id: Uuid::new_v4(),
+        session,
+        payload,
+        admitted_at: T0,
+        eligible_at,
+        idempotency_key: key.map(String::from),
+    }
+}
+
+// -- CAS fences ---------------------------------------------------------------
+
+/// Stale-epoch and seq-mismatch appends are rejected with the same typed
+/// errors sqlite produces, and the stream is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_cas_fences_reject_stale_epoch_and_seq_mismatch() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 3, Epoch(5)).await;
+
+    let err = pg
+        .store
+        .append(
+            sid,
+            ev(sid, 4, Epoch(3), EventKind::TurnStart),
+            AppendGuard {
+                epoch: Epoch(3),
+                expected_seq: 4,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            StoreError::StaleEpoch {
+                event_epoch: Epoch(3),
+                current_epoch: Epoch(5),
+                ..
+            }
+        ),
+        "expected StaleEpoch, got {err:?}"
+    );
+
+    let err = pg
+        .store
+        .append(
+            sid,
+            ev(sid, 9, Epoch(5), EventKind::TurnStart),
+            AppendGuard {
+                epoch: Epoch(5),
+                expected_seq: 9,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            StoreError::SeqMismatch {
+                expected_seq: 9,
+                actual_next: 4,
+                ..
+            }
+        ),
+        "expected SeqMismatch, got {err:?}"
+    );
+
+    assert_eq!(pg.store.scan(sid, all()).await.unwrap().len(), 3);
+    assert_eq!(
+        pg.store.head(sid).await.unwrap(),
+        Head {
+            next_seq: 4,
+            epoch: Epoch(5)
+        }
+    );
+    pg.finish().await;
+}
+
+/// The end write is the single-statement CAS append (constraint 4): it
+/// lands once at the tail, and a competing second end write at the same
+/// position is rejected — never two terminal rows.
+#[tokio::test]
+async fn pg_end_write_lands_once_and_rejects_the_competing_end() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 3, Epoch(5)).await;
+
+    pg.store
+        .append_end(
+            sid,
+            ev(
+                sid,
+                4,
+                Epoch(5),
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+            ),
+            AppendGuard {
+                epoch: Epoch(5),
+                expected_seq: 4,
+            },
+        )
+        .await
+        .expect("end write");
+
+    // A zombie writer's end write at the same position: rejected, and
+    // the stream keeps exactly one session/ended.
+    let err = pg
+        .store
+        .append_end(
+            sid,
+            ev(
+                sid,
+                4,
+                Epoch(5),
+                EventKind::SessionEnded {
+                    reason: EndReason::Failed,
+                },
+            ),
+            AppendGuard {
+                epoch: Epoch(5),
+                expected_seq: 4,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::SeqMismatch { .. } | StoreError::StaleEpoch { .. }
+        ),
+        "expected a typed CAS rejection, got {err:?}"
+    );
+
+    let events = pg.store.scan(sid, all()).await.unwrap();
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        events[3].kind,
+        EventKind::SessionEnded {
+            reason: EndReason::Completed
+        }
+    ));
+    pg.finish().await;
+}
+
+// -- batch atomicity ----------------------------------------------------------
+
+/// A batch commits whole under a passing fence; a stale-epoch or
+/// seq-mismatched batch commits NOTHING (all-or-nothing, C32 semantics
+/// via one CTE statement).
+#[tokio::test]
+async fn pg_append_batch_is_all_or_nothing() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 3, Epoch(1)).await;
+
+    // Happy path: the spill pair lands contiguously.
+    let batch = [
+        ev(sid, 4, Epoch(1), EventKind::InputAdmitted),
+        ev(sid, 5, Epoch(1), EventKind::InputSpilled),
+    ];
+    pg.store
+        .append_batch(
+            sid,
+            &batch,
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: 4,
+            },
+        )
+        .await
+        .expect("batch append");
+    let events = pg.store.scan(sid, all()).await.unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[3], batch[0]);
+    assert_eq!(events[4], batch[1]);
+
+    // Forced fence failure — stale epoch: neither row lands.
+    let stale = [
+        ev(sid, 6, Epoch(0), EventKind::InputAdmitted),
+        ev(sid, 7, Epoch(0), EventKind::InputSpilled),
+    ];
+    let err = pg
+        .store
+        .append_batch(
+            sid,
+            &stale,
+            AppendGuard {
+                epoch: Epoch(0),
+                expected_seq: 6,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::StaleEpoch { .. }),
+        "expected StaleEpoch, got {err:?}"
+    );
+
+    // Forced fence failure — seq mismatch: neither row lands.
+    let mismatch = [
+        ev(sid, 8, Epoch(1), EventKind::InputAdmitted),
+        ev(sid, 9, Epoch(1), EventKind::InputSpilled),
+    ];
+    let err = pg
+        .store
+        .append_batch(
+            sid,
+            &mismatch,
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: 8,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::SeqMismatch { .. }),
+        "expected SeqMismatch, got {err:?}"
+    );
+
+    assert_eq!(pg.store.scan(sid, all()).await.unwrap().len(), 5);
+    assert_eq!(pg.store.head(sid).await.unwrap().next_seq, 6);
+    pg.finish().await;
+}
+
+// -- the PK race (C50 §3) -----------------------------------------------------
+
+/// Concurrent same-session appends for one seq: exactly one lands and
+/// every loser gets a *typed* CAS error — the pg PK race (WHERE snapshot
+/// passed, then the primary key lost) is classified through the same
+/// HEAD path as a fence refusal, never leaked as a unique-violation
+/// `Sql` error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_concurrent_append_pk_race_is_classified_never_leaked() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 2, Epoch(5)).await;
+
+    let racers: Vec<_> = (0..8)
+        .map(|i| {
+            let store = pg.store.clone();
+            tokio::spawn(async move {
+                store
+                    .append(
+                        sid,
+                        ev(
+                            sid,
+                            3,
+                            Epoch(5),
+                            if i % 2 == 0 {
+                                EventKind::TurnStart
+                            } else {
+                                EventKind::ToolCall
+                            },
+                        ),
+                        AppendGuard {
+                            epoch: Epoch(5),
+                            expected_seq: 3,
+                        },
+                    )
+                    .await
+            })
+        })
+        .collect();
+    let mut winners = 0usize;
+    for racer in racers {
+        let result = racer.await.expect("racer join");
+        match result {
+            Ok(()) => winners += 1,
+            Err(StoreError::StaleEpoch { .. } | StoreError::SeqMismatch { .. }) => {}
+            Err(other) => panic!(
+                "the PK race must classify into a typed CAS error, got a leaked error: {other:?}"
+            ),
+        }
+    }
+    assert_eq!(winners, 1, "exactly one racer wins the CAS position");
+
+    let events = pg.store.scan(sid, all()).await.unwrap();
+    assert_eq!(events.len(), 3, "the stream stays contiguous");
+    assert_eq!(events[2].seq, 3);
+    pg.finish().await;
+}
+
+// -- conditional claim admission (C47 on pg) -----------------------------------
+
+/// The C47 conditions hold on postgres with identical observables: no
+/// row → epoch 1; fresh + different holder → `ClaimRejected` carrying
+/// the live holder and expiry; same holder → bumps; expired → takeover.
+#[tokio::test]
+async fn pg_claim_conditional_admission() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    let ttl = 1_000u64;
+
+    // (a) no claims row.
+    let first = pg.store.claim(sid, "replica-a", ttl, T0).await.unwrap();
+    assert_eq!(first.epoch, Epoch(1));
+
+    // Refusal while fresh: typed, carries holder/epoch/expiry.
+    pg.store.heartbeat(sid, T0 + 500).await.unwrap();
+    let err = pg
+        .store
+        .claim(sid, "replica-b", ttl, T0 + 900)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            InboxError::ClaimRejected {
+                holder,
+                epoch: Epoch(1),
+                expires_at_ms,
+                ..
+            } if holder == "replica-a" && *expires_at_ms == T0 + 500 + ttl
+        ),
+        "expected ClaimRejected carrying the live holder, got {err:?}"
+    );
+
+    // (c) same holder on a fresh lease still bumps.
+    let again = pg
+        .store
+        .claim(sid, "replica-a", ttl, T0 + 600)
+        .await
+        .unwrap();
+    assert_eq!(again.epoch, Epoch(2));
+
+    // (b) past the TTL a different holder takes over with the next epoch.
+    let takeover = pg
+        .store
+        .claim(sid, "replica-b", ttl, T0 + 600 + ttl + 1)
+        .await
+        .unwrap();
+    assert_eq!(takeover.epoch, Epoch(3));
+    assert_eq!(takeover.holder, "replica-b");
+
+    // The events floor feeds issuance too (durable high-water mark).
+    let other = SessionId::new();
+    append_ok(&pg.store, other, 1, Epoch(7), EventKind::SessionCreated).await;
+    let lease = pg.store.claim(other, "holder", ttl, T0).await.unwrap();
+    assert_eq!(lease.epoch, Epoch(8));
+    pg.finish().await;
+}
+
+// -- inbox consume + startup scan ----------------------------------------------
+
+/// Admit is idempotent by key; consumption stays event-driven; the
+/// startup scan surfaces exactly the eligible-unconsumed sessions.
+#[tokio::test]
+async fn pg_inbox_consume_and_startup_scan() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let a = SessionId::new();
+    let b = SessionId::new();
+    let c = SessionId::new();
+
+    let a1 = input(a, Some("a1"), T0 - 300, json!("a1"));
+    pg.store.admit(a1.clone()).await.unwrap();
+    let dup = InputRow {
+        id: Uuid::new_v4(),
+        payload: json!("changed"),
+        ..a1.clone()
+    };
+    let out = pg.store.admit(dup).await.unwrap();
+    assert!(out.deduplicated, "same key dedupes on pg too");
+    assert_eq!(out.input, a1);
+
+    let b1 = input(b, Some("b1"), T0 - 100, json!("b1"));
+    pg.store.admit(b1.clone()).await.unwrap();
+    let future = input(c, Some("c1"), T0 + 60_000, json!("c1"));
+    pg.store.admit(future).await.unwrap();
+
+    // Consumption is refused before its event exists…
+    let err = pg.store.mark_consumed(b, b1.id, 5).await.unwrap_err();
+    assert!(
+        matches!(err, InboxError::MissingConsumptionEvent { .. }),
+        "{err:?}"
+    );
+    // …lands once the event is committed…
+    append_ok(&pg.store, b, 1, Epoch(1), EventKind::SessionCreated).await;
+    append_ok(&pg.store, b, 2, Epoch(1), EventKind::DrainClaimed).await;
+    pg.store
+        .mark_consumed(b, b1.id, 2)
+        .await
+        .expect("consume via committed event");
+    // …re-consuming the same seq is idempotent, a different seq conflicts.
+    pg.store
+        .mark_consumed(b, b1.id, 2)
+        .await
+        .expect("re-consume idempotent");
+    append_ok(&pg.store, b, 3, Epoch(1), EventKind::TurnStart).await;
+    let err = pg.store.mark_consumed(b, b1.id, 3).await.unwrap_err();
+    assert!(matches!(err, InboxError::AlreadyConsumed { .. }), "{err:?}");
+
+    // Startup scan: a only — b is fully consumed, c is future-eligible.
+    let scan = pg.store.startup_scan(T0).await.unwrap();
+    assert_eq!(scan.len(), 1);
+    assert_eq!(scan[0].session, a);
+    assert_eq!(scan[0].eligible, vec![a1]);
+    // Crossing c's eligible_at boundary surfaces it.
+    assert_eq!(pg.store.startup_scan(T0 + 60_000).await.unwrap().len(), 2);
+    pg.finish().await;
+}
+
+// -- export parity (the compat golden) -----------------------------------------
+
+/// The same stream seeded into sqlite and postgres exports
+/// byte-identically: both the stored envelope column (the S7 export
+/// source) and the scanned/round-tripped events.
+#[tokio::test]
+async fn pg_export_parity_with_sqlite() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+
+    let path = std::env::temp_dir().join(format!("kian-store-parity-{}.sqlite", Uuid::new_v4()));
+    let lite = EventStore::open(&path).await.expect("open sqlite store");
+
+    let sid = SessionId::new();
+    for store in [&lite, &pg.store] {
+        store
+            .append(
+                sid,
+                ev(sid, 1, Epoch(5), EventKind::SessionCreated),
+                AppendGuard {
+                    epoch: Epoch(5),
+                    expected_seq: 1,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                sid,
+                ev(sid, 2, Epoch(5), EventKind::DrainClaimed),
+                AppendGuard {
+                    epoch: Epoch(5),
+                    expected_seq: 2,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                sid,
+                ev(sid, 3, Epoch(5), EventKind::InputAdmitted),
+                AppendGuard {
+                    epoch: Epoch(5),
+                    expected_seq: 3,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_end(
+                sid,
+                ev(
+                    sid,
+                    4,
+                    Epoch(5),
+                    EventKind::SessionEnded {
+                        reason: EndReason::Completed,
+                    },
+                ),
+                AppendGuard {
+                    epoch: Epoch(5),
+                    expected_seq: 4,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // The envelope column is the export: identical bytes on both.
+    let lite_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT envelope FROM events WHERE session = ? ORDER BY seq ASC")
+            .bind(sid.0.to_string())
+            .fetch_all(lite.pool())
+            .await
+            .unwrap();
+    let pg_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT envelope FROM events WHERE session = $1::text ORDER BY seq ASC")
+            .bind(sid.0.to_string())
+            .fetch_all(pg.store.pg_pool().expect("pg pool"))
+            .await
+            .unwrap();
+    assert_eq!(
+        lite_rows, pg_rows,
+        "exported JSONL bytes must match across backends"
+    );
+
+    // Round-trip parity too.
+    let from_lite = lite.scan(sid, all()).await.unwrap();
+    let from_pg = pg.store.scan(sid, all()).await.unwrap();
+    let ser = |evs: &[Event]| {
+        evs.iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ser(&from_lite), ser(&from_pg));
+    assert_eq!(from_pg.len(), 4);
+
+    lite.close().await;
+    let _ = std::fs::remove_file(&path);
+    pg.finish().await;
+}
+
+// -- read-only role refuses migrations ------------------------------------------
+
+/// A role with CONNECT but no schema privileges: `open_postgres`
+/// (which migrates) is refused by the server, while
+/// `open_postgres_read_only` opens without attempting migrations —
+/// read-only on pg is a URL/role property, and the migrating
+/// constructor never runs against it.
+#[tokio::test]
+async fn pg_read_only_role_refuses_migrations() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let pool = pg.store.pg_pool().expect("pg pool");
+    let role = format!("kian_ro_{}", Uuid::new_v4().simple());
+
+    // Cluster-wide setup; any failure (no CREATEROLE, no password auth
+    // path) degrades to a logged skip — this subtest needs privileges
+    // the operator's URL may honestly not carry.
+    let setup = sqlx::query(&format!(
+        "CREATE ROLE \"{role}\" LOGIN PASSWORD 'kian_ro_test'"
+    ))
+    .execute(pool)
+    .await;
+    if setup.is_err() {
+        eprintln!(
+            "SKIP: cannot create a read-only role against KIAN_PG_URL (insufficient privilege)"
+        );
+        pg.store.close().await;
+        return;
+    }
+    sqlx::query(&format!(
+        "GRANT CONNECT ON DATABASE \"{}\" TO \"{role}\"",
+        pg.db
+    ))
+    .execute(pool)
+    .await
+    .expect("grant connect");
+
+    // host[:port] with the role's credentials swapped in.
+    let base = pg.url();
+    let scheme_end = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let host = base[scheme_end..]
+        .split('/')
+        .next()
+        .unwrap_or("localhost:5432")
+        .to_string();
+    let ro_url = format!("postgres://{role}:kian_ro_test@{host}/{}", pg.db);
+
+    // The migrating constructor is refused: the role cannot create
+    // schema (pg ≥ 15 default; pg 14 operators must revoke CREATE on
+    // public for the role).
+    let denied = EventStore::open_postgres(&ro_url).await;
+    assert!(
+        denied.is_err(),
+        "a read-only role must refuse the migrating open"
+    );
+
+    // The read-only constructor opens without migrating — no schema
+    // access is attempted by construction.
+    let reader = EventStore::open_postgres_read_only(&ro_url)
+        .await
+        .expect("read-only open performs no migrations");
+    reader.close().await;
+
+    // Direct migration on the read-only pool is refused too.
+    let ro_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&ro_url)
+        .await
+        .expect("ro connection");
+    assert!(
+        migrations::migrate_pg(&ro_pool).await.is_err(),
+        "migrations must be refused for a read-only role"
+    );
+    ro_pool.close().await;
+
+    // Cleanup (best-effort).
+    sqlx::query(&format!(
+        "REVOKE CONNECT ON DATABASE \"{}\" FROM \"{role}\"",
+        pg.db
+    ))
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(&format!("DROP ROLE \"{role}\""))
+        .execute(pool)
+        .await
+        .ok();
+    pg.finish().await;
+}
+
+// -- C52: wake transport (LISTEN/NOTIFY) -------------------------------------
+
+/// Notify-after-commit ordering (the C52 named test): a wake
+/// notification is observable **only after** the input row it announces
+/// is durable and visible. The listener receives the notification and
+/// — on the same connection turn — the input row is already readable;
+/// a notify observed before its row is visible would invert
+/// durable-before-wake (constraint 6) across processes.
+#[tokio::test]
+async fn pg_wake_notify_fires_only_after_the_input_row_is_visible() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let pool = pg.store.pg_pool().expect("pg store carries a pool").clone();
+
+    // The receiving replica: one dedicated pooled connection LISTENing
+    // on the wake channel (exactly how `kian serve` relays).
+    let mut listener = kian_store::wake::listen_for_wakes(&pool)
+        .await
+        .expect("listen kian_wake");
+
+    // The admitting replica's sequence, exactly as the engine performs
+    // it: the single-statement INSERT commits, then the notify flies.
+    let sid = SessionId::new();
+    let row = InputRow {
+        id: Uuid::new_v4(),
+        session: sid,
+        payload: json!("task-A"),
+        admitted_at: T0,
+        eligible_at: T0,
+        idempotency_key: Some("c52-notify-order".into()),
+    };
+    pg.store.admit(row.clone()).await.expect("durable admit");
+    pg.store
+        .notify_wake(sid)
+        .await
+        .expect("notify after commit");
+
+    // The notification arrives…
+    let notification = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+        .await
+        .expect("notification within 5s")
+        .expect("listener alive");
+    assert_eq!(notification.channel(), kian_store::wake::WAKE_CHANNEL);
+    assert_eq!(notification.payload(), sid.0.to_string());
+
+    // …and by the time it is observed, the announced row is already
+    // visible to an ordinary read (committed before the notify flew).
+    let eligible = pg.store.eligible_inputs(sid, T0).await.expect("read");
+    assert_eq!(
+        eligible,
+        vec![row],
+        "the notified input must be durable-visible the moment the notify is observed"
+    );
+
+    pg.finish().await;
+}
+
+/// A listener gap drops notifications honestly: with no listener
+/// attached (the simulated gap — reconnect window or replica down),
+/// the notify still succeeds (publish is best-effort) and the input
+/// row remains durable for the sweep/startup-scan rebuild. This pins
+/// the transport's advisory contract at the store layer; the
+/// sweep-services-it half is the engine's named listener-gap test.
+#[tokio::test]
+async fn pg_wake_notify_without_a_listener_still_commits_the_input() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+    let row = InputRow {
+        id: Uuid::new_v4(),
+        session: sid,
+        payload: json!("task-B"),
+        admitted_at: T0,
+        eligible_at: T0,
+        idempotency_key: Some("c52-notify-gap".into()),
+    };
+    // No listener exists — the notification lands nowhere (pg_notify
+    // with no subscribers is a no-op, never an error).
+    pg.store.admit(row.clone()).await.expect("durable admit");
+    pg.store
+        .notify_wake(sid)
+        .await
+        .expect("best-effort notify is Ok");
+
+    // The durable row is what NoLostWork rests on — not the transport.
+    let scan = pg.store.startup_scan(T0).await.expect("startup scan");
+    assert_eq!(
+        scan,
+        vec![kian_store::SessionInbox {
+            session: sid,
+            eligible: vec![row],
+        }],
+        "a dropped notify leaves the durable row for the rebuild"
+    );
+
+    pg.finish().await;
+}

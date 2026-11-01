@@ -1,0 +1,506 @@
+//! The sqlite backend (C50): the pre-C50 statements and statement logic,
+//! extracted verbatim from the single-backend store so the dispatching
+//! [`EventStore`](crate::event_store::EventStore) can expose the same
+//! surface on postgres. Dialect SQL lives here and only here.
+//!
+//! sqlite specifics pinned by this module:
+//! - `?N` placeholders, bound per occurrence (positional per index);
+//! - scalar `MAX(a, b)` in CLAIM_SQL (sqlite's two-argument MAX is scalar);
+//! - `append_batch` = guarded first-row CAS + plain tail inserts inside one
+//!   transaction: the first insert holds sqlite's writer lock until commit,
+//!   so no concurrent writer can interleave between the fence check and the
+//!   tail rows (the guarantee postgres gets from a single CTE statement).
+
+use std::ops::Range;
+
+use kian_core::events::Event;
+use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
+use kian_core::state::{SessionState, project};
+use sqlx::sqlite::SqlitePool;
+use uuid::Uuid;
+
+use crate::event_store::{AppendGuard, Head, StoreError, classify_cas_rejection, to_i64 as se_i64};
+use crate::inbox::{AdmitOutcome, InboxError, SessionInbox, decode_input, to_i64 as ie_i64};
+
+// -- events -----------------------------------------------------------------
+
+/// The single-statement CAS append (ADR-005). The insert lands only when
+/// both fences hold at statement time: the session's epoch floor must not
+/// exceed the write's epoch, and the stream head must be exactly
+/// `expected_seq - 1` (so the primary key can never collide and seqs stay
+/// contiguous). Anything else inserts zero rows and is classified into a
+/// typed error by the HEAD re-read in [`classify`].
+const APPEND_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nSELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7\nWHERE (SELECT COALESCE(MAX(epoch), 0) FROM events WHERE session = ?8) <= ?9\n  AND (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?10) = ?11 - 1";
+
+/// The tail rows of a batch append ride the first row's CAS (see module
+/// docs: the writer lock covers the whole transaction).
+const BATCH_TAIL_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+const HEAD_SQL: &str =
+    "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
+
+const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? AND seq >= ? AND seq < ? ORDER BY seq ASC";
+
+/// The CAS refused the write: re-read the head and classify which fence
+/// tripped — the same classification both backends share (C50 §3: pg's
+/// PK-race zero-row outcome flows through here too).
+async fn classify(
+    pool: &SqlitePool,
+    session_key: &str,
+    session: SessionId,
+    guard: AppendGuard,
+) -> Result<(), StoreError> {
+    let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
+        .bind(session_key)
+        .fetch_one(pool)
+        .await?;
+    Err(classify_cas_rejection(session, guard, epoch_floor, max_seq))
+}
+
+pub(crate) async fn append(
+    pool: &SqlitePool,
+    session: SessionId,
+    event: &Event,
+    envelope: &str,
+    guard: AppendGuard,
+) -> Result<(), StoreError> {
+    let session_key = session.0.to_string();
+    let result = sqlx::query(APPEND_SQL)
+        .bind(&session_key)
+        .bind(se_i64(event.seq, "seq")?)
+        .bind(se_i64(event.epoch.0, "epoch")?)
+        .bind(se_i64(event.ts, "ts")?)
+        .bind(event.kind.as_str())
+        .bind(i64::from(event.version))
+        .bind(envelope)
+        // Fence inputs are bound again: sqlite parameters are positional
+        // per index, and repeating ?N inline reads worse than rebinding.
+        .bind(&session_key)
+        .bind(se_i64(event.epoch.0, "epoch")?)
+        .bind(&session_key)
+        .bind(se_i64(event.seq, "seq")?)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        return Ok(());
+    }
+    classify(pool, &session_key, session, guard).await
+}
+
+pub(crate) async fn append_batch(
+    pool: &SqlitePool,
+    session: SessionId,
+    events: &[Event],
+    envelopes: &[String],
+    guard: AppendGuard,
+) -> Result<(), StoreError> {
+    let first = &events[0];
+    let session_key = session.0.to_string();
+    let mut tx = pool.begin().await?;
+    // The first row is the same single-statement CAS as `append`: either
+    // both fences hold and the batch proceeds (holding the writer lock
+    // until commit), or zero rows land and the typed error classifies
+    // which fence tripped.
+    let result = sqlx::query(APPEND_SQL)
+        .bind(&session_key)
+        .bind(se_i64(first.seq, "seq")?)
+        .bind(se_i64(first.epoch.0, "epoch")?)
+        .bind(se_i64(first.ts, "ts")?)
+        .bind(first.kind.as_str())
+        .bind(i64::from(first.version))
+        .bind(envelopes[0].as_str())
+        .bind(&session_key)
+        .bind(se_i64(first.epoch.0, "epoch")?)
+        .bind(&session_key)
+        .bind(se_i64(first.seq, "seq")?)
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() != 1 {
+        let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
+            .bind(&session_key)
+            .fetch_one(&mut *tx)
+            .await?;
+        return Err(classify_cas_rejection(session, guard, epoch_floor, max_seq));
+    }
+    for (event, envelope) in events[1..].iter().zip(&envelopes[1..]) {
+        sqlx::query(BATCH_TAIL_SQL)
+            .bind(&session_key)
+            .bind(se_i64(event.seq, "seq")?)
+            .bind(se_i64(event.epoch.0, "epoch")?)
+            .bind(se_i64(event.ts, "ts")?)
+            .bind(event.kind.as_str())
+            .bind(i64::from(event.version))
+            .bind(envelope.as_str())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn scan(
+    pool: &SqlitePool,
+    session: SessionId,
+    range: Range<u64>,
+) -> Result<Vec<Event>, StoreError> {
+    // Clamp the upper bound to sqlite's i64 domain so "everything" can be
+    // expressed as 0..i64::MAX.
+    let end = range.end.min(i64::MAX as u64);
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_SQL)
+        .bind(session.0.to_string())
+        .bind(se_i64(range.start, "seq")?)
+        .bind(se_i64(end, "seq")?)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session != session {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+pub(crate) async fn head(pool: &SqlitePool, session: SessionId) -> Result<Head, StoreError> {
+    let (epoch, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(pool)
+        .await?;
+    Ok(Head {
+        next_seq: max_seq as u64 + 1,
+        epoch: Epoch(epoch as u64),
+    })
+}
+
+// -- inbox ------------------------------------------------------------------
+
+/// Durable admit keyed by `(session, idempotency_key)`: the unique index
+/// makes the insert a no-op on a key collision; NULL keys never collide,
+/// so keyless admits always insert.
+const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)\nON CONFLICT (session, idempotency_key) DO NOTHING";
+
+const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND idempotency_key = ?2";
+
+const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, id ASC";
+
+const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, id ASC";
+
+/// Consumption is event-driven by construction: the row is touched only
+/// when the referenced event row already exists in the same session's
+/// stream. The input row is never removed.
+const CONSUME_SQL: &str = "UPDATE inputs SET consumed_by_seq = ?3\nWHERE session = ?1 AND id = ?2\n  AND consumed_by_seq IS NULL\n  AND EXISTS (SELECT 1 FROM events WHERE session = ?1 AND seq = ?3)";
+
+const EVENT_EXISTS_SQL: &str = "SELECT COUNT(*) FROM events WHERE session = ?1 AND seq = ?2";
+
+const CONSUMED_STATE_SQL: &str =
+    "SELECT consumed_by_seq FROM inputs WHERE session = ?1 AND id = ?2";
+
+/// Monotonic epoch issuance in one statement (sqlite serializes writers,
+/// so concurrent claims execute this atomically in order). The floor is
+/// max(claims.epoch, events epoch floor); the conflict branch's
+/// `excluded.epoch` is strictly greater than the stored epoch, so epochs
+/// never repeat. C47 (ADR-009) — conditional claim admission: the conflict
+/// branch lands only when the existing lease is expired or the claiming
+/// holder already owns the row; otherwise zero rows return and `claim`
+/// reports the typed `ClaimRejected`.
+const CLAIM_SQL: &str = "INSERT INTO claims (session, epoch, holder, ttl_ms, last_heartbeat)\nVALUES (?1,\n        MAX(COALESCE((SELECT MAX(epoch) FROM claims WHERE session = ?2), 0),\n             COALESCE((SELECT MAX(epoch) FROM events WHERE session = ?3), 0)) + 1,\n        ?4, ?5, ?6)\nON CONFLICT(session) DO UPDATE SET\n    epoch = excluded.epoch,\n    holder = excluded.holder,\n    ttl_ms = excluded.ttl_ms,\n    last_heartbeat = excluded.last_heartbeat\nWHERE (?7 - ttl_ms) > last_heartbeat\n   OR holder = ?4\nRETURNING epoch";
+
+/// Reads the live claims row after a refused claim, to report *who* holds
+/// the fresh lease (C47 `ClaimRejected` diagnostics).
+const CLAIM_ROW_SQL: &str =
+    "SELECT epoch, holder, ttl_ms, last_heartbeat FROM claims WHERE session = ?1";
+
+const HEARTBEAT_SQL: &str = "UPDATE claims SET last_heartbeat = ?2 WHERE session = ?1";
+
+/// Expired = `now - ttl > last_heartbeat`, written as a subtraction so
+/// neither side of the comparison can overflow i64.
+const EXPIRED_SQL: &str = "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims WHERE (?1 - ttl_ms) > last_heartbeat ORDER BY session ASC";
+
+/// Every claims row (C14 `lease inspect`): no filtering, epoch order.
+const ALL_LEASES_SQL: &str =
+    "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims ORDER BY epoch ASC";
+
+type InputCols = (String, String, String, i64, i64, Option<String>);
+
+pub(crate) async fn admit(pool: &SqlitePool, input: InputRow) -> Result<AdmitOutcome, InboxError> {
+    let payload = serde_json::to_string(&input.payload)?;
+    let session_key = input.session.0.to_string();
+    let result = sqlx::query(ADMIT_SQL)
+        .bind(input.id.to_string())
+        .bind(&session_key)
+        .bind(&payload)
+        .bind(ie_i64(input.admitted_at, "admitted_at")?)
+        .bind(ie_i64(input.eligible_at, "eligible_at")?)
+        .bind(input.idempotency_key.as_deref())
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        return Ok(AdmitOutcome {
+            input,
+            deduplicated: false,
+        });
+    }
+    // Zero rows: the (session, idempotency_key) index already held a row.
+    // Read it back — first write wins.
+    let Some(key) = input.idempotency_key.clone() else {
+        return Err(InboxError::CorruptRow {
+            session: input.session,
+            input_id: input.id,
+            reason: "insert skipped without an idempotency key".into(),
+        });
+    };
+    let existing: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
+        .bind(&session_key)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    existing
+        .map(decode_input)
+        .transpose()?
+        .map(|input| AdmitOutcome {
+            input,
+            deduplicated: true,
+        })
+        .ok_or(InboxError::CorruptRow {
+            session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
+            input_id: Uuid::nil(),
+            reason: "unique index reported a collision but no row was found".into(),
+        })
+}
+
+pub(crate) async fn eligible_inputs(
+    pool: &SqlitePool,
+    session: SessionId,
+    now_ms: u64,
+) -> Result<Vec<InputRow>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(ELIGIBLE_SQL)
+        .bind(session.0.to_string())
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(decode_input).collect()
+}
+
+pub(crate) async fn mark_consumed(
+    pool: &SqlitePool,
+    session: SessionId,
+    input_id: Uuid,
+    consumed_by_seq: u64,
+) -> Result<(), InboxError> {
+    let session_key = session.0.to_string();
+    let seq = ie_i64(consumed_by_seq, "consumed_by_seq")?;
+    let result = sqlx::query(CONSUME_SQL)
+        .bind(&session_key)
+        .bind(input_id.to_string())
+        .bind(seq)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        return Ok(());
+    }
+    // The guarded write refused: classify which condition failed.
+    let committed: i64 = sqlx::query_scalar(EVENT_EXISTS_SQL)
+        .bind(&session_key)
+        .bind(seq)
+        .fetch_one(pool)
+        .await?;
+    if committed == 0 {
+        return Err(InboxError::MissingConsumptionEvent {
+            session,
+            input_id,
+            seq: consumed_by_seq,
+        });
+    }
+    let state: Option<Option<i64>> = sqlx::query_scalar(CONSUMED_STATE_SQL)
+        .bind(&session_key)
+        .bind(input_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    match state {
+        None => Err(InboxError::UnknownInput { session, input_id }),
+        Some(Some(prev)) if prev == seq => Ok(()),
+        Some(Some(prev)) => Err(InboxError::AlreadyConsumed {
+            session,
+            input_id,
+            consumed_by_seq: prev as u64,
+            seq: consumed_by_seq,
+        }),
+        Some(None) => Err(InboxError::CorruptRow {
+            session,
+            input_id,
+            reason: "guarded consume refused on an unconsumed row with a committed event".into(),
+        }),
+    }
+}
+
+pub(crate) async fn claim(
+    pool: &SqlitePool,
+    session: SessionId,
+    holder: &str,
+    ttl_ms: u64,
+    now_ms: u64,
+) -> Result<LeaseRecord, InboxError> {
+    let session_key = session.0.to_string();
+    let issued: Option<i64> = sqlx::query_scalar(CLAIM_SQL)
+        .bind(&session_key)
+        .bind(&session_key)
+        .bind(&session_key)
+        .bind(holder)
+        .bind(ie_i64(ttl_ms, "ttl_ms")?)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_optional(pool)
+        .await?;
+    let Some(epoch) = issued else {
+        // Conditional admission refused: read the live row and report who
+        // holds the fresh lease. Claims rows are never deleted, so a
+        // missing row here is corruption.
+        let live: Option<(i64, String, i64, i64)> = sqlx::query_as(CLAIM_ROW_SQL)
+            .bind(&session_key)
+            .fetch_optional(pool)
+            .await?;
+        let Some((epoch, live_holder, live_ttl, last_heartbeat)) = live else {
+            return Err(InboxError::CorruptRow {
+                session,
+                input_id: Uuid::nil(),
+                reason: "conditional claim refused but no claims row exists".into(),
+            });
+        };
+        return Err(InboxError::ClaimRejected {
+            session,
+            holder: live_holder,
+            epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
+                session,
+                input_id: Uuid::nil(),
+                reason: format!("claims table returned a negative epoch ({epoch})"),
+            })?),
+            expires_at_ms: u64::try_from(last_heartbeat)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(live_ttl).unwrap_or(u64::MAX)),
+        });
+    };
+    Ok(LeaseRecord {
+        session,
+        epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
+            session,
+            input_id: Uuid::nil(),
+            reason: format!("claims table returned a negative epoch ({epoch})"),
+        })?),
+        holder: holder.to_string(),
+        ttl_ms,
+        last_heartbeat: now_ms,
+    })
+}
+
+pub(crate) async fn heartbeat(
+    pool: &SqlitePool,
+    session: SessionId,
+    now_ms: u64,
+) -> Result<(), InboxError> {
+    let result = sqlx::query(HEARTBEAT_SQL)
+        .bind(session.0.to_string())
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(InboxError::NoLease { session })
+    }
+}
+
+pub(crate) async fn expired_leases(
+    pool: &SqlitePool,
+    now_ms: u64,
+) -> Result<Vec<LeaseRecord>, InboxError> {
+    let rows: Vec<(String, i64, String, i64, i64)> = sqlx::query_as(EXPIRED_SQL)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::new();
+    for (session_key, epoch, holder, ttl_ms, last_heartbeat) in rows {
+        let sid = Uuid::parse_str(&session_key)
+            .map_err(|e| InboxError::CorruptRow {
+                session: SessionId(Uuid::nil()),
+                input_id: Uuid::nil(),
+                reason: format!("claims row session id: {e}"),
+            })
+            .map(SessionId)?;
+        // State comes from the event projection only (constraint 1):
+        // terminal, idle and recoverable sessions never surface as
+        // expired leases.
+        let events = scan(pool, sid, 0..i64::MAX as u64).await?;
+        let state = project(&events).map_err(|source| InboxError::Projection {
+            session: sid,
+            source,
+        })?;
+        if state != SessionState::Running {
+            continue;
+        }
+        out.push(LeaseRecord {
+            session: sid,
+            epoch: Epoch(epoch as u64),
+            holder,
+            ttl_ms: ttl_ms as u64,
+            last_heartbeat: last_heartbeat as u64,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) async fn leases(pool: &SqlitePool) -> Result<Vec<LeaseRecord>, InboxError> {
+    let rows: Vec<(String, i64, String, i64, i64)> =
+        sqlx::query_as(ALL_LEASES_SQL).fetch_all(pool).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (session_key, epoch, holder, ttl_ms, last_heartbeat) in rows {
+        let session = Uuid::parse_str(&session_key)
+            .map_err(|e| InboxError::CorruptRow {
+                session: SessionId(Uuid::nil()),
+                input_id: Uuid::nil(),
+                reason: format!("claims row session id: {e}"),
+            })
+            .map(SessionId)?;
+        out.push(LeaseRecord {
+            session,
+            epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
+                session,
+                input_id: Uuid::nil(),
+                reason: format!("claims table returned a negative epoch ({epoch})"),
+            })?),
+            holder,
+            ttl_ms: ttl_ms.max(0) as u64,
+            last_heartbeat: last_heartbeat.max(0) as u64,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) async fn startup_scan(
+    pool: &SqlitePool,
+    now_ms: u64,
+) -> Result<Vec<SessionInbox>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(STARTUP_SQL)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    // Rows arrive ordered by (eligible_at, id); sessions may interleave,
+    // so group by first-seen session, preserving that order across the
+    // groups.
+    let mut inboxes: Vec<SessionInbox> = Vec::new();
+    for row in rows {
+        let input = decode_input(row)?;
+        match inboxes.iter_mut().find(|i| i.session == input.session) {
+            Some(inbox) => inbox.eligible.push(input),
+            None => inboxes.push(SessionInbox {
+                session: input.session,
+                eligible: vec![input],
+            }),
+        }
+    }
+    Ok(inboxes)
+}
