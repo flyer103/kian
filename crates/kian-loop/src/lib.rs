@@ -14,15 +14,25 @@
 //! - [`tools`] — the built-in local fs/exec `ToolProvider` + `ExecBackend`
 //!   (card C11); local exec runs via `spawn_blocking` so a sleeping tool
 //!   cannot stall concurrent drains
+//! - [`evidence`] — the evidence gate v1 (card C24): bounded, declarative,
+//!   pure predicates over the event stream; wired into [`react`]'s stop
+//!   path, default-off
 
+pub mod evidence;
 pub mod react;
 pub mod tools;
 
+#[cfg(test)]
+mod evidence_gate_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod test_support;
 
+pub use evidence::{
+    BUILTIN_GATE_NAME, CheckOutcome, CheckSpec, EvidenceGateConfig, EvidenceGateCounters,
+    GateVerdict, VerdictCounters, evaluate_evidence_gate, verdict_payload,
+};
 pub use kian_core::seams::{LoopDriver, LoopOutcome};
 pub use react::{
     CLASS_EMPTY_RESPONSE, DEFAULT_MAX_ITERATIONS, LoopError, ReActConfig, ReActLoop,

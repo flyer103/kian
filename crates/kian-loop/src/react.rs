@@ -36,6 +36,17 @@
 //! engine settles it as `failed`, never `completed`. The loop itself never
 //! retries (constraint 8: recovery disposition is one-shot-guarded and
 //! owned by the caller, C10).
+//!
+//! ## Evidence gate on the stop path (C24)
+//!
+//! When mounted via [`ReActLoop::with_evidence_gate`], every terminal stop
+//! flow (`Settled` — the final-answer "done" claim — and `Stopped`) passes
+//! through [`crate::evidence`] before it is reported: pass appends
+//! `evidence/verdict{passed:true}` and lets the stop proceed; fail appends
+//! the failed verdict, buys at most `max_retries` extra provider turns,
+//! then reports a soft failure the engine settles as `failed` — never
+//! `completed` with a failed gate. The gate makes no provider call and
+//! never mutates context. Default-off (Phase-1 behavior unchanged).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,6 +64,10 @@ use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
 use kian_orchestrator::{DrainCtx, EngineError};
 use serde_json::{Value, json};
+
+use crate::evidence::{
+    BUILTIN_GATE_NAME, EvidenceGateConfig, evaluate_evidence_gate, verdict_payload,
+};
 
 /// Recovery-policy class for an empty model response (constraint 7).
 pub const CLASS_EMPTY_RESPONSE: &str = "empty_response";
@@ -90,6 +105,9 @@ struct Inner {
     policy: Arc<dyn RecoveryPolicySource>,
     agent: AgentDef,
     config: ReActConfig,
+    /// C24 evidence gate on the stop path; default (disabled) leaves
+    /// Phase-1 behavior untouched.
+    gate: EvidenceGateConfig,
 }
 
 /// The built-in async ReAct [`LoopDriver`] (DESIGN §6.2). Cheap to clone.
@@ -109,7 +127,8 @@ impl ReActLoop {
         Self::with_config(agent, registry, tools, policy, ReActConfig::default())
     }
 
-    /// [`ReActLoop::new`] with explicit loop tuning.
+    /// [`ReActLoop::new`] with explicit loop tuning. The evidence gate is
+    /// disabled (Phase-1 behavior).
     pub fn with_config(
         agent: AgentDef,
         registry: Arc<ProviderRegistry>,
@@ -117,18 +136,48 @@ impl ReActLoop {
         policy: Arc<dyn RecoveryPolicySource>,
         config: ReActConfig,
     ) -> Self {
+        Self::with_evidence_gate(
+            agent,
+            registry,
+            tools,
+            policy,
+            config,
+            EvidenceGateConfig::default(),
+        )
+    }
+
+    /// [`ReActLoop::with_config`] with an evidence gate (C24) mounted on
+    /// the stop path. A disabled [`EvidenceGateConfig`] behaves exactly
+    /// like [`ReActLoop::with_config`].
+    pub fn with_evidence_gate(
+        agent: AgentDef,
+        registry: Arc<ProviderRegistry>,
+        tools: Arc<dyn ToolProvider>,
+        policy: Arc<dyn RecoveryPolicySource>,
+        config: ReActConfig,
+        gate: EvidenceGateConfig,
+    ) -> Self {
         Self(Arc::new(Inner {
             registry,
             tools,
             policy,
             agent,
             config,
+            gate,
         }))
     }
 
     #[must_use]
     pub fn config(&self) -> &ReActConfig {
         &self.0.config
+    }
+
+    /// The mounted evidence-gate config (C24). The shared verdict counters
+    /// inside are the metrics surface for `GET /metrics` (wired by the
+    /// C27 assembly).
+    #[must_use]
+    pub fn evidence_gate(&self) -> &EvidenceGateConfig {
+        &self.0.gate
     }
 }
 
@@ -212,9 +261,58 @@ pub enum LoopError {
 impl Inner {
     /// One ReAct iteration.
     async fn iteration(&self, ctx: &DrainCtx) -> Flow {
-        match self.run_iteration(ctx).await {
+        let flow = match self.run_iteration(ctx).await {
             Ok(flow) => flow,
-            Err(e) => Flow::Soft(format!("loop error: {e}")),
+            Err(e) => return Flow::Soft(format!("loop error: {e}")),
+        };
+        // C24: terminal stop flows pass through the evidence gate before
+        // they are reported (a disabled gate is a no-op pass-through).
+        match flow {
+            Flow::Settled | Flow::Stopped(_) => self.apply_evidence_gate(ctx, flow).await,
+            other => other,
+        }
+    }
+
+    /// The evidence gate on the loop's stop path (C24). Evaluates the
+    /// configured checks as pure predicates over the session's own event
+    /// stream — never a provider call, never a context mutation — and
+    /// appends one `evidence/verdict` event:
+    ///
+    /// - pass → the stop proceeds; the verdict is the last event before
+    ///   the engine's end write;
+    /// - fail → the loop continues (`Flow::TurnDone`) while
+    ///   `attempt < max_retries`, else reports a soft failure — the
+    ///   engine settles it `failed`, never `completed` (constraint 7).
+    ///
+    /// The gate only reports; disposition stays with the engine.
+    async fn apply_evidence_gate(&self, ctx: &DrainCtx, flow: Flow) -> Flow {
+        if !self.gate.enabled {
+            return flow;
+        }
+        let events = match ctx.events().await {
+            Ok(events) => events,
+            Err(e) => {
+                return Flow::Soft(format!("evidence gate: stream read failed: {e}"));
+            }
+        };
+        let verdict = evaluate_evidence_gate(BUILTIN_GATE_NAME, &self.gate.checks, &events);
+        let payload = verdict_payload(BUILTIN_GATE_NAME, &verdict);
+        if let Err(e) = ctx.append(EventKind::EvidenceVerdict, payload).await {
+            return Flow::Soft(format!("evidence gate: verdict append failed: {e}"));
+        }
+        if verdict.passed {
+            self.gate.counters.record_passed();
+            flow
+        } else {
+            self.gate.counters.record_failed();
+            if verdict.attempt < self.gate.max_retries {
+                Flow::TurnDone
+            } else {
+                Flow::Soft(format!(
+                    "evidence gate `{BUILTIN_GATE_NAME}` failed after {} attempt(s)",
+                    verdict.attempt + 1
+                ))
+            }
         }
     }
 
