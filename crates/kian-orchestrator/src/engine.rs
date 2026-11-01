@@ -21,7 +21,16 @@
 //! `mark_consumed`. Payload convention: a plain input row's payload IS
 //! the message content; a steer row wraps it as
 //! `{"synthetic": true, "content": <content>}` so the synthetic
-//! (strippable) marker survives the inbox round-trip.
+//! (strippable) marker survives the inbox round-trip. The C32 spill
+//! envelope extends this row-level convention: a row payload of exactly
+//! `{"content": <message content>, "spill": <sidecar value>}` consumes
+//! as TWO events in one fenced write batch — `input/admitted` carrying
+//! `{"role": "user", "content": <content>}` exactly as the bare content
+//! would have produced, followed immediately by `input/spilled` carrying
+//! the opaque sidecar verbatim. The envelope exists only at the row
+//! level: the frozen event payload contracts are untouched, the sidecar
+//! never enters model context (`input/spilled` is non-context-bearing),
+//! and rows without the envelope consume byte-identically to before.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -282,6 +291,62 @@ impl DrainCtxCore {
             session: self.session,
         })
     }
+
+    /// The C32 spill consumption write: `input/admitted` immediately
+    /// followed by `input/spilled` as ONE fenced write batch (the
+    /// store's `append_batch`), so the pair either lands whole or not at
+    /// all — a stale-epoch rejection writes neither event. Retry
+    /// semantics mirror [`DrainCtxCore::append_event`]: a `SeqMismatch`
+    /// from a fenced-out concurrent writer is repaired from the head and
+    /// retried; a stale-epoch rejection propagates immediately.
+    async fn append_input_pair(
+        &self,
+        admitted: Value,
+        spill: Value,
+    ) -> Result<(Event, Event), EngineError> {
+        for _ in 0..APPEND_ATTEMPTS {
+            let seq = self.seq.load(Ordering::Acquire);
+            let ts = self.clock.now_ms();
+            let admitted_ev = Event {
+                seq,
+                session: self.session,
+                epoch: self.epoch,
+                ts,
+                kind: EventKind::InputAdmitted,
+                bytes: admitted.clone(),
+                version: SCHEMA_VERSION,
+            };
+            let spilled_ev = Event {
+                seq: seq + 1,
+                session: self.session,
+                epoch: self.epoch,
+                ts,
+                kind: EventKind::InputSpilled,
+                bytes: spill.clone(),
+                version: SCHEMA_VERSION,
+            };
+            let batch = [admitted_ev.clone(), spilled_ev.clone()];
+            let guard = AppendGuard {
+                epoch: self.epoch,
+                expected_seq: seq,
+            };
+            match self.store.append_batch(self.session, &batch, guard).await {
+                Ok(()) => {
+                    self.seq.store(seq + 2, Ordering::Release);
+                    return Ok((admitted_ev, spilled_ev));
+                }
+                Err(StoreError::SeqMismatch { .. }) => {
+                    let head = self.store.head(self.session).await?;
+                    self.seq.store(head.next_seq, Ordering::Release);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(EngineError::AppendRetryExhausted {
+            session: self.session,
+        })
+    }
 }
 
 impl DrainCtx {
@@ -368,11 +433,13 @@ impl DrainCtx {
         Ok(self.core.store.rebuild(self.core.session).await?)
     }
 
-    /// Takes every eligible input at this safe boundary: appends one
-    /// `input/admitted` event per row (the consumption event, DESIGN
-    /// §3.2 message payload) and binds the row to it via
-    /// `mark_consumed`. Refused while a provider turn is in flight
-    /// (invariant 3) — steer inputs land only at turn boundaries.
+    /// Takes every eligible input at this safe boundary: appends the
+    /// consumption event(s) per row (the `input/admitted` message event,
+    /// plus — for the C32 spill envelope — its `input/spilled` sibling in
+    /// the same fenced write batch) and binds the row to the admitted
+    /// event's seq via `mark_consumed`. Refused while a provider turn is
+    /// in flight (invariant 3) — steer inputs land only at turn
+    /// boundaries.
     pub async fn take_eligible_inputs(&self) -> Result<Vec<InputRow>, EngineError> {
         if self.core.in_turn.load(Ordering::Acquire) {
             return Err(EngineError::NotAtSafeBoundary {
@@ -387,15 +454,24 @@ impl DrainCtx {
             .await?;
         let mut taken = Vec::new();
         for r in rows {
-            let payload = message_payload(&r);
-            let ev = self
-                .core
-                .append_event(EventKind::InputAdmitted, payload)
-                .await?;
+            let admitted_seq = match consumption_plan(&r) {
+                Consumption::Single(payload) => {
+                    let ev = self
+                        .core
+                        .append_event(EventKind::InputAdmitted, payload)
+                        .await?;
+                    ev.seq
+                }
+                Consumption::SpillPair { admitted, spill } => {
+                    let (admitted_ev, _spilled_ev) =
+                        self.core.append_input_pair(admitted, spill).await?;
+                    admitted_ev.seq
+                }
+            };
             match self
                 .core
                 .store
-                .mark_consumed(self.core.session, r.id, ev.seq)
+                .mark_consumed(self.core.session, r.id, admitted_seq)
                 .await
             {
                 Ok(()) => taken.push(r),
@@ -962,18 +1038,43 @@ async fn heartbeat_loop(
     }
 }
 
-/// The engine's input-payload convention: a plain row's payload IS the
-/// message content; a steer row wraps it as
-/// `{"synthetic": true, "content": X}` so the strippable marker
-/// survives the inbox round-trip (DESIGN §3.2 payload contract).
-fn message_payload(row: &InputRow) -> Value {
-    if let Some(obj) = row.payload.as_object()
-        && obj.get("synthetic").and_then(Value::as_bool) == Some(true)
-        && let Some(content) = obj.get("content")
-    {
-        return json!({"role": "user", "content": content, "synthetic": true});
+/// The engine's input-row convention: what one row consumes to. A plain
+/// row's payload IS the message content; a steer row wraps it as
+/// `{"synthetic": true, "content": X}` so the strippable marker survives
+/// the inbox round-trip (DESIGN §3.2 payload contract); the C32 spill
+/// envelope `{"content": X, "spill": Y}` (exactly those two keys)
+/// consumes to the admitted message plus its non-context-bearing sidecar
+/// in one fenced write batch. The envelope is a row-level convention
+/// only — the committed event payload contracts are unchanged. Like the
+/// steer wrapper before it, the exact two-key shape is reserved: a plain
+/// payload of that precise shape is read as an envelope, not content.
+enum Consumption {
+    /// One `input/admitted` event (the entire pre-C32 surface).
+    Single(Value),
+    /// The C32 pair: `input/admitted` then `input/spilled`, appended
+    /// atomically under one CAS (`append_batch`).
+    SpillPair { admitted: Value, spill: Value },
+}
+
+fn consumption_plan(row: &InputRow) -> Consumption {
+    if let Some(obj) = row.payload.as_object() {
+        if obj.get("synthetic").and_then(Value::as_bool) == Some(true)
+            && let Some(content) = obj.get("content")
+        {
+            return Consumption::Single(
+                json!({"role": "user", "content": content, "synthetic": true}),
+            );
+        }
+        if obj.len() == 2
+            && let (Some(content), Some(spill)) = (obj.get("content"), obj.get("spill"))
+        {
+            return Consumption::SpillPair {
+                admitted: json!({"role": "user", "content": content}),
+                spill: spill.clone(),
+            };
+        }
     }
-    json!({"role": "user", "content": row.payload})
+    Consumption::Single(json!({"role": "user", "content": row.payload}))
 }
 
 #[cfg(test)]
@@ -1353,6 +1454,318 @@ mod tests {
             .expect("steer event with synthetic marker");
         assert_eq!(steer_ev.bytes["content"], json!("plan B"));
         assert!(steer_ev.seq > turn_end.seq);
+        cleanup(&path);
+    }
+
+    // -- C32: the spill sidecar consumption-write convention ---------------
+
+    /// Bootstraps `sid` (session/created + drain/claimed) and returns a
+    /// drain context under `epoch` — the safe-boundary surface the spill
+    /// tests drive directly.
+    async fn spill_ctx(store: &EventStore, sid: SessionId, epoch: Epoch) -> DrainCtx {
+        let created = Event {
+            seq: 1,
+            session: sid,
+            epoch: Epoch::GENESIS,
+            ts: T0,
+            kind: EventKind::SessionCreated,
+            bytes: json!({}),
+            version: SCHEMA_VERSION,
+        };
+        store
+            .append(
+                sid,
+                created,
+                kian_store::AppendGuard {
+                    epoch: Epoch::GENESIS,
+                    expected_seq: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let ctx = DrainCtx::new(
+            store.clone(),
+            sid,
+            epoch,
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+        ctx.append(EventKind::DrainClaimed, json!({}))
+            .await
+            .unwrap();
+        ctx
+    }
+
+    fn spill_sidecar() -> serde_json::Value {
+        json!({
+            "event_id": "evt-1",
+            "channel": "mock",
+            "topic": null,
+            "raw": {"text": "the full verbatim channel payload"}
+        })
+    }
+
+    fn pair_of(events: &[Event]) -> (Event, Event) {
+        let admitted = events
+            .iter()
+            .find(|e| e.kind == EventKind::InputAdmitted)
+            .expect("input/admitted event")
+            .clone();
+        let spilled = events
+            .iter()
+            .find(|e| e.kind == EventKind::InputSpilled)
+            .expect("input/spilled event")
+            .clone();
+        (admitted, spilled)
+    }
+
+    /// The envelope row consumes to the exact two-event pair: admitted
+    /// carries the bare message payload, spilled carries the sidecar
+    /// verbatim, contiguously, and the row binds to the admitted seq.
+    #[tokio::test]
+    async fn spill_envelope_consumes_to_the_exact_two_event_pair() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let sidecar = spill_sidecar();
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": "inline excerpt", "spill": sidecar.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let (admitted, spilled) = pair_of(&events);
+        assert_eq!(
+            admitted.bytes,
+            json!({"role": "user", "content": "inline excerpt"})
+        );
+        assert_eq!(spilled.bytes, sidecar, "the sidecar rides verbatim");
+        assert_eq!(spilled.seq, admitted.seq + 1, "immediately after admitted");
+        assert_eq!(spilled.epoch, admitted.epoch, "one fenced write batch");
+        // The row is consumed against the admitted event's seq, not the
+        // spilled sibling's.
+        assert!(store.startup_scan(T0).await.unwrap().is_empty());
+        assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
+        // The pair projects legally (C31 drain-activity default) and the
+        // sidecar never enters model context.
+        let projected = project(&events).expect("pair projects");
+        assert_eq!(projected, SessionState::Running);
+        let messages = kian_core::context::derive_model_context(&events)
+            .expect("context derivation over the pair");
+        let context_blob = serde_json::to_string(&messages).unwrap();
+        assert!(context_blob.contains("inline excerpt"));
+        assert!(
+            !context_blob.contains("the full verbatim channel payload"),
+            "the sidecar must never enter model context"
+        );
+        cleanup(&path);
+    }
+
+    /// Byte-comparison: the envelope row's `input/admitted` payload is
+    /// byte-identical to what the bare content would have produced.
+    #[tokio::test]
+    async fn spill_admitted_bytes_identical_to_bare_content_path() {
+        let (store, path) = open_store().await;
+        let bare = SessionId::new();
+        let envelope = SessionId::new();
+        let ctx_bare = spill_ctx(&store, bare, Epoch(1)).await;
+        let ctx_env = spill_ctx(&store, envelope, Epoch(1)).await;
+
+        let content = json!({"kian": {"type": "channel_event"}, "text": "hi"});
+        store.admit(row(bare, 1, content.clone())).await.unwrap();
+        store
+            .admit(row(
+                envelope,
+                2,
+                json!({"content": content, "spill": spill_sidecar()}),
+            ))
+            .await
+            .unwrap();
+        ctx_bare.take_eligible_inputs().await.unwrap();
+        ctx_env.take_eligible_inputs().await.unwrap();
+
+        let bare_events = events_of(&store, bare).await;
+        let bare_admitted = bare_events
+            .iter()
+            .find(|e| e.kind == EventKind::InputAdmitted)
+            .expect("bare input/admitted");
+        let events = events_of(&store, envelope).await;
+        let (env_admitted, _) = pair_of(&events);
+        assert_eq!(
+            serde_json::to_string(&bare_admitted.bytes).unwrap(),
+            serde_json::to_string(&env_admitted.bytes).unwrap(),
+            "envelope admitted bytes == bare-content admitted bytes"
+        );
+        cleanup(&path);
+    }
+
+    /// Fencing: a stale-epoch drain attempting to consume an envelope row
+    /// writes NEITHER event of the pair, and the row stays eligible for
+    /// the rightful owner.
+    #[tokio::test]
+    async fn spill_pair_stale_epoch_writes_neither_event() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        // A newer claim raises the epoch floor to 2.
+        let _rightful = spill_ctx(&store, sid, Epoch(2)).await;
+        store
+            .admit(row(
+                sid,
+                3,
+                json!({"content": "x", "spill": spill_sidecar()}),
+            ))
+            .await
+            .unwrap();
+
+        // The zombie drain from epoch 1 tries to consume the same row.
+        let zombie = DrainCtx::new(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+        let err = zombie.take_eligible_inputs().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Store(kian_store::StoreError::StaleEpoch { .. })
+            ),
+            "stale-epoch rejection, got {err}"
+        );
+
+        let events = events_of(&store, sid).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::InputAdmitted | EventKind::InputSpilled)),
+            "a stale-epoch attempt writes neither event of the pair"
+        );
+        assert_eq!(
+            store.eligible_inputs(sid, T0).await.unwrap().len(),
+            1,
+            "the row was never marked consumed"
+        );
+        cleanup(&path);
+    }
+
+    /// A2: crash between enqueue and consumption. The durable envelope
+    /// row outlives the crashed drain; the resumed drain consumes it to
+    /// the same pair the no-crash path would have produced.
+    #[tokio::test]
+    async fn spill_row_replays_to_the_same_pair_after_crash_between_enqueue_and_consumption() {
+        let (store, path) = open_store().await;
+        let envelope = json!({"content": "inline excerpt", "spill": spill_sidecar()});
+
+        // Baseline: no crash — one drain consumes the row to its pair.
+        let baseline = SessionId::new();
+        let ctx = spill_ctx(&store, baseline, Epoch(1)).await;
+        store
+            .admit(row(baseline, 1, envelope.clone()))
+            .await
+            .unwrap();
+        ctx.take_eligible_inputs().await.unwrap();
+        let baseline_events = events_of(&store, baseline).await;
+        let (baseline_admitted, baseline_spilled) = pair_of(&baseline_events);
+
+        // Crash leg: the row is enqueued (durable) but never consumed.
+        let crashed = SessionId::new();
+        let doomed = spill_ctx(&store, crashed, Epoch(1)).await;
+        store.admit(row(crashed, 2, envelope)).await.unwrap();
+        drop(doomed); // crash before consumption; the row survives.
+
+        // Recovery: a fresh drain (new epoch) finds the row via the
+        // inbox scan and consumes it.
+        assert_eq!(store.startup_scan(T0).await.unwrap().len(), 1);
+        let resumed = DrainCtx::new(
+            store.clone(),
+            crashed,
+            Epoch(2),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+        resumed
+            .append(EventKind::DrainClaimed, json!({}))
+            .await
+            .unwrap();
+        assert_eq!(resumed.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, crashed).await;
+        let (admitted, spilled) = pair_of(&events);
+        assert_eq!(
+            serde_json::to_string(&admitted.bytes).unwrap(),
+            serde_json::to_string(&baseline_admitted.bytes).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&spilled.bytes).unwrap(),
+            serde_json::to_string(&baseline_spilled.bytes).unwrap()
+        );
+        assert_eq!(spilled.seq, admitted.seq + 1);
+        cleanup(&path);
+    }
+
+    /// Compat: the envelope is exactly two keys. Content objects that
+    /// merely carry a `content` key (or extra keys alongside `spill`)
+    /// remain plain payloads — byte-identical to the pre-C32 surface.
+    #[tokio::test]
+    async fn content_objects_with_extra_keys_are_not_treated_as_spill_envelopes() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let payloads = [
+            json!({"content": "x", "other": 1}),
+            json!({"content": "x", "spill": 1, "extra": 2}),
+            json!({"spill": 1}),
+            json!({"synthetic": true, "content": "plan B"}),
+        ];
+        for (i, payload) in payloads.iter().enumerate() {
+            store
+                .admit(row(sid, i as u128 + 1, payload.clone()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 4);
+
+        let events = events_of(&store, sid).await;
+        assert!(
+            !events.iter().any(|e| e.kind == EventKind::InputSpilled),
+            "none of these rows is an envelope"
+        );
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": payloads[0]})
+        );
+        assert_eq!(
+            admitted[1].bytes,
+            json!({"role": "user", "content": payloads[1]})
+        );
+        assert_eq!(
+            admitted[2].bytes,
+            json!({"role": "user", "content": payloads[2]})
+        );
+        assert_eq!(
+            admitted[3].bytes,
+            json!({"role": "user", "content": "plan B", "synthetic": true}),
+            "the steer wrapper is unchanged"
+        );
         cleanup(&path);
     }
 

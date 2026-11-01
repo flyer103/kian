@@ -102,6 +102,12 @@ pub enum StoreError {
 /// Anything else inserts zero rows and is classified into a typed error.
 const APPEND_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nSELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7\nWHERE (SELECT COALESCE(MAX(epoch), 0) FROM events WHERE session = ?8) <= ?9\n  AND (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?10) = ?11 - 1";
 
+/// The tail rows of a batch append ride the first row's CAS: the guarded
+/// first insert holds sqlite's writer lock for the whole transaction, so
+/// no concurrent writer can interleave between the fence check and these
+/// plain inserts.
+const BATCH_TAIL_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
 const HEAD_SQL: &str =
     "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
 
@@ -270,6 +276,101 @@ impl EventStore {
             });
         }
         self.append(session, event, guard).await
+    }
+
+    /// Appends a contiguous batch of events as ONE atomic CAS transaction
+    /// (C32): the batch shares a single fence decision — the first event
+    /// takes the CAS position and every event carries the guard's epoch —
+    /// so a rejected write (stale epoch, seq mismatch) commits NOTHING.
+    /// Used when two events are one logical fact (the spill sidecar's
+    /// `input/admitted` + `input/spilled` pair): half a pair must never
+    /// become durable (NoSplitBrainWrite over the whole batch).
+    pub async fn append_batch(
+        &self,
+        session: SessionId,
+        events: &[Event],
+        guard: AppendGuard,
+    ) -> Result<(), StoreError> {
+        let Some(first) = events.first() else {
+            return Err(StoreError::GuardMismatch("empty batch append"));
+        };
+        for (i, event) in events.iter().enumerate() {
+            if event.version > SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedVersion {
+                    found: event.version,
+                    current: SCHEMA_VERSION,
+                });
+            }
+            if event.session != session {
+                return Err(StoreError::GuardMismatch(
+                    "event.session disagrees with the session argument",
+                ));
+            }
+            if event.epoch != guard.epoch {
+                return Err(StoreError::GuardMismatch(
+                    "guard.epoch disagrees with event.epoch",
+                ));
+            }
+            if event.seq != guard.expected_seq + i as u64 {
+                return Err(StoreError::GuardMismatch(
+                    "batch seqs must be contiguous from guard.expected_seq",
+                ));
+            }
+        }
+
+        let session_key = session.0.to_string();
+        let mut tx = self.pool.begin().await?;
+        // The first row is the same single-statement CAS as `append`:
+        // either both fences hold and the batch proceeds (holding the
+        // writer lock until commit), or zero rows land and the typed
+        // error classifies which fence tripped.
+        let result = sqlx::query(APPEND_SQL)
+            .bind(&session_key)
+            .bind(to_i64(first.seq, "seq")?)
+            .bind(to_i64(first.epoch.0, "epoch")?)
+            .bind(to_i64(first.ts, "ts")?)
+            .bind(first.kind.as_str())
+            .bind(i64::from(first.version))
+            .bind(serde_json::to_string(first)?)
+            .bind(&session_key)
+            .bind(to_i64(first.epoch.0, "epoch")?)
+            .bind(&session_key)
+            .bind(to_i64(first.seq, "seq")?)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
+                .bind(&session_key)
+                .fetch_one(&mut *tx)
+                .await?;
+            return if guard.epoch.0 < epoch_floor as u64 {
+                Err(StoreError::StaleEpoch {
+                    session,
+                    event_epoch: guard.epoch,
+                    current_epoch: Epoch(epoch_floor as u64),
+                })
+            } else {
+                Err(StoreError::SeqMismatch {
+                    session,
+                    expected_seq: guard.expected_seq,
+                    actual_next: max_seq as u64 + 1,
+                })
+            };
+        }
+        for event in &events[1..] {
+            sqlx::query(BATCH_TAIL_SQL)
+                .bind(&session_key)
+                .bind(to_i64(event.seq, "seq")?)
+                .bind(to_i64(event.epoch.0, "epoch")?)
+                .bind(to_i64(event.ts, "ts")?)
+                .bind(event.kind.as_str())
+                .bind(i64::from(event.version))
+                .bind(serde_json::to_string(event)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Reads a session's events back in seq order over `[start, end)`.
@@ -454,6 +555,171 @@ mod tests {
                 epoch: Epoch(5)
             }
         );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    // -- C32 batch append: one logical fact, one fenced write --------------
+
+    /// A batch append commits every event contiguously, in order, under
+    /// one CAS — the happy path of the spill pair.
+    #[tokio::test]
+    async fn append_batch_commits_the_whole_batch_contiguously() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed(&store, sid, 3, Epoch(1)).await;
+
+        let batch = [
+            ev(sid, 4, Epoch(1), EventKind::InputAdmitted),
+            ev(sid, 5, Epoch(1), EventKind::InputSpilled),
+        ];
+        store
+            .append_batch(
+                sid,
+                &batch,
+                AppendGuard {
+                    epoch: Epoch(1),
+                    expected_seq: 4,
+                },
+            )
+            .await
+            .expect("batch append");
+
+        let events = store.scan(sid, all()).await.unwrap();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[3], batch[0]);
+        assert_eq!(events[4], batch[1]);
+        assert_eq!(store.head(sid).await.unwrap().next_seq, 6);
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A stale-epoch batch writes NEITHER event: the pair is one logical
+    /// fact, so a fenced-out writer must not leave half of it behind.
+    #[tokio::test]
+    async fn append_batch_stale_epoch_writes_neither_event() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed(&store, sid, 3, Epoch(5)).await;
+
+        let batch = [
+            ev(sid, 4, Epoch(3), EventKind::InputAdmitted),
+            ev(sid, 5, Epoch(3), EventKind::InputSpilled),
+        ];
+        let err = store
+            .append_batch(
+                sid,
+                &batch,
+                AppendGuard {
+                    epoch: Epoch(3),
+                    expected_seq: 4,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StoreError::StaleEpoch {
+                    event_epoch: Epoch(3),
+                    ..
+                }
+            ),
+            "expected StaleEpoch, got {err:?}"
+        );
+        assert_eq!(store.scan(sid, all()).await.unwrap().len(), 3);
+        assert_eq!(
+            store.head(sid).await.unwrap(),
+            Head {
+                next_seq: 4,
+                epoch: Epoch(5)
+            }
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A seq-mismatched batch writes neither event either — the batch
+    /// aborts before any row is committed.
+    #[tokio::test]
+    async fn append_batch_seq_mismatch_writes_neither_event() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed(&store, sid, 3, Epoch(1)).await;
+
+        let batch = [
+            ev(sid, 5, Epoch(1), EventKind::InputAdmitted),
+            ev(sid, 6, Epoch(1), EventKind::InputSpilled),
+        ];
+        let err = store
+            .append_batch(
+                sid,
+                &batch,
+                AppendGuard {
+                    epoch: Epoch(1),
+                    expected_seq: 5,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StoreError::SeqMismatch {
+                    expected_seq: 5,
+                    ..
+                }
+            ),
+            "expected SeqMismatch, got {err:?}"
+        );
+        assert_eq!(store.scan(sid, all()).await.unwrap().len(), 3);
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// Malformed batches (non-contiguous seqs, mixed epochs, wrong
+    /// session) are rejected before touching sqlite.
+    #[tokio::test]
+    async fn append_batch_rejects_malformed_batches() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let other = SessionId::new();
+
+        let guard = AppendGuard {
+            epoch: Epoch(1),
+            expected_seq: 1,
+        };
+        let err = store.append_batch(sid, &[], guard).await.unwrap_err();
+        assert!(matches!(err, StoreError::GuardMismatch(_)), "{err:?}");
+
+        let non_contiguous = [
+            ev(sid, 1, Epoch(1), EventKind::SessionCreated),
+            ev(sid, 3, Epoch(1), EventKind::InputAdmitted),
+        ];
+        let err = store
+            .append_batch(sid, &non_contiguous, guard)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GuardMismatch(_)), "{err:?}");
+
+        let mixed_epochs = [
+            ev(sid, 1, Epoch(1), EventKind::SessionCreated),
+            ev(sid, 2, Epoch(2), EventKind::InputAdmitted),
+        ];
+        let err = store
+            .append_batch(sid, &mixed_epochs, guard)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GuardMismatch(_)), "{err:?}");
+
+        let wrong_session = [ev(other, 1, Epoch(1), EventKind::SessionCreated)];
+        let err = store
+            .append_batch(sid, &wrong_session, guard)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::GuardMismatch(_)), "{err:?}");
+
+        assert_eq!(store.scan(sid, all()).await.unwrap().len(), 0);
         store.close().await;
         cleanup(&path);
     }
