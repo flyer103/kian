@@ -192,16 +192,38 @@ modified) / Thread (independent event stream + version pin; task-centric delegat
 | Evidence gate v1 | A6 |
 | Acceptance | S4, S5 |
 
-### Phase 3 (ecosystem, ongoing)
-| Module | Contents |
-|--------|----------|
-| Harness being-integrated protocol | dsh loop → worker (S6) |
-| Postgres EventStore, multi-replica lease/fencing | Foundation of the hosted control plane |
-| Plugin SDK + Footprint Ladder | Ecosystem |
-| Audit export/replay tooling (S7) | |
-| A2A boundaries | Exploration |
+### Phase 3 (article-sync round, landed 2026-11-01; ecosystem, ongoing)
 
-### Deferred (Phase 2/3)
+What the round landed, recorded against the contract (cards C31–C44; closeout C45). Scenario
+definitions S1–S7 in §2.5 are unchanged — only status is recorded here.
+
+| Module | Contents | Status |
+|--------|----------|--------|
+| Inline/Spill admission shaping (the `input/spilled` kind) | Oversized channel payloads admit as a bounded Inline view in model context; the verbatim raw is appended in-stream, out of context, in the same atomic consumption write (C31–C33) | landed |
+| Recall toolpack (Chain of Recall) | Read-only `recall_event` / `recall_neighbors` / `recall_thread` over `RecallPort`; outputs are themselves Inline/Spill-shaped so multi-hop recall composes; Router global observability rides the event stream via recall, not Router context (C34–C35) | landed |
+| Two-level admission filtering | Fast-path `classes:` table (`candidate | explicit-only | ignore`, keyed by channel/topic/sender, most-specific-wins) evaluated before the rule set and before any model call; the judge prompt is the natural-language policy extension point (C36) | landed |
+| Async `start()`/`stop()` tool pattern | `start` acks immediately with a job id; the completion returns as an admitted input (`async_result` envelope) promoted at the next safe boundary; `stop` cancels honestly; job rows are pre-event durable state ([ADR-008](../design/decisions/ADR-008-async-tool-completion-admitted-input.md)) | landed |
+| Many-to-many passthrough fan-out | A topic maps to the set of workers that served it; one event admits one durable row per subscriber, idempotent per `(session, event_id)`; empty set falls back to the Router (C38) | landed |
+| Speculative-execution profile | Additive `speculative: true` delegation marker; stream-derived `max_outstanding` cap enforced with honest tool errors; discarded speculation audits everything and delivers nothing (C39) | landed |
+| Watchdog Session v2 | Model-in-the-loop progress judge: a `type: timer` channel routes ticks to a fixed session via `route: {session: <uuid>}`; `intervene` admits a steer row durable-before-wake, `escalate` replies under the IM policy; v1 endpoint heartbeat untouched (C40) | landed |
+| Batching metrics (§7.2 shape) | `superagent.router_batching` series on `/metrics`: batch size, turn wall duration, amortized ms/input; metrics-off is behavior-identical (C41) | landed |
+| Ablation benchmark (§7.1 shape) | Deterministic with/without-passthrough comparison in kian's native units (Router judge turns + request bytes); directionality asserted, both configurations must complete (C42) | landed |
+| Untrusted-input marking | `"untrusted": true` in the provenance wrapper for configured channels (real channels default untrusted); judge-prompt and recall-hop hygiene (C43) | landed |
+| Real lark channel adapter | Feishu IM receive/send over the open APIs; env-only credentials (`KIAN_LARK_*`), fail-closed startup; default-untrusted (C44) | landed |
+| Plugin SDK + Footprint Ladder | Static plugin system + Footprint Ladder landed across Phases 1–3; SDK extraction → Phase 4 (below) | partial |
+| Audit export/replay tooling (S7) | `session export`/re-import (byte-identical, C14) + delegation-audit replay assertions (C28) — demonstrated by prior rounds, recorded here at closeout (C45); no new work | **demonstrated** |
+
+### Phase 4 (deferred from Phase 3)
+
+| Item | Reason (round-3 plan §3, summarized) |
+|------|--------------------------------------|
+| Postgres EventStore + multi-replica lease/fencing | No Phase-3 acceptance scenario requires it (S1–S5 are sqlite-proven; everything this round ran single-machine); effort XL, and mid-round store churn would destabilize exactly the goldens the recall/ablation cards depend on. DESIGN §12 already assigns multi-replica to the hosted layer; constraint 4 anticipates the one-statement end write |
+| S6 dsh harness integration | Ecosystem-gated: depends on dsh's own session-log semantics staying stable and touches an external repo; nothing in the article-sync backlog depends on it. Opens Phase 4 after `kian-sdk` so the embedding contract freezes once |
+| kian-sdk | The thin client extraction is small, but publishing an SDK freezes the control-plane API — do it after the Phase-3 additions (async completion inputs, recall surfaces, admission classes) settle so the freeze happens once |
+| GitHub adapter | Needs an inbound webhook HTTP surface + an auth/verification model — a new server-surface class, not just an adapter; no acceptance scenario beyond S4's shape that mock + lark don't already cover |
+| A2A boundaries | Remains exploration; the context-sharing boundary is the Session/Thread boundary |
+
+### Deferred (unchanged)
 | Item | Reason |
 |------|--------|
 | Web UI | Polish core semantics via CLI/API first |
