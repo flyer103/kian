@@ -42,7 +42,6 @@ jobs:
       - run: cargo test --workspace --locked
         env:
           NO_PROXY: 127.0.0.1,localhost
-          no_proxy: 127.0.0.1,localhost
 
   # Postgres surfaces are env-gated (KIAN_PG_URL) and skip — never
   # fail — when the env is absent. This job supplies a real postgres
@@ -73,13 +72,17 @@ jobs:
         run: |
           set -euo pipefail
           export KIAN_PG_URL="postgres://kian@localhost:5432/kian_ci"
-          export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
+          export NO_PROXY=127.0.0.1,localhost
           for t in "kian-store --test postgres" "kian-exec --test postgres" \
                    "kian-cli --test postgres_serve" "kian-cli --test postgres_s8"; do
             echo "== cargo test -p $t =="
+            # shellcheck disable=SC2086  # $t is a word-split target list by design
             cargo test --locked -p $t 2>&1 | tee /tmp/out.log
             grep -q "test result: ok" /tmp/out.log
-            ! grep -q "SKIP:" /tmp/out.log
+            if grep -q "SKIP:" /tmp/out.log; then
+              echo "ERROR: gated suite skipped despite KIAN_PG_URL being set" >&2
+              exit 1
+            fi
           done
       - name: default gates stay green without any env
         run: cargo test --locked --workspace
