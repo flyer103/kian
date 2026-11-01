@@ -264,11 +264,40 @@ impl AsyncJobs {
         {
             Ok(true) => {}
             Ok(false) => {
-                tracing::debug!(
-                    job_id = %job_id,
-                    holder,
-                    "async job row leased by another replica; this observer exits"
-                );
+                // The claim's CAS matched nothing. Two causes with
+                // opposite obligations: (a) a live foreign lease —
+                // another replica's observer drives this job, exit;
+                // (b) the row settled between the read above and
+                // this claim (`stop` won the race) — the settled row
+                // must be delivered HERE: in-process only this
+                // observer would, and the startup redelivery sweep
+                // is a recovery path, not this turn's (C56: a
+                // cancelled completion used to be lost here until
+                // the next process restart).
+                match store.get_async_job(job_id).await {
+                    Ok(Some(row)) if row.status.is_terminal() => {
+                        tracing::info!(
+                            job_id = %job_id,
+                            status = row.status.as_str(),
+                            "async observer: row settled while claiming; delivering"
+                        );
+                        self.deliver(row).await;
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            job_id = %job_id,
+                            holder,
+                            "async job row leased by another replica; this observer exits"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            error = %e,
+                            "async observer: claim-refused row read failed"
+                        );
+                    }
+                }
                 self.finish(job_id);
                 return;
             }

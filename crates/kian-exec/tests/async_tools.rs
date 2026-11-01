@@ -401,6 +401,78 @@ async fn stop_mid_run_cancels_and_completion_lands_labelled_cancelled() {
     shutdown(rig).await;
 }
 
+/// Regression (C56): `stop` racing the observer's row-lease claim.
+/// A worker can issue `start` → `stop` in consecutive turns (the
+/// kian-cli e2e does, milliseconds apart). If the cancel CAS lands
+/// between the observer's first row read and its `claim_async_row`,
+/// the claim matches nothing and the observer used to exit as
+/// "leased by another replica" WITHOUT delivering the settled row —
+/// the completion was then lost until the next process restart. A
+/// refused claim must re-read the row: settled → deliver here (only
+/// this observer would, in-process); still live with a foreign lease
+/// → exit. Tight-looped with zero turn delay so the race window is
+/// exercised; every job's cancelled completion must still land.
+#[tokio::test]
+async fn stop_racing_the_observer_claim_still_delivers_every_completion() {
+    no_proxy();
+    let db = temp_db();
+    let rig = rig(&db).await;
+
+    const JOBS: usize = 12;
+    let mut job_ids = Vec::new();
+    for i in 0..JOBS {
+        let started = rig
+            .pair
+            .invoke(call(
+                &format!("call-race-start-{i}"),
+                "start",
+                serde_json::json!({"argv": ["sleep", "10"]}),
+            ))
+            .await
+            .unwrap();
+        let job_id = Uuid::parse_str(started.output["job_id"].as_str().unwrap()).unwrap();
+        // Stop immediately: the observer is between its first read
+        // and the claim (or has not run at all) — the racy window.
+        let stopped = rig
+            .pair
+            .invoke(call(
+                &format!("call-race-stop-{i}"),
+                "stop",
+                serde_json::json!({"job_id": job_id.to_string()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stopped.output["status"], "cancelled", "job {i}");
+        job_ids.push(job_id);
+    }
+
+    for (i, job) in job_ids.iter().enumerate() {
+        let row = wait_for_job(&rig.store, *job, |r| r.status.is_terminal()).await;
+        assert_eq!(row.status, AsyncJobStatus::Cancelled, "job {i} row");
+    }
+    // Every cancelled completion is delivered — exactly once per job.
+    for _ in 0..300 {
+        if rig.sink.delivered.lock().unwrap().len() >= JOBS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let delivered = rig.sink.delivered.lock().unwrap().clone();
+    let mut by_job: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+    for job in &delivered {
+        *by_job.entry(job.job_id).or_default() += 1;
+    }
+    for (i, job) in job_ids.iter().enumerate() {
+        let count = by_job.get(job).copied().unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "job {i} ({job}) must be delivered exactly once, deliveries: {by_job:?}"
+        );
+    }
+
+    shutdown(rig).await;
+}
+
 /// Server-restart semantics: `pending` and `inflight` rows are
 /// re-driven by a fresh engine over the reopened pool (drop drivers,
 /// reopen) — the completion still lands.
