@@ -1,0 +1,23 @@
+[package]
+name = "kian-loop"
+description = "LoopDriver seam, built-in ReAct loop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kian-core.workspace = true
+# DESIGN §7 crate map: kian-loop --> kian-orchestrator (the loop is a
+# passenger inside the drain and drives against its DrainCtx surface)
+# and consumes the C8 provider/slot machinery from kian-llm.
+kian-llm.workspace = true
+kian-orchestrator.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+kian-store.workspace = true
