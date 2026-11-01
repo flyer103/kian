@@ -891,11 +891,13 @@ dependencies = [
  "futures",
  "kian-core",
  "kian-endpoint",
+ "kian-exec",
  "kian-llm",
  "kian-loop",
  "kian-orchestrator",
  "kian-plugin",
  "kian-store",
+ "kian-superagent",
  "reqwest",
  "serde",
  "serde_json",
@@ -926,6 +928,22 @@ dependencies = [
  "kian-core",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kian-exec"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kian-core",
+ "kian-endpoint",
+ "serde",
+ "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tracing",
@@ -1009,6 +1027,42 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kian-superagent"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kian-core",
+ "kian-llm",
+ "kian-loop",
+ "kian-orchestrator",
+ "kian-plugin",
+ "kian-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kiand"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kian-core",
+ "kian-endpoint",
+ "kian-exec",
+ "serde",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1691,6 +1745,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1699,6 +1759,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest",
+]
+
+[[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -2045,6 +2114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2202,6 +2280,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "sharded-slab",
+ "thread_local",
+ "tracing-core",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2288,6 +2377,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

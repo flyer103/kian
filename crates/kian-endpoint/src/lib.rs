@@ -22,7 +22,7 @@ pub mod executor;
 pub mod proto;
 pub mod tcp;
 
-pub use endpoint::{Endpoint, EndpointError, ServerPeer};
+pub use endpoint::{Endpoint, EndpointError, HeartbeatInfo, HeartbeatTap, ServerPeer};
 pub use executor::LocalExecutor;
 
 #[cfg(test)]

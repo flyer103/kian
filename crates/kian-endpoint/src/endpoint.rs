@@ -52,6 +52,22 @@ pub struct HelloInfo {
     pub max_concurrent: u32,
 }
 
+/// One heartbeat the endpoint successfully sent, as seen by an optional
+/// observer installed via [`Endpoint::with_heartbeat_tap`] (additive
+/// builder hook, card C22): a hosting daemon logs liveness at its own
+/// level without the library choosing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatInfo {
+    pub endpoint_id: String,
+    pub ts_ms: u64,
+    pub inflight: u32,
+}
+
+/// Observer invoked after each heartbeat frame has been sent — both the
+/// periodic emitter's beats and ping answers. Called inline on the
+/// connection task: it must not block.
+pub type HeartbeatTap = Arc<dyn Fn(HeartbeatInfo) + Send + Sync>;
+
 /// An execution endpoint: identity + executor + concurrency cap.
 ///
 /// Cheap to share: `serve`, `embed` and every spawned connection hold the
@@ -62,6 +78,7 @@ pub struct Endpoint {
     executor: Arc<dyn ExecBackend>,
     max_concurrent: usize,
     heartbeat: Duration,
+    heartbeat_tap: Option<HeartbeatTap>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -74,6 +91,7 @@ impl Endpoint {
             executor,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             heartbeat: DEFAULT_HEARTBEAT,
+            heartbeat_tap: None,
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
         }
     }
@@ -94,6 +112,14 @@ impl Endpoint {
     /// per connection.
     pub fn with_heartbeat(mut self, heartbeat: Duration) -> Self {
         self.heartbeat = heartbeat;
+        self
+    }
+
+    /// Install a heartbeat observer (additive builder hook, card C22).
+    /// Called for every heartbeat frame successfully sent — both the
+    /// periodic emitter's beats and ping answers.
+    pub fn with_heartbeat_tap(mut self, tap: HeartbeatTap) -> Self {
+        self.heartbeat_tap = Some(tap);
         self
     }
 
@@ -179,19 +205,28 @@ impl Endpoint {
             let outbound = outbound.clone();
             let endpoint_id = self.endpoint_id.clone();
             let inflight = inflight.clone();
+            let tap = self.heartbeat_tap.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(heartbeat);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
-                            let frame = EndpointFrame::Heartbeat {
+                            let info = HeartbeatInfo {
                                 endpoint_id: endpoint_id.clone(),
                                 ts_ms: now_ms(),
                                 inflight: inflight.load(Ordering::SeqCst) as u32,
                             };
+                            let frame = EndpointFrame::Heartbeat {
+                                endpoint_id: info.endpoint_id.clone(),
+                                ts_ms: info.ts_ms,
+                                inflight: info.inflight,
+                            };
                             if outbound.send(frame).await.is_err() {
                                 break; // peer gone
+                            }
+                            if let Some(tap) = tap.as_ref() {
+                                tap(info);
                             }
                         }
                         _ = shutdown_rx.changed() => break,
@@ -206,13 +241,21 @@ impl Endpoint {
                     self.spawn_execution(id, cmd, &outbound, &inflight).await;
                 }
                 Some(ServerFrame::Ping) => {
-                    let heartbeat = EndpointFrame::Heartbeat {
+                    let info = HeartbeatInfo {
                         endpoint_id: self.endpoint_id.clone(),
                         ts_ms: now_ms(),
                         inflight: inflight.load(Ordering::SeqCst) as u32,
                     };
-                    if outbound.send(heartbeat).await.is_err() {
+                    let frame = EndpointFrame::Heartbeat {
+                        endpoint_id: info.endpoint_id.clone(),
+                        ts_ms: info.ts_ms,
+                        inflight: info.inflight,
+                    };
+                    if outbound.send(frame).await.is_err() {
                         break Err(EndpointError::TransportClosed);
+                    }
+                    if let Some(tap) = self.heartbeat_tap.as_ref() {
+                        tap(info);
                     }
                 }
                 Some(ServerFrame::Welcome { .. }) => {
@@ -387,7 +430,7 @@ mod tests {
     use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
     use tokio::sync::watch;
 
-    use super::{DEFAULT_MAX_CONCURRENT, Endpoint};
+    use super::{DEFAULT_MAX_CONCURRENT, Endpoint, HeartbeatInfo, HeartbeatTap};
     use crate::endpoint::ServerPeer;
     use crate::proto::{EndpointFrame, ErrorCode, PROTOCOL_VERSION, ServerFrame};
 
@@ -613,5 +656,37 @@ mod tests {
         .await
         .unwrap();
         assert!(peer.next_frame().await.is_none(), "endpoint must close");
+    }
+
+    /// The heartbeat tap (additive hook, C22) observes every beat the
+    /// emitter successfully sends — identity, timestamp, in-flight count.
+    #[tokio::test]
+    async fn heartbeat_tap_observes_periodic_beats() {
+        use std::sync::Mutex;
+
+        let beats: Arc<Mutex<Vec<HeartbeatInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = beats.clone();
+        let tap: HeartbeatTap = Arc::new(move |info| seen.lock().unwrap().push(info));
+        let endpoint =
+            Arc::new(Endpoint::new("tap-box", Arc::new(FailExecutor)).with_heartbeat_tap(tap));
+        let mut peer = endpoint.embed();
+        peer.handshake(Some(Duration::from_millis(20)))
+            .await
+            .unwrap();
+        until("two taps observed", || beats.lock().unwrap().len() >= 2).await;
+        let observed = beats.lock().unwrap().clone();
+        assert!(
+            observed.iter().all(|b| b.endpoint_id == "tap-box"),
+            "every beat carries the endpoint id"
+        );
+        assert!(
+            observed.iter().all(|b| b.ts_ms > 0),
+            "every beat carries a wall-clock timestamp"
+        );
+        assert!(
+            observed.iter().all(|b| b.inflight == 0),
+            "idle endpoint reports zero in-flight"
+        );
+        peer.bye().await.unwrap();
     }
 }

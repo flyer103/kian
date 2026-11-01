@@ -7,8 +7,11 @@ members = [
     "crates/kian-llm",
     "crates/kian-loop",
     "crates/kian-endpoint",
+    "crates/kian-exec",
     "crates/kian-plugin",
+    "crates/kian-superagent",
     "crates/kian-cli",
+    "crates/kiand",
 ]
 
 [workspace.package]
@@ -28,7 +31,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "rustls-tls",
 ] }
-uuid = { version = "1", features = ["v4", "serde"] }
+# v5 (C20): remote-exec command ids are derived deterministically from the
+# calling tool-call id so session recovery + re-execution dedupes at the
+# queue-row level (ADR-007).
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 thiserror = "2"
 tracing = "0.1"
 futures = "0.3"
@@ -36,17 +42,22 @@ dashmap = "6"
 wiremock = "0.6"
 sha2 = "0.10"
 serde_yaml = "0.9"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+] }
 
-# Internal crates (Phase-1 subset of DESIGN §7; kian-exec / kian-superagent /
-# kian-sdk / kiand are Phase 2+ and deliberately absent).
+# Internal crates (DESIGN §7 as landed; kian-sdk is still ahead).
 kian-core = { path = "crates/kian-core" }
 kian-store = { path = "crates/kian-store" }
 kian-orchestrator = { path = "crates/kian-orchestrator" }
 kian-llm = { path = "crates/kian-llm" }
 kian-loop = { path = "crates/kian-loop" }
 kian-endpoint = { path = "crates/kian-endpoint" }
+kian-exec = { path = "crates/kian-exec" }
 kian-plugin = { path = "crates/kian-plugin" }
+kian-superagent = { path = "crates/kian-superagent" }
 kian-cli = { path = "crates/kian-cli" }
+kiand = { path = "crates/kiand" }
 
 [profile.release]
 lto = "thin"
