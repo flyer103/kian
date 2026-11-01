@@ -1,0 +1,16 @@
+[package]
+name = "kian-plugin"
+description = "Ctx registry, Plugin trait, five-mode dispatch, Disposer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kian-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
