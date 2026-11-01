@@ -36,6 +36,8 @@
 //! Command ids are correlation ids; the durable ones derive from the
 //! calling tool-call id (ADR-007).
 
+pub mod async_jobs;
+pub mod async_tool;
 pub mod backend;
 pub mod connection;
 pub mod error;
@@ -44,6 +46,10 @@ pub mod store;
 pub mod tool;
 pub mod watchdog;
 
+pub use async_jobs::{AsyncEnqueueOutcome, AsyncJob, AsyncJobStatus};
+pub use async_tool::{
+    AsyncExecTool, AsyncJobs, AsyncResultSink, AsyncToolPair, SessionForCall, StopTool,
+};
 pub use backend::{RemoteExecBackend, RemoteExecConfig};
 pub use connection::{BackoffConfig, ConnectionConfig, ConnectionManager, EndpointStatus};
 pub use error::ConnectionError;

@@ -112,8 +112,10 @@ impl ToolProvider for RemoteExecTool {
 }
 
 /// Same argument contract as the local built-in `exec` tool (kian-loop
-/// C11): argv vector, optional cwd/timeout_ms, env empty.
-fn parse_exec(args: &serde_json::Value) -> Result<ExecCommand, ToolError> {
+/// C11): argv vector, optional cwd/timeout_ms, env empty. Shared by
+/// the sync `RemoteExecTool` and the async `start` tool (C37) — one
+/// uniform argument surface.
+pub(crate) fn parse_exec(args: &serde_json::Value) -> Result<ExecCommand, ToolError> {
     let argv = args
         .get("argv")
         .and_then(serde_json::Value::as_array)

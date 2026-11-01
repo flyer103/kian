@@ -191,10 +191,21 @@ const V0_REGISTRY_QUEUE: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS endpoint_registry (\n    endpoint_id TEXT PRIMARY KEY,\n    addr TEXT NOT NULL,\n    last_heartbeat_ms INTEGER NOT NULL,\n    state TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS exec_queue (\n    command_id TEXT PRIMARY KEY,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_exec_queue_drive ON exec_queue (endpoint_id, status, created_at)",
 };
 
+/// v1 — the async job table (card C37, ADR-008). Frozen golden once
+/// committed: the same append-only discipline as v0. Rows are
+/// pre-event durable state per ADR-007's pattern — the row exists
+/// before any dispatch, the completion reaches a session only as an
+/// admitted input.
+const V1_ASYNC_JOBS: Migration = Migration {
+    version: 1,
+    name: "v1_async_jobs",
+    up: "CREATE TABLE IF NOT EXISTS async_jobs (\n    job_id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
-    &[V0_REGISTRY_QUEUE]
+    &[V0_REGISTRY_QUEUE, V1_ASYNC_JOBS]
 }
 
 /// Applies every unapplied generation in order (same transactional
