@@ -219,23 +219,40 @@ pub fn session_for_call(store: EventStore) -> SessionForCall {
         let store = store.clone();
         let call_id = call_id.to_string();
         Box::pin(async move {
-            let rows: Vec<(String,)> = match sqlx::query_as(
-                "SELECT DISTINCT session FROM events \
-                 WHERE kind = 'tool/call' \
-                   AND json_extract(envelope, '$.bytes.content.id') = ?",
-            )
-            .bind(&call_id)
-            .fetch_all(store.pool())
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(error = %e, call_id = %call_id, "async bridge: invoking-session lookup failed");
-                    return None;
+            // C51: same lookup, per dialect — sqlite's json_extract vs
+            // pg's jsonb path. Both derive the answer purely from the
+            // committed event log (constraint 1).
+            let rows: Result<Vec<(String,)>, sqlx::Error> = match &store {
+                EventStore::Sqlite(pool) => {
+                    sqlx::query_as(
+                        "SELECT DISTINCT session FROM events \
+                     WHERE kind = 'tool/call' \
+                       AND json_extract(envelope, '$.bytes.content.id') = ?",
+                    )
+                    .bind(&call_id)
+                    .fetch_all(pool)
+                    .await
+                }
+                EventStore::Postgres(pool) => {
+                    sqlx::query_as(
+                        "SELECT DISTINCT session FROM events \
+                     WHERE kind = 'tool/call' \
+                       AND envelope::jsonb -> 'bytes' -> 'content' ->> 'id' = $1::text",
+                    )
+                    .bind(&call_id)
+                    .fetch_all(pool)
+                    .await
                 }
             };
-            rows.into_iter()
-                .find_map(|(session,)| uuid::Uuid::parse_str(&session).ok().map(SessionId))
+            match rows {
+                Ok(rows) => rows
+                    .into_iter()
+                    .find_map(|(session,)| uuid::Uuid::parse_str(&session).ok().map(SessionId)),
+                Err(e) => {
+                    tracing::warn!(error = %e, call_id = %call_id, "async bridge: invoking-session lookup failed");
+                    None
+                }
+            }
         }) as BoxFuture<'static, Option<SessionId>>
     })
 }

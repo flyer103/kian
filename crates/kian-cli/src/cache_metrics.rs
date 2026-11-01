@@ -34,7 +34,6 @@ use std::collections::BTreeMap;
 use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
 use kian_store::InboxError;
-use sqlx::SqlitePool;
 
 /// Invalidation cause: a `compact` event between two requests (the one
 /// deliberate, observable prefix invalidation — constraint 3).
@@ -198,13 +197,25 @@ pub fn session_cache_report(session: SessionId, events: &[Event]) -> SessionCach
     report
 }
 
-/// Every session that has at least one event row (read-only DISTINCT
-/// over the pool — a listing query, not metrics code in a core crate).
-pub async fn sessions_with_events(pool: &SqlitePool) -> Result<Vec<SessionId>, InboxError> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT DISTINCT session FROM events ORDER BY session ASC")
-            .fetch_all(pool)
-            .await?;
+/// Every session with events, ascending — a listing query over the
+/// events table (not metrics code in a core crate), backend-dispatched
+/// since C51 (the same statement on both dialects; only the executor
+/// differs).
+pub async fn sessions_with_events(
+    store: &kian_store::EventStore,
+) -> Result<Vec<SessionId>, InboxError> {
+    let rows: Vec<(String,)> = match store {
+        kian_store::EventStore::Sqlite(pool) => {
+            sqlx::query_as("SELECT DISTINCT session FROM events ORDER BY session ASC")
+                .fetch_all(pool)
+                .await?
+        }
+        kian_store::EventStore::Postgres(pool) => {
+            sqlx::query_as("SELECT DISTINCT session FROM events ORDER BY session ASC")
+                .fetch_all(pool)
+                .await?
+        }
+    };
     rows.into_iter()
         .map(|(s,)| {
             s.parse::<uuid::Uuid>()
@@ -229,7 +240,7 @@ pub async fn cache_stats_report(
 ) -> Result<CacheStatsReport, InboxError> {
     let sessions = match only {
         Some(s) => vec![s],
-        None => sessions_with_events(store.pool()).await?,
+        None => sessions_with_events(store).await?,
     };
     let mut report = CacheStatsReport::default();
     for session in sessions {
@@ -250,9 +261,29 @@ pub async fn run_cache_stats(
 ) -> Result<String, String> {
     let config =
         crate::config::ServeConfig::load(config_path).map_err(|e| format!("config: {e}"))?;
-    let store = kian_store::EventStore::open(&config.storage.sqlite)
-        .await
-        .map_err(|e| format!("store: {e}"))?;
+    // C51: the store follows the config's backend. sqlite opens the
+    // configured file (read intent — no mutations happen here); postgres
+    // resolves the env-only URL and opens without migrating (the report
+    // is a pure projection).
+    let store = if config.storage.is_postgres() {
+        let url_env = &config
+            .storage
+            .postgres
+            .as_ref()
+            .expect("validated: postgres mode requires the section")
+            .url_env;
+        let url = std::env::var(url_env)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| format!("`{url_env}` (the postgres URL) is not set"))?;
+        kian_store::EventStore::open_postgres_read_only(&url)
+            .await
+            .map_err(|e| format!("store: {e}"))?
+    } else {
+        kian_store::EventStore::open(&config.storage.sqlite)
+            .await
+            .map_err(|e| format!("store: {e}"))?
+    };
     let report = cache_stats_report(&store, session)
         .await
         .map_err(|e| format!("cache stats: {e}"))?;

@@ -1,0 +1,12 @@
+{"op":"send","frame":{"v":0,"type":"ready","logical_format":0}}
+{"op":"expect","frame":{"v":0,"type":"input","content":{"thread_id":"11111111-2222-3333-4444-555555555555","task":"deploy the service"}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/start","payload":{},"ts":1761900000001}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"system/message","payload":{"content":"You are the deploy agent."},"ts":1761900000002}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"user/message","payload":{"content":{"thread_id":"11111111-2222-3333-4444-555555555555","task":"deploy the service"}},"ts":1761900000003}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/start","payload":{},"ts":1761900000004}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/attempt","payload":{"status":"succeeded","request":{"model":"dsh-model","messages":[{"role":"system","content":"You are the deploy agent."},{"role":"user","content":{"thread_id":"11111111-2222-3333-4444-555555555555","task":"deploy the service"}}],"tools":[]}},"ts":1761900000005}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"assistant/message","payload":{"content":{"text":"running build","tool_calls":[{"id":"call-1","name":"run_build","arguments":{"target":"api"}}]}},"ts":1761900000006}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"tool/call","payload":{"id":"call-1","name":"run_build","arguments":{"target":"api"}},"ts":1761900000007}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"tool/result","payload":{"call_id":"call-1","output":{"ok":true},"is_error":false},"ts":1761900000008}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/end","payload":{"outcome":"tool_calls","tool_calls":1},"ts":1761900000009}}}
+{"op":"expect","frame":{"v":0,"type":"steer","content":"a frame that never arrives: the server is about to be killed"}}

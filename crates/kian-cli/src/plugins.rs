@@ -235,6 +235,12 @@ pub struct RemoteExecPlugin {
     pub store: ExecStore,
     /// The configured endpoints.
     pub endpoints: Vec<crate::config::EndpointConfig>,
+    /// C52 row-lease identity: this replica's `drain.holder`. Under
+    /// postgres the config validates it explicit-unique before we get
+    /// here; sqlite passes the (defaulted) holder too — the lease is
+    /// backend-portable and same-holder claims always land, so
+    /// single-process behavior is unchanged.
+    pub holder: String,
 }
 
 impl Plugin for RemoteExecPlugin {
@@ -277,8 +283,15 @@ impl Plugin for RemoteExecPlugin {
             .first()
             .map(|ep| ep.id.clone())
             .ok_or_else(|| apply_error("remote-exec: no endpoints configured"))?;
-        let backend = RemoteExecBackend::new(self.store, routes, default_endpoint, config)
-            .map_err(apply_error)?;
+        let backend = RemoteExecBackend::with_row_leases(
+            self.store,
+            routes,
+            default_endpoint,
+            config,
+            self.holder,
+            Duration::from_millis(max_timeout),
+        )
+        .map_err(apply_error)?;
         let services = Arc::new(RemoteExecServices {
             backend: Arc::new(backend),
             managers,
@@ -334,6 +347,12 @@ pub struct SuperAgentPlugin {
     /// from env-gated credentials, registered into the channel
     /// registry and the subscription consumers exactly like mocks.
     pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
+    /// GitHub channels by configured name (C48/C49): webhook-fed
+    /// adapters built by the server (token env-only, fail-closed when
+    /// send is configured), registered alongside the others. The C49
+    /// receiver hands verified deliveries to the single channel
+    /// through the `WebhookPlane` implementation in `server.rs`.
+    pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
     /// The worker's evidence gate (mounts on the worker wrapper).
     pub worker_gate: EvidenceGateConfig,
     /// The default agent's evidence gate (mounts on the plain loop).
@@ -351,6 +370,10 @@ pub struct SuperAgentPlugin {
     /// `StoreRecall` port the runtime exposes (the shared instance is
     /// built once, below).
     pub recall: crate::config::RecallConfig,
+    /// C54: the resolved S6 dsh bridge config
+    /// (`superagent.harness.dsh`, default off). When present the
+    /// worker template's inner loop is the `DshDriver`.
+    pub dsh_harness: Option<kian_dsh::DshDriverConfig>,
     /// The timer input sources (C40), built by the server over the
     /// system clock; registered into the channel registry and the
     /// consumer spawn exactly like mocks. Their run tasks start in
@@ -458,7 +481,10 @@ impl Plugin for SuperAgentPlugin {
         ));
         let mut channels = kian_superagent::ChannelRegistry::new();
         let mut adapters = Vec::with_capacity(
-            self.mock_channels.len() + self.lark_channels.len() + self.timer_channels.len(),
+            self.mock_channels.len()
+                + self.lark_channels.len()
+                + self.github_channels.len()
+                + self.timer_channels.len(),
         );
         for (name, mock) in &self.mock_channels {
             channels.register(name.clone(), Arc::clone(mock) as Arc<dyn ChannelAdapter>);
@@ -470,6 +496,14 @@ impl Plugin for SuperAgentPlugin {
         for (name, lark) in &self.lark_channels {
             channels.register(name.clone(), Arc::clone(lark) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(lark) as Arc<dyn ChannelAdapter>);
+        }
+        // C48/C49: the github adapter rides the same registry +
+        // consumer spawn; its receive half is fed exclusively by the
+        // webhook receiver's verified hand-off (nothing here knows
+        // HTTP delivery exists).
+        for (name, github) in &self.github_channels {
+            channels.register(name.clone(), Arc::clone(github) as Arc<dyn ChannelAdapter>);
+            adapters.push(Arc::clone(github) as Arc<dyn ChannelAdapter>);
         }
         // C40: the timers ride the same registry + consumer spawn (a
         // timer is a channel — nothing here knows a watchdog exists).
@@ -560,6 +594,19 @@ impl Plugin for SuperAgentPlugin {
                 max_iterations: self.max_iterations,
             },
         ));
+        // C54: the worker template's inner loop is config-gated — the
+        // S6 dsh bridge replaces the built-in ReAct loop when
+        // `superagent.harness.dsh` is on (default off; the decorator,
+        // evidence gate and completion report above it are unchanged).
+        // The config is resolved fail-closed by the server assembly
+        // (`DshHarnessConfig::to_runtime`: command from config or
+        // `KIAN_DSH_BIN`); the mount just builds the driver from it.
+        let worker_inner = match &self.dsh_harness {
+            Some(config) => crate::superagent::WorkerInnerDriver::Dsh(Arc::new(
+                kian_dsh::DshDriver::new(config.clone()),
+            )),
+            None => crate::superagent::WorkerInnerDriver::React(worker_loop),
+        };
 
         // Plain-session loop: the default agent, with its own gate.
         let default_loop = Arc::new(ReActLoop::with_evidence_gate(
@@ -630,7 +677,7 @@ impl Plugin for SuperAgentPlugin {
             ),
         );
         let worker_side = kian_superagent::WorkerLoopDriver::new(
-            worker_loop,
+            Arc::new(worker_inner),
             Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
             kian_superagent::WorkerLoopConfig {
                 router: self.router_session,
@@ -675,6 +722,7 @@ impl Plugin for SuperAgentPlugin {
             subscriptions,
             mock_channels: self.mock_channels,
             lark_channels: self.lark_channels,
+            github_channels: self.github_channels,
             adapters,
             worker_gate: self.worker_gate,
             subscription_metrics,

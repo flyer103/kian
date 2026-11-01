@@ -53,7 +53,7 @@ fn invalid(msg: impl Into<String>) -> ConfigError {
 pub struct ServeConfig {
     /// Bind address, `"host:port"` (parsed and validated).
     pub listen: String,
-    /// Storage (Phase 1: sqlite only).
+    /// Storage (sqlite default; postgres since C51).
     pub storage: StorageConfig,
     /// The agent definition (id, model slots, tools, session budgets).
     pub agent: AgentConfig,
@@ -100,12 +100,47 @@ fn default_plugins() -> Vec<String> {
     ]
 }
 
-/// Storage selection. Phase 1 is sqlite-only by design.
+/// Storage selection (C51): `event_store: sqlite` (the default — Phase-1
+/// behavior, byte-identical) or `event_store: postgres` (the hosted
+/// substrate; one server, one database). The sqlite path and the pg URL
+/// env are mutually exclusive — a config that names storage the active
+/// backend ignores is refused (fail-closed), never silently skipped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    /// Path of the sqlite database file.
+    /// The event-store backend: `sqlite` (default) or `postgres`.
+    #[serde(default = "default_event_store")]
+    pub event_store: String,
+    /// Path of the sqlite database file (required iff `event_store:
+    /// sqlite`; must be absent/empty under postgres).
+    #[serde(default)]
     pub sqlite: String,
+    /// The postgres section (required iff `event_store: postgres`).
+    #[serde(default)]
+    pub postgres: Option<PostgresStorageConfig>,
+}
+
+fn default_event_store() -> String {
+    "sqlite".into()
+}
+
+impl StorageConfig {
+    /// True when the event store is postgres-backed.
+    pub fn is_postgres(&self) -> bool {
+        self.event_store == "postgres"
+    }
+}
+
+/// The `storage.postgres` section (C51). The database URL — which may
+/// carry a password — is read from the named environment variable at
+/// startup: env-only, never a config value (the C13 secrets rule).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresStorageConfig {
+    /// Environment variable holding the postgres URL (e.g.
+    /// `postgres://user:pass@host:5432/kian`). Missing at startup
+    /// refuses to start.
+    pub url_env: String,
 }
 
 /// The `agent:` section.
@@ -282,6 +317,104 @@ fn default_poll_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// C54: the `superagent.harness` section (the S6 dsh bridge mount)
+// ---------------------------------------------------------------------------
+
+/// The `superagent.harness:` section. Every harness is default-off;
+/// the built-in worker loop stays the default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessConfig {
+    /// The S6 dsh bridge (C54, ADR-010 / DESIGN §16): the worker
+    /// template's inner loop becomes the `DshDriver`, driving a
+    /// `dsh --profile sdk` child process; dsh keeps its interaction
+    /// model, kian owns durability.
+    #[serde(default)]
+    pub dsh: Option<DshHarnessConfig>,
+}
+
+/// The `superagent.harness.dsh:` section.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DshHarnessConfig {
+    /// Path to the dsh binary. When absent, the `KIAN_DSH_BIN` env var
+    /// is used (env-only, like every runtime-resolved path); neither
+    /// present refuses to start (fail-closed).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Child argv. Default `["--profile", "sdk"]` (DESIGN §16).
+    #[serde(default = "default_dsh_args")]
+    pub args: Vec<String>,
+    /// The slot fact stamped into mapped `step/request` envelopes.
+    #[serde(default = "default_dsh_slot")]
+    pub slot: String,
+    /// The provider fact (audit label of the binding).
+    #[serde(default = "default_dsh_provider")]
+    pub provider: String,
+    /// The model fact (audit label of the binding).
+    #[serde(default = "default_dsh_model")]
+    pub model: String,
+    /// Mapped-step budget across the whole session.
+    #[serde(default = "default_dsh_max_steps")]
+    pub max_steps: u64,
+}
+
+fn default_dsh_args() -> Vec<String> {
+    kian_dsh::driver::DEFAULT_DSH_ARGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+fn default_dsh_slot() -> String {
+    "main".to_owned()
+}
+
+fn default_dsh_provider() -> String {
+    "openai-compat".to_owned()
+}
+
+fn default_dsh_model() -> String {
+    "dsh".to_owned()
+}
+
+fn default_dsh_max_steps() -> u64 {
+    kian_dsh::driver::DEFAULT_MAX_STEPS
+}
+
+impl DshHarnessConfig {
+    /// Resolves the runtime driver config, fail-closed: the command
+    /// comes from config or `KIAN_DSH_BIN` and nothing else.
+    pub fn to_runtime(&self) -> Result<kian_dsh::DshDriverConfig, ConfigError> {
+        let command = self
+            .command
+            .clone()
+            .or_else(|| std::env::var("KIAN_DSH_BIN").ok())
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    "`superagent.harness.dsh` needs a `command` or the \
+                     `KIAN_DSH_BIN` env var (fail-closed)",
+                )
+            })?;
+        if self.args.is_empty() {
+            return Err(invalid("`superagent.harness.dsh.args` must not be empty"));
+        }
+        Ok(kian_dsh::DshDriverConfig {
+            command,
+            args: self.args.clone(),
+            map: kian_dsh::MapCtx {
+                slot: self.slot.clone(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+            },
+            max_steps: self.max_steps,
+            startup_timeout: kian_dsh::driver::DEFAULT_STARTUP_TIMEOUT,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C27: super-agent + endpoint configuration
 // ---------------------------------------------------------------------------
 
@@ -333,6 +466,11 @@ pub struct SuperAgentConfig {
     /// enabling it without endpoints refuses to start (fail-closed).
     #[serde(default)]
     pub async_tools: bool,
+    /// C54: the harness section — external agent harnesses the worker
+    /// template can run instead of the built-in loop. Default off;
+    /// absence keeps the built-in worker loop byte-for-byte.
+    #[serde(default)]
+    pub harness: HarnessConfig,
     /// The recall toolpack (C35, the Chain of Recall): read-only
     /// `recall_event` / `recall_neighbors` / `recall_thread` tools.
     /// Default: mounted on the Router profile, opt-in per worker
@@ -557,6 +695,141 @@ pub struct ChannelConfig {
     /// [`ServeConfig::parse`]).
     #[serde(default)]
     pub timer: Option<TimerChannelSection>,
+    /// The C48/C49 github section — required when (and only when)
+    /// `type: github` (fail-closed both directions, validated in
+    /// [`ServeConfig::parse`]). Configuring a github channel is what
+    /// mounts the `POST /webhooks/github` receiver route.
+    #[serde(default)]
+    pub github: Option<GitHubChannelSection>,
+}
+
+/// The `superagent.channels.<name>.github:` section (C48 adapter +
+/// C49 receiver): the topic-mapping allowlist, the events filter and
+/// the webhook receiver limits. Credentials are deliberately absent:
+/// the send token comes from `KIAN_GITHUB_TOKEN` and the webhook
+/// secret from `KIAN_GITHUB_WEBHOOK_SECRET` (assembly, fail-closed) —
+/// tokens never live in `kian.yaml` (the C13 secrets discipline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubChannelSection {
+    /// REST API base (api.github.com or a GitHub Enterprise server).
+    #[serde(default = "default_github_api_base")]
+    pub api_base: String,
+    /// Topic mapping table: `owner/repo` → topic, optionally
+    /// narrowed per PR with an exact `owner/repo#N` → topic key. The
+    /// keys are also the receive allowlist: a delivery from an
+    /// unmapped repo is an honest drop (the C48 contract).
+    pub topics: BTreeMap<String, String>,
+    /// Webhook event-type filter (empty = every supported type).
+    #[serde(default)]
+    pub events: std::collections::BTreeSet<String>,
+    /// Is send configured? Requires `KIAN_GITHUB_TOKEN` at assembly
+    /// (fail-closed); receive-only needs none.
+    #[serde(default)]
+    pub send: bool,
+    /// Webhook receiver limits (C49). Defaults are the receiver
+    /// module's (`WebhookLimits::default`).
+    #[serde(default)]
+    pub webhook: GitHubWebhookLimitsSection,
+}
+
+fn default_github_api_base() -> String {
+    kian_superagent::GITHUB_DEFAULT_API_BASE.to_string()
+}
+
+/// The `superagent.channels.<name>.github.webhook:` limits (C49):
+/// body cap + per-source token bucket. All fields optional (the
+/// manual `Default` mirrors the per-field serde defaults — a derived
+/// `Default` would silently zero every limit); zero values refuse to
+/// start (a disabled limit is not a limit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubWebhookLimitsSection {
+    /// Maximum raw body bytes (413 above).
+    #[serde(default = "default_webhook_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Per-source token-bucket capacity.
+    #[serde(default = "default_webhook_rate_capacity")]
+    pub rate_capacity: u64,
+    /// Per-source bucket refill, tokens per second.
+    #[serde(default = "default_webhook_rate_refill")]
+    pub rate_refill_per_second: u64,
+}
+
+impl Default for GitHubWebhookLimitsSection {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: crate::webhook::DEFAULT_MAX_BODY_BYTES,
+            rate_capacity: crate::webhook::DEFAULT_RATE_CAPACITY,
+            rate_refill_per_second: crate::webhook::DEFAULT_RATE_REFILL_PER_SECOND,
+        }
+    }
+}
+
+fn default_webhook_max_body_bytes() -> usize {
+    crate::webhook::DEFAULT_MAX_BODY_BYTES
+}
+fn default_webhook_rate_capacity() -> u64 {
+    crate::webhook::DEFAULT_RATE_CAPACITY
+}
+fn default_webhook_rate_refill() -> u64 {
+    crate::webhook::DEFAULT_RATE_REFILL_PER_SECOND
+}
+
+impl GitHubChannelSection {
+    /// Converts to the bundle's runtime config, fail-closed on every
+    /// degenerate field (the C48 validation). `token` is the env-only
+    /// credential filled by assembly (`KIAN_GITHUB_TOKEN`; `send:
+    /// true` without it is a startup error, receive-only needs none).
+    pub fn to_runtime(
+        &self,
+        name: &str,
+        token: Option<String>,
+    ) -> Result<kian_superagent::GitHubConfig, ConfigError> {
+        let config = kian_superagent::GitHubConfig {
+            api_base: self.api_base.clone(),
+            topics: self.topics.clone(),
+            events: self.events.clone(),
+            // C43: GitHub payloads are attacker-influible text — the
+            // channel is untrusted, no opt-out (the lark discipline).
+            untrusted: true,
+            send: self.send,
+            token: token
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        };
+        config
+            .validate()
+            .map_err(|e| invalid(format!("superagent.channels `{name}` (type github): {e}")))?;
+        Ok(config)
+    }
+
+    /// Validates the pure-config shape at parse time (env credentials
+    /// are an assembly concern): topics, events filter and api base
+    /// through the bundle's validation with `send` neutralized.
+    fn validate_shape(&self, name: &str) -> Result<(), ConfigError> {
+        let probe = kian_superagent::GitHubConfig {
+            api_base: self.api_base.clone(),
+            topics: self.topics.clone(),
+            events: self.events.clone(),
+            untrusted: true,
+            send: false,
+            token: None,
+        };
+        probe
+            .validate()
+            .map_err(|e| invalid(format!("superagent.channels `{name}` (type github): {e}")))?;
+        Ok(())
+    }
+
+    /// The C49 receiver limits (defaults where unset).
+    pub fn webhook_limits(&self) -> crate::webhook::WebhookLimits {
+        crate::webhook::WebhookLimits {
+            max_body_bytes: self.webhook.max_body_bytes,
+            rate_capacity: self.webhook.rate_capacity,
+            rate_refill_per_second: self.webhook.rate_refill_per_second,
+        }
+    }
 }
 
 /// The `superagent.channels.<name>.timer:` section (C40): the timer
@@ -858,16 +1131,18 @@ impl SuperAgentConfig {
         Ok(set)
     }
 
-    /// The runtime untrusted set (C43 + C44): the configured
-    /// `untrusted_channels` list **plus every lark-typed channel** —
-    /// real IM input is attacker-controllable text, so the real
-    /// channel is untrusted by default (listing it again is harmless;
-    /// opting out is deliberately not offered this round — trust must
+    /// The runtime untrusted set (C43 + C44 + C48): the configured
+    /// `untrusted_channels` list **plus every lark- and github-typed
+    /// channel** — real inbound text is attacker-controllable, so a
+    /// real channel is untrusted by default (listing it again is
+    /// harmless; opting out is deliberately not offered — trust must
     /// be a considered change, not a missing default).
     pub fn runtime_untrusted_set(&self) -> Result<std::collections::BTreeSet<String>, ConfigError> {
         let mut set = self.untrusted_channel_set()?;
         for (name, channel) in &self.channels {
-            if channel.channel_type == kian_superagent::LARK_CHANNEL_TYPE {
+            if channel.channel_type == kian_superagent::LARK_CHANNEL_TYPE
+                || channel.channel_type == kian_superagent::GITHUB_CHANNEL_TYPE
+            {
                 set.insert(name.clone());
             }
         }
@@ -876,9 +1151,10 @@ impl SuperAgentConfig {
 }
 
 /// Every channel adapter type `serve` knows how to build (C27 v1:
-/// the first-class mock; C44 adds the real lark adapter — the GitHub
-/// adapter stays a Phase-4 placeholder).
-pub const KNOWN_CHANNEL_TYPES: [&str; 3] = ["mock-im", "lark", "timer"];
+/// the first-class mock; C44 adds the real lark adapter; C40 the
+/// timer input source; C48/C49 the github channel + webhook
+/// receiver).
+pub const KNOWN_CHANNEL_TYPES: [&str; 4] = ["mock-im", "lark", "timer", "github"];
 
 /// One remote execution endpoint (over the C20 durable queue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -938,6 +1214,60 @@ impl ServeConfig {
 
     /// Cross-reference validation (references resolve, semantics sane).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Storage (C51): the backend picks its required section, and any
+        // storage config the active backend would IGNORE is refused —
+        // fail-closed, never a silently skipped path or credential.
+        match self.storage.event_store.as_str() {
+            "sqlite" => {
+                if self.storage.sqlite.trim().is_empty() {
+                    return Err(invalid(
+                        "storage.sqlite (the database path) is required when storage.event_store is sqlite",
+                    ));
+                }
+                if self.storage.postgres.is_some() {
+                    return Err(invalid(
+                        "storage.postgres is set but storage.event_store is sqlite — one server, one database; remove the unused section",
+                    ));
+                }
+            }
+            "postgres" => {
+                if !self.storage.sqlite.trim().is_empty() {
+                    return Err(invalid(
+                        "storage.sqlite is set but storage.event_store is postgres — one server, one database; remove the unused path",
+                    ));
+                }
+                let pg = self.storage.postgres.as_ref().ok_or_else(|| {
+                    invalid(
+                        "storage.event_store: postgres requires a storage.postgres section with url_env (env-only URLs, the C13 secrets rule)",
+                    )
+                })?;
+                if pg.url_env.trim().is_empty() {
+                    return Err(invalid(
+                        "storage.postgres.url_env must name the environment variable holding the database URL",
+                    ));
+                }
+                // C47 condition (c) depends on this: two replicas sharing
+                // a holder string would defeat same-holder claim
+                // admission, so the default holder refuses to start.
+                if self.drain.holder.trim().is_empty() {
+                    return Err(invalid(
+                        "storage.event_store: postgres requires an explicit drain.holder (an empty holder cannot claim)",
+                    ));
+                }
+                if self.drain.holder == default_holder() {
+                    return Err(invalid(format!(
+                        "storage.event_store: postgres requires an explicit unique drain.holder — the default `{}` is refused: two replicas sharing a holder would defeat same-holder claim admission (C47/ADR-009)",
+                        default_holder()
+                    )));
+                }
+            }
+            other => {
+                return Err(invalid(format!(
+                    "storage.event_store must be `sqlite` or `postgres`, got `{other}`"
+                )));
+            }
+        }
+
         // listen must parse as a socket address.
         self.listen().map_err(|e| {
             invalid(format!(
@@ -1138,6 +1468,56 @@ impl ServeConfig {
                     }
                     (None, _) => {}
                 }
+                // C48/C49: the `github:` section is presence-locked
+                // to `type: github` in both directions; its pure
+                // shape validates fail-closed, and the webhook
+                // limits must be real limits (zero refuses).
+                match (&channel.github, channel.channel_type.as_str()) {
+                    (Some(section), "github") => {
+                        section.validate_shape(name)?;
+                        let limits = section.webhook_limits();
+                        if limits.max_body_bytes == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.github.webhook.max_body_bytes \
+                                 must be > 0 (a disabled cap is not a cap)"
+                            )));
+                        }
+                        if limits.rate_capacity == 0 || limits.rate_refill_per_second == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.github.webhook.rate_capacity and \
+                                 rate_refill_per_second must be > 0 (a disabled limit is not a \
+                                 limit)"
+                            )));
+                        }
+                    }
+                    (Some(_), other) => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}`: the `github:` section belongs to \
+                             `type: github` channels only (this channel is `type: {other}`)"
+                        )));
+                    }
+                    (None, "github") => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}` (type github) requires a `github:` \
+                             section (api_base?, topics, events?, send?, webhook?)"
+                        )));
+                    }
+                    (None, _) => {}
+                }
+            }
+            // C49: at most one `type: github` channel — the single
+            // `POST /webhooks/github` route feeds exactly one channel
+            // (two channels would make delivery routing ambiguous).
+            let github_count = sa
+                .channels
+                .values()
+                .filter(|channel| channel.channel_type == kian_superagent::GITHUB_CHANNEL_TYPE)
+                .count();
+            if github_count > 1 {
+                return Err(invalid(
+                    "superagent.channels may declare at most one `type: github` channel (the \
+                     single POST /webhooks/github route feeds exactly one)",
+                ));
             }
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
@@ -1414,6 +1794,90 @@ recovery:
         assert_eq!(agent.model_slots.len(), 1);
         let policy = cfg.policy().unwrap();
         assert_eq!(policy.rules.len(), 2);
+    }
+
+    /// C51 golden fixture: a config with NO `event_store:` key parses to
+    /// exactly today's sqlite storage — default backend, path read
+    /// verbatim, no postgres section — and serializes back to today's
+    /// bytes. The sqlite default is byte-identical, not merely similar.
+    #[test]
+    fn sqlite_default_config_parses_byte_identically_to_today() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        assert_eq!(
+            cfg.storage,
+            super::StorageConfig {
+                event_store: "sqlite".into(),
+                sqlite: "/tmp/kian-test.sqlite".into(),
+                postgres: None,
+            }
+        );
+        assert!(!cfg.storage.is_postgres());
+        assert_eq!(
+            serde_yaml::to_string(&cfg.storage).unwrap(),
+            "event_store: sqlite\nsqlite: /tmp/kian-test.sqlite\npostgres: null\n"
+        );
+    }
+
+    /// C51: sqlite mode without a path refuses (the pre-C51 required
+    /// field's behavior, now enforced at validation with a clearer
+    /// message).
+    #[test]
+    fn sqlite_mode_requires_the_sqlite_path() {
+        let yaml = valid_yaml().replace(
+            "storage:\n  sqlite: \"/tmp/kian-test.sqlite\"\n",
+            "storage:\n  event_store: sqlite\n",
+        );
+        let err = ServeConfig::parse(&yaml).expect_err("missing path must refuse");
+        assert!(
+            err.to_string().contains("storage.sqlite"),
+            "{}",
+            err.to_string()
+        );
+    }
+
+    /// C51: an unknown backend name refuses, never falls back.
+    #[test]
+    fn unknown_event_store_backend_refuses() {
+        let yaml = valid_yaml().replace("storage:\n", "storage:\n  event_store: mysql\n");
+        let err = ServeConfig::parse(&yaml).expect_err("unknown backend must refuse");
+        assert!(err.to_string().contains("mysql"), "{}", err.to_string());
+    }
+
+    /// C51: postgres mode without the `storage.postgres` section refuses.
+    #[test]
+    fn postgres_mode_requires_the_postgres_section() {
+        let yaml = valid_yaml().replace(
+            "storage:\n  sqlite: \"/tmp/kian-test.sqlite\"\n",
+            "storage:\n  event_store: postgres\n",
+        );
+        let err = ServeConfig::parse(&yaml).expect_err("missing section must refuse");
+        assert!(
+            err.to_string().contains("storage.postgres"),
+            "{}",
+            err.to_string()
+        );
+    }
+
+    /// C51: postgres mode parses with an explicit holder and an env-only
+    /// URL name; the URL itself never appears in the config.
+    #[test]
+    fn postgres_mode_parses_with_explicit_holder() {
+        let yaml = valid_yaml()
+            .replace(
+                "storage:\n  sqlite: \"/tmp/kian-test.sqlite\"\n",
+                "storage:\n  event_store: postgres\n  postgres:\n    url_env: KIAN_PG_URL\n",
+            )
+            .replace(
+                "drain:\n  max_iterations: 8\n",
+                "drain:\n  holder: replica-a\n  max_iterations: 8\n",
+            );
+        let cfg = ServeConfig::parse(&yaml).expect("valid postgres config");
+        assert!(cfg.storage.is_postgres());
+        assert_eq!(
+            cfg.storage.postgres.as_ref().unwrap().url_env,
+            "KIAN_PG_URL"
+        );
+        assert_eq!(cfg.drain.holder, "replica-a");
     }
 
     #[test]
@@ -2234,12 +2698,143 @@ recovery:
     #[test]
     fn superagent_unknown_channel_type_is_rejected() {
         // C44 note: the fixture originally used `lark` as the unknown
-        // type; lark is a real adapter now, so the probe rides a
-        // still-unknown spelling (github is the parked Phase-4 adapter,
-        // not a `serve`-buildable type today).
-        let err = ServeConfig::parse(&superagent_yaml().replace("type: mock-im", "type: github"))
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown type `github`"), "{}", err);
+        // type; lark is a real adapter now. C49 note: same story for
+        // `github` — the probe rides a still-unknown spelling so the
+        // unknown-type arm keeps its subject.
+        let err =
+            ServeConfig::parse(&superagent_yaml().replace("type: mock-im", "type: carrier-pigeon"))
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown type `carrier-pigeon`"),
+            "{}",
+            err
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // C48/C49: the github channel + webhook receiver wire layer
+    // -------------------------------------------------------------------
+
+    /// A github channel declaration spliced into the golden fixture
+    /// (no credentials in the section — token and webhook secret are
+    /// env-only).
+    fn github_yaml(extra: &str) -> String {
+        superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            &format!("  channels:\n    github:\n      type: github\n{extra}    mock-im:"),
+            1,
+        )
+    }
+
+    const GITHUB_SECTION: &str = "      github:\n        topics:\n          flyer103/kian: ci\n";
+
+    #[test]
+    fn github_channel_config_parses_with_defaults() {
+        let cfg = ServeConfig::parse(&github_yaml(GITHUB_SECTION)).expect("github config parses");
+        cfg.validate().expect("github config validates");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let github = sa.channels["github"].github.as_ref().expect("section");
+        assert_eq!(github.api_base, "https://api.github.com");
+        assert_eq!(
+            github.topics,
+            BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())])
+        );
+        assert!(github.events.is_empty());
+        assert!(!github.send, "send defaults off (receive-only)");
+
+        // Webhook limits default to the receiver module's constants.
+        let limits = github.webhook_limits();
+        assert_eq!(limits, crate::webhook::WebhookLimits::default());
+
+        // The runtime config converts (receive-only needs no token)
+        // and is untrusted by construction (C43/C48, no opt-out).
+        let runtime = github.to_runtime("github", None).expect("converts");
+        assert!(runtime.untrusted);
+        assert_eq!(runtime.token, None);
+
+        // C43: github-typed channels join the runtime untrusted set
+        // automatically, like lark.
+        let untrusted = sa.runtime_untrusted_set().unwrap();
+        assert!(untrusted.contains("github"));
+    }
+
+    #[test]
+    fn github_channel_section_is_fail_closed() {
+        // No section on a github channel.
+        let err = ServeConfig::parse(&github_yaml("")).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a `github:` section"),
+            "{err}"
+        );
+
+        // The section on a non-github channel.
+        let misapplied = superagent_yaml().replacen(
+            "    mock-im:\n      type: mock-im",
+            "    mock-im:\n      type: mock-im\n      github:\n        topics:\n          a/b: ci",
+            1,
+        );
+        let err = ServeConfig::parse(&misapplied).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to `type: github` channels only"),
+            "{err}"
+        );
+
+        // Degenerate shapes refuse (through the bundle's validation).
+        let empty_topics = "      github:\n        topics: {}\n";
+        let err = ServeConfig::parse(&github_yaml(empty_topics)).unwrap_err();
+        assert!(err.to_string().contains("at least one repo"), "{err}");
+
+        let bad_event =
+            "      github:\n        topics:\n          a/b: ci\n        events: [frobnicate]\n";
+        let err = ServeConfig::parse(&github_yaml(bad_event)).unwrap_err();
+        assert!(
+            err.to_string().contains("not a supported event type"),
+            "{err}"
+        );
+
+        // Zero webhook limits refuse (a disabled limit is not a limit).
+        let zero_cap = "      github:\n        topics:\n          a/b: ci\n        webhook:\n          max_body_bytes: 0\n";
+        let err = ServeConfig::parse(&github_yaml(zero_cap)).unwrap_err();
+        assert!(err.to_string().contains("max_body_bytes"), "{err}");
+
+        let zero_rate = "      github:\n        topics:\n          a/b: ci\n        webhook:\n          rate_capacity: 0\n";
+        let err = ServeConfig::parse(&github_yaml(zero_rate)).unwrap_err();
+        assert!(err.to_string().contains("rate_capacity"), "{err}");
+    }
+
+    #[test]
+    fn at_most_one_github_channel_mounts_the_single_route() {
+        let doubled = superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            "  channels:\n    gh1:\n      type: github\n      github:\n        topics:\n          a/b: ci\n    gh2:\n      type: github\n      github:\n        topics:\n          c/d: ops\n    mock-im:",
+            1,
+        );
+        let err = ServeConfig::parse(&doubled).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most one `type: github` channel"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn github_send_without_token_fails_closed_at_conversion() {
+        let send = "      github:\n        topics:\n          a/b: ci\n        send: true\n";
+        let cfg = ServeConfig::parse(&github_yaml(send)).expect("parses (env is assembly's)");
+        let superagent = cfg.superagent.unwrap();
+        let github = superagent.channels["github"].github.as_ref().unwrap();
+        // No token in the environment contract: conversion refuses.
+        let err = github.to_runtime("github", None).unwrap_err();
+        assert!(err.to_string().contains("KIAN_GITHUB_TOKEN"), "{err}");
+        // With the token it converts; the token rides the config.
+        let runtime = github
+            .to_runtime("github", Some("ghp_x".into()))
+            .expect("converts with token");
+        assert_eq!(runtime.token.as_deref(), Some("ghp_x"));
+        // A blank token is a missing token.
+        let err = github.to_runtime("github", Some("  ".into())).unwrap_err();
+        assert!(err.to_string().contains("KIAN_GITHUB_TOKEN"), "{err}");
     }
 
     #[test]

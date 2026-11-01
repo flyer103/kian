@@ -16,7 +16,8 @@
 //! - [`cache_metrics`] — S3 cache-byte stability report (C17), exposed
 //!   at `GET /metrics` and `kian cache-stats`
 //! - [`client`] — thin JSON-RPC HTTP client the session commands use to
-//!   talk to a running `serve`
+//!   talk to a running `serve` (re-exported from the wire-only
+//!   `kian-sdk` crate, card C46)
 //! - [`commands`] — the C14 session commands (inspect / replay / export
 //!   / wake-now / lease / recovery budget reset) with documented
 //!   `--json` schemas
@@ -32,6 +33,10 @@
 //! - [`superagent`] — the C27 super-agent assembly: the three-way
 //!   Router/Worker/plain driver, the `InboxWriter` port over the
 //!   engine, subscription consumers, watchdog wiring and metrics
+//! - [`webhook`] — the C49 inbound webhook receiver plane
+//!   (`POST /webhooks/github`: HMAC-verified GitHub deliveries handed
+//!   to the subscription pipeline), trait-isolated like the control
+//!   and ops planes (ADR-011)
 pub mod api;
 pub mod async_bridge;
 pub mod cache_metrics;
@@ -42,6 +47,7 @@ pub mod ops;
 pub mod plugins;
 pub mod server;
 pub mod superagent;
+pub mod webhook;
 
 #[cfg(test)]
 mod tests {

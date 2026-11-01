@@ -161,7 +161,7 @@ fn ops_plane_exposes_only_the_operator_actions() {
 
 /// Modules that hold HTTP handlers: none of them may reference an
 /// execution API (same forbidden-token table as above).
-const HANDLER_MODULES: [&str; 2] = ["src/api.rs", "src/ops.rs"];
+const HANDLER_MODULES: [&str; 3] = ["src/api.rs", "src/ops.rs", "src/webhook.rs"];
 
 #[test]
 fn no_handler_module_references_any_execution_api() {
@@ -215,6 +215,64 @@ fn assembly_modules_hold_no_http_surface() {
             failures.is_empty(),
             "{module} references HTTP symbols {failures:?}; \
              the wire lives in api.rs/ops.rs only"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C49: the webhook receiver plane — the fourth server surface, the
+// same structural discipline (the module greps with the table above
+// via HANDLER_MODULES; these tests pin the trait and the route set).
+// ---------------------------------------------------------------------------
+
+fn webhook_src() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/webhook.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+#[test]
+fn webhook_plane_exposes_only_the_verified_ingest_capability() {
+    let src = webhook_src();
+    assert!(
+        src.contains("pub trait WebhookPlane"),
+        "WebhookPlane trait missing"
+    );
+    // The plane's single method: verify-then-hand-off, nothing else.
+    assert!(
+        src.contains("fn ingest_verified_github"),
+        "WebhookPlane is missing `ingest_verified_github`"
+    );
+    // The trait declares exactly one `fn` of its own.
+    let trait_body = src
+        .split("pub trait WebhookPlane")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("trait body");
+    let declared: Vec<String> = trait_body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("fn "))
+        .map(str::trim_start)
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        declared,
+        ["fn ingest_verified_github("],
+        "the webhook plane must stay admit-only: {declared:?}"
+    );
+}
+
+#[test]
+fn webhook_module_dispatches_exactly_one_route() {
+    let src = webhook_src();
+    assert!(
+        src.contains("\"/webhooks/github\""),
+        "the webhook route is missing"
+    );
+    // No other route sneaks into the receiver module.
+    for banned in ["/rpc", "/ops", "/metrics", "/sessions"] {
+        assert!(
+            !src.contains(banned),
+            "webhook.rs dispatches a non-webhook route `{banned}`"
         );
     }
 }

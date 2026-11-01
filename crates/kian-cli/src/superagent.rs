@@ -324,6 +324,124 @@ pub enum ServeLoopDriver {
     SuperAgent(Arc<SuperAgentDriver>),
 }
 
+// ---------------------------------------------------------------------------
+// C54: the S6 dsh bridge mount — the DshCtx port over the real DrainCtx
+// ---------------------------------------------------------------------------
+
+/// Assembly's [`kian_dsh::DshCtx`] over the engine's `DrainCtx`: the
+/// fenced append path, the safe-boundary input take, and the read-only
+/// stream — the bridge reaches nothing else (no store, no end write).
+/// A newtype because the orphan rule puts the port impl in the crate
+/// that owns neither side's foreign halves — this one owns the
+/// wrapper.
+pub struct DrainDshCtx(DrainCtx);
+
+impl kian_dsh::DshCtx for DrainDshCtx {
+    fn session(&self) -> SessionId {
+        self.0.session()
+    }
+
+    fn epoch(&self) -> kian_core::model::Epoch {
+        self.0.epoch()
+    }
+
+    fn in_turn(&self) -> bool {
+        self.0.in_turn()
+    }
+
+    fn events(&self) -> BoxFuture<'_, Result<Vec<Event>, kian_dsh::DshCtxError>> {
+        let fut = self.0.events();
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn append(
+        &self,
+        kind: EventKind,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_dsh::DshCtxError>> {
+        let fut = self.0.append(kind, bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn begin_turn(
+        &self,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_dsh::DshCtxError>> {
+        let fut = self.0.begin_turn_with(bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn end_turn(
+        &self,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_dsh::DshCtxError>> {
+        let fut = self.0.end_turn_with(bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn take_eligible_inputs(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<kian_core::model::InputRow>, kian_dsh::DshCtxError>> {
+        let fut = self.0.take_eligible_inputs();
+        Box::pin(async move {
+            fut.await.map_err(|e| match e {
+                kian_orchestrator::EngineError::NotAtSafeBoundary { .. } => {
+                    kian_dsh::DshCtxError::NotAtSafeBoundary
+                }
+                other => kian_dsh::DshCtxError::Failure(other.to_string()),
+            })
+        })
+    }
+
+    fn has_eligible_inputs(&self) -> BoxFuture<'_, Result<bool, kian_dsh::DshCtxError>> {
+        let fut = self.0.has_eligible_inputs();
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
+        })
+    }
+
+    // interrupt_requested: the engine's interrupt flag is not visible
+    // from DrainCtx; v1 relies on the engine honoring it at outcome
+    // boundaries (the mounted bridge never forwards an `interrupt`
+    // control frame mid-episode). The contract frame itself is
+    // exercised by the kian-dsh driver suite.
+}
+
+/// The worker template's inner loop, config-gated (C54): the built-in
+/// ReAct loop (default), or the S6 dsh bridge when
+/// `superagent.harness.dsh` is on. The decorator (`WorkerLoopDriver`)
+/// and the plain/router sides are unchanged either way.
+pub enum WorkerInnerDriver {
+    React(Arc<ReActLoop>),
+    Dsh(Arc<kian_dsh::DshDriver>),
+}
+
+impl LoopDriver for WorkerInnerDriver {
+    type Ctx = DrainCtx;
+
+    fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
+        match self {
+            Self::React(loop_) => loop_.drive(ctx),
+            Self::Dsh(driver) => {
+                driver.drive(Arc::new(DrainDshCtx(ctx)) as Arc<dyn kian_dsh::DshCtx>)
+            }
+        }
+    }
+}
+
 impl LoopDriver for ServeLoopDriver {
     type Ctx = DrainCtx;
 
@@ -350,7 +468,7 @@ pub struct SuperAgentDriver {
     router: SessionId,
     worker_version: u64,
     router_side: RouterDriver<ReActLoop>,
-    worker_side: WorkerLoopDriver<ReActLoop>,
+    worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
     default_side: Arc<ReActLoop>,
     /// The resident watchdog session (C40), when configured: routed to
     /// its own driver (the same residency shape as the Router's) so
@@ -365,7 +483,7 @@ impl SuperAgentDriver {
         router: SessionId,
         worker_version: u64,
         router_side: RouterDriver<ReActLoop>,
-        worker_side: WorkerLoopDriver<ReActLoop>,
+        worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
         default_side: Arc<ReActLoop>,
     ) -> Self {
         Self {
@@ -611,15 +729,28 @@ async fn sessions_for_tool_calls(
 ) -> Result<BTreeSet<SessionId>, String> {
     let mut sessions = BTreeSet::new();
     for call_id in tool_call_refs {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT session FROM events \
-             WHERE kind = 'tool/call' \
-               AND json_extract(envelope, '$.bytes.content.id') = ?",
-        )
-        .bind(call_id)
-        .fetch_all(store.pool())
-        .await
-        .map_err(|e| format!("endpoint-health session lookup: {e}"))?;
+        // C51: same lookup, per dialect (sqlite json_extract vs pg
+        // jsonb path) — derived purely from the event log either way.
+        let rows: Vec<(String,)> = match store {
+            EventStore::Sqlite(pool) => sqlx::query_as(
+                "SELECT DISTINCT session FROM events \
+                 WHERE kind = 'tool/call' \
+                   AND json_extract(envelope, '$.bytes.content.id') = ?",
+            )
+            .bind(call_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("endpoint-health session lookup: {e}"))?,
+            EventStore::Postgres(pool) => sqlx::query_as(
+                "SELECT DISTINCT session FROM events \
+                 WHERE kind = 'tool/call' \
+                   AND envelope::jsonb -> 'bytes' -> 'content' ->> 'id' = $1::text",
+            )
+            .bind(call_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("endpoint-health session lookup: {e}"))?,
+        };
         for (session,) in rows {
             if let Ok(uuid) = uuid::Uuid::parse_str(&session) {
                 sessions.insert(SessionId(uuid));
@@ -817,6 +948,10 @@ pub struct SuperAgentRuntime {
     /// with the startup-rebuilt spill index. Read-only by
     /// construction; the recall toolpack (C35) mounts on it.
     pub recall: Arc<StoreRecall>,
+    /// GitHub channels by configured name (C48/C49): the webhook-fed
+    /// adapters (at most one — the config validation enforces it).
+    /// The `WebhookPlane` hand-off in `server.rs` reads this map.
+    pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
     /// Consumer + bridge tasks; kept alive for the server's lifetime.
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -908,6 +1043,10 @@ pub struct SuperAgentServices {
     /// Lark channels by configured name (C44) — the real Feishu
     /// adapters, registered alongside the mocks.
     pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
+    /// GitHub channels by configured name (C48/C49) — the webhook-fed
+    /// adapters. The C49 receiver plane (server.rs) hands verified
+    /// deliveries to the single channel through this map.
+    pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
     /// Adapters in config order (consumer spawn order).
     pub adapters: Vec<Arc<dyn ChannelAdapter>>,
     /// The worker's evidence gate config (shared counters).
@@ -1079,6 +1218,7 @@ pub async fn start_services(
         remote: services.remote.clone(),
         async_metrics: services.async_metrics.clone(),
         recall: Arc::clone(&services.recall),
+        github_channels: services.github_channels.clone(),
         tasks,
     })
 }

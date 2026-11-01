@@ -30,12 +30,13 @@ use kian_plugin::{Ctx as PluginCtx, Disposer, PluginError};
 use kian_store::EventStore;
 
 use crate::api::{ControlError, ControlPlane};
-use crate::config::ServeConfig;
+use crate::config::{DshHarnessConfig, ServeConfig};
 use crate::ops::{MockSendReceipt, OpsError, OpsPlane, ResetReceipt, WakeReceipt};
 use crate::plugins::{
     LocalToolsPlugin, OpenAiCompatPlugin, ReActPlugin, RemoteExecPlugin, SuperAgentPlugin,
 };
 use crate::superagent::{ServeLoopDriver, SuperAgentRuntime, SuperAgentServices};
+use crate::webhook::{WebhookError, WebhookLimits, WebhookPlane};
 
 /// Everything assembling `kian serve` can fail with. All of them refuse
 /// to start — none degrade to defaults.
@@ -61,9 +62,20 @@ pub struct Server {
     /// Recovery-sweep period (C15). Equals `drain.heartbeat_interval_ms`;
     /// see [`Server::serve`] for the documented bound.
     recovery_tick_ms: u64,
+    /// The shared pg pool under postgres mode (C52): the wake-transport
+    /// listener's dedicated connection is checked out of this pool in
+    /// [`Server::serve`]. `None` under sqlite (no transport — the
+    /// in-process wake registry is the whole story).
+    pg_pool: Option<sqlx::postgres::PgPool>,
     /// The super-agent runtime (present iff the `superagent:` section
     /// is configured): mock channels, metrics surfaces, watchdog.
     superagent: Option<Arc<SuperAgentRuntime>>,
+    /// The C49 webhook receiver secret (present iff a `type: github`
+    /// channel is configured — the route is configured). Env-only:
+    /// `KIAN_GITHUB_WEBHOOK_SECRET`, fail-closed at assembly.
+    webhook_secret: Option<String>,
+    /// The C49 receiver limits from the (single) github section.
+    webhook_limits: WebhookLimits,
     /// This assembly's recorded startup sequence (the C27 test hook).
     startup_order: crate::superagent::StartupOrder,
     /// Keeps the plugin-registered services alive for the server's
@@ -75,6 +87,13 @@ pub struct Server {
 /// absent (a blank KIAN_LARK_APP_ID is a missing credential, not an
 /// empty-string app id).
 fn lark_env(key: &str) -> Option<String> {
+    env_credential(key)
+}
+
+/// Reads one credential from the environment, treating blank as
+/// absent (a blank value is a missing credential, never an
+/// empty-string secret).
+fn env_credential(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -124,11 +143,52 @@ impl Server {
         let superagent_cfg = config.superagent.as_ref();
         let has_remote = !config.endpoints.is_empty();
 
+        // C49: the webhook receiver's env-only secret + limits (filled
+        // by the github arm below; present iff the route is
+        // configured, consumed by the Server construction below).
+        let mut webhook_secret: Option<String> = None;
+        let mut webhook_limits = WebhookLimits::default();
+
         // The exec store opens before activation (plugin apply is sync).
-        let exec_store = if has_remote {
-            let store = ExecStore::open(&config.storage.sqlite)
+        // C51: one server, one database — under `event_store: postgres`
+        // the event store and the exec store share ONE pg pool, opened
+        // here before either adopts it. The URL is env-only (the C13
+        // secrets rule); config validation already refused the default
+        // drain.holder for postgres (C47 condition (c)).
+        let pg_pool = if config.storage.is_postgres() {
+            let url_env = &config
+                .storage
+                .postgres
+                .as_ref()
+                .expect("validated: postgres mode requires the section")
+                .url_env;
+            let url = std::env::var(url_env)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| {
+                    ServeError::Assembly(format!(
+                        "storage.event_store: postgres but environment variable `{url_env}` \
+                         (the database URL) is not set — URLs are env-only, never a config value"
+                    ))
+                })?;
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(16)
+                .connect(&url)
                 .await
-                .map_err(|e| ServeError::Assembly(format!("exec store: {e}")))?;
+                .map_err(|e| ServeError::Assembly(format!("postgres pool ({url_env}): {e}")))?;
+            Some(pool)
+        } else {
+            None
+        };
+        let exec_store = if has_remote {
+            let store = match pg_pool.as_ref() {
+                Some(pool) => ExecStore::from_pg_pool(pool.clone())
+                    .await
+                    .map_err(|e| ServeError::Assembly(format!("exec store: {e}")))?,
+                None => ExecStore::open(&config.storage.sqlite)
+                    .await
+                    .map_err(|e| ServeError::Assembly(format!("exec store: {e}")))?,
+            };
             Some(store)
         } else {
             None
@@ -138,7 +198,10 @@ impl Server {
         // The event store opens before activation too: the C37
         // completion bridge (inside the superagent plugin) reads
         // session projections and committed `tool/call` events.
-        let store = EventStore::open(&config.storage.sqlite).await?;
+        let store = match pg_pool.as_ref() {
+            Some(pool) => EventStore::from_pg_pool(pool.clone()).await?,
+            None => EventStore::open(&config.storage.sqlite).await?,
+        };
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
@@ -150,6 +213,7 @@ impl Server {
             plugins.register(RemoteExecPlugin {
                 store,
                 endpoints: config.endpoints.clone(),
+                holder: config.drain.holder.clone(),
             });
         }
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
@@ -210,6 +274,10 @@ impl Server {
             // refuses to start — tokens never live in kian.yaml).
             let mut mock_channels = std::collections::BTreeMap::new();
             let mut lark_channels = std::collections::BTreeMap::new();
+            // C48/C49: the webhook-fed github channels (config
+            // validation caps them at one — the single receiver route
+            // feeds exactly one).
+            let mut github_channels = std::collections::BTreeMap::new();
             // C40: the timer input sources (a channel like any other —
             // the system clock times the cadence).
             let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
@@ -220,6 +288,26 @@ impl Server {
                             name.clone(),
                             Arc::new(kian_superagent::MockChannel::new(name.clone())),
                         );
+                    }
+                    "github" => {
+                        let section = channel.github.as_ref().ok_or_else(|| {
+                            ServeError::Config(crate::config::ConfigError::Invalid(format!(
+                                "superagent.channels `{name}` (type github) requires a `github:` section"
+                            )))
+                        })?;
+                        // Send token env-only: `send: true` without
+                        // KIAN_GITHUB_TOKEN refuses to start
+                        // (fail-closed, never a degraded send);
+                        // receive-only needs none.
+                        let runtime = section
+                            .to_runtime(name, env_credential("KIAN_GITHUB_TOKEN"))
+                            .map_err(ServeError::Config)?;
+                        let adapter = kian_superagent::GitHubChannel::new(name.clone(), runtime)
+                            .map_err(|e| {
+                                ServeError::Assembly(format!("github channel `{name}`: {e}"))
+                            })?;
+                        webhook_limits = section.webhook_limits();
+                        github_channels.insert(name.clone(), Arc::new(adapter));
                     }
                     "timer" => {
                         let section = channel.timer.as_ref().ok_or_else(|| {
@@ -258,6 +346,25 @@ impl Server {
                 }
             }
 
+            // C49: any github channel configures the webhook receiver
+            // route — and a configured route without its env-only
+            // secret refuses to start (fail-closed, the C13 secrets
+            // discipline: never a signature-less receiver, never a
+            // secret in kian.yaml).
+            if !github_channels.is_empty() {
+                webhook_secret = Some(
+                    env_credential(crate::webhook::GITHUB_WEBHOOK_SECRET_ENV).ok_or_else(|| {
+                        ServeError::Assembly(format!(
+                            "superagent.channels declares a `type: github` channel (the \
+                                 POST /webhooks/github route is configured) but `{}` is \
+                                 absent/blank in the environment — webhook secrets never live \
+                                 in kian.yaml",
+                            crate::webhook::GITHUB_WEBHOOK_SECRET_ENV
+                        ))
+                    })?,
+                );
+            }
+
             plugins.register(SuperAgentPlugin {
                 router_agent,
                 worker_agent,
@@ -283,6 +390,7 @@ impl Server {
                 untrusted_channels,
                 mock_channels,
                 lark_channels,
+                github_channels,
                 timer_channels,
                 watchdog,
                 worker_gate,
@@ -291,6 +399,12 @@ impl Server {
                 has_remote,
                 async_tools: sa.async_tools,
                 recall: sa.recall.clone(),
+                dsh_harness: sa
+                    .harness
+                    .dsh
+                    .as_ref()
+                    .map(DshHarnessConfig::to_runtime)
+                    .transpose()?,
                 event_store: store.clone(),
             });
             None // services resolve from the Ctx after activation
@@ -353,7 +467,10 @@ impl Server {
             store,
             sse_poll_ms: config.sse.poll_interval_ms,
             recovery_tick_ms: config.drain.heartbeat_interval_ms,
+            pg_pool: pg_pool.clone(),
             superagent: None,
+            webhook_secret,
+            webhook_limits,
             startup_order: Arc::clone(&startup_order),
             _plugin_disposer: plugin_disposer,
         };
@@ -414,9 +531,25 @@ impl Server {
     pub fn router(self: &Arc<Self>) -> axum::Router {
         let plane: Arc<dyn ControlPlane> = self.clone();
         let ops: Arc<dyn OpsPlane> = self.clone();
-        crate::api::router(plane, self.sse_poll_ms)
+        let router = crate::api::router(plane, self.sse_poll_ms)
             .merge(metrics_router(self.clone()))
-            .merge(crate::ops::router(ops))
+            .merge(crate::ops::router(ops));
+        // C49: the fourth surface — the inbound webhook receiver,
+        // mounted **only** when the route is configured (a `type:
+        // github` channel exists; assembly already refused to start
+        // without the env-only secret). The C13 wire surface, the ops
+        // plane and the metrics route are untouched.
+        match self.webhook_secret.clone() {
+            Some(secret) => {
+                let webhook: Arc<dyn WebhookPlane> = self.clone();
+                router.merge(crate::webhook::router(
+                    webhook,
+                    secret,
+                    self.webhook_limits.clone(),
+                ))
+            }
+            None => router,
+        }
     }
 
     /// Serves on `addr` until the process is stopped.
@@ -461,9 +594,75 @@ impl Server {
                 }
             });
         }
-        axum::serve(listener, self.router())
-            .await
-            .map_err(|e| ServeError::Assembly(format!("server error: {e}")))
+        // C52 wake transport (postgres mode only): a relay task holds
+        // one dedicated pooled connection LISTENing on `kian_wake` and
+        // fires the local engine `wake` per notification — the
+        // cross-replica accelerator. Advisory by contract (ADR-009
+        // decision 4): a listener gap (reconnect, error) logs, backs
+        // off and re-listens, and every notification missed in the gap
+        // is bounded by the recovery sweep ticker above plus this
+        // replica's startup inbox scan — the same rebuild that already
+        // makes in-process wakes losable. sqlite runs nothing here.
+        if let Some(pool) = self.pg_pool.clone() {
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let mut backoff = std::time::Duration::from_millis(100);
+                loop {
+                    match kian_store::wake::listen_for_wakes(&pool).await {
+                        Ok(mut listener) => {
+                            backoff = std::time::Duration::from_millis(100);
+                            loop {
+                                match listener.recv().await {
+                                    Ok(notification) => {
+                                        let payload = notification.payload();
+                                        match uuid::Uuid::parse_str(payload) {
+                                            Ok(id) => {
+                                                engine.wake(kian_core::model::SessionId(id));
+                                            }
+                                            Err(e) => {
+                                                // Foreign payloads are logged and
+                                                // dropped — never a panic, never a
+                                                // relay death (wakes are advisory).
+                                                tracing::warn!(
+                                                    payload,
+                                                    error = %e,
+                                                    "wake notification payload is not a session uuid; ignored"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "wake listener dropped; re-listening (gap is bounded by the sweep)"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "wake listener connect failed; retrying with backoff"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            });
+        }
+        axum::serve(
+            listener,
+            self.router()
+                // C49: peer connect info feeds the webhook receiver's
+                // per-source rate-limit buckets (additive — every
+                // other surface ignores it).
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| ServeError::Assembly(format!("server error: {e}")))
     }
 }
 
@@ -725,6 +924,40 @@ impl OpsPlane for Server {
                 channel,
                 topic,
             })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebhookPlane: the C49 inbound surface's sole capability (verify +
+// hand the verified delivery to the subscription pipeline — an inbox
+// write, control-plane-legal)
+// ---------------------------------------------------------------------------
+
+impl WebhookPlane for Server {
+    fn ingest_verified_github(
+        &self,
+        event_type: String,
+        delivery_id: String,
+        body: serde_json::Value,
+    ) -> BoxFuture<'_, Result<usize, WebhookError>> {
+        Box::pin(async move {
+            // The receiver module authenticated the bytes; the channel
+            // maps + dedupes them, and the subscription consumers
+            // (started after the inbox rebuild) do the admitting. This
+            // implementation only routes between the two — it touches
+            // no execution surface itself.
+            let Some(runtime) = self.superagent.as_ref() else {
+                return Err(WebhookError(
+                    "github webhook delivered but the superagent assembly is not running".into(),
+                ));
+            };
+            let Some(channel) = runtime.github_channels.values().next() else {
+                return Err(WebhookError(
+                    "github webhook delivered but no github channel is configured".into(),
+                ));
+            };
+            Ok(channel.ingest_delivery(&event_type, &delivery_id, &body))
         })
     }
 }

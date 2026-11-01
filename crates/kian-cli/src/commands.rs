@@ -125,6 +125,16 @@ pub fn resolve_db(db: Option<&Path>, config_path: &Path) -> CmdResult<PathBuf> {
             config_path.display()
         )
     })?;
+    // C51: postgres-mode configs carry no sqlite path (validation
+    // refuses the mix) — these audit commands read sqlite files, so a
+    // postgres config needs an explicit --db export.
+    if config.storage.sqlite.trim().is_empty() {
+        return Err(format!(
+            "config `{}` selects storage.event_store: postgres and carries no sqlite path — \
+             these audit commands read sqlite files; pass --db <sqlite> (or export one)",
+            config_path.display()
+        ));
+    }
     Ok(PathBuf::from(config.storage.sqlite))
 }
 
