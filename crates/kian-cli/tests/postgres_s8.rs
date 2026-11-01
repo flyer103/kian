@@ -216,11 +216,13 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
     let base_a = format!("http://127.0.0.1:{port_a}");
     let base_b = format!("http://127.0.0.1:{port_b}");
 
-    // -- boot both replicas on the same database ---------------------------
+    // -- boot replica A (B boots only after the kill: with both live,
+    // the submit-time claim is an open race between the two sweeps and
+    // the kill would not target the holder. A boots alone -> the claim
+    // is structurally A's; B's takeover then proves the cross-process
+    // handoff the scenario is about) ------------------------------
     let mut replica_a = spawn_kian_serve(&config_a);
     assert!(wait_ready(&base_a).await, "replica A never became ready");
-    let mut replica_b = spawn_kian_serve(&config_b);
-    assert!(wait_ready(&base_b).await, "replica B never became ready");
 
     // Direct store reader for the assertions (independent of both
     // processes — the database is the truth, constraint 1).
@@ -247,16 +249,36 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
     );
 
     // A's frozen epoch: the highest epoch A committed before the kill.
+    // Also assert A holds the claim *before* killing it: the holder
+    // field on the last drain/claimed event must be replica A, else
+    // the kill would not be killing the holder (structural guard
+    // against the both-replicas-live claim race this test avoids by
+    // booting B late — this check fails loudly if that ever regresses).
     let events_before = reader.rebuild(sid).await.unwrap();
     let epoch_a = events_before
         .iter()
         .map(|e| e.epoch.0)
         .max()
         .expect("A committed events");
+    let last_claim_holder = events_before
+        .iter()
+        .filter(|e| e.kind == EventKind::DrainClaimed)
+        .filter_map(|e| e.bytes.get("holder").and_then(|h| h.as_str()))
+        .last()
+        .unwrap_or_default();
+    assert_eq!(
+        last_claim_holder, "s8-replica-a",
+        "replica A must hold the claim before the kill (got {last_claim_holder:?})"
+    );
 
     // -- kill -9 replica A mid-provider-turn -------------------------------
     replica_a.kill().expect("kill -9 replica A");
     let _ = replica_a.wait();
+
+    // Now boot replica B on the same database: its startup + sweep is
+    // the takeover path under test (no live competitor for the claim).
+    let mut replica_b = spawn_kian_serve(&config_b);
+    assert!(wait_ready(&base_b).await, "replica B never became ready");
     // Release the gate: A's hung request is dead with it; B's re-drive
     // request (#2) answers immediately.
     mock.released.store(true, Ordering::SeqCst);
