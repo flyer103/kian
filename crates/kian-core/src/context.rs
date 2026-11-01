@@ -97,14 +97,26 @@ pub enum ContextError {
 /// is a message. Every other kind (session/drain/turn/step/slot) is
 /// envelope or audit data — `step/request` is the A2 audit copy of a whole
 /// request, not a message, so it never re-enters the context.
+///
+/// The C18 Phase-2 kinds are named *explicitly* in the skip branch: they
+/// are lineage/audit/receipt data by contract, so a stream containing
+/// them derives exactly the context of the same stream without them.
+/// Skipping them is not silent inheritance of the catch-all — a future
+/// context-bearing addition must edit this match.
 fn is_context_bearing(kind: &EventKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         EventKind::InputAdmitted
-            | EventKind::AssistantMessage
-            | EventKind::ToolCall
-            | EventKind::ToolResult
-    )
+        | EventKind::AssistantMessage
+        | EventKind::ToolCall
+        | EventKind::ToolResult => true,
+        // C18 Phase-2 additions: non-context-bearing (thread lineage,
+        // evidence verdicts, delivery receipts).
+        EventKind::ThreadStarted
+        | EventKind::ThreadCompleted
+        | EventKind::EvidenceVerdict
+        | EventKind::ChannelDelivered => false,
+        _ => false,
+    }
 }
 
 /// Parses the frozen message payload contract:
@@ -528,6 +540,68 @@ mod tests {
             derive_model_context(&b.build()).unwrap(),
             vec![user_msg("hello"), assistant_msg(json!("hi there"))]
         );
+    }
+
+    /// C18: the four Phase-2 kinds are non-context-bearing — a stream
+    /// containing them derives a byte-identical context to the same
+    /// stream without them (constraints 1 and 3: the additions are audit
+    /// data, never a context mutation), and a stream containing *only*
+    /// new kinds derives an empty context.
+    #[test]
+    fn phase2_kinds_leave_model_context_unchanged() {
+        let mut with = started();
+        with.user("hello");
+        with.push(
+            EventKind::ThreadStarted,
+            json!({"thread_id": "t-1", "pinned_version": 1, "task": {"role": "user", "content": "work"}}),
+        );
+        with.assistant(json!("working"));
+        with.push(
+            EventKind::EvidenceVerdict,
+            json!({"gate": "g", "passed": true, "checks": [], "attempt": 1}),
+        );
+        with.push(
+            EventKind::ThreadCompleted,
+            json!({"thread_id": "t-1", "status": "completed", "summary": {"role": "assistant", "content": "done"}}),
+        );
+        with.push(
+            EventKind::ChannelDelivered,
+            json!({"channel": "mock-im", "target": {}, "policy": "im", "truncated": false}),
+        );
+
+        let mut without = started();
+        without.user("hello");
+        without.assistant(json!("working"));
+
+        let ctx_with = derive_model_context(&with.build()).unwrap();
+        let ctx_without = derive_model_context(&without.build()).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(
+            context_to_bytes(&ctx_with),
+            context_to_bytes(&ctx_without),
+            "Phase-2 kinds must not change a single context byte"
+        );
+
+        // A stream of only new kinds (on top of create/claim) is context
+        // empty — even when the payloads are message-shaped.
+        let mut only_new = started();
+        only_new.push(
+            EventKind::ThreadStarted,
+            json!({"role": "user", "content": "looks like a message, is not"}),
+        );
+        only_new.push(
+            EventKind::ThreadCompleted,
+            json!({"role": "assistant", "content": "no"}),
+        );
+        only_new.push(
+            EventKind::EvidenceVerdict,
+            json!({"role": "user", "content": "no"}),
+        );
+        only_new.push(
+            EventKind::ChannelDelivered,
+            json!({"role": "user", "content": "no"}),
+        );
+        assert_eq!(derive_model_context(&only_new.build()).unwrap(), Vec::new());
     }
 
     /// A2: assistant/message bytes are the truth — content passes through

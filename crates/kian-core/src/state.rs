@@ -14,10 +14,11 @@
 //! end write where `completed`/`cancelled` are terminal and freeze the
 //! stream while `interrupted`/`failed` release ownership cleanly and
 //! return the session to `idle` (resumable via a new claim; the final end
-//! write records the final outcome); `input/admitted` is state-preserving
-//! in `idle`/`running`/`recoverable`; every other kind is drain activity,
-//! legal only while `running`. `recoverable` (lease expiry) and `archived`
-//! are transitions of the machine with no v0 event trigger.
+//! write records the final outcome); `input/admitted` and `thread/started`
+//! (C18) are state-preserving in `idle`/`running`/`recoverable`; every other
+//! kind is drain activity, legal only while `running`. `recoverable` (lease
+//! expiry) and `archived` are transitions of the machine with no v0 event
+//! trigger.
 
 use crate::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
 use crate::model::SessionId;
@@ -71,6 +72,12 @@ pub enum TransitionTrigger {
     Archived,
     /// `input/admitted` — state-preserving.
     InputAdmitted,
+    /// `thread/started` (C18, Phase 2) — state-preserving in
+    /// `idle`/`running`/`recoverable`, mirroring `InputAdmitted`. The
+    /// worker's stream records its delegation lineage after
+    /// `session/created` but before the first `drain/claimed`; the
+    /// Router's stream records it mid-drain.
+    ThreadStarted,
     /// Any drain-activity kind (`turn/*`, `step/*`, `assistant/*`,
     /// `tool/*`, `compact`, `slot/*`) — state-preserving, legal only
     /// while running.
@@ -87,6 +94,7 @@ impl TransitionTrigger {
             EventKind::DrainClaimed => Self::Claimed,
             EventKind::SessionEnded { reason } => Self::Ended(*reason),
             EventKind::InputAdmitted => Self::InputAdmitted,
+            EventKind::ThreadStarted => Self::ThreadStarted,
             _ => Self::DrainActivity,
         }
     }
@@ -144,9 +152,9 @@ pub enum ProjectionError {
 /// end write); running→idle (interrupted/failed end write: ownership
 /// released cleanly, session resumable); running→recoverable (lease
 /// expiry, non-event); idle/running→archived (ops action, non-event);
-/// `input/admitted` preserves idle/running/recoverable; drain activity
-/// preserves running only. Every other pair is
-/// [`IllegalTransition`].
+/// `input/admitted` and `thread/started` (C18) preserve
+/// idle/running/recoverable; drain activity preserves running only. Every
+/// other pair is [`IllegalTransition`].
 pub fn transition(
     from: Option<SessionState>,
     on: TransitionTrigger,
@@ -158,12 +166,14 @@ pub fn transition(
     match (from, on) {
         (None, T::Created) => Ok(S::Idle),
         (Some(S::Idle), T::Claimed) => Ok(S::Running),
-        (Some(S::Idle), T::InputAdmitted) => Ok(S::Idle),
+        (Some(S::Idle), T::InputAdmitted | T::ThreadStarted) => Ok(S::Idle),
         (Some(S::Idle), T::Archived) => Ok(S::Archived),
         (Some(S::Recoverable), T::Claimed) => Ok(S::Running),
-        (Some(S::Recoverable), T::InputAdmitted) => Ok(S::Recoverable),
+        (Some(S::Recoverable), T::InputAdmitted | T::ThreadStarted) => Ok(S::Recoverable),
         (Some(S::Running), T::Claimed) => Ok(S::Running),
-        (Some(S::Running), T::InputAdmitted | T::DrainActivity) => Ok(S::Running),
+        (Some(S::Running), T::InputAdmitted | T::ThreadStarted | T::DrainActivity) => {
+            Ok(S::Running)
+        }
         (Some(S::Running), T::Ended(R::Completed)) => Ok(S::Completed),
         (Some(S::Running), T::Ended(R::Cancelled)) => Ok(S::Cancelled),
         (Some(S::Running), T::Ended(R::Interrupted) | T::Ended(R::Failed)) => Ok(S::Idle),
@@ -626,6 +636,196 @@ mod tests {
         for (kind, want) in cases {
             assert_eq!(TransitionTrigger::from_event_kind(&kind), want);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // C18 Phase-2 kinds: trigger mapping and projection behavior
+    // ------------------------------------------------------------------
+
+    /// `thread/started` maps to its own state-preserving trigger; the
+    /// other three Phase-2 kinds map to drain activity via the
+    /// additions-only default.
+    #[test]
+    fn trigger_mapping_for_phase2_kinds() {
+        use super::TransitionTrigger as T;
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::ThreadStarted),
+            T::ThreadStarted
+        );
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::ThreadCompleted),
+            T::DrainActivity
+        );
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::EvidenceVerdict),
+            T::DrainActivity
+        );
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::ChannelDelivered),
+            T::DrainActivity
+        );
+    }
+
+    /// `thread/started` mirrors `input/admitted` in the transition table
+    /// exactly: state-preserving in idle/running/recoverable, rejected at
+    /// the origin and from every terminal/frozen state.
+    #[test]
+    fn thread_started_mirrors_input_admitted_across_the_whole_table() {
+        let states = [
+            None,
+            Some(Idle),
+            Some(Running),
+            Some(Recoverable),
+            Some(Completed),
+            Some(Cancelled),
+            Some(Archived),
+        ];
+        for from in states {
+            // Compare outcomes, not raw errors: an `IllegalTransition`
+            // honestly names the offending trigger, so the error values
+            // differ by design while the legality must not.
+            let ts = transition(from, TransitionTrigger::ThreadStarted);
+            let ia = transition(from, InputAdmitted);
+            assert_eq!(
+                ts.is_ok(),
+                ia.is_ok(),
+                "thread/started must mirror input/admitted legality from {from:?}"
+            );
+            assert_eq!(
+                ts.ok(),
+                ia.ok(),
+                "thread/started must mirror input/admitted from {from:?}"
+            );
+        }
+        // The mirroring rows are the legal ones, spelled out.
+        assert_eq!(
+            transition(Some(Idle), TransitionTrigger::ThreadStarted),
+            Ok(Idle)
+        );
+        assert_eq!(
+            transition(Some(Running), TransitionTrigger::ThreadStarted),
+            Ok(Running)
+        );
+        assert_eq!(
+            transition(Some(Recoverable), TransitionTrigger::ThreadStarted),
+            Ok(Recoverable)
+        );
+        // Rejected at the origin (before session/created) and from the
+        // terminal states (frozen streams).
+        assert!(transition(None, TransitionTrigger::ThreadStarted).is_err());
+        assert!(transition(Some(Completed), TransitionTrigger::ThreadStarted).is_err());
+        assert!(transition(Some(Cancelled), TransitionTrigger::ThreadStarted).is_err());
+        assert!(transition(Some(Archived), TransitionTrigger::ThreadStarted).is_err());
+    }
+
+    /// The worker-bootstrap shape: `thread/started` lands after
+    /// `session/created` while still `idle` (before the first
+    /// `drain/claimed`) and the stream projects.
+    #[test]
+    fn project_thread_started_legal_in_idle_after_create() {
+        let mut b = StreamBuilder::new(21);
+        b.push(EventKind::SessionCreated)
+            .push(EventKind::InputAdmitted)
+            .push(EventKind::ThreadStarted);
+        assert_eq!(project(&b.build()), Ok(Idle));
+
+        // It survives an interrupted first episode and the resume.
+        let mut b = StreamBuilder::new(22);
+        b.push(EventKind::SessionCreated)
+            .push(EventKind::ThreadStarted)
+            .claim()
+            .push(EventKind::StepRequest)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Interrupted,
+            })
+            .claim()
+            .push(EventKind::StepRequest)
+            .push(EventKind::AssistantMessage)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            });
+        assert_eq!(project(&b.build()), Ok(Completed));
+    }
+
+    /// The Router shape: `thread/started` appended mid-drain while
+    /// `running` projects `running`.
+    #[test]
+    fn project_thread_started_legal_mid_drain_in_running() {
+        let mut b = StreamBuilder::new(23);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::StepRequest)
+            .push(EventKind::ThreadStarted)
+            .push(EventKind::AssistantMessage)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            });
+        assert_eq!(project(&b.build()), Ok(Completed));
+    }
+
+    /// Terminal states are frozen: `thread/started` after a terminal end
+    /// write is an illegal transition.
+    #[test]
+    fn project_thread_started_rejected_from_terminal() {
+        let mut b = StreamBuilder::new(24);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            })
+            .push(EventKind::ThreadStarted);
+        assert_eq!(
+            project(&b.build()),
+            Err(ProjectionError::Illegal(super::IllegalTransition {
+                from: Some(Completed),
+                on: TransitionTrigger::ThreadStarted,
+            }))
+        );
+    }
+
+    /// The other three Phase-2 kinds are drain activity by the
+    /// additions-only default: no ownership, no drain activity — they are
+    /// rejected while `idle` (only legal mid-drain under a claim).
+    #[test]
+    fn project_phase2_drain_activity_kinds_rejected_while_idle() {
+        for kind in [
+            EventKind::ThreadCompleted,
+            EventKind::EvidenceVerdict,
+            EventKind::ChannelDelivered,
+        ] {
+            let mut b = StreamBuilder::new(25);
+            b.push(EventKind::SessionCreated)
+                .push(EventKind::InputAdmitted)
+                .push(kind);
+            assert_eq!(
+                project(&b.build()),
+                Err(ProjectionError::Illegal(super::IllegalTransition {
+                    from: Some(Idle),
+                    on: DrainActivity,
+                })),
+                "kind {:?} must default to drain activity",
+                kind
+            );
+        }
+    }
+
+    /// The same three kinds are legal mid-drain (under a claim) and the
+    /// worker-end shape completes: `thread/completed` is appended by the
+    /// worker's own drain before its end write.
+    #[test]
+    fn project_phase2_drain_activity_kinds_legal_mid_drain() {
+        let mut b = StreamBuilder::new(26);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::StepRequest)
+            .push(EventKind::AssistantMessage)
+            .push(EventKind::EvidenceVerdict)
+            .push(EventKind::ThreadCompleted)
+            .push(EventKind::ChannelDelivered)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            });
+        assert_eq!(project(&b.build()), Ok(Completed));
     }
 
     #[test]

@@ -146,6 +146,40 @@ pub enum EventKind {
     #[serde(rename = "recovery/budget-reset")]
     RecoveryBudgetReset,
 
+    /// Thread lineage start (C18, Phase 2): a Router's drain dispatched
+    /// work to a worker session, or the worker's stream records that it
+    /// was spawned by delegation. Payload schema (owned by C18):
+    /// `{"thread_id": uuid, "parent": session-uuid, "worker":
+    /// session-uuid, "pinned_version": u64, "task": <message payload>}`.
+    /// State-preserving in `idle`/`running`/`recoverable` (same row as
+    /// `input/admitted`); not context-bearing.
+    #[serde(rename = "thread/started")]
+    ThreadStarted,
+
+    /// Thread lineage completion (C18, Phase 2): the worker's own drain
+    /// appended its outcome before the end write. Payload schema (owned
+    /// by C18): `{"thread_id": uuid, "status": "completed"|"failed"|
+    /// "interrupted", "summary": <message payload>}`. Drain activity
+    /// (default mapping); not context-bearing.
+    #[serde(rename = "thread/completed")]
+    ThreadCompleted,
+
+    /// Evidence-gate verdict (C18, Phase 2): the bounded, declarative
+    /// stop-gate recorded its decision. Payload schema (owned by C18):
+    /// `{"gate": str, "passed": bool, "checks": [{"name": str,
+    /// "passed": bool, "detail"?: str}], "attempt": u64}`. Drain activity
+    /// (default mapping); not context-bearing.
+    #[serde(rename = "evidence/verdict")]
+    EvidenceVerdict,
+
+    /// Channel delivery receipt (C18, Phase 2): a channel output policy
+    /// delivered a message and recorded the honest receipt. Payload
+    /// schema (owned by C18): `{"channel": str, "target": <value>,
+    /// "policy": str, "words"?: u64, "truncated": bool}`. Drain activity
+    /// (default mapping); not context-bearing.
+    #[serde(rename = "channel/delivered")]
+    ChannelDelivered,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -171,6 +205,10 @@ impl EventKind {
             Self::SlotFallback => "slot/fallback",
             Self::SlotMigration => "slot/migration",
             Self::RecoveryBudgetReset => "recovery/budget-reset",
+            Self::ThreadStarted => "thread/started",
+            Self::ThreadCompleted => "thread/completed",
+            Self::EvidenceVerdict => "evidence/verdict",
+            Self::ChannelDelivered => "channel/delivered",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -231,6 +269,13 @@ mod tests {
                 EventKind::RecoveryBudgetReset,
                 r#"{"kind":"recovery/budget-reset"}"#,
             ),
+            (EventKind::ThreadStarted, r#"{"kind":"thread/started"}"#),
+            (EventKind::ThreadCompleted, r#"{"kind":"thread/completed"}"#),
+            (EventKind::EvidenceVerdict, r#"{"kind":"evidence/verdict"}"#),
+            (
+                EventKind::ChannelDelivered,
+                r#"{"kind":"channel/delivered"}"#,
+            ),
             (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
@@ -244,10 +289,124 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the fifteen kinds above (the
+        // The durable set is exactly the nineteen kinds above (the
         // fourteen frozen by C2 + the additive C14
-        // `recovery/budget-reset`; additions-only, no renames).
-        assert_eq!(cases.len(), 15);
+        // `recovery/budget-reset` + the four additive C18 Phase-2 kinds;
+        // additions-only, no renames).
+        assert_eq!(cases.len(), 19);
+    }
+
+    /// Additions-only regression (C18): every pre-existing kind's golden
+    /// bytes are byte-identical to the Phase-1 frozen forms. This list is
+    /// deliberately independent of the growing `cases` array above — it
+    /// is the frozen Phase-1 contract, copied verbatim, so a future edit
+    /// to an existing kind's serialization fails here even if `cases`
+    /// was updated alongside it.
+    #[test]
+    fn additions_only_regression_phase1_kind_bytes_are_frozen() {
+        let frozen_phase1: [(EventKind, &str); 15] = [
+            (EventKind::SessionCreated, r#"{"kind":"session/created"}"#),
+            (EventKind::InputAdmitted, r#"{"kind":"input/admitted"}"#),
+            (EventKind::DrainClaimed, r#"{"kind":"drain/claimed"}"#),
+            (EventKind::TurnStart, r#"{"kind":"turn/start"}"#),
+            (EventKind::TurnEnd, r#"{"kind":"turn/end"}"#),
+            (EventKind::StepRequest, r#"{"kind":"step/request"}"#),
+            (
+                EventKind::AssistantMessage,
+                r#"{"kind":"assistant/message"}"#,
+            ),
+            (EventKind::ToolCall, r#"{"kind":"tool/call"}"#),
+            (EventKind::ToolResult, r#"{"kind":"tool/result"}"#),
+            (EventKind::Compact, r#"{"kind":"compact"}"#),
+            (EventKind::SlotBinding, r#"{"kind":"slot/binding"}"#),
+            (EventKind::SlotFallback, r#"{"kind":"slot/fallback"}"#),
+            (EventKind::SlotMigration, r#"{"kind":"slot/migration"}"#),
+            (
+                EventKind::RecoveryBudgetReset,
+                r#"{"kind":"recovery/budget-reset"}"#,
+            ),
+            (
+                EventKind::SessionEnded {
+                    reason: EndReason::Failed,
+                },
+                r#"{"kind":"session/ended","reason":"failed"}"#,
+            ),
+        ];
+        for (kind, golden) in &frozen_phase1 {
+            assert_eq!(
+                &serde_json::to_string(kind).unwrap(),
+                golden,
+                "pre-existing kind {:?} changed bytes (additions-only violated)",
+                kind
+            );
+            let back: EventKind = serde_json::from_str(golden).unwrap();
+            assert_eq!(&back, kind);
+        }
+    }
+
+    /// Each C18 Phase-2 kind round-trips through the full envelope with
+    /// a payload of its tabled schema riding opaquely in `bytes`
+    /// (JSONL-export shape, the C14 replay path).
+    #[test]
+    fn phase2_kind_envelopes_round_trip_with_tabled_payloads() {
+        let payloads = [
+            (
+                EventKind::ThreadStarted,
+                json!({
+                    "thread_id": "0b6a18c4-0e52-4b8f-9d5a-2f4c9c1b7d01",
+                    "parent": "0b6a18c4-0e52-4b8f-9d5a-2f4c9c1b7d02",
+                    "worker": "0b6a18c4-0e52-4b8f-9d5a-2f4c9c1b7d03",
+                    "pinned_version": 3,
+                    "task": {"role": "user", "content": "refactor the parser"}
+                }),
+            ),
+            (
+                EventKind::ThreadCompleted,
+                json!({
+                    "thread_id": "0b6a18c4-0e52-4b8f-9d5a-2f4c9c1b7d01",
+                    "status": "completed",
+                    "summary": {"role": "assistant", "content": "done: 3 files"}
+                }),
+            ),
+            (
+                EventKind::EvidenceVerdict,
+                json!({
+                    "gate": "worker-stop",
+                    "passed": true,
+                    "checks": [
+                        {"name": "final_message_present", "passed": true},
+                        {"name": "no_error_tool_result_tail", "passed": true, "detail": "tail=2"}
+                    ],
+                    "attempt": 1
+                }),
+            ),
+            (
+                EventKind::ChannelDelivered,
+                json!({
+                    "channel": "mock-im",
+                    "target": {"chat_id": 42},
+                    "policy": "im/max-words",
+                    "words": 87,
+                    "truncated": false
+                }),
+            ),
+        ];
+        for (kind, payload) in &payloads {
+            let ev = Event {
+                seq: 4,
+                session: SessionId(Uuid::nil()),
+                epoch: Epoch(2),
+                ts: 1_762_000_000_000,
+                kind: *kind,
+                bytes: payload.clone(),
+                version: SCHEMA_VERSION,
+            };
+            let line = serde_json::to_string(&ev).unwrap();
+            let back: Event = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, ev, "envelope round-trip for {}", kind.as_str());
+            // The kind tag is exactly the tabled serde name.
+            assert_eq!(tag_of(&line), kind.as_str());
+        }
     }
 
     /// `session/ended` carries every `EndReason`; `interrupted` is distinct

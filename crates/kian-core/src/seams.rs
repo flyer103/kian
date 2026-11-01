@@ -1,10 +1,12 @@
 //! Seam trait definitions (DESIGN §6.2 "Seam three roles").
 //!
 //! The Phase-1 seam traits — `ModelProvider`, `LoopDriver`, `ToolProvider`,
-//! `ExecBackend`, `RecoveryPolicySource` — are *definitions only*: no impls
-//! here; implementation crates (kian-llm, kian-loop, …) implement and
-//! re-export them. Living in `kian-core` keeps the orchestrator dependency
-//! tree clean (constraint 10).
+//! `ExecBackend`, `RecoveryPolicySource` — plus the Phase-2 additions
+//! `ChannelAdapter` and `WatchdogSource` (C18) — are *definitions only*:
+//! no impls here; implementation crates (kian-llm, kian-loop,
+//! kian-superagent, kian-exec, …) implement and re-export them. Living in
+//! `kian-core` keeps the orchestrator dependency tree clean (constraint
+//! 10).
 
 use std::collections::BTreeMap;
 
@@ -216,6 +218,112 @@ pub trait RecoveryPolicySource: Send + Sync {
     fn table(&self) -> Vec<PolicyRule>;
 }
 
+// ---------------------------------------------------------------------------
+// ChannelAdapter (C18, Phase 2 — definition only; impls live in the
+// super-agent bundle, never in core)
+// ---------------------------------------------------------------------------
+
+/// One inbound channel event, surfaced by a [`ChannelAdapter`]. The
+/// payload is verbatim channel JSON (it rides inside the admitted input's
+/// `content`, so the frozen C4 message-payload contract is untouched).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelEvent {
+    /// Channel name (e.g. `mock-im`, `lark`, `github`).
+    pub channel: String,
+    /// Adapter-side unique id — the idempotency key for admission
+    /// (one inbox row per event, never two).
+    pub event_id: String,
+    /// Optional routing topic (subscription rules may match on it).
+    pub topic: Option<String>,
+    /// Verbatim event payload, opaque to the core.
+    pub payload: Value,
+    /// Observed at, unix epoch milliseconds.
+    pub ts_ms: u64,
+}
+
+/// One outbound channel delivery, handed to a [`ChannelAdapter`]. Output
+/// policies (word limits, structured sections) are applied by the caller
+/// *before* the send; the adapter delivers what it is given and returns
+/// an honest [`SendReceipt`] or error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelDelivery {
+    pub channel: String,
+    /// Channel-defined delivery target (chat id, issue ref, …) — opaque
+    /// to everything upstream of the adapter.
+    pub target: Value,
+    /// The message content to deliver, already policy-shaped.
+    pub content: Value,
+}
+
+/// Proof that a delivery landed: the adapter's own id for the sent
+/// message plus the delivery timestamp. Recorded in the audit stream via
+/// the caller's `channel/delivered` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendReceipt {
+    pub message_id: String,
+    pub ts_ms: u64,
+}
+
+/// Adapter-side failures, pre-aligned with the pure error classifier's
+/// vocabulary so classification never parses error strings.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum ChannelError {
+    #[error("channel unavailable: {0}")]
+    Unavailable(String),
+    #[error("delivery failed: {0}")]
+    DeliveryFailed(String),
+    #[error("delivery timed out")]
+    Timeout,
+}
+
+/// Seam (DESIGN §6.2, Phase 2): an inbound/outbound channel (IM, issue
+/// tracker, …). Definition only in core — the first impl is the
+/// production-quality in-memory mock channel (kian-superagent, C23); real
+/// lark/GitHub adapters are Phase 3. Subscribe streams must be
+/// independently cloneable consumers of the adapter's own choosing.
+pub trait ChannelAdapter: Send + Sync {
+    /// Inbound events. Each event must be surfaced exactly once per
+    /// subscriber; admission dedupes on `event_id` as the durable guard.
+    fn subscribe(&self) -> BoxStream<'static, ChannelEvent>;
+    /// Outbound delivery. Resolves only after the channel accepted the
+    /// message — an honest error never masquerades as a receipt.
+    fn send(&self, out: ChannelDelivery) -> BoxFuture<'static, Result<SendReceipt, ChannelError>>;
+}
+
+// ---------------------------------------------------------------------------
+// WatchdogSource (C18, Phase 2 — definition only)
+// ---------------------------------------------------------------------------
+
+/// Endpoint health as the watchdog observes it. Edge-triggered: a source
+/// reports *changes*, not heartbeats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointHealth {
+    Online,
+    Offline,
+}
+
+/// One edge-triggered health transition for a registered endpoint. A
+/// dead daemon cannot report its own death — the authoritative v1 view
+/// is the server's heartbeat-absence observation (DESIGN §4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthEvent {
+    pub endpoint_id: String,
+    pub status: EndpointHealth,
+    pub ts_ms: u64,
+    pub detail: Option<String>,
+}
+
+/// Seam (DESIGN §6.2, Phase 2): an edge-triggered health monitor.
+/// Definition only in core — the v1 impl is the server-side heartbeat
+/// watchdog over the endpoint registry (kian-exec, C21). The stream
+/// carries state changes only (no flapping, no periodic noise); health
+/// events reach sessions exclusively via Admit — the watchdog never
+/// writes session streams itself (layered iron rule).
+pub trait WatchdogSource: Send + Sync {
+    fn health(&self) -> BoxStream<'static, HealthEvent>;
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -239,6 +347,73 @@ mod tests {
         ) {
         }
         let _ = assert_object_safe;
+    }
+
+    /// The C18 Phase-2 seams are object-safe for the same reason the
+    /// Phase-1 seams are: assembly holds `Arc<dyn ChannelAdapter>` /
+    /// `Arc<dyn WatchdogSource>` registered by plugins.
+    #[test]
+    fn phase2_seam_traits_are_object_safe() {
+        fn assert_object_safe(_: &dyn super::ChannelAdapter, _: &dyn super::WatchdogSource) {}
+        let _ = assert_object_safe;
+    }
+
+    /// The Phase-2 seam support types round-trip through JSON; the
+    /// health status serializes as the lowercase tabled form.
+    #[test]
+    fn phase2_seam_support_types_round_trip() {
+        use super::{
+            ChannelDelivery, ChannelError, ChannelEvent, EndpointHealth, HealthEvent, SendReceipt,
+        };
+
+        let event = ChannelEvent {
+            channel: "mock-im".into(),
+            event_id: "evt-7".into(),
+            topic: Some("worker-1".into()),
+            payload: json!({"text": "@kian deploy"}),
+            ts_ms: 1_762_000_000_000,
+        };
+        let delivery = ChannelDelivery {
+            channel: "mock-im".into(),
+            target: json!({"chat_id": 42}),
+            content: json!({"text": "done"}),
+        };
+        let receipt = SendReceipt {
+            message_id: "msg-9".into(),
+            ts_ms: 1_762_000_000_001,
+        };
+        let health = HealthEvent {
+            endpoint_id: "ep-laptop".into(),
+            status: EndpointHealth::Offline,
+            ts_ms: 1_762_000_000_002,
+            detail: Some("heartbeat stale".into()),
+        };
+
+        fn rt<T>(val: &T)
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let ser = serde_json::to_value(val).unwrap();
+            let back: T = serde_json::from_value(ser).unwrap();
+            assert_eq!(&back, val);
+        }
+        rt(&event);
+        rt(&delivery);
+        rt(&receipt);
+        rt(&health);
+
+        // Tabled serde forms: lowercase status words.
+        assert_eq!(
+            serde_json::to_value(EndpointHealth::Online).unwrap(),
+            json!("online")
+        );
+        assert_eq!(
+            serde_json::to_value(EndpointHealth::Offline).unwrap(),
+            json!("offline")
+        );
+        // Errors stay display-stable (classification reads kinds, not
+        // strings, but the messages are human-facing).
+        assert_eq!(ChannelError::Timeout.to_string(), "delivery timed out");
     }
 
     /// The seam support types round-trip through JSON; policy rules come
