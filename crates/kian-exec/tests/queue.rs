@@ -646,3 +646,253 @@ async fn store_reopen_is_idempotent_and_rows_survive() {
     }
     let _ = std::fs::remove_file(&db);
 }
+
+// -- C52: queue-row leases ---------------------------------------------------
+
+/// The single-statement row lease over sqlite (the same code path
+/// postgres rides): claim → fresh-foreign refusal → heartbeat
+/// extension → expiry takeover → same-holder re-claim → terminal
+/// freeze. Liveness only — the lease never touches results.
+#[tokio::test]
+async fn row_lease_claims_expire_and_redrive_on_sqlite() {
+    no_proxy();
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let id: CommandId = Uuid::new_v4();
+    store
+        .enqueue(id, "box", &cmd(&["echo", "lease"]), None)
+        .await
+        .unwrap();
+
+    // Unclaimed row: the first claimant takes ownership.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-a", 1_000, 0)
+            .await
+            .unwrap()
+    );
+    // Fresh lease, different holder: refused, nothing written.
+    assert!(
+        !store
+            .claim_queue_row(id, "replica-b", 1_000, 500)
+            .await
+            .unwrap()
+    );
+    // The owner's heartbeat pushes the deadline out…
+    assert!(
+        store
+            .heartbeat_queue_row(id, "replica-a", 1_000, 800)
+            .await
+            .unwrap()
+    );
+    // …so the foreign claim at 1500 is still inside (800+1000).
+    assert!(
+        !store
+            .claim_queue_row(id, "replica-b", 1_000, 1_500)
+            .await
+            .unwrap()
+    );
+    // Past expiry (1801 > 1800) any replica takes over honestly.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-b", 1_000, 1_801)
+            .await
+            .unwrap()
+    );
+    // Same-holder re-claim always lands (single-replica re-drive).
+    assert!(
+        store
+            .claim_queue_row(id, "replica-b", 1_000, 1_900)
+            .await
+            .unwrap()
+    );
+    // A foreign heartbeat never extends someone else's lease.
+    assert!(
+        !store
+            .heartbeat_queue_row(id, "replica-a", 1_000, 1_950)
+            .await
+            .unwrap()
+    );
+
+    // Terminal rows freeze: once done, no claim ever lands again.
+    let outcome = kian_exec::store::CommandOutcome::Ok {
+        result: ExecResult {
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            timed_out: false,
+        },
+    };
+    assert!(store.mark_done(id, &outcome).await.unwrap());
+    assert!(
+        !store
+            .claim_queue_row(id, "replica-c", 1_000, 5_000)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .heartbeat_queue_row(id, "replica-b", 1_000, 5_000)
+            .await
+            .unwrap()
+    );
+
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+/// The async-jobs twin of the row lease on sqlite (claim / fresh-foreign
+/// refusal / expiry takeover / terminal freeze).
+#[tokio::test]
+async fn async_row_lease_claims_and_expires_on_sqlite() {
+    no_proxy();
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let job = Uuid::new_v4();
+    let session = kian_core::model::SessionId(Uuid::new_v4());
+    store
+        .insert_async_job(job, session, "box", &cmd(&["echo", "a"]), None)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .claim_async_row(job, "replica-a", 1_000, 0)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_async_row(job, "replica-b", 1_000, 500)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .heartbeat_async_row(job, "replica-a", 1_000, 800)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .claim_async_row(job, "replica-b", 1_000, 1_500)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .claim_async_row(job, "replica-b", 1_000, 1_801)
+            .await
+            .unwrap()
+    );
+
+    // Terminal freeze: a settled job row is never claimable again.
+    store
+        .mark_async_done(job, &serde_json::json!({"stdout": "x"}))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .claim_async_row(job, "replica-c", 1_000, 5_000)
+            .await
+            .unwrap()
+    );
+
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Drive-loop integration: a queue row freshly leased by *another*
+/// replica is not dispatched by this backend's driver; once that lease
+/// expires, this replica re-drives the row honestly to `done`
+/// (at-least-once; command-id correlation is the safety net).
+#[tokio::test]
+async fn foreign_row_lease_blocks_dispatch_until_expiry() {
+    no_proxy();
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+
+    let (addr, listener) = ephemeral_listener().await;
+    let manager = Arc::new(ConnectionManager::new(
+        ConnectionConfig::new(addr).with_backoff(fast_backoff()),
+    ));
+    manager.start();
+    // This replica is "replica-a"; its row-lease TTL is short (400ms)
+    // so the foreign lease below expires within the test's bounds.
+    let backend = RemoteExecBackend::with_row_leases(
+        store.clone(),
+        vec![("box".into(), manager.clone())],
+        "box",
+        queue_config(8_000),
+        "replica-a",
+        Duration::from_millis(400),
+    )
+    .unwrap();
+
+    let id: CommandId = Uuid::new_v4();
+    store
+        .enqueue(id, "box", &cmd(&["echo", "leased"]), None)
+        .await
+        .unwrap();
+    // Another replica owns the row, fresh for a long window — no race
+    // with the "must not dispatch" observation below.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-b", 10_000, kian_exec::store::now_ms())
+            .await
+            .unwrap()
+    );
+
+    // Endpoint online — the driver loads the row but the claim refuses:
+    // no dispatch may happen while the foreign lease is fresh.
+    let endpoint = Arc::new(Endpoint::new("box", Arc::new(kian_endpoint::LocalExecutor)));
+    tokio::spawn(endpoint.serve(listener));
+    until_async("endpoint connected", || async {
+        store
+            .endpoints()
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .any(|r| r.endpoint_id == "box" && r.state == "online")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let row = store.get(id).await.unwrap().expect("row present");
+    assert_eq!(
+        row.status,
+        QueueStatus::Pending,
+        "a freshly foreign-leased row must not be dispatched"
+    );
+
+    // The foreign holder re-claims with a short TTL (its own liveness
+    // shrinking — the deterministic expiry knob), after which this
+    // replica's driver claims on its next poll and re-drives the row
+    // to a real result.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-b", 300, kian_exec::store::now_ms())
+            .await
+            .unwrap(),
+        "same-holder re-claim must land"
+    );
+    until_async("row re-driven after lease expiry", || async {
+        store
+            .get(id)
+            .await
+            .map(|row| matches!(row, Some(r) if r.status == QueueStatus::Done))
+            .unwrap_or(false)
+    })
+    .await;
+    let row = store.get(id).await.unwrap().unwrap();
+    assert_eq!(
+        row.outcome.unwrap().to_exec().unwrap().stdout.trim(),
+        "leased"
+    );
+
+    backend.shutdown().await;
+    manager.shutdown().await;
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}

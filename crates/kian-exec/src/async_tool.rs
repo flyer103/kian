@@ -250,6 +250,32 @@ impl AsyncJobs {
             self.finish(job_id);
             return;
         }
+        // C52 row lease: own the job row before observing. A fresh lease
+        // held by another replica means *its* observer drives this job —
+        // exit honestly (delivery is idempotent by the bridge's admit
+        // key, and that replica's startup redeliver covers the handoff).
+        // Liveness only: the dispatch itself is gated by the
+        // `exec_queue` row lease; command-id correlation is the net.
+        let (holder, ttl) = self.backend.row_lease();
+        let ttl_ms = ttl.as_millis().min(i64::MAX as u128) as i64;
+        match store
+            .claim_async_row(job_id, holder, ttl_ms, crate::store::now_ms())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    job_id = %job_id,
+                    holder,
+                    "async job row leased by another replica; this observer exits"
+                );
+                self.finish(job_id);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job_id, error = %e, "async row lease claim failed");
+            }
+        }
         let _ = store.mark_async_inflight(job_id).await;
         // Register the cancel watch BEFORE re-reading the status, so
         // a stop that races the registration still surfaces (Notify

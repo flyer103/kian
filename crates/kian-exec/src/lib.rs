@@ -46,6 +46,9 @@ pub mod store;
 pub mod tool;
 pub mod watchdog;
 
+mod postgres;
+mod sqlite;
+
 pub use async_jobs::{AsyncEnqueueOutcome, AsyncJob, AsyncJobStatus};
 pub use async_tool::{
     AsyncExecTool, AsyncJobs, AsyncResultSink, AsyncToolPair, SessionForCall, StopTool,

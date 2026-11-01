@@ -28,7 +28,7 @@ use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
 use crate::connection::ConnectionManager;
 use crate::proto::{CommandError, CommandId};
 use crate::store::{
-    CommandOutcome, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError, QueuedCommand,
+    CommandOutcome, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError, QueuedCommand, now_ms,
 };
 
 /// Caller-visible failures of the queue machinery, mapped onto the exec
@@ -60,6 +60,14 @@ struct QueueCore {
     store: ExecStore,
     routes: HashMap<String, Arc<Route>>,
     config: RemoteExecConfig,
+    /// C52 row-lease identity: which replica's drivers own the rows
+    /// they drive. Defaults to a single-process holder; multi-replica
+    /// assemblies (postgres mode) pass the config-validated unique
+    /// `drain.holder` via [`RemoteExecBackend::with_row_leases`].
+    row_lease_holder: String,
+    /// C52 row-lease TTL — how long a claimed row stays owned without a
+    /// heartbeat before any replica may re-drive it.
+    row_lease_ttl: Duration,
     waiters: Mutex<HashMap<CommandId, Vec<(u64, Waiter)>>>,
     waiter_tokens: std::sync::atomic::AtomicU64,
     shutdown: watch::Sender<bool>,
@@ -116,6 +124,33 @@ impl RemoteExecBackend {
         default_endpoint: impl Into<String>,
         config: RemoteExecConfig,
     ) -> std::result::Result<Self, String> {
+        // C52 row-lease defaults: a single-process holder and the queue
+        // timeout as the TTL (a row owed longer than that is re-drivable
+        // — consistent with the honest-timeout bound). Single-process
+        // behavior is unchanged: the same holder always re-claims.
+        Self::with_row_leases(
+            store,
+            routes,
+            default_endpoint,
+            config,
+            "kian-exec",
+            config.queue_timeout,
+        )
+    }
+
+    /// [`RemoteExecBackend::new`] with an explicit C52 row-lease
+    /// identity: `holder` names this replica (multi-replica postgres
+    /// assemblies pass the config-validated unique `drain.holder`),
+    /// `ttl` how long a claimed queue row stays owned without a
+    /// heartbeat. Existing call sites stay on [`Self::new`] unchanged.
+    pub fn with_row_leases(
+        store: ExecStore,
+        routes: Vec<(String, Arc<ConnectionManager>)>,
+        default_endpoint: impl Into<String>,
+        config: RemoteExecConfig,
+        holder: impl Into<String>,
+        ttl: Duration,
+    ) -> std::result::Result<Self, String> {
         if routes.is_empty() {
             return Err("remote exec needs at least one endpoint route".into());
         }
@@ -138,6 +173,8 @@ impl RemoteExecBackend {
             store,
             routes: map.clone(),
             config,
+            row_lease_holder: holder.into(),
+            row_lease_ttl: ttl,
             waiters: Mutex::new(HashMap::new()),
             waiter_tokens: std::sync::atomic::AtomicU64::new(0),
             shutdown,
@@ -160,6 +197,12 @@ impl RemoteExecBackend {
     /// row inspection for ops).
     pub fn store(&self) -> &ExecStore {
         &self.core.store
+    }
+
+    /// The C52 row-lease identity this backend's drivers claim queue
+    /// rows under: `(holder, ttl)`.
+    pub fn row_lease(&self) -> (&str, Duration) {
+        (&self.core.row_lease_holder, self.core.row_lease_ttl)
     }
 
     /// The configured default endpoint route.
@@ -479,15 +522,62 @@ async fn drive_row_inner(
             .await
             .map_err(|_| "route cap closed".to_string())?
     };
+    // C52 row lease: single-statement ownership of this row for the
+    // dispatch's duration — claimed BEFORE any mutation of the row. A
+    // fresh lease held by *another* replica means its driver owns the
+    // row: skip honestly and leave the row parked untouched (the lease
+    // is liveness only; command-id correlation is the safety net).
+    // Same-holder claims always land, so single-process behavior is
+    // unchanged.
+    let lease_ttl_ms = duration_ms_i64(core.row_lease_ttl);
+    match core
+        .store
+        .claim_queue_row(
+            row.command_id,
+            &core.row_lease_holder,
+            lease_ttl_ms,
+            now_ms(),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::debug!(
+                command_id = %row.command_id,
+                holder = %core.row_lease_holder,
+                "queue row leased by another replica; this driver skips it"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(format!("row lease claim failed: {e}")),
+    }
     // pending → inflight. A false return means the row was already inflight
     // (presumed lost across a restart) — proceed, at-least-once.
     if let Err(e) = core.store.mark_inflight(row.command_id).await {
         return Err(format!("mark_inflight failed: {e}"));
     }
+    // Heartbeat the row lease while the dispatch flies (liveness only —
+    // mirrors the engine's drain heartbeat). Losing the lease mid-flight
+    // (expired and reclaimed after a long dispatch) is logged and the
+    // dispatch still completes through the terminal guard: at-least-once
+    // with command-id dedupe remains the net.
+    let hb_stop = Arc::new(Notify::new());
+    let heartbeat = {
+        let store = core.store.clone();
+        let holder = core.row_lease_holder.clone();
+        let id = row.command_id;
+        let ttl = core.row_lease_ttl;
+        let stop = Arc::clone(&hb_stop);
+        tokio::spawn(async move {
+            row_lease_heartbeat(store, id, holder, ttl, stop).await;
+        })
+    };
     let outcome: Result<Result<ExecResult, CommandError>, crate::error::ConnectionError> = route
         .manager
         .dispatch_with_id(row.command_id, row.cmd)
         .await;
+    hb_stop.notify_one();
+    let _ = heartbeat.await;
     match outcome {
         Ok(Ok(result)) => {
             core.complete(row.command_id, CommandOutcome::Ok { result })
@@ -504,6 +594,46 @@ async fn drive_row_inner(
     }
     drop(permit);
     Ok(())
+}
+
+/// A `Duration` clamped into the store's i64 milliseconds.
+fn duration_ms_i64(d: Duration) -> i64 {
+    d.as_millis().min(i64::MAX as u128) as i64
+}
+
+/// Extends one queue row's lease every `ttl/3` until `stop` fires —
+/// the owner's drive-loop heartbeat (C52). Losing the lease (another
+/// replica reclaimed after expiry) logs and ends the loop; the
+/// in-flight dispatch itself is unaffected (the lease is liveness
+/// only, never a write permission).
+async fn row_lease_heartbeat(
+    store: ExecStore,
+    id: CommandId,
+    holder: String,
+    ttl: Duration,
+    stop: Arc<Notify>,
+) {
+    let ttl_ms = duration_ms_i64(ttl);
+    let interval = ttl.max(Duration::from_millis(1)) / 3;
+    loop {
+        tokio::select! {
+            _ = stop.notified() => return,
+            _ = tokio::time::sleep(interval) => {},
+        }
+        match store
+            .heartbeat_queue_row(id, &holder, ttl_ms, now_ms())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(command_id = %id, "row lease lost mid-dispatch (liveness only)");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(command_id = %id, error = %e, "row lease heartbeat failed");
+            }
+        }
+    }
 }
 
 // The plain seam impl: untracked, random command id, default route. Tools

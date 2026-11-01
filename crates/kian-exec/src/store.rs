@@ -1,10 +1,21 @@
-//! Durable command queue + endpoint registry (card C20, DESIGN §4.3/§7).
+//! Durable command queue + endpoint registry (card C20, DESIGN §4.3/§7;
+//! dual-backend since C51).
 //!
 //! Queue rows are **pre-event durable state**, exactly like inbox rows: the
-//! row exists in `kian.sqlite` before any dispatch flies (admit-before-
-//! execute), and results become session events only through the normal
-//! `tool/call`/`tool/result` loop path — never by writing the events table
-//! from here.
+//! row exists in the server's database before any dispatch flies
+//! (admit-before-execute), and results become session events only through
+//! the normal `tool/call`/`tool/result` loop path — never by writing the
+//! events table from here.
+//!
+//! One server, one database (C51): when the event store is postgres,
+//! `endpoint_registry`/`exec_queue`/`async_jobs` live in the same postgres
+//! database. The public [`ExecStore`] is a small dispatching enum —
+//! `Sqlite(..) | Postgres(..)` — with the same method names and signatures
+//! on both backends (the C50 pattern: dispatch, not generics — sqlx cannot
+//! usefully genericize over the two dialects). Per-backend SQL lives in
+//! [`crate::sqlite`] and [`crate::postgres`]; `open`/`from_pool` stay
+//! sqlite construction, `from_pg_pool`/`open_postgres` are the postgres
+//! entry points.
 //!
 //! Statuses form a monotone little state machine:
 //!
@@ -17,11 +28,13 @@
 //! `done` and `abandoned` are terminal: every transition statement carries a
 //! status guard (`WHERE status IN (...)`) so a committed `done` row is never
 //! updated again and no row is ever deleted (asserted by
-//! `no_delete_and_done_rows_are_never_mutated` — the C5 review pattern).
+//! `no_delete_and_done_rows_are_never_mutated` and
+//! `backend_modules_keep_guards_and_never_delete` — the C5 review pattern).
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -38,8 +51,8 @@ use crate::proto::{CommandError, ErrorCode};
 /// Failures of the durable queue store itself (never a command outcome).
 #[derive(Debug, thiserror::Error)]
 pub enum QueueStoreError {
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] sqlx::Error),
+    #[error("database error: {0}")]
+    Sql(#[from] sqlx::Error),
     #[error("corrupt queue row: {0}")]
     Corrupt(String),
 }
@@ -105,7 +118,7 @@ impl CommandOutcome {
         }
     }
 
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         match self {
             Self::Ok { result } => serde_json::to_string(&serde_json::json!({ "ok": result }))
                 .expect("exec results always serialize"),
@@ -166,12 +179,13 @@ pub fn now_ms() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Migrations (kian-exec's own adjacent chain in the shared kian.sqlite)
+// Migrations (kian-exec's own adjacent chains, one per backend; the
+// bookkeeping table `_kian_exec_migrations` keeps them independent of
+// kian-store's chains in the same database)
 // ---------------------------------------------------------------------------
 
 /// One generation in the adjacent chain (same shape as `kian-store`'s
-/// migrations; a separate bookkeeping table `_kian_exec_migrations` keeps
-/// the two chains independent in one file).
+/// migrations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Migration {
     pub version: u32,
@@ -202,14 +216,62 @@ const V1_ASYNC_JOBS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS async_jobs (\n    job_id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
 };
 
-/// The registered adjacent chain, ordered v0 → head. Extensible by
+/// v2 — queue-row lease columns (C51, the designed chain extension C52
+/// builds its row leases on): every queue table grows `claimed_by` /
+/// `claimed_until_ms` so a single replica can *own* a row while it drives
+/// it, and any replica can honestly re-drive after expiry (ADR-009: the
+/// lease is liveness only — the command-id correlation stays the safety
+/// net). Purely additive `ALTER TABLE`s: committed rows keep their shape,
+/// existing columns are untouched, and the columns start `NULL`
+/// (unclaimed) on both backends.
+const V2_QUEUE_ROW_LEASES: Migration = Migration {
+    version: 2,
+    name: "v2_queue_row_leases",
+    up: "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\nALTER TABLE exec_queue ADD COLUMN claimed_until_ms INTEGER;\nALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\nALTER TABLE async_jobs ADD COLUMN claimed_until_ms INTEGER",
+};
+
+/// The registered adjacent sqlite chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
-    &[V0_REGISTRY_QUEUE, V1_ASYNC_JOBS]
+    &[V0_REGISTRY_QUEUE, V1_ASYNC_JOBS, V2_QUEUE_ROW_LEASES]
 }
 
-/// Applies every unapplied generation in order (same transactional
-/// discipline as `kian-store::migrations::migrate`).
+/// v0 (postgres chain, C51) — same version and name as the sqlite
+/// generation, pg DDL (TEXT/BIGINT; DESIGN §3.3's per-backend typing).
+const PG_V0_REGISTRY_QUEUE: Migration = Migration {
+    version: 0,
+    name: "v0_endpoint_registry_exec_queue",
+    up: "CREATE TABLE IF NOT EXISTS endpoint_registry (\n    endpoint_id TEXT PRIMARY KEY,\n    addr TEXT NOT NULL,\n    last_heartbeat_ms BIGINT NOT NULL,\n    state TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS exec_queue (\n    command_id TEXT PRIMARY KEY,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_exec_queue_drive ON exec_queue (endpoint_id, status, created_at)",
+};
+
+/// v1 (postgres chain, C51) — the async job table, pg DDL.
+const PG_V1_ASYNC_JOBS: Migration = Migration {
+    version: 1,
+    name: "v1_async_jobs",
+    up: "CREATE TABLE IF NOT EXISTS async_jobs (\n    job_id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
+};
+
+/// v2 (postgres chain, C51) — the queue-row lease columns, pg DDL. Same
+/// version and name as the sqlite v2: the two chains track each other
+/// generation for generation.
+const PG_V2_QUEUE_ROW_LEASES: Migration = Migration {
+    version: 2,
+    name: "v2_queue_row_leases",
+    up: "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\nALTER TABLE exec_queue ADD COLUMN claimed_until_ms BIGINT;\nALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\nALTER TABLE async_jobs ADD COLUMN claimed_until_ms BIGINT",
+};
+
+/// The postgres chain: same versions, same names, same ordering as
+/// [`chain`] (enforced by `pg_chain_mirrors_sqlite_chain_versions_and_names`).
+pub fn pg_chain() -> &'static [Migration] {
+    &[
+        PG_V0_REGISTRY_QUEUE,
+        PG_V1_ASYNC_JOBS,
+        PG_V2_QUEUE_ROW_LEASES,
+    ]
+}
+
+/// Applies every unapplied sqlite generation in order (same transactional
+/// discipline as `kian_store::migrations::migrate`).
 pub async fn migrate(pool: &SqlitePool) -> Result<(), QueueStoreError> {
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS _kian_exec_migrations (\n    version INTEGER PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at INTEGER NOT NULL\n)",
@@ -240,15 +302,53 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), QueueStoreError> {
     Ok(())
 }
 
+/// Applies every unapplied pg generation in order — the same runner logic
+/// as [`migrate`], dispatched per backend (the C50 pattern).
+pub async fn migrate_pg(pool: &PgPool) -> Result<(), QueueStoreError> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS _kian_exec_migrations (\n    version BIGINT PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at BIGINT NOT NULL\n)",
+    )
+    .execute(pool)
+    .await?;
+    for m in pg_chain() {
+        let applied: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _kian_exec_migrations WHERE version = $1")
+                .bind(i64::from(m.version))
+                .fetch_one(pool)
+                .await?;
+        if applied != 0 {
+            continue;
+        }
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(m.up).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO _kian_exec_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+        )
+        .bind(i64::from(m.version))
+        .bind(m.name)
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ExecStore
 // ---------------------------------------------------------------------------
 
-/// Durable queue + registry access over a sqlx sqlite pool (WAL,
-/// `busy_timeout`; all access is async — never blocks a tokio worker).
+/// Durable queue + registry access (dual-backend since C51): a small
+/// dispatching enum over the sqlite and postgres backends. Every method
+/// carries the same name and signature the pre-C51 sqlite store had, so
+/// callers and tests are unchanged; construction picks the backend
+/// (`open`/`from_pool` = sqlite, `open_postgres`/`from_pg_pool` =
+/// postgres). All access goes through a sqlx pool — never blocks a tokio
+/// worker.
 #[derive(Clone)]
-pub struct ExecStore {
-    pool: SqlitePool,
+pub enum ExecStore {
+    Sqlite(SqlitePool),
+    Postgres(PgPool),
 }
 
 /// What [`ExecStore::enqueue`] found: a freshly inserted `pending` row, or
@@ -260,8 +360,9 @@ pub enum EnqueueOutcome {
 }
 
 impl ExecStore {
-    /// Opens (creating if needed) a database file and applies the exec
-    /// migration chain. Same connection discipline as `EventStore::open`.
+    /// Opens (creating if needed) a sqlite database file and applies the
+    /// exec migration chain. Same connection discipline as
+    /// `EventStore::open`.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, QueueStoreError> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
@@ -273,27 +374,75 @@ impl ExecStore {
             .max_connections(8)
             .connect_with(opts)
             .await?;
-        let store = Self { pool };
-        migrate(&store.pool).await?;
+        let store = Self::Sqlite(pool);
+        store.run_migrations().await?;
         Ok(store)
     }
 
-    /// Adopts an already-open pool (the server's shared `kian.sqlite` pool)
-    /// and applies the exec migration chain to it.
+    /// Opens a postgres database by URL, applies the pg exec migration
+    /// chain, and returns a pooled store. The URL is env-sourced by the
+    /// caller (the C51 assembly); it may carry a password, but never
+    /// lands in a config value (the C13 secrets rule).
+    pub async fn open_postgres(url: &str) -> Result<Self, QueueStoreError> {
+        let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
+        let store = Self::Postgres(pool);
+        store.run_migrations().await?;
+        Ok(store)
+    }
+
+    /// Adopts an already-open sqlite pool (the server's shared
+    /// `kian.sqlite` pool) and applies the exec migration chain to it.
     pub async fn from_pool(pool: SqlitePool) -> Result<Self, QueueStoreError> {
-        let store = Self { pool };
-        migrate(&store.pool).await?;
+        let store = Self::Sqlite(pool);
+        store.run_migrations().await?;
         Ok(store)
     }
 
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Adopts an already-open postgres pool (the server's shared pg pool —
+    /// one server, one database: the event store and the exec tables
+    /// share it) and applies the pg exec migration chain to it.
+    pub async fn from_pg_pool(pool: PgPool) -> Result<Self, QueueStoreError> {
+        let store = Self::Postgres(pool);
+        store.run_migrations().await?;
+        Ok(store)
     }
 
-    /// Closes the pool; reopening the same file rebuilds from the committed
-    /// rows.
+    async fn run_migrations(&self) -> Result<(), QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => migrate(pool).await,
+            Self::Postgres(pool) => migrate_pg(pool).await,
+        }
+    }
+
+    /// The underlying sqlite pool (the shared-pool adoption path and the
+    /// sqlite test suite). The sqlite-only accessor: a postgres-backed
+    /// store carries no sqlite pool by construction, so calling it there
+    /// is a programming error and panics with this message (the C50
+    /// `EventStore::pool` pattern).
+    pub fn pool(&self) -> &SqlitePool {
+        match self {
+            ExecStore::Sqlite(pool) => pool,
+            ExecStore::Postgres(_) => panic!(
+                "ExecStore::pool() is the sqlite-only pool accessor; this store is postgres-backed (C51)"
+            ),
+        }
+    }
+
+    /// The underlying postgres pool when this store is postgres-backed.
+    pub fn pg_pool(&self) -> Option<&PgPool> {
+        match self {
+            ExecStore::Sqlite(_) => None,
+            ExecStore::Postgres(pool) => Some(pool),
+        }
+    }
+
+    /// Closes the pool; reopening the same file (or URL) rebuilds from
+    /// the committed rows.
     pub async fn close(self) {
-        self.pool.close().await;
+        match self {
+            ExecStore::Sqlite(pool) => pool.close().await,
+            ExecStore::Postgres(pool) => pool.close().await,
+        }
     }
 
     // -- queue --------------------------------------------------------------
@@ -311,18 +460,24 @@ impl ExecStore {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|e| QueueStoreError::Corrupt(format!("cmd not serializable: {e}")))?;
         let now = now_ms();
-        let result = sqlx::query(
-            "INSERT INTO exec_queue (command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at)\n             VALUES (?, ?, ?, 'pending', ?, NULL, ?, ?)\n             ON CONFLICT(command_id) DO NOTHING",
-        )
-        .bind(command_id.to_string())
-        .bind(endpoint_id)
-        .bind(&cmd_json)
-        .bind(tool_call_ref)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 1 {
+        let inserted = match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::enqueue(pool, command_id, endpoint_id, &cmd_json, tool_call_ref, now)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::enqueue(
+                    pool,
+                    command_id,
+                    endpoint_id,
+                    &cmd_json,
+                    tool_call_ref,
+                    now,
+                )
+                .await?
+            }
+        };
+        if inserted {
             Ok(EnqueueOutcome::Inserted)
         } else {
             Ok(EnqueueOutcome::Existing(Box::new(
@@ -335,12 +490,10 @@ impl ExecStore {
 
     /// Reads one row, if present.
     pub async fn get(&self, command_id: Uuid) -> Result<Option<QueuedCommand>, QueueStoreError> {
-        let row = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, i64, i64)>(
-            "SELECT command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE command_id = ?",
-        )
-        .bind(command_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = match self {
+            Self::Sqlite(pool) => crate::sqlite::get(pool, command_id).await?,
+            Self::Postgres(pool) => crate::postgres::get(pool, command_id).await?,
+        };
         row.map(parse_row).transpose()
     }
 
@@ -348,14 +501,13 @@ impl ExecStore {
     /// `pending` (already inflight from a previous life — the at-least-once
     /// re-drive case — or terminal).
     pub async fn mark_inflight(&self, command_id: Uuid) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE exec_queue SET status = 'inflight', updated_at = ? WHERE command_id = ? AND status = 'pending'",
-        )
-        .bind(now_ms())
-        .bind(command_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            Self::Sqlite(pool) => crate::sqlite::mark_inflight(pool, command_id, now_ms()).await?,
+            Self::Postgres(pool) => {
+                crate::postgres::mark_inflight(pool, command_id, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// `pending|inflight → done`, recording the correlated outcome.
@@ -367,41 +519,133 @@ impl ExecStore {
         command_id: Uuid,
         outcome: &CommandOutcome,
     ) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE exec_queue SET status = 'done', result = ?, updated_at = ? WHERE command_id = ? AND status IN ('pending', 'inflight')",
-        )
-        .bind(outcome.to_json())
-        .bind(now_ms())
-        .bind(command_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::mark_done(pool, command_id, outcome, now_ms()).await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::mark_done(pool, command_id, outcome, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// `pending|inflight → abandoned` (queue timeout). Returns false when
     /// the row already settled — including when the real result won the
     /// race against the timer (the caller re-reads and prefers it).
     pub async fn mark_abandoned(&self, command_id: Uuid) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE exec_queue SET status = 'abandoned', updated_at = ? WHERE command_id = ? AND status IN ('pending', 'inflight')",
-        )
-        .bind(now_ms())
-        .bind(command_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            Self::Sqlite(pool) => crate::sqlite::mark_abandoned(pool, command_id, now_ms()).await?,
+            Self::Postgres(pool) => {
+                crate::postgres::mark_abandoned(pool, command_id, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// Rows this endpoint should (re-)drive: `pending` never sent, and
     /// `inflight` presumed lost (at-least-once; ADR-007). Oldest first.
     pub async fn drivable(&self, endpoint_id: &str) -> Result<Vec<QueuedCommand>, QueueStoreError> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, i64, i64)>(
-            "SELECT command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE endpoint_id = ? AND status IN ('pending', 'inflight') ORDER BY created_at ASC, command_id ASC",
-        )
-        .bind(endpoint_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = match self {
+            Self::Sqlite(pool) => crate::sqlite::drivable(pool, endpoint_id).await?,
+            Self::Postgres(pool) => crate::postgres::drivable(pool, endpoint_id).await?,
+        };
         rows.into_iter().map(parse_row).collect()
+    }
+
+    // -- C52: queue-row leases (ADR-009 decision 5) -------------------------
+
+    /// Claims one `exec_queue` row with a single-statement lease
+    /// (`claimed_by`/`claimed_until_ms`, v2 columns). The claim lands
+    /// iff the row is live (`pending`/`inflight` — terminal rows freeze)
+    /// and unclaimed, expired, or already this holder's. Returns
+    /// `false` when a fresh lease is held by another replica — the
+    /// caller skips the row; that replica's driver owns it.
+    ///
+    /// The lease is **liveness only**: it bounds duplicate dispatch
+    /// across replicas and is never consulted for accepting a result —
+    /// the command-id correlation (ADR-007) remains the safety net.
+    pub async fn claim_queue_row(
+        &self,
+        command_id: Uuid,
+        holder: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::claim_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::claim_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+            }
+        }
+        .map_err(QueueStoreError::from)
+    }
+
+    /// Extends this holder's lease on one `exec_queue` row. `false` =
+    /// ownership lost (expired and reclaimed elsewhere) or the row
+    /// settled — the caller stops heartbeating (a stray late result is
+    /// still discarded by the terminal guard; the lease never gates
+    /// correctness).
+    pub async fn heartbeat_queue_row(
+        &self,
+        command_id: Uuid,
+        holder: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::heartbeat_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::heartbeat_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+            }
+        }
+        .map_err(QueueStoreError::from)
+    }
+
+    /// The [`ExecStore::claim_queue_row`] lease for `async_jobs` rows.
+    /// A job's *dispatch* is additionally gated by the `exec_queue` row
+    /// it rides (the job id is the command id); this lease gives the
+    /// observer (the replica driving the job to its session) ownership
+    /// of the bookkeeping row on the same discipline.
+    pub async fn claim_async_row(
+        &self,
+        job_id: Uuid,
+        holder: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::claim_async_row(pool, job_id, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::claim_async_row(pool, job_id, holder, ttl_ms, now_ms).await
+            }
+        }
+        .map_err(QueueStoreError::from)
+    }
+
+    /// The [`ExecStore::heartbeat_queue_row`] twin for `async_jobs`.
+    pub async fn heartbeat_async_row(
+        &self,
+        job_id: Uuid,
+        holder: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::heartbeat_async_row(pool, job_id, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::heartbeat_async_row(pool, job_id, holder, ttl_ms, now_ms).await
+            }
+        }
+        .map_err(QueueStoreError::from)
     }
 
     // -- registry -----------------------------------------------------------
@@ -416,33 +660,26 @@ impl ExecStore {
         last_heartbeat_ms: u64,
         state: &str,
     ) -> Result<(), QueueStoreError> {
-        sqlx::query(
-            "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state) VALUES (?, ?, ?, ?)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = excluded.addr, last_heartbeat_ms = excluded.last_heartbeat_ms, state = excluded.state",
-        )
-        .bind(endpoint_id)
-        .bind(addr)
-        .bind(last_heartbeat_ms as i64)
-        .bind(state)
-        .execute(&self.pool)
-        .await?;
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::upsert_endpoint(pool, endpoint_id, addr, last_heartbeat_ms, state)
+                    .await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::upsert_endpoint(pool, endpoint_id, addr, last_heartbeat_ms, state)
+                    .await?
+            }
+        }
         Ok(())
     }
 
     /// All registry rows (the C21 watchdog's read API).
     pub async fn endpoints(&self) -> Result<Vec<EndpointRegistryRow>, QueueStoreError> {
-        let rows: Vec<(String, String, i64, String)> =
-            sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state FROM endpoint_registry ORDER BY endpoint_id ASC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(endpoint_id, addr, hb, state)| EndpointRegistryRow {
-                endpoint_id,
-                addr,
-                last_heartbeat_ms: hb.max(0) as u64,
-                state,
-            })
-            .collect())
+        match self {
+            Self::Sqlite(pool) => crate::sqlite::endpoints(pool).await,
+            Self::Postgres(pool) => crate::postgres::endpoints(pool).await,
+        }
+        .map_err(QueueStoreError::from)
     }
 }
 
@@ -486,7 +723,7 @@ fn parse_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{Migration, chain};
+    use super::{Migration, chain, pg_chain};
 
     /// The chain must be adjacent and gapless starting at v0 (same rule as
     /// the store's chain, independently enforced for this one).
@@ -529,6 +766,144 @@ mod tests {
         assert_eq!(v0.up, golden);
     }
 
+    /// v2 is committed the moment this chain ships: pinned byte-for-byte
+    /// (additive `ALTER TABLE`s only — the C52 queue-lease columns, the
+    /// designed chain extension).
+    #[test]
+    fn v2_generation_sql_is_frozen_and_additive() {
+        let v2: &Migration = &chain()[2];
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.name, "v2_queue_row_leases");
+        assert_eq!(
+            v2.up,
+            concat!(
+                "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\n",
+                "ALTER TABLE exec_queue ADD COLUMN claimed_until_ms INTEGER;\n",
+                "ALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\n",
+                "ALTER TABLE async_jobs ADD COLUMN claimed_until_ms INTEGER",
+            )
+        );
+        // Additive only: no CREATE, no DROP, no column rewrite.
+        assert!(!v2.up.contains("CREATE"));
+        assert!(!v2.up.contains("DROP"));
+        for stmt in v2.up.split(";") {
+            assert!(
+                stmt.trim_start().starts_with("ALTER TABLE"),
+                "v2 must be ALTER TABLE only: {stmt}"
+            );
+        }
+    }
+
+    /// The pg chain tracks the sqlite chain generation for generation:
+    /// same versions, same names, same order (C51; DESIGN §3.3).
+    #[test]
+    fn pg_chain_mirrors_sqlite_chain_versions_and_names() {
+        let sqlite = chain();
+        let pg = pg_chain();
+        assert_eq!(
+            sqlite.len(),
+            pg.len(),
+            "the two chains must stay the same length"
+        );
+        for (s, p) in sqlite.iter().zip(pg.iter()) {
+            assert_eq!(s.version, p.version, "version mismatch at v{}", s.version);
+            assert_eq!(s.name, p.name, "name mismatch at v{}", s.version);
+        }
+    }
+
+    /// The pg chain is adjacent and gapless from v0, like the sqlite
+    /// chain.
+    #[test]
+    fn pg_chain_is_adjacent_and_gapless_from_zero() {
+        let pg = pg_chain();
+        assert!(!pg.is_empty(), "pg chain must contain v0");
+        assert_eq!(pg[0].version, 0, "pg chain starts at v0");
+        let versions: Vec<u32> = pg.iter().map(|m| m.version).collect();
+        assert_eq!(versions, (0..pg.len() as u32).collect::<Vec<_>>());
+    }
+
+    /// The pg generations carry pg types (TEXT/BIGINT), never sqlite's
+    /// untyped INTEGER column spelling — except the ALTER statements,
+    /// which name no type-bearing sqlite column (their BIGINT arms are
+    /// checked by the frozen v2 golden below).
+    #[test]
+    fn pg_generations_use_pg_types() {
+        for m in pg_chain() {
+            for stmt in m.up.split(';') {
+                if !stmt.contains("INTEGER") {
+                    continue;
+                }
+                assert!(
+                    stmt.trim_start().starts_with("ALTER TABLE"),
+                    "pg migration v{} ({}) uses sqlite's INTEGER spelling",
+                    m.version,
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// v0/v1/v2 of the pg chain are committed generations: pinned
+    /// byte-for-byte like their sqlite twins.
+    #[test]
+    fn pg_generations_sql_is_frozen() {
+        let pg = pg_chain();
+        assert_eq!(pg[0].version, 0);
+        assert_eq!(pg[0].name, "v0_endpoint_registry_exec_queue");
+        assert_eq!(
+            pg[0].up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS endpoint_registry (\n",
+                "    endpoint_id TEXT PRIMARY KEY,\n",
+                "    addr TEXT NOT NULL,\n",
+                "    last_heartbeat_ms BIGINT NOT NULL,\n",
+                "    state TEXT NOT NULL\n",
+                ");\n",
+                "CREATE TABLE IF NOT EXISTS exec_queue (\n",
+                "    command_id TEXT PRIMARY KEY,\n",
+                "    endpoint_id TEXT NOT NULL,\n",
+                "    cmd TEXT NOT NULL,\n",
+                "    status TEXT NOT NULL,\n",
+                "    tool_call_ref TEXT,\n",
+                "    result TEXT,\n",
+                "    created_at BIGINT NOT NULL,\n",
+                "    updated_at BIGINT NOT NULL\n",
+                ");\n",
+                "CREATE INDEX IF NOT EXISTS idx_exec_queue_drive ON exec_queue (endpoint_id, status, created_at)",
+            )
+        );
+        assert_eq!(pg[1].version, 1);
+        assert_eq!(pg[1].name, "v1_async_jobs");
+        assert_eq!(
+            pg[1].up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS async_jobs (\n",
+                "    job_id TEXT PRIMARY KEY,\n",
+                "    session TEXT NOT NULL,\n",
+                "    endpoint_id TEXT NOT NULL,\n",
+                "    cmd TEXT NOT NULL,\n",
+                "    status TEXT NOT NULL,\n",
+                "    tool_call_ref TEXT,\n",
+                "    result TEXT,\n",
+                "    created_at BIGINT NOT NULL,\n",
+                "    updated_at BIGINT NOT NULL\n",
+                ");\n",
+                "CREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
+            )
+        );
+        assert_eq!(pg[2].version, 2);
+        assert_eq!(pg[2].name, "v2_queue_row_leases");
+        assert_eq!(
+            pg[2].up,
+            concat!(
+                "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\n",
+                "ALTER TABLE exec_queue ADD COLUMN claimed_until_ms BIGINT;\n",
+                "ALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\n",
+                "ALTER TABLE async_jobs ADD COLUMN claimed_until_ms BIGINT",
+            )
+        );
+    }
+
     /// Review assertion (C5 pattern): the store never deletes queue rows,
     /// and every queue mutation carries a status guard so committed `done`
     /// rows are immutable.
@@ -548,6 +923,33 @@ mod tests {
                     line.contains("AND status"),
                     "unguarded exec_queue mutation: {line}"
                 );
+            }
+        }
+    }
+
+    /// The same review assertion over the backend modules, where the SQL
+    /// lives since C51: no deletes anywhere, and every `exec_queue` /
+    /// `async_jobs` mutation carries a status guard.
+    #[test]
+    fn backend_modules_keep_guards_and_never_delete() {
+        for (name, src) in [
+            ("sqlite.rs", include_str!("sqlite.rs")),
+            ("postgres.rs", include_str!("postgres.rs")),
+        ] {
+            let delete = format!("{} {}", "DELETE", "FROM");
+            assert!(
+                !src.to_uppercase().contains(&delete.to_uppercase()),
+                "{name}: queue rows are durable audit state — deletion is forbidden"
+            );
+            for line in src.lines() {
+                let trimmed = line.trim_start();
+                let t = trimmed.to_uppercase();
+                if t.starts_with("UPDATE EXEC_QUEUE") || t.starts_with("UPDATE ASYNC_JOBS") {
+                    assert!(
+                        line.contains("AND status"),
+                        "{name}: unguarded queue mutation: {line}"
+                    );
+                }
             }
         }
     }

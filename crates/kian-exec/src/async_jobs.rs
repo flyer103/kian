@@ -28,8 +28,12 @@
 //! `done`, `cancelled` and `abandoned` are terminal: every transition
 //! carries a status guard, no row is ever deleted, and no committed
 //! terminal row is ever mutated (asserted by
-//! [`self::tests::async_rows_are_guarded_and_never_deleted`], the C5
-//! review pattern applied to this table).
+//! [`self::tests::async_rows_are_guarded_and_never_deleted`] and
+//! `crate::store::tests::backend_modules_keep_guards_and_never_delete`,
+//! the C5 review pattern applied to this table).
+//!
+//! C51: every method dispatches over the [`ExecStore`] backend enum —
+//! same signatures, sqlite or postgres.
 
 use kian_core::model::SessionId;
 use kian_core::seams::ExecCommand;
@@ -120,19 +124,34 @@ impl ExecStore {
         let cmd_json = serde_json::to_string(cmd)
             .map_err(|e| QueueStoreError::Corrupt(format!("cmd not serializable: {e}")))?;
         let now = now_ms();
-        let result = sqlx::query(
-            "INSERT INTO async_jobs (job_id, session, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at)\n             VALUES (?, ?, ?, ?, 'pending', ?, NULL, ?, ?)\n             ON CONFLICT(job_id) DO NOTHING",
-        )
-        .bind(job_id.to_string())
-        .bind(session.0.to_string())
-        .bind(endpoint_id)
-        .bind(&cmd_json)
-        .bind(tool_call_ref)
-        .bind(now)
-        .bind(now)
-        .execute(self.pool())
-        .await?;
-        if result.rows_affected() == 1 {
+        let session_key = session.0.to_string();
+        let inserted = match self {
+            ExecStore::Sqlite(pool) => {
+                crate::sqlite::insert_async_job(
+                    pool,
+                    job_id,
+                    &session_key,
+                    endpoint_id,
+                    &cmd_json,
+                    tool_call_ref,
+                    now,
+                )
+                .await?
+            }
+            ExecStore::Postgres(pool) => {
+                crate::postgres::insert_async_job(
+                    pool,
+                    job_id,
+                    &session_key,
+                    endpoint_id,
+                    &cmd_json,
+                    tool_call_ref,
+                    now,
+                )
+                .await?
+            }
+        };
+        if inserted {
             Ok(AsyncEnqueueOutcome::Inserted)
         } else {
             Ok(AsyncEnqueueOutcome::Existing(Box::new(
@@ -145,39 +164,25 @@ impl ExecStore {
 
     /// Reads one job row, if present.
     pub async fn get_async_job(&self, job_id: Uuid) -> Result<Option<AsyncJob>, QueueStoreError> {
-        let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                i64,
-                i64,
-            ),
-        >(
-            "SELECT job_id, session, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM async_jobs WHERE job_id = ?",
-        )
-        .bind(job_id.to_string())
-        .fetch_optional(self.pool())
-        .await?;
+        let row = match self {
+            ExecStore::Sqlite(pool) => crate::sqlite::get_async_job(pool, job_id).await?,
+            ExecStore::Postgres(pool) => crate::postgres::get_async_job(pool, job_id).await?,
+        };
         row.map(parse_async_row).transpose()
     }
 
     /// `pending → inflight`. Returns false when the row is no longer
     /// `pending` (re-drive of an already-inflight row, or terminal).
     pub async fn mark_async_inflight(&self, job_id: Uuid) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE async_jobs SET status = 'inflight', updated_at = ? WHERE job_id = ? AND status = 'pending'",
-        )
-        .bind(now_ms())
-        .bind(job_id.to_string())
-        .execute(self.pool())
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            ExecStore::Sqlite(pool) => {
+                crate::sqlite::mark_async_inflight(pool, job_id, now_ms()).await?
+            }
+            ExecStore::Postgres(pool) => {
+                crate::postgres::mark_async_inflight(pool, job_id, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// `pending|inflight → done`, recording the completion value.
@@ -190,42 +195,44 @@ impl ExecStore {
     ) -> Result<bool, QueueStoreError> {
         let result_json = serde_json::to_string(result)
             .map_err(|e| QueueStoreError::Corrupt(format!("result not serializable: {e}")))?;
-        let outcome = sqlx::query(
-            "UPDATE async_jobs SET status = 'done', result = ?, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'inflight')",
-        )
-        .bind(result_json)
-        .bind(now_ms())
-        .bind(job_id.to_string())
-        .execute(self.pool())
-        .await?;
-        Ok(outcome.rows_affected() == 1)
+        let affected = match self {
+            ExecStore::Sqlite(pool) => {
+                crate::sqlite::mark_async_done(pool, job_id, &result_json, now_ms()).await?
+            }
+            ExecStore::Postgres(pool) => {
+                crate::postgres::mark_async_done(pool, job_id, &result_json, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// `pending|inflight → cancelled` (the `stop` tool). Honest
     /// cancellation: the row keeps the label forever; it never erases
     /// the job. Returns false when the row already settled.
     pub async fn mark_async_cancelled(&self, job_id: Uuid) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE async_jobs SET status = 'cancelled', updated_at = ? WHERE job_id = ? AND status IN ('pending', 'inflight')",
-        )
-        .bind(now_ms())
-        .bind(job_id.to_string())
-        .execute(self.pool())
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            ExecStore::Sqlite(pool) => {
+                crate::sqlite::mark_async_cancelled(pool, job_id, now_ms()).await?
+            }
+            ExecStore::Postgres(pool) => {
+                crate::postgres::mark_async_cancelled(pool, job_id, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// `pending|inflight → abandoned` (queue timeout). Returns false
     /// when the row already settled.
     pub async fn mark_async_abandoned(&self, job_id: Uuid) -> Result<bool, QueueStoreError> {
-        let result = sqlx::query(
-            "UPDATE async_jobs SET status = 'abandoned', updated_at = ? WHERE job_id = ? AND status IN ('pending', 'inflight')",
-        )
-        .bind(now_ms())
-        .bind(job_id.to_string())
-        .execute(self.pool())
-        .await?;
-        Ok(result.rows_affected() == 1)
+        let affected = match self {
+            ExecStore::Sqlite(pool) => {
+                crate::sqlite::mark_async_abandoned(pool, job_id, now_ms()).await?
+            }
+            ExecStore::Postgres(pool) => {
+                crate::postgres::mark_async_abandoned(pool, job_id, now_ms()).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// Job rows in any of `statuses`, oldest first (the startup
@@ -234,30 +241,15 @@ impl ExecStore {
         &self,
         statuses: &[AsyncJobStatus],
     ) -> Result<Vec<AsyncJob>, QueueStoreError> {
-        let placeholders = statuses
-            .iter()
-            .map(|s| format!("'{}'", s.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT job_id, session, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM async_jobs WHERE status IN ({placeholders}) ORDER BY created_at ASC, job_id ASC"
-        );
-        let rows = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                i64,
-                i64,
-            ),
-        >(&sql)
-        .fetch_all(self.pool())
-        .await?;
+        // Closed enum → trusted literals; the same list works on both
+        // dialects.
+        let list: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+        let rows = match self {
+            ExecStore::Sqlite(pool) => crate::sqlite::async_jobs_with_status(pool, &list).await?,
+            ExecStore::Postgres(pool) => {
+                crate::postgres::async_jobs_with_status(pool, &list).await?
+            }
+        };
         rows.into_iter().map(parse_async_row).collect()
     }
 }
