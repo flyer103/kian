@@ -81,6 +81,14 @@ pub const DEFAULT_MAX_STEPS: u64 = 32;
 /// Default wait for the peer's `ready` frame.
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often an idle drain re-checks the inbox while waiting for the
+/// peer's next line (C57). Constraint 6: wakes may fold, be lost, or
+/// race — the drain never depends on one to make progress. A step-open
+/// wait is unbounded (the provider call is in flight, exactly like the
+/// built-in loop's); an idle safe-boundary wait is bounded by this
+/// interval so a late-admitted input still lands.
+pub const IDLE_INPUT_RECHECK: Duration = Duration::from_millis(50);
+
 /// Driver configuration (assembly-owned; `superagent.harness.dsh`).
 #[derive(Debug, Clone)]
 pub struct DshDriverConfig {
@@ -569,7 +577,27 @@ impl DshDriver {
                     Err(e) => return (soft("input take", e), St::Done),
                 }
             }
-            let msg = sess.peer.line_rx.recv().await;
+            // Constraint 6: wakes may fold, be lost, or race. While a
+            // step is open the peer will speak (the provider call is in
+            // flight — unbounded, like the built-in loop's model call);
+            // at an idle safe boundary the peer may legitimately stay
+            // silent until *we* deliver the next input, so the line
+            // wait is bounded by [`IDLE_INPUT_RECHECK`] and the loop
+            // top re-checks interrupt + eligible inputs. Without this,
+            // an input admitted after the boundary check deadlocks the
+            // episode (peer blocked on `expect`, driver on the line).
+            let msg = if sess.mapper.step_open() {
+                sess.peer.line_rx.recv().await
+            } else {
+                tokio::select! {
+                    m = sess.peer.line_rx.recv() => m,
+                    // Cancel-safe: the mpsc recv is dropped, not the
+                    // message — an arrived line stays queued.
+                    _ = tokio::time::sleep(IDLE_INPUT_RECHECK) => {
+                        continue;
+                    }
+                }
+            };
             match msg {
                 Some(PeerMsg::Line(text)) => {
                     match sess.mapper.accept_line(&text) {

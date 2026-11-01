@@ -259,6 +259,40 @@ fn deploy() -> Value {
     json!({"text": "deploy the service"})
 }
 
+/// C57 live-run finding (the hang): a steer admitted *after* the drain
+/// already reached the safe boundary and went idle must still be
+/// delivered — the driver may not depend on a wake to make progress
+/// (constraint 6: wakes may fold, be lost, or race). The steer row
+/// below becomes eligible 300 ms in, well after the driver is parked
+/// waiting for the peer's next line (the peer blocks on `expect steer`
+/// and says nothing). Without the inbox re-check this deadlocks: the
+/// test wraps the drive in a timeout so the deadlock is a failure, not
+/// a hang.
+#[tokio::test]
+async fn late_eligible_input_still_lands_at_the_idle_boundary() {
+    let ctx = FakeCtx::seeded(deploy());
+    // The steer arrives late: after the turn-1 boundary check ran empty.
+    let delayed = ctx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        delayed.queue_row(json!({"synthetic": true, "content": {"text": "switch to plan B"}}));
+    });
+
+    let driver = driver("steer.jsonl");
+    let outcomes =
+        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
+            .await
+            .expect("the bridge must not deadlock waiting for a wake; it re-checks the inbox");
+
+    assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
+    let turn_starts = ctx
+        .kinds()
+        .into_iter()
+        .filter(|k| matches!(k, EventKind::TurnStart))
+        .count();
+    assert_eq!(turn_starts, 2, "the late steer still drove the second turn");
+}
+
 #[tokio::test]
 async fn spawn_steer_complete_runs_the_full_bridge_flow() {
     let ctx = FakeCtx::seeded(deploy());
