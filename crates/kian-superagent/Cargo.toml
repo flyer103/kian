@@ -1,0 +1,35 @@
+[package]
+name = "kian-superagent"
+version.workspace = true
+edition.workspace = true
+
+# DESIGN §7: `kian-superagent` is the super-agent *bundle* (ADR-003) —
+# Router/Worker templates, subscription rules, channel framework. It is
+# outside the narrow waist: it depends on the core (seams + concept
+# model), on the plugin registry, and on `kian-orchestrator` for *types
+# only* (`WakeOutcome`) — every execution capability reaches the bundle
+# through the `InboxWriter` port (card C23). Assembly (kian-cli)
+# implements the port over the real engine. Enforced textually by
+# tests/iron_rule.rs.
+
+[dependencies]
+kian-core.workspace = true
+kian-plugin.workspace = true
+kian-orchestrator.workspace = true
+# C25: the worker wrapper reuses the C24 evidence gate's public, pure
+# evaluation (`evaluate_evidence_gate` / `CheckSpec` / verdict payload)
+# instead of duplicating gate semantics. Types + pure functions only —
+# no execution surface flows from this edge (iron rule still holds).
+kian-loop.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+kian-store.workspace = true
+kian-llm.workspace = true
+tracing-subscriber.workspace = true
