@@ -91,6 +91,7 @@ pub mod metrics;
 pub mod mock;
 pub mod policy;
 pub mod provenance;
+pub mod rearm;
 pub mod recall;
 pub mod registry;
 pub mod router;
