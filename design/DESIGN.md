@@ -405,6 +405,11 @@ kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resol
   that passes the fence snapshot and loses the primary-key race is turned into zero rows
   (`ON CONFLICT DO NOTHING`) or a caught 23505 and classified through the same HEAD re-read as
   every other CAS refusal (`StaleEpoch` vs `SeqMismatch`).
+- C57 (`v2_inbox_admit_order`, both backends): the inbox take order is `(eligible_at,
+  admitted_seq)` — a database-assigned admission ordinal (sqlite: `max+1` inside the single
+  INSERT; pg: identity column), never the random uuid. Same-millisecond admits consume in
+  admission order: the worker-template classification reads a stream's *first* input, and
+  cross-replica replay must be deterministic.
 
 ## 4. Super-agent reference architecture (bundle, not core)
 

@@ -1,10 +1,19 @@
-# Kian — Super-agent Platform / Managed Agent Substrate
+# Kian — the durable execution runtime for agents
 
-> **One-liner: the Temporal of agents — an open-source durable execution runtime that makes agent
-> tasks killable, resumable, migratable and auditable, with the super-agent reference architecture
-> as a first-class workload.**
+> **One-liner: the Temporal of agents — an open-source, model-neutral, self-hostable durable
+> execution runtime that makes agent tasks killable, resumable, migratable and auditable, with the
+> super-agent reference architecture as a first-class workload.**
 
-- Implementation language: **Rust**
+A single-session agent dies with its process, cannot be redirected at a safe boundary, cannot prove
+what it did, and re-pays for its own context on every turn. Kian makes the **Session** the durable
+entity, the **event stream** the only truth, and each execution interval (a **drain**) disposable —
+so a crash, a deploy or a machine move costs a restart, not the work. Start with
+[docs/overview.md](docs/overview.md): the problem, the model, the crate map and what has actually
+been demonstrated.
+
+- Implementation language: **Rust** (13 crates, edition 2024)
+- Storage: **sqlite** by default (single machine); **postgres** for multi-replica deployments
+  (env-gated)
 - Design inputs: frozen local snapshots in [a vendored archive/](a vendored archive/) (archived
   2026-10-31: the WeChat super-agent article, dsh/cordis docs, two internal design notes); structured
   synthesis in [the design notes](the design notes)
@@ -13,89 +22,65 @@
 
 | Document | Type | Contents |
 |----------|------|----------|
+| [docs/overview.md](docs/overview.md) | **Start here** | The problem, the execution model, architecture, crate map, S1–S8 proofs, design-input map |
 | [docs/SPEC.md](docs/SPEC.md) | Spec (WHAT) | Positioning, user interfaces, scope, milestones |
-| [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Combined architecture, execution model, super-agent reference architecture, plugin system, crate map |
-| [design/decisions/](design/decisions/) | Decisions (WHY) | ADRs: key decisions with alternatives |
+| [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
+| [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-011: each decision with its alternatives and trade-offs |
 | [the design notes](the design notes) | Research | Structured digest of the four design inputs |
+| [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live smoke, and the 0.2.1-rc.5 contract gap |
+| [docs/runbook-postgres.md](docs/runbook-postgres.md) | Runbook | Operating postgres mode: `KIAN_PG_URL`, `drain.holder`, migrations, the S8 live replay |
 | [a vendored archive/](a vendored archive/) | Archive | Frozen local snapshots of the design inputs (read-only) |
+| [CHANGELOG.md](CHANGELOG.md) | History | Phase-dated record of what landed, and what is env-gated |
 
-Docs-map consistency (every relative link in the authored docs resolves) is enforced by the
-`docs_map` test in `crates/kian-cli/tests/docs_map.rs`.
-
-## Core claim
-
-**Agent Orchestrator = a durable execution runtime where the Session is the one first-class
-durable entity, the event stream is the sole truth, and the drain is the execution hold interval.
-The agent loop is just a control flow inside a drain.**
-
-The four super-agent characteristics (continuous / efficient / proactive / persistent) are not
-hard-coded core capabilities but **composition patterns** over Kian primitives (Router/Worker
-two-layer, event subscriptions, async promote, BYOM endpoints) — the core stays a narrow waist
-(A10).
+Docs-map consistency is enforced by the `docs_map` test in `crates/kian-cli/tests/docs_map.rs`: it
+checks that every relative link in `README.md`, `AGENTS.md`, `docs/SPEC.md`, `design/DESIGN.md`,
+`the design notes` and the ADRs resolves. The two runbooks, `docs/overview.md` and
+`CHANGELOG.md` are not yet in that enforced set — their links are checked by hand for now (extending
+`AUTHORED` is tracked as a follow-up, not done here).
 
 ## Status
 
-Phase 1 (MVP) implemented: an eight-crate cargo workspace under `crates/` —
-`kian-core` (event schema v0, projections, model-context derivation), `kian-store` (sqlite
-EventStore with CAS/epoch fencing, inbox, leases), `kian-orchestrator` (Admit → Wake → Drain →
-Promote engine, three-layer recovery), `kian-llm` (openai-compat provider, slots,
-persist-before-send), `kian-loop` (built-in ReAct driver), `kian-plugin` (static plugin system),
-`kian-endpoint` (KiandProto endpoint-side SDK), `kian-cli` (`kian serve` control plane + CLI).
+| Property | Value |
+|----------|-------|
+| Crates | 13 (`cargo build --workspace`) |
+| Tests | 751 at the Phase-4 closeout (more as later cards land regression tests), all default-green with zero credentials (`cargo test --workspace`) |
+| Event kinds | 20, append-only (additions only, never renamed) |
+| ADRs | 11 |
+| Acceptance | S1–S5 and S7 default-green; S6 fixture-proven in CI, its live leg executed against dsh 0.2.1-rc.5 with an honest negative (S6-live still open); S8 env-gated (`KIAN_PG_URL`) |
 
-Phase 2 (super-agent bundle + BYOM endpoints) implemented on top: three more members —
-`kian-exec` (KiandProto server half: connection manager, durable command queue, watchdog),
-`kian-superagent` (Router/Worker bundle: subscriptions, channels, output policies), and `kiand`
-(the endpoint daemon binary) — assembled into `kian serve` by the additive `superagent:` /
-`endpoints:` config surface (see [Phase 2](#phase-2-super-agent-bundle--byom-endpoints) below).
+Phase history, one line each (details in the [phase sections](#phase-1-acceptance-checklist-s1s3)
+below):
 
-Phase 3 (the article-sync round) landed on the same 11-crate workspace — no new crates, exactly
-one additive event kind (`input/spilled`; the durable set is now 20): Inline/Spill admission
-shaping + the recall toolpack, two-level admission filtering, async `start()`/`stop()` tools
-(ADR-008), many-to-many passthrough fan-out, speculation, Watchdog Session v2, batching metrics,
-the ablation benchmark, untrusted-input marking, and the real lark channel adapter (see
-[Phase 3](#phase-3-article-sync-recall-admission-economics-real-channels) below).
-
-Phase 4 (round 4, the hosted foundation) opens with a twelfth crate: `kian-sdk` — the wire-only
-embedded SDK extracted from `kian-cli`'s client (card C46). It speaks the frozen C13/C14 wire
-contract (JSON-RPC control/ops planes + the `events` SSE stream) with typed methods and matchable
-error codes, depends on **no kian crate** (reqwest/serde/serde_json/futures/thiserror only), and
-carries its own version (`0.1.0`) decoupled from the workspace bump cadence. Its public surface is
-**frozen additive-only** after this card — a breaking change requires a new plan round, exactly
-like event kinds; golden wire fixtures (`crates/kian-sdk/tests/fixtures/`) pin the request/response
-bytes of every method. `kian-cli` re-exports `KianClient` from it, so the CLI is unchanged.
-Round 4's thirteenth crate is `kian-dsh` — the S6 dsh bridge (card C54): a `LoopDriver` that drives
-a `dsh --profile sdk` child over stdio JSON-lines with the C53/ADR-010 mapping (zero new event
-kinds), mounted on the worker template config-gated (`superagent.harness.dsh`, default off). It
-depends on `kian-core` only (narrow waist) and is proven in CI against the scripted fixture peer;
-the live run is env-gated (`KIAN_DSH_BIN`, see the
-[run log](#live-dsh-bridge-run-log-manual-env-gated)).
-
-Phase 4 also landed the hosted foundation itself — the postgres dual-backend store and
-multi-replica lease/fencing semantics (S8, ADR-009) — plus the GitHub channel with its verified
-webhook receiver (ADR-011); zero new event kinds this round (the durable set stays 20). The
-operator surface for all of it is the
-[Phase 4](#phase-4-hosted-foundation-postgres-multi-replica-sdk-freeze-ecosystem-surfaces)
-section below.
+- **Phase 1 — MVP, durable sessions**: event store on sqlite with `expectedSeq` CAS + epoch fencing,
+  Admit → Wake → Drain → Promote, three-layer recovery, control-plane API and CLI. Scenarios S1–S3.
+- **Phase 2 — super-agent bundle**: Router/Worker composition over the core (never in it), event
+  subscriptions + channels, the evidence gate, BYOM endpoint daemons. Scenarios S4–S5.
+- **Phase 3 — article-sync**: Inline/Spill shaping + Chain of Recall, two-level admission filtering,
+  async tools, passthrough fan-out, speculation, Watchdog v2, batching metrics, untrusted marking,
+  the lark channel adapter. S4-extended legs + S7.
+- **Phase 4 — hosted foundation**: postgres dual backend and multi-replica lease/fencing, the frozen
+  wire-only `kian-sdk`, the GitHub channel with a verified webhook receiver, the dsh bridge.
+  Scenarios S6, S8.
 
 ## Quickstart
 
-Prerequisites: a recent Rust toolchain (stable, 1.85+ for let-chains); nothing else — Phase 1 is
-single-machine sqlite with no external services.
+Prerequisites: Rust stable 1.85+ (`edition 2024`), plus `curl` and `jq`. Nothing else — sqlite is
+embedded and a single `kian serve` process is the whole system.
 
-### Build
+Every command and every output block below was executed against this tree on 2026-11-01 (macOS,
+rustc 1.98.1). The provider was a local OpenAI-compatible SSE stub that answers
+`hello from a scripted provider`, so the run needed no credentials and no network; point
+`base_url`/`model` at any real OpenAI-compatible endpoint and the same session runs against a model.
+
+### 1. Build
 
 ```bash
-cargo build --workspace
+cargo build --workspace          # 13 crates
 ```
 
-### Configure and serve
+### 2. Write `kian.yaml`
 
-`kian serve` reads a `kian.yaml` (fail-closed: a malformed config refuses to start). Providers
-take their API keys from the environment — never from the file:
-
-```bash
-export MY_PROVIDER_KEY=sk-...   # must match `api_key_env` below
-cat > kian.yaml <<'EOF'
+```yaml
 listen: "127.0.0.1:7433"
 storage:
   sqlite: "./kian.db"
@@ -103,44 +88,290 @@ agent:
   id: my-agent
   model_slots:
     main:
-      provider: my-provider
+      provider: local
       model: gpt-4o-mini
 providers:
-  my-provider:
-    base_url: "https://api.openai.com/v1"
-    api_key_env: MY_PROVIDER_KEY
+  local:
+    base_url: "http://127.0.0.1:7411/v1"   # any OpenAI-compatible endpoint
+    api_key_env: KIAN_LOCAL_KEY            # names the env var; the key never lives in the file
 drain:
   max_iterations: 32
-EOF
-cargo run -p kian-cli --bin kian -- serve
+  lease_ttl_ms: 1500             # default 30000; shortened so a takeover is visible in seconds
+  heartbeat_interval_ms: 300     # default 10000; must stay well under the lease TTL
+recovery:                        # required: the policy table never defaults silently
+  rules:
+    - class: rate_limited
+      action: {backoff_retry: {delay_ms: 500}}
+    - class: unknown
+      action: fail
 ```
 
-### Run a session
+Two rules are fail-closed and worth knowing before you edit anything: a missing `recovery:` section
+refuses to start (a policy table is never implied), and a provider whose `api_key_env` variable is
+unset refuses to start (secrets are never read from the file). A malformed config never degrades
+into a running server.
 
-The control plane is JSON-RPC over `POST /rpc` plus SSE at `GET /sessions/{id}/events`:
+### 3. Serve
 
 ```bash
-SID=$(curl -s localhost:7433/rpc -d '{"jsonrpc":"2.0","id":1,"method":"create_session"}' | jq -r .result.session)
-curl -s localhost:7433/rpc -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"submit\",\"params\":{\"session\":\"$SID\",\"content\":\"hello kian\"}}"
-curl -sN localhost:7433/sessions/$SID/events     # live event stream; ends after session/ended
-curl -s localhost:7433/rpc -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"projection\",\"params\":{\"session\":\"$SID\"}}"
+export KIAN_LOCAL_KEY=sk-...        # any non-empty value; the stub ignores it
+cargo run -p kian-cli --bin kian -- serve --config kian.yaml
 ```
 
-Methods: `create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`; `events` is the
-SSE endpoint. Observability: `GET /metrics` returns engine counters and the cache-byte stability
-report.
+The process stays in the foreground on `127.0.0.1:7433`. Prefix local commands with
+`NO_PROXY=127.0.0.1,localhost` on macOS — the system proxy otherwise intercepts localhost.
 
-### Cache-byte stability report (S3)
+### 4. Run a session
 
 ```bash
-cargo run -p kian-cli --bin kian -- cache-stats --config kian.yaml --json
+SID=$(curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"create_session"}' | jq -r .result.session)
+echo "$SID"      # 36e8cedd-693f-414e-bcf3-21f9f737f8d2
+
+curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"submit\",\"params\":{\"session\":\"$SID\",\"content\":\"hello kian\"}}"
+# {"id":2,"jsonrpc":"2.0","result":{"deduplicated":false}}
+
+curl -sN localhost:7433/sessions/$SID/events      # live SSE stream; ends after session/ended
 ```
 
-Reports, per store: consecutive request pairs compared, how many shared a byte-identical message
-prefix (the provider-independent prefix-cache hit-rate proxy), and invalidation causes. A
-`compact` event counts under `compact`; **any other prefix change counts under
-`unexpected_prefix_change` and is a bug** (constraint 3: compression is the only deliberate
-invalidation point).
+The stream *is* the audit record. Abridged below — session ids shortened to `36e8cedd-…` and the
+full `step/request` body elided; every other value is verbatim:
+
+```
+event: kian
+data: {"seq":1,"session":"36e8cedd-…","epoch":0,"ts":1793541036163,"kind":"session/created","bytes":{},"version":0}
+data: {"seq":2,"session":"36e8cedd-…","epoch":1,"ts":1793541036175,"kind":"drain/claimed","bytes":{"epoch":1,"holder":"kian-serve"},"version":0}
+data: {"seq":3,"session":"36e8cedd-…","epoch":1,"ts":1793541036175,"kind":"input/admitted","bytes":{"content":"hello kian","role":"user"},"version":0}
+data: {"seq":4,…,"kind":"slot/binding","bytes":{"slot":"main","spec":{"fallback":[],"model":"gpt-4o-mini","provider":"local"}}}
+data: {"seq":5,…,"kind":"turn/start","bytes":{"iteration":0}}
+data: {"seq":6,…,"kind":"step/request","bytes":{"body":{…,"messages":[{"content":"hello kian","role":"user"}],…},"iteration":0,"model":"gpt-4o-mini","provider":"local","slot":"main"}}
+data: {"seq":7,"session":"36e8cedd-…","epoch":1,"ts":1793541040187,"kind":"assistant/message","bytes":{"content":{"text":"hello from a scripted provider"},"role":"assistant"},"version":0}
+data: {"seq":8,"session":"36e8cedd-…","epoch":1,"ts":1793541040188,"kind":"turn/end","bytes":{"iteration":0,"outcome":"final_answer"},"version":0}
+data: {"seq":9,"session":"36e8cedd-…","epoch":1,"ts":1793541040189,"kind":"session/ended","reason":"completed","bytes":{},"version":0}
+event: done
+data: ended
+```
+
+Note `step/request` at seq 6: the exact request bytes are persisted **before** the call flies, which
+is what makes replay byte-identical. Read state back from the projection, never from a column:
+
+```bash
+curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"projection\",\"params\":{\"session\":\"$SID\"}}"
+# {"id":3,"jsonrpc":"2.0","result":{"state":"completed"}}
+
+target/debug/kian session inspect "$SID" --config kian.yaml
+```
+
+```
+session             36e8cedd-693f-414e-bcf3-21f9f737f8d2
+state               completed
+events              9 (next seq 10, epoch 1)
+last event ts       1793541040189
+inputs admitted     1
+drain claims        1
+turns               1
+requests            1
+assistant messages  1
+tool calls          0
+tool results        0
+compactions         0
+budget resets       0
+pending inputs      0
+```
+
+### 5. Wake a session (operator action)
+
+```bash
+IDLE=$(curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":4,"method":"create_session"}' | jq -r .result.session)
+target/debug/kian wake-now "$IDLE" --config kian.yaml
+```
+
+```
+session             b8c6cdcf-166f-4e78-b515-89c9a7b2a730
+outcome             started (a drain was spawned)
+```
+
+A wake is advisory: it spawns a drain that finds an empty inbox and exits, and the session stays
+`idle` until an input is admitted. Waking a terminal session is refused honestly rather than silently
+ignored:
+
+```
+$ target/debug/kian wake-now "$SID" --config kian.yaml
+kian: wake-now failed — wake-now: rpc error -32003: session 36e8cedd-… is terminal
+```
+
+### 6. Audit it: replay, export, cache report
+
+```bash
+target/debug/kian session replay "$SID" --config kian.yaml
+target/debug/kian session export "$SID" --config kian.yaml --out audit.jsonl
+target/debug/kian cache-stats --config kian.yaml --json
+```
+
+```
+session             36e8cedd-693f-414e-bcf3-21f9f737f8d2
+events              9
+derived state       "completed"
+live state          (not fetched; pass --url to diff)
+invariants          ok
+model context       1 of 1 requests byte-identical   <- A2: replay derives the same bytes
+```
+```
+exported 9 events (seq 1..=9) to audit.jsonl
+```
+```json
+{
+  "sessions": 2,
+  "requests": 1,
+  "compared_pairs": 0,
+  "prefix_stable_pairs": 0,
+  "compacts": 0,
+  "invalidation_causes": {},
+  "parse_errors": 0
+}
+```
+
+The cache report is the S3 observable: per store, consecutive request pairs compared, how many
+shared a byte-identical message prefix (the provider-independent prefix-cache proxy), and why a
+prefix broke. `compact` is the **only** counted invalidation cause — any other prefix change is
+reported as `unexpected_prefix_change` and is a bug. One request in this session, so there are no
+pairs to compare yet.
+
+`GET /metrics` carries the engine counters and the same cache report:
+
+```bash
+curl -s localhost:7433/metrics | jq '{engine: .engine, pending_wake_depth, cache: .cache}'
+```
+
+```json
+{
+  "engine": {
+    "drain_depth": 0,
+    "drain_duration_ms_total": 4016,
+    "drains_started": 2,
+    "end_writes": 1,
+    "state_transitions": 4,
+    "wakes_folded": 0,
+    "wakes_registered": 0
+  },
+  "pending_wake_depth": 0,
+  "cache": {
+    "compacts": 0,
+    "compared_pairs": 0,
+    "invalidation_causes": {},
+    "parse_errors": 0,
+    "prefix_stable_pairs": 0,
+    "requests": 1,
+    "sessions": 2
+  }
+}
+```
+
+(`drains_started` is 2 because the idempotent wake in step 5 spawned a second, empty drain; the engine
+counters are in-memory and restart with the process, while the cache report is a pure projection over
+the durable stream.)
+
+### 7. Prove durability: `kill -9` mid-turn, restart, no lost work
+
+This is the whole pitch in one run. Submit an input, `kill -9` the server while the provider call is
+in flight, then restart on the same sqlite file:
+
+```bash
+S2=$(curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":5,"method":"create_session"}' | jq -r .result.session)
+curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"submit\",\"params\":{\"session\":\"$S2\",\"content\":\"run the long job\"}}"
+
+sleep 1
+kill -9 <pid-of-kian-serve>
+target/debug/kian session inspect "$S2" --config kian.yaml
+```
+
+```
+session             62795e1c-708d-4b2b-802d-ebeba1151da2
+state               running
+events              6 (next seq 7, epoch 1)
+last event ts       1793541042379
+inputs admitted     1
+drain claims        1
+turns               1
+requests            1               <- the request bytes are durable; the turn is not finished
+assistant messages  0
+```
+
+The session is still `running`: no end write happened, and the dead drain's lease is still unexpired
+(leases are liveness — their job is only to make this session *detectable* as recoverable):
+
+```
+$ target/debug/kian lease inspect --config kian.yaml
+SESSION                                  EPOCH     HOLDER   TTL(ms) LAST-HEARTBEAT  EXPIRED
+36e8cedd-693f-414e-bcf3-21f9f737f8d2      1 kian-serve      1500  1793541040078      yes
+b8c6cdcf-166f-4e78-b515-89c9a7b2a730      1 kian-serve      1500  1793541042313      yes
+62795e1c-708d-4b2b-802d-ebeba1151da2      1 kian-serve      1500  1793541043280       no
+```
+
+Restart `kian serve` on the same `kian.db`; the recovery sweep takes over the expired lease and a new
+drain continues from the stream:
+
+```bash
+target/debug/kian session inspect "$S2" --config kian.yaml    # a few seconds later
+```
+
+```
+session             62795e1c-708d-4b2b-802d-ebeba1151da2
+state               completed
+events              12 (next seq 13, epoch 2)
+inputs admitted     1
+drain claims        2
+turns               2
+requests            2
+assistant messages  1
+```
+
+And the stream shows the takeover without rewriting a single earlier event:
+
+```
+$ curl -sN localhost:7433/sessions/$S2/events | sed -n 's/^data: //p' | grep -v '^ended$' | jq -c '{seq, epoch, kind}'
+{"seq":1,"epoch":0,"kind":"session/created"}
+{"seq":2,"epoch":1,"kind":"drain/claimed"}      <- the drain that died
+{"seq":3,"epoch":1,"kind":"input/admitted"}
+{"seq":4,"epoch":1,"kind":"slot/binding"}
+{"seq":5,"epoch":1,"kind":"turn/start"}
+{"seq":6,"epoch":1,"kind":"step/request"}
+{"seq":7,"epoch":2,"kind":"drain/claimed"}      <- takeover claim, epoch 2
+{"seq":8,"epoch":2,"kind":"turn/start"}
+{"seq":9,"epoch":2,"kind":"step/request"}
+{"seq":10,"epoch":2,"kind":"assistant/message"}
+{"seq":11,"epoch":2,"kind":"turn/end"}
+{"seq":12,"epoch":2,"kind":"session/ended"}
+```
+
+The retried request derived a byte-identical message prefix from the stream — nothing in the earlier
+history was rewritten — which the cache report (now one comparable pair) confirms:
+
+```bash
+target/debug/kian cache-stats --config kian.yaml --json
+```
+
+```json
+{
+  "sessions": 3,
+  "requests": 3,
+  "compared_pairs": 1,
+  "prefix_stable_pairs": 1,
+  "compacts": 0,
+  "invalidation_causes": {},
+  "parse_errors": 0
+}
+```
+
+The process died; the work did not. Safety came from the **epoch** (every drain write carries it and
+the store rejects stale-epoch writes), not from the lease — a partitioned-but-alive old holder would
+be fenced out the same way. The automated version of this run, with six kill points and repeated
+iterations, is `crates/kian-cli/tests/chaos_s1.rs` (scenario S1).
 
 ### Test
 
@@ -150,7 +381,9 @@ cargo test --workspace
 
 Everything — unit, wire-level e2e against a scripted mock provider, and the kill-and-restart
 (chaos-style) suite — runs in the default workspace test invocation. Local e2e sets
-`NO_PROXY=127.0.0.1,localhost` itself (the macOS system proxy intercepts localhost).
+`NO_PROXY=127.0.0.1,localhost` itself (the macOS system proxy intercepts localhost). Suites whose
+environment is absent skip with a log line and never fail; see the
+[environment contract](#environment-contract).
 
 ### Chaos
 
@@ -158,40 +391,6 @@ The S1 crash-recovery chaos suite — kill -9 a live `kian serve` at every drain
 after claim, mid-provider-turn, mid-tool, before/after the end write), restart on the same sqlite,
 and assert no lost work, no half-terminated sessions and monotone epochs — lives in
 `crates/kian-cli/tests/chaos_s1.rs` and runs as part of `cargo test --workspace`.
-
-## Ablation benchmark: passthrough vs. Router judgment (§7.1, C42)
-
-A deterministic, CI-safe replication of the article's §7.1 ablation on kian's own bundle
-(`crates/kian-superagent/tests/ablation_passthrough.rs`): one scripted workload — a mock-IM work
-request plus a train of same-topic CI-style events on `ci/pr-42` — runs twice under identical
-scripted providers, with **passthrough on** (rules route the topic to the dispatched worker; the
-train never reaches the Router) and **passthrough off** (every event reaches the Router). It
-measures kian's native units — Router judge turns (`turn/start` on the Router stream) and the
-read-token proxy (summed `step/request` body bytes on the Router stream) — and asserts
-**directionality only**, never the article's numbers, with `ablation_both_configurations_complete`
-as the honesty anchor (both runs end `thread/completed{completed}` + `channel/delivered`). Fully
-in-process: `ManualClock`, scripted providers, fixed event order, zero credentials, zero network
-egress.
-
-```bash
-# the CI-sized variant (train of 6) — part of cargo test --workspace
-cargo test -p kian-superagent --test ablation_passthrough
-
-# the heavier local variant (trains of 40, three seeds)
-cargo test -p kian-superagent --test ablation_passthrough -- --ignored --nocapture
-```
-
-- **2026-11-01 (C42)**: directionality holds, strictly, in every observed run. Heavy variant
-  (train of 40, seeds 11–13): passthrough on — 3 Router judge turns, ~7.0 KB summed Router
-  request bytes, exactly 2 Router inputs (the work request + the completion report); passthrough
-  off — 4–7 turns (train batching varies by scheduling; each consumed batch is a judge turn),
-  ~34.9–54.4 KB request bytes (the train wrappers ride every post-consumption request under the
-  append-only context), 42 Router inputs. Both configurations completed the identical workload
-  (`thread/completed{completed}` + `channel/delivered`). One deliberate asymmetry, by
-  construction: with passthrough off the CI train can never reach the worker, so after the Router
-  has consumed the whole train the test admits an explicit finish row to the worker (with
-  passthrough on, the worker finishes by observing the train itself — the behavior under test);
-  the ablation never weakens the completion anchor.
 
 ## Live-provider run log (manual, env-gated)
 
@@ -238,18 +437,68 @@ the command may come from config or `KIAN_DSH_BIN` — neither refuses to start,
 All default-CI coverage runs against the C53 scripted fixture peer with zero Node/dsh present:
 the driver suite (`crates/kian-dsh/tests/driver_bridge.rs`) and the mounted e2e — spawn/steer/
 complete, kill-9 takeover continuation, and honest child-crash failure
-(`crates/kian-cli/tests/dsh_bridge.rs`).
+(`crates/kian-cli/tests/dsh_bridge.rs`). Operational detail: [docs/runbook-dsh.md](docs/runbook-dsh.md).
 
 - **2026-11-01 (C54)**: *not executed* — no dsh install was available in the working
-  environment. The bridge, fixture-driven CI proof and the smoke are in place; the first
-  executed live run should be recorded here with its session stream and replay report.
+  environment. The bridge, fixture-driven CI proof and the smoke are in place. (Superseded by the
+  C57 entry below, which did execute the smoke against a real dsh install.)
+- **2026-11-01 (C57)**: *executed* against real dsh **0.2.1-rc.5** (`dsh --profile sdk`).
+  Outcome: honest `SoftFailed { reason: "peer never sent ready within 30s" }` — the stock
+  dsh SDK app is a JSON-RPC server (client-initiated `initialize`, `session.event`
+  notifications, no steer/cancel methods, attempt events only for unsettled attempts) and
+  does not satisfy the C53/ADR-010 v0 contract, which ADR-010 scopes as the bar for an
+  ecosystem-owned dsh-side plugin (outside this repo). The kind vocabulary matches real
+  `dsh-session` verbatim; the gap is transport + pre-flight bytes + steer/interrupt, and the
+  bridge stopped at the documented negative result exactly as ADR-010 §3 requires — never a
+  fabricated completion. The parallel run also surfaced and fixed two real bugs with
+  deterministic regressions: same-millisecond inbox ordering (store migration
+  `v2_inbox_admit_order`, both backends, live-verified on PG 17) and an idle-boundary
+  wake-loss deadlock in the `kian-dsh` driver (bounded `IDLE_INPUT_RECHECK`). All fixture
+  suites green with the gate present; the mounted e2e then ran 300 consecutive clean runs.
+  Full survey, evidence and re-run commands: [docs/runbook-dsh.md](docs/runbook-dsh.md).
+  S6-live stays open until a contract-v0 dsh-side peer (or an ecosystem plugin) exists and
+  the smoke settles green.
+
+## Ablation benchmark: passthrough vs. Router judgment (§7.1, C42)
+
+A deterministic, CI-safe replication of the article's §7.1 ablation on kian's own bundle
+(`crates/kian-superagent/tests/ablation_passthrough.rs`): one scripted workload — a mock-IM work
+request plus a train of same-topic CI-style events on `ci/pr-42` — runs twice under identical
+scripted providers, with **passthrough on** (rules route the topic to the dispatched worker; the
+train never reaches the Router) and **passthrough off** (every event reaches the Router). It
+measures kian's native units — Router judge turns (`turn/start` on the Router stream) and the
+read-token proxy (summed `step/request` body bytes on the Router stream) — and asserts
+**directionality only**, never the article's numbers, with `ablation_both_configurations_complete`
+as the honesty anchor (both runs end `thread/completed{completed}` + `channel/delivered`). Fully
+in-process: `ManualClock`, scripted providers, fixed event order, zero credentials, zero network
+egress.
+
+```bash
+# the CI-sized variant (train of 6) — part of cargo test --workspace
+cargo test -p kian-superagent --test ablation_passthrough
+
+# the heavier local variant (trains of 40, three seeds)
+cargo test -p kian-superagent --test ablation_passthrough -- --ignored --nocapture
+```
+
+- **2026-11-01 (C42)**: directionality holds, strictly, in every observed run. Heavy variant
+  (train of 40, seeds 11–13): passthrough on — 3 Router judge turns, ~7.0 KB summed Router
+  request bytes, exactly 2 Router inputs (the work request + the completion report); passthrough
+  off — 4–7 turns (train batching varies by scheduling; each consumed batch is a judge turn),
+  ~34.9–54.4 KB request bytes (the train wrappers ride every post-consumption request under the
+  append-only context), 42 Router inputs. Both configurations completed the identical workload
+  (`thread/completed{completed}` + `channel/delivered`). One deliberate asymmetry, by
+  construction: with passthrough off the CI train can never reach the worker, so after the Router
+  has consumed the whole train the test admits an explicit finish row to the worker (with
+  passthrough on, the worker finishes by observing the train itself — the behavior under test);
+  the ablation never weakens the completion anchor.
 
 ## Phase-1 acceptance checklist (S1–S3)
 
 | Scenario | Card | Status | Proof |
 |----------|------|--------|-------|
 | S1 crash recovery (kill -9 at every drain stage, restart, no lost work) | C15 | **done** | `chaos_s1.rs` (six kill points × repeated runs; zombie-epoch writes rejected); API-level preview in `restart_serve.rs` |
-| S2 steer/interrupt semantics + honesty | C16 | in flight | card C16 e2e; steer boundary + synthetic marker + `interrupted ≠ failed` |
+| S2 steer/interrupt semantics + honesty | C16 | **done** | `s2_steer_interrupt.rs`: `steer_lands_at_next_safe_boundary_with_strippable_synthetic_marker` (no input lands inside an in-flight provider turn; the synthetic marker is strippable from durable context), `interrupt_mid_tool_settles_on_abort_and_resumes_honestly` (interrupt ≠ failed), `interrupt_of_idle_and_completed_sessions_is_a_noop` |
 | S3 cache-byte stability | C17 | **done** | `s3_cache_stability.rs`: consecutive requests share the byte prefix; only a `compact` breaks it and counts under the `compact` cause; `unexpected_prefix_change` stays zero; exposed via `GET /metrics` and `kian cache-stats` |
 
 Unit-level underpinnings: A2 golden-bytes and A3 compact-prefix tests in `kian-core`
@@ -267,7 +516,9 @@ and a heartbeat watchdog that admits offline health inputs to affected worker se
 ### Build (S4 + S5)
 
 ```bash
-cargo build --workspace   # 11 members: Phase-1 eight + kian-exec, kian-superagent, kiand
+cargo build --workspace   # 13 members: Phase 1's eight (kian-core, kian-store, kian-orchestrator,
+                          # kian-llm, kian-loop, kian-plugin, kian-endpoint, kian-cli) plus
+                          # kian-exec, kian-superagent, kiand, then kian-sdk, kian-dsh
 ```
 
 ### kiand — the execution endpoint daemon (S5)
@@ -290,7 +541,14 @@ cat > kian.yaml <<'EOF'
 listen: "127.0.0.1:7433"
 storage:
   sqlite: "./kian.db"
-agents:
+agent:                       # the single-agent definition Phase 1 used (always required)
+  id: default
+  model_slots:
+    main:
+      provider: my-provider
+      model: gpt-4o-mini
+  tools: ["fs.read"]
+agents:                      # the bundle's named agent templates (additive)
   router:
     id: router
     version: 1
@@ -331,6 +589,14 @@ providers:
     base_url: "https://api.openai.com/v1"
     api_key_env: MY_PROVIDER_KEY
 plugins: ["openai-compat", "local-tools", "superagent", "remote-exec"]
+drain:
+  max_iterations: 32
+recovery:                    # required, as in Phase 1 (no silent policy defaults)
+  rules:
+    - class: rate_limited
+      action: {backoff_retry: {delay_ms: 500}}
+    - class: unknown
+      action: fail
 EOF
 cargo run -p kian-cli --bin kian -- serve
 ```
@@ -367,7 +633,7 @@ process, paired with the assembled server).
 
 | Scenario | Card | Status | Proof |
 |----------|------|--------|-------|
-| S4 super-agent demo (mock-IM → Router judges → Worker completes → ≤100-word reply + structured delivery) | C28 | **done** | `s4_superagent_demo.rs` (7 tests over the assembled serve, mock channel + scripted providers): `s4_router_judges_and_dispatches`, `s4_worker_completes_with_evidence`, `s4_reply_within_word_limit`, `s4_structured_delivery`, `s4_delegation_audit_export_replays`, `s4_readme_demo_cli_mock_channel_send_against_serve`, and the negative path `s4_gate_failed_worker_never_reaches_delivered_done_reply`; mechanics covered by `superagent_serve.rs` (C27 assembly: serve smoke, watchdog→health-input, startup order, Phase-1 compat) |
+| S4 super-agent demo (mock-IM → Router judges → Worker completes → ≤100-word reply + structured delivery) | C28 | **done** | `s4_superagent_demo.rs` (8 tests over the assembled serve, mock channel + scripted providers): `s4_router_judges_and_dispatches`, `s4_worker_completes_with_evidence`, `s4_reply_within_word_limit`, `s4_structured_delivery`, `s4_delegation_audit_export_replays`, `s4_readme_demo_cli_mock_channel_send_against_serve`, `s4_shaping_config_spills_over_cap_channel_event_on_assembled_server`, and the negative path `s4_gate_failed_worker_never_reaches_delivered_done_reply`; mechanics covered by `superagent_serve.rs` (C27 assembly: serve smoke, watchdog→health-input, startup order, Phase-1 compat) |
 | S5 BYOM (cloud loop + kiand execution + watchdog detects endpoint offline) | C29 | **done** | `s5_byom_e2e.rs`: `s5_exec_on_kiand_round_trip` (exec → durable row → dial → real `tool/result` → completion), `s5_offline_queue_parks_durable` (kill -9 while queued → row parks, no fake result), `s5_watchdog_detects_offline_within_bound` (durable health input within `offline_after + poll + tick` + slack), `s5_reconnect_drains_queue` (restart same port → reconnect drains → result flows → completion strictly after the real result), `s5_honesty_across_offline_window` (queue timeout first → honest `Timeout`, row `abandoned`, completion only after the honest error) |
 
 Phase-2 final four-gate run (card C29 closeout, 2026-11-01): `cargo build --workspace`,
@@ -587,8 +853,12 @@ A local postgres via docker (documented recipe; not a CI gate):
 ```bash
 docker run -d --name kian-pg -e POSTGRES_PASSWORD=kian -p 5432:5432 postgres:16
 docker exec kian-pg createdb -U postgres kian
-export KIAN_PG_URL="postgres://postgres:kian@127.0.0.1:5432/kian"
+export KIAN_PG_URL="postgres://postgres:***@127.0.0.1:5432/kian"
 ```
+
+Full local runbook — Homebrew/dedicated `createdb` setup, the docker alternative on postgres 17,
+per-suite commands, and exactly what the S8 kill -9 e2e proves:
+[docs/runbook-postgres.md](docs/runbook-postgres.md).
 
 ```yaml
 # kian.yaml (postgres mode)
@@ -729,8 +999,8 @@ CI proves the bridge against the C53 scripted fixture peer with zero Node/dsh pr
 `crates/kian-dsh/tests/driver_bridge.rs` (driver), `crates/kian-superagent/tests/dsh_conformance.rs`
 (the C53 mapping conformance suite), and the mounted e2e `crates/kian-cli/tests/dsh_bridge.rs`
 — spawn/steer/complete, kill-9 takeover continuation, honest `interrupted` on child crash. The
-live run is env-gated and recorded in the
-[run log](#live-dsh-bridge-run-log-manual-env-gated) above.
+live leg is env-gated; its executed outcome (an honest negative against dsh 0.2.1-rc.5) is recorded
+in the [run log](#live-dsh-bridge-run-log-manual-env-gated) above.
 
 ## Phase-4 acceptance checklist (S8 + S6)
 
@@ -739,7 +1009,7 @@ Scenario wording lives in [SPEC §2.5](docs/SPEC.md); proof is by the named test
 | Scenario | Card | Status | Proof |
 |----------|------|--------|-------|
 | S8 multi-replica takeover (two replicas, kill -9 mid-drain, no split-brain) | C47 + C52 | **demonstrated** (env-gated `KIAN_PG_URL`; default CI excluded) | `crates/kian-cli/tests/postgres_s8.rs::s8_two_replicas_kill9_takeover_no_split_brain` (real `kian serve` children, real kill -9, stale-epoch probe rejected); store/exec pg semantics suites in `kian-store`/`kian-exec` `tests/postgres.rs` |
-| S6 harness integration (dsh interaction unchanged, made durable) | C53 + C54 | **demonstrated — pending live run** | fixture-proven in CI: `kian-dsh/tests/driver_bridge.rs` + `kian-superagent/tests/dsh_conformance.rs` (every mapping row, replay byte-parity, pre-flight ordering, honest unknown-kind errors) and `kian-cli/tests/dsh_bridge.rs` (mounted e2e: spawn/steer/complete, kill-9 takeover, child crash → `interrupted`); the live run is env-gated (`KIAN_DSH_BIN`) and honestly recorded as *not executed* in the [run log](#live-dsh-bridge-run-log-manual-env-gated) — not claimed as CI-proven |
+| S6 harness integration (dsh interaction unchanged, made durable) | C53 + C54, live leg C57 | **demonstrated — fixture-proven; live leg executed (honest negative), S6-live open** | fixture-proven in CI: `kian-dsh/tests/driver_bridge.rs` + `kian-superagent/tests/dsh_conformance.rs` (every mapping row, replay byte-parity, pre-flight ordering, honest unknown-kind errors) and `kian-cli/tests/dsh_bridge.rs` (mounted e2e: spawn/steer/complete, kill-9 takeover, child crash → `interrupted`). The live leg (`KIAN_DSH_BIN`) **ran** against real dsh 0.2.1-rc.5 and returned an honest `SoftFailed { reason: "peer never sent ready within 30s" }` — the stock dsh SDK app does not meet the ADR-010 contract-v0 bar — so S6-live **stays open**; it is not claimed as CI-proven, and the fixture suites remain the CI proof (see the [run log](#live-dsh-bridge-run-log-manual-env-gated)) |
 | SDK freeze (wire-only client, golden bytes) | C46 | done | `crates/kian-sdk/tests/` — every typed method round-trips against a scripted server with golden request bytes; matchable typed errors |
 | GitHub channel + webhook receiver (verify-then-parse, admit-only) | C48 + C49 | done | `crates/kian-superagent/tests/github_channel.rs` (mapping, send honesty, fail-closed token) + `crates/kian-cli/tests/webhook_receiver.rs` (signature matrix, 413/415-before-signature, 429 + audit, idempotent replay) + the iron-rule grep in `tests/iron_rule.rs` |
 | Postgres export parity (S7 shape across backends) | C50 | done (env-gated) | `kian-store/tests/postgres.rs` — byte-identical JSONL export vs a sqlite store seeded with the same stream |
