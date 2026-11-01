@@ -108,6 +108,19 @@ impl WatchdogPrompt {
     pub fn render(&self) -> String {
         self.template.clone()
     }
+
+    /// Renders the bootstrap prompt of a re-armed successor (kian-62):
+    /// the observable cause prefix (frozen predecessors + reasons)
+    /// followed by the plain watchdog prompt. Rendered once at
+    /// bootstrap and persisted — replays are byte-identical.
+    #[must_use]
+    pub fn render_re_arm(&self, ended: &[crate::rearm::EndedResident]) -> String {
+        format!(
+            "[re-arm] This session re-arms the resident watchdog; {}. The watch over delegated \
+             threads continues on this session. ",
+            crate::rearm::re_arm_cause(ended)
+        ) + &self.render()
+    }
 }
 
 /// The resident watchdog profile: the configured fixed session id, the
@@ -124,6 +137,9 @@ pub struct WatchdogProfile {
     /// `main` slot; tools exactly [`WATCHDOG_TOOLS`]).
     pub agent: AgentDef,
     pub prompt: WatchdogPrompt,
+    /// kian-62 re-arm: the ended, frozen predecessors of `session`
+    /// (empty = generation 0, the configured pinned session itself).
+    pub re_arm: Vec<crate::rearm::EndedResident>,
 }
 
 impl WatchdogProfile {
@@ -135,6 +151,7 @@ impl WatchdogProfile {
             session,
             agent,
             prompt: WatchdogPrompt::default(),
+            re_arm: Vec::new(),
         }
     }
 
@@ -143,17 +160,27 @@ impl WatchdogProfile {
     /// first hold appends `session/created`. Idempotent per
     /// [`WATCHDOG_BOOTSTRAP_KEY`], so assembly may call it at every
     /// startup.
+    ///
+    /// kian-62: for a re-armed successor (`re_arm` non-empty) the key
+    /// becomes the per-generation
+    /// [`watchdog:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
+    /// and the payload carries the observable re-arm cause.
     pub async fn bootstrap(
         &self,
         inbox: &dyn InboxWriter,
     ) -> Result<AdmitReceipt, InboxWriteError> {
-        inbox
-            .admit(
-                self.session,
+        let (key, payload) = if self.re_arm.is_empty() {
+            (
+                WATCHDOG_BOOTSTRAP_KEY.to_string(),
                 json!(self.prompt.render()),
-                Some(WATCHDOG_BOOTSTRAP_KEY.to_string()),
             )
-            .await
+        } else {
+            (
+                crate::rearm::re_arm_bootstrap_key(WATCHDOG_BOOTSTRAP_KEY, self.session),
+                json!(self.prompt.render_re_arm(&self.re_arm)),
+            )
+        };
+        inbox.admit(self.session, payload, Some(key)).await
     }
 }
 
@@ -821,6 +848,37 @@ mod tests {
         assert_eq!(admits[0].0, session);
         assert_eq!(admits[0].1, json!(WATCHDOG_PROMPT_TEMPLATE));
         assert_eq!(admits[0].2.as_deref(), Some(WATCHDOG_BOOTSTRAP_KEY));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_of_a_re_armed_successor_carries_cause_and_stable_key() {
+        use crate::rearm::{EndedResident, re_arm_bootstrap_key, successor_session};
+        use kian_core::events::EndReason;
+
+        let inbox = LoggingInbox::shared();
+        let pinned = sid(11);
+        let live = successor_session(pinned);
+        let mut profile = WatchdogProfile::new(live, watchdog_template("mock", "m", 1));
+        profile.re_arm = vec![EndedResident {
+            session: pinned,
+            reason: EndReason::Cancelled,
+        }];
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        assert_eq!(admits[0].0, live);
+        assert_eq!(
+            admits[0].2.as_deref(),
+            Some(re_arm_bootstrap_key(WATCHDOG_BOOTSTRAP_KEY, live).as_str())
+        );
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        assert!(payload.starts_with("[re-arm]"), "got: {payload}");
+        assert!(payload.contains(&pinned.0.to_string()));
+        assert!(payload.contains("(cancelled)"));
+        assert!(payload.contains(WATCHDOG_PROMPT_TEMPLATE));
     }
 
     /// `read_progress` over a stuck worker: status outstanding, the

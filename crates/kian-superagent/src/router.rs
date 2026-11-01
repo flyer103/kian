@@ -132,6 +132,21 @@ impl JudgePrompt {
     pub fn render(&self, pending: usize) -> String {
         self.template.replace("{inputs}", &pending.to_string())
     }
+
+    /// Renders the bootstrap prompt of a re-armed successor (kian-62):
+    /// an observable, derivable cause prefix — naming every frozen
+    /// predecessor and its end reason — followed by the plain judge
+    /// prompt, so the watch's charter rides along unchanged. The prefix
+    /// is rendered once at bootstrap and persisted in the input payload;
+    /// replays are byte-identical (constraint-3 pattern).
+    #[must_use]
+    pub fn render_re_arm(&self, ended: &[crate::rearm::EndedResident], pending: usize) -> String {
+        format!(
+            "[re-arm] This session re-arms the resident Router; {}. The watch continues on this \
+             session; prior issues and thread state live on those streams (recall can read them). ",
+            crate::rearm::re_arm_cause(ended)
+        ) + &self.render(pending)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +172,11 @@ pub struct RouterProfile {
     /// refused with an honest tool error naming the missing config —
     /// never a silent refusal, never an uncapped spawn.
     pub speculation: Option<SpeculationPolicy>,
+    /// kian-62 re-arm: the ended, frozen predecessors of `session`
+    /// (empty = generation 0, the configured pinned session itself).
+    /// Assembly fills it from the boot-time chain walk; the bootstrap
+    /// keys and prompt above branch on it.
+    pub re_arm: Vec<crate::rearm::EndedResident>,
 }
 
 impl RouterProfile {
@@ -171,6 +191,7 @@ impl RouterProfile {
             im: ImPolicy::default(),
             structured: StructuredPolicy::default(),
             speculation: None,
+            re_arm: Vec::new(),
         }
     }
 
@@ -179,17 +200,28 @@ impl RouterProfile {
     /// not-yet-existing) session id — the first execution hold appends
     /// `session/created`. Idempotent per [`ROUTER_BOOTSTRAP_KEY`], so
     /// assembly may call it at every startup.
+    ///
+    /// kian-62: for a re-armed successor (`re_arm` non-empty) the key
+    /// becomes the per-generation
+    /// [`router:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
+    /// and the payload carries the observable re-arm cause — the frozen
+    /// predecessors and their reasons — before the judge prompt.
     pub async fn bootstrap(
         &self,
         inbox: &dyn InboxWriter,
     ) -> Result<AdmitReceipt, InboxWriteError> {
-        inbox
-            .admit(
-                self.session,
+        let (key, payload) = if self.re_arm.is_empty() {
+            (
+                ROUTER_BOOTSTRAP_KEY.to_string(),
                 json!(self.judge.render(0)),
-                Some(ROUTER_BOOTSTRAP_KEY.to_string()),
             )
-            .await
+        } else {
+            (
+                crate::rearm::re_arm_bootstrap_key(ROUTER_BOOTSTRAP_KEY, self.session),
+                json!(self.judge.render_re_arm(&self.re_arm, 0)),
+            )
+        };
+        inbox.admit(self.session, payload, Some(key)).await
     }
 }
 
@@ -1281,7 +1313,7 @@ mod tests {
 
     /// A scripted inbox (admits recorded, wakes recorded).
     struct ScriptedInbox {
-        admits: Mutex<Vec<(SessionId, Option<String>)>>,
+        admits: Mutex<Vec<(SessionId, serde_json::Value, Option<String>)>>,
         dedup: bool,
     }
 
@@ -1289,10 +1321,13 @@ mod tests {
         fn admit(
             &self,
             session: SessionId,
-            _payload: serde_json::Value,
+            payload: serde_json::Value,
             idempotency_key: Option<String>,
         ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
-            self.admits.lock().unwrap().push((session, idempotency_key));
+            self.admits
+                .lock()
+                .unwrap()
+                .push((session, payload, idempotency_key));
             let dedup = self.dedup;
             Box::pin(async move {
                 Ok(AdmitReceipt {
@@ -1357,7 +1392,57 @@ mod tests {
         let admits = inbox.admits.lock().unwrap().clone();
         assert_eq!(admits.len(), 1);
         assert_eq!(admits[0].0, router);
-        assert_eq!(admits[0].1.as_deref(), Some(ROUTER_BOOTSTRAP_KEY));
+        assert_eq!(admits[0].2.as_deref(), Some(ROUTER_BOOTSTRAP_KEY));
+        // Generation 0 is byte-identical to the pre-kian-62 bootstrap:
+        // the plain judge prompt, no re-arm prefix.
+        assert_eq!(admits[0].1, json!(profile.judge.render(0)));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_of_a_re_armed_successor_carries_cause_and_stable_key() {
+        use crate::rearm::{EndedResident, re_arm_bootstrap_key, successor_session};
+        use kian_core::events::EndReason;
+
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let pinned = sid(11);
+        let live = successor_session(pinned);
+        let mut profile = RouterProfile::new(live, router_template("mock", "mock-router"));
+        profile.re_arm = vec![EndedResident {
+            session: pinned,
+            reason: EndReason::Completed,
+        }];
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        // The live (successor) session, never the frozen predecessor.
+        assert_eq!(admits[0].0, live);
+        // Per-generation key: distinct from every legacy key and stable
+        // across reboots (deterministic successor ids).
+        assert_eq!(
+            admits[0].2.as_deref(),
+            Some(re_arm_bootstrap_key(ROUTER_BOOTSTRAP_KEY, live).as_str())
+        );
+        assert_ne!(admits[0].2.as_deref(), Some(ROUTER_BOOTSTRAP_KEY));
+        // The payload is the observable cause: the re-arm prefix names
+        // the frozen predecessor and its reason, then the full judge
+        // prompt (the watch's charter rides along unchanged).
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        assert!(payload.starts_with("[re-arm]"), "got: {payload}");
+        assert!(payload.contains(&pinned.0.to_string()));
+        assert!(payload.contains("(completed)"));
+        assert!(payload.contains(&profile.judge.render(0)));
+        // Replay-stable: same chain renders byte-identically.
+        assert_eq!(payload, &render_successor_prompt(&profile));
+    }
+
+    fn render_successor_prompt(profile: &RouterProfile) -> String {
+        profile.judge.render_re_arm(&profile.re_arm, 0)
     }
 
     #[test]
