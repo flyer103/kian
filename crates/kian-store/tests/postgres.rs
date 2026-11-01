@@ -893,7 +893,7 @@ async fn pg_same_millisecond_inputs_consume_in_admission_order() {
     if !gated() {
         return;
     }
-    let mut pg = PgStore::open().await;
+    let pg = PgStore::open().await;
     let sid = SessionId::new();
 
     let first = InputRow {
@@ -945,7 +945,7 @@ async fn pg_v2_upgrade_backfills_legacy_inbox_rows() {
     if !gated() {
         return;
     }
-    let mut pg = PgStore::open().await;
+    let pg = PgStore::open().await;
     // Re-migrate down is impossible by design; instead simulate a legacy
     // DB by checking the applied chain includes v2 and that rows
     // admitted before this test's knowledge of v2 still order by their

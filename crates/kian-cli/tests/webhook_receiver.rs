@@ -7,7 +7,6 @@
 
 mod common;
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use common::{ScriptedResponse, force_no_proxy, spawn_scripted_provider, temp_dir};
@@ -22,8 +21,11 @@ use sha2::Sha256;
 const ROUTER_SESSION: &str = "1234abcd-1234-abcd-1234-abcd1234abcd";
 const WEBHOOK_SECRET: &str = "whsec_e2e";
 
-/// Env-var tests mutate process-global state; serialize them.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
+/// Env-var tests mutate process-global state; serialize them. The
+/// guard is held across awaits (server startup), so it must be
+/// async-aware (clippy await_holding_lock).
+static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn sign(body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(WEBHOOK_SECRET.as_bytes()).expect("key");
@@ -205,7 +207,7 @@ async fn await_admissions(sqlite: &std::path::Path, delivery_id: &str, expected:
 /// stays one admission; an invalid signature admits nothing.
 #[tokio::test]
 async fn verified_delivery_admits_exactly_once_and_replay_is_idempotent() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().await;
     force_no_proxy();
     unsafe { std::env::set_var("KIAN_GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET) };
 
@@ -244,7 +246,7 @@ async fn verified_delivery_admits_exactly_once_and_replay_is_idempotent() {
 /// Invalid signature → 401, zero admissions.
 #[tokio::test]
 async fn invalid_signature_is_401_with_zero_admissions() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().await;
     force_no_proxy();
     unsafe { std::env::set_var("KIAN_GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET) };
 
@@ -267,7 +269,7 @@ async fn invalid_signature_is_401_with_zero_admissions() {
 /// (fail-closed, never a signature-less receiver).
 #[tokio::test]
 async fn configured_route_without_secret_refuses_to_start() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().await;
     force_no_proxy();
     unsafe { std::env::remove_var("KIAN_GITHUB_WEBHOOK_SECRET") };
 
@@ -292,7 +294,7 @@ async fn configured_route_without_secret_refuses_to_start() {
 /// Phase-1/C27 servers never expose the webhook surface.
 #[tokio::test]
 async fn route_is_absent_without_a_github_channel() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().await;
     force_no_proxy();
     unsafe { std::env::remove_var("KIAN_GITHUB_WEBHOOK_SECRET") };
 

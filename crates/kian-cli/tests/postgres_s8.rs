@@ -264,7 +264,7 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
         .iter()
         .filter(|e| e.kind == EventKind::DrainClaimed)
         .filter_map(|e| e.bytes.get("holder").and_then(|h| h.as_str()))
-        .last()
+        .next_back()
         .unwrap_or_default();
     assert_eq!(
         last_claim_holder, "s8-replica-a",
