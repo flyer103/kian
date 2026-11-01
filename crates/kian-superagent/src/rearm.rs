@@ -33,7 +33,7 @@
 //! ticks — inputs that arrived while the predecessor was terminal were
 //! never consumed and stay honestly pending on the frozen stream.
 
-use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
+use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::SessionId;
 use kian_core::state::project;
 
@@ -248,6 +248,7 @@ pub fn re_arm_cause(ended: &[EndedResident]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kian_core::events::SCHEMA_VERSION;
     use serde_json::json;
 
     // A readable deterministic id builder: uuid v4 shape is irrelevant
