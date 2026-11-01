@@ -236,12 +236,22 @@ impl StoreRecall {
     /// or to spawned workers. A spill on a session unreachable from
     /// the Router stream therefore cannot exist today; if a future
     /// route widens admission, this scan list widens with it.
-    pub async fn rebuild_spill_index(&self, router: SessionId) -> Result<(), String> {
-        let mut events = self
-            .store
-            .rebuild(router)
-            .await
-            .map_err(|e| format!("spill index rebuild (router): {e}"))?;
+    ///
+    /// kian-62: `chain` is the re-arm chain — ended frozen predecessors
+    /// first, then the live resident session (see
+    /// [`RouterProfile::re_arm`]); predecessor streams still carry
+    /// spill envelopes the index must serve.
+    pub async fn rebuild_spill_index(&self, chain: &[SessionId]) -> Result<(), String> {
+        let mut events = Vec::new();
+        for session in chain {
+            let part = self.store.rebuild(*session).await.map_err(|e| {
+                format!(
+                    "spill index rebuild (resident {session}): {e}",
+                    session = session.0
+                )
+            })?;
+            events.extend(part);
+        }
         for worker in worker_sessions(&events) {
             let worker_events = self
                 .store
@@ -1091,11 +1101,24 @@ pub async fn start_services(
 
     // 1. Rebuild the passthrough registry from event streams (the
     //    NoLostWork analog for subscriptions; nothing authoritative
-    //    survives only in memory).
-    let mut events = store
-        .rebuild(router)
-        .await
-        .map_err(|e| format!("passthrough registry rebuild: {e}"))?;
+    //    survives only in memory). kian-62: the scan covers the whole
+    //    re-arm chain — ended predecessors still carry thread/started
+    //    lineage and worker references the registry must serve.
+    let resident_chain: Vec<SessionId> = services
+        .profile
+        .re_arm
+        .iter()
+        .map(|ended| ended.session)
+        .chain(std::iter::once(router))
+        .collect();
+    let mut events = Vec::new();
+    for session in &resident_chain {
+        let part = store
+            .rebuild(*session)
+            .await
+            .map_err(|e| format!("passthrough registry rebuild (resident {}): {e}", session.0))?;
+        events.extend(part);
+    }
     for worker in worker_sessions(&events) {
         let worker_events = store
             .rebuild(worker)
@@ -1106,6 +1129,7 @@ pub async fn start_services(
     let registry = PassthroughRegistry::rebuild(&events);
     tracing::info!(
         topics = registry.len(),
+        chain = resident_chain.len(),
         "superagent: passthrough registry rebuilt from streams"
     );
     services.subscriptions.install_registry(registry);
@@ -1114,7 +1138,7 @@ pub async fn start_services(
     //     scanned universe — a pure location projection, reads only.
     services
         .recall
-        .rebuild_spill_index(router)
+        .rebuild_spill_index(&resident_chain)
         .await
         .map_err(|e| format!("spill index rebuild: {e}"))?;
     record(&order, "spill_index_rebuilt");

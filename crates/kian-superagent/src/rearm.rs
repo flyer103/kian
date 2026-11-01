@@ -160,73 +160,65 @@ pub fn terminal_resident(
     }
 }
 
-/// The pure chain walk: `stream_of` yields a candidate session's
-/// committed stream (empty = never created). See the module docs for
-/// the semantics; the walk is deterministic because
-/// [`successor_session`] is.
-pub fn resolve_re_arm<S, E>(pinned: SessionId, stream_of: S) -> Result<ReArm, ReArmError<E>>
+/// The chain walk: `stream_of` yields a candidate session's committed
+/// stream (empty = never created). See the module docs for the
+/// semantics; the walk is deterministic because [`successor_session`]
+/// is.
+///
+/// `stream_of` is a port-shaped callback (the bundle crate reaches no
+/// store — the §7 iron rule): each call returns a future producing the
+/// candidate's stream, and assembly passes a closure reading the real
+/// event store.
+pub fn resolve_re_arm<S, E>(
+    pinned: SessionId,
+    mut stream_of: S,
+) -> futures::future::BoxFuture<'static, Result<ReArm, ReArmError<E>>>
 where
-    S: FnMut(SessionId) -> Result<Vec<Event>, E>,
+    S: FnMut(SessionId) -> futures::future::BoxFuture<'static, Result<Vec<Event>, E>>
+        + Send
+        + 'static,
+    E: Send + 'static,
 {
-    let mut stream_of = stream_of;
-    let mut current = pinned;
-    let mut ended: Vec<EndedResident> = Vec::new();
-    loop {
-        if ended.len() >= RE_ARM_CHAIN_BOUND {
-            return Err(ReArmError::ChainTooLong {
-                pinned,
-                bound: RE_ARM_CHAIN_BOUND,
-            });
-        }
-        let events = stream_of(current).map_err(ReArmError::Stream)?;
-        let Some(link) = terminal_resident(&events).map_err(|e| match e {
-            ReArmError::Project(msg) => ReArmError::Project(msg),
-            ReArmError::Stream(x) => match x {},
-            ReArmError::ChainTooLong { pinned, bound } => {
-                ReArmError::ChainTooLong { pinned, bound }
+    Box::pin(async move {
+        let mut current = pinned;
+        let mut ended: Vec<EndedResident> = Vec::new();
+        loop {
+            if ended.len() >= RE_ARM_CHAIN_BOUND {
+                return Err(ReArmError::ChainTooLong {
+                    pinned,
+                    bound: RE_ARM_CHAIN_BOUND,
+                });
             }
-        })?
-        else {
-            return Ok(ReArm {
-                live: current,
-                ended,
-            });
-        };
-        ended.push(link);
-        current = successor_session(current);
-    }
+            let events = stream_of(current).await.map_err(ReArmError::Stream)?;
+            let Some(link) = terminal_resident(&events).narrow()? else {
+                return Ok(ReArm {
+                    live: current,
+                    ended,
+                });
+            };
+            ended.push(link);
+            current = successor_session(current);
+        }
+    })
 }
 
-/// The store walk: [`resolve_re_arm`] over `kian-store` rebuilds.
-pub async fn resolve_re_arm_in_store(
-    store: &kian_store::EventStore,
-    pinned: SessionId,
-) -> Result<ReArm, ReArmError<kian_store::InboxError>> {
-    let mut current = pinned;
-    let mut ended: Vec<EndedResident> = Vec::new();
-    loop {
-        if ended.len() >= RE_ARM_CHAIN_BOUND {
-            return Err(ReArmError::ChainTooLong {
-                pinned,
-                bound: RE_ARM_CHAIN_BOUND,
-            });
-        }
-        let events = store.rebuild(current).await.map_err(ReArmError::Stream)?;
-        let Some(link) = terminal_resident(&events).map_err(|e| match e {
-            ReArmError::Project(msg) => ReArmError::Project(msg),
-            ReArmError::Stream(x) => match x {},
-            ReArmError::ChainTooLong { pinned, bound } => {
-                ReArmError::ChainTooLong { pinned, bound }
+/// Infallible-error narrowing: [`terminal_resident`] never fails with a
+/// stream error, so its error type widens losslessly to any
+/// [`ReArmError<E>`].
+trait Narrow<E> {
+    fn narrow(self) -> Result<Option<EndedResident>, ReArmError<E>>;
+}
+
+impl<E> Narrow<E> for Result<Option<EndedResident>, ReArmError<std::convert::Infallible>> {
+    fn narrow(self) -> Result<Option<EndedResident>, ReArmError<E>> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(ReArmError::Project(msg)) => Err(ReArmError::Project(msg)),
+            Err(ReArmError::Stream(x)) => match x {},
+            Err(ReArmError::ChainTooLong { pinned, bound }) => {
+                Err(ReArmError::ChainTooLong { pinned, bound })
             }
-        })?
-        else {
-            return Ok(ReArm {
-                live: current,
-                ended,
-            });
-        };
-        ended.push(link);
-        current = successor_session(current);
+        }
     }
 }
 
@@ -295,8 +287,10 @@ mod tests {
         events
     }
 
-    fn ok(events: Vec<Event>) -> Result<Vec<Event>, std::convert::Infallible> {
-        Ok(events)
+    fn ok(
+        events: Vec<Event>,
+    ) -> futures::future::BoxFuture<'static, Result<Vec<Event>, std::convert::Infallible>> {
+        Box::pin(async { Ok(events) })
     }
 
     #[test]
@@ -350,53 +344,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_fresh_store_arms_the_pinned_session() {
+    #[tokio::test]
+    async fn resolve_fresh_store_arms_the_pinned_session() {
         let pinned = session(1);
-        let rearm = resolve_re_arm(pinned, |_| ok(vec![])).unwrap();
+        let rearm = resolve_re_arm(pinned, |_| ok(vec![])).await.unwrap();
         assert_eq!(rearm, ReArm::pinned(pinned));
         assert!(!rearm.is_succession());
         assert_eq!(rearm.scan_chain(), vec![pinned]);
     }
 
-    #[test]
-    fn resolve_live_pinned_session_stays_generation_zero() {
+    #[tokio::test]
+    async fn resolve_live_pinned_session_stays_generation_zero() {
         let pinned = session(1);
-        let rearm = resolve_re_arm(pinned, |s| {
+        let rearm = resolve_re_arm(pinned, move |s| {
             ok(if s == pinned { running(pinned) } else { vec![] })
         })
+        .await
         .unwrap();
         assert_eq!(rearm, ReArm::pinned(pinned));
     }
 
-    #[test]
-    fn resolve_soft_failed_pinned_session_stays_generation_zero() {
+    #[tokio::test]
+    async fn resolve_soft_failed_pinned_session_stays_generation_zero() {
         // The card's original framing: a soft-failed resident projects
         // idle and re-opens on its next admitted input — same session,
         // no successor.
         let pinned = session(1);
-        let rearm = resolve_re_arm(pinned, |s| {
+        let rearm = resolve_re_arm(pinned, move |s| {
             ok(if s == pinned {
                 ended(pinned, EndReason::Failed)
             } else {
                 vec![]
             })
         })
+        .await
         .unwrap();
         assert_eq!(rearm, ReArm::pinned(pinned));
     }
 
-    #[test]
-    fn resolve_terminal_pinned_session_arms_its_successor() {
+    #[tokio::test]
+    async fn resolve_terminal_pinned_session_arms_its_successor() {
         let pinned = session(1);
         let successor = successor_session(pinned);
-        let rearm = resolve_re_arm(pinned, |s| {
+        let rearm = resolve_re_arm(pinned, move |s| {
             ok(if s == pinned {
                 ended(pinned, EndReason::Completed)
             } else {
                 vec![]
             })
         })
+        .await
         .unwrap();
         assert_eq!(rearm.live, successor);
         assert_eq!(
@@ -410,12 +407,12 @@ mod tests {
         assert_eq!(rearm.scan_chain(), vec![pinned, successor]);
     }
 
-    #[test]
-    fn resolve_walks_multiple_terminal_generations() {
+    #[tokio::test]
+    async fn resolve_walks_multiple_terminal_generations() {
         let pinned = session(1);
         let s1 = successor_session(pinned);
         let s2 = successor_session(s1);
-        let rearm = resolve_re_arm(pinned, |s| {
+        let rearm = resolve_re_arm(pinned, move |s| {
             ok(if s == pinned {
                 ended(pinned, EndReason::Completed)
             } else if s == s1 {
@@ -424,6 +421,7 @@ mod tests {
                 running(s2)
             })
         })
+        .await
         .unwrap();
         assert_eq!(rearm.live, s2);
         assert_eq!(rearm.ended.len(), 2);
@@ -434,12 +432,14 @@ mod tests {
         assert_eq!(rearm.scan_chain(), vec![pinned, s1, s2]);
     }
 
-    #[test]
-    fn resolve_refuses_an_unbounded_terminal_chain() {
+    #[tokio::test]
+    async fn resolve_refuses_an_unbounded_terminal_chain() {
         let pinned = session(1);
         // Every candidate (including every derived successor) is a
         // terminal stream — the walk must refuse, not loop.
-        let err = resolve_re_arm(pinned, |s| ok(ended(s, EndReason::Completed))).unwrap_err();
+        let err = resolve_re_arm(pinned, |s| ok(ended(s, EndReason::Completed)))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             ReArmError::ChainTooLong {

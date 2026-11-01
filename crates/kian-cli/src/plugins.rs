@@ -330,8 +330,15 @@ pub struct SuperAgentPlugin {
     pub worker_agent: AgentDef,
     /// The default agent's compiled definition (plain sessions).
     pub default_agent: AgentDef,
-    /// The configured resident Router session id.
+    /// The configured resident Router session id — already the kian-62
+    /// re-arm walk's *live* session: the pinned id itself when its
+    /// stream is non-terminal (or never created), else the deterministic
+    /// successor at the end of the chain.
     pub router_session: SessionId,
+    /// kian-62: the ended, frozen predecessors of `router_session`
+    /// (empty = generation 0). Flows into the Router profile's re-arm
+    /// bootstrap (per-generation key + cause-carrying prompt).
+    pub router_rearm: Vec<kian_superagent::rearm::EndedResident>,
     /// The Router's slot name.
     pub router_slot: String,
     /// The Router profile's speculation budget (C39): `None` disables
@@ -477,6 +484,8 @@ impl Plugin for SuperAgentPlugin {
         // budget (None = disabled, speculative spawns refused honestly).
         let mut profile = RouterProfile::new(self.router_session, profile.router);
         profile.speculation = self.speculation.clone();
+        // kian-62: the re-arm chain — empty for generation 0.
+        profile.re_arm = self.router_rearm;
 
         // The mounted inbox: admits counted for Router residency.
         let router_inbox = RouterInbox::new(

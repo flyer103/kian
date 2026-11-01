@@ -243,21 +243,81 @@ impl Server {
                 uuid::Uuid::parse_str(&sa.router.session_id)
                     .map_err(|_| ServeError::Assembly("router session id is not a uuid".into()))?,
             );
+            // kian-62: the boot-time re-arm walk. A resident Router that
+            // ended terminally (session/ended{completed|cancelled} —
+            // e.g. the loop's lifetime iteration budget exhausting) is
+            // frozen; the consumed bootstrap row can never re-wake it.
+            // The walk resolves the live session down the deterministic
+            // successor chain (uuid5) and assembly binds THAT session
+            // everywhere the pinned id used to go. Soft-failed sessions
+            // project idle and stay generation 0 — the next admitted
+            // input re-opens them, no successor needed.
+            let router_re_arm = kian_superagent::rearm::resolve_re_arm(router_session, {
+                let store = store.clone();
+                move |session| {
+                    let store = store.clone();
+                    Box::pin(async move { store.rebuild(session).await })
+                }
+            })
+            .await
+            .map_err(|e| {
+                ServeError::Assembly(format!(
+                    "router re-arm resolution (pinned {}): {e}",
+                    router_session.0
+                ))
+            })?;
+            let router_session = router_re_arm.live;
+            if router_re_arm.is_succession() {
+                tracing::info!(
+                    pinned = %sa.router.session_id,
+                    live = %router_session.0,
+                    ended = router_re_arm.ended.len(),
+                    "superagent: resident Router re-armed onto a successor session"
+                );
+            }
             // C40: the resident watchdog binding (optional). The agent
             // is worker-template shaped; the read/intervene surface
             // mounts on it the same way the async/recall pairs mount.
             let watchdog = match &sa.watchdog {
                 Some(watchdog) => {
-                    let session = kian_core::model::SessionId(
+                    let pinned = kian_core::model::SessionId(
                         uuid::Uuid::parse_str(&watchdog.session_id).map_err(|_| {
                             ServeError::Assembly("watchdog session id is not a uuid".into())
                         })?,
                     );
+                    // kian-62: the same re-arm walk for the resident
+                    // watchdog (it can terminally end exactly like the
+                    // Router; the timer rule's Route::Session target
+                    // becomes the resolved live session).
+                    let re_arm = kian_superagent::rearm::resolve_re_arm(pinned, {
+                        let store = store.clone();
+                        move |session| {
+                            let store = store.clone();
+                            Box::pin(async move { store.rebuild(session).await })
+                        }
+                    })
+                    .await
+                    .map_err(|e| {
+                        ServeError::Assembly(format!(
+                            "watchdog re-arm resolution (pinned {}): {e}",
+                            pinned.0
+                        ))
+                    })?;
+                    if re_arm.is_succession() {
+                        tracing::info!(
+                            pinned = %watchdog.session_id,
+                            live = %re_arm.live.0,
+                            ended = re_arm.ended.len(),
+                            "superagent: resident watchdog re-armed onto a successor session"
+                        );
+                    }
                     let mut agent = config
                         .named_agent_def(&watchdog.agent)
                         .ok_or_else(|| ServeError::Assembly("watchdog agent missing".into()))?;
                     kian_superagent::mount_watchdog_tools(&mut agent, true);
-                    Some(kian_superagent::WatchdogProfile::new(session, agent))
+                    let mut profile = kian_superagent::WatchdogProfile::new(re_arm.live, agent);
+                    profile.re_arm = re_arm.ended;
+                    Some(profile)
                 }
                 None => None,
             };
@@ -370,6 +430,7 @@ impl Server {
                 worker_agent,
                 default_agent: config.agent_def(),
                 router_session,
+                router_rearm: router_re_arm.ended,
                 router_slot: sa.router.slot.clone(),
                 speculation: sa
                     .router
