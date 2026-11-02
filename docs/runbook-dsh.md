@@ -1,8 +1,8 @@
-# Runbook — S6 live dsh bridge (C57)
+# Runbook — S6 live dsh bridge (C57, updated C59)
 
 What it takes to exercise the S6 dsh bridge against a **real** dsh install, what each
-suite asserts, the current live status (2026-11-01), and the exact commands to re-run.
-The bridge contract itself is fixed by
+suite asserts, the current live status (2026-11-02, C59: **live positive landed**), and
+the exact commands to re-run. The bridge contract itself is fixed by
 [ADR-010](../design/decisions/ADR-010-dsh-session-mapping.md) and DESIGN §16; this
 runbook is operational only.
 
@@ -12,6 +12,8 @@ runbook is operational only.
 |---|---|---|
 | dsh binary | verified against dsh **0.2.1-rc.5** (npm `-g`, `@deepseek-ai/dsh`) | `dsh --version` |
 | binary path | e.g. `/Users/you/.hermes/node/bin/dsh` | `command -v dsh` |
+| contract-v0 peer | `contrib/dsh-v0-peer/dsh-v0-peer.mjs` (C59) — the ecosystem half that adapts `dsh --profile sdk` JSON-RPC to bridge contract v0; needs `node` ≥ 18 and `dsh` on PATH (or `$DSH_BIN`) | `node --check contrib/dsh-v0-peer/dsh-v0-peer.mjs` |
+| provider route | `deepseek-official` (the adapter the sdk profile registers; plain `deepseek` is rejected by `initialize`) | `DSH_PEER_PROVIDER` in the peer README |
 | profile | `sdk` (bundles `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-sdk-app`); serves "DeepSeek Harness SDK clients over stdio JSON-RPC" | `dsh --profile sdk --help` |
 | env gate | `KIAN_DSH_BIN=<path-to-dsh>` — absent/empty → every live test SKIPs, never fails | run the suites without the var; expect `SKIP:` log lines |
 | proxy bypass | `NO_PROXY=127.0.0.1,localhost` for any e2e that talks to a local `kian serve` (macOS system proxy intercepts localhost) | — |
@@ -22,6 +24,7 @@ runbook is operational only.
 | Suite | Needs dsh? | Asserts |
 |---|---|---|
 | `cargo test -p kian-dsh --tests` — `tests/live.rs` | **yes** (one real `dsh --profile sdk` child) | Drives the real child through the `DshDriver`; whatever the peer does, the outcome must be honest — `Settled`/`Stopped`/`SoftFailed` carry the real reason; the test panics only on a missing/dishonest outcome (constraint 7). |
+| `cargo test -p kian-dsh --tests` — `tests/live.rs` (`KIAN_DSH_PEER`, C59) | **yes** (peer + real model round trip) | The S6 live positive: spawns `contrib/dsh-v0-peer/dsh-v0-peer.mjs`, drives one real input through peer → dsh → DeepSeek. On `Settled` with a model response it requires the full mapped chain (`input/admitted`, `turn/start`, `step/request`, `assistant/message`, `turn/end`); a genuine model failure must surface as the honest `turn/end outcome=error`; on `SoftFailed` the peer's ready handshake must at least be proven (never a vacuous skip). |
 | `cargo test -p kian-dsh --tests` — `tests/driver_bridge.rs`, unit tests | no (scripted fixture peer) | Spawn/steer/complete bridge flow, interrupt → cancelled step, child crash → `interrupted` never `completed`, replay byte-parity, takeover continuation, foreign-logical-format refusal, narrow waist. |
 | `cargo test -p kian-cli --test dsh_bridge` | no (fixture peer behind `kian serve`) | The mounted S6 path end-to-end: worker template spawn/steer/complete, byte-identical replay of the finished stream, honest `interrupted` on child crash, kill -9 takeover continuing the same interaction. |
 | `cargo test -p kian-superagent --test dsh_conformance` | no (C53 fixture) | Both mapping directions of the ADR-010 table, steer → synthetic-marked message, interrupt → cancelled attempt with no assistant message, the pre-flight request-bytes ordering rule, foreign-format refusal, unknown-kind honest error, byte-identical re-import replay. |
@@ -31,8 +34,32 @@ them with `KIAN_DSH_BIN` set additionally proves the env gate does not disturb t
 
 ## Commands
 
-The one-liner for the live smoke (re-run once a credential and a contract-satisfying
-dsh-side peer exist — see "Current live status"):
+The live positive through the contract-v0 peer (C59) — the primary live command:
+
+```bash
+source <(grep '^DEEPSEEK_API_KEY=' ~/.hermes/.env | sed 's/^/export /')   # export-prefix matters, see note
+NO_PROXY=127.0.0.1,localhost \
+KIAN_DSH_BIN="$PWD/contrib/dsh-v0-peer/dsh-v0-peer.mjs" KIAN_DSH_PEER=1 \
+DSH_PEER_SESSION="kian-live-$(date +%s)" \
+cargo test -p kian-dsh --test live -- --nocapture
+```
+
+(`$PWD` matters: the test binary's cwd is the crate dir, so a relative
+`contrib/...` path fails to spawn — the failure surfaces as an honest
+`SoftFailed("spawn ...")`, never a fake pass. `KIAN_DSH_PEER` is the gate:
+either `1` — with `KIAN_DSH_BIN` naming the peer — or the peer's path.
+`DSH_PEER_SESSION` fresh per run keeps the dsh session deterministic; unset
+it to continue the cwd-derived session and exercise resume/continuation.)
+
+The `sed 's/^/export /'` prefix is load-bearing: in agent-terminal sessions a
+bare `DEEPSEEK_API_KEY=...` assignment read via `source <(grep ...)` can be
+silently dropped by the host's secret scrubber, leaving a keyless run that
+still exits honestly (MISSING_CREDENTIAL) — indistinguishable from a missing
+key. Always gate the run with `[ -n "$DEEPSEEK_API_KEY" ]` (length check
+only; never echo the value).
+
+The raw-dsh smoke against stock `dsh` (still the honest C57 negative — stock
+dsh speaks JSON-RPC, not contract v0):
 
 ```bash
 KIAN_DSH_BIN=/Users/you/.hermes/node/bin/dsh NO_PROXY=127.0.0.1,localhost cargo test -p kian-dsh --test live -- --nocapture
@@ -56,7 +83,34 @@ live smoke skipping, never failing):
 env -u KIAN_DSH_BIN cargo test -p kian-dsh --tests
 ```
 
-## Current live status (2026-11-01, C57)
+## Current live status (2026-11-02, C59)
+
+**The S6 live positive has landed.** `contrib/dsh-v0-peer/dsh-v0-peer.mjs`
+(C59) is the contract-v0 peer the C57 run identified as the missing
+ecosystem half. Verified live twice in a row against real dsh 0.2.1-rc.5 +
+`deepseek-chat` with a real `DEEPSEEK_API_KEY`:
+
+- `cargo test -p kian-dsh --test live` with
+  `KIAN_DSH_BIN=$PWD/contrib/dsh-v0-peer/dsh-v0-peer.mjs KIAN_DSH_PEER=1`:
+  **2 passed** —
+  - `live_dsh_smoke_env_gated`: `TurnDone → Settled` through the peer (the
+    smoke now also completes the real round trip when pointed at the peer);
+  - `live_dsh_peer_positive_env_gated`: **the positive** — appended mapped
+    chain `[TurnStart, InputAdmitted, StepRequest, AssistantMessage,
+    TurnEnd]`, model reply "pong", `Settled`, ~4 s wall clock.
+- The peer's adaptation facts (observed SDK vocabulary → v0 frames, the
+  pre-flight `request/header` → `assistant/attempt` synthesis, the buffered
+  `step/end` outcome derivation, the no-cancel interrupt limitation) are
+  recorded in [contrib/dsh-v0-peer/README.md](../contrib/dsh-v0-peer/README.md).
+- Zero-credential default suites stay green (both live tests SKIP).
+
+Known operational notes: `initialize` rejects provider `deepseek` (the
+registered adapter is `deepseek-official`); a known session id in a fresh
+runtime needs `session/resume` before `session/prompt` (the peer retries
+once on "already exists"); the peer exits via the SDK-blessed `shutdown`
+after the turn settles.
+
+## History: C57 run and findings (2026-11-01)
 
 **Bugs the live parallel run surfaced (both fixed in this change, with
 deterministic regression tests):**
