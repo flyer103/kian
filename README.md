@@ -15,7 +15,8 @@ been demonstrated.
 - Storage: **sqlite** by default (single machine); **postgres** for multi-replica deployments
   (env-gated)
 - Design inputs: frozen local snapshots in [a vendored archive/](a vendored archive/) (archived
-  2026-10-31: the WeChat super-agent article, dsh/cordis docs, two internal design notes); structured
+  2026-10-31 and 2026-11-02: the WeChat super-agent article, dsh/cordis docs, two internal design notes, the
+  dsh-superagent-prototype); structured
   synthesis in [the design notes](the design notes)
 
 ## Docs map
@@ -26,7 +27,7 @@ been demonstrated.
 | [docs/SPEC.md](docs/SPEC.md) | Spec (WHAT) | Positioning, user interfaces, scope, milestones |
 | [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
 | [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-011: each decision with its alternatives and trade-offs |
-| [the design notes](the design notes) | Research | Structured digest of the four design inputs |
+| [the design notes](the design notes) | Research | Structured digest of the five design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live positive via the contract-v0 peer (`contrib/dsh-v0-peer/`), and the C57 stock-dsh contract survey |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Runbook | Operating postgres mode: `KIAN_PG_URL`, `drain.holder`, migrations, the S8 live replay |
 | [a vendored archive/](a vendored archive/) | Archive | Frozen local snapshots of the design inputs (read-only) |

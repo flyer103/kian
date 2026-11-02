@@ -251,6 +251,41 @@ foreign action is labeled in the audit stream; (3) the failure/honesty model —
 recovery semantics across the boundary (interrupted ≠ failed applies unchanged). An experiment
 that skips stating these freezes speculation; none was attempted this round.
 
+### Phase 5 (live positives + dogfood + field fixes, landed 2026-11-02)
+
+Round 5 (cards kian-59/kian-60 + worker-initiated kian-61/kian-62). Scenario definitions S1–S8
+unchanged; status recorded here.
+
+| Item | Contents | Status |
+|------|---------|--------|
+| S6 live leg — contract-v0 peer | `contrib/dsh-v0-peer/dsh-v0-peer.mjs` (zero-dep Node) adapting stock dsh JSON-RPC onto the frozen [ADR-010](../design/decisions/ADR-010-dsh-session-mapping.md) v0 contract; live run green (real `deepseek-chat`, full mapped chain, honest `Settled`) — supersedes the 2026-11-01 honest negative | landed |
+| Dogfood workload | `examples/issue-watch/`: TimerChannel → `gh issue list` → Router triage → worker draft (dry-run) on the real `flyer103/kian` repo; `demo-restart.sh` proves kill -9 reboot resumes the same session; RUNLOG records real data | landed |
+| Wire dialect v2 (breaking) | Strict OpenAI-compatible serialization: dotless built-in tool names (`fs_list`/`fs_read`/`fs_write`, dotted forms replayable), wire-level `tool_calls`/`tool_call_id`, `AgentDef.tools` fail-closed. Found live via DeepSeek HTTP 400/422; constraint-3 event in DESIGN (golden hash same commit) | landed |
+| Router re-arm | Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident Router with an observable `[re-arm]` cause input; soft-failed sessions re-open the same pinned session. Zero new kinds; DESIGN §4.6 | landed |
+
+### Phase 6 (bundle-domain policy round, proposed 2026-11-02 — input: dsh-superagent-prototype)
+
+Adoption of the official article implementation's domain-policy layer onto kian's substrate.
+Reference: `a vendored archive/dsh-superagent-*.md` (archived rev 6337fc8), digest §5. **Everything
+below is bundle-layer (`kian-superagent`, at most core projection support); nothing touches
+kian-core/store/orchestrator seams except through the ADR path.**
+
+| Candidate | From prototype | kian's today-gap | Layer/cost | Priority |
+|---|---|---|---|---|
+| Ticket stage projection | 003 first-match stage table ("what is it waiting for") | session state is execution state; no "awaiting person" semantics | pure projection, zero new kinds | P6a — highest |
+| Closed reason vocabularies | Decision reasons as closed enum + display text | free-text rationale only | enum + display text, zero new kinds | P6a |
+| Output-side speak-rules | attention economics (000/005): speak only when someone must act or can use a result | input-side admission only | config-first rule table, zero new kinds | P6a |
+| Follow-up ownership routing | a person's follow-up belongs to the live Ticket's Executor; Router may only stop | all follow-ups re-enter Router | routing policy reusing existing kinds | P6a/P6b |
+| Mandate (delegation authority scope) | Ticket carries an explicit authority object; actions bounded by it | delegation carries task text, no authority object | **ADR-012 candidate** — new event shape (charter-like) | P6b |
+| Thread/Correlation intake projection | Source read-position + Thread key + one-Trigger-many-Tickets fan-out (grants no authority) | channel admit idempotency only; one source feeds one session | **ADR-013 candidate** — projection + derivation rule | P6b |
+| Outbox+receipts bounded retry | delivery failures retried 2s→1min exponential, then parked honestly | structured delivery exists; no unified retry domain | check delivery-kind reuse first | P6b |
+| Policy/prompt versioning + drift marking | numbered snapshots + current pointer; overrides marked "default updated" on upgrade | prompts unversioned in config | config-first + replayable version events | P6c |
+
+Wave split (mirrors P4's structure): **P6a** = zero-new-kind bundle work (stage projection, reason
+vocabularies, speak-rules, follow-up routing); **P6b** = ADR-backed event-shape additions (Mandate
+ADR-012, Thread intake ADR-013, outbox retry); **P6c** = dogfood validation — issue-watch upgraded to
+multi-Ticket subscription fan-out, run live against the prototype's scenarios.
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|
