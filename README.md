@@ -27,7 +27,7 @@ been demonstrated.
 | [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
 | [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-011: each decision with its alternatives and trade-offs |
 | [the design notes](the design notes) | Research | Structured digest of the four design inputs |
-| [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live smoke, and the 0.2.1-rc.5 contract gap |
+| [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live positive via the contract-v0 peer (`contrib/dsh-v0-peer/`), and the C57 stock-dsh contract survey |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Runbook | Operating postgres mode: `KIAN_PG_URL`, `drain.holder`, migrations, the S8 live replay |
 | [a vendored archive/](a vendored archive/) | Archive | Frozen local snapshots of the design inputs (read-only) |
 | [CHANGELOG.md](CHANGELOG.md) | History | Phase-dated record of what landed, and what is env-gated |
@@ -458,6 +458,18 @@ complete, kill-9 takeover continuation, and honest child-crash failure
   Full survey, evidence and re-run commands: [docs/runbook-dsh.md](docs/runbook-dsh.md).
   S6-live stays open until a contract-v0 dsh-side peer (or an ecosystem plugin) exists and
   the smoke settles green.
+- **2026-11-02 (C59)**: *executed, positive* — `contrib/dsh-v0-peer/dsh-v0-peer.mjs`
+  (Node ESM, zero npm deps) adapts stock `dsh --profile sdk` JSON-RPC onto bridge
+  contract v0: immediate `ready`, `session.event` → v0 session-event frames, `input` →
+  `session/prompt`, interrupt → honest child kill (the SDK has no cancel), pre-flight
+  request bytes synthesized from the in-step `request/header` + model-visible surface.
+  Live run with `KIAN_DSH_BIN=$PWD/contrib/dsh-v0-peer/dsh-v0-peer.mjs KIAN_DSH_PEER=1`
+  and a real `DEEPSEEK_API_KEY`: both live tests green — the smoke `TurnDone → Settled`,
+  the peer positive appending `[TurnStart, InputAdmitted, StepRequest,
+  AssistantMessage, TurnEnd]` with model reply "pong" (verified twice, ~4 s). Observed
+  SDK vocabulary, divergences from ADR-010's assumed payloads, and the exact commands:
+  [contrib/dsh-v0-peer/README.md](contrib/dsh-v0-peer/README.md) and
+  [docs/runbook-dsh.md](docs/runbook-dsh.md). **S6-live positive closed.**
 
 ## Ablation benchmark: passthrough vs. Router judgment (§7.1, C42)
 
