@@ -129,12 +129,37 @@ Two labels are used throughout:
   exactly as ADR-010 §3 requires, instead of manufacturing a completion. **S6-live stays open** until
   a contract-v0 dsh-side peer exists; the fixture suites remain the CI proof.
 
+## Phase 5 — 2026-11-02 — live positives, dogfood, and field fixes
+
+- **S6 live positive landed** (`contrib/dsh-v0-peer/dsh-v0-peer.mjs`, kian-59): a zero-dependency Node
+  peer adapting stock `dsh --profile sdk` (JSON-RPC 2.0) onto the frozen ADR-010 contract v0 — `ready`
+  emitted immediately, `session.event` notifications forwarded as v0 session-event frames, `input`
+  frames translated to `session/prompt`. Driving one real input through peer → dsh → real
+  `deepseek-chat` appended the full mapped chain (turn/start, input/admitted, step/request,
+  assistant/message, turn/end) with an honest `Settled` outcome — the S6 live leg is now **green**,
+  upgrading the 2026-11-01 honest negative. Re-run: see `docs/runbook-dsh.md`.
+- **Dogfood example** (`examples/issue-watch/`, kian-60): a real long-running workload on
+  `flyer103/kian` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
+  reply (dry-run by default) → everything in the durable audit stream. Proven live: real issue triaged
+  (severity, decision, draft in-stream), and `demo-restart.sh` shows `kill -9` + reboot resuming the
+  same session from the event stream. `RUNLOG.md` records the real data.
+- **Wire dialect v2** (kian-61, breaking): strict OpenAI-compatible serialization — built-in tools
+  renamed to dotless spellings (`fs_list`/`fs_read`/`fs_write`; dotted forms still invocable for
+  replay), wire-level `tool_calls`/`tool_call_id` emitted on tool round trips, `AgentDef.tools`
+  enforced fail-closed. Found by the dogfood run replaying persisted `step/request` bodies against the
+  real DeepSeek API (HTTP 400/422); constraint-3 event recorded in DESIGN (golden hash updated in the
+  same commit). After: direct-to-DeepSeek green — 13 sessions, 59 requests, 0 failures.
+- **Router re-arm** (kian-62): a resident Router whose turn soft-failed no longer stayed terminally
+  frozen across reboots. Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident
+  with an observable `[re-arm]` cause input on the successor stream; soft-failed sessions re-open the
+  same pinned session. Zero new event kinds; DESIGN §4.6 records the semantics.
+
 ## Gated surfaces — current live-run status
 
 | Surface | Gate | Status |
 |---------|------|--------|
-| Multi-replica / postgres (S8) | `KIAN_PG_URL` | Suite in place; live run recorded per round in the kanban handoffs, skipped in default CI |
-| dsh bridge (S6 live leg) | `KIAN_DSH_BIN` | Suite in place; **executed** 2026-11-01 against dsh 0.2.1-rc.5 — honest negative (`SoftFailed { reason: "peer never sent ready within 30s" }`: the stock dsh SDK app does not meet the ADR-010 contract-v0 bar). S6-live stays open; fixtures are the CI proof |
+| Multi-replica / postgres (S8) | `KIAN_PG_URL` | Suite in place; **executed green** in CI on every push since 2026-11-02 (postgres service container; the job also asserts the gated suites ran, not skipped) |
+| dsh bridge (S6 live leg) | `KIAN_DSH_BIN` | Suite in place; **executed green** 2026-11-02 via the contract-v0 peer (`contrib/dsh-v0-peer/`) against dsh 0.2.1-rc.5 + real `deepseek-chat` — full mapped chain, honest `Settled`. (The 2026-11-01 stock-dsh honest negative is superseded; runbook records both.) |
 | Live provider smoke | `KIAN_API_KEY` | Suite in place; **not executed** — no provider key in the build environment |
 | Live lark channel | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` | Suite in place; **not executed** — no Feishu app credentials in the build environment |
 | GitHub send / webhook | `KIAN_GITHUB_TOKEN` / `KIAN_GITHUB_WEBHOOK_SECRET` | Covered by scripted fixtures, default-green; no live GitHub delivery executed |
@@ -145,5 +170,6 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
 
 ## Unreleased
 
-Nothing yet. Next steps (postgres in CI, a contract-v0 dsh-side peer so the S6 live leg can settle
-green, publishing) are owner-gated and tracked on the kanban board, not here.
+Nothing queued. The next owner-gated steps are: making the repo public, executing the remaining
+gated surfaces with real credentials (live provider smoke, live lark channel, GitHub delivery), and
+any Phase-6 scoping. Tracked on the kanban board, not here.
