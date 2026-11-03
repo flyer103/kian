@@ -32,6 +32,16 @@
 //! - [`subscriptions`] — the subscription service consuming
 //!   `ChannelAdapter` streams, matching rules, admitting + waking —
 //!   one durable row per passthrough subscriber (C38)
+//! - [`intake`] — the Thread/Correlation intake projection (C61,
+//!   ADR-013 draft): config-owned canonical thread keys derived from
+//!   provenance/payload fields (`<channel>:<group>#<key>` — after
+//!   derivation the key *is* a topic; the rule matcher is unchanged),
+//!   stream-derived source read positions (lark message-id offsets;
+//!   GitHub REST `since` timestamps) with an honest idempotent
+//!   re-poll bound where no cursor derives, and the neighbors-block
+//!   surface that carries the key as context — correlation never
+//!   routes, and fan-out grants no authority (bounded by Mandate,
+//!   ADR-012)
 //! - [`mock`] — `MockChannel`: the production-quality in-memory channel
 //!   (the S4 IM stand-in and the framework's reference implementation)
 //! - [`lark`] — `LarkChannel`: the first *real* channel adapter (C44),
@@ -93,6 +103,7 @@
 pub mod dsh;
 pub mod github;
 pub mod inbox;
+pub mod intake;
 pub mod lark;
 pub mod metrics;
 pub mod mock;
@@ -119,22 +130,27 @@ pub use dsh::{
 pub use github::{
     API_VERSION, DEFAULT_API_BASE as GITHUB_DEFAULT_API_BASE, GITHUB_CHANNEL_TYPE, GitHubChannel,
     GitHubConfig, GitHubError, SUBSCRIBER_CAPACITY as GITHUB_SUBSCRIBER_CAPACITY,
-    SUPPORTED_EVENT_TYPES,
+    SUPPORTED_EVENT_TYPES, payload_since_cursor,
 };
 pub use inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
+pub use intake::{
+    GROUP_FIELD, ReadPosition, SourceCursor, THREAD_KEY_FIELD, ThreadKey, ThreadKeyRule,
+    ThreadKeySet, derive_thread_key, neighbors_with_thread_key, read_position,
+};
 pub use lark::{
     DEFAULT_API_BASE, DEFAULT_POLL_INTERVAL, LARK_CHANNEL_TYPE, LarkChannel, LarkConfig, LarkError,
-    SUBSCRIBER_CAPACITY,
+    SUBSCRIBER_CAPACITY, payload_message_cursor,
 };
 pub use metrics::{
-    ManualTurnClock, ROUTER_BATCH_BUCKETS, RouterMetrics, RouterTurnRecorder, SystemTurnClock,
-    TurnClock, TurnRecord,
+    ManualTurnClock, ROUTER_BATCH_BUCKETS, RouterMetrics, RouterTurnRecorder, SpeakMetrics,
+    SystemTurnClock, TurnClock, TurnRecord,
 };
 pub use mock::{CapturedDelivery, MockChannel};
 pub use policy::{
     DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME, ImPolicy,
-    PolicyError, STRUCTURED_POLICY_NAME, StructuredPolicy, count_words, im_delivered_payload,
-    structured_delivered_payload,
+    PolicyError, STRUCTURED_POLICY_NAME, SpeakCondition, SpeakContext, SpeakKind, SpeakPolicy,
+    SpeakRule, SpeakTracker, SpeakVerdict, StructuredPolicy, count_words, im_delivered_payload,
+    speak_key, structured_delivered_payload,
 };
 pub use provenance::{
     CHANNEL_EVENT_TYPE, ChannelEventMarker, ShapingConfig, channel_event_untrusted,

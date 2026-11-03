@@ -344,6 +344,10 @@ pub struct SuperAgentPlugin {
     /// The Router profile's speculation budget (C39): `None` disables
     /// speculation (speculative spawns refused honestly at the tool).
     pub speculation: Option<kian_superagent::SpeculationPolicy>,
+    /// The output-side speak-rules (C58): the whether-to-send gate on
+    /// `reply`/`deliver_structured`. Empty = ungated (today's
+    /// behavior).
+    pub speak: kian_superagent::SpeakPolicy,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -484,6 +488,7 @@ impl Plugin for SuperAgentPlugin {
         // budget (None = disabled, speculative spawns refused honestly).
         let mut profile = RouterProfile::new(self.router_session, profile.router);
         profile.speculation = self.speculation.clone();
+        profile.speak = self.speak.clone();
         // kian-62: the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 

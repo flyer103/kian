@@ -485,6 +485,80 @@ pub struct SuperAgentConfig {
     /// (`route: {session: <uuid>}`) over a `type: timer` channel.
     #[serde(default)]
     pub watchdog: Option<WatchdogConfig>,
+    /// C58 output-side speak-rules: the *whether-to-send* gate on the
+    /// Router's `reply`/`deliver_structured` tools (attention
+    /// economics — DESIGN §4.2). Absent (the default) = every send
+    /// passes, byte-identical to today. Converted fail-closed by
+    /// [`SuperAgentConfig::speak_policy`]; every rule's `channel`
+    /// must be declared in `channels:` (fail-closed cross-reference).
+    #[serde(default)]
+    pub speak_rules: Vec<SpeakRuleDef>,
+}
+
+impl SuperAgentConfig {
+    /// Converts the C58 speak-rule table to the bundle policy,
+    /// fail-closed: an unknown condition spelling or an empty channel
+    /// refuses to start, never silently defaults. Errors carry the
+    /// rule's index.
+    pub fn speak_policy(&self) -> Result<kian_superagent::SpeakPolicy, ConfigError> {
+        let rules = self
+            .speak_rules
+            .iter()
+            .enumerate()
+            .map(|(i, def)| {
+                def.to_rule_inner()
+                    .map_err(|message| invalid(format!("superagent.speak_rules[{i}].{message}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(kian_superagent::SpeakPolicy::from_rules(rules))
+    }
+}
+
+/// One `superagent.speak_rules` entry (C58):
+/// `{channel, when: always | ack-first-only | decision-needed |
+/// result-ready | never, per_topic_ack?}` — the condition under which
+/// a send may leave the channel, evaluated before the §4.2 shaping
+/// policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakRuleDef {
+    /// The channel this rule gates. Must be declared in
+    /// `superagent.channels` (fail-closed cross-reference) and
+    /// non-empty.
+    pub channel: String,
+    /// The closed condition vocabulary's code spelling. Unknown
+    /// spellings refuse to start.
+    pub when: String,
+    /// For `ack-first-only`: key the confirm-once memory per topic
+    /// rather than per channel. Default false.
+    #[serde(default)]
+    pub per_topic_ack: bool,
+}
+
+impl SpeakRuleDef {
+    /// Converts to the bundle rule (C58), fail-closed. Messages are
+    /// index-free; [`SuperAgentConfig::speak_policy`] prefixes them.
+    pub fn to_rule(&self) -> Result<kian_superagent::SpeakRule, ConfigError> {
+        self.to_rule_inner().map_err(invalid)
+    }
+
+    fn to_rule_inner(&self) -> Result<kian_superagent::SpeakRule, String> {
+        if self.channel.trim().is_empty() {
+            return Err("channel must be non-empty".into());
+        }
+        let when = kian_superagent::SpeakCondition::from_code(&self.when).ok_or_else(|| {
+            format!(
+                "when `{}` is not one of always | ack-first-only | decision-needed | \
+                     result-ready | never",
+                self.when
+            )
+        })?;
+        Ok(kian_superagent::SpeakRule {
+            channel: self.channel.clone(),
+            when,
+            per_topic_ack: self.per_topic_ack,
+        })
+    }
 }
 
 /// The additive `superagent.watchdog:` section (C40): the resident
@@ -1581,6 +1655,19 @@ impl ServeConfig {
                 }
             }
             sa.admission_classes()?;
+            // C58: speak rules convert cleanly and cross-reference
+            // declared channels (fail-closed — an unknown condition
+            // spelling or an undeclared channel refuses to start).
+            sa.speak_policy()?;
+            for (i, rule) in sa.speak_rules.iter().enumerate() {
+                if !sa.channels.contains_key(&rule.channel) {
+                    return Err(invalid(format!(
+                        "superagent.speak_rules[{i}] references channel `{}` which is not \
+                         declared in superagent.channels",
+                        rule.channel
+                    )));
+                }
+            }
             // C43: the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -3072,5 +3159,88 @@ recovery:
             "  router:\n    speculation:\n      max_outstanding: 2\n      label: x\n      budget: 9\n    session_id:",
         );
         assert!(ServeConfig::parse(&unknown).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // C58: the superagent.speak_rules section
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn speak_rules_section_parses_converts_and_defaults_absent() {
+        let yaml = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: mock-im\n      when: ack-first-only\n      per_topic_ack: true\n    - channel: ci\n      when: result-ready\n  subscriptions:\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("speak rules config");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let policy = sa.speak_policy().expect("converts");
+        let mock_rule = policy.rule_for("mock-im").expect("mock-im gated");
+        assert_eq!(
+            mock_rule.when,
+            kian_superagent::SpeakCondition::AckFirstOnly
+        );
+        assert!(mock_rule.per_topic_ack);
+        let ci_rule = policy.rule_for("ci").expect("ci gated");
+        assert_eq!(ci_rule.when, kian_superagent::SpeakCondition::ResultReady);
+        assert!(!ci_rule.per_topic_ack);
+        assert!(policy.rule_for("elsewhere").is_none());
+
+        // Absent table = empty policy: every send passes (today's
+        // behavior, byte-identical).
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.speak_policy().unwrap(),
+            kian_superagent::SpeakPolicy::default()
+        );
+
+        // Unknown condition spelling refuses to start (fail-closed,
+        // vocabulary named in the error).
+        let bad = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: mock-im\n      when: sometimes\n  subscriptions:\n",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("superagent.speak_rules[0].when `sometimes`"),
+            "{err}"
+        );
+
+        // Empty channel spelling refuses to start.
+        let bad = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: \" \"\n      when: never\n  subscriptions:\n",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("superagent.speak_rules[0].channel must be non-empty"),
+            "{err}"
+        );
+
+        // Unknown keys inside a rule fail closed like the rest of the
+        // config surface.
+        let bad = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: mock-im\n      when: never\n      volume: 3\n  subscriptions:\n",
+        );
+        assert!(ServeConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn speak_rules_cross_reference_declared_channels() {
+        // A rule gating a channel that is not declared refuses to
+        // start (the subscriptions/classes cross-ref discipline).
+        let bad = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: nope\n      when: never\n  subscriptions:\n",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("superagent.speak_rules[0] references channel `nope`"),
+            "{err}"
+        );
     }
 }
