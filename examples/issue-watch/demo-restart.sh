@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# demo-restart.sh — the S1 story on a real workload (kian examples/issue-watch).
+# demo-restart.sh — the S1 story on a real workload (kian examples/issue-watch v2).
 #
-# Boots the issue-watch, lets at least one tick flow, kill -9's the server
-# mid-watch, reboots it on the SAME sqlite event store, and shows the SAME
-# Router session resuming from the event stream: seq keeps growing (never
-# resets), already-delivered timer ticks dedupe (the tick counter is
-# per-process; committed tick rows win), and the next tick drives a fresh
-# poll without losing or duplicating work.
+# Boots the issue-watch, lets at least one poll flow, kill -9's the
+# server mid-watch, reboots it on the SAME sqlite event store, and
+# shows the SAME Router session resuming from the event stream: seq
+# keeps growing (never resets), the passthrough registry / outbox /
+# speak tracker / poll cursor are all rebuilt or re-derived from the
+# streams, and already-admitted github events dedupe by event id (the
+# boot-derived since cursor means the source is not re-delivered).
 #
 # Options (env):
 #   KEEP_STATE=1   do not wipe .state first (default: fresh demo)
 #   CREATE_ISSUE=1 also create a throwaway issue on flyer103/kian before
 #                  the kill, so the post-restart poll sees real new work
-#                  (the RUNLOG run used this; closes the issue afterwards)
+#                  (closes the issue afterwards)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,6 +29,12 @@ KIAN_BIN="${KIAN_BIN:-../../target/debug/kian}"
 [[ -f ~/.hermes/.env ]] || { echo "demo-restart.sh: ~/.hermes/.env missing" >&2; exit 1; }
 set -a; source ~/.hermes/.env; set +a
 [[ -n "${DEEPSEEK_API_KEY:-}" ]] || { echo "demo-restart.sh: DEEPSEEK_API_KEY absent" >&2; exit 1; }
+# The github poll + send token (env-only; gh keyring fallback).
+if [[ -z "${KIAN_GITHUB_TOKEN:-}" ]]; then
+  KIAN_GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
+  [[ -n "$KIAN_GITHUB_TOKEN" ]] && export KIAN_GITHUB_TOKEN
+fi
+[[ -n "${KIAN_GITHUB_TOKEN:-}" ]] || { echo "demo-restart.sh: KIAN_GITHUB_TOKEN absent (gh auth token failed)" >&2; exit 1; }
 
 ROUTER_SESSION="$(sed -n 's/^ *session_id: *"\(.*\)"/\1/p' config.yaml | head -1)"
 
@@ -114,6 +121,7 @@ if [[ "${CREATE_ISSUE:-0}" == "1" ]]; then
 fi
 
 echo "== demo-restart: audit proof =="
+"$KIAN_BIN" tickets --db .state/kian.db || true
 "$KIAN_BIN" session inspect "$ROUTER_SESSION" --db .state/kian.db || true
 echo "-- recent Router events (kind + seq):"
 sqlite3 .state/kian.db \

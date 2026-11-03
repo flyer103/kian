@@ -40,6 +40,21 @@ if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   exit 1
 fi
 
+# The github poll + send token (env-only; config has send: true so a
+# missing token is a fail-closed startup error). Fall back to the
+# invoking user's gh keyring; never printed.
+if [[ -z "${KIAN_GITHUB_TOKEN:-}" ]]; then
+  KIAN_GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
+  if [[ -n "$KIAN_GITHUB_TOKEN" ]]; then
+    export KIAN_GITHUB_TOKEN
+  fi
+fi
+if [[ -z "${KIAN_GITHUB_TOKEN:-}" ]]; then
+  echo "run.sh: KIAN_GITHUB_TOKEN absent and 'gh auth token' failed —" >&2
+  echo "run.sh: the github channel is configured with send: true (fail-closed)" >&2
+  exit 1
+fi
+
 mkdir -p .state/tools
 : > .state/serve.log
 
@@ -93,17 +108,22 @@ echo
 
 cat <<EOF
 
-run.sh: watch is live.
-  - timer: one tick every 30s (topic "issues")
-  - flow:  tick -> Router -> poll worker (gh issue list) -> new issues
-           -> draft worker (severity + decision + reply draft)
-  - dry-run: DRY_RUN=$DRY_RUN (drafts land in the audit stream only)
+run.sh: watch is live (config v2 — the multi-Ticket fan-out).
+  - poll:  github flyer103/kian every 30s (issues + comments, since
+           cursor derived at boot — a restart never replays)
+  - flow:  new issue -> Router judge (Mandate) -> one triager worker
+           per issue topic; follow-ups go to the live triager with
+           zero Router judge turns; drafts deliver once under
+           speak-rules (result-ready), retrying through the outbox
+  - dry-run: DRY_RUN=$DRY_RUN (drafts land in the audit stream only;
+           posting also requires DRY_RUN=0)
 
 Inspect the durable audit (from this directory):
   $KIAN_BIN session inspect $ROUTER_SESSION --db .state/kian.db
+  $KIAN_BIN tickets --db .state/kian.db          # the live stage board
   $KIAN_BIN session replay   $ROUTER_SESSION --db .state/kian.db
   $KIAN_BIN session export   $ROUTER_SESSION --db .state/kian.db --out audit.json
-Worker sessions (fresh uuids per thread) are listed by:
+Worker sessions (fresh uuids per issue thread) are listed by:
   sqlite3 .state/kian.db 'select distinct session from events order by 1'
 Live server log: tail -f .state/serve.log
 Stop: kill \$(cat .state/serve.pid)
