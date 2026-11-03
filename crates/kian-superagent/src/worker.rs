@@ -176,6 +176,100 @@ pub fn speculative_delegation_content(
 }
 
 // ---------------------------------------------------------------------------
+// The mandate object (C60 / ADR-012)
+// ---------------------------------------------------------------------------
+
+/// The mandate key (C60, ADR-012): present iff the delegation carries
+/// an authority object. An additive optional field inside the wrapper
+/// `content` — the frozen fields (`thread_id`/`correlation`/`task`),
+/// the C39 marker, and every legacy wrapper byte are unchanged. The
+/// markers compose: a speculative delegation may carry a mandate too
+/// (both are additive wrapper keys).
+pub const MANDATE_KEY: &str = "mandate";
+
+/// The mandate delegation wrapper (C60, ADR-012): exactly
+/// [`delegation_content`] plus `"mandate"` — the C39 marker mechanism
+/// applied to an object. The mandate is the authority the Router
+/// granted: `{strength, scope, granted_by, source{channel,topic},
+/// policy_version, matched_rules?}` (schema owned by ADR-012). It is
+/// **immutable** — carried verbatim inside `thread/started`'s task
+/// payload (durable + audit-visible forever) and model-visible as the
+/// worker's first message, because the wrapper *is* that message.
+#[must_use]
+pub fn mandate_delegation_content(
+    thread_id: Uuid,
+    correlation: Option<Value>,
+    task: Value,
+    mandate: &Value,
+) -> Value {
+    let mut wrapper = delegation_content(thread_id, correlation, task);
+    wrapper[MANDATE_KEY] = mandate.clone();
+    wrapper
+}
+
+/// Reads the additive mandate object off a delegation wrapper — the
+/// companion of [`delegation_is_speculative`] for this wrapper field:
+/// the [`Delegation`] struct stays exactly its frozen shape, and every
+/// existing parse path is byte-identical. `None` on legacy wrappers
+/// (the key is absent) and on non-wrapper content — never guessed,
+/// never misread.
+#[must_use]
+pub fn delegation_mandate(content: &Value) -> Option<&Value> {
+    content.as_object().and_then(|obj| obj.get(MANDATE_KEY))
+}
+
+/// The result of revalidating a live worker's mandate before a
+/// follow-up routes to it (ADR-012's revalidation rule, composed with
+/// the C59 live-routing path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MandateRevalidation {
+    /// The mandate authorizes the follow-up: `strength: explicit`
+    /// always passes; `inferred` passes while its `policy_version` is
+    /// still the current pointer. Legacy delegations (no mandate
+    /// object) pass — pre-C60 authority is never retroactively
+    /// narrowed.
+    Pass,
+    /// `strength: inferred` under a `policy_version` that is no longer
+    /// the current pointer: the follow-up releases to fresh
+    /// evaluation (the C59 `released_to_eval` path) — honestly
+    /// audited, never a silent drop. `policy_version` is the mandate's
+    /// persisted label, for the audit line.
+    Release { policy_version: String },
+}
+
+/// Pure mandate revalidation (ADR-012): `strength: explicit` passes;
+/// `inferred` passes iff its `policy_version` equals the current
+/// policy pointer (the C63 label; `None` on either side reads as the
+/// honest `none` label, so an unversioned deployment never releases).
+/// A missing `strength` is treated as `inferred` (the safe reading:
+/// only an explicit statement is explicit).
+#[must_use]
+pub fn revalidate_mandate(
+    mandate: Option<&Value>,
+    current_policy_label: Option<&str>,
+) -> MandateRevalidation {
+    use crate::policy_version::NO_POLICY_LABEL;
+    let Some(mandate) = mandate else {
+        return MandateRevalidation::Pass;
+    };
+    if mandate.get("strength").and_then(Value::as_str) == Some("explicit") {
+        return MandateRevalidation::Pass;
+    }
+    let stamped = mandate
+        .get("policy_version")
+        .and_then(Value::as_str)
+        .unwrap_or(NO_POLICY_LABEL);
+    let current = current_policy_label.unwrap_or(NO_POLICY_LABEL);
+    if stamped == current {
+        MandateRevalidation::Pass
+    } else {
+        MandateRevalidation::Release {
+            policy_version: stamped.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lineage payload builders (golden forms, frozen like all event bytes)
 // ---------------------------------------------------------------------------
 
@@ -403,6 +497,9 @@ pub enum SpawnError {
 pub struct WorkerSpawner {
     router: SessionId,
     pinned_version: u64,
+    /// The worker template's id (C60): the key the Router's mandate
+    /// policy resolves per-template scope text against.
+    worker_template_id: String,
     inbox: Arc<dyn InboxWriter>,
 }
 
@@ -412,8 +509,16 @@ impl WorkerSpawner {
         Self {
             router,
             pinned_version: worker_template.version,
+            worker_template_id: worker_template.id.clone(),
             inbox,
         }
+    }
+
+    /// The worker template's id — the mandate scope key (C60,
+    /// `superagent.mandate.scopes`).
+    #[must_use]
+    pub fn worker_template_id(&self) -> &str {
+        &self.worker_template_id
     }
 
     /// Spawns one worker for `task` (the actual user content).
@@ -425,7 +530,21 @@ impl WorkerSpawner {
         task: Value,
         correlation: Option<Value>,
     ) -> Result<SpawnedWorker, SpawnError> {
-        self.spawn_inner(task, correlation, false).await
+        self.spawn_inner(task, correlation, false, None).await
+    }
+
+    /// [`WorkerSpawner::spawn`] plus the authority object (C60,
+    /// ADR-012): the wrapper is exactly the legacy bytes plus the
+    /// additive `"mandate"` key, carried verbatim into the worker's
+    /// first message and both streams' `thread/started` payloads.
+    pub async fn spawn_with_mandate(
+        &self,
+        task: Value,
+        correlation: Option<Value>,
+        mandate: Value,
+    ) -> Result<SpawnedWorker, SpawnError> {
+        self.spawn_inner(task, correlation, false, Some(mandate))
+            .await
     }
 
     /// Spawns one worker **speculatively** (C39): identical mechanics
@@ -442,7 +561,21 @@ impl WorkerSpawner {
         task: Value,
         correlation: Option<Value>,
     ) -> Result<SpawnedWorker, SpawnError> {
-        self.spawn_inner(task, correlation, true).await
+        self.spawn_inner(task, correlation, true, None).await
+    }
+
+    /// [`WorkerSpawner::spawn_speculative`] plus the authority object
+    /// (C60): the C39 and C60 markers compose — the wrapper carries
+    /// both additive keys, so even a speculatively spawned worker runs
+    /// under a recorded mandate (weak signal, bounded authority).
+    pub async fn spawn_speculative_with_mandate(
+        &self,
+        task: Value,
+        correlation: Option<Value>,
+        mandate: Value,
+    ) -> Result<SpawnedWorker, SpawnError> {
+        self.spawn_inner(task, correlation, true, Some(mandate))
+            .await
     }
 
     async fn spawn_inner(
@@ -450,6 +583,7 @@ impl WorkerSpawner {
         task: Value,
         correlation: Option<Value>,
         speculative: bool,
+        mandate: Option<Value>,
     ) -> Result<SpawnedWorker, SpawnError> {
         let thread = Thread {
             id: Uuid::new_v4(),
@@ -457,11 +591,18 @@ impl WorkerSpawner {
             pinned_version: self.pinned_version,
         };
         let worker_session = SessionId::new();
-        let wrapper = if speculative {
-            speculative_delegation_content(thread.id, correlation, task)
-        } else {
-            delegation_content(thread.id, correlation, task)
+        // The C60 wrapper composes the public builders: the mandate
+        // key lands through mandate_delegation_content (exactly
+        // delegation_content plus one key), the speculative marker
+        // through the C39 spelling — both additive, both optional, and
+        // absent together the bytes are the frozen legacy form.
+        let mut wrapper = match &mandate {
+            Some(mandate) => mandate_delegation_content(thread.id, correlation, task, mandate),
+            None => delegation_content(thread.id, correlation, task),
         };
+        if speculative {
+            wrapper[SPECULATIVE_MARKER] = Value::Bool(true);
+        }
         let task_message = json!({"role": "user", "content": wrapper});
         // The admitted payload *is* the message content (the server's
         // consumption write wraps it as {"role","content"}).
@@ -980,11 +1121,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Delegation, DelegationPair, LineagePlan, SPECULATIVE_MARKER, SpawnError, StreamPortError,
-        WorkerSpawner, completion_summary, delegation_content, delegation_is_speculative,
-        delegation_pairs, lineage_plan, parse_delegation, parse_thread_report,
-        speculative_delegation_content, thread_completed_payload, thread_report_content,
-        thread_started_payload,
+        Delegation, DelegationPair, LineagePlan, MANDATE_KEY, MandateRevalidation,
+        SPECULATIVE_MARKER, SpawnError, StreamPortError, WorkerSpawner, completion_summary,
+        delegation_content, delegation_is_speculative, delegation_mandate, delegation_pairs,
+        lineage_plan, mandate_delegation_content, parse_delegation, parse_thread_report,
+        revalidate_mandate, speculative_delegation_content, thread_completed_payload,
+        thread_report_content, thread_started_payload,
     };
     use crate::templates::worker_template;
     use kian_core::events::{Event, EventKind};
@@ -1194,6 +1336,188 @@ mod tests {
         );
         assert!(text.contains("2 outstanding thread(s), max 2"), "{text}");
         assert!(text.contains("wait for a thread completion"), "{text}");
+    }
+
+    // ------------------------------------------------------------------
+    // The mandate wrapper (C60 / ADR-012)
+    // ------------------------------------------------------------------
+
+    fn mandate() -> serde_json::Value {
+        json!({
+            "strength": "inferred",
+            "scope": "draft a triage comment for the issue; never post",
+            "granted_by": {"login": "reporter", "type": "User"},
+            "source": {"channel": "github", "topic": "acme/repo#7"},
+            "policy_version": "v1",
+        })
+    }
+
+    #[test]
+    fn mandate_wrapper_is_exactly_legacy_plus_one_key() {
+        let mandate = mandate();
+        let content = mandate_delegation_content(
+            tid(0x6a),
+            Some(json!("evt-9")),
+            json!("do the thing"),
+            &mandate,
+        );
+        // Exactly delegation_content + "mandate": the frozen fields are
+        // byte-identical, one additive key carries the object verbatim.
+        let legacy = delegation_content(tid(0x6a), Some(json!("evt-9")), json!("do the thing"));
+        assert_eq!(content.as_object().map(serde_json::Map::len), Some(4));
+        for (key, value) in legacy.as_object().expect("legacy is an object") {
+            assert_eq!(
+                content.get(key),
+                Some(value),
+                "frozen field `{key}` unchanged"
+            );
+        }
+        assert_eq!(delegation_mandate(&content), Some(&mandate));
+        // The wrapper still parses as a delegation (the struct is frozen).
+        let back = parse_delegation(&content).expect("mandate wrapper parses");
+        assert_eq!(back.thread_id, tid(0x6a));
+        assert_eq!(back.task, json!("do the thing"));
+    }
+
+    #[test]
+    fn legacy_wrappers_parse_with_no_mandate() {
+        // Legacy, speculative, and non-wrapper content: the key is
+        // absent and the companion parser returns None — never guessed.
+        let legacy = delegation_content(tid(0x6b), None, json!("x"));
+        assert!(legacy.get(MANDATE_KEY).is_none());
+        assert_eq!(delegation_mandate(&legacy), None);
+        let speculative = speculative_delegation_content(tid(0x6c), None, json!("x"));
+        assert_eq!(delegation_mandate(&speculative), None);
+        assert_eq!(delegation_mandate(&json!("plain text")), None);
+        assert_eq!(delegation_mandate(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn mandate_wrapper_bytes_are_a_stable_golden() {
+        let content = mandate_delegation_content(tid(0x6d), None, json!("t"), &mandate());
+        let serialized = content.to_string();
+        let expected = format!(
+            "{{\"mandate\":{{\"granted_by\":{{\"login\":\"reporter\",\"type\":\"User\"}},\
+             \"policy_version\":\"v1\",\"scope\":\"draft a triage comment for the issue; never \
+             post\",\"source\":{{\"channel\":\"github\",\"topic\":\"acme/repo#7\"}},\
+             \"strength\":\"inferred\"}},\"task\":\"t\",\"thread_id\":\"{}\"}}",
+            tid(0x6d)
+        );
+        assert_eq!(serialized, expected);
+    }
+
+    #[tokio::test]
+    async fn speculative_and_mandate_markers_compose() {
+        // C39 + C60 compose: one wrapper carries both additive keys, so
+        // even a weak-signal spawn runs under recorded authority.
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        let mandate = mandate();
+        let spawned = spawner
+            .spawn_speculative_with_mandate(json!("check the anomaly"), None, mandate.clone())
+            .await
+            .expect("speculative mandated spawn");
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        let wrapper = &admits[0].1;
+        assert!(delegation_is_speculative(wrapper));
+        assert_eq!(delegation_mandate(wrapper), Some(&mandate));
+        // The same composed bytes ride both streams' thread/started.
+        assert!(delegation_is_speculative(&spawned.task_message["content"]));
+        assert_eq!(
+            delegation_mandate(&spawned.task_message["content"]),
+            Some(&mandate)
+        );
+    }
+
+    #[tokio::test]
+    async fn mandated_spawn_admits_the_wrapper_and_pins_the_template_id() {
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        assert_eq!(spawner.worker_template_id(), "kian-worker");
+        let mandate = mandate();
+        spawner
+            .spawn_with_mandate(json!("plain work"), None, mandate.clone())
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        assert_eq!(delegation_mandate(&admits[0].1), Some(&mandate));
+        assert!(!delegation_is_speculative(&admits[0].1));
+    }
+
+    // ------------------------------------------------------------------
+    // Mandate revalidation (ADR-012)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn revalidation_passes_explicit_legacy_and_matching_versions() {
+        let explicit = json!({"strength": "explicit", "policy_version": "v1"});
+        let inferred = json!({"strength": "inferred", "policy_version": "v1"});
+        // Explicit always passes — even under a changed version.
+        assert_eq!(
+            revalidate_mandate(Some(&explicit), Some("v9")),
+            MandateRevalidation::Pass
+        );
+        // Legacy delegations (no object) pass; pre-C60 authority is
+        // never retroactively narrowed.
+        assert_eq!(
+            revalidate_mandate(None, Some("v9")),
+            MandateRevalidation::Pass
+        );
+        // Inferred passes while its version is the current pointer
+        // (both sides unversioned read as the honest `none` label).
+        assert_eq!(
+            revalidate_mandate(Some(&inferred), Some("v1")),
+            MandateRevalidation::Pass
+        );
+        assert_eq!(
+            revalidate_mandate(Some(&json!({"strength": "inferred"})), None),
+            MandateRevalidation::Pass
+        );
+        assert_eq!(
+            revalidate_mandate(
+                Some(&json!({"strength": "inferred", "policy_version": "none"})),
+                None
+            ),
+            MandateRevalidation::Pass
+        );
+    }
+
+    #[test]
+    fn revalidation_releases_inferred_under_a_changed_version() {
+        let inferred = json!({"strength": "inferred", "policy_version": "v1"});
+        assert_eq!(
+            revalidate_mandate(Some(&inferred), Some("v2")),
+            MandateRevalidation::Release {
+                policy_version: "v1".into()
+            }
+        );
+        // A versioned mandate under an unversioned deployment drifts
+        // too (the pointer moved — unset is a drift, C63's rule).
+        assert_eq!(
+            revalidate_mandate(Some(&inferred), None),
+            MandateRevalidation::Release {
+                policy_version: "v1".into()
+            }
+        );
+        // A missing strength is the safe inferred reading.
+        assert_eq!(
+            revalidate_mandate(Some(&json!({"policy_version": "v1"})), Some("v2")),
+            MandateRevalidation::Release {
+                policy_version: "v1".into()
+            }
+        );
     }
 
     // ------------------------------------------------------------------
