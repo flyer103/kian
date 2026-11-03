@@ -107,6 +107,7 @@ pub mod intake;
 pub mod lark;
 pub mod metrics;
 pub mod mock;
+pub mod outbox;
 pub mod policy;
 pub mod policy_version;
 pub mod provenance;
@@ -147,6 +148,12 @@ pub use metrics::{
     SystemTurnClock, TurnClock, TurnRecord,
 };
 pub use mock::{CapturedDelivery, MockChannel};
+pub use outbox::{
+    DEFAULT_BACKOFF_CAP_MS, DEFAULT_BACKOFF_START_MS, DEFAULT_MAX_ATTEMPTS, Delivered,
+    ManualRetryClock, OutboxConfig, OutboxDriver, OutboxEntry, OutboxMetrics, OutboxPark,
+    OutboxState, OutboxStatus, PARK_ERROR_PREFIX, RetryClock, SystemRetryClock, ThreadOutboxView,
+    conversation_key, intent_ticket, outbox_pending, reconstruct_delivery, with_attempt_keys,
+};
 pub use policy::{
     DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME, ImPolicy,
     PolicyError, STRUCTURED_POLICY_NAME, SpeakCondition, SpeakContext, SpeakKind, SpeakPolicy,

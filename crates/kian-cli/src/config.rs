@@ -516,6 +516,14 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::mandate_policy`].
     #[serde(default)]
     pub mandate: MandateConfig,
+    /// C62 outbox bounded retry (`superagent.outbox`): stored work
+    /// for the write side — bounded backoff, per-`(ticket,
+    /// conversation)` ordering, park with a visible stage. Absent
+    /// (the default) = the legacy single-attempt send path,
+    /// byte-identical. Present (even empty) enables it; converted
+    /// fail-closed by [`SuperAgentConfig::outbox_config`].
+    #[serde(default)]
+    pub outbox: Option<OutboxConfigDef>,
 }
 
 /// C59's default: follow-up ownership is **on** — the honest default
@@ -567,6 +575,44 @@ impl SuperAgentConfig {
     pub fn mandate_policy(&self) -> Option<kian_superagent::MandatePolicy> {
         self.mandate.to_policy()
     }
+
+    /// Converts the C62 outbox section to the bundle's
+    /// [`kian_superagent::OutboxConfig`], fail-closed (a broken
+    /// schedule refuses to start). `Ok(None)` when nothing is
+    /// configured (the legacy single-attempt send path,
+    /// byte-identical).
+    pub fn outbox_config(&self) -> Result<Option<kian_superagent::OutboxConfig>, ConfigError> {
+        let Some(config) = self.outbox.as_ref() else {
+            return Ok(None);
+        };
+        let converted = kian_superagent::OutboxConfig {
+            max_attempts: config
+                .max_attempts
+                .unwrap_or(kian_superagent::DEFAULT_MAX_ATTEMPTS),
+            backoff_start_ms: config
+                .backoff_start_ms
+                .unwrap_or(kian_superagent::DEFAULT_BACKOFF_START_MS),
+            backoff_cap_ms: config
+                .backoff_cap_ms
+                .unwrap_or(kian_superagent::DEFAULT_BACKOFF_CAP_MS),
+        };
+        converted
+            .validate()
+            .map_err(|message| invalid(format!("superagent.outbox: {message}")))?;
+        Ok(Some(converted))
+    }
+}
+
+/// The C62 `superagent.outbox` section:
+/// `{max_attempts?, backoff_start_ms?, backoff_cap_ms?}` — every
+/// field optional; an empty section enables the outbox with the
+/// defaults (6 attempts, backoff 2s doubling, cap 60s).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct OutboxConfigDef {
+    pub max_attempts: Option<u32>,
+    pub backoff_start_ms: Option<u64>,
+    pub backoff_cap_ms: Option<u64>,
 }
 
 /// The C63 `superagent.policy` section:
@@ -1840,6 +1886,9 @@ impl ServeConfig {
             // C60: the mandate scope texts are non-blank (fail-closed —
             // an empty authority string is never issued).
             sa.mandate.validate()?;
+            // C62: the outbox schedule converts cleanly (fail-closed —
+            // a broken retry bound or backoff refuses to start).
+            sa.outbox_config()?;
             // C43: the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;

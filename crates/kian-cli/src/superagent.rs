@@ -1152,6 +1152,15 @@ pub struct SuperAgentServices {
     /// marked at boot (live sessions are never rewritten — the counter
     /// is the audit surface's numeric twin).
     pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
+    /// C62: the outbox bounded-retry driver, when
+    /// `superagent.outbox` is configured — the same handle the Router
+    /// tools deliver through; the boot re-drive uses it after the
+    /// stream rebuild.
+    pub outbox: Option<Arc<kian_superagent::OutboxDriver>>,
+    /// The Router's shared hold slot (C62: the boot re-drive waits
+    /// for its first per-hold stream port before writing re-drive
+    /// receipts).
+    pub router_hold: Arc<kian_superagent::RouterHold>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
     /// The async-jobs engine (C37), present when `superagent.async_tools`
@@ -1293,6 +1302,70 @@ pub async fn start_services(
         );
         record(&order, "policy_drift_marked");
     }
+
+    // 1d. C62: the outbox boot re-drive — pending (in-flight,
+    //     result-less) delivery intents rebuilt from the Router's
+    //     stream are re-sent through the adapter (at-least-once; under
+    //     per-key ordering the receipt lands once). Parked entries are
+    //     NOT re-driven (003: a parked delivery waits for a person —
+    //     visible via the `delivery-retry` stage and `kian tickets`).
+    //     Receipts write through the Router's per-hold port, so the
+    //     re-drive task waits for the hold's first port (the resident
+    //     Router installs one on its first drain after boot); until
+    //     then the intent stays pending and visible — never silently
+    //     dropped.
+    if let Some(driver) = services.outbox.clone() {
+        // The Router's own events (the same universe scan above).
+        let router_events: Vec<Event> = events
+            .iter()
+            .filter(|event| event.session == router)
+            .cloned()
+            .collect();
+        let pending = kian_superagent::outbox_pending(&router_events);
+        let redriven = pending
+            .iter()
+            .filter(|entry| entry.state == kian_superagent::OutboxState::Pending)
+            .count();
+        tracing::info!(
+            target: "kian::outbox",
+            pending = redriven,
+            parked = pending.len() - redriven,
+            "outbox audit: boot rebuild from the Router stream"
+        );
+        if redriven > 0 {
+            let hold = services.router_hold.clone();
+            let im = services.profile.im.clone();
+            let structured = services.profile.structured.clone();
+            tokio::spawn(async move {
+                // Wait for the first Router hold port (poll tick well
+                // under any drain cadence; a sleeping task, never a
+                // blocked worker).
+                let port = loop {
+                    if let Some(port) = hold.port() {
+                        break port;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                };
+                let outcomes = driver.redrive(&pending, &im, &structured, &port).await;
+                for (call_id, outcome) in outcomes {
+                    match outcome {
+                        Ok(delivered) => tracing::info!(
+                            target: "kian::outbox",
+                            call_id = %call_id,
+                            attempt = delivered.attempt,
+                            "outbox audit: boot re-drive delivered"
+                        ),
+                        Err(park) => tracing::error!(
+                            target: "kian::outbox",
+                            call_id = %call_id,
+                            "outbox audit: boot re-drive parked: {}", park.error_message()
+                        ),
+                    }
+                }
+            });
+        }
+    }
+    record(&order, "outbox_redrive_scheduled");
 
     // 2. Subscription consumers (AFTER the rebuild — no event is
     //    routed against an empty registry).

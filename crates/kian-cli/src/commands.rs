@@ -675,6 +675,10 @@ pub struct TicketRow {
     pub age_ms: u64,
     /// Event count of the worker stream.
     pub events: usize,
+    /// C62: the parked outbox deliveries named for this ticket
+    /// (`<conversation> (parked after N attempts)` lines; empty when
+    /// the outbox holds nothing for it).
+    pub parked: Vec<String>,
 }
 
 /// `kian tickets [--db <sqlite>] [--json]` — the Ticket stage board
@@ -716,6 +720,34 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
     }
 
     let now = now_ms();
+    // C62: the real outbox view — the delivery-retry stage arm's input
+    // (kian-64's stub exemption: this construction replaces `NoOutbox`).
+    // Ticket aliases per thread: the thread's own id string plus the
+    // topics its worker owns (a delivery's `correlation` names either).
+    let outbox_status = kian_superagent::OutboxStatus::from_events(&all_events);
+    let mut thread_aliases: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut worker_aliases: std::collections::BTreeMap<SessionId, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (worker, topics) in &worker_topics {
+        let Some(events) = streams.get(worker) else {
+            continue;
+        };
+        let thread = events
+            .iter()
+            .find(|e| e.kind == EventKind::ThreadStarted)
+            .and_then(|e| e.bytes.get("thread_id"))
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        if let Some(thread) = thread {
+            let mut aliases = vec![thread.to_string()];
+            aliases.extend(topics.iter().cloned());
+            worker_aliases.insert(*worker, aliases.clone());
+            thread_aliases.entry(thread).or_default().extend(aliases);
+        }
+    }
+    let outbox_view = kian_superagent::ThreadOutboxView::new(outbox_status.clone(), thread_aliases);
+    let parked_lines = outbox_status.parked_lines();
     let mut rows = Vec::new();
     for worker in workers {
         let events = streams.get(&worker).cloned().unwrap_or_default();
@@ -724,13 +756,25 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             .await
             .map_err(|e| format!("inbox read: {e}"))?
             .len();
-        let stage = kian_superagent::project_stage(&events, pending, &kian_superagent::NoOutbox);
+        let stage = kian_superagent::project_stage(&events, pending, &outbox_view);
         let thread = events
             .iter()
             .find(|e| e.kind == EventKind::ThreadStarted)
             .and_then(|e| e.bytes.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        // The parked message named on the board (C62): a worker whose
+        // ticket has a pending/parked delivery shows every parked line.
+        let parked = worker_aliases
+            .get(&worker)
+            .map(|aliases| {
+                if aliases.iter().any(|a| outbox_status.pending_for(a)) {
+                    parked_lines.clone()
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
         let thread_status = events
             .iter()
             .rev()
@@ -749,6 +793,7 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             pending_inbox: pending,
             age_ms: now.saturating_sub(first_ts),
             events: events.len(),
+            parked,
         });
     }
     store.close().await;
@@ -776,6 +821,19 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             row.pending_inbox,
             row.events,
             format_age(row.age_ms),
+        ));
+    }
+    // C62: the parked message named on the board — appended lines only
+    // when something is parked (empty board output stays byte-identical
+    // to the pre-C62 shape).
+    for row in rows.iter().filter(|row| !row.parked.is_empty()) {
+        out.push_str(&format!(
+            "parked: {} {} → {}\n",
+            row.session.0,
+            row.thread
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.parked.join("; ")
         ));
     }
     Ok(out)

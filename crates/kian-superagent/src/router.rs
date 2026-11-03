@@ -67,6 +67,10 @@ use uuid::Uuid;
 
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 use crate::metrics::{RouterTurnRecorder, SpeakMetrics};
+use crate::outbox::{
+    Delivered, OutboxConfig, OutboxDriver, SystemRetryClock, conversation_key, intent_ticket,
+    with_attempt_keys,
+};
 use crate::policy::{
     ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
     im_delivered_payload, speak_key, structured_delivered_payload,
@@ -200,6 +204,14 @@ pub struct RouterProfile {
     /// per-worker-template scope texts here, stamping the current
     /// policy-version pointer.
     pub mandate: Option<MandatePolicy>,
+    /// C62: the outbox bounded-retry configuration
+    /// (`superagent.outbox`). `None` (the default, and what an absent
+    /// config section produces) sends exactly once and reports the
+    /// honest adapter error to the model — byte-identical to the
+    /// pre-C62 behavior. When set, `reply`/`deliver_structured`
+    /// deliver through the [`OutboxDriver`] (bounded backoff, per-
+    /// `(ticket, conversation)` ordering, park with a visible stage).
+    pub outbox: Option<OutboxConfig>,
 }
 
 impl RouterProfile {
@@ -219,6 +231,7 @@ impl RouterProfile {
             re_arm: Vec::new(),
             policy_version: None,
             mandate: None,
+            outbox: None,
         }
     }
 
@@ -562,6 +575,10 @@ pub struct RouterTools {
     /// C60: the current policy-version pointer (the C63 label) the
     /// mandate stamps — the same label the bootstrap renders.
     policy_label: Option<String>,
+    /// C62: the outbox bounded-retry driver. `None` (the default) is
+    /// the legacy single-attempt send path, byte-identical. When
+    /// present, `reply`/`deliver_structured` deliver through it.
+    outbox: Option<Arc<OutboxDriver>>,
     hold: Arc<RouterHold>,
 }
 
@@ -573,6 +590,15 @@ impl RouterTools {
         profile: &RouterProfile,
         hold: Arc<RouterHold>,
     ) -> Self {
+        // C62: the outbox driver is built before the literal moves
+        // `channels` (it owns a clone for the boot re-drive).
+        let outbox = profile.outbox.map(|config| {
+            Arc::new(OutboxDriver::new(
+                config,
+                Arc::new(SystemRetryClock),
+                channels.clone(),
+            ))
+        });
         Self {
             spawner,
             channels,
@@ -590,6 +616,7 @@ impl RouterTools {
                 .policy_version
                 .as_ref()
                 .map(|version| version.label().to_string()),
+            outbox,
             hold,
         }
     }
@@ -605,6 +632,23 @@ impl RouterTools {
     ) -> Self {
         self.followup_registry = Some(registry);
         self
+    }
+
+    /// C62 assembly/test wiring: installs an explicitly-built outbox
+    /// driver (clock-injected for tests; the boot re-drive uses the
+    /// same handle). Overrides any driver the profile's config built.
+    #[must_use]
+    pub fn with_outbox_driver(mut self, driver: Arc<OutboxDriver>) -> Self {
+        self.outbox = Some(driver);
+        self
+    }
+
+    /// C62: the installed outbox driver, if any (the boot re-drive
+    /// surface — `start_services` rebuilds pending intents from the
+    /// Router's stream and re-drives them through this handle).
+    #[must_use]
+    pub fn outbox_driver(&self) -> Option<Arc<OutboxDriver>> {
+        self.outbox.as_ref().map(Arc::clone)
     }
 
     /// The speak-gate's suppression counters (C58) — the assembly's
@@ -914,6 +958,46 @@ impl RouterTools {
         })
     }
 
+    /// C62: the shared send path of `reply`/`deliver_structured`.
+    /// Without a driver (the default) this is the legacy single
+    /// attempt — byte-identical behavior. With one, the send runs
+    /// through [`OutboxDriver::deliver_with_retry`]: bounded backoff,
+    /// per-`(ticket, conversation)` ordering, and an honest park error
+    /// (the `outbox park:` prefix is the rebuild contract) instead of
+    /// an endless in-turn model retry.
+    async fn send_with_outbox(
+        &self,
+        args: &Value,
+        channel: &str,
+        target: &Value,
+        adapter: &Arc<dyn ChannelAdapter>,
+        delivery: ChannelDelivery,
+    ) -> Result<Delivered, ToolError> {
+        let Some(driver) = self.outbox.as_ref() else {
+            let receipt = adapter
+                .send(delivery)
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            return Ok(Delivered {
+                receipt,
+                attempt: 1,
+                // Unused on the legacy path — no attempt keys are
+                // stamped there.
+                first_attempt_ms: 0,
+                conversation: conversation_key(channel, target),
+            });
+        };
+        let ticket = intent_ticket(args, &self.router.0.to_string());
+        let conversation = conversation_key(channel, target);
+        let send_adapter = Arc::clone(adapter);
+        driver
+            .deliver_with_retry(&ticket, &conversation, move || {
+                send_adapter.send(delivery.clone())
+            })
+            .await
+            .map_err(|park| ToolError::Execution(park.error_message()))
+    }
+
     async fn reply(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let port = self.port()?;
         let args = &call.arguments;
@@ -939,22 +1023,27 @@ impl RouterTools {
             target: target.clone(),
             content: json!({"text": enforced.text}),
         };
-        let receipt = adapter
-            .send(delivery)
+        let delivered = self
+            .send_with_outbox(args, channel, &target, &adapter, delivery)
+            .await?;
+        // channel/delivered lands only after the send succeeded; under
+        // an enabled outbox (C62) the receipt carries the additive
+        // `attempt`/`first_attempt_ms` keys (legacy payloads stay
+        // byte-identical).
+        let payload = im_delivered_payload(channel, &target, &enforced);
+        let payload = if self.outbox.is_some() {
+            with_attempt_keys(payload, &delivered)
+        } else {
+            payload
+        };
+        port.emit(EventKind::ChannelDelivered, payload)
             .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-        // channel/delivered lands only after the send succeeded.
-        port.emit(
-            EventKind::ChannelDelivered,
-            im_delivered_payload(channel, &target, &enforced),
-        )
-        .await
-        .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
+            .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
         self.speak_record(channel, &target);
         Ok(ToolResult {
             call_id: call.id,
             output: json!({
-                "message_id": receipt.message_id,
+                "message_id": delivered.receipt.message_id,
                 "words": enforced.words,
                 "truncated": enforced.truncated,
             }),
@@ -996,20 +1085,22 @@ impl RouterTools {
             target: target.clone(),
             content: payload,
         };
-        let receipt = adapter
-            .send(delivery)
+        let delivered = self
+            .send_with_outbox(args, channel, &target, &adapter, delivery)
+            .await?;
+        let receipt_payload = structured_delivered_payload(channel, &target);
+        let receipt_payload = if self.outbox.is_some() {
+            with_attempt_keys(receipt_payload, &delivered)
+        } else {
+            receipt_payload
+        };
+        port.emit(EventKind::ChannelDelivered, receipt_payload)
             .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-        port.emit(
-            EventKind::ChannelDelivered,
-            structured_delivered_payload(channel, &target),
-        )
-        .await
-        .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
+            .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
         self.speak_record(channel, &target);
         Ok(ToolResult {
             call_id: call.id,
-            output: json!({"message_id": receipt.message_id, "sections_delivered": true}),
+            output: json!({"message_id": delivered.receipt.message_id, "sections_delivered": true}),
             is_error: false,
         })
     }
@@ -1069,7 +1160,10 @@ impl ToolProvider for RouterTools {
                     "properties": {
                         "channel": {"type": "string"},
                         "text": {"type": "string"},
-                        "target": {"description": "Channel-defined delivery target"}
+                        "target": {"description": "Channel-defined delivery target"},
+                        "correlation": {"type": "string", "description": "Optional ticket correlation \
+                         (thread id or topic) — the outbox orders and reports deliveries per \
+                         (correlation, target conversation)"}
                     },
                     "required": ["channel", "text"],
                 }),
@@ -1084,7 +1178,10 @@ changes, verification)."
                     "properties": {
                         "channel": {"type": "string"},
                         "target": {"description": "Channel-defined delivery target"},
-                        "payload": {"type": "object", "description": "Must carry every required section"}
+                        "payload": {"type": "object", "description": "Must carry every required section"},
+                        "correlation": {"type": "string", "description": "Optional ticket correlation \
+                         (thread id or topic) — the outbox orders and reports deliveries per \
+                         (correlation, target conversation)"}
                     },
                     "required": ["channel", "target", "payload"],
                 }),
@@ -1130,6 +1227,7 @@ impl Clone for RouterTools {
             router: self.router,
             mandate: self.mandate.clone(),
             policy_label: self.policy_label.clone(),
+            outbox: self.outbox.clone(),
             hold: Arc::clone(&self.hold),
         }
     }

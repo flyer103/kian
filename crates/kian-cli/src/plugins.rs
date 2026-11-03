@@ -367,6 +367,10 @@ pub struct SuperAgentPlugin {
     /// (`superagent.mandate`), per-worker-template scope texts.
     /// `None` = no mandate issued (byte-identical legacy wrappers).
     pub mandate: Option<kian_superagent::MandatePolicy>,
+    /// C62: the outbox bounded-retry configuration
+    /// (`superagent.outbox`). `None` = the legacy single-attempt send
+    /// path, byte-identical.
+    pub outbox: Option<kian_superagent::OutboxConfig>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -517,6 +521,10 @@ impl Plugin for SuperAgentPlugin {
         // C60 (ADR-012): the mandate issuance policy rides the profile
         // into the spawn tool (the single issuance point).
         profile.mandate = self.mandate.clone();
+        // C62: the outbox bounded-retry config rides the profile (an
+        // explicitly-built driver below overrides the auto-built one,
+        // sharing one handle with the boot re-drive).
+        profile.outbox = self.outbox;
         // kian-62: the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 
@@ -573,10 +581,23 @@ impl Plugin for SuperAgentPlugin {
         let followup_registry = Arc::new(std::sync::RwLock::new(
             kian_superagent::PassthroughRegistry::new(),
         ));
-        let router_tools = Arc::new(
-            RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
-                .with_followup_registry(Arc::clone(&followup_registry)),
-        );
+        // C62: one outbox driver shared by the tool surface (retry +
+        // ordering + park) and the boot re-drive (`start_services`
+        // rebuilds pending intents from the Router's stream and
+        // re-drives them through this handle).
+        let outbox_driver = self.outbox.map(|config| {
+            Arc::new(kian_superagent::OutboxDriver::new(
+                config,
+                Arc::new(kian_superagent::SystemRetryClock),
+                channels.clone(),
+            ))
+        });
+        let mut router_tools = RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
+            .with_followup_registry(Arc::clone(&followup_registry));
+        if let Some(driver) = &outbox_driver {
+            router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
+        }
+        let router_tools = Arc::new(router_tools);
         // C35: the recall toolpack reads through the one `StoreRecall`
         // port the runtime also exposes (the spill index it holds is
         // rebuilt by `start_services`). Config-gated: default on for
@@ -772,7 +793,7 @@ impl Plugin for SuperAgentPlugin {
         let router_metrics = kian_superagent::RouterMetrics::shared();
         let router_side = kian_superagent::RouterDriver::with_metrics(
             router_loop,
-            hold,
+            hold.clone(),
             crate::superagent::port_for_ctx(),
             router_inbox.clone(),
             kian_superagent::RouterTurnRecorder::new(
@@ -848,6 +869,11 @@ impl Plugin for SuperAgentPlugin {
             policy: self.policy_version.clone(),
             policy_notify_live: self.policy_notify_live,
             policy_drift: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // C62: the outbox driver + the Router hold (the boot
+            // re-drive waits for the hold's first port, then re-sends
+            // the rebuilt pending intents through this handle).
+            outbox: outbox_driver,
+            router_hold: hold,
             watchdog_inbox: mounted_watchdog_inbox,
             remote,
             async_jobs,
