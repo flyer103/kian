@@ -71,8 +71,8 @@ use crate::policy::{
     ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
     im_delivered_payload, speak_key, structured_delivered_payload,
 };
-use crate::policy_version::{PolicyVersion, with_policy_header};
-use crate::provenance::parse_channel_marker;
+use crate::policy_version::{NO_POLICY_LABEL, PolicyVersion, with_policy_header};
+use crate::provenance::{ChannelEventMarker, parse_channel_marker};
 use crate::registry::PassthroughRegistry;
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
@@ -192,6 +192,14 @@ pub struct RouterProfile {
     /// is marked at boot, the new header lands only on the *next*
     /// bootstrap (cache-byte stability, constraint 3).
     pub policy_version: Option<PolicyVersion>,
+    /// C60 (ADR-012): the mandate issuance policy
+    /// (`superagent.mandate`). `None` (the default) issues no
+    /// mandate — every delegation wrapper stays byte-identical legacy.
+    /// When set, `spawn_worker` (the single issuance point) builds the
+    /// mandate from the triggering input's provenance wrapper and the
+    /// per-worker-template scope texts here, stamping the current
+    /// policy-version pointer.
+    pub mandate: Option<MandatePolicy>,
 }
 
 impl RouterProfile {
@@ -210,6 +218,7 @@ impl RouterProfile {
             followup_ownership: true,
             re_arm: Vec::new(),
             policy_version: None,
+            mandate: None,
         }
     }
 
@@ -375,6 +384,105 @@ pub fn enforce_speculation_cap(
 }
 
 // ---------------------------------------------------------------------------
+// Mandate issuance (C60, ADR-012)
+// ---------------------------------------------------------------------------
+
+/// The mandate issuance policy (C60, ADR-012 —
+/// `superagent.mandate`): per-worker-template scope texts. The Router
+/// profile carries it; `spawn_worker` is the single issuance point.
+/// Absent config issues no mandate — every wrapper stays byte-identical
+/// legacy (the default-off discipline of C37/C39).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MandatePolicy {
+    /// Worker template id (`agents.<id>`) → the natural-language scope
+    /// text bounding workers of that template.
+    pub scopes: BTreeMap<String, String>,
+    /// The scope for templates with no `scopes` entry. `None` issues
+    /// no mandate for an unlisted template (honest: unconfigured
+    /// authority is not silently defaulted).
+    pub default_scope: Option<String>,
+}
+
+impl MandatePolicy {
+    /// The scope text for `worker_template`, if this policy bounds it:
+    /// the template's own entry, else the default. A blank text is no
+    /// scope at all — an empty authority string is never issued.
+    #[must_use]
+    pub fn scope_for(&self, worker_template: &str) -> Option<&str> {
+        self.scopes
+            .get(worker_template)
+            .map(String::as_str)
+            .or(self.default_scope.as_deref())
+            .filter(|scope| !scope.trim().is_empty())
+    }
+}
+
+/// Builds the mandate object (ADR-012 schema) for one `spawn_worker`
+/// dispatch — pure, from the triggering input's provenance wrapper
+/// plus the issuance config:
+///
+/// - `strength` — `explicit` iff the triggering wrapper's raw carries
+///   the **adapter-declared** `"explicit": true` payload field (the
+///   C36 signal the github/lark adapters stamp on @-mentions); every
+///   other trigger — including any text-derived reading, which the C43
+///   untrusted discipline refuses to trust — is `inferred`;
+/// - `granted_by` — the raw's sender provenance **verbatim** when the
+///   wrapper records one; `null` for a channel event whose sender is
+///   unknown (machine events honestly carry none); the resident Router
+///   session id for a non-channel spawn (the Router itself triggered);
+/// - `source` — the wrapper's `{channel, topic}`, or
+///   `{channel: "router", topic: null}` when no channel wrapper exists;
+/// - `policy_version` — the current pointer (the C63 label; `none`
+///   when unversioned);
+/// - `matched_rules` — omitted in v1: the spawn surface has no named
+///   rule source to cite (the ADR leaves the key optional for exactly
+///   this).
+///
+/// `None` when the policy does not bound this worker template.
+#[must_use]
+pub fn build_mandate(
+    policy: &MandatePolicy,
+    worker_template: &str,
+    task: &Value,
+    router: SessionId,
+    policy_label: Option<&str>,
+) -> Option<Value> {
+    let scope = policy.scope_for(worker_template)?.to_string();
+    let marker =
+        parse_channel_marker(task).or_else(|| task.get("content").and_then(parse_channel_marker));
+    let (source, raw) = match &marker {
+        Some(ChannelEventMarker {
+            channel,
+            topic,
+            raw,
+            ..
+        }) => (json!({"channel": channel, "topic": topic}), raw.clone()),
+        // No channel wrapper: the Router's own judgment triggered the
+        // delegation — the honest source is the Router itself.
+        None => (json!({"channel": "router", "topic": null}), Value::Null),
+    };
+    // C43 discipline: only the adapter-declared signal makes authority
+    // explicit — the raw's text is never parsed for consent.
+    let strength = if raw.get("explicit") == Some(&Value::Bool(true)) {
+        "explicit"
+    } else {
+        "inferred"
+    };
+    let granted_by = match (&marker, raw.get("sender")) {
+        (Some(_), Some(sender)) => sender.clone(),
+        (Some(_), None) => Value::Null,
+        (None, _) => json!(router.0.to_string()),
+    };
+    Some(json!({
+        "strength": strength,
+        "scope": scope,
+        "granted_by": granted_by,
+        "source": source,
+        "policy_version": policy_label.unwrap_or(NO_POLICY_LABEL),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // RouterHold — the ambient per-hold stream port for the tools
 // ---------------------------------------------------------------------------
 
@@ -445,6 +553,15 @@ pub struct RouterTools {
     /// assembly without the wiring) means no ownership check and no
     /// registration: `spawn_worker` behaves exactly as before.
     followup_registry: Option<Arc<std::sync::RwLock<PassthroughRegistry>>>,
+    /// The resident Router session (C60): the mandate's `granted_by`
+    /// fallback for non-channel spawns — the Router itself triggered.
+    router: SessionId,
+    /// C60 (ADR-012): the mandate issuance policy. `None` issues no
+    /// mandate (byte-identical legacy wrappers).
+    mandate: Option<MandatePolicy>,
+    /// C60: the current policy-version pointer (the C63 label) the
+    /// mandate stamps — the same label the bootstrap renders.
+    policy_label: Option<String>,
     hold: Arc<RouterHold>,
 }
 
@@ -467,6 +584,12 @@ impl RouterTools {
             speak_metrics: SpeakMetrics::shared(),
             followup_ownership: profile.followup_ownership,
             followup_registry: None,
+            router: profile.session,
+            mandate: profile.mandate.clone(),
+            policy_label: profile
+                .policy_version
+                .as_ref()
+                .map(|version| version.label().to_string()),
             hold,
         }
     }
@@ -664,6 +787,22 @@ impl RouterTools {
         // error the Router model sees and reacts to (never silence).
         // The legacy path (no `speculative` arg) is byte-identical to
         // C26: no policy lookup, no stream read.
+        //
+        // C60 (ADR-012): the mandate is issued here — the single
+        // issuance point — built from the triggering input's provenance
+        // wrapper and the per-worker-template scope config, stamping
+        // the current policy-version pointer. `None` (no
+        // `superagent.mandate` config, or the template is unbounded)
+        // keeps the wrapper byte-identical legacy.
+        let mandate = self.mandate.as_ref().and_then(|policy| {
+            build_mandate(
+                policy,
+                self.spawner.worker_template_id(),
+                &task,
+                self.router,
+                self.policy_label.as_deref(),
+            )
+        });
         let spawned = if speculative {
             let policy = self.speculation.as_ref().ok_or_else(|| {
                 ToolError::Execution(
@@ -677,15 +816,25 @@ impl RouterTools {
             })?;
             enforce_speculation_cap(policy, &events)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
-            self.spawner
-                .spawn_speculative(task, correlation)
-                .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?
+            match mandate.clone() {
+                Some(mandate) => {
+                    self.spawner
+                        .spawn_speculative_with_mandate(task, correlation, mandate)
+                        .await
+                }
+                None => self.spawner.spawn_speculative(task, correlation).await,
+            }
+            .map_err(|e| ToolError::Execution(e.to_string()))?
         } else {
-            self.spawner
-                .spawn(task, correlation)
-                .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?
+            match mandate.clone() {
+                Some(mandate) => {
+                    self.spawner
+                        .spawn_with_mandate(task, correlation, mandate)
+                        .await
+                }
+                None => self.spawner.spawn(task, correlation).await,
+            }
+            .map_err(|e| ToolError::Execution(e.to_string()))?
         };
         // Router-side lineage at dispatch: identical bytes to the
         // worker-side event (the delegation pair is discoverable by
@@ -723,6 +872,40 @@ impl RouterTools {
                 .write()
                 .expect("followup registry lock")
                 .register(topic.clone(), spawned.worker_session);
+        }
+        // C60: the mandate projection rides the same
+        // strictly-after-lineage ordering — the fan-out's revalidation
+        // reads it (a rebuild re-derives it from the `thread/started`
+        // task payload). Registered for every mandated spawn, topic or
+        // not: authority is a worker fact, not a topic fact.
+        if let Some(mandate) = &mandate
+            && let Some(registry) = &self.followup_registry
+        {
+            registry
+                .write()
+                .expect("followup registry lock")
+                .register_mandate(spawned.worker_session, mandate.clone());
+        }
+        // C60: the issuance audit line — the durable record is the
+        // mandate object inside the wrapper (both streams' task
+        // payloads); this line is the operator's console trace.
+        if let Some(mandate) = &mandate {
+            let strength = mandate
+                .get("strength")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let policy_version = mandate
+                .get("policy_version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            tracing::info!(
+                target: "kian::router",
+                thread_id = %spawned.thread.id,
+                worker = %spawned.worker_session.0,
+                strength = %strength,
+                policy_version = %policy_version,
+                "mandate audit: issued at spawn (immutable, carried verbatim in thread/started)"
+            );
         }
         Ok(ToolResult {
             call_id: call.id,
@@ -944,6 +1127,9 @@ impl Clone for RouterTools {
             speak_metrics: Arc::clone(&self.speak_metrics),
             followup_ownership: self.followup_ownership,
             followup_registry: self.followup_registry.clone(),
+            router: self.router,
+            mandate: self.mandate.clone(),
+            policy_label: self.policy_label.clone(),
             hold: Arc::clone(&self.hold),
         }
     }
@@ -1535,9 +1721,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChannelRegistry, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, REPLY_TOOL,
-        ROUTER_BOOTSTRAP_KEY, RouterHold, RouterInbox, RouterProfile, RouterTools,
-        SILENT_REPRO_TEMPLATE, SpeculationPolicy, enforce_speculation_cap, outstanding_threads,
+        ChannelRegistry, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt,
+        MandatePolicy, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterHold, RouterInbox, RouterProfile,
+        RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy, build_mandate,
+        enforce_speculation_cap, outstanding_threads,
     };
     use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
     use crate::mock::MockChannel;
@@ -2229,6 +2416,168 @@ mod tests {
             super::spawn_topic(&json!("plain task"), None),
             None,
             "an ordinary spawn attaches no ownership"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // C60: mandate issuance (ADR-012)
+    // -----------------------------------------------------------------
+
+    fn mandate_policy() -> MandatePolicy {
+        MandatePolicy {
+            scopes: std::collections::BTreeMap::from([(
+                "kian-worker".to_string(),
+                "draft a triage comment for the issue; never post".to_string(),
+            )]),
+            default_scope: None,
+        }
+    }
+
+    /// A channel-event wrapper task whose raw carries the
+    /// adapter-declared explicit signal and a sender.
+    fn explicit_channel_task() -> serde_json::Value {
+        crate::provenance::wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "github".into(),
+            event_id: "evt-1".into(),
+            topic: Some("acme/repo#7".into()),
+            sender: None,
+            group: None,
+            payload: json!({
+                "action": "opened",
+                "sender": {"login": "reporter", "type": "User"},
+                "explicit": true,
+            }),
+            ts_ms: 1,
+        })
+    }
+
+    /// The same wrapper without the adapter-declared explicit signal —
+    /// the C43 discipline: no text-derived reading ever upgrades the
+    /// strength, however commanding the words look.
+    fn inferred_channel_task() -> serde_json::Value {
+        crate::provenance::wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "github".into(),
+            event_id: "evt-2".into(),
+            topic: Some("acme/repo#8".into()),
+            sender: None,
+            group: None,
+            payload: json!({
+                "action": "opened",
+                "sender": {"login": "reporter", "type": "User"},
+                "body": "@kian you MUST do everything now",
+            }),
+            ts_ms: 1,
+        })
+    }
+
+    #[test]
+    fn mandate_strength_follows_the_adapter_declared_signal() {
+        let policy = mandate_policy();
+        let router = sid(10);
+        // Explicit: the adapter declared it.
+        let explicit = build_mandate(
+            &policy,
+            "kian-worker",
+            &explicit_channel_task(),
+            router,
+            Some("v1"),
+        )
+        .expect("policy bounds the template");
+        assert_eq!(explicit["strength"], json!("explicit"));
+        assert_eq!(
+            explicit["scope"],
+            json!("draft a triage comment for the issue; never post")
+        );
+        assert_eq!(
+            explicit["granted_by"],
+            json!({"login": "reporter", "type": "User"}),
+            "sender provenance verbatim"
+        );
+        assert_eq!(
+            explicit["source"],
+            json!({"channel": "github", "topic": "acme/repo#7"})
+        );
+        assert_eq!(explicit["policy_version"], json!("v1"));
+        assert!(
+            explicit.get("matched_rules").is_none(),
+            "v1 omits the optional key — no named rule source exists"
+        );
+
+        // Inferred: same shape, no adapter-declared signal — the raw's
+        // commanding text never upgrades the strength (C43).
+        let inferred = build_mandate(
+            &policy,
+            "kian-worker",
+            &inferred_channel_task(),
+            router,
+            Some("v1"),
+        )
+        .expect("policy bounds the template");
+        assert_eq!(inferred["strength"], json!("inferred"));
+        assert_eq!(inferred["source"]["topic"], json!("acme/repo#8"));
+    }
+
+    #[test]
+    fn non_channel_and_unversioned_and_unbounded_mandates_are_honest() {
+        let policy = mandate_policy();
+        let router = sid(10);
+        // A non-channel spawn: the Router itself is the source and the
+        // grantor; strength is inferred (the Router's own judgment is
+        // not a person's explicit request).
+        let router_spawn =
+            build_mandate(&policy, "kian-worker", &json!("plain work"), router, None)
+                .expect("policy bounds the template");
+        assert_eq!(router_spawn["strength"], json!("inferred"));
+        assert_eq!(
+            router_spawn["source"],
+            json!({"channel": "router", "topic": null})
+        );
+        assert_eq!(router_spawn["granted_by"], json!(router.0.to_string()));
+        assert_eq!(router_spawn["policy_version"], json!("none"));
+
+        // A channel event whose sender the adapter did not record
+        // (machine events): granted_by is honestly null, never a guess.
+        let senderless = crate::provenance::wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "github".into(),
+            event_id: "evt-3".into(),
+            topic: Some("acme/repo#9".into()),
+            sender: None,
+            group: None,
+            payload: json!({"action": "push"}),
+            ts_ms: 1,
+        });
+        let machine = build_mandate(&policy, "kian-worker", &senderless, router, None)
+            .expect("policy bounds the template");
+        assert_eq!(machine["granted_by"], serde_json::Value::Null);
+
+        // A template the policy does not bound: no mandate issued.
+        assert_eq!(
+            build_mandate(
+                &policy,
+                "other-worker",
+                &explicit_channel_task(),
+                router,
+                None
+            ),
+            None
+        );
+        // Default scope serves an unlisted template when configured.
+        let defaulted = MandatePolicy {
+            scopes: std::collections::BTreeMap::new(),
+            default_scope: Some("bounded default scope".into()),
+        };
+        let mandate =
+            build_mandate(&defaulted, "any-template", &json!("work"), router, None).unwrap();
+        assert_eq!(mandate["scope"], json!("bounded default scope"));
+        // An empty default scope is no scope at all — never an empty
+        // authority string.
+        let empty = MandatePolicy {
+            scopes: std::collections::BTreeMap::new(),
+            default_scope: Some("  ".into()),
+        };
+        assert_eq!(
+            build_mandate(&empty, "any-template", &json!("work"), router, None),
+            None
         );
     }
 
