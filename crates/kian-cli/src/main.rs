@@ -38,6 +38,9 @@ const USAGE: &str = "usage:
                                          operator wake via the running server (C14)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease (C14)
+  kian tickets [--db <sqlite>] [--config <path>] [--json]
+                                         Ticket stage board: every worker session's
+                                         'what is it waiting for' stage (C56)
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event (C14)
   kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
@@ -59,6 +62,7 @@ fn main() -> ExitCode {
         Some("wake-now") => wake_now(&args[2..]),
         Some("mock-channel-send") => mock_channel_send(&args[2..]),
         Some("lease") => lease(&args[2..]),
+        Some("tickets") => tickets(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
             print!("{USAGE}");
@@ -530,7 +534,43 @@ fn lease(args: &[String]) -> ExitCode {
     )
 }
 
-/// `kian recovery budget reset <uuid> [--reason <text>] [--url <base>]`
+/// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the C56
+/// Ticket stage board (read-only embedded).
+fn tickets(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!("kian: --db requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown tickets option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    run_command(
+        kian_cli::commands::run_tickets(&config, db.as_deref(), json),
+        "tickets",
+    )
+}
+
+/// `kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--json]`
 fn recovery(args: &[String]) -> ExitCode {
     let ok_shape = args.first().map(String::as_str) == Some("budget")
         && args.get(1).map(String::as_str) == Some("reset");

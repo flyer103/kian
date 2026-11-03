@@ -1,6 +1,6 @@
 //! The C14 operational session commands: `inspect` / `replay` /
 //! `export` / `wake-now` / `lease inspect` / `recovery budget reset`
-//! (SPEC §3.2).
+//! (SPEC §3.2), plus `tickets` — the C56 Ticket stage board.
 //!
 //! Two access modes, by card design:
 //!
@@ -68,6 +68,17 @@
 //!   "leases": [ { "session": "<uuid>", "epoch": 3, "holder": "…",
 //!                 "ttl_ms": 30000, "last_heartbeat_ms": 1761899990000,
 //!                 "expires_in_ms": 22000, "expired": false } ]
+//! }
+//! ```
+//!
+//! **`tickets`** (C56) — one row per worker session, uuid-ascending
+//! ```json
+//! {
+//!   "now_ms": 1761900000000,
+//!   "tickets": [ { "session": "<uuid>", "thread": "<uuid>|null",
+//!                  "topic": "pr-9|null", "stage": "working",
+//!                  "thread_status": "outstanding",
+//!                  "pending_inbox": 0, "age_ms": 45000, "events": 12 } ]
 //! }
 //! ```
 //!
@@ -638,6 +649,155 @@ pub async fn run_lease_inspect(
         ));
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// tickets — the Ticket stage board (C56)
+// ---------------------------------------------------------------------------
+
+/// One row of the `kian tickets` board: a worker session (one Ticket
+/// v1) with its derived stage and the facts behind it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TicketRow {
+    /// The worker session (= the Ticket v1 identity).
+    pub session: SessionId,
+    /// The thread this worker serves (from its `thread/started`).
+    pub thread: Option<uuid::Uuid>,
+    /// The spawning/served topic(s), if the channel wrapper named one.
+    pub topic: Option<String>,
+    /// The derived stage (pure projection, never persisted).
+    pub stage: kian_superagent::TicketStage,
+    /// Latest `thread/completed` status, or `outstanding`.
+    pub thread_status: String,
+    /// Eligible-but-unconsumed inbox rows (the queued arm's read side).
+    pub pending_inbox: usize,
+    /// Age in ms since the stream's first event.
+    pub age_ms: u64,
+    /// Event count of the worker stream.
+    pub events: usize,
+}
+
+/// `kian tickets [--db <sqlite>] [--json]` — the Ticket stage board
+/// (C56): every worker session discovered by scanning `thread/started`
+/// across streams (the [`kian_superagent::worker_sessions`] derivation),
+/// each with its stage, topic, thread status, and age. Read-only
+/// (`open_read_only`); the stage is a pure projection of the stream +
+/// inbox, recomputed on every call — nothing is cached, nothing is
+/// written. Deterministic order: session uuid ascending.
+pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> CmdResult<String> {
+    let db = resolve_db(db, config_path)?;
+    let store = open_reader(&db).await?;
+    let sessions = crate::cache_metrics::sessions_with_events(&store)
+        .await
+        .map_err(|e| format!("session listing: {e}"))?;
+    let mut streams = std::collections::BTreeMap::new();
+    let mut all_events = Vec::new();
+    for session in &sessions {
+        let events = store
+            .rebuild(*session)
+            .await
+            .map_err(|e| format!("read events for {session:?}: {e}"))?;
+        all_events.extend(events.iter().cloned());
+        streams.insert(*session, events);
+    }
+    // Worker discovery: `thread/started` across every stream (a
+    // Router's dispatch side names the workers; worker-side lineage
+    // names them too). BTreeSet ⇒ deterministic uuid order.
+    let workers = kian_superagent::worker_sessions(&all_events);
+    // Topic binding: the same disposable registry projection the
+    // runtime rebuilds (C38), inverted to worker → topics.
+    let registry = kian_superagent::PassthroughRegistry::rebuild(&all_events);
+    let mut worker_topics: std::collections::BTreeMap<SessionId, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for topic in registry.topics() {
+        for worker in registry.resolve(&topic) {
+            worker_topics.entry(worker).or_default().push(topic.clone());
+        }
+    }
+
+    let now = now_ms();
+    let mut rows = Vec::new();
+    for worker in workers {
+        let events = streams.get(&worker).cloned().unwrap_or_default();
+        let pending = store
+            .eligible_inputs(worker, now)
+            .await
+            .map_err(|e| format!("inbox read: {e}"))?
+            .len();
+        let stage = kian_superagent::project_stage(&events, pending, &kian_superagent::NoOutbox);
+        let thread = events
+            .iter()
+            .find(|e| e.kind == EventKind::ThreadStarted)
+            .and_then(|e| e.bytes.get("thread_id"))
+            .and_then(Value::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        let thread_status = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == EventKind::ThreadCompleted)
+            .and_then(|e| e.bytes.get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "outstanding".to_string());
+        let first_ts = events.first().map(|e| e.ts).unwrap_or(0);
+        rows.push(TicketRow {
+            session: worker,
+            thread,
+            topic: worker_topics.get(&worker).map(|topics| topics.join(",")),
+            stage,
+            thread_status,
+            pending_inbox: pending,
+            age_ms: now.saturating_sub(first_ts),
+            events: events.len(),
+        });
+    }
+    store.close().await;
+
+    if json {
+        let report = json!({"now_ms": now, "tickets": rows});
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    if rows.is_empty() {
+        return Ok("no worker sessions (no thread/started lineage in this store)\n".into());
+    }
+    let mut out = format!(
+        "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
+        "SESSION", "STAGE", "TOPIC", "THREAD", "PENDING", "EVENTS", "AGE"
+    );
+    for row in &rows {
+        out.push_str(&format!(
+            "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
+            row.session.0,
+            row.stage,
+            row.topic.as_deref().unwrap_or("-"),
+            row.thread
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.pending_inbox,
+            row.events,
+            format_age(row.age_ms),
+        ));
+    }
+    Ok(out)
+}
+
+/// Human age from ms, deterministic formatting: the two most
+/// significant units (`2h13m`, `45s`, `0s`).
+fn format_age(age_ms: u64) -> String {
+    let secs = age_ms / 1000;
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins}m")
+    } else if mins > 0 {
+        format!("{mins}m{s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 // ---------------------------------------------------------------------------

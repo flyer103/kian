@@ -1067,6 +1067,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "kian-cli",
  "kian-core",
  "kian-dsh",
  "kian-llm",

@@ -623,11 +623,99 @@ pub struct SubscriptionMetrics {
     /// C36 `explicit-only` drops without an explicit-request signal.
     dropped_not_explicit: std::sync::atomic::AtomicU64,
     failures: std::sync::atomic::AtomicU64,
+    /// C57: per-code intake-reason counters — one tick per decision,
+    /// keyed by the closed [`kian_superagent::IntakeReason`] set's
+    /// stable code. Every code is materialized in the snapshot, so
+    /// the series shape is fixed (the C41 histogram discipline).
+    by_reason: ReasonCounters,
+}
+
+/// The closed per-code counter set (all 7 codes, zero-initialized).
+#[derive(Debug)]
+struct ReasonCounters {
+    counts: std::collections::BTreeMap<&'static str, std::sync::atomic::AtomicU64>,
+}
+
+impl ReasonCounters {
+    fn new() -> Self {
+        Self {
+            counts: kian_superagent::IntakeReason::ALL
+                .iter()
+                .map(|reason| (reason.code(), std::sync::atomic::AtomicU64::new(0)))
+                .collect(),
+        }
+    }
+
+    fn bump(&self, reason: kian_superagent::IntakeReason) {
+        if let Some(counter) = self.counts.get(reason.code()) {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for (code, counter) in &self.counts {
+            object.insert(
+                (*code).to_string(),
+                serde_json::json!(counter.load(std::sync::atomic::Ordering::Relaxed)),
+            );
+        }
+        serde_json::Value::Object(object)
+    }
+}
+
+impl Default for ReasonCounters {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubscriptionMetrics {
     fn bump(counter: &std::sync::atomic::AtomicU64) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records one handled event's outcome: the legacy shape counters
+    /// plus exactly one per-code tick per decision (C57 — the codes
+    /// come from the same mapping the audit lines stamp, so the two
+    /// surfaces cannot drift).
+    pub fn record_outcome(
+        &self,
+        outcome: &kian_superagent::RoutingOutcome,
+        router: kian_core::model::SessionId,
+    ) {
+        match outcome {
+            kian_superagent::RoutingOutcome::Routed { deduplicated, .. } => {
+                Self::bump(&self.routed);
+                if *deduplicated {
+                    Self::bump(&self.routed_deduplicated);
+                }
+            }
+            // C38 fan-out: one routed counter tick per admitted
+            // subscriber, dedup per row.
+            kian_superagent::RoutingOutcome::FannedOut { admitted } => {
+                for admission in admitted {
+                    Self::bump(&self.routed);
+                    if admission.deduplicated {
+                        Self::bump(&self.routed_deduplicated);
+                    }
+                }
+            }
+            kian_superagent::RoutingOutcome::DroppedNoRule => {
+                Self::bump(&self.dropped_no_rule);
+            }
+            // C36 fast-path drops: audit line by the service, counter
+            // here (the DroppedNoRule shape).
+            kian_superagent::RoutingOutcome::DroppedIgnored => {
+                Self::bump(&self.dropped_ignored);
+            }
+            kian_superagent::RoutingOutcome::DroppedNotExplicit => {
+                Self::bump(&self.dropped_not_explicit);
+            }
+        }
+        for reason in kian_superagent::outcome_reasons(outcome, router) {
+            self.by_reason.bump(reason);
+        }
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
@@ -639,6 +727,7 @@ impl SubscriptionMetrics {
             "dropped_ignored": self.dropped_ignored.load(Ordering::Relaxed),
             "dropped_not_explicit": self.dropped_not_explicit.load(Ordering::Relaxed),
             "failures": self.failures.load(Ordering::Relaxed),
+            "by_reason": self.by_reason.snapshot(),
         })
     }
 }
@@ -651,7 +740,6 @@ pub fn spawn_subscription_consumers(
     adapters: Vec<Arc<dyn ChannelAdapter>>,
     metrics: Arc<SubscriptionMetrics>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    use kian_superagent::RoutingOutcome;
     adapters
         .into_iter()
         .map(|adapter| {
@@ -661,32 +749,11 @@ pub fn spawn_subscription_consumers(
             tokio::spawn(async move {
                 while let Some(event) = stream.next().await {
                     match service.handle_event(event).await {
-                        Ok(RoutingOutcome::Routed { deduplicated, .. }) => {
-                            SubscriptionMetrics::bump(&metrics.routed);
-                            if deduplicated {
-                                SubscriptionMetrics::bump(&metrics.routed_deduplicated);
-                            }
-                        }
-                        // C38 fan-out: one routed counter tick per
-                        // admitted subscriber, dedup per row.
-                        Ok(RoutingOutcome::FannedOut { admitted }) => {
-                            for admission in admitted {
-                                SubscriptionMetrics::bump(&metrics.routed);
-                                if admission.deduplicated {
-                                    SubscriptionMetrics::bump(&metrics.routed_deduplicated);
-                                }
-                            }
-                        }
-                        Ok(RoutingOutcome::DroppedNoRule) => {
-                            SubscriptionMetrics::bump(&metrics.dropped_no_rule);
-                        }
-                        // C36 fast-path drops: audit line by the
-                        // service, counter here (the DroppedNoRule shape).
-                        Ok(RoutingOutcome::DroppedIgnored) => {
-                            SubscriptionMetrics::bump(&metrics.dropped_ignored);
-                        }
-                        Ok(RoutingOutcome::DroppedNotExplicit) => {
-                            SubscriptionMetrics::bump(&metrics.dropped_not_explicit);
+                        Ok(outcome) => {
+                            // Legacy shape counters plus the C57
+                            // per-code ticks (once per decision, the
+                            // audit lines' own mapping).
+                            metrics.record_outcome(&outcome, service.router_session());
                         }
                         Err(_) => {
                             SubscriptionMetrics::bump(&metrics.failures);
@@ -1471,5 +1538,78 @@ mod tests {
         for task in tasks.into_iter().chain(ignored_tasks) {
             task.abort();
         }
+    }
+
+    /// C57: per-code counters increment exactly once per decision,
+    /// keyed by the closed `IntakeReason` set, and the snapshot
+    /// materializes every code (stable series shape). The legacy
+    /// shape counters keep their semantics beside them.
+    #[test]
+    fn by_reason_counters_tick_once_per_decision() {
+        use kian_superagent::FanoutAdmission;
+
+        let router = SessionId::new();
+        let worker_a = SessionId::new();
+        let worker_b = SessionId::new();
+        let metrics = SubscriptionMetrics::default();
+
+        metrics.record_outcome(
+            &kian_superagent::RoutingOutcome::Routed {
+                session: router,
+                deduplicated: false,
+            },
+            router,
+        );
+        metrics.record_outcome(
+            &kian_superagent::RoutingOutcome::Routed {
+                session: worker_a,
+                deduplicated: true,
+            },
+            router,
+        );
+        metrics.record_outcome(
+            &kian_superagent::RoutingOutcome::FannedOut {
+                admitted: vec![
+                    FanoutAdmission {
+                        session: worker_a,
+                        deduplicated: false,
+                    },
+                    FanoutAdmission {
+                        session: worker_b,
+                        deduplicated: true,
+                    },
+                ],
+            },
+            router,
+        );
+        metrics.record_outcome(&kian_superagent::RoutingOutcome::DroppedNoRule, router);
+        metrics.record_outcome(&kian_superagent::RoutingOutcome::DroppedIgnored, router);
+        metrics.record_outcome(&kian_superagent::RoutingOutcome::DroppedNotExplicit, router);
+
+        let snap = metrics.snapshot();
+        let by_reason = &snap["by_reason"];
+        // Exactly once per decision: 1 router admit, 1 passthrough
+        // admit, 2 dedups, 1 per drop shape.
+        assert_eq!(by_reason["admitted_router"], serde_json::json!(1));
+        assert_eq!(by_reason["admitted_passthrough"], serde_json::json!(1));
+        assert_eq!(by_reason["deduplicated"], serde_json::json!(2));
+        assert_eq!(by_reason["no_rule"], serde_json::json!(1));
+        assert_eq!(by_reason["class_ignored"], serde_json::json!(1));
+        assert_eq!(by_reason["not_explicit"], serde_json::json!(1));
+        // Reserved for C59: defined and materialized, never produced.
+        assert_eq!(by_reason["released_to_eval"], serde_json::json!(0));
+        // Every code of the closed set is materialized — the snapshot
+        // shape is fixed regardless of what has happened.
+        assert_eq!(
+            by_reason.as_object().expect("by_reason object").len(),
+            kian_superagent::IntakeReason::ALL.len()
+        );
+        // The legacy shape counters keep their own semantics.
+        assert_eq!(snap["routed"], serde_json::json!(4));
+        assert_eq!(snap["routed_deduplicated"], serde_json::json!(2));
+        assert_eq!(snap["dropped_no_rule"], serde_json::json!(1));
+        assert_eq!(snap["dropped_ignored"], serde_json::json!(1));
+        assert_eq!(snap["dropped_not_explicit"], serde_json::json!(1));
+        assert_eq!(snap["failures"], serde_json::json!(0));
     }
 }

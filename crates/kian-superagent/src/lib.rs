@@ -17,11 +17,18 @@
 //! Modules:
 //! - [`inbox`] — the `InboxWriter` port (the bundle's whole server surface)
 //! - [`rules`] — declarative `SubscriptionRule` set (config, DESIGN §4.1)
+//! - [`reasons`] — the closed decision-reason vocabularies (C57):
+//!   `IntakeReason` audit/counter codes for every intake decision, and
+//!   the `DecisionKind` judge-side decision-tag convention
 //! - [`provenance`] — the channel-event wrapper riding inside the input
 //!   payload's `content` (the frozen C4 payload contract stays untouched)
 //! - [`registry`] — the passthrough worker registry (C38: topic →
 //!   *set* of worker sessions, the many-to-many fan-out projection):
 //!   disposable, rebuilt from event streams (constraint 1)
+//! - [`stage`] — the Ticket stage projection (C56): "what is it
+//!   waiting for" — a pure first-match table over the worker's own
+//!   stream plus two read-side inputs (pending inbox rows, an outbox
+//!   view); a disposable projection, never persisted
 //! - [`subscriptions`] — the subscription service consuming
 //!   `ChannelAdapter` streams, matching rules, admitting + waking —
 //!   one durable row per passthrough subscriber (C38)
@@ -92,10 +99,12 @@ pub mod mock;
 pub mod policy;
 pub mod provenance;
 pub mod rearm;
+pub mod reasons;
 pub mod recall;
 pub mod registry;
 pub mod router;
 pub mod rules;
+pub mod stage;
 pub mod subscriptions;
 pub mod templates;
 pub mod timer;
@@ -132,6 +141,7 @@ pub use provenance::{
     channel_input_payload, is_untrusted_view, parse_channel_marker, raw_view, shape_channel_input,
     shape_channel_input_marked, wrap_channel_event, wrap_channel_event_marked,
 };
+pub use reasons::{DecisionKind, IntakeReason, outcome_reasons, routed_reason};
 pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, worker_sessions};
 pub use router::{
@@ -144,6 +154,7 @@ pub use rules::{
     AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
     SubscriptionRule, SubscriptionRuleSet, event_has_explicit_signal,
 };
+pub use stage::{NoOutbox, OutboxView, TicketStage, project_stage};
 pub use subscriptions::{FanoutAdmission, RoutingOutcome, SubscriptionService};
 pub use templates::{
     ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
@@ -163,9 +174,9 @@ pub use watchdog::{
     watchdog_template,
 };
 pub use worker::{
-    Delegation, DelegationPair, LineagePlan, PortFor, SpawnError, SpawnedWorker, StreamPort,
-    StreamPortError, ThreadReport, WORKER_GATE_NAME, WorkerLoopConfig, WorkerLoopDriver,
-    WorkerSpawner, completion_summary, delegation_content, delegation_pairs, lineage_plan,
-    parse_delegation, parse_thread_report, thread_completed_payload, thread_report_content,
-    thread_started_payload,
+    Delegation, DelegationPair, LineagePlan, PortFor, REPORT_STATE_KEY, ReportState, SpawnError,
+    SpawnedWorker, StreamPort, StreamPortError, ThreadReport, WORKER_GATE_NAME, WorkerLoopConfig,
+    WorkerLoopDriver, WorkerSpawner, completion_summary, delegation_content, delegation_pairs,
+    lineage_plan, parse_delegation, parse_thread_report, thread_completed_payload,
+    thread_report_content, thread_report_content_stated, thread_started_payload,
 };
