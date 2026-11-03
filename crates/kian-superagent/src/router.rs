@@ -66,9 +66,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
-use crate::metrics::RouterTurnRecorder;
+use crate::metrics::{RouterTurnRecorder, SpeakMetrics};
 use crate::policy::{
-    ImPolicy, StructuredPolicy, im_delivered_payload, structured_delivered_payload,
+    ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
+    im_delivered_payload, speak_key, structured_delivered_payload,
 };
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
@@ -160,6 +161,12 @@ pub struct RouterProfile {
     /// refused with an honest tool error naming the missing config —
     /// never a silent refusal, never an uncapped spawn.
     pub speculation: Option<SpeculationPolicy>,
+    /// The output-side speak-rules (C58, `superagent.speak_rules`):
+    /// the *whether-to-send* gate on `reply`/`deliver_structured`,
+    /// composed **before** the §4.2 shaping policies. Empty (the
+    /// default, and what an absent config section produces) admits
+    /// every send — byte-identical to the pre-C58 behavior.
+    pub speak: SpeakPolicy,
     /// kian-62 re-arm: the ended, frozen predecessors of `session`
     /// (empty = generation 0, the configured pinned session itself).
     /// Assembly fills it from the boot-time chain walk; the bootstrap
@@ -179,6 +186,7 @@ impl RouterProfile {
             im: ImPolicy::default(),
             structured: StructuredPolicy::default(),
             speculation: None,
+            speak: SpeakPolicy::default(),
             re_arm: Vec::new(),
         }
     }
@@ -390,6 +398,14 @@ pub struct RouterTools {
     im: ImPolicy,
     structured: StructuredPolicy,
     speculation: Option<SpeculationPolicy>,
+    /// C58: the output-side speak-rule table (empty = ungated).
+    speak: SpeakPolicy,
+    /// C58: the ack-once memory — a disposable projection seeded lazily
+    /// from the Router's own stream at the first gated send (the boot
+    /// rebuild) and then kept in step by [`Self::speak_record`].
+    speak_tracker: Arc<Mutex<Option<SpeakTracker>>>,
+    /// C58: suppression counters (audit-visible, snapshot-stable).
+    speak_metrics: Arc<SpeakMetrics>,
     hold: Arc<RouterHold>,
 }
 
@@ -407,7 +423,120 @@ impl RouterTools {
             im: profile.im.clone(),
             structured: profile.structured.clone(),
             speculation: profile.speculation.clone(),
+            speak: profile.speak.clone(),
+            speak_tracker: Arc::new(Mutex::new(None)),
+            speak_metrics: SpeakMetrics::shared(),
             hold,
+        }
+    }
+
+    /// The speak-gate's suppression counters (C58) — the assembly's
+    /// observability surface.
+    #[must_use]
+    pub fn speak_metrics(&self) -> Arc<SpeakMetrics> {
+        Arc::clone(&self.speak_metrics)
+    }
+
+    /// A copy of the runtime ack-once memory (C58). The tracker is a
+    /// disposable projection: this snapshot must always equal
+    /// [`SpeakTracker::from_events`] over the Router's committed
+    /// stream — the equality the C58 tests pin.
+    #[must_use]
+    pub fn speak_tracker_snapshot(&self) -> SpeakTracker {
+        self.speak_tracker
+            .lock()
+            .expect("speak tracker lock")
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// The C58 output gate: evaluates the channel's speak rule *before*
+    /// the send, before the shaping policies. An ungated channel
+    /// returns `Ok(())` without touching the stream (byte-identical to
+    /// the pre-C58 path). A suppression is an **honest tool error**
+    /// naming the rule and condition — the model sees it and reacts —
+    /// plus an audit line and a counter tick; nothing is sent and no
+    /// `channel/delivered` is appended (the C39 deliver-or-discard
+    /// discipline).
+    async fn speak_gate(
+        &self,
+        port: &Arc<dyn StreamPort>,
+        channel: &str,
+        kind: SpeakKind,
+        target: &Value,
+    ) -> Result<(), ToolError> {
+        let Some(rule) = self.speak.rule_for(channel) else {
+            return Ok(());
+        };
+        // Boot rebuild: the first gated send seeds the ack-once memory
+        // from the Router's own committed `channel/delivered` events,
+        // so "first ack only" survives restarts (constraint 1).
+        if self
+            .speak_tracker
+            .lock()
+            .expect("speak tracker lock")
+            .is_none()
+        {
+            let events = port.read_stream().await.map_err(|e| {
+                ToolError::Execution(format!("speak tracker rebuild: stream read failed: {e}"))
+            })?;
+            let mut slot = self.speak_tracker.lock().expect("speak tracker lock");
+            if slot.is_none() {
+                *slot = Some(SpeakTracker::from_events(&events));
+            }
+        }
+        let key = speak_key(target);
+        let verdict = {
+            let tracker = self.speak_tracker.lock().expect("speak tracker lock");
+            let tracker = tracker.as_ref().expect("tracker seeded above");
+            SpeakPolicy::check(
+                rule,
+                &SpeakContext {
+                    channel,
+                    topic: Some(key.as_str()),
+                    kind,
+                    tracker,
+                },
+            )
+        };
+        match verdict {
+            SpeakVerdict::Admit => Ok(()),
+            SpeakVerdict::Suppress { condition } => {
+                self.speak_metrics.record_suppressed(condition);
+                tracing::info!(
+                    target: "kian::router",
+                    channel = channel,
+                    when = %condition.code(),
+                    per_topic_ack = rule.per_topic_ack,
+                    "speak audit: send suppressed by rule"
+                );
+                Err(ToolError::Execution(format!(
+                    "send suppressed by the speak rule for channel `{channel}` \
+                     (when={}, per_topic_ack={}): {} — nothing was sent",
+                    condition.code(),
+                    rule.per_topic_ack,
+                    condition.guidance()
+                )))
+            }
+        }
+    }
+
+    /// The C58 gate's success half: after a send (and its
+    /// `channel/delivered`) committed on a *gated* channel, the
+    /// ack-once memory records the conversation — keeping the runtime
+    /// tracker equal to a stream rebuild.
+    fn speak_record(&self, channel: &str, target: &Value) {
+        if self.speak.rule_for(channel).is_none() {
+            return;
+        }
+        let key = speak_key(target);
+        if let Some(tracker) = self
+            .speak_tracker
+            .lock()
+            .expect("speak tracker lock")
+            .as_mut()
+        {
+            tracker.record(channel, &key);
         }
     }
 
@@ -509,6 +638,12 @@ impl RouterTools {
             .get(channel)
             .ok_or_else(|| ToolError::InvalidCall(format!("unknown channel `{channel}`")))?;
 
+        // C58 speak gate: the *whether-to-send* decision, before the
+        // §4.2 shaping (a suppressed send is never shaped, never sent,
+        // and leaves no channel/delivered).
+        self.speak_gate(&port, channel, SpeakKind::Decision, &target)
+            .await?;
+
         // §4.2 IM policy: shape the text BEFORE the send (policy lives
         // in the bundle, not the adapter).
         let enforced = self.im.enforce(text);
@@ -528,6 +663,7 @@ impl RouterTools {
         )
         .await
         .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
+        self.speak_record(channel, &target);
         Ok(ToolResult {
             call_id: call.id,
             output: json!({
@@ -555,6 +691,12 @@ impl RouterTools {
             .get(channel)
             .ok_or_else(|| ToolError::InvalidCall(format!("unknown channel `{channel}`")))?;
 
+        // C58 speak gate, before the §4.2 section contract: a result
+        // the rule refuses is never validated-then-sent — it is
+        // refused honestly with nothing sent and no channel/delivered.
+        self.speak_gate(&port, channel, SpeakKind::Result, &target)
+            .await?;
+
         // §4.2 structured contract: a payload missing a section is
         // rejected honestly — error to the loop, never silently sent,
         // no delivery, no channel/delivered.
@@ -577,6 +719,7 @@ impl RouterTools {
         )
         .await
         .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
+        self.speak_record(channel, &target);
         Ok(ToolResult {
             call_id: call.id,
             output: json!({"message_id": receipt.message_id, "sections_delivered": true}),
@@ -672,6 +815,9 @@ impl Clone for RouterTools {
             im: self.im.clone(),
             structured: self.structured.clone(),
             speculation: self.speculation.clone(),
+            speak: self.speak.clone(),
+            speak_tracker: Arc::clone(&self.speak_tracker),
+            speak_metrics: Arc::clone(&self.speak_metrics),
             hold: Arc::clone(&self.hold),
         }
     }

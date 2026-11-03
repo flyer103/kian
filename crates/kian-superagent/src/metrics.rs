@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 
@@ -190,6 +191,70 @@ fn bucket_index(batch: u64) -> usize {
         .iter()
         .position(|&upper| batch <= upper)
         .unwrap_or(ROUTER_BATCH_BUCKETS.len())
+}
+
+// ---------------------------------------------------------------------------
+// Speak-rule metrics (C58) — the suppression side of the output gate
+// ---------------------------------------------------------------------------
+
+/// Counters for the output-side speak gate (C58, DESIGN §4.2): one
+/// `suppressed` tick per honest refusal, plus per-condition counters
+/// over the closed [`crate::policy::SpeakCondition`] set — every
+/// condition materialized zero-initialized, so the series shape is
+/// fixed (the C41 histogram discipline). Plain atomics, monotone;
+/// recording never emits an event and never changes a decision.
+#[derive(Debug)]
+pub struct SpeakMetrics {
+    suppressed: AtomicU64,
+    by_condition: std::collections::BTreeMap<&'static str, AtomicU64>,
+}
+
+impl Default for SpeakMetrics {
+    fn default() -> Self {
+        Self {
+            suppressed: AtomicU64::new(0),
+            by_condition: crate::policy::SpeakCondition::ALL
+                .iter()
+                .map(|condition| (condition.code(), AtomicU64::new(0)))
+                .collect(),
+        }
+    }
+}
+
+impl SpeakMetrics {
+    /// A fresh handle (the Router tools hold one per assembly).
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one suppressed send, keyed by the refusing condition.
+    pub fn record_suppressed(&self, condition: crate::policy::SpeakCondition) {
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+        if let Some(counter) = self.by_condition.get(condition.code()) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Total suppressed sends so far.
+    #[must_use]
+    pub fn suppressed(&self) -> u64 {
+        self.suppressed.load(Ordering::Relaxed)
+    }
+
+    /// The snapshot: `suppressed` plus the per-condition table (all
+    /// five codes, zero-initialized — stable series shape).
+    #[must_use]
+    pub fn snapshot(&self) -> Value {
+        let mut by_condition = serde_json::Map::new();
+        for (code, counter) in &self.by_condition {
+            by_condition.insert((*code).to_string(), json!(counter.load(Ordering::Relaxed)));
+        }
+        json!({
+            "suppressed": self.suppressed.load(Ordering::Relaxed),
+            "by_condition": Value::Object(by_condition),
+        })
+    }
 }
 
 /// The sink [`crate::router::RouterDriver`] records through: the
