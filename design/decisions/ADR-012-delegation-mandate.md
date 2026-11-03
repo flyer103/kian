@@ -1,7 +1,8 @@
 # ADR-012: Delegation Mandate — the authority object on the frozen delegation wrapper
 
-- Status: draft (round 6, plan C60)
-- Date: 2026-11-03
+- Status: landed (C60 / kian-70 implements it; landed on the round-6 shared tree, the
+  orchestrator records the implementation commit at gate time)
+- Date: 2026-11-03 (landed 2026-11-04)
 - Deciders: round-6 architect plan (`shared/round6-plan.md` §5), orchestrator-landed draft ahead of implementation card C60
 - Relates to: ADR-010 (frozen contract v0), the C18 delegation wrapper freeze, C39 speculative-marker precedent, ADR-013 (fan-out authority rule)
 
