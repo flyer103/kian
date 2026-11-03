@@ -404,20 +404,25 @@ fn channel_event_input(event_id: &str, text: &str) -> Value {
     })
 }
 
-/// Admits `n` channel events together (durable rows, no wakes), then
-/// wakes the Router once — exactly "N channel events admitted
+/// Admits `n` channel events together as ONE residency signal (the
+/// whole cohort commits before the Router's admit counter moves — a
+/// parked Router can never observe a torn cohort; kian-63), no wakes,
+/// then wakes the Router once — exactly "N channel events admitted
 /// together".
 async fn admit_batch_together(h: &Harness, ids: &[&str]) {
-    for id in ids {
-        h.router_inbox
-            .admit(
-                h.router,
+    let rows = ids
+        .iter()
+        .map(|id| {
+            (
                 channel_event_input(id, &format!("event {id}")),
                 Some((*id).into()),
             )
-            .await
-            .expect("admit");
-    }
+        })
+        .collect();
+    h.router_inbox
+        .admit_cohort(h.router, rows)
+        .await
+        .expect("admit cohort");
     h.engine.wake(h.router);
 }
 

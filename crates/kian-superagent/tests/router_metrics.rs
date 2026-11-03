@@ -438,18 +438,23 @@ fn channel_event_input(event_id: &str, text: &str) -> Value {
     })
 }
 
-/// Admits `ids` as durable rows, then wakes the Router once.
+/// Admits `ids` as durable rows with ONE residency signal (the whole
+/// cohort commits before the Router's admit counter moves — a parked
+/// Router can never observe a torn cohort), then wakes the Router once.
 async fn admit_and_wake(h: &Harness, ids: &[&str]) {
-    for id in ids {
-        h.router_inbox
-            .admit(
-                h.router,
+    let rows = ids
+        .iter()
+        .map(|id| {
+            (
                 channel_event_input(id, &format!("event {id}")),
                 Some((*id).into()),
             )
-            .await
-            .expect("admit");
-    }
+        })
+        .collect();
+    h.router_inbox
+        .admit_cohort(h.router, rows)
+        .await
+        .expect("admit cohort");
     h.engine.wake(h.router);
 }
 
@@ -543,7 +548,11 @@ async fn n_events_admitted_together_one_judge_turn_batch_n_amortized_determinist
     assert_eq!(snap["batch_histogram"]["2"], json!(0));
 
     // Exactly two provider requests: bootstrap judge + batch judge —
-    // recording did not add provider behavior.
+    // recording did not add provider behavior. Structural (kian-63):
+    // the cohort admit advances the Router's residency counter in one
+    // atomic jump after every row commits, so the parked Router cannot
+    // observe a torn cohort and fold a second batch into the same
+    // judge turn; and a no-work re-drive parks before opening a turn.
     assert_eq!(h.script.request_count(), 2);
 }
 
