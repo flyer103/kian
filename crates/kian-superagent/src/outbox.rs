@@ -45,7 +45,7 @@
 //! | `tool/result` for the intent | State | Re-driven at boot? |
 //! |---|---|---|
 //! | none yet | [`OutboxState::Pending`] (in-flight; kill -9 mid-retry) | **yes** (at-least-once) |
-//! | error, output starts `outbox park:` | [`OutboxState::Parked`] | no — visible, a person releases |
+//! | error carrying `outbox park:` — bare, or behind the stable `ToolError::Execution` Display wrapper `"tool execution failed: "` that the live loop writes (kian-76) | [`OutboxState::Parked`] | no — visible at boot, on the stage arm and the board; a person releases |
 //! | error, other text | suppressed / invalid args / legacy single failure | no (re-driving would duplicate suppressed sends) |
 //! | ok | delivered (its `channel/delivered` exists) | no |
 //!
@@ -78,7 +78,7 @@ use std::sync::Mutex;
 
 use futures::future::BoxFuture;
 use kian_core::events::{Event, EventKind};
-use kian_core::seams::{ChannelDelivery, ChannelError, SendReceipt};
+use kian_core::seams::{ChannelDelivery, ChannelError, SendReceipt, ToolError};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -104,6 +104,29 @@ pub const DEFAULT_BACKOFF_CAP_MS: u64 = 60_000;
 /// other honest send error (speak-suppression, invalid args, the
 /// legacy single-attempt failure). Parse nothing else out of it.
 pub const PARK_ERROR_PREFIX: &str = "outbox park:";
+
+/// Reads the attempt count out of a park-shaped tool error, if it is
+/// one (kian-76). The live `tool/result` path never carries the bare
+/// [`PARK_ERROR_PREFIX`]: the Router maps a park to
+/// `ToolError::Execution(msg)` and the loop renders that enum's
+/// Display — `"tool execution failed: {msg}"` — into
+/// `content.output.error`. The C65 run2 proved the divergence: a
+/// bare-prefix-only match classified every live park as an ordinary
+/// error and the boot rebuild reported `parked=0` while two
+/// deliveries sat parked. Both shapes parse; the wrapper prefix is
+/// computed from the enum so it cannot drift.
+fn park_attempts(error_text: &str) -> Option<u32> {
+    let wrapper = ToolError::Execution(String::new()).to_string();
+    let rest = error_text
+        .strip_prefix(&wrapper)
+        .unwrap_or(error_text)
+        .strip_prefix(PARK_ERROR_PREFIX)?;
+    Some(
+        rest.split_whitespace()
+            .find_map(|w| w.parse::<u32>().ok())
+            .unwrap_or(1),
+    )
+}
 
 /// The outbox retry configuration (`superagent.outbox`). An **absent**
 /// section is a disabled outbox — the send path is byte-identical to
@@ -377,13 +400,7 @@ pub fn outbox_pending(events: &[Event]) -> Vec<OutboxEntry> {
                     .unwrap_or("");
                 intents[i].state = if !is_error {
                     OutboxState::Delivered
-                } else if let Some(rest) = error_text.strip_prefix(PARK_ERROR_PREFIX) {
-                    // "… parked after N attempts" — N recorded on the
-                    // park error itself (see OutboxPark::error_message).
-                    let attempts = rest
-                        .split_whitespace()
-                        .find_map(|w| w.parse::<u32>().ok())
-                        .unwrap_or(1);
+                } else if let Some(attempts) = park_attempts(error_text) {
                     OutboxState::Parked { attempts }
                 } else {
                     // Suppressed / invalid / legacy single failure —
@@ -454,13 +471,42 @@ impl OutboxStatus {
         self.entries.iter().any(|e| e.ticket == ticket)
     }
 
+    /// Whether any delivery is pending or parked for `conversation` —
+    /// the attribution both sides can derive (kian-76): a live
+    /// intent's ticket key is the freeform `correlation` the model
+    /// passed and matches no thread alias, but the target
+    /// conversation is computable from the worker's own stream
+    /// regardless (see [`worker_conversation_keys`]).
+    #[must_use]
+    pub fn pending_for_conversation(&self, conversation: &str) -> bool {
+        self.entries.iter().any(|e| e.conversation == conversation)
+    }
+
     /// One board line per parked delivery: `<conversation> (parked
     /// after N attempts)` — the "parked message named in kian
     /// tickets".
     #[must_use]
     pub fn parked_lines(&self) -> Vec<String> {
+        self.parked_lines_matching(|_| true)
+    }
+
+    /// The parked lines limited to `conversations` — the board's
+    /// per-worker attribution input (a worker shows the parked
+    /// deliveries of the conversations its stream names, not every
+    /// parked line in the store).
+    #[must_use]
+    pub fn parked_lines_in(
+        &self,
+        conversations: &std::collections::BTreeSet<String>,
+    ) -> Vec<String> {
+        self.parked_lines_matching(|e| conversations.contains(&e.conversation))
+    }
+
+    /// The shared body of the two `parked_lines` selectors.
+    fn parked_lines_matching(&self, keep: impl Fn(&OutboxEntry) -> bool) -> Vec<String> {
         self.entries
             .iter()
+            .filter(|e| keep(e))
             .filter_map(|e| match e.state {
                 OutboxState::Parked { attempts } => Some(format!(
                     "{} (parked after {attempts} attempts)",
@@ -474,29 +520,134 @@ impl OutboxStatus {
 
 /// The real [`OutboxView`] (C56's arm 1, wired by this card): a
 /// pending/parked delivery lights the `delivery-retry` stage for the
-/// ticket it belongs to. The ticket aliases per thread are supplied by
-/// the caller — the thread's own id string plus the topics its worker
-/// owns in the registry projection (a `correlation` may name either).
+/// ticket it belongs to. Two attribution inputs, either sufficing
+/// (kian-76):
+///
+/// - `aliases` — the thread's own id string plus the topics its
+///   worker owns in the registry projection (a `correlation` may
+///   name either);
+/// - `conversations` — the target conversation keys the worker's own
+///   stream implies ([`worker_conversation_keys`]). The live C65 run
+///   proved alias-only attribution blind: the model passes a
+///   freeform correlation (the triggering event id) that matches no
+///   alias, while the conversation is derivable on both sides.
 pub struct ThreadOutboxView {
     status: OutboxStatus,
     aliases: BTreeMap<Uuid, Vec<String>>,
+    conversations: BTreeMap<Uuid, Vec<String>>,
 }
 
 impl ThreadOutboxView {
     /// `aliases`: thread → the ticket identities that name it.
     #[must_use]
     pub fn new(status: OutboxStatus, aliases: BTreeMap<Uuid, Vec<String>>) -> Self {
-        Self { status, aliases }
+        Self {
+            status,
+            aliases,
+            conversations: BTreeMap::new(),
+        }
+    }
+
+    /// The full attribution: aliases plus `conversations` (thread →
+    /// the conversation keys its worker's stream names).
+    #[must_use]
+    pub fn with_conversations(
+        status: OutboxStatus,
+        aliases: BTreeMap<Uuid, Vec<String>>,
+        conversations: BTreeMap<Uuid, Vec<String>>,
+    ) -> Self {
+        Self {
+            status,
+            aliases,
+            conversations,
+        }
     }
 }
 
 impl OutboxView for ThreadOutboxView {
     fn has_pending_delivery(&self, thread_id: Uuid) -> bool {
-        let Some(aliases) = self.aliases.get(&thread_id) else {
-            return false;
-        };
-        aliases.iter().any(|a| self.status.pending_for(a))
+        let alias_hit = self
+            .aliases
+            .get(&thread_id)
+            .is_some_and(|aliases| aliases.iter().any(|a| self.status.pending_for(a)));
+        alias_hit
+            || self.conversations.get(&thread_id).is_some_and(|convs| {
+                convs
+                    .iter()
+                    .any(|c| self.status.pending_for_conversation(c))
+            })
     }
+}
+
+/// The outbox conversation keys a worker's own stream implies
+/// (kian-76): every channel-event wrapper the stream carries — an
+/// `input/admitted` content, a `thread/started` task, or that task's
+/// `content` (the shapes `spawn_topic` reads, plus the **string**
+/// forms the live C65 run proved the model passes: the wrapper
+/// serialized inside `task`, and a `correlation` naming the topic —
+/// the kian-75 gap shapes) — contributes its marker topic, and each
+/// topic derives the conversation keys of the conversations it names
+/// (for the GitHub thread-key topics,
+/// [`crate::github::topic_conversation_keys`]).
+///
+/// Registry-independent on purpose: the live C65 run had no topic
+/// binding at all (the kian-75 gap) yet every wrapper rode the
+/// worker's stream — the durable log is the attribution source that
+/// cannot be skipped. Pure over events; sorted and deduped.
+#[must_use]
+pub fn worker_conversation_keys(events: &[Event]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for ev in events {
+        for candidate in [ev.bytes.get("content"), ev.bytes.get("task")] {
+            let Some(candidate) = candidate else { continue };
+            for topic in candidate_topics(candidate) {
+                keys.extend(crate::github::topic_conversation_keys(&topic));
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Every topic one message-shaped value names (pure, bounded): the
+/// wrapper object itself, a nested `content`, a wrapper serialized as
+/// a JSON **string** under `task` (the live model shape), or an
+/// explicit `correlation` string. Shape validation happens downstream
+/// in [`crate::github::topic_conversation_keys`] — a non-shaped
+/// string (a freeform event id) derives nothing, honestly.
+fn candidate_topics(value: &Value) -> Vec<String> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut topics = Vec::new();
+    // The wrapper object itself, or nested one level under `content`.
+    for content in [Some(value), obj.get("content")] {
+        if let Some(topic) = content
+            .and_then(crate::provenance::parse_channel_marker)
+            .and_then(|m| m.topic)
+        {
+            topics.push(topic);
+        }
+    }
+    // The wrapper serialized as a string under `task` (kian-75's live
+    // gap shape: the model stringifies the wrapper the spawner then
+    // admits verbatim).
+    if let Some(task) = obj.get("task").and_then(Value::as_str)
+        && let Ok(parsed) = serde_json::from_str::<Value>(task)
+        && let Some(topic) = crate::provenance::parse_channel_marker(&parsed).and_then(|m| m.topic)
+    {
+        topics.push(topic);
+    }
+    // An explicit correlation naming the topic (the `spawn_worker`
+    // vocabulary; the live run1 correlation was the thread key
+    // itself). Downstream shape validation keeps freeform ids inert.
+    if let Some(correlation) = obj.get("correlation").and_then(Value::as_str)
+        && !correlation.is_empty()
+    {
+        topics.push(correlation.to_string());
+    }
+    topics
 }
 
 /// Counters for the retry driver (the C58 `SpeakMetrics` pattern —
@@ -1055,6 +1206,163 @@ mod tests {
             1,
             "an earlier receipt never satisfies a later intent"
         );
+    }
+
+    #[test]
+    fn rebuild_parses_the_live_tool_error_wrapped_park() {
+        // kian-76 (C65 run2, G3a): the live `tool/result` shape wraps
+        // the park message in `ToolError::Execution`, whose Display
+        // adds "tool execution failed: " before PARK_ERROR_PREFIX —
+        // the bare-prefix match classified every live park as an
+        // ordinary error and dropped it (boot rebuild parked=0).
+        use kian_core::events::Event;
+        use kian_core::model::{Epoch, SessionId};
+        use kian_core::seams::ToolError;
+        let session = SessionId(uuid::Uuid::nil());
+        let mk = |seq, kind, bytes| Event {
+            seq,
+            session,
+            epoch: Epoch(1),
+            ts: seq,
+            kind,
+            bytes,
+            version: 0,
+        };
+        let target = json!({"kind":"issue_comment","number":4,"owner":"flyer103","repo":"kian"});
+        let park = OutboxPark {
+            attempts: 6,
+            conversation: conversation_key("issue-github", &target),
+            last_error: "delivery failed: github send rejected: HTTP 502".into(),
+        };
+        // The exact byte shape react.rs writes for the live park: the
+        // error rides `output.error` as `ToolError::Execution`'s
+        // Display, wrapper and all.
+        let events = vec![
+            mk(
+                1,
+                EventKind::ToolCall,
+                json!({"role": "assistant", "content": {"id": "c1", "name": "deliver_structured",
+                    "arguments": {"channel": "issue-github", "target": target, "payload": {},
+                                  "correlation": "poll:issues:flyer103/kian#4:2026-11-03T21:27:36Z"}}}),
+            ),
+            mk(
+                2,
+                EventKind::ToolResult,
+                json!({"role": "tool", "content": {"call_id": "c1", "is_error": true,
+                    "output": {"error": ToolError::Execution(park.error_message()).to_string()}}}),
+            ),
+        ];
+        let pending = outbox_pending(&events);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(
+            pending[0].state,
+            OutboxState::Parked { attempts: 6 },
+            "the live wrapped park must rebuild as parked, not vanish"
+        );
+        assert_eq!(
+            pending[0].ticket,
+            "poll:issues:flyer103/kian#4:2026-11-03T21:27:36Z"
+        );
+        let status = OutboxStatus::from_events(&events);
+        assert_eq!(status.parked_lines().len(), 1);
+    }
+
+    #[test]
+    fn conversation_attribution_matches_what_both_sides_derive() {
+        // kian-76 (C65 run2, G3b): a live intent's ticket key is the
+        // freeform correlation the model passed — no thread alias ever
+        // matches it. The target conversation is derivable on both
+        // sides regardless: the intent carries it verbatim, and a
+        // worker whose stream admitted the thread-key topic derives
+        // the same key.
+        use kian_core::events::Event;
+        use kian_core::model::{Epoch, SessionId};
+        let router = SessionId(uuid::Uuid::nil());
+        let worker_session = SessionId(uuid::Uuid::new_v4());
+        let thread = uuid::Uuid::new_v4();
+        let mk = |seq, session, kind, bytes| Event {
+            seq,
+            session,
+            epoch: Epoch(1),
+            ts: seq,
+            kind,
+            bytes,
+            version: 0,
+        };
+        let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian"});
+        let park = OutboxPark {
+            attempts: 6,
+            conversation: conversation_key("issue-github", &target),
+            last_error: "delivery failed: github send rejected: HTTP 502".into(),
+        };
+        let router_events = vec![
+            mk(
+                1,
+                router,
+                EventKind::ToolCall,
+                json!({"role": "assistant", "content": {"id": "c1", "name": "deliver_structured",
+                    "arguments": {"channel": "issue-github", "target": target, "payload": {},
+                                  "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z"}}}),
+            ),
+            mk(
+                2,
+                router,
+                EventKind::ToolResult,
+                json!({"role": "tool", "content": {"call_id": "c1", "is_error": true,
+                    "output": {"error": format!(
+                        "tool execution failed: {}", park.error_message())}}}),
+            ),
+        ];
+        let status = OutboxStatus::from_events(&router_events);
+        let conv = conversation_key("issue-github", &target);
+        // The live negative, reproduced: no alias-shaped ticket key
+        // matches — the freeform correlation is not the thread id.
+        assert!(!status.pending_for(&thread.to_string()));
+        // The conversation both sides derive does match.
+        assert!(status.pending_for_conversation(&conv));
+
+        // The worker's own stream admitted the live shape (run1
+        // worker3 export, verbatim structure): the wrapper serialized
+        // as a STRING under `task`, plus a correlation naming the
+        // thread-key topic — no registry binding needed (the kian-75
+        // live gap).
+        let wrapper_string = json!({
+            "kian": {
+                "type": "channel_event", "channel": "issue-github",
+                "topic": "issue-github:flyer103/kian#6",
+                "event_id": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+                "raw": {}
+            }
+        })
+        .to_string();
+        let worker_events = vec![
+            mk(
+                1,
+                worker_session,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": {
+                    "correlation": "issue-github:flyer103/kian#6",
+                    "task": wrapper_string}}),
+            ),
+            mk(
+                2,
+                worker_session,
+                EventKind::ThreadStarted,
+                json!({"thread_id": thread.to_string(), "worker": worker_session.0.to_string()}),
+            ),
+        ];
+        let convs = worker_conversation_keys(&worker_events);
+        assert!(convs.contains(&conv), "derived {convs:?}, want {conv}");
+        let set: std::collections::BTreeSet<String> = convs.into_iter().collect();
+        assert_eq!(status.parked_lines_in(&set).len(), 1);
+
+        // The stage view lights `delivery-retry` through the same
+        // conversation set — aliases stay empty on purpose.
+        let mut conversations = BTreeMap::new();
+        conversations.insert(thread, vec![conv]);
+        let view = ThreadOutboxView::with_conversations(status, BTreeMap::new(), conversations);
+        assert!(view.has_pending_delivery(thread));
+        assert!(!view.has_pending_delivery(uuid::Uuid::new_v4()));
     }
 
     #[test]

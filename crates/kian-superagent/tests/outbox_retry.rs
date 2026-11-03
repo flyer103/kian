@@ -617,10 +617,15 @@ fn scripted_router_stream_with_park(
             2,
             EventKind::ToolResult,
             json!({"role": "tool", "content": {"call_id": "call-1", "is_error": true,
-                "output": {"error": format!(
+                // kian-76: the live shape — react.rs renders the park
+                // as `ToolError::Execution(msg)`, whose Display wraps
+                // "tool execution failed: " around the park message.
+                // The C65 run2 stream carried exactly this; the bare
+                // prefix is the never-live shape.
+                "output": {"error": ToolError::Execution(format!(
                     "outbox park: delivery to mock-im:{target} parked after {attempts} attempts: \
                      scripted flaky failure — no further sends; the ticket shows delivery-retry \
-                     until released")}}}),
+                     until released")).to_string()}}}),
         ),
     ]
 }

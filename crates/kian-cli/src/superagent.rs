@@ -1332,6 +1332,29 @@ pub async fn start_services(
             parked = pending.len() - redriven,
             "outbox audit: boot rebuild from the Router stream"
         );
+        // kian-76: each parked delivery rebuilt from the stream is
+        // surfaced at boot with its identity — the park is durable
+        // (the intent + park-shaped tool/result on the stream), so the
+        // rebooted process re-states it instead of silently forgetting
+        // (the C65 run2 negative: parked=0 while two sat parked). Not
+        // re-driven: a parked delivery waits for a person (003).
+        for entry in pending
+            .iter()
+            .filter(|e| matches!(e.state, kian_superagent::OutboxState::Parked { .. }))
+        {
+            let attempts = match entry.state {
+                kian_superagent::OutboxState::Parked { attempts } => attempts,
+                _ => 0,
+            };
+            tracing::error!(
+                target: "kian::outbox",
+                ticket = %entry.ticket,
+                conversation = %entry.conversation,
+                attempts,
+                "outbox audit: boot rebuild found a parked delivery — visible on `kian tickets`, \
+                 released by a person, not re-driven"
+            );
+        }
         if redriven > 0 {
             let hold = services.router_hold.clone();
             let im = services.profile.im.clone();

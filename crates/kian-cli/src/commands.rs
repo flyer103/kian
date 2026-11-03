@@ -724,10 +724,19 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
     // (kian-64's stub exemption: this construction replaces `NoOutbox`).
     // Ticket aliases per thread: the thread's own id string plus the
     // topics its worker owns (a delivery's `correlation` names either).
+    // kian-76 adds the conversation attribution: a live intent's ticket
+    // key is the freeform correlation the model passed (the triggering
+    // event id) and matches no alias — but the target conversation is
+    // derivable from the worker's own stream (its admitted wrappers)
+    // and its registry topics, so both paths feed the view.
     let outbox_status = kian_superagent::OutboxStatus::from_events(&all_events);
     let mut thread_aliases: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
         std::collections::BTreeMap::new();
     let mut worker_aliases: std::collections::BTreeMap<SessionId, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut thread_conversations: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut worker_conversations: std::collections::BTreeMap<SessionId, Vec<String>> =
         std::collections::BTreeMap::new();
     for (worker, topics) in &worker_topics {
         let Some(events) = streams.get(worker) else {
@@ -739,14 +748,63 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             .and_then(|e| e.bytes.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+        // Registry topics contribute both their alias form and the
+        // conversations they name (a thread-key topic of the github
+        // shape derives them; anything else derives none).
+        let mut conversations: Vec<String> = topics
+            .iter()
+            .flat_map(|topic| kian_superagent::github::topic_conversation_keys(topic))
+            .collect();
+        // The worker's own stream is the registry-independent source:
+        // every admitted wrapper names its topic on the durable log
+        // (the live C65 run had no registry binding at all — kian-75).
+        conversations.extend(kian_superagent::worker_conversation_keys(events));
+        conversations.sort();
+        conversations.dedup();
+        worker_conversations.insert(*worker, conversations.clone());
         if let Some(thread) = thread {
             let mut aliases = vec![thread.to_string()];
             aliases.extend(topics.iter().cloned());
             worker_aliases.insert(*worker, aliases.clone());
             thread_aliases.entry(thread).or_default().extend(aliases);
+            thread_conversations
+                .entry(thread)
+                .or_default()
+                .extend(conversations);
         }
     }
-    let outbox_view = kian_superagent::ThreadOutboxView::new(outbox_status.clone(), thread_aliases);
+    // Workers the registry never bound (the kian-75 live shape) still
+    // get their conversations from their own streams.
+    for worker in &workers {
+        let entry = worker_conversations.entry(*worker).or_default();
+        if let Some(events) = streams.get(worker) {
+            entry.extend(kian_superagent::worker_conversation_keys(events));
+            entry.sort();
+            entry.dedup();
+        }
+        if let Some(thread) = streams.get(worker).and_then(|events| {
+            events
+                .iter()
+                .find(|e| e.kind == EventKind::ThreadStarted)
+                .and_then(|e| e.bytes.get("thread_id"))
+                .and_then(Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        }) {
+            let convs = worker_conversations
+                .get(worker)
+                .cloned()
+                .unwrap_or_default();
+            thread_conversations
+                .entry(thread)
+                .or_default()
+                .extend(convs);
+        }
+    }
+    let outbox_view = kian_superagent::ThreadOutboxView::with_conversations(
+        outbox_status.clone(),
+        thread_aliases,
+        thread_conversations,
+    );
     let parked_lines = outbox_status.parked_lines();
     let mut rows = Vec::new();
     for worker in workers {
@@ -764,17 +822,24 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             .and_then(Value::as_str)
             .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
         // The parked message named on the board (C62): a worker whose
-        // ticket has a pending/parked delivery shows every parked line.
-        let parked = worker_aliases
+        // ticket has a pending/parked delivery shows its parked lines.
+        // Attribution is alias-or-conversation (kian-76): an alias hit
+        // keeps the historical all-lines shape; otherwise the lines
+        // are the parked deliveries of the conversations the worker's
+        // own stream names — the live path, where the freeform
+        // correlation ticket matches no alias.
+        let alias_hit = worker_aliases
             .get(&worker)
-            .map(|aliases| {
-                if aliases.iter().any(|a| outbox_status.pending_for(a)) {
-                    parked_lines.clone()
-                } else {
-                    Vec::new()
-                }
-            })
-            .unwrap_or_default();
+            .is_some_and(|aliases| aliases.iter().any(|a| outbox_status.pending_for(a)));
+        let parked = if alias_hit {
+            parked_lines.clone()
+        } else {
+            let conversations: std::collections::BTreeSet<String> = worker_conversations
+                .get(&worker)
+                .map(|c| c.iter().cloned().collect())
+                .unwrap_or_default();
+            outbox_status.parked_lines_in(&conversations)
+        };
         let thread_status = events
             .iter()
             .rev()

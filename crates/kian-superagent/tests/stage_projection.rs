@@ -735,3 +735,149 @@ async fn run_tickets_over_an_empty_store_is_an_honest_empty_board() {
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
+
+/// kian-76 (C65 run2, G3): the live board negative, replayed as a
+/// fixture — a parked `deliver_structured` whose ticket key is the
+/// freeform correlation the model passed (the triggering event id, no
+/// thread alias match), spawned through the string-form wrapper (no
+/// registry binding — the kian-75 live gap), with the park error
+/// wrapped in `ToolError::Execution`'s Display. The board must still
+/// surface the parked line and the `delivery-retry` stage, attributed
+/// by the conversation both sides derive from the worker's own stream.
+#[tokio::test]
+async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
+    let path = temp_db_path("kian76");
+    let store = EventStore::open(&path).await.expect("fixture db");
+    let router = sid(0x110);
+    let worker = sid(0x205);
+    let thread = tid(0xa05);
+
+    // The live wrapper shape: the channel-event wrapper serialized as
+    // a STRING (what the model passes as `task`), topic = the C61
+    // thread key, correlation = the freeform event id.
+    let wrapper_string = channel_input_payload(&ChannelEvent {
+        channel: "issue-github".into(),
+        event_id: "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z".into(),
+        topic: Some("issue-github:flyer103/kian#6".into()),
+        sender: None,
+        group: Some("flyer103/kian".into()),
+        payload: json!({"text": "triage this issue"}),
+        ts_ms: 1_761_900_000_000,
+    })
+    .to_string();
+    let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian"});
+    let conversation = format!("issue-github:{}", serde_json::to_string(&target).unwrap());
+
+    // Router stream: the spawn lineage (task = the stringified
+    // wrapper — binds nothing in the registry), the delivery intent
+    // (freeform correlation), and the wrapped park result.
+    let router_started = thread_started_payload(
+        &kian_core::model::Thread {
+            id: thread,
+            parent_session: router,
+            pinned_version: 1,
+        },
+        worker,
+        &json!({"role": "user", "content": {
+            "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+            "task": wrapper_string}}),
+    );
+    let router_events = vec![
+        (EventKind::SessionCreated, Value::Null),
+        (EventKind::ThreadStarted, router_started),
+        (
+            EventKind::ToolCall,
+            json!({"role": "assistant", "content": {"id": "call-6", "name": "deliver_structured",
+                "arguments": {"channel": "issue-github", "target": target,
+                              "payload": {"background": "b", "changes": "c", "verification": "v"},
+                              "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z"}}}),
+        ),
+        (
+            EventKind::ToolResult,
+            json!({"role": "tool", "content": {"call_id": "call-6", "is_error": true,
+                "output": {"error": format!(
+                    "tool execution failed: outbox park: delivery to {conversation} parked after 6 \
+                     attempts: delivery failed: github send rejected: HTTP 502 — no further sends; \
+                     the ticket shows delivery-retry until released")}}}),
+        ),
+    ];
+
+    // Worker stream: the live admitted input (correlation + the
+    // stringified wrapper), worker-side lineage, and an in-progress
+    // drain (the stage without the outbox arm would be `working`).
+    let worker_started = thread_started_payload(
+        &kian_core::model::Thread {
+            id: thread,
+            parent_session: router,
+            pinned_version: 1,
+        },
+        worker,
+        &json!({"role": "user", "content": {
+            "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+            "task": wrapper_string}}),
+    );
+    let worker_events = vec![
+        (EventKind::SessionCreated, Value::Null),
+        (
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": {
+                "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+                "task": wrapper_string}}),
+        ),
+        (EventKind::ThreadStarted, worker_started),
+        (EventKind::DrainClaimed, json!({})),
+        (EventKind::TurnStart, json!({"iteration": 0})),
+    ];
+
+    for (session, events) in [(router, router_events), (worker, worker_events)] {
+        for (i, (kind, bytes)) in events.into_iter().enumerate() {
+            store
+                .append(
+                    session,
+                    event(session, (i + 1) as u64, kind, bytes),
+                    AppendGuard {
+                        epoch: Epoch(2),
+                        expected_seq: (i + 1) as u64,
+                    },
+                )
+                .await
+                .expect("append fixture event");
+        }
+    }
+    store.close().await;
+
+    let no_config = std::path::Path::new("kian.yaml-does-not-exist.yaml");
+    let json_out = kian_cli::commands::run_tickets(no_config, Some(&path), true)
+        .await
+        .expect("json board");
+    let doc: Value = serde_json::from_str(&json_out).expect("json");
+    let tickets = doc["tickets"].as_array().expect("tickets");
+    assert_eq!(tickets.len(), 1, "{tickets:?}");
+    let row = &tickets[0];
+    assert_eq!(row["session"], worker.0.to_string());
+    // The live negative, closed: the stage lights `delivery-retry` …
+    assert_eq!(row["stage"], json!("delivery-retry"), "{row}");
+    // … and the parked line names the conversation, attributed from
+    // the worker's own stream (no alias matched — the correlation is
+    // a freeform event id).
+    let parked = row["parked"].as_array().expect("parked array");
+    assert_eq!(parked.len(), 1, "{row}");
+    assert!(
+        parked[0].as_str().unwrap().contains(&conversation),
+        "parked line `{}` must name `{conversation}`",
+        parked[0]
+    );
+
+    let text = kian_cli::commands::run_tickets(no_config, Some(&path), false)
+        .await
+        .expect("text board");
+    assert!(text.contains("delivery-retry"), "{text}");
+    assert!(
+        text.contains("parked:") && text.contains(&conversation),
+        "the text board names the parked delivery:\n{text}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
