@@ -857,6 +857,29 @@ its slice here (the C66 closeout reconciles the whole section).
   §4.1: **fan-out grants no authority; bounded by Mandate (ADR-012)** — no admission check runs
   on a fanned-out message. Full placement note: §4.1 bullet "Thread/Correlation intake
   projection".
+- **Policy/prompt versioning + drift marking (C63, kian-69)** — the prototype's versioned
+  Policy (rules + accept mode + source parts, references 001/007) in kian's shape, zero new
+  event kinds (`kian-superagent` `policy_version.rs`, pure): the configured revision
+  (`superagent.policy.version: <label>`, absent = today's bytes, byte-identical) rides the
+  **rendered** bootstrap prompt of the resident Router and watchdog as a `[policy <label>]`
+  header — added at render, so the template text (the `JUDGE_PROMPT_TEMPLATE` goldens) is
+  untouched and legacy persisted prompts replay byte-identically (constraint 3); the
+  `PolicyVersion` also carries sha256 display fingerprints of the prompt templates the label
+  was pinned against, so a label always names template bytes. Boot-time drift marking
+  (assembly `start_services`) compares the **live** resident sessions' persisted bootstrap
+  headers against the configured version: an audit line + the `superagent.policy_drift`
+  counter — and **live sessions are never rewritten** (cache-byte stability: a drifted
+  session keeps its persisted prompt; only the next bootstrap renders the new header; the
+  idempotent bootstrap key guarantees it). Config-gated `superagent.policy.notify_live`
+  (default **false**): when true, a drift delivers **one ordinary admitted input** to each
+  affected live session — the marker text `[policy <old>→<new>] defaults updated; …`,
+  synthetic-marked and strippable (the watchdog steer-row vocabulary, constraint 2),
+  idempotent by the stable event id `policy:drift:<old>-><new>` (a `(session, key)` admit;
+  each upgrade notifies exactly once), admitted through the resident's **mounted inbox**
+  (the residency counter a parked resident polls — a raw-engine admit would strand behind
+  the park). The version is replayable: it lives in persisted bootstrap prompts and marker
+  inputs — derivable from the stream, no `policy/version` kind (rejected: the persisted
+  prompt is the record).
 
 ## 5. Control-plane protocol (P5 protocolized)
 
