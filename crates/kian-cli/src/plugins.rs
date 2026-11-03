@@ -380,6 +380,12 @@ pub struct SuperAgentPlugin {
     /// The converted admission-class table (C36 config, fail-closed;
     /// empty = today's behavior).
     pub classes: kian_superagent::AdmissionClassTable,
+    /// C61/ADR-013: the converted thread-key derivations
+    /// (`superagent.intake.thread_keys`). The derived key surfaces in
+    /// spilled events' Inline `neighbors` block as recall context —
+    /// correlation is context only, never a routing input. Empty =
+    /// no derivation, byte-identical wrappers.
+    pub thread_keys: kian_superagent::ThreadKeySet,
     /// C33 admission-time shaping (infinite cap = legacy behavior).
     pub shaping: kian_superagent::ShapingConfig,
     /// C43 untrusted-channel set (prompt-injection hygiene): events
@@ -836,6 +842,10 @@ impl Plugin for SuperAgentPlugin {
             )
             .with_shaping(self.shaping)
             .with_untrusted_channels(self.untrusted_channels)
+            // C61/ADR-013: the derived thread key joins spilled
+            // events' Inline neighbors as recall context (context
+            // only — routing stays topic-keyed).
+            .with_thread_keys(self.thread_keys.clone())
             // C59: the fan-out and the spawn tool share one registry
             // projection, and the ownership gate rides the same flag.
             .with_shared_registry(Arc::clone(&followup_registry))

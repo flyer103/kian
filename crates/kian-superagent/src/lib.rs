@@ -131,8 +131,10 @@ pub use dsh::{
 };
 pub use github::{
     API_VERSION, DEFAULT_API_BASE as GITHUB_DEFAULT_API_BASE, GITHUB_CHANNEL_TYPE, GitHubChannel,
-    GitHubConfig, GitHubError, SUBSCRIBER_CAPACITY as GITHUB_SUBSCRIBER_CAPACITY,
-    SUPPORTED_EVENT_TYPES, payload_since_cursor,
+    GitHubConfig, GitHubError, POLL_SINCE_FIELD, PollConfig, PollKind,
+    SUBSCRIBER_CAPACITY as GITHUB_SUBSCRIBER_CAPACITY, SUPPORTED_EVENT_TYPES, payload_since_cursor,
+    poll_author_is_human, poll_comment_body, poll_event_id, poll_issue_body, poll_item_since,
+    poll_items_to_events, poll_thread_key_rule, rfc3339_ms,
 };
 pub use inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 pub use intake::{

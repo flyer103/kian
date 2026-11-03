@@ -413,12 +413,23 @@ impl Server {
                 }
             }
 
-            // C49: any github channel configures the webhook receiver
-            // route — and a configured route without its env-only
-            // secret refuses to start (fail-closed, the C13 secrets
-            // discipline: never a signature-less receiver, never a
-            // secret in kian.yaml).
-            if !github_channels.is_empty() {
+            // C49: a webhook-**receiving** github channel configures the
+            // webhook receiver route — and a configured route without
+            // its env-only secret refuses to start (fail-closed, the
+            // C13 secrets discipline: never a signature-less receiver,
+            // never a secret in kian.yaml). C64: a poll-only channel
+            // (`webhook_receive: false`) mounts no receiver route and
+            // needs no secret — poll mode is beside the webhook
+            // surface, and a deployment that receives no webhooks
+            // mounts no signature-verifying route.
+            let webhook_fed = sa.channels.values().any(|channel| {
+                channel.channel_type == kian_superagent::GITHUB_CHANNEL_TYPE
+                    && channel
+                        .github
+                        .as_ref()
+                        .is_some_and(|section| section.webhook_receive)
+            });
+            if webhook_fed {
                 webhook_secret = Some(
                     env_credential(crate::webhook::GITHUB_WEBHOOK_SECRET_ENV).ok_or_else(|| {
                         ServeError::Assembly(format!(
@@ -452,6 +463,12 @@ impl Server {
                 policy_notify_live: sa.policy.notify_live,
                 mandate: sa.mandate_policy(),
                 outbox: sa.outbox_config().map_err(ServeError::Config)?,
+                // C61/ADR-013: the thread-key derivations (validated at
+                // parse; converted again here — one shape, both gates).
+                thread_keys: sa
+                    .intake
+                    .to_runtime(&sa.channels.keys().cloned().collect())
+                    .map_err(ServeError::Config)?,
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,

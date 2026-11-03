@@ -134,6 +134,16 @@ pub struct SubscriptionService {
     /// never releases on version drift, and a `none`-stamped mandate
     /// matches it.
     policy_pointer: Option<String>,
+    /// C61/ADR-013: the configured thread-key derivations
+    /// (`superagent.intake.thread_keys`). Correlation is context
+    /// only: the derived key surfaces in the C33 Inline `neighbors`
+    /// block (`thread_key`) so the Router and workers reach sibling
+    /// threads through the recall toolpack — it never routes (the
+    /// subscription rules stay topic-keyed; a poll-mode adapter's
+    /// topics are the derived keys already, produced at mapping
+    /// time). Empty (the default) stamps nothing — byte-identical
+    /// wrappers.
+    thread_keys: crate::intake::ThreadKeySet,
     registry: Arc<RwLock<PassthroughRegistry>>,
     inbox: Arc<dyn InboxWriter>,
 }
@@ -152,6 +162,7 @@ impl SubscriptionService {
             untrusted_channels: std::collections::BTreeSet::new(),
             followup_ownership: true,
             policy_pointer: None,
+            thread_keys: crate::intake::ThreadKeySet::default(),
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
@@ -174,6 +185,7 @@ impl SubscriptionService {
             untrusted_channels: std::collections::BTreeSet::new(),
             followup_ownership: true,
             policy_pointer: None,
+            thread_keys: crate::intake::ThreadKeySet::default(),
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
@@ -240,6 +252,16 @@ impl SubscriptionService {
     /// labeling only — routing, classes and rules are unchanged.
     pub fn with_untrusted_channels(mut self, channels: std::collections::BTreeSet<String>) -> Self {
         self.untrusted_channels = channels;
+        self
+    }
+
+    /// Sets the C61 thread-key derivations
+    /// (`superagent.intake.thread_keys`): the derived key of an
+    /// over-cap (spilled) event surfaces in its Inline `neighbors`
+    /// block as `thread_key` recall context. Context only — never a
+    /// routing input. An empty set (the default) changes nothing.
+    pub fn with_thread_keys(mut self, keys: crate::intake::ThreadKeySet) -> Self {
+        self.thread_keys = keys;
         self
     }
 
@@ -452,7 +474,23 @@ impl SubscriptionService {
         // untrusted bit is decided by channel config at this same
         // pre-admission point — labeling, never filtering.
         let untrusted = self.untrusted_channels.contains(&event.channel);
-        let payload = shape_channel_input_marked(&event, &self.shaping, untrusted);
+        let mut payload = shape_channel_input_marked(&event, &self.shaping, untrusted);
+        // C61 (ADR-013): correlation is context only — the derived
+        // thread key joins the over-cap Inline `neighbors` block for
+        // recall hops. An under-cap wrapper carries the raw verbatim
+        // (no neighbors block to stamp); an empty config stamps
+        // nothing. Never a routing input.
+        if !self.thread_keys.is_empty()
+            && let Some(key) = self.thread_keys.derive(&event)
+            && let Some(neighbors) = payload
+                .pointer_mut("/kian/inline/neighbors")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            neighbors.insert(
+                crate::intake::THREAD_KEY_FIELD.to_string(),
+                serde_json::Value::String(key.topic().to_string()),
+            );
+        }
         // Invariant 1 per subscriber: the admit future resolves only
         // on commit, and that subscriber's wake strictly after. The
         // set is sorted, so a fan-out admits in deterministic order.

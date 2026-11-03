@@ -40,6 +40,9 @@ struct GitHubMock {
     calls: Mutex<Vec<CapturedCall>>,
     /// The (status, json) the API answers with, when scripted.
     respond: Mutex<Option<(u16, Value)>>,
+    /// C64: path-keyed list pages (exact path match wins over
+    /// `respond`) — the scripted github the poll tests read from.
+    pages: Mutex<std::collections::BTreeMap<String, Value>>,
 }
 
 impl GitHubMock {
@@ -47,6 +50,7 @@ impl GitHubMock {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             respond: Mutex::new(None),
+            pages: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -56,6 +60,19 @@ impl GitHubMock {
 
     fn reject_with(&self, status: u16, body: Value) {
         *self.respond.lock().unwrap() = Some((status, body));
+    }
+
+    /// Scripts one list page under an exact path (query included).
+    fn serve_page(&self, path: &str, body: Value) {
+        self.pages.lock().unwrap().insert(path.to_string(), body);
+    }
+
+    /// The path of the first captured call starting with `prefix`.
+    fn first_path_starting_with(&self, prefix: &str) -> Option<String> {
+        self.calls()
+            .iter()
+            .find(|(method, path, ..)| method == "GET" && path.starts_with(prefix))
+            .map(|(_, path, ..)| path.clone())
     }
 
     async fn serve(self: Arc<Self>) -> String {
@@ -73,7 +90,11 @@ impl GitHubMock {
 
 async fn capture_endpoint(State(state): State<Arc<GitHubMock>>, req: Request) -> impl IntoResponse {
     let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
     let auth = req
         .headers()
         .get("authorization")
@@ -94,13 +115,30 @@ async fn capture_endpoint(State(state): State<Arc<GitHubMock>>, req: Request) ->
         .calls
         .lock()
         .unwrap()
-        .push((method, path, auth, api_version, body));
-    let (status, body) = state
-        .respond
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or((201, json!({"id": 4242, "node_id": "R_1"})));
+        .push((method, path.clone(), auth, api_version, body));
+    // A scripted page wins (the poll tests' list endpoints — longest
+    // key prefix, so `/issues` vs `/issues/comments` disambiguate);
+    // else the shared scripted response; else the default send
+    // acceptance. The pages map is cloned out under one lock (the
+    // lookup below must not re-lock).
+    let scripted = {
+        let pages = state.pages.lock().unwrap().clone();
+        pages
+            .keys()
+            .filter(|key| path.starts_with(key.as_str()))
+            .max_by_key(|key| key.len())
+            .and_then(|key| pages.get(key).cloned())
+    };
+    let (status, body) = if let Some(page) = scripted {
+        (200u16, page)
+    } else {
+        state
+            .respond
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or((201, json!({"id": 4242, "node_id": "R_1"})))
+    };
     (
         StatusCode::from_u16(status).expect("mock status"),
         Json(body),
@@ -119,6 +157,7 @@ fn github_config(api_base: &str) -> GitHubConfig {
         untrusted: true,
         send: true,
         token: Some("ghp_mock".into()),
+        poll: None,
     }
 }
 
@@ -664,6 +703,7 @@ async fn github_live_smoke_env_gated() {
         untrusted: true,
         send: true,
         token: Some(token),
+        poll: None,
     };
     config.validate().expect("live config validates");
     let channel = GitHubChannel::new("github", config).expect("live channel builds");
@@ -683,6 +723,320 @@ async fn github_live_smoke_env_gated() {
             eprintln!("live send ok: id={}", receipt.message_id);
         }
         None => eprintln!("live send skipped: KIAN_GITHUB_SEND_TARGET not set"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C64: poll-receive mode — scripted issue/comment list pages parsed
+// into ChannelEvents, the since cursor honored, re-polls deduped by
+// event id, and bot/CI senders dropped by the C36 classes table.
+// ---------------------------------------------------------------------------
+
+use kian_superagent::{POLL_SINCE_FIELD, PollConfig, PollKind};
+
+fn poll_channel_config(api_base: &str) -> GitHubConfig {
+    let mut config = github_config(api_base);
+    config.send = false;
+    config.token = None;
+    config.poll = Some(PollConfig {
+        repo: "flyer103/kian".into(),
+        interval_ms: 30_000,
+        kinds: BTreeSet::from([PollKind::Issues, PollKind::IssueComments]),
+        since_field: POLL_SINCE_FIELD.into(),
+        backfill_ms: 86_400_000,
+    });
+    config
+}
+
+fn issue_item(number: u64, updated: &str, login: &str, sender_type: &str) -> Value {
+    json!({
+        "number": number,
+        "title": format!("issue {number}"),
+        "body": "the CI log shows a panic",
+        "updated_at": updated,
+        "user": {"login": login, "type": sender_type, "id": 7},
+    })
+}
+
+fn comment_item(id: u64, issue: u64, updated: &str, body: &str) -> Value {
+    json!({
+        "id": id,
+        "body": body,
+        "updated_at": updated,
+        "issue_url": format!("https://api.github.com/repos/flyer103/kian/issues/{issue}"),
+        "user": {"login": "reporter", "type": "User"},
+    })
+}
+
+/// Gate 1: scripted list pages parse into provenance-carrying
+/// `ChannelEvent`s — the delivery id is the deterministic poll id, the
+/// topic is the C61 thread-key derivation (`github:owner/repo#N`), a
+/// human author's issue carries the adapter-declared explicit signal,
+/// and the cursor advances to the newest admitted `updated_at`.
+#[tokio::test]
+async fn poll_pages_parse_into_thread_keyed_channel_events() {
+    force_no_proxy();
+    let mock = GitHubMock::new();
+    let base = mock.clone().serve().await;
+    mock.serve_page(
+        "/repos/flyer103/kian/issues",
+        json!([
+            issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
+            issue_item(102, "2026-11-04T10:30:00Z", "github-actions[bot]", "Bot"),
+        ]),
+    );
+    mock.serve_page(
+        "/repos/flyer103/kian/issues/comments",
+        json!([comment_item(
+            991,
+            101,
+            "2026-11-04T11:00:00Z",
+            "still reproducible on main",
+        )]),
+    );
+    let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
+    let mut stream = channel.subscribe();
+    // A seeded resume position (the boot derivation's shape): the
+    // window starts before every fixture timestamp.
+    channel.seed_poll_cursor(Some("2026-11-01T00:00:00Z".into()));
+
+    let surfaced = channel.poll_once().await.expect("poll parses");
+    assert_eq!(surfaced, 3);
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.push(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("event within 5s")
+                .expect("stream open"),
+        );
+    }
+    // Chronological order across BOTH kinds (the conversation order).
+    let ids: Vec<&str> = events.iter().map(|e| e.event_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "poll:issues:flyer103/kian#101:2026-11-04T10:00:00Z",
+            "poll:issues:flyer103/kian#102:2026-11-04T10:30:00Z",
+            "poll:issue_comment:flyer103/kian#991:2026-11-04T11:00:00Z",
+        ]
+    );
+    // The topic is the derived thread key — one canonical topic per
+    // issue thread; the comment joins its issue's thread.
+    assert_eq!(events[0].topic.as_deref(), Some("github:flyer103/kian#101"));
+    assert_eq!(events[1].topic.as_deref(), Some("github:flyer103/kian#102"));
+    assert_eq!(events[2].topic.as_deref(), Some("github:flyer103/kian#101"));
+    assert_eq!(events[0].group.as_deref(), Some("flyer103/kian"));
+    // Adapter-declared explicit on (human) issue authorship; the
+    // bot's issue and the human comment never carry it.
+    assert_eq!(events[0].payload["explicit"], json!(true));
+    assert!(events[1].payload.get("explicit").is_none());
+    assert!(events[2].payload.get("explicit").is_none());
+    assert_eq!(events[0].sender.as_ref().unwrap()["login"], "reporter");
+
+    // The GETs carried the cursor, URL-encoded, on both endpoints.
+    let issues_path = mock
+        .first_path_starting_with("/repos/flyer103/kian/issues?")
+        .expect("issues list call");
+    assert!(
+        issues_path.contains("&since=2026-11-01T00%3A00%3A00Z"),
+        "the since cursor rides the issues list query: {issues_path}"
+    );
+    let comments_path = mock
+        .first_path_starting_with("/repos/flyer103/kian/issues/comments")
+        .expect("comments list call");
+    assert!(
+        comments_path.contains("&since=2026-11-01T00%3A00%3A00Z"),
+        "the since cursor rides the comments list query: {comments_path}"
+    );
+
+    // The cursor advanced to the newest admitted updated_at.
+    assert_eq!(
+        channel.poll_since_cursor().as_deref(),
+        Some("2026-11-04T11:00:00Z")
+    );
+    let (polls, surfaced_count) = channel.poll_counts();
+    assert_eq!((polls, surfaced_count), (1, 3));
+}
+
+/// Gate 2: the since cursor is honored — nothing at or before it is
+/// emitted; only genuinely newer items surface.
+#[tokio::test]
+async fn poll_since_cursor_is_honored_nothing_older_is_emitted() {
+    force_no_proxy();
+    let mock = GitHubMock::new();
+    let base = mock.clone().serve().await;
+    mock.serve_page(
+        "/repos/flyer103/kian/issues",
+        json!([issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User")]),
+    );
+    let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
+    let mut stream = channel.subscribe();
+    channel.seed_poll_cursor(Some("2026-11-01T00:00:00Z".into()));
+    assert_eq!(channel.poll_once().await.expect("first poll"), 1);
+    let _ = stream.next().await;
+
+    // A page holding the SAME item, an OLDER item, and one NEWER
+    // update of issue 101: only the newer surfaces.
+    mock.serve_page(
+        "/repos/flyer103/kian/issues",
+        json!([
+            issue_item(100, "2026-11-03T09:00:00Z", "old", "User"), // older
+            issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"), // tie
+            issue_item(101, "2026-11-04T12:00:00Z", "reporter", "User"), // newer
+        ]),
+    );
+    assert_eq!(channel.poll_once().await.expect("second poll"), 1);
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("event within 5s")
+        .expect("stream open");
+    assert_eq!(
+        event.event_id, "poll:issues:flyer103/kian#101:2026-11-04T12:00:00Z",
+        "only the strictly-newer item surfaces"
+    );
+    // Nothing else followed.
+    let none = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(none.is_err() || none.unwrap().is_none());
+    assert_eq!(
+        channel.poll_since_cursor().as_deref(),
+        Some("2026-11-04T12:00:00Z")
+    );
+}
+
+/// Gate 3: the same page re-polled dedupes by `event_id` — an
+/// unchanged item re-derives its id and surfaces nothing.
+#[tokio::test]
+async fn same_page_repolled_dedupes_by_event_id() {
+    force_no_proxy();
+    let mock = GitHubMock::new();
+    let base = mock.clone().serve().await;
+    let page = json!([
+        issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
+        comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment"),
+    ]);
+    mock.serve_page("/repos/flyer103/kian/issues", page.clone());
+    mock.serve_page("/repos/flyer103/kian/issues/comments", page.clone());
+    // (The comments endpoint returning the issue-shaped items is
+    // harmless: the comment mapper skips what has no issue_url/id —
+    // serve the right page below instead.)
+    mock.serve_page(
+        "/repos/flyer103/kian/issues/comments",
+        json!([comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment")]),
+    );
+    let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
+    let mut stream = channel.subscribe();
+    channel.seed_poll_cursor(Some("2026-11-01T00:00:00Z".into()));
+
+    assert_eq!(channel.poll_once().await.expect("first poll"), 2);
+    for _ in 0..2 {
+        let _ = stream.next().await;
+    }
+
+    // The SAME pages again (no change upstream): zero surfaced, zero
+    // stream events — the deterministic ids dedupe.
+    assert_eq!(channel.poll_once().await.expect("re-poll"), 0);
+    let none = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+    assert!(none.is_err() || none.unwrap().is_none());
+    // The durable backstop asserted shape-wise: identical items
+    // derive identical ids (the admission key never moves).
+    assert_eq!(
+        channel.poll_since_cursor().as_deref(),
+        Some("2026-11-04T11:00:00Z"),
+        "the cursor held (a re-poll advances nothing)"
+    );
+}
+
+/// Gate 4 (config side): bot/CI senders are ignored by the C36
+/// classes table while human comments stay candidates — the poll
+/// events flow the same pipeline a webhook event does.
+#[tokio::test]
+async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
+    force_no_proxy();
+    let mock = GitHubMock::new();
+    let base = mock.clone().serve().await;
+    mock.serve_page(
+        "/repos/flyer103/kian/issues",
+        json!([
+            issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
+            issue_item(102, "2026-11-04T10:30:00Z", "github-actions[bot]", "Bot"),
+        ]),
+    );
+    mock.serve_page(
+        "/repos/flyer103/kian/issues/comments",
+        json!([comment_item(
+            991,
+            101,
+            "2026-11-04T11:00:00Z",
+            "a human follow-up",
+        )]),
+    );
+    let channel = Arc::new(GitHubChannel::new("github", poll_channel_config(&base)).expect("ok"));
+
+    let router = SessionId(uuid::Uuid::new_v4());
+    let inbox = RecordingInbox::new();
+    let service = Arc::new(
+        SubscriptionService::with_classes(
+            router,
+            SubscriptionRuleSet::new(vec![SubscriptionRule {
+                channel: "github".into(),
+                matcher: RuleMatcher::Always,
+                route: Route::Passthrough {
+                    correlate_by: CorrelateBy::Topic,
+                },
+            }]),
+            // The C36 classes table: the known bot senders are
+            // `ignore`; everything else on the channel is a
+            // candidate (human issues explicit by the adapter, human
+            // comments candidate).
+            AdmissionClassTable::new(vec![AdmissionClassRule {
+                channel: "github".into(),
+                topic: None,
+                sender: Some(json!({"login": "github-actions[bot]", "type": "Bot", "id": 7})),
+                class: AdmissionClass::Ignore,
+            }]),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        )
+        .with_untrusted_channels(BTreeSet::from(["github".to_string()])),
+    );
+    let _consumers = service.spawn(vec![Arc::clone(&channel) as Arc<dyn ChannelAdapter>]);
+    channel.seed_poll_cursor(Some("2026-11-01T00:00:00Z".into()));
+    assert_eq!(channel.poll_once().await.expect("poll"), 3);
+
+    // Three events polled; the classes table drops the bot's before
+    // any rule, any row, any wake: exactly two admits.
+    within(5, || {
+        let admits = inbox.admits.lock().unwrap();
+        (admits.len() == 2).then_some(())
+    })
+    .await
+    .expect("two admits within 5s (the bot's event dropped by class)");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let admits = inbox.admits.lock().unwrap().clone();
+    assert_eq!(admits.len(), 2, "no late admit: {admits:?}");
+    let keys: Vec<&str> = admits
+        .iter()
+        .filter_map(|(_, _, key)| key.as_deref())
+        .collect();
+    assert!(keys.contains(&"poll:issues:flyer103/kian#101:2026-11-04T10:00:00Z"));
+    assert!(keys.contains(&"poll:issue_comment:flyer103/kian#991:2026-11-04T11:00:00Z"));
+    assert!(
+        !keys.iter().any(|k| k.contains("#102")),
+        "the bot's issue never admitted: {keys:?}"
+    );
+    // The admitted wrappers carry the derived thread-key topics and
+    // the untrusted bit.
+    for (_, payload, _) in &admits {
+        assert_eq!(payload["kian"]["channel"], "github");
+        assert_eq!(payload["kian"]["untrusted"], json!(true));
+        assert!(
+            payload["kian"]["topic"]
+                .as_str()
+                .unwrap()
+                .starts_with("github:flyer103/kian#"),
+            "the topic is the derived thread key: {}",
+            payload["kian"]["topic"]
+        );
     }
 }
 

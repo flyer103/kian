@@ -1455,6 +1455,52 @@ pub async fn start_services(
         record(&order, "timers_started");
     }
 
+    // 4c. C64: the github poll drivers — strictly after the consumers
+    //     (a polled event emitted before any subscriber is an event
+    //     nobody hears) and after the Router bootstrap (the first poll
+    //     waits one interval besides). Each poll-mode channel resumes
+    //     from the stream-derived read position (C61): the universe
+    //     scan above covers the Router chain and every worker stream,
+    //     so the newest admitted github event's `updated_at` cursor
+    //     seeds the adapter and a restart never replays what a previous
+    //     incarnation admitted (the durable backstop is `event_id`
+    //     dedupe — ADR-013's no position table).
+    let mut polls_spawned = 0usize;
+    for github in services.github_channels.values() {
+        if github.config().poll.is_none() {
+            continue;
+        }
+        let mut tail: Vec<Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::InputAdmitted)
+            .cloned()
+            .collect();
+        // Newest-first (the read-position scan's contract): sort by
+        // committed timestamp, descending.
+        tail.sort_by_key(|a| std::cmp::Reverse(a.ts));
+        let resume =
+            kian_superagent::read_position(kian_superagent::SourceCursor::GitHubSince, &tail)
+                .map(|position| position.cursor);
+        if let Some(cursor) = &resume {
+            tracing::info!(
+                target: "kian::github_channel",
+                channel = github.channel_name(),
+                since = %cursor,
+                "github poll: resume cursor derived from the admitted-event tail"
+            );
+        }
+        github.seed_poll_cursor(resume);
+        tasks.push(github.spawn_poll());
+        polls_spawned += 1;
+    }
+    if polls_spawned > 0 {
+        tracing::info!(
+            polls = polls_spawned,
+            "superagent: github poll drivers started"
+        );
+        record(&order, "github_poll_started");
+    }
+
     tasks.extend(bridge);
     Ok(SuperAgentRuntime {
         router,

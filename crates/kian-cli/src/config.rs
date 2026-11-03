@@ -524,6 +524,15 @@ pub struct SuperAgentConfig {
     /// fail-closed by [`SuperAgentConfig::outbox_config`].
     #[serde(default)]
     pub outbox: Option<OutboxConfigDef>,
+    /// C61/ADR-013 thread-key intake (`superagent.intake`): the
+    /// config-owned canonical thread-key derivations. The derived key
+    /// surfaces in the C33 Inline `neighbors` block (`thread_key`) as
+    /// recall context — correlation is context only, never a routing
+    /// input (routing stays topic-keyed; poll-mode github topics are
+    /// the derived keys themselves, produced at adapter mapping time).
+    /// Absent = no derivation, byte-identical wrappers.
+    #[serde(default)]
+    pub intake: IntakeConfig,
 }
 
 /// C59's default: follow-up ownership is **on** — the honest default
@@ -613,6 +622,80 @@ pub struct OutboxConfigDef {
     pub max_attempts: Option<u32>,
     pub backoff_start_ms: Option<u64>,
     pub backoff_cap_ms: Option<u64>,
+}
+
+/// The C61 `superagent.intake` section (ADR-013):
+/// `{thread_keys: [{channel, key: [group?, <payload-field>…]}]}`.
+///
+/// The derived key (`<channel>:<group>#<key>`, percent-encoded
+/// components — collision-free by construction) surfaces in the C33
+/// Inline `neighbors` block as `thread_key` recall context. Keys are
+/// **config-owned**: a config change is a new key, and old streams
+/// keep their topics (cache-stable, no rewrite). Absent section = no
+/// derivation, byte-identical admission wrappers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeConfig {
+    #[serde(default)]
+    pub thread_keys: Vec<ThreadKeyDef>,
+}
+
+/// One `superagent.intake.thread_keys` entry: `{channel, key: […]}`.
+/// `key` entries: `"group"` fills the group slot from the event's
+/// group provenance; any other name is a dotted payload-field path
+/// whose leaf must be a scalar. The wire form is the bundle's
+/// [`kian_superagent::ThreadKeyRule`] verbatim (one shape, two
+/// readers — this def adds only fail-closed config paths).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadKeyDef {
+    /// Channel name the rule applies to (must be declared in
+    /// `superagent.channels`, fail-closed cross-reference).
+    pub channel: String,
+    /// The derivation fields, config order (see the type doc).
+    pub key: Vec<String>,
+}
+
+impl IntakeConfig {
+    /// Converts to the bundle's [`kian_superagent::ThreadKeySet`],
+    /// fail-closed: blank channels, empty key lists and undeclared
+    /// channel references refuse to start (the caller supplies the
+    /// declared channel names for the cross-reference).
+    pub fn to_runtime(
+        &self,
+        declared_channels: &std::collections::BTreeSet<String>,
+    ) -> Result<kian_superagent::ThreadKeySet, ConfigError> {
+        let mut rules = Vec::with_capacity(self.thread_keys.len());
+        for (i, def) in self.thread_keys.iter().enumerate() {
+            if def.channel.trim().is_empty() {
+                return Err(invalid(format!(
+                    "superagent.intake.thread_keys[{i}].channel must not be empty"
+                )));
+            }
+            if def.key.is_empty() {
+                return Err(invalid(format!(
+                    "superagent.intake.thread_keys[{i}].key must name at least one field"
+                )));
+            }
+            if def.key.iter().any(|field| field.trim().is_empty()) {
+                return Err(invalid(format!(
+                    "superagent.intake.thread_keys[{i}].key entries must not be empty"
+                )));
+            }
+            if !declared_channels.contains(&def.channel) {
+                return Err(invalid(format!(
+                    "superagent.intake.thread_keys[{i}] references channel `{}` which is not \
+                     declared in superagent.channels",
+                    def.channel
+                )));
+            }
+            rules.push(kian_superagent::ThreadKeyRule {
+                channel: def.channel.clone(),
+                key: def.key.clone(),
+            });
+        }
+        Ok(kian_superagent::ThreadKeySet::new(rules))
+    }
 }
 
 /// The C63 `superagent.policy` section:
@@ -1003,7 +1086,10 @@ pub struct GitHubChannelSection {
     /// Topic mapping table: `owner/repo` → topic, optionally
     /// narrowed per PR with an exact `owner/repo#N` → topic key. The
     /// keys are also the receive allowlist: a delivery from an
-    /// unmapped repo is an honest drop (the C48 contract).
+    /// unmapped repo is an honest drop (the C48 contract). In
+    /// poll-receive mode the table keys are still the allowlist (the
+    /// polled repo must be mapped); the routing topic of a polled
+    /// event is its derived thread key, not the table value.
     pub topics: BTreeMap<String, String>,
     /// Webhook event-type filter (empty = every supported type).
     #[serde(default)]
@@ -1016,10 +1102,57 @@ pub struct GitHubChannelSection {
     /// module's (`WebhookLimits::default`).
     #[serde(default)]
     pub webhook: GitHubWebhookLimitsSection,
+    /// C64: is webhook receive mounted for this channel? Default
+    /// `true` (the C48/C49 shape); `false` on a poll-only channel
+    /// keeps the webhook route — and its env-only secret
+    /// requirement — unconfigured (poll mode is *beside* the webhook
+    /// surface, and a deployment that receives no webhooks mounts no
+    /// signature-verifying route).
+    #[serde(default = "default_github_webhook_receive")]
+    pub webhook_receive: bool,
+    /// C64: the poll-receive mode. Present (with `webhook_receive` at
+    /// its default) the channel receives webhooks **and** polls;
+    /// absent the channel is exactly the C48/C49 shape.
+    #[serde(default)]
+    pub poll: Option<GitHubPollSection>,
+}
+
+fn default_github_webhook_receive() -> bool {
+    true
 }
 
 fn default_github_api_base() -> String {
     kian_superagent::GITHUB_DEFAULT_API_BASE.to_string()
+}
+
+/// The default bounded first-poll backfill window (C64): 24 hours. A
+/// fresh deployment admits at most the issues/comments updated in
+/// this window — never the repo's whole history.
+pub const DEFAULT_POLL_BACKFILL_MS: u64 = 86_400_000;
+
+/// The C64 `superagent.channels.<name>.github.poll:` section:
+/// `{repo, interval_ms, kinds, since_field?, backfill_ms?}` — the
+/// poll-receive mode beside webhook receive. `repo` must be a
+/// `owner/repo` key of the channel's `topics` table (the receive
+/// allowlist); `kinds` names the REST list endpoints
+/// (`issues` | `issue_comments`); `since_field` defaults to
+/// `updated_at` (the only honest v1 cursor) and `backfill_ms` to 24h.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubPollSection {
+    /// The repo polled (`owner/repo`; must be a `topics` key).
+    pub repo: String,
+    /// Milliseconds between polls (> 0).
+    pub interval_ms: u64,
+    /// The list endpoints to drive (non-empty; `issues` |
+    /// `issue_comments`).
+    pub kinds: std::collections::BTreeSet<String>,
+    /// The cursor field (default `updated_at`).
+    #[serde(default)]
+    pub since_field: Option<String>,
+    /// The bounded first-poll window, milliseconds (default 24h).
+    #[serde(default)]
+    pub backfill_ms: Option<u64>,
 }
 
 /// The `superagent.channels.<name>.github.webhook:` limits (C49):
@@ -1065,7 +1198,7 @@ impl GitHubChannelSection {
     /// Converts to the bundle's runtime config, fail-closed on every
     /// degenerate field (the C48 validation). `token` is the env-only
     /// credential filled by assembly (`KIAN_GITHUB_TOKEN`; `send:
-    /// true` without it is a startup error, receive-only needs none).
+    /// true` without it is a startup error, receive/poll need none).
     pub fn to_runtime(
         &self,
         name: &str,
@@ -1082,11 +1215,44 @@ impl GitHubChannelSection {
             token: token
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            poll: self.poll_runtime(name)?,
         };
         config
             .validate()
             .map_err(|e| invalid(format!("superagent.channels `{name}` (type github): {e}")))?;
         Ok(config)
+    }
+
+    /// The poll section as the bundle's runtime config (C64),
+    /// fail-closed on kind spellings and degenerate bounds.
+    fn poll_runtime(&self, name: &str) -> Result<Option<kian_superagent::PollConfig>, ConfigError> {
+        let Some(section) = &self.poll else {
+            return Ok(None);
+        };
+        let mut kinds = std::collections::BTreeSet::new();
+        for kind in &section.kinds {
+            let parsed = match kind.as_str() {
+                "issues" => kian_superagent::PollKind::Issues,
+                "issue_comments" => kian_superagent::PollKind::IssueComments,
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.channels `{name}`.github.poll.kinds entry `{other}` is not \
+                         one of [issues, issue_comments]"
+                    )));
+                }
+            };
+            kinds.insert(parsed);
+        }
+        Ok(Some(kian_superagent::PollConfig {
+            repo: section.repo.clone(),
+            interval_ms: section.interval_ms,
+            kinds,
+            since_field: section
+                .since_field
+                .clone()
+                .unwrap_or_else(|| kian_superagent::POLL_SINCE_FIELD.to_string()),
+            backfill_ms: section.backfill_ms.unwrap_or(DEFAULT_POLL_BACKFILL_MS),
+        }))
     }
 
     /// Validates the pure-config shape at parse time (env credentials
@@ -1100,6 +1266,7 @@ impl GitHubChannelSection {
             untrusted: true,
             send: false,
             token: None,
+            poll: self.poll_runtime(name)?,
         };
         probe
             .validate()
@@ -1892,6 +2059,12 @@ impl ServeConfig {
             // C43: the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
+            // C61/ADR-013: the intake thread-keys cross-reference the
+            // declared channels and convert cleanly (fail-closed —
+            // an undeclared channel or an empty key list refuses to
+            // start, never a silently dead derivation).
+            sa.intake
+                .to_runtime(&sa.channels.keys().cloned().collect())?;
             // C40: the watchdog binding cross-references convert
             // cleanly — a fixed session uuid distinct from the Router
             // session, an agent that exists and carries a strong
