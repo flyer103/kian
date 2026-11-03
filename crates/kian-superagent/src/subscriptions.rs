@@ -20,6 +20,12 @@
 //!
 //! Events matching no rule are dropped with an audit log line and no
 //! inbox row — an honest no-op, never a silent swallow.
+//!
+//! C57: every drop/admit audit line stamps a machine-stable
+//! `reason=<code>` from the closed [`crate::reasons::IntakeReason`]
+//! vocabulary (single source of truth: the admit lines and the
+//! assembly counters both render through
+//! [`crate::reasons::routed_reason`], so they cannot drift).
 
 use std::sync::{Arc, RwLock};
 
@@ -31,6 +37,7 @@ use tracing::warn;
 
 use crate::inbox::{InboxWriteError, InboxWriter};
 use crate::provenance::{ShapingConfig, shape_channel_input_marked};
+use crate::reasons::{IntakeReason, routed_reason};
 use crate::registry::PassthroughRegistry;
 use crate::rules::{
     AdmissionClass, AdmissionClassTable, Route, SubscriptionRuleSet, event_has_explicit_signal,
@@ -203,6 +210,7 @@ impl SubscriptionService {
                     channel = %event.channel,
                     event_id = %event.event_id,
                     topic = event.topic.as_deref().unwrap_or(""),
+                    reason = %IntakeReason::ClassIgnored.code(),
                     "subscription audit: event dropped by admission class `ignore`"
                 );
                 return Ok(RoutingOutcome::DroppedIgnored);
@@ -213,6 +221,7 @@ impl SubscriptionService {
                     channel = %event.channel,
                     event_id = %event.event_id,
                     topic = event.topic.as_deref().unwrap_or(""),
+                    reason = %IntakeReason::NotExplicit.code(),
                     "subscription audit: event dropped by admission class `explicit-only` \
                      (no explicit-request signal)"
                 );
@@ -226,6 +235,7 @@ impl SubscriptionService {
                 target: "kian::subscriptions",
                 channel = %event.channel,
                 event_id = %event.event_id,
+                reason = %IntakeReason::NoRule.code(),
                 "subscription audit: event dropped, no matching rule"
             );
             return Ok(RoutingOutcome::DroppedNoRule);
@@ -256,6 +266,7 @@ impl SubscriptionService {
                         channel = %event.channel,
                         event_id = %event.event_id,
                         topic = event.topic.as_deref().unwrap_or(""),
+                        reason = %IntakeReason::AdmittedRouter.code(),
                         "subscription audit: passthrough topic unbound, falling back to router"
                     );
                     vec![self.router_session]
@@ -284,11 +295,16 @@ impl SubscriptionService {
             {
                 Ok(receipt) => {
                     self.inbox.wake(target);
+                    // C57: the admit line's code comes from the same
+                    // mapping the assembly counters use — audit and
+                    // metrics cannot disagree.
+                    let reason = routed_reason(target, self.router_session, receipt.deduplicated);
                     info!(
                         target: "kian::subscriptions",
                         session = %target.0,
                         event_id = %event.event_id,
                         deduplicated = receipt.deduplicated,
+                        reason = %reason.code(),
                         "subscription audit: event admitted"
                     );
                     admitted.push(FanoutAdmission {
