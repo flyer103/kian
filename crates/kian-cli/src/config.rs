@@ -503,6 +503,12 @@ pub struct SuperAgentConfig {
     /// `false` restores the pre-C59 behavior.
     #[serde(default = "default_followup_ownership")]
     pub followup_ownership: bool,
+    /// C63 policy/prompt versioning: the policy revision the resident
+    /// profiles render into their bootstrap prompts as a
+    /// `[policy <label>]` header, plus the drift-notice gate. Absent
+    /// (`version` unset) = today's bytes, byte-identical.
+    #[serde(default)]
+    pub policy: PolicyVersionConfig,
 }
 
 /// C59's default: follow-up ownership is **on** — the honest default
@@ -527,6 +533,68 @@ impl SuperAgentConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(kian_superagent::SpeakPolicy::from_rules(rules))
+    }
+
+    /// Converts the C63 policy-version section to the bundle's
+    /// [`kian_superagent::PolicyVersion`], fingerprinted against the
+    /// resident profiles' prompt templates (the judge and watchdog
+    /// defaults) so a label always names the template bytes it was
+    /// pinned against. `None` when no version is configured (today's
+    /// bytes, byte-identical).
+    pub fn policy_version(&self) -> Option<kian_superagent::PolicyVersion> {
+        self.policy.version.as_deref().map(|label| {
+            kian_superagent::PolicyVersion::from_templates(
+                label,
+                &[
+                    ("judge", kian_superagent::JUDGE_PROMPT_TEMPLATE),
+                    ("watchdog", kian_superagent::WATCHDOG_PROMPT_TEMPLATE),
+                ],
+            )
+        })
+    }
+}
+
+/// The C63 `superagent.policy` section:
+/// `{version: <label>, notify_live: bool}`.
+///
+/// - `version` (optional) — the policy revision label rendered into
+///   the resident Router/watchdog bootstrap prompts as a
+///   `[policy <label>]` header. Absent = today's bytes. Labels are
+///   restricted to `[A-Za-z0-9._+-]+` (fail-closed at validation) so
+///   the header parses back unambiguously.
+/// - `notify_live` (default `false`) — when a boot-time drift is
+///   detected, deliver one synthetic policy-changed marker input to
+///   each affected live session (idempotent by a stable event id).
+///   Live sessions are never rewritten either way (cache-byte
+///   stability).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyVersionConfig {
+    pub version: Option<String>,
+    #[serde(default)]
+    pub notify_live: bool,
+}
+
+impl PolicyVersionConfig {
+    /// Fail-closed label validation: non-empty and restricted to
+    /// header-safe ASCII (no `]`, no whitespace — the
+    /// `[policy <label>]` header must parse back unambiguously from
+    /// persisted prompts).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(label) = &self.version {
+            let safe = !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'));
+            if !safe {
+                return Err(invalid(format!(
+                    "superagent.policy.version `{label}` is not a valid label (non-empty, \
+                     ASCII letters/digits/`. _ - + :` only — it rides the `[policy <label>]` \
+                     prompt header and must parse back unambiguously)"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1684,6 +1752,10 @@ impl ServeConfig {
                     )));
                 }
             }
+            // C63: the policy-version label is header-safe (fail-closed
+            // — it rides persisted bootstrap prompts and must parse
+            // back unambiguously).
+            sa.policy.validate()?;
             // C43: the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -3258,5 +3330,63 @@ recovery:
                 .contains("superagent.speak_rules[0] references channel `nope`"),
             "{err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // C63: the superagent.policy section
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn policy_section_parses_converts_and_defaults_absent() {
+        // Present: the label converts to a version fingerprinted over
+        // the resident prompt templates.
+        let yaml = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  policy:\n    version: 2026-11.1\n    notify_live: true\n  subscriptions:\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("policy config");
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert!(sa.policy.notify_live);
+        let version = sa.policy_version().expect("version converts");
+        assert_eq!(version.label(), "2026-11.1");
+        let hashes = version.prompt_hashes();
+        assert_eq!(hashes.len(), 2, "judge + watchdog templates");
+        assert!(hashes.contains_key("judge"));
+        assert!(hashes.contains_key("watchdog"));
+
+        // Absent: no version (today's bytes, byte-identical), notices
+        // off.
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(sa.policy, super::PolicyVersionConfig::default());
+        assert!(sa.policy_version().is_none());
+    }
+
+    #[test]
+    fn policy_version_label_validation_fails_closed() {
+        for bad in ["", "v1 x", "v1]x", "new\nline"] {
+            let yaml = superagent_yaml().replace(
+                "  subscriptions:\n",
+                &format!("  policy:\n    version: {bad:?}\n  subscriptions:\n"),
+            );
+            let err = ServeConfig::parse(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("superagent.policy.version"),
+                "label {bad:?} must refuse: {err}"
+            );
+        }
+        // Every header-safe spelling is accepted.
+        for good in ["v1", "2026-11.1", "a-b_c.d+e"] {
+            let yaml = superagent_yaml().replace(
+                "  subscriptions:\n",
+                &format!("  policy:\n    version: {good}\n  subscriptions:\n"),
+            );
+            let parsed = ServeConfig::parse(&yaml);
+            assert!(
+                parsed.is_ok(),
+                "label {good} must parse: {:?}",
+                parsed.err()
+            );
+        }
     }
 }

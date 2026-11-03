@@ -37,6 +37,9 @@ reqwest.workspace = true
 # and is re-exported from `kian_superagent::dsh` — types only, the
 # bundle never drives the bridge (assembly mounts it config-gated).
 kian-dsh.workspace = true
+# C63: the policy-version template fingerprints (sha256, display-truncated)
+# — pure rendering over prompt bytes, no execution surface.
+sha2.workspace = true
 
 [dev-dependencies]
 kian-store.workspace = true

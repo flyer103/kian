@@ -354,6 +354,15 @@ pub struct SuperAgentPlugin {
     /// refusal at the tool surface. `false` restores the pre-C59
     /// behavior.
     pub followup_ownership: bool,
+    /// C63: the configured policy version
+    /// (`superagent.policy.version`), rendered into the resident
+    /// profiles' bootstrap prompts as a `[policy <label>]` header.
+    /// `None` = today's bytes, byte-identical.
+    pub policy_version: Option<kian_superagent::PolicyVersion>,
+    /// C63: `superagent.policy.notify_live` (default false) — deliver
+    /// one synthetic policy-changed marker input to each drifted live
+    /// resident session at boot (idempotent by a stable event id).
+    pub policy_notify_live: bool,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -498,6 +507,9 @@ impl Plugin for SuperAgentPlugin {
         // C59: the follow-up-ownership gate rides the profile into the
         // tool surface.
         profile.followup_ownership = self.followup_ownership;
+        // C63: the policy version rides the profile into the bootstrap
+        // render (header over the rendered prompt).
+        profile.policy_version = self.policy_version.clone();
         // kian-62: the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 
@@ -704,6 +716,9 @@ impl Plugin for SuperAgentPlugin {
         // engine inbox, the shared channel registry (escalation) and
         // its own hold. Driven by the Router's residency shape: one
         // judge turn per admitted tick, parked between ticks.
+        // C63: its mounted inbox is hoisted for the services (the
+        // drift notice admits through it).
+        let mut mounted_watchdog_inbox: Option<Arc<RouterInbox>> = None;
         let watchdog_side = self.watchdog.as_ref().map(|profile| {
             // One hold shared by the driver (per-hold port install)
             // and the tools (the channel/delivered surface).
@@ -721,6 +736,11 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
                 profile.session,
             );
+            // C63: the mounted inbox rides the services so the boot-time
+            // policy drift notice admits through the residency counter
+            // a parked resident polls (a raw-engine admit would strand
+            // behind the park).
+            mounted_watchdog_inbox = Some(watchdog_inbox.clone());
             let watchdog_loop = Arc::new(ReActLoop::with_config(
                 profile.agent.clone(),
                 registry.clone(),
@@ -808,6 +828,12 @@ impl Plugin for SuperAgentPlugin {
             worker_gate: self.worker_gate,
             subscription_metrics,
             router_metrics,
+            // C63: boot-time policy drift marking (audit + counter +
+            // the config-gated marker notice).
+            policy: self.policy_version.clone(),
+            policy_notify_live: self.policy_notify_live,
+            policy_drift: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            watchdog_inbox: mounted_watchdog_inbox,
             remote,
             async_jobs,
             async_metrics,

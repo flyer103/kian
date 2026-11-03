@@ -278,7 +278,7 @@ impl Server {
             // C40: the resident watchdog binding (optional). The agent
             // is worker-template shaped; the read/intervene surface
             // mounts on it the same way the async/recall pairs mount.
-            let watchdog = match &sa.watchdog {
+            let mut watchdog = match &sa.watchdog {
                 Some(watchdog) => {
                     let pinned = kian_core::model::SessionId(
                         uuid::Uuid::parse_str(&watchdog.session_id).map_err(|_| {
@@ -323,6 +323,13 @@ impl Server {
             };
             let rules = sa.subscription_rules().map_err(ServeError::Config)?;
             let classes = sa.admission_classes().map_err(ServeError::Config)?;
+            // C63: the configured policy version (`superagent.policy
+            // .version`), fingerprinted over the resident prompt
+            // templates; `None` = today's bytes, byte-identical.
+            let policy_version = sa.policy_version();
+            if let Some(watchdog_profile) = watchdog.as_mut() {
+                watchdog_profile.policy_version = policy_version.clone();
+            }
             // C43 + C44: the configured list plus every lark-typed
             // channel (real channels are untrusted by default).
             let untrusted_channels = sa.runtime_untrusted_set().map_err(ServeError::Config)?;
@@ -441,6 +448,8 @@ impl Server {
                     .map_err(ServeError::Config)?,
                 speak: sa.speak_policy().map_err(ServeError::Config)?,
                 followup_ownership: sa.followup_ownership,
+                policy_version,
+                policy_notify_live: sa.policy.notify_live,
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,

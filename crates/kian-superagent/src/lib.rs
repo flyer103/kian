@@ -108,6 +108,7 @@ pub mod lark;
 pub mod metrics;
 pub mod mock;
 pub mod policy;
+pub mod policy_version;
 pub mod provenance;
 pub mod rearm;
 pub mod reasons;
@@ -151,6 +152,11 @@ pub use policy::{
     PolicyError, STRUCTURED_POLICY_NAME, SpeakCondition, SpeakContext, SpeakKind, SpeakPolicy,
     SpeakRule, SpeakTracker, SpeakVerdict, StructuredPolicy, count_words, im_delivered_payload,
     speak_key, structured_delivered_payload,
+};
+pub use policy_version::{
+    DriftMarking, DriftRecord, NO_POLICY_LABEL, PolicyVersion, drift, notify_drift,
+    parse_policy_header, persisted_bootstrap_prompt, policy_header, policy_marker_key,
+    run_drift_marking, scan_drift, with_policy_header,
 };
 pub use provenance::{
     CHANNEL_EVENT_TYPE, ChannelEventMarker, ShapingConfig, channel_event_untrusted,

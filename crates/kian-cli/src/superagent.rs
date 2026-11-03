@@ -1010,9 +1010,12 @@ pub struct SuperAgentRuntime {
     /// Subscription outcome counters.
     pub subscription_metrics: Arc<SubscriptionMetrics>,
     /// Router judge-turn batching metrics (C41: batch size, wall
-    /// duration, amortized per-decision latency — recorded by
+    /// duration and amortized per-decision latency — recorded by
     /// `RouterDriver`, read-only here).
     pub router_metrics: Arc<RouterMetrics>,
+    /// The `superagent.policy_drift` counter (C63): one tick per
+    /// drift marked at boot.
+    pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
     /// The heartbeat watchdog (when endpoints are configured).
     pub watchdog: Option<Arc<HeartbeatWatchdog>>,
     /// The remote-exec services (when endpoints are configured).
@@ -1089,6 +1092,9 @@ impl SuperAgentRuntime {
             },
             "subscriptions": subscriptions,
             "router_batching": router_batching,
+            "policy_drift": self
+                .policy_drift
+                .load(std::sync::atomic::Ordering::Relaxed),
             "channel_policy": {
                 "delivered": delivered,
                 "im": im,
@@ -1133,6 +1139,19 @@ pub struct SuperAgentServices {
     /// Router judge-turn batching metrics (C41) — the handle the
     /// driver records into and `/metrics` snapshots.
     pub router_metrics: Arc<RouterMetrics>,
+    /// C63: the configured policy version
+    /// (`superagent.policy.version`), rendered into the resident
+    /// profiles' bootstrap prompts as a `[policy <label>]` header.
+    /// `None` = today's bytes, byte-identical.
+    pub policy: Option<kian_superagent::PolicyVersion>,
+    /// C63: `superagent.policy.notify_live` (default false) — deliver
+    /// one synthetic policy-changed marker input to each drifted live
+    /// resident session at boot (idempotent by a stable event id).
+    pub policy_notify_live: bool,
+    /// The `superagent.policy_drift` counter: one tick per drift
+    /// marked at boot (live sessions are never rewritten — the counter
+    /// is the audit surface's numeric twin).
+    pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
     /// The async-jobs engine (C37), present when `superagent.async_tools`
@@ -1152,6 +1171,10 @@ pub struct SuperAgentServices {
     /// The resident watchdog profile (C40), when configured: bootstrapped
     /// (idempotent prompt admit + wake) in `start_services`.
     pub watchdog: Option<kian_superagent::WatchdogProfile>,
+    /// C63: the watchdog's mounted inbox (residency-counted), when
+    /// configured — the drift notice admits through the mounted inbox
+    /// a parked resident polls.
+    pub watchdog_inbox: Option<Arc<RouterInbox>>,
 }
 
 /// Post-`startup_rebuild` services start (the card's load-bearing
@@ -1209,6 +1232,67 @@ pub async fn start_services(
         .await
         .map_err(|e| format!("spill index rebuild: {e}"))?;
     record(&order, "spill_index_rebuilt");
+
+    // 1c. C63: boot-time policy drift marking over the LIVE resident
+    //     sessions (the Router and, when configured, the watchdog).
+    //     The persisted bootstrap prompts are read-only here — a
+    //     drifted session keeps its prompt byte-identically; only the
+    //     next bootstrap renders the new header (cache-byte stability).
+    //     Ended re-arm predecessors are frozen history and never
+    //     marked or notified.
+    let current_policy = services.policy.as_ref().map(|p| p.label().to_string());
+    let router_stream: Vec<Event> = events
+        .iter()
+        .filter(|event| event.session == router)
+        .cloned()
+        .collect();
+    let mut residents: Vec<(SessionId, Vec<Event>)> = vec![(router, router_stream)];
+    if let Some(watchdog_profile) = &services.watchdog {
+        let watchdog_events = store.rebuild(watchdog_profile.session).await.map_err(|e| {
+            format!(
+                "policy drift scan (watchdog {}): {e}",
+                watchdog_profile.session.0
+            )
+        })?;
+        residents.push((watchdog_profile.session, watchdog_events));
+    }
+    let marking = kian_superagent::run_drift_marking(
+        residents.iter().map(|(s, evs)| (*s, evs.as_slice())),
+        current_policy.as_deref(),
+        services.policy_notify_live,
+        |session| {
+            // Each resident's marker admits through ITS OWN mounted
+            // inbox — the residency counter a parked resident polls
+            // (kian-63). The Router's and the watchdog's mounted
+            // inboxes; anything else falls back to the raw engine
+            // inbox.
+            if session == router {
+                Arc::clone(&services.router_inbox) as Arc<dyn kian_superagent::InboxWriter>
+            } else if services
+                .watchdog
+                .as_ref()
+                .is_some_and(|profile| profile.session == session)
+            {
+                Arc::clone(
+                    services
+                        .watchdog_inbox
+                        .as_ref()
+                        .expect("the watchdog inbox is mounted exactly when the profile is"),
+                ) as Arc<dyn kian_superagent::InboxWriter>
+            } else {
+                Arc::clone(&services.inbox) as Arc<dyn kian_superagent::InboxWriter>
+            }
+        },
+    )
+    .await
+    .map_err(|e| format!("policy drift marking: {e}"))?;
+    if !marking.marked.is_empty() {
+        services.policy_drift.fetch_add(
+            marking.marked.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        record(&order, "policy_drift_marked");
+    }
 
     // 2. Subscription consumers (AFTER the rebuild — no event is
     //    routed against an empty registry).
@@ -1305,6 +1389,7 @@ pub async fn start_services(
         worker_gate: clone_gate(&services.worker_gate),
         subscription_metrics: Arc::clone(&services.subscription_metrics),
         router_metrics: Arc::clone(&services.router_metrics),
+        policy_drift: Arc::clone(&services.policy_drift),
         watchdog,
         remote: services.remote.clone(),
         async_metrics: services.async_metrics.clone(),
