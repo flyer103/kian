@@ -450,6 +450,7 @@ impl Server {
                 followup_ownership: sa.followup_ownership,
                 policy_version,
                 policy_notify_live: sa.policy.notify_live,
+                mandate: sa.mandate_policy(),
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,

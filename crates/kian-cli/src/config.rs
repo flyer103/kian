@@ -509,6 +509,13 @@ pub struct SuperAgentConfig {
     /// (`version` unset) = today's bytes, byte-identical.
     #[serde(default)]
     pub policy: PolicyVersionConfig,
+    /// C60 (ADR-012) mandate issuance: per-worker-template scope
+    /// texts bounding every delegation `spawn_worker` issues. Absent
+    /// (the default) = no mandate — wrappers stay byte-identical
+    /// legacy. Converted fail-closed by
+    /// [`SuperAgentConfig::mandate_policy`].
+    #[serde(default)]
+    pub mandate: MandateConfig,
 }
 
 /// C59's default: follow-up ownership is **on** — the honest default
@@ -551,6 +558,14 @@ impl SuperAgentConfig {
                 ],
             )
         })
+    }
+
+    /// Converts the C60 mandate section to the bundle's
+    /// [`kian_superagent::MandatePolicy`]. `None` when nothing is
+    /// configured (no mandate issued — byte-identical legacy
+    /// wrappers).
+    pub fn mandate_policy(&self) -> Option<kian_superagent::MandatePolicy> {
+        self.mandate.to_policy()
     }
 }
 
@@ -595,6 +610,72 @@ impl PolicyVersionConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// The C60 `superagent.mandate` section (ADR-012):
+/// `{scopes: {<worker-template-id>: <scope text>}, default_scope: <text>}`.
+///
+/// - `scopes` — worker template id (`agents.<id>`) → the
+///   natural-language bounds stamped on every mandate issued for
+///   workers of that template. Non-empty template keys and scope
+///   texts (fail-closed at validation).
+/// - `default_scope` (optional) — bounds templates with no `scopes`
+///   entry. Absent: an unlisted template is issued no mandate
+///   (unconfigured authority is never silently defaulted).
+///
+/// Absent section = no mandate at all (byte-identical legacy
+/// delegation wrappers).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MandateConfig {
+    #[serde(default)]
+    pub scopes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub default_scope: Option<String>,
+}
+
+impl MandateConfig {
+    /// Fail-closed validation: template keys non-empty, scope texts
+    /// non-blank (an empty authority string is never issued).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (template, scope) in &self.scopes {
+            if template.trim().is_empty() {
+                return Err(invalid(
+                    "superagent.mandate.scopes has an empty worker-template key (keys are \
+                     `agents.<id>` template ids)",
+                ));
+            }
+            if scope.trim().is_empty() {
+                return Err(invalid(format!(
+                    "superagent.mandate.scopes[`{template}`] has a blank scope — a mandate \
+                     scope is the worker's authority bounds and is never empty"
+                )));
+            }
+        }
+        if self
+            .default_scope
+            .as_ref()
+            .is_some_and(|scope| scope.trim().is_empty())
+        {
+            return Err(invalid(
+                "superagent.mandate.default_scope is blank — a mandate scope is the worker's \
+                 authority bounds and is never empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Converts to the bundle policy; `None` when nothing is
+    /// configured.
+    pub fn to_policy(&self) -> Option<kian_superagent::MandatePolicy> {
+        if self.scopes.is_empty() && self.default_scope.is_none() {
+            return None;
+        }
+        Some(kian_superagent::MandatePolicy {
+            scopes: self.scopes.clone(),
+            default_scope: self.default_scope.clone(),
+        })
     }
 }
 
@@ -1756,6 +1837,9 @@ impl ServeConfig {
             // — it rides persisted bootstrap prompts and must parse
             // back unambiguously).
             sa.policy.validate()?;
+            // C60: the mandate scope texts are non-blank (fail-closed —
+            // an empty authority string is never issued).
+            sa.mandate.validate()?;
             // C43: the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -3388,5 +3472,71 @@ recovery:
                 parsed.err()
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // C60: the superagent.mandate section
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mandate_section_parses_converts_and_defaults_absent() {
+        // Present: the per-template scopes convert to the issuance
+        // policy.
+        let yaml = superagent_yaml().replace(
+            "  subscriptions:\n",
+            concat!(
+                "  mandate:\n",
+                "    scopes:\n",
+                "      kian-worker: draft a triage comment; never post\n",
+                "    default_scope: bounded default work only\n",
+                "  subscriptions:\n",
+            ),
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("mandate config");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let policy = sa.mandate_policy().expect("policy converts");
+        assert_eq!(
+            policy.scope_for("kian-worker"),
+            Some("draft a triage comment; never post")
+        );
+        assert_eq!(
+            policy.scope_for("any-other-template"),
+            Some("bounded default work only")
+        );
+
+        // Absent: no mandate issued (byte-identical legacy wrappers).
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(sa.mandate, super::MandateConfig::default());
+        assert!(sa.mandate_policy().is_none());
+    }
+
+    #[test]
+    fn mandate_scope_validation_fails_closed() {
+        for bad in [
+            ("      kian-worker: \"  \"\n", "blank scope text"),
+            ("      \" \": do the work\n", "blank template key"),
+        ] {
+            let yaml = superagent_yaml().replace(
+                "  subscriptions:\n",
+                &format!("  mandate:\n    scopes:\n{}  subscriptions:\n", bad.0),
+            );
+            let err = ServeConfig::parse(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains("superagent.mandate"),
+                "{} must refuse: {err}",
+                bad.1
+            );
+        }
+        // A blank default scope refuses too.
+        let yaml = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  mandate:\n    default_scope: \" \"\n  subscriptions:\n",
+        );
+        let err = ServeConfig::parse(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("superagent.mandate.default_scope"),
+            "{err}"
+        );
     }
 }

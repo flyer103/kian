@@ -363,6 +363,10 @@ pub struct SuperAgentPlugin {
     /// one synthetic policy-changed marker input to each drifted live
     /// resident session at boot (idempotent by a stable event id).
     pub policy_notify_live: bool,
+    /// C60 (ADR-012): the mandate issuance policy
+    /// (`superagent.mandate`), per-worker-template scope texts.
+    /// `None` = no mandate issued (byte-identical legacy wrappers).
+    pub mandate: Option<kian_superagent::MandatePolicy>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -510,6 +514,9 @@ impl Plugin for SuperAgentPlugin {
         // C63: the policy version rides the profile into the bootstrap
         // render (header over the rendered prompt).
         profile.policy_version = self.policy_version.clone();
+        // C60 (ADR-012): the mandate issuance policy rides the profile
+        // into the spawn tool (the single issuance point).
+        profile.mandate = self.mandate.clone();
         // kian-62: the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 
@@ -811,7 +818,15 @@ impl Plugin for SuperAgentPlugin {
             // C59: the fan-out and the spawn tool share one registry
             // projection, and the ownership gate rides the same flag.
             .with_shared_registry(Arc::clone(&followup_registry))
-            .with_followup_ownership(self.followup_ownership),
+            .with_followup_ownership(self.followup_ownership)
+            // C60 (ADR-012): the fan-out's mandate revalidation compares
+            // against the same current pointer the bootstrap renders and
+            // the spawn tool stamps — one configured version everywhere.
+            .with_policy_pointer(
+                self.policy_version
+                    .as_ref()
+                    .map(|version| version.label().to_string()),
+            ),
         );
         let subscription_metrics = Arc::new(crate::superagent::SubscriptionMetrics::default());
 

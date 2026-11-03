@@ -168,9 +168,9 @@ pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, WorkerStatus, worker_sessions};
 pub use router::{
     ChannelRegistry, DEFAULT_PARK_TICK_MS, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE,
-    JudgePrompt, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox,
-    RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy, enforce_speculation_cap,
-    outstanding_threads,
+    JudgePrompt, MandatePolicy, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold,
+    RouterInbox, RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy,
+    build_mandate, enforce_speculation_cap, outstanding_threads,
 };
 pub use rules::{
     AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
@@ -180,8 +180,9 @@ pub use stage::{NoOutbox, OutboxView, TicketStage, project_stage};
 pub use subscriptions::{FanoutAdmission, RoutingOutcome, SubscriptionService};
 pub use templates::{
     ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
-    WORKER_TOOLS, empty_tool_parameters, is_channel_tool, mount_async_tools, mount_recall_tools,
-    mount_watchdog_tools, router_template, worker_template,
+    WORKER_PROMPT_TEMPLATE, WORKER_TOOLS, empty_tool_parameters, is_channel_tool,
+    mount_async_tools, mount_recall_tools, mount_watchdog_tools, render_worker_prompt,
+    router_template, worker_mandate_line, worker_template,
 };
 pub use timer::{
     DEFAULT_TIMER_TOPIC, TIMER_CHANNEL, TIMER_QUEUE_CAPACITY, TimerChannel, TimerConfig,
@@ -196,9 +197,12 @@ pub use watchdog::{
     watchdog_template,
 };
 pub use worker::{
-    Delegation, DelegationPair, LineagePlan, PortFor, REPORT_STATE_KEY, ReportState, SpawnError,
-    SpawnedWorker, StreamPort, StreamPortError, ThreadReport, WORKER_GATE_NAME, WorkerLoopConfig,
-    WorkerLoopDriver, WorkerSpawner, completion_summary, delegation_content, delegation_pairs,
-    lineage_plan, parse_delegation, parse_thread_report, thread_completed_payload,
-    thread_report_content, thread_report_content_stated, thread_started_payload,
+    Delegation, DelegationPair, LineagePlan, MANDATE_KEY, MandateRevalidation, PortFor,
+    REPORT_STATE_KEY, ReportState, SpawnError, SpawnedWorker, StreamPort, StreamPortError,
+    ThreadReport, WORKER_GATE_NAME, WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner,
+    completion_summary, delegation_content, delegation_is_speculative, delegation_mandate,
+    delegation_pairs, lineage_plan, mandate_delegation_content, parse_delegation,
+    parse_thread_report, revalidate_mandate, speculative_delegation_content,
+    thread_completed_payload, thread_report_content, thread_report_content_stated,
+    thread_started_payload,
 };

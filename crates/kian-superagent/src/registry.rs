@@ -28,8 +28,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
+use serde_json::Value;
 
 use crate::provenance::parse_channel_marker;
+use crate::worker::delegation_mandate;
 
 /// A worker's liveness (C59): `Live` until its own stream carries
 /// `thread/completed` or `session/ended`, then `Ended` — terminal for
@@ -67,6 +69,15 @@ pub struct PassthroughRegistry {
     /// are the historical binding record; `ended` is the liveness view
     /// the fan-out filters with.
     ended: BTreeSet<SessionId>,
+    /// C60 (ADR-012): each worker's mandate — the verbatim authority
+    /// object carried by its delegation wrapper. A disposable
+    /// projection like everything else here: registered at spawn time
+    /// by the Router's tool surface and re-derived by
+    /// [`PassthroughRegistry::rebuild`] from `thread/started` task
+    /// payloads, so the revalidation the fan-out runs survives
+    /// restarts for free. The stored object is read-only — a mandate is
+    /// immutable by construction (wider scope is a new Ticket).
+    mandates: BTreeMap<SessionId, Value>,
 }
 
 impl PassthroughRegistry {
@@ -92,6 +103,26 @@ impl PassthroughRegistry {
     /// [`PassthroughRegistry::resolve_live`] stops returning it.
     pub fn mark_ended(&mut self, worker: SessionId) {
         self.ended.insert(worker);
+    }
+
+    /// Registers a worker's mandate (C60, ADR-012): the verbatim
+    /// authority object the Router's `spawn_worker` issued. Called
+    /// strictly after the durable `thread/started` lineage write — the
+    /// projection never runs ahead of the log — and re-derived by
+    /// [`PassthroughRegistry::rebuild`] at startup. A second
+    /// registration for the same worker does not happen (one thread,
+    /// one mandate); if a caller retries it, the honest reading is the
+    /// fresh assertion, matching `register`.
+    pub fn register_mandate(&mut self, worker: SessionId, mandate: Value) {
+        self.mandates.insert(worker, mandate);
+    }
+
+    /// The worker's mandate, verbatim (C60). `None` for pre-C60
+    /// workers and unregistered sessions — legacy authority, which the
+    /// revalidation rule never narrows.
+    #[must_use]
+    pub fn mandate_of(&self, worker: &SessionId) -> Option<&Value> {
+        self.mandates.get(worker)
     }
 
     /// The worker's projected status (C59). Unknown sessions are
@@ -213,6 +244,7 @@ impl PassthroughRegistry {
         }
 
         let mut topics: BTreeMap<String, BTreeSet<SessionId>> = BTreeMap::new();
+        let mut mandates: BTreeMap<SessionId, Value> = BTreeMap::new();
         for ev in &events {
             if ev.kind != EventKind::ThreadStarted {
                 continue;
@@ -222,6 +254,19 @@ impl PassthroughRegistry {
             let Some(worker) = bytes_worker(&ev.bytes) else {
                 continue;
             };
+            // C60 (ADR-012): the same task content may carry the
+            // mandate object — derived here verbatim, so the
+            // revalidation projection survives restarts (the mandate
+            // itself is immutable; a wider scope is a new Ticket).
+            if let Some(mandate) = ev
+                .bytes
+                .get("task")
+                .and_then(|task| task.get("content"))
+                .and_then(delegation_mandate)
+                .cloned()
+            {
+                mandates.insert(worker, mandate);
+            }
             if let Some(marker) = ev
                 .bytes
                 .get("task")
@@ -242,7 +287,11 @@ impl PassthroughRegistry {
                 topics.entry(topic).or_default().insert(ev.session);
             }
         }
-        Self { topics, ended }
+        Self {
+            topics,
+            ended,
+            mandates,
+        }
     }
 }
 
@@ -589,5 +638,56 @@ mod tests {
         runtime.mark_ended(done);
         runtime.mark_ended(session_ended_worker);
         assert_eq!(rebuilt, runtime);
+    }
+
+    // -----------------------------------------------------------------
+    // C60: the mandate projection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rebuild_derives_mandates_and_runtime_registration_equals_it() {
+        // A Router-side thread/started whose task content is a
+        // mandated delegation wrapper (the C60 shape): the rebuild
+        // derives the mandate verbatim; the runtime register_mandate
+        // write equals it (the projection is disposable).
+        let router = sid(1);
+        let worker = sid(2);
+        let mandate = json!({
+            "strength": "inferred",
+            "scope": "draft a triage comment; never post",
+            "granted_by": {"login": "reporter", "type": "User"},
+            "source": {"channel": "github", "topic": "acme/repo#7"},
+            "policy_version": "v1",
+        });
+        let wrapper = json!({
+            "thread_id": "00000000-0000-0000-0000-0000000000aa",
+            "task": "triage issue 7",
+            "mandate": mandate,
+        });
+        let started = event(
+            router,
+            3,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": "00000000-0000-0000-0000-0000000000aa",
+                "parent": router.0.to_string(),
+                "worker": worker.0.to_string(),
+                "pinned_version": 1,
+                "task": {"role": "user", "content": wrapper},
+            }),
+        );
+        let rebuilt = PassthroughRegistry::rebuild([&started]);
+        assert_eq!(rebuilt.mandate_of(&worker), Some(&mandate));
+        // A worker without a mandate (legacy delegation) reads None.
+        assert_eq!(rebuilt.mandate_of(&sid(9)), None);
+
+        let mut runtime = PassthroughRegistry::new();
+        runtime.register_mandate(worker, mandate.clone());
+        assert_eq!(runtime, rebuilt);
+        // mark_ended keeps the mandate: authority is auditable forever,
+        // ended or not (release-to-eval is a routing fact, not a
+        // mandate erasure).
+        runtime.mark_ended(worker);
+        assert_eq!(runtime.mandate_of(&worker), Some(&mandate));
     }
 }

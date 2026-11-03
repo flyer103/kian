@@ -28,6 +28,16 @@
 //! `superagent.followup_ownership` (default on); off restores the
 //! pre-C59 behavior (every historical subscriber admits).
 //!
+//! C60 (ADR-012 mandate revalidation): before a follow-up admits to a
+//! live subscriber, its mandate is revalidated — `strength: explicit`
+//! passes; `inferred` passes while its `policy_version` is still the
+//! current pointer (`superagent.policy.version`, C63). A released
+//! worker drops out of the admission set with an honest audit line
+//! (`released_to_eval`), and a set emptied entirely by releases is the
+//! same release-to-fresh-eval as an all-ended topic. Legacy workers
+//! (no mandate object) always pass — pre-C60 authority is never
+//! retroactively narrowed.
+//!
 //! Events matching no rule are dropped with an audit log line and no
 //! inbox row — an honest no-op, never a silent swallow.
 //!
@@ -117,6 +127,13 @@ pub struct SubscriptionService {
     /// all-ended set releases the topic to the Router (fresh Eval);
     /// off, every historical subscriber admits — the pre-C59 behavior.
     followup_ownership: bool,
+    /// C60 (ADR-012): the current policy-version pointer (the C63
+    /// label, `superagent.policy.version`) the live-subscriber
+    /// revalidation compares each mandate against. `None` (the
+    /// default) is the honest `none` label: an unversioned deployment
+    /// never releases on version drift, and a `none`-stamped mandate
+    /// matches it.
+    policy_pointer: Option<String>,
     registry: Arc<RwLock<PassthroughRegistry>>,
     inbox: Arc<dyn InboxWriter>,
 }
@@ -134,6 +151,7 @@ impl SubscriptionService {
             shaping: ShapingConfig::default(),
             untrusted_channels: std::collections::BTreeSet::new(),
             followup_ownership: true,
+            policy_pointer: None,
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
@@ -155,6 +173,7 @@ impl SubscriptionService {
             shaping: ShapingConfig::default(),
             untrusted_channels: std::collections::BTreeSet::new(),
             followup_ownership: true,
+            policy_pointer: None,
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
@@ -165,6 +184,17 @@ impl SubscriptionService {
     /// admission set is every historical subscriber, live or ended.
     pub fn with_followup_ownership(mut self, enabled: bool) -> Self {
         self.followup_ownership = enabled;
+        self
+    }
+
+    /// Sets the C60 current policy-version pointer
+    /// (`superagent.policy.version`): the label the live-subscriber
+    /// mandate revalidation compares against on every follow-up
+    /// (ADR-012: `explicit` passes; `inferred` passes only while its
+    /// stamped version is still current — otherwise the worker
+    /// releases to fresh evaluation, audited `released_to_eval`).
+    pub fn with_policy_pointer(mut self, label: Option<String>) -> Self {
+        self.policy_pointer = label;
         self
     }
 
@@ -309,6 +339,12 @@ impl SubscriptionService {
         // topic releases to the Router as a fresh evaluation
         // (`released_to_eval`), the bootstrap-empty fallback keeps its
         // `admitted_router` shape.
+        // C60 (ADR-012): each live subscriber's mandate is
+        // revalidated under the same lock — `explicit` passes,
+        // `inferred` passes while its `policy_version` is the current
+        // pointer, and a release drops the worker from the admission
+        // set (honestly audited below; a set emptied by releases is
+        // the same release-to-fresh-eval as an all-ended one).
         let targets: Vec<SessionId> = match &rule.route {
             Route::Router => vec![self.router_session],
             Route::Session(session) => vec![*session],
@@ -316,33 +352,82 @@ impl SubscriptionService {
                 let resolution = event.topic.as_deref().map(|t| {
                     let registry = self.registry.read().expect("passthrough registry lock");
                     if self.followup_ownership {
-                        (registry.resolve_live(t), registry.resolve(t))
+                        let released: Vec<(SessionId, String)> = registry
+                            .resolve_live(t)
+                            .iter()
+                            .filter_map(|worker| {
+                                match crate::worker::revalidate_mandate(
+                                    registry.mandate_of(worker),
+                                    self.policy_pointer.as_deref(),
+                                ) {
+                                    crate::worker::MandateRevalidation::Pass => None,
+                                    crate::worker::MandateRevalidation::Release {
+                                        policy_version,
+                                    } => Some((*worker, policy_version)),
+                                }
+                            })
+                            .collect();
+                        let live = registry
+                            .resolve_live(t)
+                            .into_iter()
+                            .filter(|worker| {
+                                !released.iter().any(|(released, _)| released == worker)
+                            })
+                            .collect::<std::collections::BTreeSet<_>>();
+                        (live, registry.resolve(t), released)
                     } else {
                         let all = registry.resolve(t);
-                        (all.clone(), all)
+                        (all.clone(), all, Vec::new())
                     }
                 });
                 match resolution {
-                    Some((live, historical)) if !historical.is_empty() => {
-                        if self.followup_ownership && live.is_empty() {
-                            // Release to fresh evaluation (C59, 002's
-                            // Ticket-end rule): every subscriber ended —
-                            // the follow-up belongs to a *new* Ticket,
-                            // judged by the Router. The audit line names
-                            // the released topic and carries the closed
-                            // reason code.
-                            warn!(
-                                target: "kian::subscriptions",
-                                channel = %event.channel,
-                                event_id = %event.event_id,
-                                topic = event.topic.as_deref().unwrap_or(""),
-                                reason = %IntakeReason::ReleasedToEval.code(),
-                                "subscription audit: topic released to fresh evaluation \
-                                 (all subscribers ended), falling back to router"
-                            );
-                            vec![self.router_session]
-                        } else if self.followup_ownership {
-                            live.into_iter().collect()
+                    Some((live, historical, released)) if !historical.is_empty() => {
+                        if self.followup_ownership {
+                            // C60: the honest release audit — one line
+                            // per released worker, naming the stale
+                            // version and the closed reason code.
+                            for (worker, from_version) in &released {
+                                warn!(
+                                    target: "kian::subscriptions",
+                                    channel = %event.channel,
+                                    event_id = %event.event_id,
+                                    topic = event.topic.as_deref().unwrap_or(""),
+                                    session = %worker.0,
+                                    from_policy = %from_version,
+                                    reason = %IntakeReason::ReleasedToEval.code(),
+                                    "subscription audit: mandate revalidation released live \
+                                     subscriber (inferred strength, policy version no longer \
+                                     current), follow-up goes to fresh evaluation"
+                                );
+                            }
+                            if live.is_empty() {
+                                // Release to fresh evaluation (C59, 002's
+                                // Ticket-end rule; C60 adds the mandate
+                                // path into the same release): every
+                                // live subscriber is gone — ended, or
+                                // released by revalidation — the
+                                // follow-up belongs to a *new* Ticket,
+                                // judged by the Router. The audit line
+                                // names the cause and carries the
+                                // closed reason code.
+                                let cause = if released.is_empty() {
+                                    "all subscribers ended"
+                                } else {
+                                    "mandate revalidation released every live subscriber"
+                                };
+                                warn!(
+                                    target: "kian::subscriptions",
+                                    channel = %event.channel,
+                                    event_id = %event.event_id,
+                                    topic = event.topic.as_deref().unwrap_or(""),
+                                    reason = %IntakeReason::ReleasedToEval.code(),
+                                    "subscription audit: topic released to fresh evaluation \
+                                     ({cause}), falling back to router"
+                                );
+                                vec![self.router_session]
+                            } else {
+                                live.into_iter().collect()
+                            }
                         } else {
                             historical.into_iter().collect()
                         }
