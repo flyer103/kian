@@ -263,28 +263,40 @@ unchanged; status recorded here.
 | Wire dialect v2 (breaking) | Strict OpenAI-compatible serialization: dotless built-in tool names (`fs_list`/`fs_read`/`fs_write`, dotted forms replayable), wire-level `tool_calls`/`tool_call_id`, `AgentDef.tools` fail-closed. Found live via DeepSeek HTTP 400/422; constraint-3 event in DESIGN (golden hash same commit) | landed |
 | Router re-arm | Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident Router with an observable `[re-arm]` cause input; soft-failed sessions re-open the same pinned session. Zero new kinds; DESIGN §4.6 | landed |
 
-### Phase 6 (bundle-domain policy round, proposed 2026-11-02 — input: dsh-superagent-prototype)
+### Phase 6 (bundle-domain policy round, landed 2026-11-04 — input: dsh-superagent-prototype)
 
 Adoption of the official article implementation's domain-policy layer onto kian's substrate.
 Reference: `a vendored archive/dsh-superagent-*.md` (archived rev 6337fc8), digest §5. **Everything
-below is bundle-layer (`kian-superagent`, at most core projection support); nothing touches
-kian-core/store/orchestrator seams except through the ADR path.**
+landed at bundle-layer (`kian-superagent`, plus read/assembly slices of `kian-cli` and the
+`examples/issue-watch` dogfood); zero new event kinds — the durable set stays 20; every addition
+is an additive payload key on a frozen wrapper, a disposable projection, or a config/template
+artifact.** Semantics: DESIGN §4.7 (reconciled at this closeout); operator surface: the README
+Phase-6 sections.
 
-| Candidate | From prototype | kian's today-gap | Layer/cost | Priority |
-|---|---|---|---|---|
-| Ticket stage projection | 003 first-match stage table ("what is it waiting for") | session state is execution state; no "awaiting person" semantics | pure projection, zero new kinds | P6a — highest |
-| Closed reason vocabularies | Decision reasons as closed enum + display text | free-text rationale only | enum + display text, zero new kinds | P6a |
-| Output-side speak-rules | attention economics (000/005): speak only when someone must act or can use a result | input-side admission only | config-first rule table, zero new kinds | P6a |
-| Follow-up ownership routing | a person's follow-up belongs to the live Ticket's Executor; Router may only stop | all follow-ups re-enter Router | routing policy reusing existing kinds | P6a/P6b |
-| Mandate (delegation authority scope) | Ticket carries an explicit authority object; actions bounded by it | delegation carries task text, no authority object | **ADR-012 candidate** — new event shape (charter-like) | P6b |
-| Thread/Correlation intake projection | Source read-position + Thread key + one-Trigger-many-Tickets fan-out (grants no authority) | channel admit idempotency only; one source feeds one session | **ADR-013 candidate** — projection + derivation rule | P6b |
-| Outbox+receipts bounded retry | delivery failures retried 2s→1min exponential, then parked honestly | structured delivery exists; no unified retry domain | check delivery-kind reuse first | P6b |
-| Policy/prompt versioning + drift marking | numbered snapshots + current pointer; overrides marked "default updated" on upgrade | prompts unversioned in config | config-first + replayable version events | P6c |
+| Item | What landed (card) | Status |
+|---|---|---|
+| Ticket stage projection | "What is it waiting for" as a pure derived projection over the worker stream + inbox + outbox view (first-match table); additive `state` key on completion-report content; read surface `kian tickets [--json]` (kian-64, plan C56) | landed |
+| Closed reason vocabularies | Closed `IntakeReason` codes as `reason=<code>` on every drop/admit audit line + per-code metrics counters; judge-side `decision:<accept\|stop\|ignore\|unavailable>` tag convention in the default template (kian-65, plan C57) | landed |
+| Output-side speak-rules | The whether-to-send gate before output shaping: `superagent.speak_rules` over `always \| ack-first-only \| decision-needed \| result-ready \| never`; suppression = honest tool error + audit + counter, no send; `SpeakTracker` ack-once memory rebuilt from the stream (kian-66, plan C58) | landed |
+| Follow-up ownership routing | Registry liveness projection (`live \| ended`); fan-out admits to live subscribers only; an all-ended topic releases to the Router (`reason=released_to_eval`, fresh Eval); `spawn_worker` refuses a live worker's topic naming the owner (kian-68, plan C59) | landed |
+| Mandate (delegation authority scope) | Additive `mandate` object on the frozen delegation wrapper (immutable, verbatim in `thread/started`, model-visible as the worker's first message); single issuance at `spawn_worker`; revalidation before follow-up routing — [ADR-012](../design/decisions/ADR-012-delegation-mandate.md) (kian-70, plan C60) | landed (ADR-012 landed) |
+| Thread/Correlation intake projection | Config-owned canonical thread keys `<channel>:<group>#<key>` used as routing topics; stream-derived read positions (lark/GitHub cursors) or honest idempotent re-poll — no position table; correlation adds context, never routes; fan-out grants no authority — [ADR-013](../design/decisions/ADR-013-thread-intake-projection.md) (kian-67, plan C61) | landed (ADR-013 stays a draft record) |
+| Outbox+receipts bounded retry | Reuse audit verdict: the outbox is a disposable projection over `tool/call` intent + `channel/delivered` receipt plus a bounded driver — no new durable state; 2s→60s backoff, `max_attempts` 6 then parked honestly (`delivery-retry` stage, named on `kian tickets`); per-(ticket, conversation) ordering; additive `attempt`/`first_attempt_ms` on new receipts; park survives reboot (kian-71 + kian-76, plan C62) | landed |
+| Policy/prompt versioning + drift marking | `[policy <label>]` header added at render (template text untouched, persisted prompts replay byte-identically); boot-time drift marking (audit + counter, live sessions never rewritten); config-gated one-shot policy-changed marker input (kian-69, plan C63) | landed |
+| Issue-watch multi-Ticket dogfood | GitHub poll-receive mode beside the webhook (`since` cursors, bounded backfill); `examples/issue-watch` v2 composes the whole stack — one Ticket per live issue, thread-keyed topics, mandate-bounded triagers, speak-rule deliveries through the outbox; v1 kept as `config-timer.yaml` (kian-72, plan C64) | landed |
+| P6c live validation | The eight-scenario protocol executed live against `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`): scenarios 1, 4, 5, 6, 7, 8 PASS with captured evidence; scenarios 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; gap report G1–G4 filed as cards (kian-73, plan C65; `examples/issue-watch/RUNLOG.md` §7) | executed (with honest negatives) |
+| Wave-C gap fixes | The four RUNLOG §7.2 gaps, all landed: G1 `User-Agent` on every github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode (kian-74); G2 `spawn_topic` accepts the live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing work live (kian-75); G3 outbox park rebuilt at boot and surfaced per-ticket on the stage board (kian-76); G4 exec secret hygiene — shared core redactor + env policy, `env` dumps never persist secrets (kian-77; the round's one cross-bundle-fence commit, filed as its own card) | landed |
 
-Wave split (mirrors P4's structure): **P6a** = zero-new-kind bundle work (stage projection, reason
-vocabularies, speak-rules, follow-up routing); **P6b** = ADR-backed event-shape additions (Mandate
-ADR-012, Thread intake ADR-013, outbox retry); **P6c** = dogfood validation — issue-watch upgraded to
-multi-Ticket subscription fan-out, run live against the prototype's scenarios.
+Wave split, as landed (mirrors P4's structure): **P6a** = zero-new-kind bundle work (stage
+projection, reason vocabularies, speak-rules, follow-up routing — kian-64/65/66/68); **P6b** =
+ADR-backed additive event shapes (Mandate ADR-012, thread intake ADR-013, outbox retry, policy
+versioning — kian-67/69/70/71); **P6c** = dogfood validation — issue-watch v2 (kian-72) run live
+against the prototype's scenarios (kian-73) plus the gap-fix wave it spawned (kian-74–77).
+
+Known deviations, kept visible (the round's honest v1 record): a kian **Ticket v1 = one worker
+session** (one `thread/started`), not the prototype's full resumable lifecycle; **an ended
+ticket resumes via fresh Eval** (release-to-Router, new accept, new mandate), not same-Mandate
+resume; and **the panel is the CLI** (`kian tickets` — the stage board), not a web UI.
 
 ### Deferred (unchanged)
 | Item | Reason |

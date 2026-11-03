@@ -154,6 +154,61 @@ Two labels are used throughout:
   with an observable `[re-arm]` cause input on the successor stream; soft-failed sessions re-open the
   same pinned session. Zero new event kinds; DESIGN §4.6 records the semantics.
 
+## Phase 6 — 2026-11-04 — bundle-domain policy round: ticket semantics, mandate, attention economics — default-green
+
+Round 6 (cards kian-63…kian-78) adopted the dsh-superagent-prototype's domain-policy layer onto
+the bundle. **Zero new event kinds — the durable set stays 20**; every addition is an additive
+payload key on a frozen wrapper, a disposable projection, or a config/template artifact.
+
+- **Ticket stage projection + `kian tickets`** (kian-64): "what is it waiting for" as a pure
+  first-match derived projection over the worker stream + inbox + outbox view
+  (`delivery-retry / awaiting-answer / awaiting-review / blocked-failed / queued / idle /
+  working`), with the additive `state` key on completion-report content; the read-only CLI
+  stage board. Honest v1 shape: a Ticket = one worker session; ended tickets resume via fresh
+  Eval; the panel is the CLI.
+- **Closed decision-reason vocabularies** (kian-65): `reason=<code>` on every drop/admit audit
+  line, per-code metrics counters, and the judge-side `decision:<accept|stop|ignore|unavailable>`
+  tag convention in the default template.
+- **Output-side speak-rules** (kian-66): the whether-to-send gate before output shaping
+  (`superagent.speak_rules`; suppression = honest tool error + audit + counter, no send);
+  `ack-first-only` confirm-once memory rebuilt from the stream.
+- **Thread/Correlation intake projection** ([ADR-013](design/decisions/ADR-013-thread-intake-projection.md),
+  kian-67): config-owned canonical thread keys used as routing topics; stream-derived read
+  positions (lark/GitHub cursors) or honest idempotent re-poll — no position table; correlation
+  adds context, never routes; fan-out grants no authority.
+- **Follow-up ownership routing** (kian-68): registry liveness projection; fan-out admits to
+  live subscribers only; an all-ended topic releases to the Router (`released_to_eval` fresh
+  Eval); `spawn_worker` refuses a live worker's topic naming the owner.
+- **Policy/prompt versioning + drift marking** (kian-69): `[policy <label>]` render header
+  (persisted prompts replay byte-identically), boot-time drift marking that never rewrites live
+  sessions, config-gated one-shot policy-changed marker input.
+- **Delegation Mandate** ([ADR-012](design/decisions/ADR-012-delegation-mandate.md), kian-70,
+  ADR landed): the immutable authority object `{strength, scope, granted_by, source,
+  policy_version}` additive on the frozen delegation wrapper — verbatim in `thread/started`,
+  model-visible as the worker's first message; issued only at `spawn_worker`; revalidated
+  before follow-up routing (stale `inferred` releases to fresh Eval).
+- **Outbox bounded retry** (kian-71 + kian-76): a disposable projection over `tool/call`
+  intent + `channel/delivered` receipt plus a bounded driver (2 s doubling to 60 s, 6 attempts,
+  per-(ticket, conversation) ordering); park is honest — `delivery-retry` stage, named on
+  `kian tickets`, survives reboot; additive `attempt`/`first_attempt_ms` on new receipts.
+- **issue-watch v2 multi-Ticket dogfood + github poll-receive mode** (kian-72): `since`-cursored
+  REST polls beside the untouched webhook surface; one Ticket per live issue on the real repo,
+  composing the whole Wave A/B stack; v1 kept as `config-timer.yaml`.
+- **P6c live validation** (kian-73): the eight-scenario protocol executed live against
+  `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`; `examples/issue-watch/RUNLOG.md`
+  §7): six scenarios PASS live with captured evidence; scenarios 2–3 honest negatives (the
+  structural `spawn_topic` live-spelling gap), every claim cited by session id + seq.
+- **Wave-C gap fixes** (kian-74…77, from the RUNLOG §7.2 gap report): `User-Agent` on every
+  github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode (kian-74); the lenient
+  live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing
+  (kian-75); outbox park rebuilt at boot and surfaced on the stage board (kian-76); exec
+  secret hygiene — shared core `SecretRedactor` + `ExecEnvPolicy`, secrets redacted from
+  `tool/result` before persist (kian-77, HIGH; the round's one cross-bundle-fence commit,
+  filed as its own card off the live gap report).
+- **Acceptance**: the P6c checklist is recorded in the README Phase-6 section (all eight
+  scenarios done — live, or fixture-proven with the live negative root-caused and fixed);
+  the four RUNLOG §7.2 negatives are closed by kian-74…77. S1–S8 unchanged.
+
 ## Gated surfaces — current live-run status
 
 | Surface | Gate | Status |
@@ -162,7 +217,7 @@ Two labels are used throughout:
 | dsh bridge (S6 live leg) | `KIAN_DSH_BIN` | Suite in place; **executed green** 2026-11-02 via the contract-v0 peer (`contrib/dsh-v0-peer/`) against dsh 0.2.1-rc.5 + real `deepseek-chat` — full mapped chain, honest `Settled`. (The 2026-11-01 stock-dsh honest negative is superseded; runbook records both.) |
 | Live provider smoke | `KIAN_API_KEY` | Suite in place; **not executed** — no provider key in the build environment |
 | Live lark channel | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` | Suite in place; **not executed** — no Feishu app credentials in the build environment |
-| GitHub send / webhook | `KIAN_GITHUB_TOKEN` / `KIAN_GITHUB_WEBHOOK_SECRET` | Covered by scripted fixtures, default-green; no live GitHub delivery executed |
+| GitHub send / webhook | `KIAN_GITHUB_TOKEN` / `KIAN_GITHUB_WEBHOOK_SECRET` | Webhook + send covered by scripted fixtures, default-green; **executed live** 2026-11-04 (kian-73, the P6c dogfood — real REST polls and `deliver_structured` triage comments on throwaway issues of `flyer103/kian`, `DRY_RUN=1`); see `examples/issue-watch/RUNLOG.md` §7 |
 
 These are deliberately honest gaps, not silent claims: the fixture-driven suites prove the semantics,
 and the README run logs record each gated surface's real state — the dsh leg with its executed
@@ -183,6 +238,6 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   block) without writing, (id, stage) dedupe across ticks 3–4, and kill + reboot resuming the
   same Router session (epoch 2, seq continued, charter re-submit deduped, tick 5 poll normal).
   Not re-run against the real `kian` board yet — first such run should be recorded here.
-  Owner-gated next steps remain: making the repo public, executing the remaining gated surfaces
-  with real credentials (live provider smoke, live lark channel, GitHub delivery), and any
-  Phase-6 scoping. Tracked on the kanban board, not here.
+  Owner-gated next steps remain: making the repo public and executing the remaining gated
+  surfaces with real credentials (live provider smoke, live lark channel). Tracked on the
+  kanban board, not here.

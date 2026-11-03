@@ -26,7 +26,7 @@ been demonstrated.
 | [docs/overview.md](docs/overview.md) | **Start here** | The problem, the execution model, architecture, crate map, S1–S8 proofs, design-input map |
 | [docs/SPEC.md](docs/SPEC.md) | Spec (WHAT) | Positioning, user interfaces, scope, milestones |
 | [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
-| [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-011: each decision with its alternatives and trade-offs |
+| [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-013 (012 landed, 013 draft): each decision with its alternatives and trade-offs |
 | [the design notes](the design notes) | Research | Structured digest of the five design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live positive via the contract-v0 peer (`contrib/dsh-v0-peer/`), and the C57 stock-dsh contract survey |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Runbook | Operating postgres mode: `KIAN_PG_URL`, `drain.holder`, migrations, the S8 live replay |
@@ -44,10 +44,10 @@ checks that every relative link in `README.md`, `AGENTS.md`, `docs/SPEC.md`, `de
 | Property | Value |
 |----------|-------|
 | Crates | 13 (`cargo build --workspace`) |
-| Tests | 751 at the Phase-4 closeout (more as later cards land regression tests), all default-green with zero credentials (`cargo test --workspace`) |
+| Tests | 949 at the Phase-6 closeout, all default-green with zero credentials (`cargo test --workspace`; more as later cards land regression tests) |
 | Event kinds | 20, append-only (additions only, never renamed) |
-| ADRs | 11 |
-| Acceptance | S1–S5 and S7 default-green; S6 fixture-proven in CI, its live leg executed against dsh 0.2.1-rc.5 with an honest negative (S6-live still open); S8 env-gated (`KIAN_PG_URL`) |
+| ADRs | 13 (ADR-012 landed, ADR-013 draft) |
+| Acceptance | S1–S5 and S7 default-green; S6 live leg green via the contract-v0 peer (`contrib/dsh-v0-peer/`, supersedes the 2026-11-01 honest negative — [run log](#live-dsh-bridge-run-log-manual-env-gated)); S8 env-gated (`KIAN_PG_URL`) |
 
 Phase history, one line each (details in the [phase sections](#phase-1-acceptance-checklist-s1s3)
 below):
@@ -62,6 +62,13 @@ below):
 - **Phase 4 — hosted foundation**: postgres dual backend and multi-replica lease/fencing, the frozen
   wire-only `kian-sdk`, the GitHub channel with a verified webhook receiver, the dsh bridge.
   Scenarios S6, S8.
+- **Phase 5 — live positives + dogfood**: the contract-v0 dsh peer (S6-live green), the
+  issue-watch dogfood, wire dialect v2, resident Router re-arm.
+- **Phase 6 — bundle-domain policy round**: the Ticket stage board (`kian tickets`) and closed
+  reason vocabularies, output-side speak-rules, follow-up ownership (P6a); the delegation Mandate
+  (ADR-012), thread-intake projection (ADR-013), outbox bounded retry, policy versioning (P6b);
+  issue-watch v2 multi-Ticket dogfood validated live with its gap-fix wave (P6c). Zero new event
+  kinds.
 
 ## Quickstart
 
@@ -865,7 +872,7 @@ Default CI needs none of these — every gated suite **skips with a log line, ne
 |---------|---------|-----------------|
 | `KIAN_PG_URL` | `kian-store`/`kian-exec` pg suites, `kian-cli` `postgres_serve`/`postgres_s8` | skip with a log line |
 | `KIAN_DSH_BIN` | the dsh live smoke; also the default command source for a configured `superagent.harness.dsh` | smoke skips; a mounted harness without `command` or the env var refuses to start (fail-closed) |
-| `KIAN_GITHUB_TOKEN` | github channel **send** | `send: true` configured → refuses to start (receive-only needs none) |
+| `KIAN_GITHUB_TOKEN` | github channel send, and the poll channel's REST reads when present (public repos poll tokenless) | `send: true` configured → refuses to start (receive-only/poll needs none) |
 | `KIAN_GITHUB_WEBHOOK_SECRET` | webhook receiver HMAC verification | a `type: github` channel mounts the route → refuses to start |
 | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` / `KIAN_LARK_CHAT_ID` / `KIAN_LARK_POLL_CHAT` | lark live smoke | skip |
 | `KIAN_API_KEY` | live-provider smoke | skip |
@@ -1049,6 +1056,168 @@ Scenario wording lives in [SPEC §2.5](docs/SPEC.md); proof is by the named test
 | Postgres export parity (S7 shape across backends) | C50 | done (env-gated) | `kian-store/tests/postgres.rs` — byte-identical JSONL export vs a sqlite store seeded with the same stream |
 
 Phase-4 final four-gate run (card C55 closeout, 2026-11-01): `cargo build --workspace`,
-`cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --all --
---check` — all green with the gated env vars absent (postgres/dsh/github suites skip with log
+`cargo test --workspace`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --all -- --check`
+— all green with the gated env vars absent (postgres/dsh/github suites skip with log
 lines); recorded per-card in the kanban handoffs.
+
+## Phase 5 (live positives + dogfood + field fixes)
+
+Round 5 (kian-59…kian-62) turned Phase-4's honest negatives into live positives and found two
+real bugs doing it — the record is [SPEC §5 Phase 5](docs/SPEC.md) and the
+[CHANGELOG](CHANGELOG.md); the operator surfaces live here:
+
+- **S6 live positive** — `contrib/dsh-v0-peer/` (zero-dep Node) adapts stock
+  `dsh --profile sdk` onto the frozen ADR-010 contract v0; the live smoke ran green against
+  real `deepseek-chat` (full mapped chain, honest `Settled`). Details:
+  [docs/runbook-dsh.md](docs/runbook-dsh.md) and the
+  [run log](#live-dsh-bridge-run-log-manual-env-gated) above.
+- **issue-watch dogfood v1** — the timer-driven original (kept as `config-timer.yaml`), with
+  its kill -9 reboot demo; evidence `examples/issue-watch/RUNLOG.md` §1–§6.
+- **Wire dialect v2** (breaking, found live via DeepSeek HTTP 400/422) and **Router re-arm**
+  (a frozen resident revives on reboot) — semantics in [DESIGN](design/DESIGN.md) §4.6.
+- **kanban-watch** — the second dogfood (a local Hermes Kanban board): the
+  [run log](#kanban-watch-dogfood-run-log-manual-local) above.
+
+## Phase 6 (bundle-domain policy round: ticket semantics, mandate, attention economics)
+
+Round 6 (cards kian-63…kian-78, plan `round6-plan.md`) adopted the domain-policy layer of the
+dsh-superagent-prototype (the frozen fifth design input) onto kian's bundle substrate:
+**zero new event kinds — the durable set stays 20**; every addition is an additive payload key
+on a frozen wrapper, a disposable projection, or a config/template artifact. Semantics live in
+[DESIGN §4.7](design/DESIGN.md); the landed record with card references is
+[SPEC §5 Phase 6](docs/SPEC.md). The waves: **P6a** zero-new-kind bundle policy (stage board,
+reason vocabularies, speak-rules, follow-up ownership — kian-64/65/66/68), **P6b** ADR-backed
+additive shapes (Mandate ADR-012, thread intake ADR-013, outbox retry, policy versioning —
+kian-67/69/70/71), **P6c** the dogfood (issue-watch v2 run live, kian-72/73, plus the gap-fix
+wave kian-74–77 it filed). Everything below is config-first under the additive `superagent:`
+section; every omitted block preserves the previous round's behavior byte-identically.
+
+### The stage board: `kian tickets`
+
+```bash
+kian tickets --config kian.yaml          # or --json
+```
+
+A read-only view (no server needed) of every worker session as a **Ticket** with its derived
+stage — the pure first-match projection over the worker's own stream plus its pending inbox and
+outbox view: `delivery-retry` (a delivery parked after bounded retries; the conversation is
+named per ticket), `awaiting-answer` (latest structured report `waiting`, nothing since),
+`awaiting-review` (report `ready`), `blocked-failed` (a failed end, until a person writes),
+`queued` (admitted, not yet claimed), `idle` (completed), `working`. Structured facts only —
+"waiting on a person" is a report field, never prose inference. Honest v1 shape, kept visible:
+**a Ticket v1 is one worker session; an ended ticket resumes via fresh Eval (release to the
+Router, new accept, new Mandate), not same-Mandate resume — and the panel is this CLI.**
+
+### Speak-rules: output-side attention economics
+
+```yaml
+superagent:
+  speak_rules:
+    - {channel: issue-github, when: result-ready}   # speak only the result, once
+```
+
+The closed condition vocabulary is `always | ack-first-only | decision-needed | result-ready |
+never`; the rule matches per channel before any output shaping (`ImPolicy`/`StructuredPolicy`
+still shape what passes), on the Router's `reply` (a decision) and `deliver_structured` (a
+result) tool paths. A suppressed send is an **honest tool error naming the rule and condition**
+(the model sees it and reacts), plus an audit line and a per-condition counter — and no send
+means no `channel/delivered`. `ack-first-only` confirm-once memory (`SpeakTracker`) is rebuilt
+from the Router's own stream at boot, so first-acks survive restarts. Absent table = every send
+passes, byte-identically.
+
+### Mandate: the delegation authority object ([ADR-012](design/decisions/ADR-012-delegation-mandate.md))
+
+```yaml
+superagent:
+  mandate:
+    scopes:
+      worker: "draft a triage comment for the issue; never post unless DRY_RUN=0"
+```
+
+Every delegation wrapper may carry an additive `mandate` object
+`{strength, scope, granted_by, source, policy_version}`: **immutable**, carried verbatim in
+`thread/started`'s task payload (durable and audit-visible forever) and model-visible as the
+worker's first message. `spawn_worker` is the single issuance point; `strength` is `explicit`
+only for an adapter-declared signal (never text-derived consent). Before a follow-up admits to
+a live worker, the Mandate is revalidated: `explicit` passes; `inferred` passes only while its
+`policy_version` matches the current pointer — a stale one releases the topic to fresh Eval
+(`released_to_eval`). Absent config = no mandate, byte-identical wrappers.
+
+### Outbox: bounded retry for deliveries
+
+```yaml
+superagent:
+  outbox: {max_attempts: 6, backoff_cap_ms: 60000}
+```
+
+The outbox is a **disposable projection over existing events** — a `tool/call` send intent
+paired with its `channel/delivered` receipt — plus a bounded in-process driver: no new durable
+state. Failures retry at 2 s doubling to the cap (default 6 attempts), ordered per
+`(ticket, conversation)` so a later message to the same conversation waits and everything else
+never does. After the last attempt the delivery is **parked honestly**: the ticket's stage
+becomes `delivery-retry`, the conversation is named on `kian tickets`, an audit line and counter
+record it, and a parked delivery survives reboot waiting for a person. New receipts carry
+additive `attempt`/`first_attempt_ms`; legacy receipts parse unchanged. Absent config = off =
+a single attempt, byte-identically.
+
+### Policy versioning + drift marking
+
+```yaml
+superagent:
+  policy: {version: "2026-11-04.1", notify_live: false}
+```
+
+The configured label rides the **rendered** bootstrap prompt as a `[policy <label>]` header —
+template text is untouched and persisted prompts replay byte-identically, so the version is
+derivable from the stream. At boot, a drift between the live resident sessions' persisted
+headers and the configured label is marked with an audit line and the `superagent.policy_drift`
+counter — **live sessions are never rewritten**; only the next bootstrap renders the new header.
+With `notify_live: true`, each affected session additionally receives exactly one
+synthetic-marked, strippable marker input (`[policy <old>→<new>] defaults updated; …`),
+idempotent by a stable event id.
+
+### issue-watch v2: the multi-Ticket dogfood
+
+The dogfood example now demonstrates the whole stack on one real source — a GitHub **poll
+channel** (`since`-cursored REST reads beside the untouched webhook surface) feeding one Ticket
+per live issue on the real `flyer103/kian` repo: thread-keyed topics, Mandate-bounded triagers,
+follow-ups owned by the live Executor, one-shot deliveries through speak-rules and the outbox,
+and `kian tickets` as the live stage board. Config, scripts and the fault-injecting proxy
+(`flaky-proxy.py` now also fails delivery-leg requests: `FAIL_PATH`/`FAIL_N`):
+[examples/issue-watch/README.md](examples/issue-watch/README.md); the live evidence (all eight
+validation scenarios, honestly marked) is [RUNLOG §7](examples/issue-watch/RUNLOG.md). The v1
+timer-driven shape is kept as `config-timer.yaml`.
+
+The dogfood's environment contract (live leg only — nothing here runs in CI):
+
+| Env var | Used by | Absent behavior |
+|---------|---------|-----------------|
+| `DEEPSEEK_API_KEY` | issue-watch model turns (real DeepSeek round trips) | `run.sh` refuses to start (checked, never logged) |
+| `KIAN_GITHUB_TOKEN` | the poll + send halves (`run.sh` falls back to `gh auth token`) | `send: true` → refuses to start; public-repo polls run tokenless |
+| `DRY_RUN` | the worker posting gate | defaults to `1` — drafts land in the audit stream only; `DRY_RUN=0` is the only way a triager posts |
+
+### Phase-6 acceptance checklist (plan round-6 §6 — the P6c validation protocol)
+
+Scenario wording is the plan's §6 table (not S1–S8, which are unchanged); live evidence cites
+[RUNLOG §7](examples/issue-watch/RUNLOG.md), fixture proof the named CI suites.
+
+| # | Scenario | Status | Proof |
+|---|----------|--------|-------|
+| 1 | New issue → Eval accept → Ticket + Mandate | **done — live** | RUNLOG §7.1-1: Router judge turn → `spawn_worker` → worker `thread/started` carrying the mandate verbatim (worker `fe52a9c4…` seq 4) |
+| 2 | Follow-up on a live issue → Executor owns it (zero Router judge turns) | **done — fixture-proven; live negative at kian-73, root-caused and fixed** | `crates/kian-superagent/tests/issue_watch_fanout.rs` (zero-judge-turn assertion); RUNLOG §7.1-2 + §7.2 G2 (the `spawn_topic` live-spelling gap); fix `bd93985` (kian-75) with `tests/mandate.rs` live-spelling coverage |
+| 3 | Follow-up after the worker ended → fresh Eval (`released_to_eval`) | **done — fixture-proven; live negative at kian-73, same root cause, fixed** | `crates/kian-superagent/tests/followup_ownership.rs` (release-to-eval arm); RUNLOG §7.1-3 + §7.2 G2; fix `bd93985` (kian-75) |
+| 4 | Speak-rules: confirm once, speak on result only | **done — live (partial)** | RUNLOG §7.1-4: each draft delivered exactly once (`attempt:1` receipts, zero intermediate deliveries); the suppressed-send sub-item honestly marked not-reached (the Router never attempted an echo) |
+| 5 | Stage board honesty | **done — live** | RUNLOG §7.1-5: `kian tickets --json` at ≥3 moments matching stream facts, replay-stable; the documented arm-5 `queued`-on-completed projection gap confirmed live |
+| 6 | Delivery failure → bounded retry → parked honestly | **done — live** | RUNLOG §7.1-6: retry schedule 2/4 s observed with `attempt:3` receipt; full 6-attempt park twice, no unbounded loop; the two surfacing negatives fixed by `56a6c27` (kian-76) |
+| 7 | kill -9 reboot mid-ticket | **done — live** | RUNLOG §7.1-7: same session resumed (epoch 2), poll cursor derived from the admitted tail, replayed events `deduplicated`, no duplicate `thread/started` |
+| 8 | Decision reasons + policy drift visible | **done — live** | RUNLOG §7.1-8: `reason=` codes on every audit line + counters; drift marked (counter 1), exactly one marker input, live prompt byte-identical across reboots |
+
+The four RUNLOG §7.2 negatives (G1–G4) are **closed**: G1 `82eb3bf` (kian-74, User-Agent),
+G2 `bd93985` (kian-75, live spawn spellings), G3 `56a6c27` (kian-76, park rebuild + surfacing),
+G4 `0a56f96` (kian-77, exec secret hygiene — secrets redacted from `tool/result` before
+persist). The live leg was not re-executed after the fixes; the fixtures and the new
+gap-fix suites are the proof they close.
+
+Phase-6 final four-gate run (card C66 closeout, kian-78, 2026-11-04): `cargo build
+--workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check` — all green (docs-only closeout; recorded in the kanban handoff).

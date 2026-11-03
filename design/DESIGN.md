@@ -791,8 +791,10 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
 The Phase-6 round (plan round-6, SPEC §5 P6a/P6b/P6c) lands the *domain-policy* layer of the
 dsh-superagent-prototype onto the bundle substrate: ticket semantics, mandate, attention
 economics and dogfood validation — additions-only, zero new event kinds, everything a
-disposable projection, a persisted-bytes marker, or a template/config artifact. Each card notes
-its slice here (the C66 closeout reconciles the whole section).
+disposable projection, a persisted-bytes marker, or a template/config artifact. Each card noted
+its slice here as it landed; this is the reconciled whole-section record (closeout C66 / kian-78
+— including the Wave-C gap fixes kian-74…77, which post-dated the per-card notes below and are
+recorded in the closing bullets).
 
 - **Closed decision-reason vocabularies (C57, kian-65)** — the panel's "Decision reasons from a
   closed vocabulary" (reference 005) in kian's shape: the closed `IntakeReason` code set
@@ -808,7 +810,9 @@ its slice here (the C66 closeout reconciles the whole section).
   first-match stage table) as a **pure derived projection** (`kian-superagent` `stage.rs`):
   a kian Ticket v1 = one delegated worker session (one `thread/started`), and its stage is
   `project_stage(worker_stream, pending_inbox, outbox_view)` — first match wins over
-  `delivery-retry` (outbox view pending/parked; stub-empty until C62 wires it), `awaiting-answer`
+  `delivery-retry` (outbox view pending/parked; the stub was empty only until C62/kian-71
+  wired the real `ThreadOutboxView`, and kian-76 made a parked intent survive reboot and
+  surface per-ticket), `awaiting-answer`
   (latest structured report `waiting`, thread outstanding, no input since), `awaiting-review`
   (latest `ready`), `blocked-failed` (failed thread/session end, no input since — a message
   releases it), `queued` (input admitted, no claim since), `idle` (success/terminal-completed),
@@ -934,7 +938,14 @@ its slice here (the C66 closeout reconciles the whole section).
   mandate object) always pass — pre-C60 authority is never retroactively narrowed. The
   worker template doc restates the mandate as prompt text (`templates.rs`
   `WORKER_PROMPT_TEMPLATE`/`worker_mandate_line`) — restatement is documentation, never
-  widening. Normative record: **ADR-012**.
+  widening. Normative record: **ADR-012**. kian-75 follow-up (RUNLOG §7.2 G2): live, the
+  model serializes the wrapper as a JSON *string* in `task` plus a bare-string `correlation`,
+  and the C60 issuance path only read the strict object forms — live spawns degraded to
+  `inferred` with `source: {channel: "router"}` despite the adapter-declared `explicit: true`.
+  `provenance.rs` now feeds `spawn_topic` and the mandate builder the same lenient reading
+  (`parse_channel_marker_lenient` + `correlation_topic`, the one derivation in
+  `registry.rs`), so the explicit signal and the wrapper's channel/topic survive the live
+  spellings.
 - **Outbox bounded retry (C62, kian-71)** — stored work for the **write side** (reference
   003: "outgoing messages are stored and sent as stored work, retried with backoff …
   a message waits while an earlier one of the same Ticket to the same conversation has not
@@ -966,7 +977,13 @@ its slice here (the C66 closeout reconciles the whole section).
   carry additive `attempt`/`first_attempt_ms` (the C39 marker precedent; C4/C18 frozen,
   legacy receipts parse unchanged). Config `superagent.outbox` (absent = off =
   byte-identical single attempt); at-least-once duplicates under concurrent tickets are
-  the documented bound (the plan's risk-4 note). Full placement note: §4.2 outbox
+  the documented bound (the plan's risk-4 note). kian-76 follow-up (RUNLOG §7.2 G3): the
+  boot rebuild now parses the live `ToolError`-wrapped park shape (react.rs renders parks
+  as tool errors — the original rebuild matched only the bare prefix), and a live intent's
+  ticket key resolves through both the thread's admitted wrappers and its registry topics,
+  so a parked delivery survives reboot (visible in the rebuild's `pending`/`parked` counts)
+  and surfaces per-ticket on `kian tickets`; a parked delivery still waits for a person —
+  the boot states it, never re-drives it. Full placement note: §4.2 outbox
   paragraph.
 - **Issue-watch multi-Ticket fan-out (C64, kian-72)** — the P6c dogfood shape: `github.rs`
   gains an optional **poll-receive mode beside the (untouched) C49 webhook surface** —
@@ -986,7 +1003,45 @@ its slice here (the C66 closeout reconciles the whole section).
   Eval, drafts deliver once under speak-rules (C58) retrying through the outbox (C62),
   `kian tickets` shows the live stage board (C56) — fixture-proven in CI
   (`tests/github_channel.rs` poll suites, `tests/issue_watch_fanout.rs` end-to-end),
-  no default-CI network; live-repo evidence is C65.
+  no default-CI network; live-repo evidence: RUNLOG §7 (C65, kian-73). kian-74 follow-up
+  (RUNLOG §7.2 G1): every github/lark reqwest client now stamps a
+  `User-Agent: kian/<version>` — api.github.com answers UA-less requests with 403 + HTML
+  that hides the status in the error chain, which the scripted fixture pages can never
+  show — and `flaky-proxy.py` gained the path-scoped delivery-leg fault mode
+  (`FAIL_N`/`FAIL_PATH`) so the retry/park arms reproduce with shipped tooling.
+- **P6c live run (C65, kian-73)** — the plan's eight-scenario validation protocol executed
+  live against the real `flyer103/kian` repo (2026-11-04, four scratch stores, real
+  DeepSeek round trips, real GitHub REST traffic, `DRY_RUN=1` throughout; every claim cited
+  by session id + seq or a captured log line — `examples/issue-watch/RUNLOG.md` §7):
+  scenarios 1 (Eval accept → Ticket + Mandate), 4 (speak-rules: deliver-once, one
+  sub-item not-reached and honestly marked), 5 (stage board honesty, including the
+  arm-5 `queued`-on-completed projection gap confirmed live exactly as documented),
+  6 (bounded retry with `attempt:3` observed, and the full 6-attempt park schedule),
+  7 (kill -9 reboot: poll cursor derived from the admitted tail, replayed events
+  `deduplicated`), and 8 (`reason=` codes + policy drift with exactly one marker input,
+  live prompt byte-identical across reboots) **PASS live**; scenarios 2–3 (follow-up to a
+  live/ended Executor) were **honest negatives** — structurally unreachable live (the
+  `spawn_topic` spelling gap, G2), exercised only by the C64 fixtures at that moment, with
+  the incidental positives the run did show (the Router honestly re-judged echo comments
+  and dispatched nothing) recorded beside them. The gap report (§7.2, the kian-60
+  precedent) filed G1–G4 as cards kian-74…77 — all landed, below.
+- **Wave-C gap fixes (kian-74…77, from the C65 gap report)** — the round's live-validation
+  loop closing on itself: G1 the `User-Agent` stamp + flaky-proxy delivery-leg mode
+  (kian-74); G2 the lenient live spawn spellings — live topic binding, mandate
+  strength/source, and outbox ticket aliasing all work live (kian-75, noted in the C59/C60/
+  C62 bullets above); G3 the boot-time outbox-park rebuild + stage-board surfacing
+  (kian-76, noted in the C62 bullet); G4 **exec secret hygiene** (kian-77, HIGH): a worker
+  that ran `bash -c env` wrote the live GitHub token and DeepSeek key verbatim into
+  `tool/result` and every later `step/request` — kian-77 lands the shared `kian-core`
+  secrets module (`SecretRedactor` — exact configured-secret values, K/V patterns, known
+  token shapes; `ExecEnvPolicy` — inherit default, allowlist mode, fail-closed), built once
+  at assembly from every secret name `kian.yaml` itself names, redacting before persist on
+  both the exec backend and the local tool surface. **This is the round's one commit that
+  crosses the plan's bundle fence** (`kian-core`/`kian-exec`/`kian-loop`/`kian-cli`): it
+  landed as its own filed card off the live gap report — the fence rule's stop-and-report
+  path, never a silent widening — and is recorded here exactly because §4.7 otherwise
+  describes only bundle-layer work. Zero new event kinds throughout; the durable set
+  stays 20 for the whole round.
 
 ## 5. Control-plane protocol (P5 protocolized)
 

@@ -17,8 +17,8 @@ It runs on **real infrastructure only**: the real github poll channel,
 the real `gh` CLI inside workers, and a real model round trip through
 the DeepSeek API. No mocks, no scripted providers — those live in the
 CI fixture suites (`crates/kian-superagent/tests/github_channel.rs`,
-`tests/issue_watch_fanout.rs`); the live-run evidence itself is the next
-card (C65, [RUNLOG.md](RUNLOG.md)).
+`tests/issue_watch_fanout.rs`); the live-run evidence is RUNLOG §7, executed
+2026-11-04 (kian-73): [RUNLOG.md](RUNLOG.md).
 
 The timer-driven v1 shape (one-shot ticks → poll worker → diff → draft
 worker) is kept verbatim as `config-timer.yaml` — run `kian serve
@@ -225,7 +225,7 @@ the new dialect.
   included — from ever reaching the child (opt-in; `inherit` stays the
   default for compatibility). Blast radius beyond that (filesystem
   reach of the exec user) is a deployment concern, not a harness one.
-- **Known fixture-observed gap (for the C65 live run)**: the C56 stage
+- **Known fixture-observed gap (confirmed by the C65 live run)**: the C56 stage
   table's arm 5 reads `queued` whenever the consuming drain appends
   `input/admitted` after its own `drain/claimed` — on real engine
   streams that is every consumed input, so an ended ticket can project
@@ -242,6 +242,6 @@ the new dialect.
 | `run.sh` | boot `kian serve`, resolve the github token, idempotent charter submit, inspection cheat sheet |
 | `demo-restart.sh` | the kill -9 / reboot / resume demo with printed proof |
 | `flaky-proxy.py` | the fault-injecting proxy: kills the Nth router-judge stream (`KILL_ON`) and/or fails the first `FAIL_N` `FAIL_METHOD` requests matching `FAIL_PATH` with 502 (`FAIL_PATH=/comments FAIL_N=2` reproduces the C65 scenario-6 delivery-leg retry; a high `FAIL_N` the park arm) — kian-74 |
-| `RUNLOG.md` | the recorded live runs (append-only; v2 evidence lands with C65) |
+| `RUNLOG.md` | the recorded live runs (append-only; v2 evidence: §7, kian-73) |
 
 The live-run evidence itself: [RUNLOG.md](RUNLOG.md).
