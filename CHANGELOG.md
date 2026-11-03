@@ -170,6 +170,19 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
 
 ## Unreleased
 
-Nothing queued. The next owner-gated steps are: making the repo public, executing the remaining
-gated surfaces with real credentials (live provider smoke, live lark channel, GitHub delivery), and
-any Phase-6 scoping. Tracked on the kanban board, not here.
+- **Second dogfood example** (`examples/kanban-watch/`, 2026-11-03): kian watching a local
+  Hermes Kanban board — TimerChannel ticks → Router delegates a poll worker
+  (`hermes kanban --board <board> list --json`) → stuck tasks (closed stage vocabulary:
+  stalled-running / blocked-needs-input / review-idle / failure-loop) → one stage worker per
+  (task, stage) that re-verifies via `show --json` and, in live mode (`DRY_RUN=0`) only, pushes
+  the task forward (`reclaim` / `unblock` / `comment`, all carrying the `kanban-watch:` marker;
+  dry-run by default). Model provider: the local vadis gateway (OpenAI-compatible,
+  `127.0.0.1:8290`) — no external API key. Zero new event kinds. Proven live against a
+  throwaway test board: precise stuck classification (a healthy running task not flagged, a
+  blocked task flagged `blocked-needs-input`), stage worker judging needs-human (non-mechanical
+  block) without writing, (id, stage) dedupe across ticks 3–4, and kill + reboot resuming the
+  same Router session (epoch 2, seq continued, charter re-submit deduped, tick 5 poll normal).
+  Not re-run against the real `kian` board yet — first such run should be recorded here.
+  Owner-gated next steps remain: making the repo public, executing the remaining gated surfaces
+  with real credentials (live provider smoke, live lark channel, GitHub delivery), and any
+  Phase-6 scoping. Tracked on the kanban board, not here.

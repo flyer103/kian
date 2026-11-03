@@ -472,6 +472,27 @@ complete, kill-9 takeover continuation, and honest child-crash failure
   [contrib/dsh-v0-peer/README.md](contrib/dsh-v0-peer/README.md) and
   [docs/runbook-dsh.md](docs/runbook-dsh.md). **S6-live positive closed.**
 
+## kanban-watch dogfood run log (manual, local)
+
+The second dogfood (`examples/kanban-watch/`) runs entirely on local infrastructure: the model
+provider is the local vadis gateway (`127.0.0.1:8290`, OpenAI-compatible — no external key), and
+the watched system is a local Hermes Kanban board via the `hermes kanban` CLI. Default is
+dry-run; board writes (`reclaim`/`unblock`/`comment`) additionally require `DRY_RUN=0` and are
+logged `tool/call`+`tool/result` pairs.
+
+- **2026-11-03**: *executed* against a throwaway test board (`kbwatch-test`, two tasks). Five
+  timer ticks through the resident Router (`00000000-…-c101`), real vadis model turns
+  (`coding-fast`), zero new event kinds. Observed: baseline poll recorded; tick 2 poll flagged
+  exactly the blocked task (`blocked-needs-input`) while a concurrently running, heartbeating
+  task stayed unflagged (the stalled-running rule's negative case); the dispatched stage worker
+  re-verified via `show --json`, judged the block non-mechanical → `needs-human`, drafted only
+  (dry-run honored, no board write); ticks 3–4 re-polled and the Router correctly refused to
+  re-dispatch the same (task, stage) pair citing the stage report already in its stream; kill +
+  reboot resumed the same Router session (epoch 2, seq continued to 93, charter re-submit
+  deduped by idempotency key, tick 5 poll normal). The real `kian` board run is still pending —
+  record it here when executed. Test board archived after the run.
+
+
 ## Ablation benchmark: passthrough vs. Router judgment (§7.1, C42)
 
 A deterministic, CI-safe replication of the article's §7.1 ablation on kian's own bundle
