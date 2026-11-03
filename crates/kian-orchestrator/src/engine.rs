@@ -2507,15 +2507,17 @@ mod tests {
         adv_stop.store(true, Ordering::Relaxed);
         advancer.await.unwrap();
         let frozen_now = clock.now_ms();
-        assert!(wait_for(5_000, || async {
-            store
-                .expired_leases(frozen_now)
-                .await
-                .unwrap()
-                .iter()
-                .any(|l| l.session == control)
-        })
-        .await);
+        assert!(
+            wait_for(5_000, || async {
+                store
+                    .expired_leases(frozen_now)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.session == control)
+            })
+            .await
+        );
 
         let now = clock.now_ms();
         let expired = store.expired_leases(now).await.unwrap();
