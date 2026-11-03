@@ -594,6 +594,28 @@ deliver-or-discard discipline). `ack-first-only` keys its confirm-once memory in
 events rebuilt from the stream at boot, so "first ack only" survives restarts; absent
 table = every send passes, byte-identical.
 
+Composed after the gate (and after the shaping policies), the **outbox bounded retry**
+(C62, `superagent.outbox` — absent = one attempt, the honest adapter error,
+byte-identical) wraps the send itself: `OutboxDriver::deliver_with_retry` re-executes the
+same policy-shaped `ChannelDelivery` bytes with backoff `2s·2^(n-1)` cap 60s, at most
+`max_attempts` (default 6) total, serialized per `(ticket, conversation)` — a later message
+of the same key waits for the earlier one (its ack precedes its result); other tickets and
+other conversations never wait (003's channel-failure rules). The ticket is the optional
+`correlation` tool argument (the `spawn_worker` vocabulary — thread id or topic; absent ⇒
+the Router session itself), the conversation is `(channel, speak_key(target))` — the C58
+canonicalization reused. An exhausted delivery **parks honestly**: an `outbox park:`
+tool error (a stable-text prefix, the C57 vocabulary discipline — the rebuild's
+disambiguator between parked and speak-suppressed), an audit line, an `OutboxMetrics`
+counter, the C56 `delivery-retry` stage arm (the outbox view is real), and the parked
+conversation named on `kian tickets` — never a silent swallow, never an unbounded loop.
+New receipts carry additive `attempt`/`first_attempt_ms` keys (legacy receipts parse
+unchanged). The outbox itself is a **disposable projection** over `tool/call` (intent,
+log-before-execute) + `tool/result` (call_id pairing) + `channel/delivered` (receipt):
+rebuild classifies each intent — no result ⇒ pending (a kill -9 mid-retry; the boot
+re-drive re-sends it, at-least-once), park-prefixed error ⇒ parked (visible, terminal for
+the driver — a person releases), other error ⇒ suppressed/invalid/legacy (never re-driven),
+receipt/ok ⇒ delivered. No durable outbox state exists anywhere.
+
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
 | Any channel (C58) | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |
@@ -913,6 +935,39 @@ its slice here (the C66 closeout reconciles the whole section).
   worker template doc restates the mandate as prompt text (`templates.rs`
   `WORKER_PROMPT_TEMPLATE`/`worker_mandate_line`) — restatement is documentation, never
   widening. Normative record: **ADR-012**.
+- **Outbox bounded retry (C62, kian-71)** — stored work for the **write side** (reference
+  003: "outgoing messages are stored and sent as stored work, retried with backoff …
+  a message waits while an earlier one of the same Ticket to the same conversation has not
+  gone out, until that one … shows as a problem") landed after the card's Step-1
+  **delivery-kind reuse audit** — none of the three existing retry surfaces is reusable
+  (lark's adapter-internal auth refresh-and-retry is transport-bound; the loop's model
+  backoff retries provider turns, not sends; `subscriptions.rs` leaves a failed admit to
+  the *adapter's* idempotent re-delivery — the read side has a re-sender, the write side
+  had none), and the stream already carries intent + receipt, so the outbox is a
+  **disposable projection plus a bounded driver** — no new durable state, no new kinds,
+  no ADR (`kian-superagent` `outbox.rs`). Identity: ticket = the optional `correlation`
+  argument on `reply`/`deliver_structured` (the only ticket identity that survives a
+  restart rebuild without new durable state; absent ⇒ the Router session), conversation =
+  `(channel, speak_key(target))` (the C58 key reused). Ordering per `(ticket,
+  conversation)` via a fair per-key mutex held across one `deliver_with_retry` — a later
+  message of the same key waits, everything else never waits. Backoff `2s·2^(n-1)` cap
+  60s, `max_attempts` 6 (clock-injected; `ManualRetryClock` records the sleep schedule —
+  the `ManualTurnClock` discipline). **Parked honestly**: `outbox park:` tool error (a
+  stable-text prefix — the rebuild's disambiguator between parked and speak-suppressed,
+  which leave identical `tool/call` + error-`tool/result` shapes), audit line,
+  `OutboxMetrics` counter, the C56 `delivery-retry` stage arm (C62 wires the real
+  `ThreadOutboxView` — kian-64's stub exemption), the parked conversation named on
+  `kian tickets`. Restart: `outbox_pending(router_stream)` classifies each intent —
+  result-less ⇒ pending (kill -9 mid-retry; the boot re-drive re-sends, at-least-once,
+  and the receipt it writes satisfies the intent on the *next* rebuild — the receipt pass
+  exists exactly so a re-driven intent never re-drives forever), park-prefixed ⇒ parked
+  (never re-driven — a person releases, 003), other error ⇒ suppressed/invalid/legacy
+  (never re-driven — re-driving would duplicate honestly-not-made sends). New receipts
+  carry additive `attempt`/`first_attempt_ms` (the C39 marker precedent; C4/C18 frozen,
+  legacy receipts parse unchanged). Config `superagent.outbox` (absent = off =
+  byte-identical single attempt); at-least-once duplicates under concurrent tickets are
+  the documented bound (the plan's risk-4 note). Full placement note: §4.2 outbox
+  paragraph.
 
 ## 5. Control-plane protocol (P5 protocolized)
 
