@@ -880,6 +880,39 @@ its slice here (the C66 closeout reconciles the whole section).
   the park). The version is replayable: it lives in persisted bootstrap prompts and marker
   inputs — derivable from the stream, no `policy/version` kind (rejected: the persisted
   prompt is the record).
+- **Delegation mandate (C60, kian-70, ADR-012)** — the authority object separating *what to
+  do* (task) from *with what authority* (Mandate; references 001/002) lands as an
+  **additive `"mandate"` object on the C18-frozen delegation wrapper** (the C39
+  `speculative`-marker mechanism applied to an object — zero new event kinds, `Delegation`
+  stays its frozen shape, a companion parser `delegation_mandate` reads the key, legacy
+  wrappers parse with `None`): `{strength: explicit|inferred, scope, granted_by, source
+  {channel, topic}, policy_version, matched_rules?}`. **Immutable** — carried verbatim
+  inside `thread/started`'s task payload (durable + audit-visible forever on both sides of
+  the delegation pair) and model-visible as the worker's first message (the wrapper *is*
+  that message); a wider scope is a new Ticket, never a mutation. **Issuance**:
+  `spawn_worker` is the single issuance point (`router.rs` `build_mandate` over
+  `superagent.mandate` config — per-worker-template scope texts `scopes`/`default_scope`,
+  fail-closed non-blank), built from the triggering input's provenance wrapper under the
+  C43 untrusted discipline: `strength` is `explicit` **only** for the adapter-declared
+  `explicit: true` payload field (never text-derived consent), `granted_by` is the sender
+  provenance verbatim (honestly `null` for sender-less machine events; the Router session
+  for non-channel spawns), `source` is the wrapper's channel/topic, and `policy_version`
+  stamps the current C63 pointer. Config absent = no mandate, byte-identical wrappers.
+  Speculative delegations carry mandates too (the C39/C60 markers compose — weak signal,
+  bounded authority). **Revalidation** (composed with the C59 live routing, additive to
+  its frozen semantics): before a follow-up admits to a live subscriber, the registry's
+  mandate projection (`register_mandate` at spawn, strictly after the lineage write;
+  re-derived by `rebuild` from `thread/started` task payloads — disposable, restart-safe)
+  is revalidated (`worker.rs` `revalidate_mandate`, pure): `explicit` passes;
+  `inferred` passes while its `policy_version` equals the current pointer (the same
+  configured label the bootstrap renders — assembly wires one pointer to both surfaces);
+  a stale `inferred` mandate drops the worker from the admission set with an honest
+  per-worker audit line, and a set emptied by releases falls back to the Router — the
+  same `released_to_eval` release-to-fresh-eval as the all-ended path. Legacy workers (no
+  mandate object) always pass — pre-C60 authority is never retroactively narrowed. The
+  worker template doc restates the mandate as prompt text (`templates.rs`
+  `WORKER_PROMPT_TEMPLATE`/`worker_mandate_line`) — restatement is documentation, never
+  widening. Normative record: **ADR-012**.
 
 ## 5. Control-plane protocol (P5 protocolized)
 
