@@ -521,6 +521,23 @@ graph TB
   speculation simply never calls `reply` (no `channel/delivered`), while the speculative worker's
   own stream still audits every token spent — honest by construction. Per-session budgets (A5)
   are untouched; the cap is the Router-profile speculation budget.
+- **Thread/Correlation intake projection** (C61, kian-67, ADR-013 draft): the additive
+  `superagent.intake.thread_keys: [{channel, key: [group?, <payload-field>…]}]` config derives the
+  canonical thread key `<channel>:<group>#<key>` at adapter mapping time — deterministic and
+  collision-free by construction (reserved characters percent-encoded per component), and
+  **config-owned**: a config change is a new key, old streams keep their topics (cache-stable, no
+  rewrite). After derivation the key *is* a routing topic — the subscription rule matcher gains no
+  correlation concept and is unchanged. The **source read position** (a restart must not replay)
+  is derived from the last admitted event's payload cursor fields per source kind (lark
+  `message_id` offsets; GitHub REST `since` timestamps, `updated_at`); where a source exposes no
+  derivable cursor the honest v1 bound is idempotent re-poll under the existing `event_id`
+  idempotency — `deduplicated` admissions, zero duplicate rows, **no position table** (rejected as
+  pre-event durable state outside the event log). **Correlation adds context, never routes**: the
+  derived key surfaces in the C33 Inline `neighbors` block (`thread_key`, an association id for
+  recall hops through the C35 toolpack). Normative, with ADR-012: **fan-out grants no authority**
+  — a fanned-out message reaches live subscribed tickets as context bounded by their Mandates, and
+  no admission check runs on it (001's rejected-concepts rows, kept); one trigger fanning out to
+  many tickets is the C38 fan-out mechanics restated under the authority rule.
 - **Closed decision-reason vocabulary** (C57, reference 005): every intake decision — the three
   drop shapes, the empty-set fallback, every admitted row — stamps a machine-stable
   `reason=<code>` into its audit line, and the assembly's subscription-metrics snapshot counts
@@ -548,10 +565,19 @@ policy-shaped content); the adapter delivers what it is given. Policy code lives
 bundle (`kian-superagent`), never in a channel adapter and never in the core. Every
 successful send is followed by a `channel/delivered` event; a policy rejection (e.g. a
 structured payload missing a section) is an honest error to the loop — never a silent
-send.
+send. Composing **before** the shaping policies is the output-side speak-gate (C58,
+`superagent.speak_rules`): a *whether-to-send* decision over the closed condition
+vocabulary `always | ack-first-only | decision-needed | result-ready | never` — a
+suppressed send is an honest tool error naming the rule and condition (the model sees it
+and reacts), an audit line + counter, and no send ⇒ no `channel/delivered` (the C39
+deliver-or-discard discipline). `ack-first-only` keys its confirm-once memory in
+`SpeakTracker`, a **disposable projection** over the Router's own `channel/delivered`
+events rebuilt from the stream at boot, so "first ack only" survives restarts; absent
+table = every send passes, byte-identical.
 
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
+| Any channel (C58) | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |
 | IM | ≤100-word hard rule; only direct questions / short conclusions; notify only when a decision or acceptance is needed |
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
 | GitHub (adapter, C48) | the second *real* adapter beside lark, the S4 "group-chat message + CI events" family (`issues`/`issue_comment`/`pull_request`/`push`/`check_run`/`status`): receive is webhook-shaped deliveries verified by the C49 receiver surface (HMAC precedes parsing) and handed to the adapter, which maps each delivery to one provenance-carrying `ChannelEvent` (delivery id → `event_id` idempotency, repo → `group`, `owner/repo` or an exact `owner/repo#N` key → `topic` from the config table — the table is the receive allowlist —, verbatim sender, adapter-declared `explicit` on @-mentions in human text); send is PR review comment / issue comment / PR description via the REST API, resolving only on 2xx + id acceptance, structured content rendered as markdown sections; token env-only (`KIAN_GITHUB_TOKEN`, fail-closed when send is configured; receive needs none); the channel is untrusted by default (C43) |
@@ -753,6 +779,40 @@ its slice here (the C66 closeout reconciles the whole section).
   uuid-ascending board). Known v1 deviation, recorded honestly: **Ticket v1 = one worker
   session; an ended ticket resumes only via fresh Eval, not same-Mandate resume** (C59's
   release path is the follow-up).
+- **Output-side speak-rules (C58, kian-66)** — attention economics on the send path
+  (reference 000: "speak only when a person must act or can use a result; confirm once,
+  stay quiet while working"): the output-policy table (§4.2) gains the
+  **whether-to-send gate**, `superagent.speak_rules: [{channel, when, per_topic_ack}]`
+  over the closed condition vocabulary `always | ack-first-only | decision-needed |
+  result-ready | never` (`policy.rs`: `SpeakRule`/`SpeakCondition`/`SpeakPolicy::check`,
+  pure). The gate composes **before** `ImPolicy`/`StructuredPolicy` shaping on the
+  Router's `reply`/`deliver_structured` tool paths; the send kind is derived from the
+  tool (reply = decision, deliver_structured = result), never model-declared. A
+  suppressed send is an **honest tool error** naming the rule and condition (the model
+  sees it and reacts), an audit line + per-condition counter (`SpeakMetrics`), and no
+  send ⇒ no `channel/delivered` (the C39 deliver-or-discard discipline — there is no
+  event kind for "did not happen"). The `ack-first-only` confirm-once memory is
+  `SpeakTracker`: a **disposable projection** over the Router's own `channel/delivered`
+  events keyed `(channel, target)`, rebuilt from the stream at boot, so first-ack-only
+  survives restarts (constraint 1). Absent table = every send passes, byte-identical
+  (zero sanctioned test edits). Full placement note: §4.2 speak-gate paragraph + table
+  row.
+- **Thread/Correlation intake projection (C61, kian-67)** — reference 001's Source/Thread/
+  Correlation rows as **derived projections** (`kian-superagent` `intake.rs`, bundle-only —
+  pure functions over `ChannelEvent`s and admitted stream events, no store type named): the
+  config-owned canonical thread key `<channel>:<group>#<key>` (deterministic, collision-free by
+  construction via per-component percent-encoding of the reserved characters; a config change is
+  a new key, old streams keep their topics — cache-stable), the stream-derived source read
+  position (lark `message_id` offsets; GitHub REST `since` timestamps via the pure adapter
+  cursor helpers `github::payload_since_cursor` / `lark::payload_message_cursor`), and the
+  honest v1 bound where no cursor derives: idempotent re-poll under `event_id` dedupe —
+  `deduplicated` admissions, zero duplicate rows, **no position table and no
+  `intake/positioned` kind** (both rejected, ADR-013). Correlation is context only: the key
+  surfaces in the C33 Inline `neighbors` block for recall hops and never routes (the
+  subscription rule matcher is unchanged). Normative companion recorded in the same ADR and
+  §4.1: **fan-out grants no authority; bounded by Mandate (ADR-012)** — no admission check runs
+  on a fanned-out message. Full placement note: §4.1 bullet "Thread/Correlation intake
+  projection".
 
 ## 5. Control-plane protocol (P5 protocolized)
 
