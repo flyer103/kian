@@ -177,6 +177,13 @@ expiry — a liveness observation overlaid from the expired-lease query) and `ar
 action) are table edges with no v0 event trigger; later event kinds may drive them
 (additions-only).
 
+C56 note (read-side only, no state-machine change): the **Ticket stage** (`delivery-retry →
+awaiting-answer → awaiting-review → blocked-failed → queued → idle → working`, first match
+wins) is a *disposable projection over worker streams* (§4.7) — like `recoverable`, it is an
+overlay computed at read time, never a session state and never persisted; the one durable fact
+it reads beyond existing events is the additive `"state"` key on completion-report content
+(§4.7, additions-only).
+
 ### 2.3 Admit → Wake → Drain → Promote
 
 ```mermaid
@@ -514,6 +521,25 @@ graph TB
   speculation simply never calls `reply` (no `channel/delivered`), while the speculative worker's
   own stream still audits every token spent — honest by construction. Per-session budgets (A5)
   are untouched; the cap is the Router-profile speculation budget.
+- **Closed decision-reason vocabulary** (C57, reference 005): every intake decision — the three
+  drop shapes, the empty-set fallback, every admitted row — stamps a machine-stable
+  `reason=<code>` into its audit line, and the assembly's subscription-metrics snapshot counts
+  per code (`by_reason`, every code of the closed set materialized). The closed
+  `IntakeReason` set is `no_rule | class_ignored | not_explicit | admitted_router |
+  admitted_passthrough | deduplicated | released_to_eval` (the last is reserved for the
+  follow-up-ownership release rule, C59); a deduplicated admission reports `deduplicated` (the
+  row already existed — no new decision was spent), a `Route::Session` fixed target reports
+  `admitted_passthrough` (the shared "no judge turn spent" code — the closed set has no
+  per-route variant). The codes ride **audit lines + counters only**: `RoutingOutcome`'s shape
+  is frozen (no ripple), consumers match the enum (never a string parse upstream), and zero new
+  event kinds exist — the durable trace of a Router decision stays the existing
+  `tool/call`/`thread/started`/`channel/delivered` triple. The *judge-side* convention is a
+  template sentence (the soft half): the Router is instructed to tag each batch decision in its
+  reply text as exactly one of `decision:accept`, `decision:stop`, `decision:ignore`,
+  `decision:unavailable` (the closed `DecisionKind` set) — model-visible convention, not a
+  parsed contract; template discipline per the C43 note pattern (new sessions render the new
+  default, persisted prompts replay byte-identically; the template constant lives in
+  `templates.rs` beside the other template artifacts, re-exported under its historical path).
 
 ### 4.2 Channel bandwidth matching (output policy)
 
@@ -692,6 +718,41 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
   boundary — observable, not hidden). Known interaction: with the lifetime iteration budget
   unchanged, a resident Router will chain successors at every budget exhaustion; moving the
   budget to per-episode for resident loops is a follow-up (tracked), not a contract change here.
+
+### 4.7 Bundle domain-policy layer (Phase-6 seed)
+
+The Phase-6 round (plan round-6, SPEC §5 P6a/P6b/P6c) lands the *domain-policy* layer of the
+dsh-superagent-prototype onto the bundle substrate: ticket semantics, mandate, attention
+economics and dogfood validation — additions-only, zero new event kinds, everything a
+disposable projection, a persisted-bytes marker, or a template/config artifact. Each card notes
+its slice here (the C66 closeout reconciles the whole section).
+
+- **Closed decision-reason vocabularies (C57, kian-65)** — the panel's "Decision reasons from a
+  closed vocabulary" (reference 005) in kian's shape: the closed `IntakeReason` code set
+  stamped as `reason=<code>` on every drop/admit audit line of the subscription service and
+  counted per code in the assembly metrics snapshot (`by_reason`, stable series shape), plus
+  the judge-side `DecisionKind` decision-tag convention (`decision:<accept|stop|ignore|
+  unavailable>`) rendered into the default judge-prompt template. Codes ride audit + metrics,
+  never the `RoutingOutcome` enum; the durable trace of a Router decision stays the existing
+  `tool/call`/`thread/started`/`channel/delivered` triple; `released_to_eval` is defined now
+  and produced only by the follow-up-ownership release rule (C59). Full placement note: §4.1
+  bullet "Closed decision-reason vocabulary".
+- **Ticket stage projection (C56, kian-64)** — "what is it waiting for" (reference 003's
+  first-match stage table) as a **pure derived projection** (`kian-superagent` `stage.rs`):
+  a kian Ticket v1 = one delegated worker session (one `thread/started`), and its stage is
+  `project_stage(worker_stream, pending_inbox, outbox_view)` — first match wins over
+  `delivery-retry` (outbox view pending/parked; stub-empty until C62 wires it), `awaiting-answer`
+  (latest structured report `waiting`, thread outstanding, no input since), `awaiting-review`
+  (latest `ready`), `blocked-failed` (failed thread/session end, no input since — a message
+  releases it), `queued` (input admitted, no claim since), `idle` (success/terminal-completed),
+  `working` (else). Structured facts only (001: "waiting on a person" is a structured field,
+  never prose inference): the report state rides the **additive** `"state"` key on
+  completion-report content (`thread_report_content_stated`; legacy reports parse with
+  `state: None`, byte-identical). Persisting a stage would make a disposable projection
+  authoritative — rejected. Read surface: `kian tickets [--db] [--json]` (read-only embedded,
+  uuid-ascending board). Known v1 deviation, recorded honestly: **Ticket v1 = one worker
+  session; an ended ticket resumes only via fresh Eval, not same-Mandate resume** (C59's
+  release path is the follow-up).
 
 ## 5. Control-plane protocol (P5 protocolized)
 
