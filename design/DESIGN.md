@@ -477,6 +477,24 @@ graph TB
   subscriber), so workers sharing a topic observe each other's events and self-resolve conflicts
   without peer links — the Router stays the cross-task rendezvous, and only an empty set falls
   back to it.
+- **Follow-up ownership** (C59, kian-68, reference 002): a person's follow-up belongs to the
+  **live** Ticket's Executor. The registry (C38's `topic → subscriber set`) gains a **liveness
+  projection**: every worker is `live` or `ended`, derived from `thread/completed` /
+  `session/ended` on the *worker's own* stream (a Router-side end marks nothing) — a disposable
+  projection exactly like the topic sets, so a rebuild from streams equals the runtime
+  `register`/`mark_ended` map. Fan-out admits to **live subscribers only** (the historical set is
+  kept — a worker that served a topic stays bound to it in the record); an **all-ended** topic is
+  the *release to fresh evaluation* (002's Ticket-end rule): the event falls back to the Router
+  with the closed `released_to_eval` reason code, the release audit line naming the topic. The
+  tool-surface half of the rule: while a live Executor owns a topic the Router may only **stop**
+  it (the control-plane interrupt — untouched), never requeue — `spawn_worker` whose task is the
+  channel-event wrapper of an owned topic (the same derivation the registry rebuild uses), or
+  whose correlation carries `{"topic": …}`, is refused with an honest tool error naming the owner
+  session ("follow-up owned by live executor"); a successful channel spawn registers the new
+  worker as the topic's live owner (durable lineage first — `thread/started` — then the
+  projection). Config: `superagent.followup_ownership` (default **on**); `false` restores the
+  pre-C59 behavior on both surfaces. Runtime ended-transitions are honest-v1 bounded: the boot
+  rebuild re-derives them from streams, and `mark_worker_ended` is the runtime seam.
 - **Two-level filtering** (article §3.1, C36): the *Fast Path* is an admission taxonomy over
   provenance — a config-level `classes:` table keys `(channel, topic?, sender?)` to
   `candidate | explicit-only | ignore` with most-specific-wins resolution, evaluated in code
@@ -543,8 +561,9 @@ graph TB
   `reason=<code>` into its audit line, and the assembly's subscription-metrics snapshot counts
   per code (`by_reason`, every code of the closed set materialized). The closed
   `IntakeReason` set is `no_rule | class_ignored | not_explicit | admitted_router |
-  admitted_passthrough | deduplicated | released_to_eval` (the last is reserved for the
-  follow-up-ownership release rule, C59); a deduplicated admission reports `deduplicated` (the
+  admitted_passthrough | deduplicated | released_to_eval` (the last is produced only by the
+  follow-up-ownership release rule, C59 — see the "Follow-up ownership" bullet); a
+  deduplicated admission reports `deduplicated` (the
   row already existed — no new decision was spent), a `Route::Session` fixed target reports
   `admitted_passthrough` (the shared "no judge turn spent" code — the closed set has no
   per-route variant). The codes ride **audit lines + counters only**: `RoutingOutcome`'s shape
@@ -797,6 +816,31 @@ its slice here (the C66 closeout reconciles the whole section).
   survives restarts (constraint 1). Absent table = every send passes, byte-identical
   (zero sanctioned test edits). Full placement note: §4.2 speak-gate paragraph + table
   row.
+- **Follow-up ownership routing (C59, kian-68)** — reference 002's rule ("a person's
+  follow-up belongs to the live Ticket's Executor; the Router may only stop") landed as
+  policy over the existing C38 fan-out, zero new event kinds: (1) `registry.rs` gains the
+  worker-status projection (`WorkerStatus::Live | Ended`, from `thread/completed` +
+  `session/ended` on worker streams — never a Router-side end) with
+  `resolve_live(topic)` / `live_owner(topic)` beside the historical `resolve`; a rebuild
+  from a mixed live/ended stream equals the runtime `register`/`mark_ended` map (the
+  projection is disposable, constraint 1); (2) `subscriptions.rs` admits fan-out rows to
+  **live subscribers only** — an all-ended topic falls back to the Router as the
+  **release to fresh evaluation** (002's Ticket-end rule), audited with
+  `reason=released_to_eval` (the C57 reserved code's producing path — audit lines name
+  the released topic; the `by_reason` counter of the release stays a known v1 bound, the
+  assembly counts the resulting Router admit through the shared `routed_reason`
+  mapping); (3) `router.rs` enforces the rule at the tool surface: `spawn_worker` with a
+  topic correlation (task-as-channel-wrapper, the registry rebuild's own derivation, or
+  an explicit `{"topic": …}` correlation) that a **live** worker already owns is refused
+  before any side effect with an honest error naming the owner session — no thread id,
+  no row, no `thread/started`; a successful channel spawn then registers the new worker
+  as the topic's live owner (lineage first, projection second); stopping stays available
+  (control-plane interrupt — untouched, that *is* the Router-may-only-stop rule in
+  kian's vocabulary). Config `superagent.followup_ownership` default **on**; `false`
+  restores the pre-C59 behavior on both surfaces (every existing suite stays green
+  unmodified — the sanctioned `tests/fanout_audit.rs` edit set resolved to zero: all its
+  fixtures register live subscribers). Full placement note: §4.1 bullet
+  "Follow-up ownership".
 - **Thread/Correlation intake projection (C61, kian-67)** — reference 001's Source/Thread/
   Correlation rows as **derived projections** (`kian-superagent` `intake.rs`, bundle-only —
   pure functions over `ChannelEvent`s and admitted stream events, no store type named): the
