@@ -71,6 +71,8 @@ use crate::policy::{
     ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
     im_delivered_payload, speak_key, structured_delivered_payload,
 };
+use crate::provenance::parse_channel_marker;
+use crate::registry::PassthroughRegistry;
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
     PortFor, SpawnError, StreamPort, WorkerSpawner, delegation_is_speculative, parse_thread_report,
@@ -167,6 +169,14 @@ pub struct RouterProfile {
     /// default, and what an absent config section produces) admits
     /// every send — byte-identical to the pre-C58 behavior.
     pub speak: SpeakPolicy,
+    /// C59 follow-up ownership (`superagent.followup_ownership`,
+    /// default **on**): while a live Executor owns a topic, the Router
+    /// may only stop it — `spawn_worker` with that topic correlation is
+    /// refused at the tool with an honest error naming the owner
+    /// session, and the spawned worker is registered as the topic's
+    /// live owner. `false` restores the pre-C59 behavior (no refusal,
+    /// no registration).
+    pub followup_ownership: bool,
     /// kian-62 re-arm: the ended, frozen predecessors of `session`
     /// (empty = generation 0, the configured pinned session itself).
     /// Assembly fills it from the boot-time chain walk; the bootstrap
@@ -187,6 +197,7 @@ impl RouterProfile {
             structured: StructuredPolicy::default(),
             speculation: None,
             speak: SpeakPolicy::default(),
+            followup_ownership: true,
             re_arm: Vec::new(),
         }
     }
@@ -406,6 +417,14 @@ pub struct RouterTools {
     speak_tracker: Arc<Mutex<Option<SpeakTracker>>>,
     /// C58: suppression counters (audit-visible, snapshot-stable).
     speak_metrics: Arc<SpeakMetrics>,
+    /// C59: the follow-up-ownership gate (`superagent.followup_ownership`,
+    /// default on — mirrored from the profile).
+    followup_ownership: bool,
+    /// C59: the shared passthrough registry — the same projection the
+    /// subscription service fans out through. `None` (tests, or
+    /// assembly without the wiring) means no ownership check and no
+    /// registration: `spawn_worker` behaves exactly as before.
+    followup_registry: Option<Arc<std::sync::RwLock<PassthroughRegistry>>>,
     hold: Arc<RouterHold>,
 }
 
@@ -426,8 +445,23 @@ impl RouterTools {
             speak: profile.speak.clone(),
             speak_tracker: Arc::new(Mutex::new(None)),
             speak_metrics: SpeakMetrics::shared(),
+            followup_ownership: profile.followup_ownership,
+            followup_registry: None,
             hold,
         }
+    }
+
+    /// Shares the passthrough registry with the tool surface (C59
+    /// assembly wiring): the `spawn_worker` ownership check and the
+    /// fan-out path then read one projection — the same handle the
+    /// subscription service holds.
+    #[must_use]
+    pub fn with_followup_registry(
+        mut self,
+        registry: Arc<std::sync::RwLock<PassthroughRegistry>>,
+    ) -> Self {
+        self.followup_registry = Some(registry);
+        self
     }
 
     /// The speak-gate's suppression counters (C58) — the assembly's
@@ -567,6 +601,43 @@ impl RouterTools {
             .get("speculative")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // C59: follow-up ownership — the topic correlation of this
+        // spawn, derived exactly the way the registry rebuild derives
+        // topic bindings (the channel-event wrapper the Router judged),
+        // or an explicit `{"topic": …}` correlation object. `None`
+        // (the common non-channel spawn) skips the check with no
+        // registry read — byte-identical to the pre-C59 path.
+        let ownership_topic = if self.followup_ownership {
+            spawn_topic(&task, correlation.as_ref())
+        } else {
+            None
+        };
+        // While a live Executor owns the topic the Router may only
+        // stop (the control-plane interrupt — untouched here): the
+        // requeue is refused at the tool, before any side effect — no
+        // thread id is minted, no row lands, no lineage event is
+        // written — and the refusal is an honest error the Router
+        // model sees and reacts to (never silence).
+        if let Some(topic) = &ownership_topic
+            && let Some(registry) = &self.followup_registry
+            && let Some(owner) = registry
+                .read()
+                .expect("followup registry lock")
+                .live_owner(topic)
+        {
+            tracing::info!(
+                target: "kian::router",
+                topic = %topic,
+                owner = %owner.0,
+                "follow-up ownership audit: spawn refused, topic owned by a live executor"
+            );
+            return Err(ToolError::Execution(format!(
+                "spawn refused: follow-up owned by live executor — topic `{topic}` is owned by \
+                 live worker session {}; while it is live the Router may only stop it \
+                 (interrupt), not requeue",
+                owner.0
+            )));
+        }
         // C39: speculative spawns are budgeted by the Router profile.
         // The cap check happens strictly before the admit — no thread
         // id is minted, no row lands — and every refusal is an honest
@@ -619,6 +690,19 @@ impl RouterTools {
         if speculative {
             output["speculative"] = json!(true);
             debug_assert!(delegation_is_speculative(&spawned.task_message["content"]));
+        }
+        // C59: the spawned worker is now the topic's live Executor.
+        // Registration strictly after the durable lineage (`thread/started`)
+        // — the projection never runs ahead of the log — and it is the
+        // runtime half of the ownership the next duplicate spawn (or a
+        // follow-up event's fan-out) resolves through.
+        if let Some(topic) = &ownership_topic
+            && let Some(registry) = &self.followup_registry
+        {
+            registry
+                .write()
+                .expect("followup registry lock")
+                .register(topic.clone(), spawned.worker_session);
         }
         Ok(ToolResult {
             call_id: call.id,
@@ -735,6 +819,26 @@ fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, ToolEr
         .ok_or_else(|| ToolError::InvalidCall(format!("{tool} requires a string `{key}`")))
 }
 
+/// The topic correlation of a `spawn_worker` call (C59): the topic of
+/// the channel-event wrapper the Router judged — read off the task the
+/// same way the registry rebuild derives topic bindings from
+/// `thread/started` task content (the task itself may *be* the wrapper,
+/// or a message payload whose `content` is) — or, failing that, an
+/// explicit `{"topic": "…"}` correlation object. `None` for every
+/// non-channel spawn (the common case): no ownership attaches.
+fn spawn_topic(task: &Value, correlation: Option<&Value>) -> Option<String> {
+    let marker_topic = parse_channel_marker(task)
+        .or_else(|| task.get("content").and_then(parse_channel_marker))
+        .and_then(|marker| marker.topic);
+    marker_topic.or_else(|| {
+        correlation
+            .and_then(|c| c.get("topic"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    })
+}
+
 impl ToolProvider for RouterTools {
     fn schemas(&self) -> Vec<ToolSchema> {
         vec![
@@ -818,6 +922,8 @@ impl Clone for RouterTools {
             speak: self.speak.clone(),
             speak_tracker: Arc::clone(&self.speak_tracker),
             speak_metrics: Arc::clone(&self.speak_metrics),
+            followup_ownership: self.followup_ownership,
+            followup_registry: self.followup_registry.clone(),
             hold: Arc::clone(&self.hold),
         }
     }
@@ -1795,6 +1901,230 @@ mod tests {
         assert!(
             mock.deliveries().is_empty(),
             "rejected payload is never sent"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // C59: follow-up ownership at the tool surface
+    // -----------------------------------------------------------------
+
+    fn channel_task(topic: &str) -> serde_json::Value {
+        // The task the Router passes when dispatching on a channel
+        // event: the channel-event wrapper itself (the same shape the
+        // registry rebuild derives topic bindings from).
+        crate::provenance::wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-spawn".into(),
+            topic: Some(topic.into()),
+            sender: None,
+            group: None,
+            payload: json!({"build": "failed"}),
+            ts_ms: 1,
+        })
+    }
+
+    fn ownership_tools(
+        registry: Arc<std::sync::RwLock<crate::registry::PassthroughRegistry>>,
+        enabled: bool,
+    ) -> (
+        Arc<RouterTools>,
+        Arc<RouterHold>,
+        Arc<ScriptedInbox>,
+        Arc<RecordingPort>,
+    ) {
+        let router = sid(10);
+        let inbox: Arc<ScriptedInbox> = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let spawner = Arc::new(WorkerSpawner::new(
+            router,
+            &worker_template("mock", "mock-worker", 7),
+            inbox.clone() as Arc<dyn InboxWriter>,
+        ));
+        let mut channels = ChannelRegistry::new();
+        channels.register(
+            "mock-im",
+            Arc::new(MockChannel::new("mock-im")) as Arc<dyn ChannelAdapter>,
+        );
+        let hold = RouterHold::shared();
+        let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+        profile.followup_ownership = enabled;
+        let tools = Arc::new(
+            RouterTools::new(spawner, channels, &profile, hold.clone())
+                .with_followup_registry(registry),
+        );
+        let (rec, dyn_port) = RecordingPort::shared(router);
+        hold.install(dyn_port);
+        (tools, hold, inbox, rec)
+    }
+
+    /// The tool-surface enforcement (002's "requeue refused at the
+    /// tool"): a `spawn_worker` whose topic correlation a **live**
+    /// worker already owns is refused with an honest error naming the
+    /// owner session — and nothing happens: no inbox row, no
+    /// `thread/started`, no wake.
+    #[tokio::test]
+    async fn spawn_worker_refuses_a_topic_owned_by_a_live_executor() {
+        let owner = sid(21);
+        let registry = Arc::new(std::sync::RwLock::new({
+            let mut r = crate::registry::PassthroughRegistry::new();
+            r.register("pr-9", owner);
+            r
+        }));
+        let (tools, _hold, inbox, rec) = ownership_tools(registry.clone(), true);
+
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": channel_task("pr-9")}),
+            ))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("follow-up owned by live executor"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains(&owner.0.to_string()),
+            "the refusal names the owner session: {text}"
+        );
+        assert!(
+            text.contains("only stop"),
+            "the refusal states the Router-may-only-stop rule: {text}"
+        );
+        // Spawns nothing: no admit, no thread/started.
+        assert!(inbox.admits.lock().unwrap().is_empty());
+        assert!(
+            rec.emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(kind, _)| *kind != EventKind::ThreadStarted)
+        );
+        // The registry is untouched by the refusal.
+        assert_eq!(
+            registry.read().unwrap().live_owner("pr-9"),
+            Some(owner),
+            "the live owner keeps the topic"
+        );
+    }
+
+    /// The release path: once the owner's stream ended, the same spawn
+    /// succeeds (fresh Eval), the new worker becomes the live owner,
+    /// and a *second* duplicate spawn is refused naming the new owner.
+    #[tokio::test]
+    async fn ended_owner_releases_the_topic_and_the_new_worker_takes_it() {
+        let owner = sid(22);
+        let registry = Arc::new(std::sync::RwLock::new({
+            let mut r = crate::registry::PassthroughRegistry::new();
+            r.register("pr-9", owner);
+            r.mark_ended(owner);
+            r
+        }));
+        let (tools, _hold, inbox, rec) = ownership_tools(registry.clone(), true);
+
+        let result = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": channel_task("pr-9")}),
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        let new_worker = uuid::Uuid::parse_str(result.output["worker"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            inbox.admits.lock().unwrap().len(),
+            1,
+            "exactly one worker row was admitted"
+        );
+        assert!(
+            rec.emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, _)| *kind == EventKind::ThreadStarted)
+        );
+        // The spawned worker is registered as the topic's live owner.
+        assert_eq!(
+            registry.read().unwrap().live_owner("pr-9"),
+            Some(SessionId(new_worker)),
+            "the new worker owns the topic now"
+        );
+
+        // Duplicate spawn: refused, naming the NEW owner.
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": channel_task("pr-9")}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("follow-up owned by live executor"));
+        assert!(err.to_string().contains(&new_worker.to_string()));
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1, "still one row");
+    }
+
+    /// `superagent.followup_ownership: false` restores today's
+    /// behavior: the duplicate spawn goes through (and registers
+    /// nothing).
+    #[tokio::test]
+    async fn ownership_off_restores_the_ungated_spawn() {
+        let owner = sid(23);
+        let registry = Arc::new(std::sync::RwLock::new({
+            let mut r = crate::registry::PassthroughRegistry::new();
+            r.register("pr-9", owner);
+            r
+        }));
+        let (tools, _hold, inbox, _rec) = ownership_tools(registry.clone(), false);
+        let result = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": channel_task("pr-9")}),
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1);
+        assert_eq!(
+            registry.read().unwrap().resolve("pr-9"),
+            std::collections::BTreeSet::from([owner]),
+            "no registration happened while off"
+        );
+    }
+
+    /// The topic-correlation derivation (`spawn_topic`): the channel
+    /// wrapper as task, a message payload wrapping it, an explicit
+    /// `{"topic": …}` correlation object — and `None` for every
+    /// ordinary non-channel task (no ownership attaches).
+    #[test]
+    fn spawn_topic_derivation_covers_the_channel_and_correlation_forms() {
+        let wrapper = channel_task("pr-9");
+        assert_eq!(
+            super::spawn_topic(&wrapper, None),
+            Some("pr-9".to_string()),
+            "the task is the channel wrapper"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!({"role": "user", "content": wrapper}), None),
+            Some("pr-9".to_string()),
+            "the task is a message payload over the wrapper"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), Some(&json!({"topic": "pr-10"}))),
+            Some("pr-10".to_string()),
+            "an explicit correlation object carries the topic"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), Some(&json!("evt-1"))),
+            None,
+            "an opaque correlation token attaches no ownership"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), None),
+            None,
+            "an ordinary spawn attaches no ownership"
         );
     }
 
