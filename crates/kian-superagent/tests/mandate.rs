@@ -437,6 +437,90 @@ async fn spawn_worker_stamps_strength_from_the_provenance_signal() {
 }
 
 // ---------------------------------------------------------------------------
+// kian-75 — the LIVE spawn spelling (RUNLOG §7.2 gap G2)
+// ---------------------------------------------------------------------------
+
+/// `spawn_worker` exactly as the live model calls it: the schema types
+/// `task` as a STRING, so the channel wrapper rides as serialized JSON
+/// text and `correlation` is a bare topic-token string. The spawn must
+/// bind the topic (C59 registration — the gap that left every live
+/// ticket `topic:null`), stamp the mandate strength from the
+/// adapter-declared `explicit` signal (not `inferred`), attribute the
+/// mandate source to the triggering channel/topic (not `router`/null),
+/// and the registry rebuild over the emitted streams must equal the
+/// runtime registration (one derivation, two readers).
+#[tokio::test]
+async fn live_string_task_and_correlation_bind_the_topic_and_attribute_the_mandate() {
+    let _ = logs();
+    let registry = Arc::new(std::sync::RwLock::new(PassthroughRegistry::new()));
+    let (tools, _inbox, port) = mandate_tools(
+        Some(mandate_policy()),
+        Arc::clone(&registry) as Arc<std::sync::RwLock<PassthroughRegistry>>,
+    );
+    let wrapper = channel_task("evt-live", "github:acme/repo#9", true);
+    let call = ToolCall {
+        id: "call-live".into(),
+        name: "spawn_worker".into(),
+        arguments: json!({
+            "task": wrapper.to_string(),
+            "correlation": "issue-github:acme/repo#9",
+        }),
+    };
+    let result = tools.invoke(call).await.unwrap();
+    assert!(!result.is_error);
+    let worker = SessionId(
+        uuid::Uuid::parse_str(result.output["worker"].as_str().expect("worker id")).expect("uuid"),
+    );
+
+    // The topic binds: the spawned worker is the live Executor of the
+    // wrapper's topic (the marker's topic wins over the token).
+    assert_eq!(
+        registry.read().unwrap().live_owner("github:acme/repo#9"),
+        Some(worker),
+        "the live string spelling must register the worker on the topic"
+    );
+
+    // The mandate stamps strength from the adapter-declared signal and
+    // attributes the triggering channel/topic.
+    let started = port
+        .events()
+        .into_iter()
+        .find(|ev| ev.kind == EventKind::ThreadStarted)
+        .expect("router-side thread/started");
+    let mandate = delegation_mandate(&started.bytes["task"]["content"])
+        .expect("the delegation wrapper carries the mandate")
+        .clone();
+    assert_eq!(mandate["strength"], json!("explicit"));
+    assert_eq!(
+        mandate["source"],
+        json!({"channel": "github", "topic": "github:acme/repo#9"})
+    );
+    assert_eq!(
+        mandate["granted_by"],
+        json!({"login": "reporter", "type": "User"}),
+        "sender provenance verbatim off the string form"
+    );
+
+    // One derivation, two readers: the rebuild over the Router's
+    // emitted stream plus the worker's own stream equals the runtime
+    // registration — the projection survives a restart.
+    let mut events = port.events();
+    let worker_events = worker_stream(worker, &events);
+    events.extend(worker_events);
+    let rebuilt = PassthroughRegistry::rebuild(&events);
+    assert_eq!(
+        rebuilt.resolve_live("github:acme/repo#9"),
+        std::collections::BTreeSet::from([worker]),
+        "the rebuild re-derives the topic binding from the streams"
+    );
+    assert_eq!(
+        rebuilt.mandate_of(&worker),
+        Some(&mandate),
+        "the rebuild re-derives the mandate verbatim"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Gate 3 — durable + model-visible: the delegation-pair audit
 // ---------------------------------------------------------------------------
 

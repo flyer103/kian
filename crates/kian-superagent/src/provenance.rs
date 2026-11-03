@@ -239,6 +239,40 @@ pub fn parse_channel_marker(content: &Value) -> Option<ChannelEventMarker> {
     })
 }
 
+/// The live-spelling companion of [`parse_channel_marker`]
+/// (kian-75/RUNLOG §7.2 G2): the `spawn_worker` tool schema types
+/// `task` as a **string**, so the model naturally passes the wrapper
+/// *serialized as JSON text*. A string is parsed as JSON (one level —
+/// a plain non-JSON string is not a wrapper and is never misread) and
+/// the marker is read off the result; every other shape reads exactly
+/// like [`parse_channel_marker`].
+pub fn parse_channel_marker_lenient(content: &Value) -> Option<ChannelEventMarker> {
+    match content {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| parse_channel_marker(&parsed)),
+        _ => parse_channel_marker(content),
+    }
+}
+
+/// The topic token of a `spawn_worker` correlation argument (C59,
+/// kian-75): `{"topic": "…"}` — the explicit object spelling — or a
+/// bare **non-empty string**, the live spelling (the model passes the
+/// ticket correlation, e.g. `"issue-github:owner/repo#3"`, as a plain
+/// string). Every other shape attaches no topic: empty strings, null,
+/// non-string scalars, and objects without a non-empty string `topic`.
+pub fn correlation_topic(correlation: &Value) -> Option<String> {
+    match correlation {
+        Value::String(token) if !token.is_empty() => Some(token.clone()),
+        Value::Object(_) => correlation
+            .get("topic")
+            .and_then(Value::as_str)
+            .filter(|topic| !topic.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -305,6 +339,68 @@ mod tests {
         assert!(parse_channel_marker(&serde_json::Value::Null).is_none());
         // A kian object of a different type is not a channel event.
         assert!(parse_channel_marker(&json!({"kian": {"type": "other"}})).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // kian-75: the live string spellings
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn lenient_parse_reads_the_string_serialized_wrapper() {
+        // The live `spawn_worker` spelling: the tool schema types `task`
+        // as a STRING, so the model passes the wrapper serialized as
+        // JSON text. The lenient parse recovers the exact marker the
+        // object form yields.
+        let payload = channel_input_payload(&event());
+        let expected = parse_channel_marker(&payload).expect("object form parses");
+        let string_form = json!(payload.to_string());
+        assert_eq!(
+            super::parse_channel_marker_lenient(&string_form),
+            Some(expected),
+            "the string-serialized wrapper carries the same marker"
+        );
+        // The object form reads exactly like the strict parse.
+        assert_eq!(
+            super::parse_channel_marker_lenient(&payload),
+            parse_channel_marker(&payload)
+        );
+    }
+
+    #[test]
+    fn lenient_parse_never_misreads_plain_or_non_wrapper_strings() {
+        // Plain prose is not JSON — never a wrapper.
+        assert!(super::parse_channel_marker_lenient(&json!("plain task")).is_none());
+        // JSON, but not a channel-event wrapper.
+        assert!(super::parse_channel_marker_lenient(&json!("\"quoted text\"")).is_none());
+        assert!(super::parse_channel_marker_lenient(&json!("42")).is_none());
+        assert!(
+            super::parse_channel_marker_lenient(&json!(r#"{"text": "hi"}"#.to_string())).is_none()
+        );
+        assert!(super::parse_channel_marker_lenient(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn correlation_topic_accepts_the_bare_token_and_object_spellings() {
+        // The live spelling: a bare non-empty string is a topic token
+        // (the model passes the ticket correlation verbatim).
+        assert_eq!(
+            super::correlation_topic(&json!("issue-github:flyer103/kian#3")),
+            Some("issue-github:flyer103/kian#3".to_string())
+        );
+        // The explicit object spelling keeps working.
+        assert_eq!(
+            super::correlation_topic(&json!({"topic": "pr-9"})),
+            Some("pr-9".to_string())
+        );
+        // Nothing else attaches a topic.
+        assert_eq!(super::correlation_topic(&json!("")), None);
+        assert_eq!(super::correlation_topic(&serde_json::Value::Null), None);
+        assert_eq!(super::correlation_topic(&json!(42)), None);
+        assert_eq!(
+            super::correlation_topic(&json!({"event_id": "evt-1"})),
+            None
+        );
+        assert_eq!(super::correlation_topic(&json!({"topic": ""})), None);
     }
 
     #[test]

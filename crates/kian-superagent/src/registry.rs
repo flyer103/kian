@@ -30,7 +30,7 @@ use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
 use serde_json::Value;
 
-use crate::provenance::parse_channel_marker;
+use crate::provenance::{correlation_topic, parse_channel_marker, parse_channel_marker_lenient};
 use crate::worker::delegation_mandate;
 
 /// A worker's liveness (C59): `Live` until its own stream carries
@@ -267,12 +267,16 @@ impl PassthroughRegistry {
             {
                 mandates.insert(worker, mandate);
             }
-            if let Some(marker) = ev
+            // The delegated task is a message payload; its content may
+            // carry the channel-event wrapper with the spawning topic,
+            // or — the spawner's real shape — be the delegation
+            // wrapper holding the spawn call's task/correlation
+            // verbatim (the kian-75 string spellings included).
+            if let Some(topic) = ev
                 .bytes
                 .get("task")
                 .and_then(|task| task.get("content"))
-                .and_then(parse_channel_marker)
-                && let Some(topic) = marker.topic
+                .and_then(delegation_topic)
             {
                 topics.entry(topic).or_default().insert(worker);
             }
@@ -281,9 +285,10 @@ impl PassthroughRegistry {
             if ev.kind != EventKind::InputAdmitted || !workers.contains(&ev.session) {
                 continue;
             }
-            if let Some(marker) = ev.bytes.get("content").and_then(parse_channel_marker)
-                && let Some(topic) = marker.topic
-            {
+            // The worker's own channel inputs carry the wrapper
+            // directly; its *first* input is the delegation wrapper —
+            // both read with the same derivation (kian-75).
+            if let Some(topic) = ev.bytes.get("content").and_then(delegation_topic) {
                 topics.entry(topic).or_default().insert(ev.session);
             }
         }
@@ -314,6 +319,47 @@ pub fn worker_sessions(router_events: &[Event]) -> Vec<SessionId> {
 fn bytes_worker(bytes: &serde_json::Value) -> Option<SessionId> {
     let raw = bytes.get("worker").and_then(|w| w.as_str())?;
     Some(SessionId(uuid::Uuid::parse_str(raw).ok()?))
+}
+
+/// The topic correlation of a `spawn_worker` call (C59): the topic of
+/// the channel-event wrapper the Router judged — read off the task the
+/// same way the registry rebuild derives topic bindings from
+/// `thread/started` task content (one derivation, two readers) — or,
+/// failing that, the correlation argument as a topic token. `None` for
+/// every non-channel spawn (the common case): no ownership attaches.
+///
+/// The task may *be* the wrapper (a JSON object, or — the live
+/// spelling the tool schema's string `task` type produces, kian-75 — a
+/// **string** carrying the serialized wrapper) or a message payload
+/// whose `content` is. The correlation may be an explicit
+/// `{"topic": "…"}` object or a bare non-empty string token (the live
+/// spelling; see [`crate::provenance::correlation_topic`]). The
+/// wrapper's topic always wins over the correlation token — the token
+/// is a fallback, never a second binding.
+#[must_use]
+pub fn spawn_topic(task: &Value, correlation: Option<&Value>) -> Option<String> {
+    let marker_topic = task_marker(task).and_then(|marker| marker.topic);
+    marker_topic.or_else(|| correlation.and_then(correlation_topic))
+}
+
+/// The channel-event marker of a spawn task: the wrapper itself
+/// (object or string-serialized — the live spelling) or a message
+/// payload's `content` carrying it.
+fn task_marker(task: &Value) -> Option<crate::provenance::ChannelEventMarker> {
+    parse_channel_marker_lenient(task)
+        .or_else(|| task.get("content").and_then(parse_channel_marker_lenient))
+}
+
+/// The topic a delegated-task content binds: the channel-event wrapper
+/// itself (the fabricated/legacy rebuild shape), or — the spawner's
+/// real shape — a delegation wrapper whose `task`/`correlation` fields
+/// carry the spawn call's arguments verbatim, read with the same
+/// [`spawn_topic`] derivation (kian-75: the string spellings included).
+fn delegation_topic(content: &Value) -> Option<String> {
+    if let Some(topic) = parse_channel_marker(content).and_then(|marker| marker.topic) {
+        return Some(topic);
+    }
+    spawn_topic(content.get("task")?, content.get("correlation"))
 }
 
 #[cfg(test)]
@@ -375,6 +421,161 @@ mod tests {
         // C38: a single binding rebuilds to the singleton set.
         assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
         assert_eq!(registry.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // kian-75: the live string spellings (one derivation, two readers)
+    // -----------------------------------------------------------------
+
+    fn marker(topic: &str) -> serde_json::Value {
+        wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "github".into(),
+            event_id: "evt-0".into(),
+            topic: Some(topic.into()),
+            sender: None,
+            group: None,
+            payload: json!({"action": "opened"}),
+            ts_ms: 1,
+        })
+    }
+
+    /// The delegation wrapper the spawner writes as the delegated task
+    /// content (`{thread_id, task, correlation?}` — the spawn call's
+    /// arguments verbatim), in the live string spellings.
+    fn delegation_wrapper(
+        task: serde_json::Value,
+        correlation: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "thread_id": "00000000-0000-0000-0000-0000000000aa",
+            "task": task,
+            "correlation": correlation,
+        })
+    }
+
+    #[test]
+    fn spawn_topic_derivation_covers_the_live_string_spellings() {
+        // The live `spawn_worker` call (kian-75/RUNLOG §7.2 G2): the
+        // schema types `task` as a string, so the model passes the
+        // wrapper serialized as JSON text plus the correlation as a
+        // bare topic token string.
+        let serialized = json!(marker("pr-9").to_string());
+        assert_eq!(
+            super::spawn_topic(&serialized, None),
+            Some("pr-9".to_string()),
+            "the task is the string-serialized channel wrapper"
+        );
+        assert_eq!(
+            super::spawn_topic(
+                &json!({"role": "user", "content": serialized}),
+                Some(&json!("issue-github:acme/repo#9")),
+            ),
+            Some("pr-9".to_string()),
+            "the wrapper's topic wins over the correlation token"
+        );
+        assert_eq!(
+            super::spawn_topic(
+                &json!("plain task"),
+                Some(&json!("issue-github:acme/repo#9"))
+            ),
+            Some("issue-github:acme/repo#9".to_string()),
+            "a bare non-empty string correlation is a topic token (live spelling)"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), Some(&json!({"topic": "pr-10"}))),
+            Some("pr-10".to_string()),
+            "the explicit correlation object spelling still carries the topic"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), Some(&json!(""))),
+            None,
+            "an empty correlation string attaches no ownership"
+        );
+        assert_eq!(
+            super::spawn_topic(&json!("plain task"), None),
+            None,
+            "an ordinary spawn attaches no ownership"
+        );
+    }
+
+    #[test]
+    fn rebuild_binds_the_live_string_spellings() {
+        // Source 1 over the spawner's real delegation-wrapper shape:
+        // the `task` is the SERIALIZED channel wrapper (string) and
+        // the `correlation` is a bare topic token — exactly what the
+        // live Router model passes (kian-75).
+        let router = sid(1);
+        let worker = sid(2);
+        let started = thread_started(
+            router,
+            worker,
+            json!({
+                "role": "user",
+                "content": delegation_wrapper(
+                    json!(marker("pr-11").to_string()),
+                    json!("issue-github:acme/repo#11"),
+                ),
+            }),
+        );
+        let registry = PassthroughRegistry::rebuild([&started]);
+        assert_eq!(
+            registry.resolve("pr-11"),
+            BTreeSet::from([worker]),
+            "the string-serialized wrapper binds the marker's topic"
+        );
+        // The correlation token names the same ticket live, but it is
+        // a fallback — it does not mint a second topic.
+        assert!(registry.resolve("issue-github:acme/repo#11").is_empty());
+
+        // A plain-text task with only the bare correlation token: the
+        // token itself binds (the live follow-up shape).
+        let worker_b = sid(3);
+        let started_b = thread_started(
+            router,
+            worker_b,
+            json!({
+                "role": "user",
+                "content": delegation_wrapper(
+                    json!("triage the follow-up comment"),
+                    json!("issue-github:acme/repo#12"),
+                ),
+            }),
+        );
+        let registry = PassthroughRegistry::rebuild([&started_b]);
+        assert_eq!(
+            registry.resolve("issue-github:acme/repo#12"),
+            BTreeSet::from([worker_b]),
+            "a bare-string correlation binds the token as the topic"
+        );
+    }
+
+    #[test]
+    fn rebuild_binds_the_workers_first_input_wrapper_in_string_form() {
+        // Source 2 over the spawner's real shape: the worker's first
+        // `input/admitted` content is the delegation wrapper (with the
+        // live string task inside) — read with the same derivation.
+        let router = sid(1);
+        let worker = sid(2);
+        let mut events = vec![thread_started(
+            router,
+            worker,
+            json!({"role": "user", "content": "task"}),
+        )];
+        events.push(event(
+            worker,
+            4,
+            EventKind::InputAdmitted,
+            json!({
+                "role": "user",
+                "content": delegation_wrapper(json!(marker("pr-13").to_string()), serde_json::Value::Null),
+            }),
+        ));
+        let registry = PassthroughRegistry::rebuild(&events);
+        assert_eq!(
+            registry.resolve("pr-13"),
+            BTreeSet::from([worker]),
+            "the worker's first input (the delegation wrapper, string task) binds the topic"
+        );
     }
 
     #[test]

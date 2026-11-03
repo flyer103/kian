@@ -76,8 +76,8 @@ use crate::policy::{
     im_delivered_payload, speak_key, structured_delivered_payload,
 };
 use crate::policy_version::{NO_POLICY_LABEL, PolicyVersion, with_policy_header};
-use crate::provenance::{ChannelEventMarker, parse_channel_marker};
-use crate::registry::PassthroughRegistry;
+use crate::provenance::{ChannelEventMarker, parse_channel_marker_lenient};
+use crate::registry::{PassthroughRegistry, spawn_topic};
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
     PortFor, SpawnError, StreamPort, WorkerSpawner, delegation_is_speculative, parse_thread_report,
@@ -461,8 +461,12 @@ pub fn build_mandate(
     policy_label: Option<&str>,
 ) -> Option<Value> {
     let scope = policy.scope_for(worker_template)?.to_string();
-    let marker =
-        parse_channel_marker(task).or_else(|| task.get("content").and_then(parse_channel_marker));
+    // kian-75: the task may arrive as a JSON object or as the live
+    // spelling — a string carrying the serialized wrapper (the tool
+    // schema types `task` as a string). The lenient parse reads both;
+    // the mandate provenance/strength follow the marker either way.
+    let marker = parse_channel_marker_lenient(task)
+        .or_else(|| task.get("content").and_then(parse_channel_marker_lenient));
     let (source, raw) = match &marker {
         Some(ChannelEventMarker {
             channel,
@@ -1113,26 +1117,6 @@ fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, ToolEr
         .ok_or_else(|| ToolError::InvalidCall(format!("{tool} requires a string `{key}`")))
 }
 
-/// The topic correlation of a `spawn_worker` call (C59): the topic of
-/// the channel-event wrapper the Router judged — read off the task the
-/// same way the registry rebuild derives topic bindings from
-/// `thread/started` task content (the task itself may *be* the wrapper,
-/// or a message payload whose `content` is) — or, failing that, an
-/// explicit `{"topic": "…"}` correlation object. `None` for every
-/// non-channel spawn (the common case): no ownership attaches.
-fn spawn_topic(task: &Value, correlation: Option<&Value>) -> Option<String> {
-    let marker_topic = parse_channel_marker(task)
-        .or_else(|| task.get("content").and_then(parse_channel_marker))
-        .and_then(|marker| marker.topic);
-    marker_topic.or_else(|| {
-        correlation
-            .and_then(|c| c.get("topic"))
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-    })
-}
-
 impl ToolProvider for RouterTools {
     fn schemas(&self) -> Vec<ToolSchema> {
         vec![
@@ -1143,8 +1127,12 @@ impl ToolProvider for RouterTools {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "task": {"type": "string", "description": "The actual work, as user content"},
-                        "correlation": {"description": "Optional correlation token (e.g. event id)"},
+                        "task": {"type": "string", "description": "The actual work, as user content \
+                         (a channel-event dispatch may pass the triggering wrapper serialized as JSON text)"},
+                        "correlation": {"description": "Optional ticket correlation — a topic token \
+                         (bare string, e.g. the ticket thread key, or {\"topic\": …}); a token binds \
+                         the spawned worker as that topic's live Executor (follow-up ownership) and \
+                         orders outbox deliveries per (correlation, target conversation)"},
                         "speculative": {"type": "boolean", "description": "Spawn on a weak signal, \
                          budgeted by the Router's speculation policy (refused honestly at the cap; \
                          the worker's first message carries the speculative marker)"}
@@ -2483,38 +2471,52 @@ mod tests {
         );
     }
 
-    /// The topic-correlation derivation (`spawn_topic`): the channel
-    /// wrapper as task, a message payload wrapping it, an explicit
-    /// `{"topic": …}` correlation object — and `None` for every
-    /// ordinary non-channel task (no ownership attaches).
+    /// kian-75: the live `spawn_worker` spelling — the schema types
+    /// `task` as a string, so the model passes the wrapper serialized
+    /// as JSON text. The mandate must stamp strength from the
+    /// adapter-declared explicit signal and attribute the triggering
+    /// channel/topic, not fall back to `inferred` +
+    /// `router`/null (RUNLOG §7.1). The `spawn_topic` derivation
+    /// itself is golden-tested in `registry.rs` — one derivation,
+    /// two readers.
     #[test]
-    fn spawn_topic_derivation_covers_the_channel_and_correlation_forms() {
-        let wrapper = channel_task("pr-9");
+    fn mandate_reads_the_string_serialized_wrapper_live_spelling() {
+        let policy = mandate_policy();
+        let router = sid(10);
+        let serialized = json!(explicit_channel_task().to_string());
+        let mandate = build_mandate(&policy, "kian-worker", &serialized, router, Some("v1"))
+            .expect("policy bounds the template");
+        assert_eq!(mandate["strength"], json!("explicit"));
         assert_eq!(
-            super::spawn_topic(&wrapper, None),
-            Some("pr-9".to_string()),
-            "the task is the channel wrapper"
+            mandate["source"],
+            json!({"channel": "github", "topic": "acme/repo#7"})
         );
         assert_eq!(
-            super::spawn_topic(&json!({"role": "user", "content": wrapper}), None),
-            Some("pr-9".to_string()),
-            "the task is a message payload over the wrapper"
+            mandate["granted_by"],
+            json!({"login": "reporter", "type": "User"}),
+            "sender provenance verbatim off the string form"
         );
-        assert_eq!(
-            super::spawn_topic(&json!("plain task"), Some(&json!({"topic": "pr-10"}))),
-            Some("pr-10".to_string()),
-            "an explicit correlation object carries the topic"
-        );
-        assert_eq!(
-            super::spawn_topic(&json!("plain task"), Some(&json!("evt-1"))),
-            None,
-            "an opaque correlation token attaches no ownership"
-        );
-        assert_eq!(
-            super::spawn_topic(&json!("plain task"), None),
-            None,
-            "an ordinary spawn attaches no ownership"
-        );
+        // The inferred spelling keeps its honest strength as a string.
+        let inferred = build_mandate(
+            &policy,
+            "kian-worker",
+            &json!(inferred_channel_task().to_string()),
+            router,
+            Some("v1"),
+        )
+        .expect("policy bounds the template");
+        assert_eq!(inferred["strength"], json!("inferred"));
+        // A plain non-JSON string task is the Router's own trigger.
+        let plain = build_mandate(
+            &policy,
+            "kian-worker",
+            &json!("plain task"),
+            router,
+            Some("v1"),
+        )
+        .expect("policy bounds the template");
+        assert_eq!(plain["strength"], json!("inferred"));
+        assert_eq!(plain["source"], json!({"channel": "router", "topic": null}));
     }
 
     // -----------------------------------------------------------------
@@ -3145,10 +3147,15 @@ mod tests {
             .expect("spawn_worker schema");
         let serialized = serde_json::to_string(&schema.parameters).unwrap();
         let expected = concat!(
-            r#"{"properties":{"correlation":{"description":"Optional correlation token (e.g. event id)"},"#,
+            r#"{"properties":{"correlation":{"description":"Optional ticket correlation — a topic token "#,
+            r#"(bare string, e.g. the ticket thread key, or {\"topic\": …}); a token binds "#,
+            r#"the spawned worker as that topic's live Executor (follow-up ownership) and "#,
+            r#"orders outbox deliveries per (correlation, target conversation)"},"#,
             r#""speculative":{"description":"Spawn on a weak signal, budgeted by the Router's speculation "#,
             r#"policy (refused honestly at the cap; the worker's first message carries the speculative marker)","#,
-            r#""type":"boolean"},"task":{"description":"The actual work, as user content","type":"string"}},"#,
+            r#""type":"boolean"},"task":{"description":"The actual work, as user content "#,
+            r#"(a channel-event dispatch may pass the triggering wrapper serialized as JSON text)","#,
+            r#""type":"string"}},"#,
             r#""required":["task"],"type":"object"}"#
         );
         assert_eq!(serialized, expected);

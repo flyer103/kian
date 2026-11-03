@@ -155,6 +155,7 @@ pub use outbox::{
     ManualRetryClock, OutboxConfig, OutboxDriver, OutboxEntry, OutboxMetrics, OutboxPark,
     OutboxState, OutboxStatus, PARK_ERROR_PREFIX, RetryClock, SystemRetryClock, ThreadOutboxView,
     conversation_key, intent_ticket, outbox_pending, reconstruct_delivery, with_attempt_keys,
+    worker_conversation_keys,
 };
 pub use policy::{
     DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME, ImPolicy,
