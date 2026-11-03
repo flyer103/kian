@@ -44,6 +44,7 @@ use serde_json::{Value, json};
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 use crate::metrics::TurnClock;
 use crate::policy::{ImPolicy, im_delivered_payload};
+use crate::policy_version::{PolicyVersion, with_policy_header};
 use crate::recall::RecallPort;
 use crate::recall::thread_bindings;
 use crate::router::{ChannelRegistry, RouterHold};
@@ -140,6 +141,13 @@ pub struct WatchdogProfile {
     /// kian-62 re-arm: the ended, frozen predecessors of `session`
     /// (empty = generation 0, the configured pinned session itself).
     pub re_arm: Vec<crate::rearm::EndedResident>,
+    /// C63: the policy version whose label rides the bootstrap prompt
+    /// as a `[policy <label>]` header (rendered once at bootstrap,
+    /// wrapped around the *rendered* prompt — the template text is
+    /// untouched). `None` (absent `superagent.policy.version`) renders
+    /// today's bytes, byte-identical; persisted prompts are never
+    /// rewritten (cache-byte stability, constraint 3).
+    pub policy_version: Option<PolicyVersion>,
 }
 
 impl WatchdogProfile {
@@ -152,6 +160,7 @@ impl WatchdogProfile {
             agent,
             prompt: WatchdogPrompt::default(),
             re_arm: Vec::new(),
+            policy_version: None,
         }
     }
 
@@ -165,21 +174,30 @@ impl WatchdogProfile {
     /// becomes the per-generation
     /// [`watchdog:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
     /// and the payload carries the observable re-arm cause.
+    ///
+    /// C63: the configured policy version's label wraps the rendered
+    /// prompt as a `[policy <label>]` header — added at render, so the
+    /// template text and every legacy persisted prompt stay
+    /// byte-identical; a live session's persisted prompt is never
+    /// rewritten.
     pub async fn bootstrap(
         &self,
         inbox: &dyn InboxWriter,
     ) -> Result<AdmitReceipt, InboxWriteError> {
-        let (key, payload) = if self.re_arm.is_empty() {
-            (
-                WATCHDOG_BOOTSTRAP_KEY.to_string(),
-                json!(self.prompt.render()),
-            )
+        let rendered = if self.re_arm.is_empty() {
+            self.prompt.render()
         } else {
-            (
-                crate::rearm::re_arm_bootstrap_key(WATCHDOG_BOOTSTRAP_KEY, self.session),
-                json!(self.prompt.render_re_arm(&self.re_arm)),
-            )
+            self.prompt.render_re_arm(&self.re_arm)
         };
+        let key = if self.re_arm.is_empty() {
+            WATCHDOG_BOOTSTRAP_KEY.to_string()
+        } else {
+            crate::rearm::re_arm_bootstrap_key(WATCHDOG_BOOTSTRAP_KEY, self.session)
+        };
+        let payload = json!(with_policy_header(
+            self.policy_version.as_ref().map(|p| p.label()),
+            rendered,
+        ));
         inbox.admit(self.session, payload, Some(key)).await
     }
 }
@@ -879,6 +897,28 @@ mod tests {
         assert!(payload.contains(&pinned.0.to_string()));
         assert!(payload.contains("(cancelled)"));
         assert!(payload.contains(WATCHDOG_PROMPT_TEMPLATE));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_a_policy_version_wraps_the_rendered_prompt_with_the_header() {
+        let inbox = LoggingInbox::shared();
+        let session = sid(12);
+        let mut profile = WatchdogProfile::new(session, watchdog_template("mock", "m", 1));
+        profile.policy_version = Some(crate::policy_version::PolicyVersion::new("2026-11"));
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        // Header over the *rendered* prompt; the template text is
+        // untouched underneath.
+        assert_eq!(
+            admits[0].1,
+            json!(format!("[policy 2026-11] {WATCHDOG_PROMPT_TEMPLATE}"))
+        );
+        // Absent version = today's bytes (covered by
+        // `bootstrap_admits_the_watchdog_prompt_once` above, unmodified).
     }
 
     /// `read_progress` over a stuck worker: status outstanding, the

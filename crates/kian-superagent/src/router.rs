@@ -71,6 +71,7 @@ use crate::policy::{
     ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
     im_delivered_payload, speak_key, structured_delivered_payload,
 };
+use crate::policy_version::{PolicyVersion, with_policy_header};
 use crate::provenance::parse_channel_marker;
 use crate::registry::PassthroughRegistry;
 use crate::templates::SPAWN_WORKER_TOOL;
@@ -182,6 +183,15 @@ pub struct RouterProfile {
     /// Assembly fills it from the boot-time chain walk; the bootstrap
     /// keys and prompt above branch on it.
     pub re_arm: Vec<crate::rearm::EndedResident>,
+    /// C63: the policy version whose label rides the bootstrap prompt
+    /// as a `[policy <label>]` header (rendered once at bootstrap,
+    /// wrapped around the *rendered* prompt — the template text is
+    /// untouched). `None` (the default, and what an absent
+    /// `superagent.policy.version` produces) renders today's bytes,
+    /// byte-identical. Persisted prompts are never rewritten: a drift
+    /// is marked at boot, the new header lands only on the *next*
+    /// bootstrap (cache-byte stability, constraint 3).
+    pub policy_version: Option<PolicyVersion>,
 }
 
 impl RouterProfile {
@@ -199,6 +209,7 @@ impl RouterProfile {
             speak: SpeakPolicy::default(),
             followup_ownership: true,
             re_arm: Vec::new(),
+            policy_version: None,
         }
     }
 
@@ -213,21 +224,30 @@ impl RouterProfile {
     /// [`router:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
     /// and the payload carries the observable re-arm cause — the frozen
     /// predecessors and their reasons — before the judge prompt.
+    ///
+    /// C63: the configured policy version's label wraps the rendered
+    /// prompt as a `[policy <label>]` header (added at render, so the
+    /// template text and every legacy persisted prompt stay
+    /// byte-identical). The header is idempotent with the bootstrap
+    /// key: a live session's persisted prompt is never rewritten.
     pub async fn bootstrap(
         &self,
         inbox: &dyn InboxWriter,
     ) -> Result<AdmitReceipt, InboxWriteError> {
-        let (key, payload) = if self.re_arm.is_empty() {
-            (
-                ROUTER_BOOTSTRAP_KEY.to_string(),
-                json!(self.judge.render(0)),
-            )
+        let rendered = if self.re_arm.is_empty() {
+            self.judge.render(0)
         } else {
-            (
-                crate::rearm::re_arm_bootstrap_key(ROUTER_BOOTSTRAP_KEY, self.session),
-                json!(self.judge.render_re_arm(&self.re_arm, 0)),
-            )
+            self.judge.render_re_arm(&self.re_arm, 0)
         };
+        let key = if self.re_arm.is_empty() {
+            ROUTER_BOOTSTRAP_KEY.to_string()
+        } else {
+            crate::rearm::re_arm_bootstrap_key(ROUTER_BOOTSTRAP_KEY, self.session)
+        };
+        let payload = json!(with_policy_header(
+            self.policy_version.as_ref().map(|p| p.label()),
+            rendered,
+        ));
         inbox.admit(self.session, payload, Some(key)).await
     }
 }
@@ -1772,6 +1792,90 @@ mod tests {
 
     fn render_successor_prompt(profile: &RouterProfile) -> String {
         profile.judge.render_re_arm(&profile.re_arm, 0)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_a_policy_version_wraps_the_rendered_prompt_with_the_header() {
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let router = sid(12);
+        let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+        profile.policy_version = Some(crate::policy_version::PolicyVersion::new("2026-11"));
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        // The header is a prefix over the *rendered* prompt: the
+        // template text underneath is byte-identical (goldens stay
+        // valid).
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        assert_eq!(
+            payload,
+            format!("[policy 2026-11] {}", profile.judge.render(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_a_policy_version_is_today_bytes() {
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let router = sid(13);
+        let profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits[0].1, json!(profile.judge.render(0)));
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        assert!(!payload.contains("[policy "), "got: {payload}");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_header_composes_with_a_re_arm_prefix() {
+        use crate::rearm::{EndedResident, successor_session};
+        use kian_core::events::EndReason;
+
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let pinned = sid(14);
+        let live = successor_session(pinned);
+        let mut profile = RouterProfile::new(live, router_template("mock", "mock-router"));
+        profile.re_arm = vec![EndedResident {
+            session: pinned,
+            reason: EndReason::Completed,
+        }];
+        profile.policy_version = Some(crate::policy_version::PolicyVersion::new("v1"));
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        // Header first (it is the version the *session* pins), then the
+        // re-arm cause, then the untouched template render.
+        assert!(
+            payload.starts_with("[policy v1] [re-arm]"),
+            "got: {payload}"
+        );
+        assert_eq!(
+            payload,
+            &format!("[policy v1] {}", render_successor_prompt(&profile))
+        );
+        // The header parses back to the pinned label — the drift scan's
+        // read surface.
+        assert_eq!(
+            crate::policy_version::parse_policy_header(payload),
+            Some("v1")
+        );
     }
 
     #[test]
