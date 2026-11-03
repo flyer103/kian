@@ -23,6 +23,7 @@ use kian_core::seams::{
     ExecBackend, ExecCommand, ExecError, ExecResult, ToolCall, ToolError, ToolProvider, ToolResult,
     ToolSchema,
 };
+use kian_core::secrets::{ExecEnvPolicy, SecretRedactor};
 use serde_json::{Value, json};
 
 /// Default wall-clock bound for one local exec, milliseconds.
@@ -37,9 +38,24 @@ const EXEC_POLL_MS: u64 = 5;
 
 /// Local command execution via `spawn_blocking` (DESIGN §6.2 `ExecBackend`
 /// built-in). argv is executed directly — never a shell string.
+///
+/// kian-77 secret hygiene, applied at this (the only) local spawn site:
+///
+/// - **Environment**: [`ExecEnvPolicy`] bounds what the child inherits.
+///   The default is today's full inheritance (the config-compat
+///   clause); allowlist mode clears the environment and passes only
+///   the listed variables plus `DRY_RUN` — server secrets never reach
+///   the child, so a child-side `env` dump has nothing to leak.
+/// - **Output**: every stdout/stderr byte passes the [`SecretRedactor`]
+///   before leaving this backend, so no caller (tool result, event
+///   stream, transcript envelope) can observe a secret verbatim. The
+///   default redactor keeps pattern scanning on; assembly layers the
+///   configured secret values on top.
 #[derive(Debug, Clone)]
 pub struct LocalExecBackend {
     default_timeout_ms: u64,
+    env_policy: ExecEnvPolicy,
+    redactor: SecretRedactor,
 }
 
 impl LocalExecBackend {
@@ -47,6 +63,8 @@ impl LocalExecBackend {
     pub fn new() -> Self {
         Self {
             default_timeout_ms: DEFAULT_EXEC_TIMEOUT_MS,
+            env_policy: ExecEnvPolicy::Inherit,
+            redactor: SecretRedactor::patterns_only(),
         }
     }
 
@@ -54,6 +72,23 @@ impl LocalExecBackend {
     #[must_use]
     pub fn with_default_timeout(mut self, timeout_ms: u64) -> Self {
         self.default_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Sets the child environment policy (kian-77). `Inherit` (the
+    /// default) keeps today's full-passthrough behavior.
+    #[must_use]
+    pub fn with_env_policy(mut self, policy: ExecEnvPolicy) -> Self {
+        self.env_policy = policy;
+        self
+    }
+
+    /// Sets the output redactor (kian-77). The default is
+    /// patterns-only; assembly builds the full redactor from the
+    /// configured secret env names.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: SecretRedactor) -> Self {
+        self.redactor = redactor;
         self
     }
 }
@@ -67,13 +102,17 @@ impl Default for LocalExecBackend {
 impl ExecBackend for LocalExecBackend {
     fn exec(&self, cmd: ExecCommand) -> BoxFuture<'static, Result<ExecResult, ExecError>> {
         let default_timeout = self.default_timeout_ms;
+        let env_policy = self.env_policy.clone();
+        let redactor = self.redactor.clone();
         Box::pin(async move {
             // A blocking child process must never run on a runtime worker
             // (AGENTS.md): the whole spawn/poll/collect runs on the
             // dedicated blocking pool.
-            tokio::task::spawn_blocking(move || run_blocking(cmd, default_timeout))
-                .await
-                .map_err(|e| ExecError::Spawn(format!("blocking join failed: {e}")))?
+            tokio::task::spawn_blocking(move || {
+                run_blocking(cmd, default_timeout, &env_policy, &redactor)
+            })
+            .await
+            .map_err(|e| ExecError::Spawn(format!("blocking join failed: {e}")))?
         })
     }
 }
@@ -81,7 +120,12 @@ impl ExecBackend for LocalExecBackend {
 /// The blocking-side exec: spawn, watchdog-poll `try_wait`, kill on
 /// timeout, collect output via dedicated reader threads (so a child
 /// filling the pipe buffer cannot deadlock the watchdog).
-fn run_blocking(cmd: ExecCommand, default_timeout_ms: u64) -> Result<ExecResult, ExecError> {
+fn run_blocking(
+    cmd: ExecCommand,
+    default_timeout_ms: u64,
+    env_policy: &ExecEnvPolicy,
+    redactor: &SecretRedactor,
+) -> Result<ExecResult, ExecError> {
     let argv = &cmd.argv;
     let Some(program) = argv.first() else {
         return Err(ExecError::Spawn("argv must not be empty".into()));
@@ -93,6 +137,12 @@ fn run_blocking(cmd: ExecCommand, default_timeout_ms: u64) -> Result<ExecResult,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // kian-77: allowlist mode replaces the inherited environment with
+    // the closed set (configured names + DRY_RUN); `None` (inherit)
+    // leaves the spawn command's environment untouched.
+    if let Some(child_env) = env_policy.resolve() {
+        command.env_clear().envs(&child_env);
+    }
     if let Some(cwd) = &cmd.cwd {
         command.current_dir(cwd);
     }
@@ -126,8 +176,11 @@ fn run_blocking(cmd: ExecCommand, default_timeout_ms: u64) -> Result<ExecResult,
     }
     Ok(ExecResult {
         exit_code,
-        stdout: stdout_t.join(),
-        stderr: stderr_t.join(),
+        // kian-77: the redaction pass runs before the result leaves the
+        // backend — every caller (tool/result event, transcript
+        // envelopes, retries) only ever sees scrubbed bytes.
+        stdout: redactor.redact(&stdout_t.join()),
+        stderr: redactor.redact(&stderr_t.join()),
         timed_out,
     })
 }
@@ -205,6 +258,22 @@ impl LocalTools {
     #[must_use]
     pub fn with_exec_timeout(mut self, timeout_ms: u64) -> Self {
         self.exec = self.exec.with_default_timeout(timeout_ms);
+        self
+    }
+
+    /// kian-77: sets the exec child environment policy (forwarded to
+    /// the inner [`LocalExecBackend`]).
+    #[must_use]
+    pub fn with_env_policy(mut self, policy: kian_core::secrets::ExecEnvPolicy) -> Self {
+        self.exec = self.exec.with_env_policy(policy);
+        self
+    }
+
+    /// kian-77: sets the exec output redactor (forwarded to the inner
+    /// [`LocalExecBackend`]).
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: kian_core::secrets::SecretRedactor) -> Self {
+        self.exec = self.exec.with_redactor(redactor);
         self
     }
 
@@ -738,6 +807,103 @@ mod tests {
     }
 
     // -- FilteredTools (kian-61) --------------------------------------------
+
+    // -- kian-77: exec secret hygiene (env allowlist + output redaction) --
+
+    /// SAFETY: each name is written by exactly one test with a constant
+    /// value (idempotent re-writes); the names are unique to these
+    /// tests, so parallel tests never contend on the same variable.
+    fn set_env_once(name: &'static str, value: &'static str) {
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    /// The G4 acceptance test: a worker that dumps its environment (or
+    /// echoes a configured secret) must persist **no** configured secret
+    /// through the exec tool result — the exact live leak from the C65
+    /// run, now redacted at the tool edge before the result is emitted.
+    #[tokio::test]
+    async fn exec_env_dump_persists_no_configured_secret() {
+        const NAME: &str = "KIAN_LOOP_TEST_SECRET";
+        const VALUE: &str = "kian-loop-test-secret-value-0123456789";
+        set_env_once(NAME, VALUE);
+        let root = temp_root();
+        let redactor = kian_core::secrets::SecretRedactor::from_env_names(&[NAME.to_string()]);
+        let tools = LocalTools::new(&root).with_redactor(redactor);
+        let res = tools
+            .invoke(call(
+                "c1",
+                "exec",
+                serde_json::json!({"argv": ["bash", "-c", format!("echo {NAME}=${NAME}").as_str()]}),
+            ))
+            .await
+            .unwrap();
+        assert!(!res.is_error, "the command itself succeeds");
+        let stdout = res.output.get("stdout").and_then(|v| v.as_str()).unwrap();
+        assert!(!stdout.contains(VALUE), "secret value must not persist");
+        assert!(
+            stdout.contains(&format!("{NAME}=[REDACTED:{NAME}]")),
+            "the redaction marker names the variable: {stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Allowlist mode: the child inherits only the listed variables
+    /// (plus DRY_RUN) — an environment dump from the child contains no
+    /// server secret, because the child never saw one.
+    #[tokio::test]
+    async fn exec_allowlist_environment_hides_secrets_from_children() {
+        const ALLOWED: &str = "KIAN_LOOP_TEST_ALLOW";
+        const SECRET: &str = "KIAN_LOOP_TEST_SECRET2";
+        set_env_once(ALLOWED, "visible");
+        set_env_once(SECRET, "hidden-value-abcdefghij");
+        let root = temp_root();
+        let tools =
+            LocalTools::new(&root).with_env_policy(kian_core::secrets::ExecEnvPolicy::allowlist(
+                &["PATH".to_string(), ALLOWED.to_string()],
+            ));
+        let res = tools
+            .invoke(call(
+                "c1",
+                "exec",
+                serde_json::json!({"argv": ["bash", "-c", format!("echo allowed=${ALLOWED} secret=${SECRET}").as_str()]}),
+            ))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let stdout = res.output.get("stdout").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            stdout.contains("allowed=visible"),
+            "listed var passes: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("secret=") && !stdout.contains("hidden-value-abcdefghij"),
+            "unlisted secret never reached the child: {stdout:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Default redaction is patterns-on: even with no configured names,
+    /// token-shaped output never leaves the backend verbatim.
+    #[tokio::test]
+    async fn exec_default_backend_redacts_token_patterns() {
+        let exec = LocalExecBackend::new();
+        let res = exec
+            .exec(ExecCommand {
+                argv: vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "echo ghp_abcdefghijklmnopqrstuvwx".into(),
+                ],
+                env: Default::default(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.stdout.trim(), "[REDACTED:token]");
+    }
 
     #[test]
     fn filtered_tools_hides_unlisted_schemas_and_preserves_order() {

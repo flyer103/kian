@@ -134,6 +134,12 @@ pub struct LocalToolsPlugin {
     pub root: std::path::PathBuf,
     /// Default exec timeout, milliseconds.
     pub exec_timeout_ms: u64,
+    /// kian-77: the exec child environment policy
+    /// (`tools.exec_env`, default inherit).
+    pub env_policy: kian_core::secrets::ExecEnvPolicy,
+    /// kian-77: the exec output redactor (`tools.exec_redact`, default
+    /// on; built at assembly from every secret name kian.yaml names).
+    pub redactor: kian_core::secrets::SecretRedactor,
 }
 
 impl Plugin for LocalToolsPlugin {
@@ -146,7 +152,10 @@ impl Plugin for LocalToolsPlugin {
     }
 
     fn apply(self, ctx: &mut Ctx) -> Result<Disposer, PluginError> {
-        let tools = LocalTools::new(self.root).with_exec_timeout(self.exec_timeout_ms);
+        let tools = LocalTools::new(self.root)
+            .with_exec_timeout(self.exec_timeout_ms)
+            .with_env_policy(self.env_policy)
+            .with_redactor(self.redactor);
         ctx.provide::<dyn ToolProvider>(Arc::new(tools) as Arc<dyn ToolProvider>)
     }
 }
@@ -252,6 +261,9 @@ pub struct RemoteExecPlugin {
     /// backend-portable and same-holder claims always land, so
     /// single-process behavior is unchanged.
     pub holder: String,
+    /// kian-77: the exec output redactor — runs once per settled
+    /// outcome, before the durable queue row is written.
+    pub redactor: kian_core::secrets::SecretRedactor,
 }
 
 impl Plugin for RemoteExecPlugin {
@@ -294,13 +306,14 @@ impl Plugin for RemoteExecPlugin {
             .first()
             .map(|ep| ep.id.clone())
             .ok_or_else(|| apply_error("remote-exec: no endpoints configured"))?;
-        let backend = RemoteExecBackend::with_row_leases(
+        let backend = RemoteExecBackend::with_row_leases_redacting(
             self.store,
             routes,
             default_endpoint,
             config,
             self.holder,
             Duration::from_millis(max_timeout),
+            self.redactor,
         )
         .map_err(apply_error)?;
         let services = Arc::new(RemoteExecServices {

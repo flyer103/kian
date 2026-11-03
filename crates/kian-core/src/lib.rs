@@ -23,4 +23,5 @@ pub mod events;
 pub mod invariants;
 pub mod model;
 pub mod seams;
+pub mod secrets;
 pub mod state;

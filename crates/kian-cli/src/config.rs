@@ -277,6 +277,15 @@ pub struct ToolsConfig {
     /// Default local exec timeout, milliseconds.
     #[serde(default = "default_exec_timeout")]
     pub exec_timeout_ms: u64,
+    /// kian-77: the exec child environment policy (`tools.exec_env`).
+    /// Default `inherit` = today's behavior (compatibility clause).
+    #[serde(default)]
+    pub exec_env: ExecEnvSection,
+    /// kian-77: the exec output redaction config (`tools.exec_redact`).
+    /// Redaction is ON by default — it only scrubs what is persisted,
+    /// never what the child does.
+    #[serde(default)]
+    pub exec_redact: ExecRedactSection,
 }
 
 impl Default for ToolsConfig {
@@ -284,8 +293,102 @@ impl Default for ToolsConfig {
         Self {
             root: default_tools_root(),
             exec_timeout_ms: default_exec_timeout(),
+            exec_env: ExecEnvSection::default(),
+            exec_redact: ExecRedactSection::default(),
         }
     }
+}
+
+/// The `tools.exec_env:` section (kian-77 fix ①: secrets never reach
+/// spawned children).
+///
+/// ```yaml
+/// tools:
+///   exec_env:
+///     mode: allowlist
+///     allow: [PATH, HOME, LANG, TMPDIR]
+/// ```
+///
+/// `mode: allowlist` clears the child environment and passes only the
+/// listed names — plus `DRY_RUN` when the parent has it set (the
+/// dry-run contract rides the environment). `mode: inherit` (the
+/// default) keeps today's full passthrough; output redaction
+/// (`tools.exec_redact`) is the backstop either way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecEnvSection {
+    /// `inherit` (default) or `allowlist`; anything else refuses boot.
+    #[serde(default = "default_exec_env_mode")]
+    pub mode: String,
+    /// Variable names an allowlisted child may see. Names only —
+    /// values are read from the parent environment at spawn time and
+    /// never live in kian.yaml.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl Default for ExecEnvSection {
+    fn default() -> Self {
+        Self {
+            mode: default_exec_env_mode(),
+            allow: Vec::new(),
+        }
+    }
+}
+
+fn default_exec_env_mode() -> String {
+    "inherit".into()
+}
+
+impl ExecEnvSection {
+    /// Converts to the runtime policy, fail-closed on an unknown mode.
+    pub fn to_policy(&self) -> Result<kian_core::secrets::ExecEnvPolicy, ConfigError> {
+        match self.mode.as_str() {
+            "inherit" => Ok(kian_core::secrets::ExecEnvPolicy::Inherit),
+            "allowlist" => Ok(kian_core::secrets::ExecEnvPolicy::allowlist(&self.allow)),
+            other => Err(ConfigError::Invalid(format!(
+                "tools.exec_env.mode: unknown mode {other:?} (expected \"inherit\" or \"allowlist\")"
+            ))),
+        }
+    }
+}
+
+/// The `tools.exec_redact:` section (kian-77 fix ②: no configured
+/// secret persists into the event stream).
+///
+/// ```yaml
+/// tools:
+///   exec_redact:
+///     enabled: true          # default
+///     env_names: [MY_EXTRA_TOKEN]  # beyond the auto-collected ones
+/// ```
+///
+/// The assembly auto-collects every secret name kian.yaml itself
+/// configures (`api_key_env`, `KIAN_GITHUB_TOKEN`, webhook/lark
+/// secrets, the postgres URL env); `env_names` lists extras the
+/// operator knows about (e.g. a `gh` CLI token the workers use).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecRedactSection {
+    /// Redaction on/off. Default on.
+    #[serde(default = "default_exec_redact_enabled")]
+    pub enabled: bool,
+    /// Extra secret environment variable names to redact by value.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+}
+
+impl Default for ExecRedactSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_exec_redact_enabled(),
+            env_names: Vec::new(),
+        }
+    }
+}
+
+fn default_exec_redact_enabled() -> bool {
+    true
 }
 
 fn default_tools_root() -> String {
@@ -2227,6 +2330,54 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
 
 #[cfg(test)]
 mod tests {
+    // -- kian-77: tools.exec_env / tools.exec_redact -----------------------
+
+    /// Defaults: inherit (compatibility clause) + redaction on.
+    #[test]
+    fn exec_env_and_redact_defaults_are_inherit_and_enabled() {
+        let cfg = ToolsConfig::default();
+        assert_eq!(cfg.exec_env.mode, "inherit");
+        assert!(cfg.exec_env.allow.is_empty());
+        assert!(cfg.exec_redact.enabled);
+        assert!(cfg.exec_redact.env_names.is_empty());
+        assert_eq!(
+            cfg.exec_env.to_policy().unwrap(),
+            kian_core::secrets::ExecEnvPolicy::Inherit
+        );
+    }
+
+    /// An allowlist section parses and converts to the closed-set policy.
+    #[test]
+    fn exec_env_allowlist_parses_and_converts() {
+        let cfg: ToolsConfig = serde_yaml::from_str(
+            "root: \".\"\nexec_timeout_ms: 30000\nexec_env:\n  mode: allowlist\n  allow: [PATH, HOME]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.exec_env.to_policy().unwrap(),
+            kian_core::secrets::ExecEnvPolicy::allowlist(&["PATH".to_string(), "HOME".to_string()])
+        );
+    }
+
+    /// Unknown mode is fail-closed, never a silent inherit.
+    #[test]
+    fn exec_env_unknown_mode_refuses() {
+        let cfg = ExecEnvSection {
+            mode: "allowlst".into(),
+            allow: vec![],
+        };
+        let err = cfg.to_policy().unwrap_err();
+        assert!(err.to_string().contains("allowlst"), "{err}");
+    }
+
+    /// deny_unknown_fields holds on both new sections (typo'd keys
+    /// refuse boot instead of silently doing nothing).
+    #[test]
+    fn exec_env_and_redact_reject_unknown_fields() {
+        assert!(serde_yaml::from_str::<ExecEnvSection>("mode: inherit\nalow: [PATH]").is_err());
+        assert!(serde_yaml::from_str::<ExecRedactSection>("enabled: true\nenvnames: []").is_err());
+    }
+
     use super::*;
 
     /// A minimal-but-valid config used as the fixture basis.

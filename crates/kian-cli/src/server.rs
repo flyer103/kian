@@ -195,18 +195,46 @@ impl Server {
         };
 
         let mut ctx = PluginCtx::new();
-        // The event store opens before activation too: the C37
-        // completion bridge (inside the superagent plugin) reads
-        // session projections and committed `tool/call` events.
-        let store = match pg_pool.as_ref() {
-            Some(pool) => EventStore::from_pg_pool(pool.clone()).await?,
-            None => EventStore::open(&config.storage.sqlite).await?,
+        // kian-77: the exec secret hygiene pair, built once and shared
+        // by the local tool surface and the remote-exec queue:
+        //
+        // - the redactor's known values are the *configured* secrets —
+        //   every env name kian.yaml itself names (provider keys, the
+        //   github send token + webhook secret, lark credentials, the
+        //   postgres URL) plus operator-listed extras. Unset names are
+        //   skipped by the redactor itself.
+        // - the env policy is fail-closed on an unknown mode; the
+        //   default (`inherit`) keeps today's behavior.
+        let mut secret_env_names: Vec<String> = config
+            .providers
+            .values()
+            .map(|p| p.api_key_env.clone())
+            .collect();
+        secret_env_names.push("KIAN_GITHUB_TOKEN".into());
+        secret_env_names.push("KIAN_GITHUB_WEBHOOK_SECRET".into());
+        secret_env_names.push("KIAN_LARK_APP_SECRET".into());
+        if let Some(pg) = config.storage.postgres.as_ref() {
+            secret_env_names.push(pg.url_env.clone());
+        }
+        secret_env_names.extend(config.tools.exec_redact.env_names.clone());
+        let exec_redactor = if config.tools.exec_redact.enabled {
+            kian_core::secrets::SecretRedactor::from_env_names(&secret_env_names)
+        } else {
+            // Explicit config opt-out: fully disabled (no patterns).
+            kian_core::secrets::SecretRedactor::default()
         };
+        let exec_env_policy = config
+            .tools
+            .exec_env
+            .to_policy()
+            .map_err(ServeError::Config)?;
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
                 root: config.tools.root.clone().into(),
                 exec_timeout_ms: config.tools.exec_timeout_ms,
+                env_policy: exec_env_policy,
+                redactor: exec_redactor.clone(),
             },
         ];
         if let Some(store) = exec_store {
@@ -214,8 +242,16 @@ impl Server {
                 store,
                 endpoints: config.endpoints.clone(),
                 holder: config.drain.holder.clone(),
+                redactor: exec_redactor,
             });
         }
+        // The event store opens before activation too: the C37
+        // completion bridge (inside the superagent plugin) reads
+        // session projections and committed `tool/call` events.
+        let store = match pg_pool.as_ref() {
+            Some(pool) => EventStore::from_pg_pool(pool.clone()).await?,
+            None => EventStore::open(&config.storage.sqlite).await?,
+        };
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
             // Super-agent mode: the bundle plugin builds all three
             // loops (router/worker/plain); `react-loop` is absent.

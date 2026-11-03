@@ -211,6 +211,20 @@ the new dialect.
   `cargo test` time; the default gates never see it. All network access
   happens inside `run.sh`/`demo-restart.sh` with the env present, and
   secrets are env-only by the C13 rule.
+- **Exec blast radius is the operator's machine (kian-77)**: the
+  `exec` tool is argv-direct, but argv[0] can be a shell — a worker
+  that runs `bash -c "ls ~; find ~ …"` enumerates the operator's home
+  exactly as the C65 live run showed, and a worker that runs `env`
+  reads the server environment. The mandate's scope text bounds what
+  the model *should* do; the harness bounds what it *can*: every
+  secret `kian.yaml` itself names (provider keys, `KIAN_GITHUB_TOKEN`,
+  the webhook/lark secrets, the postgres URL env) plus
+  `tools.exec_redact.env_names` extras is redacted from exec
+  stdout/stderr before anything persists (default on), and
+  `tools.exec_env.mode: allowlist` stops unlisted variables — secrets
+  included — from ever reaching the child (opt-in; `inherit` stays the
+  default for compatibility). Blast radius beyond that (filesystem
+  reach of the exec user) is a deployment concern, not a harness one.
 - **Known fixture-observed gap (for the C65 live run)**: the C56 stage
   table's arm 5 reads `queued` whenever the consuming drain appends
   `input/admitted` after its own `drain/claimed` — on real engine
@@ -227,7 +241,7 @@ the new dialect.
 | `triage-prompt.md` | the v2 charter submitted to the Router: standing policy + the triager contract |
 | `run.sh` | boot `kian serve`, resolve the github token, idempotent charter submit, inspection cheat sheet |
 | `demo-restart.sh` | the kill -9 / reboot / resume demo with printed proof |
-| `flaky-proxy.py` | the forced-delivery-failure proxy (the C65 retry scenario) |
+| `flaky-proxy.py` | the fault-injecting proxy: kills the Nth router-judge stream (`KILL_ON`) and/or fails the first `FAIL_N` `FAIL_METHOD` requests matching `FAIL_PATH` with 502 (`FAIL_PATH=/comments FAIL_N=2` reproduces the C65 scenario-6 delivery-leg retry; a high `FAIL_N` the park arm) — kian-74 |
 | `RUNLOG.md` | the recorded live runs (append-only; v2 evidence lands with C65) |
 
 The live-run evidence itself: [RUNLOG.md](RUNLOG.md).

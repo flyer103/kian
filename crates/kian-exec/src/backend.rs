@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
+use kian_core::secrets::SecretRedactor;
 
 use crate::connection::ConnectionManager;
 use crate::proto::{CommandError, CommandId};
@@ -60,6 +61,11 @@ struct QueueCore {
     store: ExecStore,
     routes: HashMap<String, Arc<Route>>,
     config: RemoteExecConfig,
+    /// kian-77: the exec output redactor. Every `Ok` outcome passes it
+    /// once, at settlement ([`QueueCore::complete`]) — the single choke
+    /// point the durable row, every waiter, the sync tool result and
+    /// the async-jobs completion all read from.
+    redactor: SecretRedactor,
     /// C52 row-lease identity: which replica's drivers own the rows
     /// they drive. Defaults to a single-process holder; multi-replica
     /// assemblies (postgres mode) pass the config-validated unique
@@ -151,6 +157,33 @@ impl RemoteExecBackend {
         holder: impl Into<String>,
         ttl: Duration,
     ) -> std::result::Result<Self, String> {
+        // No configured secret names → patterns-only redaction, the
+        // same default the local exec path carries.
+        Self::with_row_leases_redacting(
+            store,
+            routes,
+            default_endpoint,
+            config,
+            holder,
+            ttl,
+            SecretRedactor::patterns_only(),
+        )
+    }
+
+    /// kian-77: [`RemoteExecBackend::with_row_leases`] with the exec
+    /// output redactor. The redactor runs once per settled `Ok`
+    /// outcome, before the durable row is written — the row, every
+    /// waiter, `RemoteExecTool` results and async-job completions all
+    /// observe scrubbed bytes.
+    pub fn with_row_leases_redacting(
+        store: ExecStore,
+        routes: Vec<(String, Arc<ConnectionManager>)>,
+        default_endpoint: impl Into<String>,
+        config: RemoteExecConfig,
+        holder: impl Into<String>,
+        ttl: Duration,
+        redactor: SecretRedactor,
+    ) -> std::result::Result<Self, String> {
         if routes.is_empty() {
             return Err("remote exec needs at least one endpoint route".into());
         }
@@ -173,6 +206,7 @@ impl RemoteExecBackend {
             store,
             routes: map.clone(),
             config,
+            redactor,
             row_lease_holder: holder.into(),
             row_lease_ttl: ttl,
             waiters: Mutex::new(HashMap::new()),
@@ -233,13 +267,20 @@ impl RemoteExecBackend {
             .map_err(store_error)?
         {
             // Re-execution of a settled command id: answer from the row —
-            // one row, one dispatch, ever (ADR-007 dedupe).
+            // one row, one dispatch, ever (ADR-007 dedupe). Rows written
+            // by pre-kian-77 builds may carry raw output; redact the
+            // read-back so a replayed tool call still emits scrubbed
+            // bytes even against an old store.
             EnqueueOutcome::Existing(row) => match row.status {
                 QueueStatus::Done => {
-                    return row
-                        .outcome
-                        .expect("done rows always carry an outcome")
-                        .to_exec();
+                    return match row.outcome.expect("done rows always carry an outcome") {
+                        CommandOutcome::Ok { result } => Ok(ExecResult {
+                            stdout: self.core.redactor.redact(&result.stdout),
+                            stderr: self.core.redactor.redact(&result.stderr),
+                            ..result
+                        }),
+                        other => other.to_exec(),
+                    };
                 }
                 QueueStatus::Abandoned => return Err(ExecError::Timeout),
                 QueueStatus::Pending | QueueStatus::Inflight => {
@@ -345,6 +386,20 @@ impl QueueCore {
     /// Record a settled outcome durably, then wake every caller attached to
     /// this command id. Called only from a dispatch task.
     async fn complete(&self, command_id: CommandId, outcome: CommandOutcome) {
+        // kian-77: the one redaction point on the remote path — before
+        // the row is written, so the durable copy (and everything that
+        // reads it: waiters, tool results, async completions, replays)
+        // only ever holds scrubbed bytes.
+        let outcome = match outcome {
+            CommandOutcome::Ok { result } => CommandOutcome::Ok {
+                result: ExecResult {
+                    stdout: self.redactor.redact(&result.stdout),
+                    stderr: self.redactor.redact(&result.stderr),
+                    ..result
+                },
+            },
+            other => other,
+        };
         match self.store.mark_done(command_id, &outcome).await {
             Ok(true) => {
                 let mapped = outcome.to_exec();
