@@ -2496,6 +2496,27 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(150)).await;
 
+        // Freeze the clock before asserting: on a starved runner the
+        // heartbeat task can lag the advancer (CI runs many tests in
+        // parallel), and the fixed sleep below is not a guarantee. With the
+        // clock frozen, wait until a heartbeat has fired *after* the freeze
+        // — then expiry is evaluated against a now the heartbeat has
+        // already covered, making the assertion starvation-proof. The
+        // un-heartbeated control stays expired regardless (its last beat is
+        // at claim time, long before the frozen now).
+        adv_stop.store(true, Ordering::Relaxed);
+        advancer.await.unwrap();
+        let frozen_now = clock.now_ms();
+        assert!(wait_for(5_000, || async {
+            store
+                .expired_leases(frozen_now)
+                .await
+                .unwrap()
+                .iter()
+                .any(|l| l.session == control)
+        })
+        .await);
+
         let now = clock.now_ms();
         let expired = store.expired_leases(now).await.unwrap();
         assert!(
@@ -2507,8 +2528,6 @@ mod tests {
             "un-heartbeated control session expired"
         );
 
-        adv_stop.store(true, Ordering::Relaxed);
-        advancer.await.unwrap();
         gate.notify_one();
         assert!(
             wait_for(5_000, || async {
