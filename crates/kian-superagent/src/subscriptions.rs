@@ -18,6 +18,16 @@
 //! Router judges the first event of an unknown topic and the spawner
 //! binds the worker; both transitions leave an audit log line).
 //!
+//! C59 (follow-up ownership): fan-out admits to **live** subscribers
+//! only — the registry's liveness projection filters ended workers out
+//! of the admission set, so an event never strands on a terminal
+//! session. A topic whose subscribers have *all* ended falls back to
+//! the Router as a **release to fresh evaluation** (002's Ticket-end
+//! rule), audited with the closed `released_to_eval` reason code and
+//! naming the released topic. Config-gated by
+//! `superagent.followup_ownership` (default on); off restores the
+//! pre-C59 behavior (every historical subscriber admits).
+//!
 //! Events matching no rule are dropped with an audit log line and no
 //! inbox row — an honest no-op, never a silent swallow.
 //!
@@ -88,7 +98,11 @@ pub struct FanoutAdmission {
 /// Holds the passthrough registry behind a lock: it is runtime-mutable
 /// (the spawner registers workers) yet disposable — a restart replaces
 /// it wholesale with the projection rebuilt from event streams
-/// ([`SubscriptionService::install_registry`]).
+/// ([`SubscriptionService::install_registry`]). Since C59 the lock
+/// lives behind a shared `Arc` ([`SubscriptionService::shared_registry`])
+/// so the Router's tool surface (the `spawn_worker` ownership check)
+/// and the fan-out path read the *same* projection — one ownership
+/// truth, still disposable.
 pub struct SubscriptionService {
     router_session: SessionId,
     rules: SubscriptionRuleSet,
@@ -98,7 +112,12 @@ pub struct SubscriptionService {
     /// (the default) marks nothing — every wrapper stays byte-for-byte
     /// the legacy form.
     untrusted_channels: std::collections::BTreeSet<String>,
-    registry: RwLock<PassthroughRegistry>,
+    /// C59: the follow-up-ownership gate (`superagent.followup_ownership`,
+    /// default on). On, fan-out admits to live subscribers only and an
+    /// all-ended set releases the topic to the Router (fresh Eval);
+    /// off, every historical subscriber admits — the pre-C59 behavior.
+    followup_ownership: bool,
+    registry: Arc<RwLock<PassthroughRegistry>>,
     inbox: Arc<dyn InboxWriter>,
 }
 
@@ -114,7 +133,8 @@ impl SubscriptionService {
             classes: AdmissionClassTable::default(),
             shaping: ShapingConfig::default(),
             untrusted_channels: std::collections::BTreeSet::new(),
-            registry: RwLock::new(PassthroughRegistry::new()),
+            followup_ownership: true,
+            registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
     }
@@ -134,9 +154,47 @@ impl SubscriptionService {
             classes,
             shaping: ShapingConfig::default(),
             untrusted_channels: std::collections::BTreeSet::new(),
-            registry: RwLock::new(PassthroughRegistry::new()),
+            followup_ownership: true,
+            registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
         }
+    }
+
+    /// Sets the C59 follow-up-ownership gate (`superagent.followup_ownership`,
+    /// default on). `false` restores the pre-C59 behavior: the fan-out
+    /// admission set is every historical subscriber, live or ended.
+    pub fn with_followup_ownership(mut self, enabled: bool) -> Self {
+        self.followup_ownership = enabled;
+        self
+    }
+
+    /// Shares the registry (C59): the handle returned here is the one
+    /// this service reads and writes — installing it into the Router's
+    /// tool surface gives both sides one ownership projection. A
+    /// startup [`SubscriptionService::install_registry`] through either
+    /// side re-derives the same shared state.
+    pub fn shared_registry(&self) -> Arc<RwLock<PassthroughRegistry>> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Adopts an already-shared registry handle (C59 assembly wiring):
+    /// after this the service and every other holder of the Arc read
+    /// and write one projection. Call before any
+    /// [`SubscriptionService::shared_registry`] handle is taken, so no
+    /// detached copies exist.
+    pub fn with_shared_registry(mut self, shared: Arc<RwLock<PassthroughRegistry>>) -> Self {
+        self.registry = shared;
+        self
+    }
+
+    /// Runtime transition of the C59 liveness projection: marks a
+    /// worker's stream ended. The topic sets keep the worker as a
+    /// historical subscriber; the fan-out live view drops it.
+    pub fn mark_worker_ended(&self, worker: SessionId) {
+        self.registry
+            .write()
+            .expect("passthrough registry lock")
+            .mark_ended(worker);
     }
 
     /// Sets the C33 admission-time shaping policy. The default (infinite
@@ -246,32 +304,60 @@ impl SubscriptionService {
         // resolves the topic's set — zero (fallback), one, or many.
         // `session` (C40) pins the event to one config-addressed fixed
         // session — the timer's ticks reach the watchdog this way.
+        // C59: with follow-up ownership on (the default), the
+        // admission set is the *live* subscriber set — an all-ended
+        // topic releases to the Router as a fresh evaluation
+        // (`released_to_eval`), the bootstrap-empty fallback keeps its
+        // `admitted_router` shape.
         let targets: Vec<SessionId> = match &rule.route {
             Route::Router => vec![self.router_session],
             Route::Session(session) => vec![*session],
             Route::Passthrough { .. } => {
-                let subscribers = event
-                    .topic
-                    .as_deref()
-                    .map(|t| {
-                        self.registry
-                            .read()
-                            .expect("passthrough registry lock")
-                            .resolve(t)
-                    })
-                    .unwrap_or_default();
-                if subscribers.is_empty() {
-                    warn!(
-                        target: "kian::subscriptions",
-                        channel = %event.channel,
-                        event_id = %event.event_id,
-                        topic = event.topic.as_deref().unwrap_or(""),
-                        reason = %IntakeReason::AdmittedRouter.code(),
-                        "subscription audit: passthrough topic unbound, falling back to router"
-                    );
-                    vec![self.router_session]
-                } else {
-                    subscribers.into_iter().collect()
+                let resolution = event.topic.as_deref().map(|t| {
+                    let registry = self.registry.read().expect("passthrough registry lock");
+                    if self.followup_ownership {
+                        (registry.resolve_live(t), registry.resolve(t))
+                    } else {
+                        let all = registry.resolve(t);
+                        (all.clone(), all)
+                    }
+                });
+                match resolution {
+                    Some((live, historical)) if !historical.is_empty() => {
+                        if self.followup_ownership && live.is_empty() {
+                            // Release to fresh evaluation (C59, 002's
+                            // Ticket-end rule): every subscriber ended —
+                            // the follow-up belongs to a *new* Ticket,
+                            // judged by the Router. The audit line names
+                            // the released topic and carries the closed
+                            // reason code.
+                            warn!(
+                                target: "kian::subscriptions",
+                                channel = %event.channel,
+                                event_id = %event.event_id,
+                                topic = event.topic.as_deref().unwrap_or(""),
+                                reason = %IntakeReason::ReleasedToEval.code(),
+                                "subscription audit: topic released to fresh evaluation \
+                                 (all subscribers ended), falling back to router"
+                            );
+                            vec![self.router_session]
+                        } else if self.followup_ownership {
+                            live.into_iter().collect()
+                        } else {
+                            historical.into_iter().collect()
+                        }
+                    }
+                    _ => {
+                        warn!(
+                            target: "kian::subscriptions",
+                            channel = %event.channel,
+                            event_id = %event.event_id,
+                            topic = event.topic.as_deref().unwrap_or(""),
+                            reason = %IntakeReason::AdmittedRouter.code(),
+                            "subscription audit: passthrough topic unbound, falling back to router"
+                        );
+                        vec![self.router_session]
+                    }
                 }
             }
         };
@@ -763,6 +849,148 @@ mod tests {
         assert_eq!(
             *inbox.wakes.lock().unwrap(),
             vec![worker_b, worker_a, worker_b]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // C59: follow-up ownership — live-only fan-out + release fallback
+    // -----------------------------------------------------------------
+
+    /// A follow-up on a topic with one live subscriber admits to that
+    /// worker (and to the worker only — the Router session never sees a
+    /// row, so no judge turn can be spent on the event).
+    #[tokio::test]
+    async fn live_subscriber_owns_the_follow_up_not_the_router() {
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let worker = sid(30);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        service.register_topic("pr-9", worker);
+        let outcome = service
+            .handle_event(event("ci", "evt-live", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: worker,
+                deduplicated: false
+            }
+        );
+        // Exactly one durable row, for the worker — the Router was
+        // never admitted, never woken.
+        assert_eq!(
+            inbox.admits.lock().unwrap().clone(),
+            vec![(worker, Some("evt-live".into()))]
+        );
+        assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker]);
+    }
+
+    /// All subscribers ended: the topic releases to the Router (fresh
+    /// evaluation). A mixed set admits to the live remainder only — an
+    /// ended subscriber's terminal session never receives a row.
+    #[tokio::test]
+    async fn all_ended_topic_releases_to_the_router_mixed_admits_live_only() {
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let ended = sid(31);
+        let live = sid(32);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        service.register_topic("pr-9", ended);
+        service.register_topic("pr-9", live);
+        // The first worker's stream ended (its thread/completed landed
+        // before this follow-up arrived).
+        service.mark_worker_ended(ended);
+        let outcome = service
+            .handle_event(event("ci", "evt-mixed", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: live,
+                deduplicated: false
+            }
+        );
+        assert_eq!(
+            inbox.admits.lock().unwrap().clone(),
+            vec![(live, Some("evt-mixed".into()))]
+        );
+
+        // All ended: the release — the Router is the single target.
+        service.mark_worker_ended(live);
+        let outcome = service
+            .handle_event(event("ci", "evt-release", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: router,
+                deduplicated: false
+            }
+        );
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.last(), Some(&(router, Some("evt-release".into()))));
+        assert_eq!(
+            admits.iter().filter(|(s, _)| *s == ended).count(),
+            0,
+            "the ended subscriber never receives a row"
+        );
+    }
+
+    /// `superagent.followup_ownership: false` restores the pre-C59
+    /// behavior: every historical subscriber — ended or not — admits.
+    #[tokio::test]
+    async fn ownership_off_restores_ended_subscriber_admission() {
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let ended = sid(33);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
+                .with_followup_ownership(false);
+        service.register_topic("pr-9", ended);
+        service.mark_worker_ended(ended);
+        let outcome = service
+            .handle_event(event("ci", "evt-off", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: ended,
+                deduplicated: false
+            }
+        );
+    }
+
+    /// The shared-registry handle (C59 assembly wiring): the service
+    /// and an outside holder observe one projection — a registration
+    /// through the service is visible through the Arc, and a startup
+    /// `install_registry` through the service reaches the Arc holder.
+    #[tokio::test]
+    async fn shared_registry_is_one_projection_across_holders() {
+        let inbox = FanoutInbox::new();
+        let router = sid(1);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let shared = service.shared_registry();
+        service.register_topic("pr-9", sid(34));
+        assert!(
+            shared
+                .read()
+                .expect("shared registry lock")
+                .live_owner("pr-9")
+                .is_some()
+        );
+        let mut rebuilt = PassthroughRegistry::new();
+        rebuilt.register("pr-9", sid(35));
+        service.install_registry(rebuilt);
+        assert_eq!(
+            shared.read().expect("shared registry lock").resolve("pr-9"),
+            std::collections::BTreeSet::from([sid(35)])
         );
     }
 

@@ -633,16 +633,30 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
         vec![worker],
         "worker discovery from thread/started"
     );
-    let rebuilt = PassthroughRegistry::rebuild(
-        router_events
-            .iter()
-            .chain(store.rebuild(worker).await.unwrap().iter()),
-    );
-    // C38: resolve returns the subscriber set (singleton here).
+    let worker_events = store.rebuild(worker).await.unwrap();
+    let rebuilt = PassthroughRegistry::rebuild(router_events.iter().chain(worker_events.iter()));
+    // C38: resolve returns the subscriber set (singleton here) — the
+    // historical record keeps the binding forever.
     assert_eq!(rebuilt.resolve("pr-9"), BTreeSet::from([worker]));
     assert_eq!(rebuilt.topics(), vec!["pr-9".to_string()]);
+    // C59 (kian-68): the worker's session settled (its scripted driver
+    // returned a terminal outcome, so its stream carries `session/ended`)
+    // — the liveness projection reads it as `ended`, and a follow-up on
+    // the topic releases to the Router as a fresh evaluation instead of
+    // admitting onto the terminal session. (Pre-C59 this fixture relied
+    // on ended-subscriber admission; rewritten to the new fallback and
+    // named — plan C59's sanctioned-edit clause.)
+    assert_eq!(
+        rebuilt.status(&worker),
+        kian_superagent::WorkerStatus::Ended
+    );
+    assert!(rebuilt.resolve_live("pr-9").is_empty());
 
-    // The rebuilt registry routes exactly like the pre-restart one.
+    // The rebuilt registry routes the follow-up to the fresh evaluation.
+    // (The release audit line itself is asserted in
+    // `tests/followup_ownership.rs`, whose binary owns a sound
+    // process-global log capture; this file's per-test buffer fixture
+    // is order-parasitic, so this test stays outcome-observable only.)
     let fresh = SubscriptionService::new(
         router,
         router_rules(),
@@ -664,9 +678,10 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
     assert_eq!(
         outcome,
         RoutingOutcome::Routed {
-            session: worker,
+            session: router,
             deduplicated: false
-        }
+        },
+        "an all-ended topic releases to the Router (released_to_eval)"
     );
 }
 
