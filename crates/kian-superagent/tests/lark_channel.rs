@@ -658,3 +658,37 @@ async fn lark_live_smoke_env_gated() {
         eprintln!("live receive skipped: KIAN_LARK_POLL_CHAT not set");
     }
 }
+
+// ---------------------------------------------------------------------------
+// C61: the chat-history cursor helper (read-position derivation, fixture
+// payloads only)
+// ---------------------------------------------------------------------------
+
+/// `payload_message_cursor` reads the top-level `message_id` off a
+/// mapped history item — the offset marker a restart's poll resumes
+/// after. Missing or empty ids are honest `None`s (the caller re-polls
+/// under `event_id` dedupe).
+#[test]
+fn payload_message_cursor_reads_the_message_id_offset() {
+    use kian_superagent::payload_message_cursor;
+
+    let message = user_message("om_8812", "oc_7f3a", "please review");
+    assert_eq!(payload_message_cursor(&message).as_deref(), Some("om_8812"));
+
+    // Missing id: honestly underivable.
+    let mut no_id = user_message("om_x", "oc_1", "hi");
+    no_id
+        .as_object_mut()
+        .unwrap()
+        .remove("message_id")
+        .expect("fixture carries the id");
+    assert_eq!(payload_message_cursor(&no_id), None);
+
+    // Empty id is not a cursor.
+    let empty = json!({"message_id": "", "chat_id": "oc_1"});
+    assert_eq!(payload_message_cursor(&empty), None);
+
+    // A non-string id is not a cursor (never a guessed render).
+    let numeric = json!({"message_id": 42, "chat_id": "oc_1"});
+    assert_eq!(payload_message_cursor(&numeric), None);
+}

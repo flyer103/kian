@@ -685,3 +685,63 @@ async fn github_live_smoke_env_gated() {
         None => eprintln!("live send skipped: KIAN_GITHUB_SEND_TARGET not set"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// C61: the REST `since` cursor helper (read-position derivation, fixture
+// payloads only)
+// ---------------------------------------------------------------------------
+
+/// `payload_since_cursor` reads the `updated_at` field the REST list
+/// endpoints filter on — issue shape, PR shape, and the honest `None`
+/// for payloads that belong to no issue/PR (push/check_run/status) or
+/// carry no timestamp.
+#[test]
+fn payload_since_cursor_reads_issue_and_pr_timestamps_and_none_otherwise() {
+    use kian_superagent::payload_since_cursor;
+
+    // Issue shape (issues / issue_comment bodies): issue.updated_at.
+    let issue = json!({
+        "action": "created",
+        "issue": {"number": 9, "updated_at": "2026-11-03T10:30:00Z"},
+        "repository": {"full_name": "flyer103/kian"},
+    });
+    assert_eq!(
+        payload_since_cursor(&issue).as_deref(),
+        Some("2026-11-03T10:30:00Z")
+    );
+
+    // PR shape: pull_request.updated_at.
+    let pr = json!({
+        "action": "synchronize",
+        "pull_request": {"number": 11, "updated_at": "2026-11-03T11:00:00Z"},
+        "repository": {"full_name": "flyer103/kian"},
+    });
+    assert_eq!(
+        payload_since_cursor(&pr).as_deref(),
+        Some("2026-11-03T11:00:00Z")
+    );
+
+    // The issue shape wins over a nested PR timestamp inside it (the
+    // mapped payload is one shape at a time; the issue pointer is
+    // probed first, deterministically).
+    let both = json!({
+        "issue": {"number": 9, "updated_at": "2026-11-03T09:00:00Z",
+                  "pull_request": {"updated_at": "2026-11-03T12:00:00Z"}},
+    });
+    assert_eq!(
+        payload_since_cursor(&both).as_deref(),
+        Some("2026-11-03T09:00:00Z")
+    );
+
+    // No issue/PR: honest None (the caller re-polls under dedupe).
+    let push = json!({
+        "ref": "refs/heads/main",
+        "commits": [{"id": "abc", "message": "fix"}],
+        "repository": {"full_name": "flyer103/kian"},
+    });
+    assert_eq!(payload_since_cursor(&push), None);
+
+    // Present but empty string is not a cursor.
+    let empty = json!({"issue": {"number": 1, "updated_at": ""}});
+    assert_eq!(payload_since_cursor(&empty), None);
+}

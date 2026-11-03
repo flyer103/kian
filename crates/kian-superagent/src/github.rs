@@ -380,6 +380,26 @@ pub fn delivery_to_event(
     })
 }
 
+/// The REST `since` cursor a mapped payload carries (C61 read
+/// position): the `updated_at` timestamp of the issue or PR the
+/// payload belongs to — exactly the field the REST list endpoints
+/// filter on, so a restart's poll resumes at the last admitted
+/// event's timestamp instead of replaying. Pure over the payload;
+/// `None` when the payload belongs to no issue/PR (push, check_run,
+/// status) or carries no timestamp — the caller then re-polls bounded
+/// by `event_id` dedupe (ADR-013's honest v1, no position table).
+pub fn payload_since_cursor(payload: &Value) -> Option<String> {
+    ["/issue/updated_at", "/pull_request/updated_at"]
+        .into_iter()
+        .find_map(|pointer| {
+            payload
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|ts| !ts.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Is this payload PR-scoped, and with which number? `pull_request`
 /// events carry `pull_request.number`; an `issues`/`issue_comment`
 /// payload belongs to a PR when its `issue` carries the nested

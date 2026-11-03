@@ -487,8 +487,23 @@ fn message_has_mention(message: &Value) -> bool {
     })
 }
 
-/// Sends one delivery through the IM send API. Resolves only on the
-/// API's acceptance (`code == 0` + a message id); anything else is an
+/// The chat-history cursor a mapped message payload carries (C61 read
+/// position): its top-level `message_id` — offset semantics, the next
+/// poll resumes after it (the history API pages by create time; the
+/// id is the durable marker of what admission already saw). Pure over
+/// the payload; `None` when the payload carries no usable id — the
+/// caller then re-polls bounded by `event_id` dedupe (ADR-013's
+/// honest v1, no position table).
+pub fn payload_message_cursor(payload: &Value) -> Option<String> {
+    payload
+        .get("message_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Sends one delivery through the IM send API. Resolves only after
+/// the API's acceptance (`code == 0` + a message id); anything else is an
 /// honest error.
 async fn send_message(inner: &Inner, out: &ChannelDelivery) -> Result<SendReceipt, ChannelError> {
     let Some(target) = out.target.as_object() else {
