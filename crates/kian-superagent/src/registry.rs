@@ -1,5 +1,6 @@
 //! Passthrough worker registry: `topic → set of worker sessions`
-//! (card C38: many-to-many fan-out).
+//! (card C38: many-to-many fan-out), with the C59 liveness
+//! projection layered on top.
 //!
 //! A **disposable projection** (constraint 1): nothing authoritative
 //! lives here. At runtime the spawner registers fresh workers
@@ -12,6 +13,16 @@
 //! task's content), and the workers' own `input/admitted` payloads
 //! carry the channel-event wrapper with the topic they served. Drop the
 //! registry and replay the streams and you get the same map back.
+//!
+//! C59 (follow-up ownership): the registry also projects each worker's
+//! **status** — `live` or `ended` — from the worker's own stream
+//! (`thread/completed` or `session/ended`). [`PassthroughRegistry::resolve`]
+//! keeps returning every subscriber (the historical record: a worker
+//! that served a topic stays bound to it); the fan-out path resolves
+//! through [`PassthroughRegistry::resolve_live`] instead, and an
+//! all-ended set is the *release to fresh evaluation* signal (002's
+//! Ticket-end rule) the subscription service turns into a Router
+//! fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,12 +31,42 @@ use kian_core::model::SessionId;
 
 use crate::provenance::parse_channel_marker;
 
+/// A worker's liveness (C59): `Live` until its own stream carries
+/// `thread/completed` or `session/ended`, then `Ended` — terminal for
+/// a kian Ticket v1 (one worker session's life; resumption is a fresh
+/// Eval, never a same-session resume). A pure projection of the
+/// stream: the runtime registry holds the same fact `register` /
+/// [`PassthroughRegistry::mark_ended`] write, and a rebuild re-derives
+/// it, so the two can be asserted equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkerStatus {
+    Live,
+    Ended,
+}
+
+impl WorkerStatus {
+    /// The stable machine spelling (audit lines, tests).
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// The runtime projection: routing topic → the *set* of worker sessions
-/// subscribed to it (C38 fan-out). Guarded by a lock at the call site;
-/// cheap to rebuild and safe to discard.
+/// subscribed to it (C38 fan-out), plus the C59 worker-status
+/// projection. Guarded by a lock at the call site; cheap to rebuild and
+/// safe to discard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassthroughRegistry {
     topics: BTreeMap<String, BTreeSet<SessionId>>,
+    /// Workers whose streams ended (`thread/completed`/`session/ended`).
+    /// Kept *beside* the topic sets, never removed from them: the sets
+    /// are the historical binding record; `ended` is the liveness view
+    /// the fan-out filters with.
+    ended: BTreeSet<SessionId>,
 }
 
 impl PassthroughRegistry {
@@ -37,15 +78,70 @@ impl PassthroughRegistry {
     /// worker spawner (C25); a second worker on the same topic joins
     /// the set — both then observe the topic's events. Restarts
     /// re-derive the same entries via [`PassthroughRegistry::rebuild`]
-    /// instead.
+    /// instead. Registration asserts liveness: a session registered
+    /// here is `live` (an `ended` session id being re-registered is a
+    /// caller bug, and the honest reading is the fresh assertion).
     pub fn register(&mut self, topic: impl Into<String>, worker: SessionId) {
+        self.ended.remove(&worker);
         self.topics.entry(topic.into()).or_default().insert(worker);
     }
 
-    /// The set of worker sessions subscribed to `topic` — empty means
-    /// unbound (the subscription service's Router fallback).
+    /// Marks a worker's stream ended (C59). Idempotent; the topic sets
+    /// are untouched — the worker stays a *historical* subscriber and
+    /// [`PassthroughRegistry::resolve`] keeps naming it, but
+    /// [`PassthroughRegistry::resolve_live`] stops returning it.
+    pub fn mark_ended(&mut self, worker: SessionId) {
+        self.ended.insert(worker);
+    }
+
+    /// The worker's projected status (C59). Unknown sessions are
+    /// `live` — the registry only ever records the ended ones.
+    #[must_use]
+    pub fn status(&self, worker: &SessionId) -> WorkerStatus {
+        if self.ended.contains(worker) {
+            WorkerStatus::Ended
+        } else {
+            WorkerStatus::Live
+        }
+    }
+
+    /// The set of worker sessions subscribed to `topic` — every worker
+    /// that ever served it, live or ended (the historical record).
+    /// Empty means unbound (the subscription service's Router
+    /// fallback).
     pub fn resolve(&self, topic: &str) -> BTreeSet<SessionId> {
         self.topics.get(topic).cloned().unwrap_or_default()
+    }
+
+    /// The set of **live** subscribers of `topic` (C59): the historical
+    /// set minus the ended workers. This is the fan-out admission set —
+    /// an event never admits onto a terminal session where it would
+    /// strand forever.
+    #[must_use]
+    pub fn resolve_live(&self, topic: &str) -> BTreeSet<SessionId> {
+        let subs = self.resolve(topic);
+        if self.ended.is_empty() {
+            return subs;
+        }
+        subs.into_iter()
+            .filter(|w| !self.ended.contains(w))
+            .collect()
+    }
+
+    /// The deterministic first live subscriber of `topic` (C59's owner
+    /// for the tool-surface refusal): session ids sort, so the owner
+    /// named in a refusal is stable. `None` when no live worker owns
+    /// the topic (unbound, or all subscribers ended — the release to
+    /// fresh evaluation).
+    #[must_use]
+    pub fn live_owner(&self, topic: &str) -> Option<SessionId> {
+        self.resolve_live(topic).into_iter().next()
+    }
+
+    /// The ended workers recorded by the projection (inspection/tests).
+    #[must_use]
+    pub fn ended_workers(&self) -> Vec<SessionId> {
+        self.ended.iter().copied().collect()
     }
 
     /// Sorted topic list (deterministic iteration for tests/inspection).
@@ -79,6 +175,14 @@ impl PassthroughRegistry {
     /// Both sources *add* to each topic's set: every worker that ever
     /// served the topic is a subscriber (the fan-out semantics), and a
     /// topic bound by several workers rebuilds to exactly their set.
+    ///
+    /// C59 status projection, derived in the same pass: a worker
+    /// session whose own stream carries `thread/completed` or
+    /// `session/ended` is `ended`. The terminal event must sit on the
+    /// *worker's* stream — a Router-side `session/ended` (the re-arm
+    /// chain) is not a worker fact and marks nothing. Rebuild is the
+    /// ground truth the runtime registry's `register`/`mark_ended`
+    /// writes must equal.
     pub fn rebuild<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
         let events: Vec<&Event> = events.into_iter().collect();
 
@@ -89,6 +193,22 @@ impl PassthroughRegistry {
                 && let Some(worker) = bytes_worker(&ev.bytes)
             {
                 workers.insert(worker);
+            }
+        }
+
+        let mut ended: BTreeSet<SessionId> = BTreeSet::new();
+        for ev in &events {
+            if !workers.contains(&ev.session) {
+                continue;
+            }
+            match ev.kind {
+                EventKind::ThreadCompleted => {
+                    ended.insert(ev.session);
+                }
+                EventKind::SessionEnded { .. } => {
+                    ended.insert(ev.session);
+                }
+                _ => {}
             }
         }
 
@@ -122,7 +242,7 @@ impl PassthroughRegistry {
                 topics.entry(topic).or_default().insert(ev.session);
             }
         }
-        Self { topics }
+        Self { topics, ended }
     }
 }
 
@@ -352,5 +472,122 @@ mod tests {
         // An unknown topic resolves to the empty set (unbound → the
         // subscription service's Router fallback).
         assert!(r.resolve("unknown").is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // C59: the worker-status projection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_live_filters_ended_workers_and_keeps_the_historical_set() {
+        let mut r = PassthroughRegistry::new();
+        r.register("pr-9", sid(7));
+        r.register("pr-9", sid(8));
+        assert_eq!(r.resolve_live("pr-9"), BTreeSet::from([sid(7), sid(8)]));
+        r.mark_ended(sid(7));
+        // The historical set is untouched; the live view drops the
+        // ended worker.
+        assert_eq!(r.resolve("pr-9"), BTreeSet::from([sid(7), sid(8)]));
+        assert_eq!(r.resolve_live("pr-9"), BTreeSet::from([sid(8)]));
+        assert_eq!(r.status(&sid(7)), super::WorkerStatus::Ended);
+        assert_eq!(r.status(&sid(8)), super::WorkerStatus::Live);
+        // Unknown sessions project live; the deterministic first live
+        // subscriber is the sorted minimum.
+        assert_eq!(r.status(&sid(99)), super::WorkerStatus::Live);
+        assert_eq!(r.live_owner("pr-9"), Some(sid(8)));
+        r.mark_ended(sid(8));
+        // All ended: no live owner — the release-to-fresh-Eval shape.
+        assert!(r.resolve_live("pr-9").is_empty());
+        assert_eq!(r.live_owner("pr-9"), None);
+        assert_eq!(r.ended_workers(), vec![sid(7), sid(8)]);
+        // mark_ended is idempotent.
+        r.mark_ended(sid(7));
+        assert_eq!(r.ended_workers(), vec![sid(7), sid(8)]);
+    }
+
+    #[test]
+    fn rebuild_derives_ended_status_from_worker_terminal_events() {
+        // Mixed live/ended stream: two workers bound to one topic (the
+        // delegation-marker source), one whose stream ended with
+        // `thread/completed`, one still live; a third worker ended via
+        // `session/ended` on another topic. The Router's own
+        // `session/ended` (re-arm chain) must mark nothing.
+        let router = sid(1);
+        let live = sid(2);
+        let done = sid(3);
+        let session_ended_worker = sid(4);
+        let marker = |topic: &str| {
+            wrap_channel_event(&kian_core::seams::ChannelEvent {
+                channel: "ci".into(),
+                event_id: "evt-0".into(),
+                topic: Some(topic.into()),
+                sender: None,
+                group: None,
+                payload: json!({"build": "ok"}),
+                ts_ms: 1,
+            })
+        };
+        let mut events = vec![
+            thread_started(
+                router,
+                live,
+                json!({"role": "user", "content": marker("pr-9")}),
+            ),
+            thread_started(
+                router,
+                done,
+                json!({"role": "user", "content": marker("pr-9")}),
+            ),
+            thread_started(
+                router,
+                session_ended_worker,
+                json!({"role": "user", "content": marker("pr-10")}),
+            ),
+        ];
+        events.push(event(
+            done,
+            7,
+            EventKind::ThreadCompleted,
+            json!({"status": "completed"}),
+        ));
+        events.push(event(
+            session_ended_worker,
+            8,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Completed,
+            },
+            json!({}),
+        ));
+        events.push(event(
+            router,
+            9,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Completed,
+            },
+            json!({}),
+        ));
+
+        let rebuilt = PassthroughRegistry::rebuild(&events);
+        // Historical sets keep every subscriber.
+        assert_eq!(rebuilt.resolve("pr-9"), BTreeSet::from([live, done]));
+        // Live views drop the ended ones.
+        assert_eq!(rebuilt.resolve_live("pr-9"), BTreeSet::from([live]));
+        assert_eq!(rebuilt.status(&done), super::WorkerStatus::Ended);
+        assert_eq!(
+            rebuilt.status(&session_ended_worker),
+            super::WorkerStatus::Ended
+        );
+        assert!(rebuilt.resolve_live("pr-10").is_empty());
+        // The Router is not a worker: its session/ended marks nothing.
+        assert_eq!(rebuilt.status(&router), super::WorkerStatus::Live);
+
+        // The runtime map (register + mark_ended) equals the rebuild.
+        let mut runtime = PassthroughRegistry::new();
+        runtime.register("pr-9", live);
+        runtime.register("pr-9", done);
+        runtime.register("pr-10", session_ended_worker);
+        runtime.mark_ended(done);
+        runtime.mark_ended(session_ended_worker);
+        assert_eq!(rebuilt, runtime);
     }
 }
