@@ -440,6 +440,7 @@ impl Server {
                     .transpose()
                     .map_err(ServeError::Config)?,
                 speak: sa.speak_policy().map_err(ServeError::Config)?,
+                followup_ownership: sa.followup_ownership,
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,

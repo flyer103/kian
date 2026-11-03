@@ -159,7 +159,7 @@ pub use provenance::{
 };
 pub use reasons::{DecisionKind, IntakeReason, outcome_reasons, routed_reason};
 pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
-pub use registry::{PassthroughRegistry, worker_sessions};
+pub use registry::{PassthroughRegistry, WorkerStatus, worker_sessions};
 pub use router::{
     ChannelRegistry, DEFAULT_PARK_TICK_MS, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE,
     JudgePrompt, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox,

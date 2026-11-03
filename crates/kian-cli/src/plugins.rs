@@ -348,6 +348,12 @@ pub struct SuperAgentPlugin {
     /// `reply`/`deliver_structured`. Empty = ungated (today's
     /// behavior).
     pub speak: kian_superagent::SpeakPolicy,
+    /// C59 follow-up ownership (`superagent.followup_ownership`,
+    /// default on): live-only fan-out + release-to-fresh-Eval on
+    /// all-ended topics, and the `spawn_worker` topic-ownership
+    /// refusal at the tool surface. `false` restores the pre-C59
+    /// behavior.
+    pub followup_ownership: bool,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -489,6 +495,9 @@ impl Plugin for SuperAgentPlugin {
         let mut profile = RouterProfile::new(self.router_session, profile.router);
         profile.speculation = self.speculation.clone();
         profile.speak = self.speak.clone();
+        // C59: the follow-up-ownership gate rides the profile into the
+        // tool surface.
+        profile.followup_ownership = self.followup_ownership;
         // kian-62: the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 
@@ -538,12 +547,17 @@ impl Plugin for SuperAgentPlugin {
             adapters.push(Arc::clone(timer) as Arc<dyn ChannelAdapter>);
         }
         let hold = kian_superagent::RouterHold::shared();
-        let router_tools = Arc::new(RouterTools::new(
-            spawner,
-            channels.clone(),
-            &profile,
-            hold.clone(),
+        // C59: one shared registry projection for the tool surface and
+        // the subscription service — the spawn-time ownership check and
+        // the fan-out resolution read the same map (still disposable:
+        // `start_services` rebuilds its contents from streams at boot).
+        let followup_registry = Arc::new(std::sync::RwLock::new(
+            kian_superagent::PassthroughRegistry::new(),
         ));
+        let router_tools = Arc::new(
+            RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
+                .with_followup_registry(Arc::clone(&followup_registry)),
+        );
         // C35: the recall toolpack reads through the one `StoreRecall`
         // port the runtime also exposes (the spill index it holds is
         // rebuilt by `start_services`). Config-gated: default on for
@@ -773,7 +787,11 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
             )
             .with_shaping(self.shaping)
-            .with_untrusted_channels(self.untrusted_channels),
+            .with_untrusted_channels(self.untrusted_channels)
+            // C59: the fan-out and the spawn tool share one registry
+            // projection, and the ownership gate rides the same flag.
+            .with_shared_registry(Arc::clone(&followup_registry))
+            .with_followup_ownership(self.followup_ownership),
         );
         let subscription_metrics = Arc::new(crate::superagent::SubscriptionMetrics::default());
 

@@ -493,6 +493,22 @@ pub struct SuperAgentConfig {
     /// must be declared in `channels:` (fail-closed cross-reference).
     #[serde(default)]
     pub speak_rules: Vec<SpeakRuleDef>,
+    /// C59 follow-up ownership: a person's follow-up belongs to the
+    /// live Ticket's Executor (reference 002). On (the default), the
+    /// fan-out admits to live subscribers only — an all-ended topic
+    /// releases to the Router as a fresh evaluation
+    /// (`released_to_eval`) — and `spawn_worker` refuses a topic
+    /// correlation a live worker already owns with an honest tool
+    /// error naming the owner (the Router may only stop it).
+    /// `false` restores the pre-C59 behavior.
+    #[serde(default = "default_followup_ownership")]
+    pub followup_ownership: bool,
+}
+
+/// C59's default: follow-up ownership is **on** — the honest default
+/// is the rule, opt-out is explicit.
+fn default_followup_ownership() -> bool {
+    true
 }
 
 impl SuperAgentConfig {
