@@ -968,6 +968,25 @@ its slice here (the C66 closeout reconciles the whole section).
   byte-identical single attempt); at-least-once duplicates under concurrent tickets are
   the documented bound (the plan's risk-4 note). Full placement note: §4.2 outbox
   paragraph.
+- **Issue-watch multi-Ticket fan-out (C64, kian-72)** — the P6c dogfood shape: `github.rs`
+  gains an optional **poll-receive mode beside the (untouched) C49 webhook surface** —
+  config `github.poll {repo, interval_ms, kinds[issues, issue_comments], since_field,
+  backfill_ms}` drives the REST list endpoints with `since` cursors (the C61 read
+  position: the cursor derives from the last admitted event's payload; a fresh deployment
+  admits at most the bounded `backfill_ms` window, never repo history), token env-only
+  (`KIAN_GITHUB_TOKEN`, falling back to the invoking user's `gh auth token`). Polled
+  items map through the existing C48 mapping unchanged: delivery id = `event_id`
+  (idempotent re-poll), topic = the C61 thread key `issue-github:<owner>/<repo>#<N>`,
+  admission classes per C36 (bot/CI ignored, human comments candidate, adapter-declared
+  `explicit` on issue authorship → ADR-012 mandate strength). The example
+  (`examples/issue-watch` v2; the timer v1 kept verbatim as `config-timer.yaml` for the
+  regression demo) composes the whole Wave A/B stack on one source: the Router judges
+  new issues (accept with Mandate → `spawn_worker` per issue topic), follow-ups admit to
+  the live triager with zero Router judge turns (C59), ended workers release to fresh
+  Eval, drafts deliver once under speak-rules (C58) retrying through the outbox (C62),
+  `kian tickets` shows the live stage board (C56) — fixture-proven in CI
+  (`tests/github_channel.rs` poll suites, `tests/issue_watch_fanout.rs` end-to-end),
+  no default-CI network; live-repo evidence is C65.
 
 ## 5. Control-plane protocol (P5 protocolized)
 
