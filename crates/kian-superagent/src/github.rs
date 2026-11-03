@@ -79,6 +79,13 @@ pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// The REST API version pin (`X-GitHub-Api-Version`).
 pub const API_VERSION: &str = "2022-11-28";
 
+/// The `User-Agent` every request carries (kian-74): api.github.com
+/// answers UA-less requests with HTTP 403 + an HTML body, which the
+/// JSON decode then fails opaquely ("poll response unreadable").
+/// Applied once on the client so both the poll GETs and the send
+/// POST/PATCHs (and any future request path) carry it.
+pub const USER_AGENT: &str = concat!("kian/", env!("CARGO_PKG_VERSION"), " (+issue-watch)");
+
 /// The webhook event types this adapter maps (the S4 family). Any
 /// other `X-GitHub-Event` is an honest drop with an audit line —
 /// never a best-effort parse.
@@ -384,6 +391,10 @@ impl GitHubChannel {
         config.validate()?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            // kian-74: api.github.com 403s UA-less requests — the
+            // client-level default covers poll, send, and every
+            // future request path in one place.
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| GitHubError::BadApiBase(format!("http client: {e}")))?;
         Ok(Self {
@@ -745,6 +756,48 @@ pub fn poll_thread_key_rule(channel: &str) -> crate::intake::ThreadKeyRule {
             "issue.number".to_string(),
         ],
     }
+}
+
+/// Derives the outbox conversation keys a C61 thread-key topic covers
+/// (kian-76): a topic of the shape `<channel>:<owner/repo>#<number>`
+/// names exactly one GitHub conversation, and every send the Router
+/// makes for it targets `{kind, number, owner, repo}` for one of
+/// [`SEND_KINDS`] — the same `(channel, speak_key(target))` key the
+/// outbox intent carries, so the board can attribute a pending/parked
+/// delivery to a worker from the topic alone (both sides derive it;
+/// no freeform `correlation` needs to match). Any topic not of that
+/// shape derives nothing — honest empty, never a guess.
+#[must_use]
+pub fn topic_conversation_keys(topic: &str) -> Vec<String> {
+    let Some((channel, rest)) = topic.split_once(':') else {
+        return Vec::new();
+    };
+    if channel.is_empty() {
+        return Vec::new();
+    }
+    let Some((repo, number)) = rest.rsplit_once('#') else {
+        return Vec::new();
+    };
+    let Some(number) = number.parse::<u64>().ok().filter(|n| *n > 0) else {
+        return Vec::new();
+    };
+    let Some((owner, repo_name)) = repo.split_once('/') else {
+        return Vec::new();
+    };
+    if owner.is_empty() || repo_name.is_empty() {
+        return Vec::new();
+    }
+    SEND_KINDS
+        .iter()
+        .map(|kind| {
+            crate::outbox::conversation_key(
+                channel,
+                &serde_json::json!({
+                    "kind": kind, "number": number, "owner": owner, "repo": repo_name
+                }),
+            )
+        })
+        .collect()
 }
 
 /// The `updated_at` timestamp of one list item (`None` = the item
@@ -1717,5 +1770,56 @@ mod tests {
         );
         // Leap-year day: 2024-02-29T12:00:00Z == 1709208000.
         assert_eq!(super::rfc3339_ms(1_709_208_000_000), "2024-02-29T12:00:00Z");
+    }
+
+    #[test]
+    fn thread_key_topic_derives_the_conversation_keys_both_sides_share() {
+        // kian-76: a C61 thread-key topic `<channel>:<owner/repo>#<n>`
+        // names one GitHub conversation; every send the Router makes
+        // for it targets `{kind, number, owner, repo}` for one of the
+        // send kinds — the exact `conversation_key` the outbox intent
+        // carries. The live run2 conversation string is asserted
+        // byte-for-byte.
+        let keys = super::topic_conversation_keys("issue-github:flyer103/kian#4");
+        let conv = |kind: &str| {
+            crate::outbox::conversation_key(
+                "issue-github",
+                &json!({"kind": kind, "number": 4, "owner": "flyer103", "repo": "kian"}),
+            )
+        };
+        assert_eq!(
+            keys,
+            vec![
+                conv("issue_comment"),
+                conv("pr_review"),
+                conv("pr_description"),
+            ],
+            "{keys:?}"
+        );
+        // The live byte shape (run2 serve.log, issue #4's parked
+        // delivery) — serde_json's canonical object rendering, no
+        // preserve_order, matches what the model's target serialized
+        // to on the Router stream.
+        assert_eq!(
+            keys[0],
+            "issue-github:{\"kind\":\"issue_comment\",\"number\":4,\"owner\":\"flyer103\",\"repo\":\"kian\"}"
+        );
+        // Anything not of the thread-key shape derives nothing —
+        // honest empty, never a guess.
+        for topic in [
+            "ci",
+            "issue-github:flyer103/kian",
+            "issue-github:flyer103/kian#zero",
+            "issue-github:flyer103#4",
+            "issue-github:/kian#4",
+            "issue-github:flyer103/#4",
+            ":flyer103/kian#4",
+            "issue-github:flyer103/kian#4:extra",
+        ] {
+            assert!(
+                super::topic_conversation_keys(topic).is_empty(),
+                "`{topic}` must derive no conversation"
+            );
+        }
     }
 }

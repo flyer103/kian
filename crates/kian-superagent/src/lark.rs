@@ -59,6 +59,12 @@ pub const DEFAULT_API_BASE: &str = "https://open.feishu.cn";
 /// `POST /open-apis/auth/v3/tenant_access_token/internal`.
 const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
 
+/// The `User-Agent` every request carries (kian-74, the lark half of
+/// the check): applied once on the client so the token POST, the
+/// history GET, and the send POST all carry it. Feishu tolerates a
+/// missing one today — the adapter must not depend on that.
+pub const USER_AGENT: &str = concat!("kian/", env!("CARGO_PKG_VERSION"), " (+issue-watch)");
+
 /// `GET`/`POST /open-apis/im/v1/messages` (history read + send).
 const MESSAGES_PATH: &str = "/open-apis/im/v1/messages";
 
@@ -184,6 +190,9 @@ impl LarkChannel {
         config.validate()?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
+            // kian-74: the client-level User-Agent covers the token
+            // POST, history GET, and send POST in one place.
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| LarkError::BadApiBase(format!("http client: {e}")))?;
         Ok(Self {

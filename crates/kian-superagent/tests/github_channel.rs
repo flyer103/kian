@@ -38,6 +38,10 @@ type CapturedCall = (String, String, String, String, Value);
 
 struct GitHubMock {
     calls: Mutex<Vec<CapturedCall>>,
+    /// The `User-Agent` of every captured call, in call order (the
+    /// kian-74 regression surface: api.github.com 403s UA-less
+    /// requests, and reqwest sends none by default).
+    user_agents: Mutex<Vec<String>>,
     /// The (status, json) the API answers with, when scripted.
     respond: Mutex<Option<(u16, Value)>>,
     /// C64: path-keyed list pages (exact path match wins over
@@ -49,6 +53,7 @@ impl GitHubMock {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
+            user_agents: Mutex::new(Vec::new()),
             respond: Mutex::new(None),
             pages: Mutex::new(std::collections::BTreeMap::new()),
         })
@@ -58,6 +63,11 @@ impl GitHubMock {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The `User-Agent` of every captured call, in call order.
+    fn user_agents(&self) -> Vec<String> {
+        self.user_agents.lock().unwrap().clone()
+    }
+
     fn reject_with(&self, status: u16, body: Value) {
         *self.respond.lock().unwrap() = Some((status, body));
     }
@@ -65,6 +75,12 @@ impl GitHubMock {
     /// Scripts one list page under an exact path (query included).
     fn serve_page(&self, path: &str, body: Value) {
         self.pages.lock().unwrap().insert(path.to_string(), body);
+    }
+
+    /// Drops every scripted page (the send tests' `/issues/N/comments`
+    /// paths prefix-match the poll page key `/issues`).
+    fn clear_pages(&self) {
+        self.pages.lock().unwrap().clear();
     }
 
     /// The path of the first captured call starting with `prefix`.
@@ -107,6 +123,12 @@ async fn capture_endpoint(State(state): State<Arc<GitHubMock>>, req: Request) ->
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = axum::body::Bytes::from_request(req, &state)
         .await
         .expect("mock body");
@@ -116,6 +138,7 @@ async fn capture_endpoint(State(state): State<Arc<GitHubMock>>, req: Request) ->
         .lock()
         .unwrap()
         .push((method, path.clone(), auth, api_version, body));
+    state.user_agents.lock().unwrap().push(user_agent);
     // A scripted page wins (the poll tests' list endpoints — longest
     // key prefix, so `/issues` vs `/issues/comments` disambiguate);
     // else the shared scripted response; else the default send
@@ -463,6 +486,71 @@ async fn send_resolves_only_after_the_api_accepts() {
         err,
         kian_core::seams::ChannelError::DeliveryFailed(_)
     ));
+}
+
+/// kian-74 regression (C65 live-run gap): api.github.com answers
+/// UA-less requests with 403 + HTML, which the adapter then fails to
+/// JSON-decode ("poll response unreadable") — the fixture suites never
+/// saw it because the scripted mock accepts anything. Every request
+/// the adapter puts on the wire (poll GETs on both list kinds, and
+/// all three send methods) must carry a `kian/…` User-Agent.
+#[tokio::test]
+async fn every_request_carries_a_user_agent() {
+    force_no_proxy();
+    let mock = GitHubMock::new();
+    let base = mock.clone().serve().await;
+
+    // The poll leg: one poll drives both list endpoints (GET).
+    mock.serve_page(
+        "/repos/flyer103/kian/issues",
+        json!([issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User")]),
+    );
+    mock.serve_page(
+        "/repos/flyer103/kian/issues/comments",
+        json!([comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment")]),
+    );
+    let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
+    let mut stream = channel.subscribe();
+    channel.seed_poll_cursor(Some("2026-11-01T00:00:00Z".into()));
+    let surfaced = channel.poll_once().await.expect("poll parses");
+    assert_eq!(surfaced, 2);
+    for _ in 0..2 {
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+    }
+    drop(stream);
+
+    // The send leg: all three send kinds (POST, POST, PATCH).
+    mock.clear_pages();
+    let channel = GitHubChannel::new("github", send_config(&base)).expect("valid config");
+    for kind in ["issue_comment", "pr_review", "pr_description"] {
+        channel
+            .send(ChannelDelivery {
+                channel: "github".into(),
+                target: json!({
+                    "owner": "flyer103",
+                    "repo": "kian",
+                    "number": 9,
+                    "kind": kind
+                }),
+                content: sections(),
+            })
+            .await
+            .expect("send accepted");
+    }
+
+    // 2 poll GETs + 3 sends = 5 captured calls, each with a UA.
+    let calls = mock.calls();
+    assert_eq!(calls.len(), 5, "2 poll GETs + 3 sends hit the mock");
+    let user_agents = mock.user_agents();
+    assert_eq!(user_agents.len(), calls.len(), "one UA per captured call");
+    for (index, ua) in user_agents.iter().enumerate() {
+        assert!(
+            ua.starts_with("kian/"),
+            "call #{index} ({}) carries the kian User-Agent, got {:?}",
+            calls[index].0,
+            ua
+        );
+    }
 }
 
 #[tokio::test]

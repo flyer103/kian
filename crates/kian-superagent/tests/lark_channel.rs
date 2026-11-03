@@ -41,6 +41,9 @@ struct FeishuMock {
     /// The (code, msg) the token endpoint rejects with, when set.
     token_reject: Mutex<Option<(i64, String)>>,
     token_calls: Mutex<u64>,
+    /// The `User-Agent` of every request the token/history/send
+    /// endpoints saw (the kian-74 check applied to lark too).
+    user_agents: Mutex<Vec<String>>,
 }
 
 impl FeishuMock {
@@ -51,7 +54,13 @@ impl FeishuMock {
             send_reject: Mutex::new(None),
             token_reject: Mutex::new(None),
             token_calls: Mutex::new(0),
+            user_agents: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The `User-Agent` of every captured request, in arrival order.
+    fn user_agents(&self) -> Vec<String> {
+        self.user_agents.lock().unwrap().clone()
     }
 
     fn put_message(&self, chat_id: &str, message: Value) {
@@ -95,8 +104,18 @@ impl FeishuMock {
     }
 }
 
-async fn token_endpoint(State(state): State<Arc<FeishuMock>>) -> Json<Value> {
+async fn token_endpoint(
+    State(state): State<Arc<FeishuMock>>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
     *state.token_calls.lock().unwrap() += 1;
+    state.user_agents.lock().unwrap().push(
+        headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    );
     if let Some((code, msg)) = state.token_reject.lock().unwrap().clone() {
         return Json(json!({"code": code, "msg": msg}));
     }
@@ -111,7 +130,15 @@ async fn token_endpoint(State(state): State<Arc<FeishuMock>>) -> Json<Value> {
 async fn history_endpoint(
     State(state): State<Arc<FeishuMock>>,
     Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Json<Value> {
+    state.user_agents.lock().unwrap().push(
+        headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    );
     let chat_id = query.get("container_id").cloned().unwrap_or_default();
     let items = state
         .chats
@@ -130,8 +157,16 @@ async fn history_endpoint(
 async fn send_endpoint(
     State(state): State<Arc<FeishuMock>>,
     Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Json<Value> {
+    state.user_agents.lock().unwrap().push(
+        headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    );
     if let Some((code, msg)) = state.send_reject.lock().unwrap().clone() {
         return Json(json!({"code": code, "msg": msg}));
     }
@@ -357,6 +392,50 @@ async fn poll_failures_are_honest_but_not_fatal() {
 // ---------------------------------------------------------------------------
 // Send (honest receipts only).
 // ---------------------------------------------------------------------------
+
+/// kian-74 (the lark half of the check): every request the adapter
+/// puts on the wire (tenant-token POST, history GET, send POST)
+/// carries a `kian/…` User-Agent — Feishu tolerates a missing one
+/// today, but the adapter must not depend on that.
+#[tokio::test]
+async fn every_request_carries_a_user_agent() {
+    force_no_proxy();
+    let mock = FeishuMock::new();
+    let base = mock.clone().serve().await;
+    mock.put_message("oc_chat1", user_message("om_1", "oc_chat1", "hello"));
+    let channel = LarkChannel::new("lark", lark_config(&base, &[("oc_chat1", "ci")]))
+        .expect("valid lark config");
+
+    // One poll tick (token POST + history GET)…
+    let mut stream = channel.subscribe();
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("event within 5s")
+        .expect("stream open");
+    assert_eq!(event.event_id, "om_1");
+
+    // …and one send (token already cached: send POST only).
+    channel
+        .send(ChannelDelivery {
+            channel: "lark".into(),
+            target: json!({"chat_id": "oc_chat1"}),
+            content: json!({"text": "done"}),
+        })
+        .await
+        .expect("send accepted");
+
+    let user_agents = mock.user_agents();
+    assert!(
+        user_agents.len() >= 3,
+        "token + history + send requests were captured, got {user_agents:?}"
+    );
+    for (index, ua) in user_agents.iter().enumerate() {
+        assert!(
+            ua.starts_with("kian/"),
+            "request #{index} carries the kian User-Agent, got {ua:?}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn send_resolves_only_after_the_api_accepts() {
