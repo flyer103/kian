@@ -217,17 +217,93 @@ pub fn thread_report_content(thread_id: Uuid, status: &str, summary: Value) -> V
     })
 }
 
+/// The structured report state (C56): the closed vocabulary the stage
+/// projection reads (the prototype 001's Report row: progress ·
+/// waiting · ready · blocked · failed · dropped). Carried by the
+/// **additive** `"state"` key on stated completion reports
+/// ([`thread_report_content_stated`]) — the frozen
+/// `thread_id`/`status`/`summary` triple and every legacy report byte
+/// are unchanged; 001's rule holds by construction: "waiting on a
+/// person" is a structured field, never inferred from free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportState {
+    Progress,
+    Waiting,
+    Ready,
+    Blocked,
+    Failed,
+    Dropped,
+}
+
+impl ReportState {
+    /// The stable wire name (the serde name).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Progress => "progress",
+            Self::Waiting => "waiting",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Dropped => "dropped",
+        }
+    }
+
+    /// Parses the wire name. Unknown values are `None` — a future
+    /// state never breaks a legacy reader (additions-only discipline).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "progress" => Some(Self::Progress),
+            "waiting" => Some(Self::Waiting),
+            "ready" => Some(Self::Ready),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            "dropped" => Some(Self::Dropped),
+            _ => None,
+        }
+    }
+}
+
+/// The additive state key on stated completion reports (C56). Omitted
+/// entirely by [`thread_report_content`] (legacy bytes unchanged, the
+/// C39 marker precedent).
+pub const REPORT_STATE_KEY: &str = "state";
+
+/// The stated completion-report content (C56): exactly
+/// [`thread_report_content`] plus the additive `"state"` key — the
+/// structured fact the Ticket stage projection reads (arm 2 `waiting`,
+/// arm 3 `ready`). The key is present (never `null`) precisely because
+/// this builder is only called with a state to state.
+#[must_use]
+pub fn thread_report_content_stated(
+    thread_id: Uuid,
+    status: &str,
+    summary: Value,
+    state: ReportState,
+) -> Value {
+    let mut report = thread_report_content(thread_id, status, summary);
+    report[REPORT_STATE_KEY] = Value::String(state.as_str().to_string());
+    report
+}
+
 /// A parsed completion report found inside a message `content`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadReport {
     pub thread_id: Uuid,
     pub status: String,
     pub summary: Value,
+    /// The additive structured state (C56): `None` on legacy reports
+    /// (the key is absent) and on unknown future values — the report
+    /// still parses, the state is never guessed.
+    pub state: Option<ReportState>,
 }
 
 /// Parses a completion report out of a message `content`. Strict:
 /// anything without a well-formed `thread_id`/`status`/`summary` triple
-/// is not a report (user text is never misread).
+/// is not a report (user text is never misread). The `state` key is
+/// additive: absent (legacy) ⇒ `None`.
 #[must_use]
 pub fn parse_thread_report(content: &Value) -> Option<ThreadReport> {
     let obj = content.as_object()?;
@@ -235,6 +311,10 @@ pub fn parse_thread_report(content: &Value) -> Option<ThreadReport> {
         thread_id: Uuid::parse_str(obj.get("thread_id")?.as_str()?).ok()?,
         status: obj.get("status")?.as_str()?.to_string(),
         summary: obj.get("summary")?.clone(),
+        state: obj
+            .get(REPORT_STATE_KEY)
+            .and_then(Value::as_str)
+            .and_then(ReportState::parse),
     })
 }
 
@@ -1157,10 +1237,76 @@ mod tests {
                 thread_id: tid(0xdd),
                 status: "failed".to_string(),
                 summary: json!({"text": "boom"}),
+                state: None,
             })
         );
         assert!(parse_thread_report(&json!("nope")).is_none());
         assert!(parse_thread_report(&json!({"thread_id": "x", "status": "ok"})).is_none());
+    }
+
+    #[test]
+    fn stated_report_is_exactly_legacy_plus_the_state_key() {
+        // The C56 additive key (the C39 marker precedent): the legacy
+        // builder emits no key at all, the stated builder adds exactly
+        // one, and legacy bytes are unchanged.
+        let legacy = thread_report_content(tid(0xe1), "completed", json!({"text": "done"}));
+        assert!(legacy.get(super::REPORT_STATE_KEY).is_none());
+        assert_eq!(
+            legacy.to_string(),
+            format!(
+                "{{\"status\":\"completed\",\"summary\":{{\"text\":\"done\"}},\"thread_id\":\"{}\"}}",
+                tid(0xe1)
+            )
+        );
+        let stated = super::thread_report_content_stated(
+            tid(0xe1),
+            "completed",
+            json!({"text": "done"}),
+            super::ReportState::Ready,
+        );
+        assert_eq!(stated.get("status"), legacy.get("status"));
+        assert_eq!(stated.get("summary"), legacy.get("summary"));
+        assert_eq!(stated.get("thread_id"), legacy.get("thread_id"));
+        assert_eq!(
+            stated.as_object().map(serde_json::Map::len),
+            Some(4),
+            "exactly one additive key"
+        );
+        // Round-trip: the parsed state is the structured fact.
+        let back = parse_thread_report(&stated).expect("stated report parses");
+        assert_eq!(back.state, Some(super::ReportState::Ready));
+        assert_eq!(back.status, "completed");
+    }
+
+    #[test]
+    fn legacy_and_unknown_states_parse_to_none() {
+        // Legacy reports (no key) parse with state None — never
+        // misread, never rejected.
+        let legacy = thread_report_content(tid(0xe2), "failed", json!({"text": "x"}));
+        assert_eq!(parse_thread_report(&legacy).unwrap().state, None);
+        // A future/unknown state value parses as a report with state
+        // None (additions-only: the reader survives new vocabulary).
+        let future = json!({
+            "thread_id": tid(0xe2).to_string(),
+            "status": "completed",
+            "summary": {"text": "x"},
+            "state": "teleported",
+        });
+        assert_eq!(parse_thread_report(&future).unwrap().state, None);
+        // The vocabulary is closed and round-trips.
+        for state in [
+            super::ReportState::Progress,
+            super::ReportState::Waiting,
+            super::ReportState::Ready,
+            super::ReportState::Blocked,
+            super::ReportState::Failed,
+            super::ReportState::Dropped,
+        ] {
+            assert_eq!(super::ReportState::parse(state.as_str()), Some(state));
+            let serde_name = serde_json::to_value(state).unwrap();
+            assert_eq!(serde_name, json!(state.as_str()));
+        }
+        assert_eq!(super::ReportState::parse("nope"), None);
     }
 
     // ------------------------------------------------------------------
