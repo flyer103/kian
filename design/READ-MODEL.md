@@ -7,8 +7,10 @@
 > Wire shapes are normative in `API-CONTRACT.md`; execution mechanics are in `DESIGN.md`.
 >
 > Status: **P0 landed** (version + unchanged/delta reads, resumable per-session streams, the
-> drain context cache). P1–P3 remain proposed. The phase table in §11 records the agreed target;
-> each phase flips to `landed` in the change that implements it and updates this header.
+> drain context cache). **P1 landed** (verified snapshots of state + model context with
+> provenance, tail replay, the maintenance builder). P2–P3 remain proposed. The phase table in
+> §11 records the agreed target; each phase flips to `landed` in the change that implements it
+> and updates this header.
 
 ## 0. Scope and relationship to the other contracts
 
@@ -239,7 +241,7 @@ Rules:
 | Phase | Scope | Status | Acceptance (L-level) |
 |---|---|---|---|
 | P0 | version + unchanged/delta reads, resumable SSE, drain context cache, bench | landed | L1 unit; L2 e2e (resume, unchanged); L3 chaos unchanged; bench: unchanged read = 1 head query, SSE poll = O(Δ) |
-| P1 | snapshots (state + context with provenance), verified publish, tail replay | planned | L1 equivalence incl. compact; L2 resume/crash; bench: 10k-event resume = O(tail); request bytes unchanged |
+| P1 | snapshots (state + context with provenance), verified publish, tail replay | landed | L1 equivalence incl. compact; L2 resume/crash; bench: 10k-event resume = O(tail); request bytes unchanged |
 | P2a | session directory, usage/stage views, kind index | planned | L1 rebuild equivalence; L2 operator surfaces on 1k sessions; corrupt/stale fallback |
 | P2b | opt-in export-only archive, import, retention | planned | L2 archive→verify→delete→inspect; export byte parity; corrupt package refused; crash windows |
 | P3 | explicit-allowlist fan-in stream, caps, filters, metrics | planned | L2 two-session fan-in; filters/caps/unknown-id; reconnect per-session unaffected; no wildcard |

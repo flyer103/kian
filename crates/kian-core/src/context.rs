@@ -175,8 +175,10 @@ fn parse_message_payload(
 }
 
 /// One validated `compact` event: the pre-compression range `[from,to)`
-/// (event seqs) and the post-compression summary message.
+/// (event seqs), the post-compression summary message, and the compact
+/// event's own seq (the summary's provenance source).
 struct CompactSpec {
+    seq: u64,
     from: u64,
     to: u64,
     summary: Message,
@@ -196,6 +198,26 @@ struct CompactSpec {
 ///
 /// Pure and total: no I/O, no clock, no allocation beyond the output.
 pub fn derive_model_context(events: &[Event]) -> Result<Vec<Message>, ContextError> {
+    Ok(derive_with_provenance(events)?.0)
+}
+
+/// The per-message provenance of a projected context (READ-MODEL §5):
+/// the source event seq of every message [`derive_model_context`] emits,
+/// position-aligned with the message list (a `compact` summary's source
+/// is the compact event's own seq). Derived by the *same* fold — the two
+/// outputs can never disagree — so a snapshot carrying messages plus
+/// this provenance is exactly the projection the stream would rebuild.
+///
+/// Metadata only (constraint 3): provenance never enters a model request
+/// and never changes [`derive_model_context`]'s bytes.
+pub fn context_provenance(events: &[Event]) -> Result<Vec<u64>, ContextError> {
+    Ok(derive_with_provenance(events)?.1)
+}
+
+/// The shared fold: messages + their source seqs in one pass. Splitting
+/// the two public functions over this single implementation is what
+/// keeps them aligned by construction.
+fn derive_with_provenance(events: &[Event]) -> Result<(Vec<Message>, Vec<u64>), ContextError> {
     let Some(first) = events.first() else {
         return Err(ProjectionError::EmptyStream.into());
     };
@@ -279,7 +301,12 @@ pub fn derive_model_context(events: &[Event]) -> Result<Vec<Message>, ContextErr
                     prev_to: c.to,
                 });
             }
-            compacts.push(CompactSpec { from, to, summary });
+            compacts.push(CompactSpec {
+                seq: ev.seq,
+                from,
+                to,
+                summary,
+            });
         }
     }
 
@@ -288,12 +315,16 @@ pub fn derive_model_context(events: &[Event]) -> Result<Vec<Message>, ContextErr
     compacts.sort_by_key(|c| c.from);
 
     // Pass 2: fold. Skipped-range events are never parsed; each summary is
-    // emitted at the position of the first event with seq >= from.
+    // emitted at the position of the first event with seq >= from. The
+    // provenance rides the same push (a summary's source seq is the
+    // compact event's own) — the two lists stay position-aligned.
     let mut messages: Vec<Message> = Vec::new();
+    let mut provenance: Vec<u64> = Vec::new();
     let mut next_summary = 0usize;
     for ev in events {
         while next_summary < compacts.len() && compacts[next_summary].from <= ev.seq {
             messages.push(compacts[next_summary].summary.clone());
+            provenance.push(compacts[next_summary].seq);
             next_summary += 1;
         }
         let compacted = compacts.iter().any(|c| c.from <= ev.seq && ev.seq < c.to);
@@ -301,12 +332,14 @@ pub fn derive_model_context(events: &[Event]) -> Result<Vec<Message>, ContextErr
             continue;
         }
         messages.push(parse_message_payload(ev.seq, ev.kind.as_str(), &ev.bytes)?);
+        provenance.push(ev.seq);
     }
     // Every compact has from < to <= its own seq, so each summary flushed
     // at its own compact event at the latest — nothing can remain pending.
     debug_assert_eq!(next_summary, compacts.len());
+    debug_assert_eq!(messages.len(), provenance.len());
 
-    Ok(messages)
+    Ok((messages, provenance))
 }
 
 /// Removes synthetic (steer-injected) messages — the A6 strip that restores
@@ -338,7 +371,10 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use super::{ContextError, Message, context_to_bytes, derive_model_context, strip_synthetic};
+    use super::{
+        ContextError, Message, context_provenance, context_to_bytes, derive_model_context,
+        strip_synthetic,
+    };
     use crate::events::{Event, EventKind, SCHEMA_VERSION};
     use crate::model::{Epoch, SessionId};
     use crate::state::ProjectionError;
@@ -1142,5 +1178,60 @@ mod tests {
             before,
             "re-deriving must still yield the original bytes"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Provenance (READ-MODEL §5)
+    // ------------------------------------------------------------------
+
+    /// Provenance is position-aligned with the derived messages and
+    /// carries each message's source event seq — derived by the same
+    /// fold, so the two can never disagree.
+    #[test]
+    fn provenance_is_position_aligned_and_carries_source_seqs() {
+        let mut b = started();
+        let u1 = b.user("one");
+        let u2 = b.user("two");
+        let a1 = b.assistant(json!("mid"));
+        let u3 = b.user("three");
+        let events = b.build();
+
+        let messages = derive_model_context(&events).unwrap();
+        let prov = context_provenance(&events).unwrap();
+        assert_eq!(messages.len(), prov.len());
+        assert_eq!(prov, vec![u1, u2, a1, u3]);
+
+        // Deterministic: the same stream, the same provenance.
+        assert_eq!(context_provenance(&events).unwrap(), prov);
+    }
+
+    /// A compact summary's provenance is the compact event's own seq;
+    /// compacted-away events contribute no provenance entries.
+    #[test]
+    fn provenance_of_a_compacted_context_sources_summaries_from_the_compact() {
+        let mut b = started();
+        let u1 = b.user("one");
+        let u2 = b.user("two");
+        let _u3 = b.user("three");
+        let c = b.compact(u2, u2 + 2, "summarized");
+        let u4 = b.user("four");
+        let events = b.build();
+
+        let messages = derive_model_context(&events).unwrap();
+        let prov = context_provenance(&events).unwrap();
+        // u1 survives; [u2, u3) compacted away; the summary sources from
+        // the compact event; u4 follows.
+        assert_eq!(prov, vec![u1, c, u4]);
+        assert_eq!(messages.len(), prov.len());
+        assert_eq!(messages[1].content, json!("summarized"));
+    }
+
+    /// The empty stream refusal is shared with `derive_model_context`.
+    #[test]
+    fn provenance_refuses_the_empty_stream_like_derive() {
+        assert!(matches!(
+            context_provenance(&[]),
+            Err(ContextError::Envelope(ProjectionError::EmptyStream))
+        ));
     }
 }

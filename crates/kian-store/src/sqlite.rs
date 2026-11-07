@@ -525,3 +525,140 @@ pub(crate) async fn startup_scan(
     }
     Ok(inboxes)
 }
+
+// -- read-model snapshots (READ-MODEL §5/§9, v3) ----------------------------
+
+/// Insert-only publication (R6): the row is born verified (the builder's
+/// second derivation compared `(state, context, provenance)` before this
+/// statement ran), and a conflict with an existing row is a no-op — a
+/// previously visible snapshot version is never overwritten.
+pub(crate) const SNAPSHOT_INSERT_SQL: &str = "INSERT INTO projection_snapshots (session, version, state, context, context_provenance, digest, verified, created_at)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)\nON CONFLICT (session, version) DO NOTHING";
+
+/// The loader's single snapshot query: the highest verified row for the
+/// session (the partial index carries it).
+pub(crate) const SNAPSHOT_HIGHEST_SQL: &str = "SELECT version, state, context, context_provenance, digest, verified, created_at FROM projection_snapshots WHERE session = ?1 AND verified = 1 ORDER BY version DESC LIMIT 1";
+
+/// GC (R6: orphans are GC-able): keep the newest `keep_n` versions of the
+/// session, delete everything older — verified or not. The just-published
+/// row is always among the newest, so publication is never undone by GC.
+pub(crate) const SNAPSHOT_GC_SQL: &str = "DELETE FROM projection_snapshots WHERE session = ?1 AND version NOT IN (SELECT version FROM projection_snapshots WHERE session = ?2 ORDER BY version DESC LIMIT ?3)";
+
+/// Snapshot-builder candidates: every session whose head version has
+/// reached the configured minimum, with that version. One aggregate over
+/// the events PK — maintenance cadence only, never the serving path.
+pub(crate) const SNAPSHOT_CANDIDATES_SQL: &str = "SELECT session, MAX(seq) FROM events GROUP BY session HAVING MAX(seq) >= ?1 ORDER BY session ASC LIMIT ?2";
+
+/// Maintenance-lease acquisition (liveness only, READ-MODEL §9): the
+/// conflict branch lands when the caller already holds the scope or the
+/// recorded lease has expired past its TTL. Zero rows = someone else
+/// holds a live lease — the builder skips (idempotent under retry).
+pub(crate) const MAINTENANCE_ACQUIRE_SQL: &str = "INSERT INTO maintenance_leases (scope, holder, ttl_ms, last_heartbeat)\nVALUES (?1, ?2, ?3, ?4)\nON CONFLICT (scope) DO UPDATE SET\n    holder = excluded.holder,\n    ttl_ms = excluded.ttl_ms,\n    last_heartbeat = excluded.last_heartbeat\nWHERE maintenance_leases.holder = excluded.holder\n   OR (?4 - maintenance_leases.ttl_ms) > maintenance_leases.last_heartbeat";
+
+pub(crate) const MAINTENANCE_HEARTBEAT_SQL: &str =
+    "UPDATE maintenance_leases SET last_heartbeat = ?3 WHERE scope = ?1 AND holder = ?2";
+
+pub(crate) const MAINTENANCE_RELEASE_SQL: &str =
+    "DELETE FROM maintenance_leases WHERE scope = ?1 AND holder = ?2";
+
+/// One snapshot row as stored (column order matches the SELECTs above).
+pub(crate) type SnapshotCols = (i64, String, String, String, String, i64, i64);
+
+pub(crate) async fn snapshot_insert(
+    pool: &SqlitePool,
+    p: &crate::snapshots::SnapshotInsert<'_>,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(SNAPSHOT_INSERT_SQL)
+        .bind(p.session_key)
+        .bind(p.version)
+        .bind(p.state)
+        .bind(p.context)
+        .bind(p.provenance)
+        .bind(p.digest)
+        .bind(p.created_at)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn snapshot_highest(
+    pool: &SqlitePool,
+    session_key: &str,
+) -> Result<Option<SnapshotCols>, StoreError> {
+    let row: Option<SnapshotCols> = sqlx::query_as(SNAPSHOT_HIGHEST_SQL)
+        .bind(session_key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub(crate) async fn snapshot_gc(
+    pool: &SqlitePool,
+    session_key: &str,
+    keep_n: i64,
+) -> Result<u64, StoreError> {
+    let res = sqlx::query(SNAPSHOT_GC_SQL)
+        .bind(session_key)
+        .bind(session_key)
+        .bind(keep_n)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub(crate) async fn snapshot_candidates(
+    pool: &SqlitePool,
+    min_events: i64,
+    limit: i64,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(SNAPSHOT_CANDIDATES_SQL)
+        .bind(min_events)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub(crate) async fn maintenance_acquire(
+    pool: &SqlitePool,
+    scope: &str,
+    holder: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(MAINTENANCE_ACQUIRE_SQL)
+        .bind(scope)
+        .bind(holder)
+        .bind(ttl_ms)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn maintenance_heartbeat(
+    pool: &SqlitePool,
+    scope: &str,
+    holder: &str,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(MAINTENANCE_HEARTBEAT_SQL)
+        .bind(scope)
+        .bind(holder)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn maintenance_release(
+    pool: &SqlitePool,
+    scope: &str,
+    holder: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(MAINTENANCE_RELEASE_SQL)
+        .bind(scope)
+        .bind(holder)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

@@ -86,9 +86,22 @@ pub struct Server {
     webhook_limits: WebhookLimits,
     /// This assembly's recorded startup sequence (the test hook).
     startup_order: crate::superagent::StartupOrder,
+    /// The snapshot maintenance plan (READ-MODEL §9, P1): present iff
+    /// `read_model.snapshots.enabled`. [`Server::serve`] spawns its
+    /// ticker — the builder runs outside every drain, under a
+    /// per-session maintenance lease.
+    snapshot_maintenance: Option<SnapshotMaintenance>,
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
+}
+
+/// The serve-side snapshot builder plan (READ-MODEL §5/§9).
+#[derive(Clone)]
+struct SnapshotMaintenance {
+    build: kian_orchestrator::SnapshotBuildConfig,
+    interval_ms: u64,
+    holder: String,
 }
 
 /// Reads one lark credential from the environment, treating blank as
@@ -627,7 +640,29 @@ impl Server {
             lease_ttl_ms: config.drain.lease_ttl_ms,
             heartbeat_interval_ms: config.drain.heartbeat_interval_ms,
         };
-        let engine = Engine::new(store.clone(), driver, engine_config);
+        // READ-MODEL §5 (P1): the read-model config routes
+        // projection/recovery state reads through the verified-snapshot
+        // loader when enabled (the honest full-derivation fallback is
+        // built into the loader — the wire never changes).
+        let read_model = kian_orchestrator::ReadModelConfig {
+            snapshots_enabled: config.read_model.snapshots.enabled,
+            tail_cap: config.read_model.snapshots.tail_cap,
+        };
+        let snapshot_maintenance =
+            config
+                .read_model
+                .snapshots
+                .enabled
+                .then(|| SnapshotMaintenance {
+                    build: kian_orchestrator::SnapshotBuildConfig {
+                        min_events: config.read_model.snapshots.min_events,
+                        keep_n: config.read_model.snapshots.keep_n,
+                        lease_ttl_ms: kian_orchestrator::DEFAULT_LEASE_TTL_MS,
+                    },
+                    interval_ms: config.read_model.snapshots.interval_ms,
+                    holder: config.drain.holder.clone(),
+                });
+        let engine = Engine::new_with_read_model(store.clone(), driver, engine_config, read_model);
 
         // The bundle's inbox port learns the engine (the cycle
         // breaker closes here, before any wake can fire).
@@ -654,6 +689,7 @@ impl Server {
             webhook_secret,
             webhook_limits,
             startup_order: Arc::clone(&startup_order),
+            snapshot_maintenance,
             _plugin_disposer: plugin_disposer,
         };
 
@@ -771,6 +807,44 @@ impl Server {
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!(error = %e, "recovery sweep failed");
+                        }
+                    }
+                }
+            });
+        }
+        // Snapshot maintenance (READ-MODEL §9, P1): a ticker whose each
+        // beat builds verified snapshots for candidate sessions under a
+        // per-session maintenance lease — strictly outside every drain
+        // (never on a drain's critical path). Publication is
+        // verify-then-insert (R6): a crash between beats can orphan a
+        // no-op, never a partial snapshot. Idempotent under retry (R9),
+        // so a missed or doubled beat is harmless.
+        if let Some(plan) = self.snapshot_maintenance.clone() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(plan.interval_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match kian_orchestrator::maintenance_tick(
+                        &store,
+                        &plan.build,
+                        &plan.holder,
+                        now_ms,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(published = n, "snapshot maintenance tick");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "snapshot maintenance tick failed");
                         }
                     }
                 }

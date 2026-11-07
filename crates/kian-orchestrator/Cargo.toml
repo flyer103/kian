@@ -18,6 +18,9 @@ tracing.workspace = true
 futures.workspace = true
 dashmap.workspace = true
 serde_yaml.workspace = true
+# READ-MODEL §5: the snapshot digest (sha256 over the stored projection
+# columns) — a pure hash, no crypto surface beyond it.
+sha2.workspace = true
 
 [dev-dependencies]
 # wake-transport tests create a throwaway postgres database from

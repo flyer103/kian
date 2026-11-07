@@ -407,3 +407,63 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   flat across history — vs legacy full-rebuild poll 843 µs → 9.2 ms (≈250× the tail poll at
   10k events). READ-MODEL §11 P0 `planned` → `landed`; DESIGN §3.2 pointer updated; docs-map
   green.
+- **Read model P1 — verified snapshots (state + model context) and tail replay (round 9,
+  R9-03)** — default-green (pg chain env-gated). The serving-form contract's second phase
+  (`design/READ-MODEL.md` §5/§9/§11): migration **v3** appended to BOTH chains (v0–v2 frozen,
+  pinned byte-for-byte by new golden tests) adds `projection_snapshots` —
+  `(session, version, state, context, context_provenance, digest, verified, created_at)` — and
+  `maintenance_leases`; the two backends' chains stay generation-for-generation identical
+  (drift test). Snapshots are infrastructure state, never truth (R1): rows are disposable and
+  the table can be dropped without touching the stream. Publication is **verify-then-insert**
+  (R6): the builder — outside every drain, under a per-session maintenance lease (liveness
+  only) — pins version `V`, reads `1..V` twice independently, derives
+  `(state fold, context, provenance)` from both, and publishes one atomic INSERT of an
+  already-verified row (`ON CONFLICT DO NOTHING`: insert-only, idempotent across replicas);
+  a crash window leaves nothing or one complete verified row, never a partial snapshot;
+  superseded rows GC to keep-N. The `state` column carries the full fold seed (state + the
+  episode-end first-write-wins bit) so tail replay mirrors `project` exactly; `context` is
+  the exact `context_to_bytes` serialization plus per-message provenance
+  (`kian_core::context::context_provenance`, derived by the same fold as
+  `derive_model_context` — aligned by construction; `derive_model_context` bytes unchanged).
+  The loader picks the highest verified `V <= head`, re-checks the digest over the stored
+  columns, and replays `(V, head]` (state via the public transition-table fold; context by
+  appending the derived compact-free tail slice); a `compact` in the tail is the R5 single
+  invalidation — one full re-derivation, exactly the P0 DrainCtx behavior; missing/corrupt/
+  unverified rows, a rejected replay, or a tail beyond the configured cap → honest full
+  rebuild. Projection and drain takeover state reads use the loader (`Engine::
+  new_with_read_model`); the wire never changes. Config gate `read_model.snapshots`
+  (`enabled` default **true** with a conservative `min_events` 2000, `tail_cap` 8192,
+  `keep_n` 3, `interval_ms` 30 000; fail-closed validation; disabling hides every snapshot);
+  `kian serve` spawns the maintenance ticker. Zero new event kinds; no history rewrite; no
+  request-byte change (witness: `snapshot_path_request_bytes_are_byte_identical` — snapshot
+  path bytes == `context_to_bytes` of the full derivation; cache-stability suite green,
+  unchanged). Executed evidence: migrations `v3_generation_sql_is_frozen`,
+  `pg_v3_generation_sql_is_frozen`; `publication_is_insert_only_and_idempotent`,
+  `highest_verified_picks_the_greatest_version` (unverified rows invisible),
+  `gc_keeps_the_newest_rows_only`, `candidates_list_sessions_past_the_minimum`,
+  `maintenance_lease_liveness_semantics` (kian-store);
+  `provenance_is_position_aligned_and_carries_source_seqs`,
+  `provenance_of_a_compacted_context_sources_summaries_from_the_compact` (kian-core);
+  `snapshot_plus_tail_equals_full_replay_on_random_streams` (randomized equivalence, with
+  and without compacts), `compact_in_the_tail_falls_back_to_full_and_stays_correct`,
+  `corrupt_unverified_and_tampered_snapshots_are_ignored`,
+  `tail_beyond_the_cap_falls_back_to_full`,
+  `build_crash_windows_leave_nothing_or_one_complete_row`,
+  `mismatched_derivations_never_publish`,
+  `episode_end_bit_survives_the_boundary_and_reproduces_duplicate_end_errors`,
+  `state_at_agrees_with_project_across_prefixes`, `builder_lease_excludes_concurrent_builders`,
+  `rebuilds_gc_older_versions` (kian-orchestrator);
+  `pg_snapshots_publication_reads_and_maintenance_leases` (env-gated pg chain, live against
+  PG 17); `read_model_defaults_are_enabled_and_conservative`,
+  `read_model_section_parses_and_gates` (config);
+  `projection_wire_identical_with_snapshots_e2e`, `disabled_read_model_hides_snapshots_e2e`
+  (kian-cli e2e — wire byte-identical with/without a snapshot);
+  `kill9_in_snapshot_crash_windows_never_serves_a_partial_snapshot` (chaos: `kill -9` against
+  the real `kian serve` with the publish write blocked behind a held sqlite `BEGIN IMMEDIATE`
+  lock, restart, every visible row load-equal to the full derivation; plus a kill during live
+  traffic). Benchmark (`cargo bench -p kian-cli --bench read_path -- resume`, sqlite,
+  criterion 0.5, M-series laptop): 10k-event resume **117 µs** via snapshot + 100-event tail
+  vs **8.96 ms** full derivation (≈77×; flat 115→117 µs from 1k→10k history while the full
+  derivation grows 826 µs→8.96 ms — resume is O(tail)); one maintenance build (two
+  derivations + digest + insert) 2.0 ms @1k → 18.8 ms @10k, off the serving path.
+  READ-MODEL §11 P1 `planned` → `landed` + header updated; docs-map green.

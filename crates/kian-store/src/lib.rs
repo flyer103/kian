@@ -18,6 +18,8 @@
 //!   here and only here)
 //! - [`inbox`] — durable input rows, claims/leases, replay source, startup
 //!   scan
+//! - [`snapshots`] — read-model snapshot rows + maintenance leases
+//!   (READ-MODEL §5/§9, migration v3): infrastructure state, never truth
 //! - [`wake`] — the postgres LISTEN/NOTIFY wake transport (advisory;
 //!   /ADR-009)
 //! - [`migrations`] — adjacent migration chains, one per backend (DESIGN
@@ -26,6 +28,7 @@
 pub mod event_store;
 pub mod inbox;
 pub mod migrations;
+pub mod snapshots;
 pub mod wake;
 
 mod postgres;
@@ -33,3 +36,4 @@ mod sqlite;
 
 pub use event_store::{AppendGuard, EventStore, Head, StoreError};
 pub use inbox::{AdmitOutcome, InboxError, SessionInbox};
+pub use snapshots::{SnapshotCandidate, SnapshotRow};

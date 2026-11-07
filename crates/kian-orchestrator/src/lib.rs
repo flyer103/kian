@@ -22,6 +22,7 @@ pub mod engine;
 pub mod metrics;
 pub mod read;
 pub mod recovery;
+pub mod snapshots;
 pub mod wake;
 
 pub use engine::{
@@ -35,6 +36,11 @@ pub use recovery::{
     EscalationCause, GuardDecision, OneShotGuard, PolicyConfig, PolicyError, PolicyTable,
     RecoveryBudget, RecoveryEnv, RecoveryError, RecoveryReactor, RecoveryTerminal, classify,
     run_with_recovery,
+};
+pub use snapshots::{
+    BuildOutcome, DEFAULT_KEEP_N, DEFAULT_LEASE_TTL_MS, DEFAULT_MIN_EVENTS, DEFAULT_TAIL_CAP,
+    LoadedProjection, ReadModelConfig, SnapshotBuildConfig, build_snapshot, load_projection,
+    maintenance_tick,
 };
 // Re-exported for convenience: the recovery policy seam types the
 // subsystem consumes (definitions live in kian-core, DESIGN §6.2).

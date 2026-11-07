@@ -511,3 +511,126 @@ pub(crate) async fn startup_scan(
     }
     Ok(inboxes)
 }
+
+// -- read-model snapshots (READ-MODEL §5/§9, v3) ----------------------------
+// Same statements as the sqlite twins, `$N` placeholders with explicit
+// casts (the pg dialect traps); the DO UPDATE predicate qualifies its
+// columns with the table name (pg resolves unqualified names there
+// against `excluded` too — sqlstate 42702).
+
+pub(crate) const SNAPSHOT_INSERT_SQL: &str = "INSERT INTO projection_snapshots (session, version, state, context, context_provenance, digest, verified, created_at)\nVALUES ($1::text, $2::bigint, $3::text, $4::text, $5::text, $6::text, 1, $7::bigint)\nON CONFLICT (session, version) DO NOTHING";
+
+pub(crate) const SNAPSHOT_HIGHEST_SQL: &str = "SELECT version, state, context, context_provenance, digest, verified, created_at FROM projection_snapshots WHERE session = $1::text AND verified = 1 ORDER BY version DESC LIMIT 1";
+
+pub(crate) const SNAPSHOT_GC_SQL: &str = "DELETE FROM projection_snapshots WHERE session = $1::text AND version NOT IN (SELECT version FROM projection_snapshots WHERE session = $1::text ORDER BY version DESC LIMIT $2::bigint)";
+
+pub(crate) const SNAPSHOT_CANDIDATES_SQL: &str = "SELECT session, MAX(seq) FROM events GROUP BY session HAVING MAX(seq) >= $1::bigint ORDER BY session ASC LIMIT $2::bigint";
+
+pub(crate) const MAINTENANCE_ACQUIRE_SQL: &str = "INSERT INTO maintenance_leases (scope, holder, ttl_ms, last_heartbeat)\nVALUES ($1::text, $2::text, $3::bigint, $4::bigint)\nON CONFLICT (scope) DO UPDATE SET\n    holder = excluded.holder,\n    ttl_ms = excluded.ttl_ms,\n    last_heartbeat = excluded.last_heartbeat\nWHERE maintenance_leases.holder = excluded.holder\n   OR ($4::bigint - maintenance_leases.ttl_ms) > maintenance_leases.last_heartbeat";
+
+pub(crate) const MAINTENANCE_HEARTBEAT_SQL: &str = "UPDATE maintenance_leases SET last_heartbeat = $3::bigint WHERE scope = $1::text AND holder = $2::text";
+
+pub(crate) const MAINTENANCE_RELEASE_SQL: &str =
+    "DELETE FROM maintenance_leases WHERE scope = $1::text AND holder = $2::text";
+
+/// One snapshot row as stored (column order matches the SELECTs above).
+pub(crate) type SnapshotCols = (i64, String, String, String, String, i64, i64);
+
+pub(crate) async fn snapshot_insert(
+    pool: &PgPool,
+    p: &crate::snapshots::SnapshotInsert<'_>,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(SNAPSHOT_INSERT_SQL)
+        .bind(p.session_key)
+        .bind(p.version)
+        .bind(p.state)
+        .bind(p.context)
+        .bind(p.provenance)
+        .bind(p.digest)
+        .bind(p.created_at)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn snapshot_highest(
+    pool: &PgPool,
+    session_key: &str,
+) -> Result<Option<SnapshotCols>, StoreError> {
+    let row: Option<SnapshotCols> = sqlx::query_as(SNAPSHOT_HIGHEST_SQL)
+        .bind(session_key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub(crate) async fn snapshot_gc(
+    pool: &PgPool,
+    session_key: &str,
+    keep_n: i64,
+) -> Result<u64, StoreError> {
+    let res = sqlx::query(SNAPSHOT_GC_SQL)
+        .bind(session_key)
+        .bind(keep_n)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub(crate) async fn snapshot_candidates(
+    pool: &PgPool,
+    min_events: i64,
+    limit: i64,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(SNAPSHOT_CANDIDATES_SQL)
+        .bind(min_events)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub(crate) async fn maintenance_acquire(
+    pool: &PgPool,
+    scope: &str,
+    holder: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(MAINTENANCE_ACQUIRE_SQL)
+        .bind(scope)
+        .bind(holder)
+        .bind(ttl_ms)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn maintenance_heartbeat(
+    pool: &PgPool,
+    scope: &str,
+    holder: &str,
+    now_ms: i64,
+) -> Result<bool, StoreError> {
+    let res = sqlx::query(MAINTENANCE_HEARTBEAT_SQL)
+        .bind(scope)
+        .bind(holder)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn maintenance_release(
+    pool: &PgPool,
+    scope: &str,
+    holder: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(MAINTENANCE_RELEASE_SQL)
+        .bind(scope)
+        .bind(holder)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

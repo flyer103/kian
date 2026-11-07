@@ -97,6 +97,12 @@ pub struct ServeConfig {
     /// assembly onto the dream-routing driver.
     #[serde(default)]
     pub memory: Option<MemorySection>,
+    /// The `read_model:` section (READ-MODEL §5/§9, P1). Absent = the
+    /// defaults: verified snapshots enabled with a conservative
+    /// threshold. Disabling (`read_model.snapshots.enabled: false`)
+    /// hides every snapshot — the honest full-derivation fallback.
+    #[serde(default)]
+    pub read_model: ReadModelSection,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -487,6 +493,76 @@ impl Default for SseConfig {
 
 fn default_poll_ms() -> u64 {
     100
+}
+
+// ---------------------------------------------------------------------------
+// the `read_model` section (READ-MODEL §5/§9, P1)
+// ---------------------------------------------------------------------------
+
+/// The `read_model:` section. Default: verified snapshots **enabled**
+/// with a conservative threshold (a session must reach `min_events`
+/// before a snapshot pays for itself); disabling hides every snapshot —
+/// the loader falls back to full stream derivation and behavior is
+/// byte-identical to pre-P1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReadModelSection {
+    /// The `read_model.snapshots:` subsection.
+    #[serde(default)]
+    pub snapshots: SnapshotSection,
+}
+
+/// Verified-snapshot settings (READ-MODEL §5): enable/min-events/tail
+/// cap/keep-N plus the maintenance tick cadence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// Whether projection/recovery reads may consult verified
+    /// snapshots. `false` hides all snapshots (honest full derivation).
+    #[serde(default = "default_snapshots_enabled")]
+    pub enabled: bool,
+    /// Sessions below this head version are never snapshotted (and the
+    /// loader never consults one — none exists yet).
+    #[serde(default = "default_snapshots_min_events")]
+    pub min_events: u64,
+    /// Replay bound: a tail longer than this skips the snapshot.
+    #[serde(default = "default_snapshots_tail_cap")]
+    pub tail_cap: u64,
+    /// Verified snapshot versions kept per session (older GC-ed).
+    #[serde(default = "default_snapshots_keep_n")]
+    pub keep_n: u64,
+    /// The maintenance tick cadence (the builder runs outside drains,
+    /// READ-MODEL §9).
+    #[serde(default = "default_snapshots_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl Default for SnapshotSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_snapshots_enabled(),
+            min_events: default_snapshots_min_events(),
+            tail_cap: default_snapshots_tail_cap(),
+            keep_n: default_snapshots_keep_n(),
+            interval_ms: default_snapshots_interval_ms(),
+        }
+    }
+}
+
+fn default_snapshots_enabled() -> bool {
+    true
+}
+fn default_snapshots_min_events() -> u64 {
+    kian_orchestrator::DEFAULT_MIN_EVENTS
+}
+fn default_snapshots_tail_cap() -> u64 {
+    kian_orchestrator::DEFAULT_TAIL_CAP
+}
+fn default_snapshots_keep_n() -> u64 {
+    kian_orchestrator::DEFAULT_KEEP_N
+}
+fn default_snapshots_interval_ms() -> u64 {
+    30_000
 }
 
 // ---------------------------------------------------------------------------
@@ -1900,6 +1976,34 @@ impl ServeConfig {
                 self.listen
             ))
         })?;
+
+        // read_model.snapshots: sane bounds (fail-closed, never a
+        // silently-degenerate maintenance loop).
+        {
+            let s = &self.read_model.snapshots;
+            if s.enabled {
+                if s.min_events == 0 {
+                    return Err(invalid(
+                        "read_model.snapshots.min_events must be >= 1 when snapshots are enabled",
+                    ));
+                }
+                if s.tail_cap == 0 {
+                    return Err(invalid(
+                        "read_model.snapshots.tail_cap must be >= 1 when snapshots are enabled",
+                    ));
+                }
+                if s.keep_n == 0 {
+                    return Err(invalid(
+                        "read_model.snapshots.keep_n must be >= 1 when snapshots are enabled",
+                    ));
+                }
+                if s.interval_ms < 100 {
+                    return Err(invalid(
+                        "read_model.snapshots.interval_ms must be >= 100 (a tighter cadence only burns the maintenance lease)",
+                    ));
+                }
+            }
+        }
 
         // At least one provider and one slot.
         if self.providers.is_empty() {
@@ -4326,6 +4430,46 @@ recovery:
         assert!(
             err.to_string().contains("superagent"),
             "the mix must refuse: {err}"
+        );
+    }
+
+    // -- read_model.snapshots (READ-MODEL P1) ----------------------
+
+    /// Defaults: snapshots enabled with the conservative threshold
+    /// (READ-MODEL plan §4.2 req 5); absent section = defaults.
+    #[test]
+    fn read_model_defaults_are_enabled_and_conservative() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        let s = &cfg.read_model.snapshots;
+        assert!(s.enabled);
+        assert_eq!(s.min_events, kian_orchestrator::DEFAULT_MIN_EVENTS);
+        assert_eq!(s.tail_cap, kian_orchestrator::DEFAULT_TAIL_CAP);
+        assert_eq!(s.keep_n, kian_orchestrator::DEFAULT_KEEP_N);
+        assert!(s.interval_ms >= 100);
+        cfg.validate().expect("defaults validate");
+    }
+
+    /// An explicit section parses; disabling validates (the gate hides
+    /// every snapshot); unknown keys refuse (fail-closed).
+    #[test]
+    fn read_model_section_parses_and_gates() {
+        let yaml =
+            valid_yaml() + "read_model:\n  snapshots:\n    enabled: false\n    min_events: 5\n";
+        let cfg = ServeConfig::parse(&yaml).expect("parse");
+        assert!(!cfg.read_model.snapshots.enabled);
+        assert_eq!(cfg.read_model.snapshots.min_events, 5);
+        // Disabling skips the numeric sanity gates entirely.
+        cfg.validate().expect("disabled validates");
+
+        let bad =
+            valid_yaml() + "read_model:\n  snapshots:\n    enabled: true\n    min_events: 0\n";
+        let err = ServeConfig::parse(&bad).expect_err("min_events 0 must refuse");
+        assert!(err.to_string().contains("min_events"), "{err}");
+
+        let typo = valid_yaml() + "read_model:\n  snapshots:\n    enbled: true\n";
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse the typo'd key"
         );
     }
 }

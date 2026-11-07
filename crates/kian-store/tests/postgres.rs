@@ -20,7 +20,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use kian_store::migrations;
-use kian_store::{AppendGuard, EventStore, Head, InboxError, StoreError};
+use kian_store::{AppendGuard, EventStore, Head, InboxError, SnapshotRow, StoreError};
 
 const T0: u64 = 1_761_900_000_000;
 
@@ -971,6 +971,139 @@ async fn pg_v2_upgrade_backfills_legacy_inbox_rows() {
         vec![legacy.id, fresh.id],
         "admission order holds across legacy and fresh rows"
     );
+
+    pg.finish().await;
+}
+
+/// v3 (READ-MODEL §5/§9): the snapshot tables exist on pg, publication
+/// is insert-only, the loader query sees only verified rows, and the
+/// maintenance lease mirrors the sqlite liveness semantics — the pg
+/// twin of the in-module sqlite suite.
+#[tokio::test]
+async fn pg_snapshots_publication_reads_and_maintenance_leases() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("applied versions");
+    assert!(
+        versions.contains(&3),
+        "open_postgres applies v3, got {versions:?}"
+    );
+
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 6, Epoch::GENESIS).await;
+
+    let row = SnapshotRow {
+        session: sid,
+        version: 6,
+        state: r#"{"state":"running","episode_end":null}"#.into(),
+        context: "[]".into(),
+        context_provenance: "[]".into(),
+        digest: "d6".into(),
+        verified: true,
+        created_at: 42,
+    };
+    assert!(
+        pg.store
+            .snapshot_insert_verified(&row)
+            .await
+            .expect("publish")
+    );
+    // Insert-only: a re-publish of the same version is a no-op.
+    let mut forged = row.clone();
+    forged.digest = "forged".into();
+    assert!(
+        !pg.store
+            .snapshot_insert_verified(&forged)
+            .await
+            .expect("re-publish")
+    );
+
+    // The highest verified read.
+    let got = pg
+        .store
+        .snapshot_highest_verified(sid)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(got.version, 6);
+    assert_eq!(got.digest, "d6");
+    assert!(got.verified);
+
+    // Candidates: the seeded session is past the minimum.
+    let cands = pg
+        .store
+        .snapshot_candidates(5, 10)
+        .await
+        .expect("candidates");
+    assert!(cands.iter().any(|c| c.session == sid && c.version == 6));
+
+    // GC keeps the newest keep_n.
+    for v in [7u64, 8] {
+        let mut newer = row.clone();
+        newer.version = v;
+        newer.digest = format!("d{v}");
+        assert!(pg.store.snapshot_insert_verified(&newer).await.expect("p"));
+    }
+    assert_eq!(pg.store.snapshot_gc(sid, 2).await.expect("gc"), 1);
+    let top = pg
+        .store
+        .snapshot_highest_verified(sid)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(top.version, 8);
+
+    // The maintenance lease: mutual exclusion, heartbeat, takeover,
+    // idempotent release.
+    let scope = format!("snapshots:{}", sid.0);
+    assert!(
+        pg.store
+            .maintenance_lease_try_acquire(&scope, "a", 1_000, 10_000)
+            .await
+            .expect("acquire a")
+    );
+    assert!(
+        !pg.store
+            .maintenance_lease_try_acquire(&scope, "b", 1_000, 10_500)
+            .await
+            .expect("b refused")
+    );
+    assert!(
+        pg.store
+            .maintenance_lease_heartbeat(&scope, "a", 11_000)
+            .await
+            .expect("heartbeat a")
+    );
+    assert!(
+        !pg.store
+            .maintenance_lease_try_acquire(&scope, "b", 1_000, 11_500)
+            .await
+            .expect("b still refused")
+    );
+    assert!(
+        pg.store
+            .maintenance_lease_try_acquire(&scope, "b", 1_000, 13_000)
+            .await
+            .expect("b takeover after ttl")
+    );
+    assert!(
+        !pg.store
+            .maintenance_lease_heartbeat(&scope, "a", 13_100)
+            .await
+            .expect("a lost")
+    );
+    pg.store
+        .maintenance_lease_release(&scope, "a")
+        .await
+        .expect("idempotent release");
+    pg.store
+        .maintenance_lease_release(&scope, "b")
+        .await
+        .expect("release b");
 
     pg.finish().await;
 }

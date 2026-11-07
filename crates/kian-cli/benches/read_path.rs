@@ -17,6 +17,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, SessionId};
 use kian_orchestrator::read::{events_after, versioned_projection};
+use kian_orchestrator::snapshots::{
+    ReadModelConfig, SnapshotBuildConfig, build_snapshot, load_projection,
+};
 use kian_store::{AppendGuard, EventStore};
 use serde_json::json;
 use uuid::Uuid;
@@ -24,7 +27,13 @@ use uuid::Uuid;
 /// Seeds one session with a projection-legal stream of `upto` events
 /// (created → claimed → balanced turn pairs).
 async fn seed(store: &EventStore, session: SessionId, upto: u64) {
-    for seq in 1..=upto {
+    seed_from(store, session, 1, upto).await;
+}
+
+/// The tail half of [`seed`]: appends `from..=upto` as balanced turn
+/// pairs (the continuation after a mid-history snapshot).
+async fn seed_from(store: &EventStore, session: SessionId, from: u64, upto: u64) {
+    for seq in from..=upto {
         let kind = if seq == 1 {
             EventKind::SessionCreated
         } else if seq == 2 {
@@ -133,6 +142,93 @@ fn bench_read_path(c: &mut Criterion) {
         group.bench_function(format!("sse_legacy_full_rebuild_{label}"), |b| {
             b.iter(|| runtime.block_on(store.rebuild(session)))
         });
+
+        // -- READ-MODEL P1: snapshot resume -------------------------------
+        // A second session per size: snapshotted 100 events behind head,
+        // so "resume" = one snapshot query + tail replay of (V, head].
+        // The full-rebuild counterpart (the honest fallback path the
+        // loader would take with snapshots disabled) shows what the
+        // snapshot saves.
+        {
+            let snap_session = SessionId(Uuid::new_v4());
+            {
+                let store = store.clone();
+                runtime.block_on(async {
+                    seed(&store, snap_session, upto - 100).await;
+                    build_snapshot(
+                        &store,
+                        snap_session,
+                        &SnapshotBuildConfig {
+                            min_events: 1,
+                            ..SnapshotBuildConfig::default()
+                        },
+                        "bench",
+                        0,
+                    )
+                    .await
+                    .expect("bench snapshot build");
+                    seed_from(&store, snap_session, upto - 99, upto).await;
+                });
+            }
+            let version = runtime
+                .block_on(store.head(snap_session))
+                .expect("head")
+                .next_seq
+                - 1;
+            let read_on = ReadModelConfig {
+                snapshots_enabled: true,
+                tail_cap: 8_192,
+            };
+
+            // Resume = snapshot + tail replay: state AND context at head
+            // for O(tail) work (READ-MODEL §11 P1).
+            group.bench_function(format!("resume_snapshot_tail_{label}"), |b| {
+                b.iter(|| {
+                    runtime.block_on(load_projection(
+                        &store,
+                        snap_session,
+                        criterion::black_box(version),
+                        &read_on,
+                    ))
+                })
+            });
+
+            // The same resume without snapshots: the full derivation
+            // (scan + project + derive over the whole history).
+            group.bench_function(format!("resume_full_derivation_{label}"), |b| {
+                b.iter(|| {
+                    runtime.block_on(load_projection(
+                        &store,
+                        snap_session,
+                        criterion::black_box(version),
+                        &ReadModelConfig::default(),
+                    ))
+                })
+            });
+
+            // The maintenance build cost (two derivations + digest +
+            // insert): what one snapshot publication costs off the
+            // serving path. The GC clears the row first so every
+            // iteration measures a real build (not the UpToDate skip).
+            group.bench_function(format!("snapshot_build_maintenance_{label}"), |b| {
+                b.iter(|| {
+                    runtime.block_on(async {
+                        let _ = store.snapshot_gc(snap_session, 0).await;
+                        build_snapshot(
+                            &store,
+                            snap_session,
+                            &SnapshotBuildConfig {
+                                min_events: 1,
+                                ..SnapshotBuildConfig::default()
+                            },
+                            "bench",
+                            0,
+                        )
+                        .await
+                    })
+                })
+            });
+        }
     }
     group.finish();
 

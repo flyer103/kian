@@ -158,6 +158,12 @@ pub enum EngineError {
         since: u64,
         version: u64,
     },
+    /// Context projection failure (READ-MODEL §5 load path: the tail
+    /// slice the loader appends must parse under the frozen message
+    /// contract; a failure is the same error the full derivation would
+    /// produce).
+    #[error("context: {0}")]
+    Context(#[from] kian_core::context::ContextError),
 }
 
 /// What a [`Engine::wake`] call did.
@@ -762,6 +768,12 @@ pub struct Engine<D: LoopDriver> {
     drains: DashMap<SessionId, DrainHandle>,
     metrics: Arc<Metrics>,
     weak: std::sync::OnceLock<Weak<Engine<D>>>,
+    /// READ-MODEL §5 (P1): whether projection/recovery state reads may
+    /// consult verified snapshots (and the tail cap). Default
+    /// `ReadModelConfig::default()` keeps every pre-P1 behavior
+    /// byte-identical; the kian serve assembly turns it on from
+    /// `read_model.snapshots`.
+    read_model: crate::snapshots::ReadModelConfig,
 }
 
 impl<D> Engine<D>
@@ -782,6 +794,36 @@ where
         config: EngineConfig,
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
+        Self::assemble(
+            store,
+            driver,
+            config,
+            clock,
+            crate::snapshots::ReadModelConfig::default(),
+        )
+    }
+
+    /// Engine with the system clock and an explicit read-model config
+    /// (READ-MODEL §5): `read_model.snapshots_enabled` routes
+    /// projection/recovery state reads through the verified-snapshot
+    /// loader; the default (disabled) keeps every behavior identical.
+    #[must_use]
+    pub fn new_with_read_model(
+        store: EventStore,
+        driver: Arc<D>,
+        config: EngineConfig,
+        read_model: crate::snapshots::ReadModelConfig,
+    ) -> Arc<Self> {
+        Self::assemble(store, driver, config, Arc::new(SystemClock), read_model)
+    }
+
+    fn assemble(
+        store: EventStore,
+        driver: Arc<D>,
+        config: EngineConfig,
+        clock: Arc<dyn Clock>,
+        read_model: crate::snapshots::ReadModelConfig,
+    ) -> Arc<Self> {
         let metrics = Arc::new(Metrics::default());
         let engine = Arc::new(Self {
             store,
@@ -792,6 +834,7 @@ where
             drains: DashMap::new(),
             metrics,
             weak: std::sync::OnceLock::new(),
+            read_model,
         });
         engine
             .weak
@@ -864,13 +907,27 @@ where
     /// version` answers `unchanged` with no state and no scan beyond
     /// the head check; `since > version` is
     /// [`EngineError::SinceAhead`]. Delegates to
-    /// [`crate::read::versioned_projection`].
+    /// [`crate::read::versioned_projection`], or — when the read model
+    /// is enabled (READ-MODEL §5, P1) — to
+    /// [`crate::snapshots::versioned_projection_via_snapshots`]:
+    /// identical wire semantics, state from the highest verified
+    /// snapshot + tail replay, honest full-derivation fallback.
     pub async fn projection_versioned(
         &self,
         session: SessionId,
         since: Option<u64>,
     ) -> Result<crate::read::VersionedProjection, EngineError> {
-        crate::read::versioned_projection(&self.store, session, since).await
+        if self.read_model.snapshots_enabled {
+            crate::snapshots::versioned_projection_via_snapshots(
+                &self.store,
+                session,
+                since,
+                &self.read_model,
+            )
+            .await
+        } else {
+            crate::read::versioned_projection(&self.store, session, since).await
+        }
     }
 
     /// Admits one input: **durable row first**, then wake (constraint
@@ -1238,6 +1295,12 @@ where
         // re-drive can finish their work. Without this, a killed-mid-turn
         // session would sit in `running` forever (the startup inbox scan
         // sees nothing for it) and the expired-lease sweep would churn.
+        //
+        // READ-MODEL §5 (P1): the state read goes through the
+        // verified-snapshot loader when the read model is enabled —
+        // snapshot + tail replay with the honest full-derivation
+        // fallback; a recoverable session's resume cost is O(tail),
+        // not O(history).
         let mut takeover = false;
         let mut end_reason: EndReason;
         'episodes: loop {
@@ -1245,17 +1308,25 @@ where
                 end_reason = EndReason::Interrupted;
                 break 'episodes;
             }
-            let events = self.store.rebuild(*session).await?;
-            if events.is_empty() {
+            let version = self.store.version(*session).await?;
+            let state = if version == 0 {
+                None
+            } else {
+                Some(
+                    crate::snapshots::state_at(&self.store, *session, version, &self.read_model)
+                        .await?,
+                )
+            };
+            if state.is_none() {
                 if !ctx.has_eligible_inputs().await? {
                     return Ok(DrainOutcome::ReleasedClean);
                 }
                 ctx.append(EventKind::SessionCreated, json!({})).await?;
-            } else if project(&events)?.is_terminal() {
+            } else if state.is_some_and(|s| s.is_terminal()) {
                 return Ok(DrainOutcome::Terminal);
             }
             if !claimed {
-                takeover = !events.is_empty() && project(&events)? == SessionState::Running;
+                takeover = state == Some(SessionState::Running);
                 if !ctx.has_eligible_inputs().await? && !takeover {
                     // Spurious wake: release without any event write.
                     return Ok(DrainOutcome::ReleasedClean);
