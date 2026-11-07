@@ -18,6 +18,10 @@
 //! - [`usage_metrics`] — provider token-usage report (pure
 //!   projection over `turn/end` payloads), exposed at `GET /metrics`,
 //!   `kian usage-stats` and the `session inspect` usage lines
+//! - [`views`] — the materialized views of the operator surfaces
+//!   (READ-MODEL §6, P2a): directory/usage/cache/ticket-stage rebuild
+//!   under a maintenance lease + fresh, digest-checked reads with the
+//!   honest full-derivation fallback
 //! - [`client`] — thin JSON-RPC HTTP client the session commands use to
 //!   talk to a running `serve` (re-exported from the wire-only
 //!   `kian-sdk` crate)
@@ -56,6 +60,7 @@ pub mod plugins;
 pub mod server;
 pub mod superagent;
 pub mod usage_metrics;
+pub mod views;
 pub mod webhook;
 
 #[cfg(test)]

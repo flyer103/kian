@@ -234,10 +234,47 @@ pub async fn sessions_with_events(
 /// Derives the whole-store aggregate: every session with events,
 /// rebuilt and folded into one [`CacheStatsReport`]. Optionally
 /// restricted to a single session.
+///
+/// With `use_views` (READ-MODEL §6, P2a) the fresh `session_cache`
+/// view is consulted first — identical numbers by construction; stale,
+/// corrupt, absent or disabled → the honest full-scan fold below.
 pub async fn cache_stats_report(
     store: &kian_store::EventStore,
     only: Option<SessionId>,
+    use_views: bool,
 ) -> Result<CacheStatsReport, InboxError> {
+    if use_views && let Some(entries) = crate::views::fresh_cache(store).await {
+        let mut report = CacheStatsReport::default();
+        match only {
+            None => {
+                for entry in &entries {
+                    report.add_session(&entry.report());
+                }
+            }
+            Some(session) => {
+                // Same shape as the honest single-session fold:
+                // one session counted, zero row when unknown.
+                let zero = crate::views::CacheEntry {
+                    session: session.0.to_string(),
+                    requests: 0,
+                    compared_pairs: 0,
+                    prefix_stable_pairs: 0,
+                    compacts: 0,
+                    invalidation_causes: BTreeMap::new(),
+                    first_unexpected_at: None,
+                    parse_errors: 0,
+                };
+                report.add_session(
+                    &entries
+                        .iter()
+                        .find(|e| e.session == session.0.to_string())
+                        .unwrap_or(&zero)
+                        .report(),
+                );
+            }
+        }
+        return Ok(report);
+    }
     let sessions = match only {
         Some(s) => vec![s],
         None => sessions_with_events(store).await?,
@@ -284,7 +321,7 @@ pub async fn run_cache_stats(
             .await
             .map_err(|e| format!("store: {e}"))?
     };
-    let report = cache_stats_report(&store, session)
+    let report = cache_stats_report(&store, session, config.read_model.views.enabled)
         .await
         .map_err(|e| format!("cache stats: {e}"))?;
     store.close().await;
@@ -562,7 +599,7 @@ mod tests {
                 .unwrap();
         }
 
-        let report = cache_stats_report(&store, None).await.unwrap();
+        let report = cache_stats_report(&store, None, false).await.unwrap();
         assert_eq!(report.sessions, 1);
         assert_eq!(report.requests, 2);
         assert_eq!(report.compared_pairs, 1);
@@ -570,10 +607,12 @@ mod tests {
         assert_eq!(report.prefix_hit_rate(), Some(1.0));
         assert!(report.invalidation_causes.is_empty());
 
-        let one = cache_stats_report(&store, Some(session)).await.unwrap();
+        let one = cache_stats_report(&store, Some(session), false)
+            .await
+            .unwrap();
         assert_eq!(one, report);
 
-        let missing = cache_stats_report(&store, Some(SessionId::new()))
+        let missing = cache_stats_report(&store, Some(SessionId::new()), false)
             .await
             .unwrap();
         assert_eq!(missing.sessions, 1, "empty stream still folds in");

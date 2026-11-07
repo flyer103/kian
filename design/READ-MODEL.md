@@ -8,9 +8,10 @@
 >
 > Status: **P0 landed** (version + unchanged/delta reads, resumable per-session streams, the
 > drain context cache). **P1 landed** (verified snapshots of state + model context with
-> provenance, tail replay, the maintenance builder). P2–P3 remain proposed. The phase table in
-> §11 records the agreed target; each phase flips to `landed` in the change that implements it
-> and updates this header.
+> provenance, tail replay, the maintenance builder). **P2a landed** (materialized views:
+> session directory, usage, ticket stage, cache, the kind index). P2b–P3 remain proposed. The
+> phase table in §11 records the agreed target; each phase flips to `landed` in the change that
+> implements it and updates this header.
 
 ## 0. Scope and relationship to the other contracts
 
@@ -166,6 +167,40 @@ none may).
 | `session_usage` | `turn/end` usage | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
 | `ticket_stage` | `thread/started`, outbox, directory | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
 | `audit_kind_index` | event kind/ts | store head | append-time or rebuild | drop/rebuild | observability |
+| `session_cache` | `step/request` prefixes, `compact` | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
+
+Landed shape (P2a):
+
+- **Physical form.** `session_directory` / `session_usage` / `ticket_stage` / `session_cache`
+  are logical views over one physical `view_rows` table (migration v4; the `view` column carries
+  the declared name, `payload` the canonical JSON row). A per-view `view_state` row records the
+  store key `(events_total, max_seq)` the rows were derived at plus a sha256 digest over the row
+  set. The count axis is load-bearing: `seq` is per-session, so `MAX(seq)` alone would miss an
+  append to a shorter session.
+- **`audit_kind_index` is a SQL index**, not a view table: `kind`/`ts` are already projection
+  columns of the truth table (`events`), so a plain index accelerates kind/time queries with
+  zero duplication of derived data, is maintained by the database at append time (always fresh —
+  no staleness class, no rebuild), and can never disagree with the stream. A view table would
+  duplicate one row per event only to go stale.
+- **`session_cache` was declared additively by the P2a change** (per §10's additive protocol):
+  the round-9 plan requires `kian cache-stats` to be served from views when fresh, and §6 had
+  declared no view over the prefix-stability counters. Its source is the `step/request` audit
+  copies (the A2 bytes) and `compact` events; it reports the same per-session counters
+  `kian cache-stats` derives.
+- **Freshness gate.** A view is served only at exactly the store key it was derived at (any
+  append makes it stale — not a TTL), only when the digest over the read rows matches the stored
+  digest, and only when every payload decodes. Stale, corrupt, undecodable, absent (a read-only
+  reader of a pre-v4 store) or disabled (`read_model.views.enabled: false`) → the honest full
+  stream derivation.
+- **`ticket_stage` declared bound.** Event-derived fields are exact-version fresh;
+  `pending_inbox` (an inbox row can become eligible with no append, via `eligible_at`) and the
+  stage's dependence on it are as of the last rebuild — the declared staleness bound `B` (the
+  rebuild cadence). The rendered board is therefore ≤ one rebuild interval old on those fields.
+- **Publication** is one transaction per view (rows + freshness key + digest together): a crash
+  leaves the old complete version or the new one, never half a view. A view *replaces* its
+  predecessor — unlike snapshots (R6 insert-only) this is safe because the whole version flips
+  atomically and no reader may treat a view as truth. Rebuilds run under the `views:all`
+  maintenance lease (liveness only), the store key pinned before any stream is read.
 
 Rules:
 
@@ -242,7 +277,7 @@ Rules:
 |---|---|---|---|
 | P0 | version + unchanged/delta reads, resumable SSE, drain context cache, bench | landed | L1 unit; L2 e2e (resume, unchanged); L3 chaos unchanged; bench: unchanged read = 1 head query, SSE poll = O(Δ) |
 | P1 | snapshots (state + context with provenance), verified publish, tail replay | landed | L1 equivalence incl. compact; L2 resume/crash; bench: 10k-event resume = O(tail); request bytes unchanged |
-| P2a | session directory, usage/stage views, kind index | planned | L1 rebuild equivalence; L2 operator surfaces on 1k sessions; corrupt/stale fallback |
+| P2a | session directory, usage/stage views, kind index | landed | L1 rebuild equivalence; L2 operator surfaces on 1k sessions; corrupt/stale fallback |
 | P2b | opt-in export-only archive, import, retention | planned | L2 archive→verify→delete→inspect; export byte parity; corrupt package refused; crash windows |
 | P3 | explicit-allowlist fan-in stream, caps, filters, metrics | planned | L2 two-session fan-in; filters/caps/unknown-id; reconnect per-session unaffected; no wildcard |
 

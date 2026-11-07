@@ -57,6 +57,43 @@ const V1_INBOX_CLAIMS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS inputs (\n    id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    admitted_at INTEGER NOT NULL,\n    eligible_at INTEGER NOT NULL,\n    idempotency_key TEXT,\n    consumed_by_seq INTEGER,\n    UNIQUE (session, idempotency_key)\n);\nCREATE INDEX IF NOT EXISTS idx_inputs_pending ON inputs (session, eligible_at) WHERE consumed_by_seq IS NULL;\nCREATE TABLE IF NOT EXISTS claims (\n    session TEXT PRIMARY KEY,\n    epoch INTEGER NOT NULL,\n    holder TEXT NOT NULL,\n    ttl_ms INTEGER NOT NULL,\n    last_heartbeat INTEGER NOT NULL\n)",
 };
 
+/// v4 — the materialized-view tables (READ-MODEL §6, P2a). Like
+/// `projection_snapshots` these are **infrastructure rows, never
+/// truth** (R1): every view can be dropped and rebuilt from the event
+/// stream at any time without changing a single event byte.
+///
+/// One physical row table serves every declared logical view: the
+/// `view` column carries the declared view name
+/// (`session_directory`, `session_usage`, `ticket_stage`,
+/// `session_cache`) and `payload` the canonical JSON of that view's
+/// row type. A per-view `view_state` row records the store key
+/// (`events_total`, `max_seq`) the rows were derived at plus a sha256
+/// digest over the row set — the freshness and corruption checks every
+/// read performs before a view is served (READ-MODEL §6 rules).
+///
+/// Publication is one transaction per view (delete the view's rows,
+/// insert the new set, upsert `view_state`): atomic on both backends,
+/// so a crash leaves the old complete version or the new complete
+/// version — never half a view (a view is visible only when complete
+/// for its version). Unlike snapshots (R6, insert-only) a view
+/// *replaces* its predecessor — that is safe precisely because the
+/// whole version flips in one transaction and no reader may treat a
+/// view as truth anyway.
+///
+/// The declared `audit_kind_index` view is implemented as the SQL
+/// index below rather than a view table: `kind`/`ts` are already
+/// projection columns of the truth table, so a plain index accelerates
+/// kind/time queries with zero duplication of derived data, is
+/// maintained by the database itself at append time (always fresh —
+/// no staleness class, no rebuild), and adds nothing that could ever
+/// disagree with the stream. A view table would duplicate one row per
+/// event only to go stale.
+const V4_VIEWS: Migration = Migration {
+    version: 4,
+    name: "v4_materialized_views",
+    up: "CREATE TABLE IF NOT EXISTS view_rows (\n    view TEXT NOT NULL,\n    session TEXT NOT NULL,\n    row_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    PRIMARY KEY (view, session)\n);\nCREATE TABLE IF NOT EXISTS view_state (\n    view TEXT PRIMARY KEY,\n    events_total INTEGER NOT NULL,\n    max_seq INTEGER NOT NULL,\n    digest TEXT NOT NULL,\n    built_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -65,6 +102,7 @@ pub fn chain() -> &'static [Migration] {
         V1_INBOX_CLAIMS,
         V2_INBOX_ADMIT_ORDER,
         V3_PROJECTION_SNAPSHOTS,
+        V4_VIEWS,
     ]
 }
 
@@ -148,6 +186,15 @@ const PG_V3_PROJECTION_SNAPSHOTS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS projection_snapshots (\n    session TEXT NOT NULL,\n    version BIGINT NOT NULL,\n    state TEXT NOT NULL,\n    context TEXT NOT NULL,\n    context_provenance TEXT NOT NULL,\n    digest TEXT NOT NULL,\n    verified BIGINT NOT NULL,\n    created_at BIGINT NOT NULL,\n    PRIMARY KEY (session, version)\n);\nCREATE INDEX IF NOT EXISTS idx_projection_snapshots_verified ON projection_snapshots (session, version) WHERE verified = 1;\nCREATE TABLE IF NOT EXISTS maintenance_leases (\n    scope TEXT PRIMARY KEY,\n    holder TEXT NOT NULL,\n    ttl_ms BIGINT NOT NULL,\n    last_heartbeat BIGINT NOT NULL\n)",
 };
 
+/// v4 (postgres chain) — the materialized-view tables, pg DDL (same
+/// version, name and shape as the sqlite generation, READ-MODEL §6).
+/// The `audit_kind_index` is the SQL index, exactly like sqlite.
+const PG_V4_VIEWS: Migration = Migration {
+    version: 4,
+    name: "v4_materialized_views",
+    up: "CREATE TABLE IF NOT EXISTS view_rows (\n    view TEXT NOT NULL,\n    session TEXT NOT NULL,\n    row_version BIGINT NOT NULL,\n    payload TEXT NOT NULL,\n    PRIMARY KEY (view, session)\n);\nCREATE TABLE IF NOT EXISTS view_state (\n    view TEXT PRIMARY KEY,\n    events_total BIGINT NOT NULL,\n    max_seq BIGINT NOT NULL,\n    digest TEXT NOT NULL,\n    built_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -158,6 +205,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V1_INBOX_CLAIMS,
         PG_V2_INBOX_ADMIT_ORDER,
         PG_V3_PROJECTION_SNAPSHOTS,
+        PG_V4_VIEWS,
     ]
 }
 
@@ -536,6 +584,63 @@ mod tests {
                 "    ttl_ms BIGINT NOT NULL,\n",
                 "    last_heartbeat BIGINT NOT NULL\n",
                 ")",
+            )
+        );
+    }
+
+    /// v4 is a committed generation the moment it ships: pinned
+    /// byte-for-byte like v0–v3 (append-only chain).
+    #[test]
+    fn v4_generation_sql_is_frozen() {
+        let v4: &Migration = &chain()[4];
+        assert_eq!(v4.version, 4);
+        assert_eq!(v4.name, "v4_materialized_views");
+        assert_eq!(
+            v4.up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS view_rows (\n",
+                "    view TEXT NOT NULL,\n",
+                "    session TEXT NOT NULL,\n",
+                "    row_version INTEGER NOT NULL,\n",
+                "    payload TEXT NOT NULL,\n",
+                "    PRIMARY KEY (view, session)\n",
+                ");\n",
+                "CREATE TABLE IF NOT EXISTS view_state (\n",
+                "    view TEXT PRIMARY KEY,\n",
+                "    events_total INTEGER NOT NULL,\n",
+                "    max_seq INTEGER NOT NULL,\n",
+                "    digest TEXT NOT NULL,\n",
+                "    built_at INTEGER NOT NULL\n",
+                ");\n",
+                "CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
+            )
+        );
+    }
+
+    /// The pg v4 generation is pinned like its sqlite twin.
+    #[test]
+    fn pg_v4_generation_sql_is_frozen() {
+        let pg = pg_chain();
+        assert_eq!(pg[4].version, 4);
+        assert_eq!(pg[4].name, "v4_materialized_views");
+        assert_eq!(
+            pg[4].up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS view_rows (\n",
+                "    view TEXT NOT NULL,\n",
+                "    session TEXT NOT NULL,\n",
+                "    row_version BIGINT NOT NULL,\n",
+                "    payload TEXT NOT NULL,\n",
+                "    PRIMARY KEY (view, session)\n",
+                ");\n",
+                "CREATE TABLE IF NOT EXISTS view_state (\n",
+                "    view TEXT PRIMARY KEY,\n",
+                "    events_total BIGINT NOT NULL,\n",
+                "    max_seq BIGINT NOT NULL,\n",
+                "    digest TEXT NOT NULL,\n",
+                "    built_at BIGINT NOT NULL\n",
+                ");\n",
+                "CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
             )
         );
     }

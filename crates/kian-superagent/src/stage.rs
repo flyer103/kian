@@ -96,6 +96,23 @@ impl TicketStage {
             Self::Working => "working",
         }
     }
+
+    /// The inverse of [`as_str`](Self::as_str): the stage for its stable
+    /// name, `None` for anything else (a stored name that is not a
+    /// stage is a doubt, never a guess).
+    #[must_use]
+    pub fn from_str_name(name: &str) -> Option<Self> {
+        match name {
+            "delivery-retry" => Some(Self::DeliveryRetry),
+            "awaiting-answer" => Some(Self::AwaitingAnswer),
+            "awaiting-review" => Some(Self::AwaitingReview),
+            "blocked-failed" => Some(Self::BlockedFailed),
+            "queued" => Some(Self::Queued),
+            "idle" => Some(Self::Idle),
+            "working" => Some(Self::Working),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for TicketStage {
@@ -333,4 +350,29 @@ impl TicketFacts {
 fn event_thread_id(ev: &Event) -> Option<Uuid> {
     let raw = ev.bytes.get("thread_id").and_then(|v| v.as_str())?;
     Uuid::parse_str(raw).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TicketStage;
+
+    /// `from_str_name` is the exact inverse of `as_str` for every stage,
+    /// and refuses anything else (a doubt, never a guess — the P2a
+    /// ticket view's stored stage strings decode through this).
+    #[test]
+    fn from_str_name_round_trips_every_stage() {
+        for stage in [
+            TicketStage::DeliveryRetry,
+            TicketStage::AwaitingAnswer,
+            TicketStage::AwaitingReview,
+            TicketStage::BlockedFailed,
+            TicketStage::Queued,
+            TicketStage::Idle,
+            TicketStage::Working,
+        ] {
+            assert_eq!(TicketStage::from_str_name(stage.as_str()), Some(stage));
+        }
+        assert_eq!(TicketStage::from_str_name("not-a-stage"), None);
+        assert_eq!(TicketStage::from_str_name(""), None);
+    }
 }

@@ -146,10 +146,44 @@ pub fn session_usage_report(session: SessionId, events: &[Event]) -> SessionUsag
 /// Derives the whole-store aggregate: every session with events,
 /// rebuilt and folded into one [`UsageStatsReport`]. Optionally
 /// restricted to a single session.
+///
+/// With `use_views` (READ-MODEL §6, P2a) the fresh `session_usage`
+/// view is consulted first — identical numbers by construction (the
+/// view rows ARE `session_usage_report` outputs, published atomically
+/// at the store key); stale, corrupt, absent or disabled → the honest
+/// full-scan fold below, which stays the truth path.
 pub async fn usage_stats_report(
     store: &kian_store::EventStore,
     only: Option<SessionId>,
+    use_views: bool,
 ) -> Result<UsageStatsReport, InboxError> {
+    if use_views && let Some(entries) = crate::views::fresh_usage(store).await {
+        return Ok(match only {
+            None => {
+                let mut report = UsageStatsReport::default();
+                for entry in &entries {
+                    report.add_session(&entry.report());
+                }
+                report
+            }
+            Some(session) => {
+                // Same shape as the honest single-session fold:
+                // one session counted, zero row when unknown.
+                let mut report = UsageStatsReport::default();
+                report.add_session(
+                    &entries
+                        .iter()
+                        .find(|e| e.session == session.0.to_string())
+                        .map(|e| e.report())
+                        .unwrap_or_else(|| SessionUsageReport {
+                            session,
+                            ..SessionUsageReport::default()
+                        }),
+                );
+                report
+            }
+        });
+    }
     let sessions = match only {
         Some(s) => vec![s],
         None => crate::cache_metrics::sessions_with_events(store).await?,
@@ -211,7 +245,7 @@ pub async fn run_usage_stats(
             .await
             .map_err(|e| format!("store: {e}"))?
     };
-    let report = usage_stats_report(&store, session)
+    let report = usage_stats_report(&store, session, config.read_model.views.enabled)
         .await
         .map_err(|e| format!("usage stats: {e}"))?;
     store.close().await;
@@ -368,7 +402,7 @@ mod tests {
         b.turn_end(json!({"usage": {"weird": true}}));
         append_all(store.clone(), c, b.build()).await;
 
-        let report = usage_stats_report(&store, None).await.unwrap();
+        let report = usage_stats_report(&store, None, false).await.unwrap();
         assert_eq!(report.sessions, 2);
         assert_eq!(report.requests_with_usage, 3);
         assert_eq!(report.unknown_usage_requests, 1);
@@ -378,7 +412,7 @@ mod tests {
         assert_eq!(report.cache_creation_input_tokens, 0);
 
         // Single-session restriction folds exactly that session.
-        let one = usage_stats_report(&store, Some(a)).await.unwrap();
+        let one = usage_stats_report(&store, Some(a), false).await.unwrap();
         assert_eq!(
             one,
             UsageStatsReport {

@@ -1107,3 +1107,85 @@ async fn pg_snapshots_publication_reads_and_maintenance_leases() {
 
     pg.finish().await;
 }
+
+/// v4 (READ-MODEL §6): the view tables exist on pg, publication is the
+/// one-transaction version flip, the store key moves on any append,
+/// and a tampered row breaks the digest — the pg twin of the in-module
+/// sqlite suite.
+#[tokio::test]
+async fn pg_views_publish_reads_and_freshness() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("applied versions");
+    assert!(
+        versions.contains(&4),
+        "open_postgres applies v4, got {versions:?}"
+    );
+
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 3, Epoch::GENESIS).await;
+    let key = pg.store.view_store_key().await.expect("store key");
+    assert_eq!(key.events_total, 3);
+    assert_eq!(key.max_seq, 3);
+
+    let rows = vec![kian_store::ViewRow {
+        session: sid.0.to_string(),
+        row_version: 3,
+        payload: r#"{"events":3}"#.into(),
+    }];
+    pg.store
+        .view_publish("session_directory", rows.clone(), key, 42)
+        .await
+        .expect("publish");
+    let state = pg
+        .store
+        .view_state("session_directory")
+        .await
+        .expect("state")
+        .expect("published");
+    assert_eq!((state.events_total, state.max_seq), (3, 3));
+    assert_eq!(state.built_at, 42);
+    let read = pg
+        .store
+        .view_rows("session_directory")
+        .await
+        .expect("rows")
+        .expect("table exists");
+    assert_eq!(read, rows);
+    assert_eq!(
+        state.digest,
+        kian_store::view_rows_digest("session_directory", &read)
+    );
+
+    // Tampering breaks the digest (the corruption check every read
+    // performs); view_drop discards the view whole.
+    sqlx::query("UPDATE view_rows SET payload = $1 WHERE view = $2 AND session = $3")
+        .bind(r#"{"events":999}"#)
+        .bind("session_directory")
+        .bind(sid.0.to_string())
+        .execute(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("tamper");
+    let tampered = pg
+        .store
+        .view_rows("session_directory")
+        .await
+        .expect("rows")
+        .expect("table exists");
+    assert_ne!(
+        state.digest,
+        kian_store::view_rows_digest("session_directory", &tampered)
+    );
+    pg.store.view_drop("session_directory").await.expect("drop");
+    assert!(
+        pg.store
+            .view_state("session_directory")
+            .await
+            .expect("state")
+            .is_none()
+    );
+}

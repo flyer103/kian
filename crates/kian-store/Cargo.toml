@@ -14,3 +14,6 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 futures.workspace = true
+# READ-MODEL §6: the view-set digest (sha256 over a view's rows — the
+# corruption check every view read performs before serving).
+sha2.workspace = true

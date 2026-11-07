@@ -467,3 +467,50 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   derivation grows 826 µs→8.96 ms — resume is O(tail)); one maintenance build (two
   derivations + digest + insert) 2.0 ms @1k → 18.8 ms @10k, off the serving path.
   READ-MODEL §11 P1 `planned` → `landed` + header updated; docs-map green.
+- **Read model P2a — materialized views (directory, usage, ticket stage, kind index) (round 9,
+  R9-04)** — default-green (pg chain env-gated). The serving-form contract's third phase
+  (`design/READ-MODEL.md` §6/§9/§11): migration **v4** appended to BOTH chains (v0–v3 frozen,
+  pinned byte-for-byte by new golden tests) adds one physical `view_rows` table (logical views
+  `session_directory` / `session_usage` / `ticket_stage` / `session_cache` keyed by name,
+  canonical-JSON payloads) plus a per-view `view_state` row (store key `(events_total, max_seq)`
+  + sha256 digest over the row set), and implements the declared `audit_kind_index` as a plain
+  SQL index `idx_events_kind_ts` — chosen over a view table because `kind`/`ts` are already
+  projection columns of the truth table: an index is append-time fresh, duplicates nothing and
+  can never disagree with the stream (justification in the migration comment and READ-MODEL
+  §6). `session_cache` is declared additively in §6 by this change (the plan requires
+  `cache-stats` served from views; §10's additive protocol). Views are disposable
+  observability accelerators, never truth (R1/R8): no control read consumes one — pinned by
+  `no_control_read_consumes_a_view` (the orchestrator sources never reference the view
+  surface). The freshness key is `(COUNT(events), MAX(seq))` — the count axis is load-bearing
+  because `seq` is per-session and an append to a shorter session moves only the count
+  (`store_key_changes_on_any_append`). A view is served only when the live key equals the
+  derived-at key exactly (no TTL), the digest over the read rows matches (corruption check —
+  tampered rows break it, `tampered_rows_break_the_digest`), and every payload decodes; stale,
+  corrupt, undecodable, absent (a read-only reader of a pre-v4 store — `absent_tables_read_as_no_view`,
+  `pre_v4_read_only_reader_falls_back`) or disabled → the honest full stream derivation, which
+  stays the truth path (`stale_view_falls_back_to_full_derivation`,
+  `corrupt_view_is_discarded_and_the_gate_hides_views`). Rebuild runs outside every drain under
+  the `views:all` maintenance lease (liveness only; `rebuild_lease_excludes_concurrent_rebuilders`),
+  pins the key BEFORE reading any stream, and publishes each view as ONE transaction (rows +
+  state + digest together): a crash leaves the old complete version or the new one, never half
+  a view (`publication_is_atomic_versioned_and_digest_covered`). Operator surfaces consult
+  fresh views first with identical numbers by construction — the builder calls the SAME
+  derivations the honest paths run (`session_usage_report`, `session_cache_report`, and the
+  `kian tickets` board extraction `ticket_board`/`ticket_rows`); `kian tickets`, `usage-stats`,
+  `cache-stats` and the `/metrics` aggregates fall back per-read. Declared staleness
+  (READ-MODEL §6): event-derived fields are exact-version fresh; `ticket_stage`'s
+  `pending_inbox` (and the stage's dependence on it) is as of the last rebuild — an inbox row
+  can become eligible with no append. Config gate `read_model.views` (`enabled` default **true**,
+  `interval_ms` 60 000, fail-closed validation; disabling hides every view);
+  `kian serve` spawns the rebuild ticker. Equivalence executed:
+  `rebuild_equals_full_derivation_on_a_multi_session_store` (directory facts, usage totals,
+  cache counters incl. compacts, and the full ticket board — view rows decode into exactly
+  `ticket_board`'s rows at the same `now`); `pg_views_publish_reads_and_freshness` (env-gated,
+  live against PG 17.11); `from_str_name_round_trips_every_stage` (the stored stage names);
+  `read_model_views_default_enabled`, `read_model_views_section_parses_and_gates` (config);
+  `v4_generation_sql_is_frozen`, `pg_v4_generation_sql_is_frozen` (migrations). Benchmark
+  (`cargo bench -p kian-cli --bench read_path -- views`, sqlite, criterion 0.5, M-series
+  laptop, 1 000 sessions ≈ 5.2k events: 800 plain + 200 workers): ticket board from the fresh
+  view **486 µs** vs **30.5 ms** full derivation (≈63×); usage aggregate **1.63 ms** vs
+  **28.4 ms** (≈17×); one maintenance rebuild of all four views **66.5 ms**, off the serving
+  path. READ-MODEL §11 P2a `planned` → `landed` + header updated; docs-map green.

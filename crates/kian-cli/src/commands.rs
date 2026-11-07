@@ -716,7 +716,7 @@ pub async fn run_lease_inspect(
 
 /// One row of the `kian tickets` board: a worker session (one Ticket
 /// v1) with its derived stage and the facts behind it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TicketRow {
     /// The worker session (= the Ticket v1 identity).
     pub session: SessionId,
@@ -744,24 +744,118 @@ pub struct TicketRow {
 /// every worker session discovered by scanning `thread/started`
 /// across streams (the [`kian_superagent::worker_sessions`] derivation),
 /// each with its stage, topic, thread status, and age. Read-only
-/// (`open_read_only`); the stage is a pure projection of the stream +
-/// inbox, recomputed on every call — nothing is cached, nothing is
-/// written. Deterministic order: session uuid ascending.
+/// (`open_read_only`). Served from the fresh `ticket_stage` view when
+/// one exists (READ-MODEL §6, P2a; `pending_inbox` and the stage's
+/// dependence on it are then as of the last rebuild — the declared
+/// staleness bound); the full per-stream derivation remains the honest
+/// fallback. Deterministic order: session uuid ascending.
 pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
+    // The view gate (READ-MODEL §6): `read_model.views.enabled: false`
+    // hides every view — full derivation only.
+    let views_enabled = ServeConfig::load(config_path)
+        .map(|cfg| cfg.read_model.views.enabled)
+        .unwrap_or(false);
     let store = open_reader(&db).await?;
-    let sessions = crate::cache_metrics::sessions_with_events(&store)
+    let now = now_ms();
+
+    let rows = if views_enabled {
+        // Fresh view first; None on any doubt (stale/corrupt/absent,
+        // or a row that fails to decode) falls through to the honest
+        // derivation.
+        match crate::views::fresh_tickets(&store).await {
+            Some(entries) => match entries
+                .iter()
+                .map(|e| e.to_row(now))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(rows) => rows,
+                Err(_) => ticket_board(&store, now).await?,
+            },
+            None => ticket_board(&store, now).await?,
+        }
+    } else {
+        ticket_board(&store, now).await?
+    };
+    store.close().await;
+
+    if json {
+        let report = json!({"now_ms": now, "tickets": rows});
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    Ok(render_tickets(&rows))
+}
+
+/// Renders the board (deterministic: a pure function of the rows).
+fn render_tickets(rows: &[TicketRow]) -> String {
+    if rows.is_empty() {
+        return "no worker sessions (no thread/started lineage in this store)\n".into();
+    }
+    let mut out = format!(
+        "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
+        "SESSION", "STAGE", "TOPIC", "THREAD", "PENDING", "EVENTS", "AGE"
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
+            row.session.0,
+            row.stage,
+            row.topic.as_deref().unwrap_or("-"),
+            row.thread
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.pending_inbox,
+            row.events,
+            format_age(row.age_ms),
+        ));
+    }
+    // the parked message named on the board — appended lines only
+    // when something is parked (empty board output stays byte-identical
+    // to the legacy shape).
+    for row in rows.iter().filter(|row| !row.parked.is_empty()) {
+        out.push_str(&format!(
+            "parked: {} {} → {}\n",
+            row.session.0,
+            row.thread
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            row.parked.join("; ")
+        ));
+    }
+    out
+}
+
+/// The honest full-board derivation: every stream rebuilt, worker
+/// discovery, stage projection per worker. This is both `kian tickets`
+/// fallback **and** the `ticket_stage` view's build mechanism — one
+/// function, so view == full derivation by construction (READ-MODEL
+/// §6 rebuild-equivalence). Deterministic: rows in session uuid order.
+/// (`pub` for the integration tests that pin that equivalence.)
+pub async fn ticket_board(store: &EventStore, now_ms: u64) -> CmdResult<Vec<TicketRow>> {
+    let sessions = crate::cache_metrics::sessions_with_events(store)
         .await
         .map_err(|e| format!("session listing: {e}"))?;
     let mut streams = std::collections::BTreeMap::new();
-    let mut all_events = Vec::new();
     for session in &sessions {
         let events = store
             .rebuild(*session)
             .await
             .map_err(|e| format!("read events for {session:?}: {e}"))?;
-        all_events.extend(events.iter().cloned());
         streams.insert(*session, events);
+    }
+    ticket_rows(store, &streams, now_ms).await
+}
+
+/// The pure-ish core of the board derivation over already-read streams
+/// (the only store access left is the per-worker pending-inbox read).
+pub(crate) async fn ticket_rows(
+    store: &EventStore,
+    streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
+    now_ms: u64,
+) -> CmdResult<Vec<TicketRow>> {
+    let mut all_events = Vec::new();
+    for events in streams.values() {
+        all_events.extend(events.iter().cloned());
     }
     // Worker discovery: `thread/started` across every stream (a
     // Router's dispatch side names the workers; worker-side lineage
@@ -778,7 +872,6 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
         }
     }
 
-    let now = now_ms();
     // the real outbox view — the delivery-retry stage arm's input
     // ('s stub exemption: this construction replaces `NoOutbox`).
     // Ticket aliases per thread: the thread's own id string plus the
@@ -869,7 +962,7 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
     for worker in workers {
         let events = streams.get(&worker).cloned().unwrap_or_default();
         let pending = store
-            .eligible_inputs(worker, now)
+            .eligible_inputs(worker, now_ms)
             .await
             .map_err(|e| format!("inbox read: {e}"))?
             .len();
@@ -915,52 +1008,12 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             stage,
             thread_status,
             pending_inbox: pending,
-            age_ms: now.saturating_sub(first_ts),
+            age_ms: now_ms.saturating_sub(first_ts),
             events: events.len(),
             parked,
         });
     }
-    store.close().await;
-
-    if json {
-        let report = json!({"now_ms": now, "tickets": rows});
-        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
-    }
-    if rows.is_empty() {
-        return Ok("no worker sessions (no thread/started lineage in this store)\n".into());
-    }
-    let mut out = format!(
-        "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
-        "SESSION", "STAGE", "TOPIC", "THREAD", "PENDING", "EVENTS", "AGE"
-    );
-    for row in &rows {
-        out.push_str(&format!(
-            "{:<38} {:<16} {:<12} {:<16} {:>7} {:>8} {:>12}\n",
-            row.session.0,
-            row.stage,
-            row.topic.as_deref().unwrap_or("-"),
-            row.thread
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "-".into()),
-            row.pending_inbox,
-            row.events,
-            format_age(row.age_ms),
-        ));
-    }
-    // the parked message named on the board — appended lines only
-    // when something is parked (empty board output stays byte-identical
-    // to the legacy shape).
-    for row in rows.iter().filter(|row| !row.parked.is_empty()) {
-        out.push_str(&format!(
-            "parked: {} {} → {}\n",
-            row.session.0,
-            row.thread
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "-".into()),
-            row.parked.join("; ")
-        ));
-    }
-    Ok(out)
+    Ok(rows)
 }
 
 /// Human age from ms, deterministic formatting: the two most

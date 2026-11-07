@@ -634,3 +634,64 @@ pub(crate) async fn maintenance_release(
         .await?;
     Ok(())
 }
+
+// -- materialized views (READ-MODEL §6, v4) ----------------------------------
+
+/// Same shapes as the sqlite module, `$N` placeholders, pg types.
+pub(crate) const STORE_KEY_SQL: &str = "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM events";
+
+pub(crate) const VIEW_STATE_SQL: &str =
+    "SELECT events_total, max_seq, digest, built_at FROM view_state WHERE view = $1";
+
+pub(crate) const VIEW_ROWS_SQL: &str =
+    "SELECT session, row_version, payload FROM view_rows WHERE view = $1 ORDER BY session ASC";
+
+pub(crate) const VIEW_ROW_DELETE_SQL: &str = "DELETE FROM view_rows WHERE view = $1";
+pub(crate) const VIEW_ROW_INSERT_SQL: &str =
+    "INSERT INTO view_rows (view, session, row_version, payload) VALUES ($1, $2, $3, $4)";
+pub(crate) const VIEW_STATE_UPSERT_SQL: &str = "INSERT INTO view_state (view, events_total, max_seq, digest, built_at)\nVALUES ($1, $2, $3, $4, $5)\nON CONFLICT(view) DO UPDATE SET\n    events_total = excluded.events_total,\n    max_seq = excluded.max_seq,\n    digest = excluded.digest,\n    built_at = excluded.built_at";
+pub(crate) const VIEW_STATE_DELETE_SQL: &str = "DELETE FROM view_state WHERE view = $1";
+
+pub(crate) async fn view_publish(
+    pool: &PgPool,
+    p: &crate::views::publish::Publish<'_>,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(VIEW_ROW_DELETE_SQL)
+        .bind(p.view)
+        .execute(&mut *tx)
+        .await?;
+    for row in p.rows {
+        sqlx::query(VIEW_ROW_INSERT_SQL)
+            .bind(p.view)
+            .bind(&row.session)
+            .bind(se_i64(row.row_version, "view row_version")?)
+            .bind(&row.payload)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(VIEW_STATE_UPSERT_SQL)
+        .bind(p.view)
+        .bind(p.events_total)
+        .bind(p.max_seq)
+        .bind(p.digest)
+        .bind(p.built_at)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn view_drop(pool: &PgPool, view: &str) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(VIEW_ROW_DELETE_SQL)
+        .bind(view)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(VIEW_STATE_DELETE_SQL)
+        .bind(view)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}

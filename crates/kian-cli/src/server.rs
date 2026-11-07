@@ -91,6 +91,15 @@ pub struct Server {
     /// ticker — the builder runs outside every drain, under a
     /// per-session maintenance lease.
     snapshot_maintenance: Option<SnapshotMaintenance>,
+    /// The view maintenance plan (READ-MODEL §6/§9, P2a): present iff
+    /// `read_model.views.enabled`. [`Server::serve`] spawns its ticker
+    /// — the rebuilder runs outside every drain under the `views:all`
+    /// maintenance lease.
+    views_maintenance: Option<ViewsMaintenance>,
+    /// Whether observability reads on this server (/metrics aggregates)
+    /// may consult fresh materialized views (READ-MODEL §6; a disabled
+    /// gate hides every view).
+    views_enabled: bool,
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
@@ -100,6 +109,13 @@ pub struct Server {
 #[derive(Clone)]
 struct SnapshotMaintenance {
     build: kian_orchestrator::SnapshotBuildConfig,
+    interval_ms: u64,
+    holder: String,
+}
+
+/// The serve-side view rebuilder plan (READ-MODEL §6/§9, P2a).
+#[derive(Clone)]
+struct ViewsMaintenance {
     interval_ms: u64,
     holder: String,
 }
@@ -662,6 +678,17 @@ impl Server {
                     interval_ms: config.read_model.snapshots.interval_ms,
                     holder: config.drain.holder.clone(),
                 });
+        // READ-MODEL §6 (P2a): the view maintenance plan — present iff
+        // `read_model.views.enabled`. [`Server::serve`] spawns its
+        // ticker; the rebuilder runs outside every drain under the
+        // `views:all` maintenance lease. The gate also decides whether
+        // the /metrics aggregates may consult views (a disabled gate
+        // hides every view — honest full derivation).
+        let views_maintenance = config.read_model.views.enabled.then(|| ViewsMaintenance {
+            interval_ms: config.read_model.views.interval_ms,
+            holder: config.drain.holder.clone(),
+        });
+        let views_enabled = config.read_model.views.enabled;
         let engine = Engine::new_with_read_model(store.clone(), driver, engine_config, read_model);
 
         // The bundle's inbox port learns the engine (the cycle
@@ -690,6 +717,8 @@ impl Server {
             webhook_limits,
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
+            views_maintenance,
+            views_enabled,
             _plugin_disposer: plugin_disposer,
         };
 
@@ -847,6 +876,30 @@ impl Server {
                             tracing::warn!(error = %e, "snapshot maintenance tick failed");
                         }
                     }
+                }
+            });
+        }
+        // View maintenance (READ-MODEL §6/§9, P2a): a ticker whose each
+        // beat rebuilds every materialized view under the `views:all`
+        // maintenance lease — strictly outside every drain. Publication
+        // is one atomic version flip per view (rows + freshness key +
+        // digest in one transaction): a crash between beats leaves the
+        // previous complete version, never half a view. Idempotent
+        // under retry (R9). Views are observability accelerators only —
+        // no control read ever consumes one (R8).
+        if let Some(plan) = self.views_maintenance.clone() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(plan.interval_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    crate::views::views_maintenance_tick(&store, &plan.holder, now_ms).await;
                 }
             });
         }
@@ -1537,16 +1590,22 @@ async fn metrics_handler(
 
     let engine =
         serde_json::to_value(server.engine.metrics().snapshot()).unwrap_or(serde_json::Value::Null);
-    let cache = match crate::cache_metrics::cache_stats_report(&server.store, None).await {
-        Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
-        Err(e) => serde_json::json!({"error": e.to_string()}),
-    };
+    let cache =
+        match crate::cache_metrics::cache_stats_report(&server.store, None, server.views_enabled)
+            .await
+        {
+            Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        };
     // the usage aggregate, derived on read from `turn/end` payloads
     // (pure projection — no drain ever bumps a counter).
-    let usage = match crate::usage_metrics::usage_stats_report(&server.store, None).await {
-        Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
-        Err(e) => serde_json::json!({"error": e.to_string()}),
-    };
+    let usage =
+        match crate::usage_metrics::usage_stats_report(&server.store, None, server.views_enabled)
+            .await
+        {
+            Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        };
     let superagent = match &server.superagent {
         Some(runtime) => runtime.metrics_report(&server.store).await,
         None => serde_json::Value::Null,

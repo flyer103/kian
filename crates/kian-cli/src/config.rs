@@ -503,13 +503,51 @@ fn default_poll_ms() -> u64 {
 /// with a conservative threshold (a session must reach `min_events`
 /// before a snapshot pays for itself); disabling hides every snapshot —
 /// the loader falls back to full stream derivation and behavior is
-/// byte-identical to pre-P1.
+/// byte-identical to pre-P1. Materialized views (P2a) default enabled
+/// the same way: disabling hides every view — operator surfaces fall
+/// back to full stream derivation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ReadModelSection {
     /// The `read_model.snapshots:` subsection.
     #[serde(default)]
     pub snapshots: SnapshotSection,
+    /// The `read_model.views:` subsection (READ-MODEL §6, P2a).
+    #[serde(default)]
+    pub views: ViewsSection,
+}
+
+/// Materialized-view settings (READ-MODEL §6): enable plus the
+/// maintenance rebuild cadence. Views are observability accelerators;
+/// a disabled builder hides every view and every operator surface
+/// serves the honest full derivation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewsSection {
+    /// Whether operator surfaces may consult materialized views.
+    /// `false` hides every view (honest full derivation everywhere).
+    #[serde(default = "default_views_enabled")]
+    pub enabled: bool,
+    /// The maintenance rebuild cadence (the rebuilder runs outside
+    /// drains, under a maintenance lease — READ-MODEL §9).
+    #[serde(default = "default_views_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl Default for ViewsSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_views_enabled(),
+            interval_ms: default_views_interval_ms(),
+        }
+    }
+}
+
+fn default_views_enabled() -> bool {
+    true
+}
+fn default_views_interval_ms() -> u64 {
+    60_000
 }
 
 /// Verified-snapshot settings (READ-MODEL §5): enable/min-events/tail
@@ -2002,6 +2040,17 @@ impl ServeConfig {
                         "read_model.snapshots.interval_ms must be >= 100 (a tighter cadence only burns the maintenance lease)",
                     ));
                 }
+            }
+        }
+
+        // read_model.views: sane bounds (fail-closed, same doctrine as
+        // the snapshot section).
+        {
+            let v = &self.read_model.views;
+            if v.enabled && v.interval_ms < 100 {
+                return Err(invalid(
+                    "read_model.views.interval_ms must be >= 100 (a tighter cadence only burns the maintenance lease)",
+                ));
             }
         }
 
@@ -4467,6 +4516,65 @@ recovery:
         assert!(err.to_string().contains("min_events"), "{err}");
 
         let typo = valid_yaml() + "read_model:\n  snapshots:\n    enbled: true\n";
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse the typo'd key"
+        );
+    }
+
+    // -- read_model.views (READ-MODEL P2a) --------------------------
+
+    /// Defaults: views enabled with a sane cadence; absent section =
+    /// defaults (operator surfaces consult fresh views, honest fallback
+    /// otherwise).
+    #[test]
+    fn read_model_views_default_enabled() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        let v = &cfg.read_model.views;
+        assert!(v.enabled);
+        assert!(v.interval_ms >= 100);
+        cfg.validate().expect("defaults validate");
+    }
+
+    /// An explicit `read_model.views` section parses; disabling
+    /// validates (the gate hides every view); unknown keys refuse;
+    /// an enabled-but-too-tight cadence refuses (fail-closed).
+    #[test]
+    fn read_model_views_section_parses_and_gates() {
+        let yaml = format!(
+            "{}read_model:
+  views:
+    enabled: false
+    interval_ms: 5000
+",
+            valid_yaml()
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parse");
+        assert!(!cfg.read_model.views.enabled);
+        assert_eq!(cfg.read_model.views.interval_ms, 5000);
+        cfg.validate().expect("disabled validates");
+
+        let bad = format!(
+            "{}read_model:
+  views:
+    enabled: true
+    interval_ms: 1
+",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad).expect_err("interval_ms 1 must refuse while enabled");
+        assert!(
+            err.to_string().contains("read_model.views.interval_ms"),
+            "{err}"
+        );
+
+        let typo = format!(
+            "{}read_model:
+  views:
+    enbled: true
+",
+            valid_yaml()
+        );
         assert!(
             ServeConfig::parse(&typo).is_err(),
             "deny_unknown_fields must refuse the typo'd key"
