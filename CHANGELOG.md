@@ -686,3 +686,30 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   suites (`KIAN_PG_URL` etc.) skipped by design; the new store SQL is dispatched per backend
   but only the sqlite paths ran. READ-MODEL §6 (incremental rebuild bullet) and §9 (per-tick
   cost rule) updated in the same change.
+
+## 2026-11-08 — round-9 closeout: read model docs landed — documentation only
+
+- **Scope**: documentation reconciliation for the read-model round (P0–P3 + the R9-08 fixes +
+  R9-10 incremental rebuild). No code, no wire, no migration, no event kind.
+- **README**: Features gains the read-model line (versioned unchanged/delta reads, resumable
+  SSE, verified snapshots + tail replay, operator views, opt-in export-only archive,
+  allowlist fan-in — all disposable projections; the stream stays the only truth); Docs map row
+  re-worded from "proposed" to "the normative serving-form contract"; new Advanced usage section
+  (unchanged `projection` poll, opt-in `retention:` config, `kian archive run|verify`).
+- **SPEC §5**: "Read model and serving form" flips to **(P0–P3 landed)** with the round-9
+  commit range; all five phase rows `designed` → `landed`.
+- **READ-MODEL**: title `(proposed)` → `(normative)`; header rewritten to "accepted and fully
+  landed" (ADR-017, owner-gated 2026-11-07) with the phase summary; R1 gains the §5
+  load-time-trust-boundary pointer (re-review residual); §7 read-behavior "any read" narrowed
+  to the enumerated surfaces with an honest scope note (memory surfaces answer `unknown
+  session` — they do not consult the marker); the §4.2 512-frame batch now points at
+  API-CONTRACT §5.4 as its normative home (F4 duplicate).
+- **DESIGN §3.2**: the serving-form pointer tag "P0 landed" → "landed" (F4).
+- **Gates on the final tree**: build / `cargo test --workspace` / clippy `--all-targets
+  -D warnings` / fmt `--check` green, `docs_map` 6/6. Independent review verdict on the round
+  (R9-08 + re-review of fix `1f4d669`): PASS; QA acceptance 12/12 groups.
+- **Residuals (owner-pending, not blocking)**: `AGENTS.md` docs-map bullet for
+  `design/READ-MODEL.md` (plan §1.6) and the `21-kind` → `22-kind` catalog count (F4) were
+  **not** applied — AGENTS.md is a protected file and the write required owner approval that
+  did not arrive in this run. `SseFrame #[non_exhaustive]` stays deferred to the SDK freeze
+  (F5, recorded with its reason in the R9-08a entry).

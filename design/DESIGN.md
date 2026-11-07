@@ -449,7 +449,7 @@ creation-time `input/admitted` with `synthetic:true`, appended before the first 
 a frozen renderer and hard caps — so the injected index joins the shared prefix instead of rewriting
 a live session's context. Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
 
-**Serving-form acceleration (READ-MODEL, P0 landed)**: projection reads, event streams and the
+**Serving-form acceleration (READ-MODEL, landed)**: projection reads, event streams and the
 model context MAY be served from versioned caches, snapshots and materialized views. They are
 disposable, verified against the stream, and never an alternative truth; `compact` remains the
 only deliberate cache-invalidation point (constraint 3). Contract: `design/READ-MODEL.md`.

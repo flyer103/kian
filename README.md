@@ -35,6 +35,10 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 - **Agent memory (notes + dreaming)** — the memory session's drain reads a bounded transcript
   range and appends `memory/note` events (claims with provenance and verification state);
   `kian memory create/dream/list/show/verify`. Injection is a later phase.
+- **Read-model serving form** — versioned unchanged/delta projection reads, resumable SSE
+  (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
+  export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
+  the event stream stays the only truth.
 - **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats, `/metrics`, and a
   frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider; one Rust process plus
@@ -69,7 +73,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
 | [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phase 1 landed; injection/representations designed) |
-| [design/READ-MODEL.md](design/READ-MODEL.md) | Serving-form contract (proposed): versions, snapshots, retention |
+| [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
@@ -476,6 +480,33 @@ target/debug/kian memory verify --session "$MEM" --config kian.yaml   # re-check
 A dream is idempotent per `(source, range)` — repeating the same range is a no-op, and a drain
 crash resumes without duplicate notes (dedupe on `(subject, derived_from)`). Injection into new
 sessions is Phase 2 (designed, not landed).
+
+### Read model (versions, snapshots, views, retention)
+
+Every serving read is versioned and disposable — the event stream stays the only truth.
+`projection` answers unchanged reads with one version check; SSE frames carry `id: <seq>` and
+reconnect with `Last-Event-ID`; recovery loads the latest verified snapshot and replays only the
+tail. Snapshots and views default on (`read_model:`) and can be disabled for byte-identical
+full-derivation behavior.
+
+Retention is opt-in and export-only (default off): terminal sessions leave the online store only
+behind a verified package that reproduces the audit export byte-identically; reads of an archived
+session answer the explicit `archived` error with import guidance.
+
+```bash
+# unchanged poll ($V = the version you last saw): one version check, no state in the answer
+NO_PROXY=127.0.0.1,localhost curl -s localhost:7433/rpc -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"projection","params":{"session":"'"$SID"'","since":'"$V"'}}'
+# → {"jsonrpc":"2.0","id":1,"result":{"version":9,"unchanged":true}}
+
+# opt-in retention (fail-closed: archive_dir + one threshold required when enabled)
+# retention:
+#   enabled: true
+#   archive_dir: /var/lib/kian/archive
+#   min_age_ms: 2592000000        # terminal ≥ 30 days
+target/debug/kian archive run    --config kian.yaml          # verify → marker → delete, idempotent
+target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes + replay offline
+```
 
 ### Operator surfaces
 

@@ -1,4 +1,4 @@
-# Kian — Read Model (proposed)
+# Kian — Read Model (normative)
 
 > **This document is the normative contract for the serving form of a session's event stream.**
 > It defines versions, deltas, resumable streams, snapshots, materialized views, retention and
@@ -6,15 +6,15 @@
 > sole truth and the only source of session state (`EVENT-MODEL.md`; AGENTS.md constraint 1).
 > Wire shapes are normative in `API-CONTRACT.md`; execution mechanics are in `DESIGN.md`.
 >
-> Status: **P0 landed** (version + unchanged/delta reads, resumable per-session streams, the
-> drain context cache). **P1 landed** (verified snapshots of state + model context with
-> provenance, tail replay, the maintenance builder). **P2a landed** (materialized views:
-> session directory, usage, ticket stage, cache, the kind index). **P2b landed** (opt-in
-> export-only retention: the archive package, the two-phase verified commit, `session import`,
-> the `-32007 archived` read error). **P3 landed** (the explicit-allowlist fan-in event
-> stream: `GET /events`, caps, kind filter, the `event_stream` metrics). The
-> phase table in §11 records the agreed target; each phase flips to `landed` in the change that
-> implements it and updates this header.
+> Status: **accepted and fully landed** ([ADR-017](decisions/ADR-017-read-model-and-snapshots.md),
+> owner-gated 2026-11-07; round 9). **P0** — version + unchanged/delta reads, resumable
+> per-session streams, the drain context cache. **P1** — verified snapshots of state + model
+> context with provenance, tail replay, the maintenance builder. **P2a** — materialized views:
+> session directory, usage, ticket stage, cache, the kind index (incremental rebuild). **P2b** —
+> opt-in export-only retention: the archive package, the two-phase verified commit,
+> `session import`, the `-32007 archived` read error. **P3** — the explicit-allowlist fan-in
+> event stream: `GET /events`, caps, kind filter, the `event_stream` metrics. §11 records the
+> phase statuses and acceptance evidence.
 
 ## 0. Scope and relationship to the other contracts
 
@@ -68,6 +68,7 @@ The decision record for this contract is
 - **R1 Truth separation.** No read path may treat a snapshot, view or cache as authority. Every
   response MUST be derivable from the event stream; if derivation or verification fails, the
   response MUST fail explicitly — never serve unverified derived data as if it were truth.
+  (Snapshots carry an explicit load-time trust boundary — §5.)
 - **R2 Version.** A response's version MUST identify a committed prefix of the stream. A version
   is never reused or allowed to decrease per session. Versions MUST NOT be mixed: the payload
   returned for version `V` is derived from exactly the events `1..V`.
@@ -149,7 +150,8 @@ Landed shape (P3):
   is delivered through its `session/ended` event (subject to the kind filter) and then dropped
   from the watch; the stream closes when every listed session has ended or errored. There is no
   `done` frame — that is a per-session concept.
-- **Backpressure, concretely.** One cycle emits at most 512 frames before yielding, and the
+- **Backpressure, concretely.** One cycle emits at most 512 frames before yielding (the fixed
+  batch bound is normative in `API-CONTRACT` §5.4), and the
   poll loop is driven by the consumer's reads: a stalled consumer suspends polling outright, so
   the server never buffers unbounded data on its behalf (a slow consumer is flow-controlled,
   not a memory risk). An explicit idle-disconnect is not implemented in v0 — a stalled
@@ -276,12 +278,16 @@ Rules:
   insert the archived marker under CAS → delete online rows in one transaction. A failure at any
   point leaves the online rows intact; retries are idempotent. Delete is never attempted before a
   verified package exists.
-- **Read behavior.** Any read of an archived session returns the explicit `archived` error
-  (`API-CONTRACT` code). `session inspect` reports archived plus the package path;
-  `session export` reads the package and MUST be byte-identical; `session replay` refuses online
-  replay with import guidance. The per-session aggregate reads (`usage-stats --session`,
-  `cache-stats --session`) refuse with the archived marker and import guidance — never a silent
-  zero report (R7; R9-08 F3). Whole-store aggregates report the online window only.
+- **Read behavior.** Reads whose range touches the online rows of an archived session return the
+  explicit `archived` error (`API-CONTRACT` code). `session inspect` reports archived plus the
+  package path; `session export` reads the package and MUST be byte-identical; `session replay`
+  refuses online replay with import guidance. The per-session aggregate reads
+  (`usage-stats --session`, `cache-stats --session`) refuse with the archived marker and import
+  guidance — never a silent zero report (R7; R9-08 F3). Whole-store aggregates report the online
+  window only. (Scope note: the memory surfaces — `kian memory list/show/verify --session` — do
+  not consult the archive marker; an archived id answers the same explicit `unknown session` as
+  any absent one. The `archived` marker surfaces exactly on the read paths enumerated above,
+  where the package path changes the guidance.)
 - **Import.** `kian session import <package>` verifies the manifest, then restores the session
   into a store for replay/forensics; a corrupt package, a package whose rows name a different
   session than its manifest (package identity), or an existing session id is refused.

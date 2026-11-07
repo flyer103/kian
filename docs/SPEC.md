@@ -343,20 +343,21 @@ Scope: knowledge that survives a session boundary (P9). The normative contract i
 Non-goals recorded with the phases: no in-session memory tool (P1), no mid-session memory updates
 (P2), no representation as truth or unbounded build (P3), no cross-agent shared memory (open).
 
-### Read model and serving form (designed; not landed)
+### Read model and serving form (P0–P3 landed)
 
 Scope: versioned unchanged/delta reads, resumable per-session streams, verified snapshots,
 materialized views, opt-in export-only retention, and bounded-staleness reads. The normative
 contract is [design/READ-MODEL.md](../design/READ-MODEL.md); the decision record is
-[ADR-017](../design/decisions/ADR-017-read-model-and-snapshots.md). Nothing here is landed yet.
+[ADR-017](../design/decisions/ADR-017-read-model-and-snapshots.md). All phases landed in round 9
+(commits `958fa76`..`1f4d669`); the incremental view rebuild landed as `c71080b`.
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
-| P0 | kian-store, kian-orchestrator, kian-cli | version + unchanged/delta reads, resumable SSE, drain context cache | designed |
-| P1 | kian-store, kian-core, kian-orchestrator | verified snapshots (state + model context), tail replay | designed |
-| P2a | kian-store, kian-cli | session directory, usage/stage views, kind index | designed |
-| P2b | kian-store, kian-cli | opt-in export-only archive, import, retention | designed |
-| P3 | kian-cli, kian-sdk | explicit-allowlist fan-in stream | designed |
+| P0 | kian-store, kian-orchestrator, kian-cli | version + unchanged/delta reads, resumable SSE, drain context cache | landed |
+| P1 | kian-store, kian-core, kian-orchestrator | verified snapshots (state + model context), tail replay | landed |
+| P2a | kian-store, kian-cli | session directory, usage/stage views, kind index | landed |
+| P2b | kian-store, kian-cli | opt-in export-only archive, import, retention | landed |
+| P3 | kian-cli, kian-sdk | explicit-allowlist fan-in stream | landed |
 
 Non-goals: transparent cold-tier query, wildcard streams in OSS, multi-region active-active.
 
