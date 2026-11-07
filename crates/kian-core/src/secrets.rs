@@ -31,12 +31,77 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 /// The env var the example's dry-run contract rides on; always forwarded
 /// to allowlisted children when set in the parent (kian-77).
 pub const DRY_RUN_ENV: &str = "DRY_RUN";
 
 /// Placeholder substituted for a redacted secret value.
 pub const REDACTED: &str = "[REDACTED]";
+
+// ---------------------------------------------------------------------------
+// Redaction provenance (C69)
+// ---------------------------------------------------------------------------
+
+/// Which redaction pass produced a report entry (C69). The closed
+/// vocabulary mirrors the [`SecretRedactor`] passes: known configured
+/// value / well-known token shape / secret-shaped env-dump line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionKind {
+    /// The exact value of a configured secret env var.
+    KnownValue,
+    /// A well-known token shape (`ghp_…`, `sk-…`, `AKIA…`, …).
+    TokenPattern,
+    /// A `NAME=value` line whose NAME is secret-shaped.
+    EnvLine,
+}
+
+impl RedactionKind {
+    /// A stable ordering key (merge output stays deterministic).
+    fn order(self) -> u8 {
+        match self {
+            Self::KnownValue => 0,
+            Self::TokenPattern => 1,
+            Self::EnvLine => 2,
+        }
+    }
+}
+
+/// One redaction-provenance entry: how many redactions of `kind` were
+/// applied, attributed to `name` (the configured env var name, the
+/// matched token prefix, or the secret-shaped env NAME). Names never
+/// carry secret *values* — only which shape/name was scrubbed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Redaction {
+    pub kind: RedactionKind,
+    pub name: String,
+    pub count: u64,
+}
+
+/// Internal accumulator for report counts, keyed by `(kind order, name)`
+/// so the emitted report is deterministic and de-duplicated.
+type ReportCounts = std::collections::BTreeMap<(u8, String), (RedactionKind, u64)>;
+
+/// Sums reports from several redaction passes (e.g. stdout + stderr) into
+/// one deterministic, de-duplicated report sorted by `(kind, name)`.
+/// Provenance is aggregate counts, never positions — merging never loses
+/// or double-counts an entry.
+#[must_use]
+pub fn merge_redaction_reports<I: IntoIterator<Item = Redaction>>(reports: I) -> Vec<Redaction> {
+    let mut counts: ReportCounts = std::collections::BTreeMap::new();
+    for r in reports {
+        let e = counts
+            .entry((r.kind.order(), r.name.clone()))
+            .or_insert((r.kind, 0));
+        e.1 += r.count;
+    }
+    counts
+        .into_iter()
+        .map(|((_, name), (kind, count))| Redaction { kind, name, count })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // SecretRedactor
@@ -130,12 +195,25 @@ impl SecretRedactor {
     }
 
     /// Returns `text` with every secret replaced by its placeholder.
+    /// Byte-identical to the report path — this is exactly
+    /// [`Self::redact_with_report`] with the report discarded (C69).
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
+        self.redact_with_report(text).0
+    }
+
+    /// C69: [`Self::redact`] plus a provenance report — one
+    /// [`Redaction`] entry per (kind, name) with the number of
+    /// redactions applied. The returned text is byte-identical to
+    /// [`Self::redact`]; the report is aggregate counts only and never
+    /// carries a secret value.
+    #[must_use]
+    pub fn redact_with_report(&self, text: &str) -> (String, Vec<Redaction>) {
         if self.is_noop() {
-            return text.to_string();
+            return (text.to_string(), Vec::new());
         }
         let mut out = text.to_string();
+        let mut counts: ReportCounts = std::collections::BTreeMap::new();
         // Pass 1: exact configured values, anywhere in the text —
         // longest values first, so a value that is a prefix of another
         // cannot shred the longer replacement (the invariant is
@@ -143,17 +221,29 @@ impl SecretRedactor {
         let mut ordered: Vec<&(String, String)> = self.known.iter().collect();
         ordered.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
         for (name, value) in ordered {
-            if out.contains(value.as_str()) {
+            let count: u64 = out.matches(value.as_str()).count() as u64;
+            if count > 0 {
                 out = out.replace(value.as_str(), &format!("[REDACTED:{name}]"));
+                let e = counts
+                    .entry((RedactionKind::KnownValue.order(), name.clone()))
+                    .or_insert((RedactionKind::KnownValue, 0));
+                e.1 += count;
             }
         }
         if self.patterns {
             // Pass 2: token shapes.
-            out = redact_token_patterns(&out);
+            let (pass2, token_counts) = redact_token_patterns_with_report(&out);
             // Pass 3: secret-shaped env-dump lines.
-            out = redact_env_lines(&out);
+            let (pass3, env_counts) = redact_env_lines_with_report(&pass2);
+            out = pass3;
+            counts.extend(token_counts);
+            counts.extend(env_counts);
         }
-        out
+        let report = counts
+            .into_iter()
+            .map(|((_, name), (kind, count))| Redaction { kind, name, count })
+            .collect();
+        (out, report)
     }
 }
 
@@ -180,7 +270,15 @@ fn is_token_char(c: char) -> bool {
 }
 
 /// Redacts well-known token shapes (`ghp_…`, `sk-…`, …) → `[REDACTED:token]`.
-fn redact_token_patterns(text: &str) -> String {
+/// C69: also reports one count per matched token prefix.
+fn redact_token_patterns_with_report(text: &str) -> (String, ReportCounts) {
+    let mut counts: ReportCounts = std::collections::BTreeMap::new();
+    let mut bump = |prefix: &str| {
+        let e = counts
+            .entry((RedactionKind::TokenPattern.order(), prefix.to_string()))
+            .or_insert((RedactionKind::TokenPattern, 0));
+        e.1 += 1;
+    };
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -196,6 +294,7 @@ fn redact_token_patterns(text: &str) -> String {
                 .count();
             if tail_len >= *min_tail {
                 out.push_str("[REDACTED:token]");
+                bump(prefix);
                 i += prefix.len() + tail_len;
                 continue;
             }
@@ -209,6 +308,7 @@ fn redact_token_patterns(text: &str) -> String {
                 .collect();
             if tail.len() == 16 {
                 out.push_str("[REDACTED:token]");
+                bump("AKIA");
                 i += 4 + 16;
                 continue;
             }
@@ -216,7 +316,7 @@ fn redact_token_patterns(text: &str) -> String {
         out.push(chars[i]);
         i += 1;
     }
-    out
+    (out, counts)
 }
 
 /// The name segments that mark an environment variable as secret-shaped.
@@ -243,7 +343,9 @@ fn is_secret_shaped_name(name: &str) -> bool {
 /// Redacts the value half of secret-shaped `NAME=value` lines →
 /// `NAME=[REDACTED]`. Catches environment dumps of secrets the deployer
 /// never listed (defense in depth behind the known-value pass).
-fn redact_env_lines(text: &str) -> String {
+/// C69: also reports one count per secret-shaped NAME.
+fn redact_env_lines_with_report(text: &str) -> (String, ReportCounts) {
+    let mut counts: ReportCounts = std::collections::BTreeMap::new();
     let mut out = String::with_capacity(text.len());
     let mut first = true;
     for line in text.split('\n') {
@@ -262,11 +364,15 @@ fn redact_env_lines(text: &str) -> String {
             out.push_str(name);
             out.push('=');
             out.push_str(REDACTED);
+            let e = counts
+                .entry((RedactionKind::EnvLine.order(), name.to_string()))
+                .or_insert((RedactionKind::EnvLine, 0));
+            e.1 += 1;
         } else {
             out.push_str(line);
         }
     }
-    out
+    (out, counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +552,109 @@ mod tests {
         let out = r.redact("x=knownvalue123456 ghp_abcdefghijklmnopqrstuvwx");
         assert!(out.contains("x=[REDACTED:T]"));
         assert!(out.contains("ghp_abcdefghijklmnopqrstuvwx"));
+    }
+
+    // -- C69: redaction provenance -------------------------------------------
+
+    #[test]
+    fn report_counts_all_three_kinds_and_text_matches_plain_redact() {
+        let r = redactor_with("KIAN_TEST_SECRET", "gh-value-aaaaaaaaaaaaaaaaaaaa");
+        // Turn the pattern passes on for this redactor (the helper above
+        // disables them); one more known value exercises multi-count.
+        let mut r = r;
+        r.patterns = true;
+        let dump = "PATH=/bin\n\
+                    KIAN_TEST_SECRET=gh-value-aaaaaaaaaaaaaaaaaaaa\n\
+                    MY_SERVICE_TOKEN=zzz-not-a-known-pattern\n\
+                    loose ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaa token\n\
+                    twice: gh-value-aaaaaaaaaaaaaaaaaaaa and gh-value-aaaaaaaaaaaaaaaaaaaa\n";
+        let (text, report) = r.redact_with_report(dump);
+        // Text is byte-identical to the (pre-existing) redact path.
+        assert_eq!(text, r.redact(dump));
+        assert!(text.contains("KIAN_TEST_SECRET=[REDACTED:KIAN_TEST_SECRET]"));
+        assert!(text.contains("MY_SERVICE_TOKEN=[REDACTED]"));
+        assert!(text.contains("loose [REDACTED:token] token"));
+        // Counts: known value ×3 (env line + two loose echoes), one
+        // ghp_ token shape, one secret-shaped env line — sorted by
+        // (kind order, name).
+        assert_eq!(
+            report,
+            vec![
+                Redaction {
+                    kind: RedactionKind::KnownValue,
+                    name: "KIAN_TEST_SECRET".into(),
+                    count: 3,
+                },
+                Redaction {
+                    kind: RedactionKind::TokenPattern,
+                    name: "ghp_".into(),
+                    count: 1,
+                },
+                Redaction {
+                    kind: RedactionKind::EnvLine,
+                    name: "MY_SERVICE_TOKEN".into(),
+                    count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn noop_redactor_reports_nothing() {
+        let r = SecretRedactor::default();
+        let (text, report) = r.redact_with_report("DEEPSEEK_API_KEY=whatever123");
+        assert_eq!(text, "DEEPSEEK_API_KEY=whatever123");
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn redaction_serializes_as_the_additive_provenance_shape() {
+        let r = serde_json::to_value(Redaction {
+            kind: RedactionKind::KnownValue,
+            name: "DEEPSEEK_API_KEY".into(),
+            count: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            serde_json::json!({"kind": "known_value", "name": "DEEPSEEK_API_KEY", "count": 2})
+        );
+    }
+
+    #[test]
+    fn merge_redaction_reports_sums_and_sorts() {
+        let merged = merge_redaction_reports([
+            Redaction {
+                kind: RedactionKind::EnvLine,
+                name: "A_TOKEN".into(),
+                count: 1,
+            },
+            Redaction {
+                kind: RedactionKind::EnvLine,
+                name: "A_TOKEN".into(),
+                count: 2,
+            },
+            Redaction {
+                kind: RedactionKind::KnownValue,
+                name: "Z_SECRET".into(),
+                count: 1,
+            },
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                Redaction {
+                    kind: RedactionKind::KnownValue,
+                    name: "Z_SECRET".into(),
+                    count: 1,
+                },
+                Redaction {
+                    kind: RedactionKind::EnvLine,
+                    name: "A_TOKEN".into(),
+                    count: 3,
+                },
+            ]
+        );
     }
 
     // -- ExecEnvPolicy -------------------------------------------------------

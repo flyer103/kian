@@ -31,6 +31,14 @@
 //! level: the frozen event payload contracts are untouched, the sidecar
 //! never enters model context (`input/spilled` is non-context-bearing),
 //! and rows without the envelope consume byte-identically to before.
+//!
+//! C68 extends the same row-level convention with the reserved control
+//! envelope `{"kian": {"type": "control", "action": "interrupt", …}}`
+//! (exactly that single key): the control plane admits it as the
+//! durable interrupt intent, and the drain consumes it to a
+//! `control/interrupt` audit event — never a message — flipping the
+//! shared interrupt flag when the row targets the current episode
+//! (ADR-014; the stale arm is audit-only).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -206,6 +214,13 @@ struct DrainCtxCore {
     seq: AtomicU64,
     /// True while a provider turn is in flight (promote boundary gate).
     in_turn: AtomicBool,
+    /// The drain's interrupt flag (C68). Shared with the engine's
+    /// `DrainHandle` when the ctx is built by `drain_episode`, so a
+    /// consumed current-epoch control row and an `interrupt` RPC flip
+    /// the *same* flag and `supervise` honors both identically. A ctx
+    /// built via [`DrainCtx::new`] owns a detached flag (tests,
+    /// recovery helpers).
+    interrupt: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     metrics: Arc<Metrics>,
 }
@@ -351,13 +366,36 @@ impl DrainCtxCore {
 
 impl DrainCtx {
     /// Builds a context for `session` under fencing `epoch`, with the
-    /// seq counter initialized from the store head.
+    /// seq counter initialized from the store head and a detached
+    /// interrupt flag.
     pub async fn new(
         store: EventStore,
         session: SessionId,
         epoch: Epoch,
         clock: Arc<dyn Clock>,
         metrics: Arc<Metrics>,
+    ) -> Result<Self, EngineError> {
+        Self::with_interrupt(
+            store,
+            session,
+            epoch,
+            clock,
+            metrics,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// [`DrainCtx::new`] sharing `interrupt` — the engine's
+    /// `drain_episode` passes the `DrainHandle` flag so a consumed
+    /// control row interrupts the live drain (C68).
+    pub async fn with_interrupt(
+        store: EventStore,
+        session: SessionId,
+        epoch: Epoch,
+        clock: Arc<dyn Clock>,
+        metrics: Arc<Metrics>,
+        interrupt: Arc<AtomicBool>,
     ) -> Result<Self, EngineError> {
         let head = store.head(session).await?;
         Ok(Self {
@@ -367,6 +405,7 @@ impl DrainCtx {
                 epoch,
                 seq: AtomicU64::new(head.next_seq),
                 in_turn: AtomicBool::new(false),
+                interrupt,
                 clock,
                 metrics,
             }),
@@ -381,6 +420,14 @@ impl DrainCtx {
     #[must_use]
     pub fn epoch(&self) -> Epoch {
         self.core.epoch
+    }
+
+    /// Whether an interrupt has been requested for this drain — via the
+    /// `interrupt` RPC flag or a consumed current-epoch control row
+    /// (C68); both flip the same flag.
+    #[must_use]
+    pub fn interrupt_requested(&self) -> bool {
+        self.core.interrupt.load(Ordering::Acquire)
     }
 
     /// Whether a provider turn is in flight (promote boundary closed).
@@ -440,55 +487,145 @@ impl DrainCtx {
     /// event's seq via `mark_consumed`. Refused while a provider turn is
     /// in flight (invariant 3) — steer inputs land only at turn
     /// boundaries.
+    ///
+    /// C68: reserved control-envelope rows are consumed here too — they
+    /// append a `control/interrupt` event (the audit record) instead of
+    /// a message, and a current-epoch row sets the drain's interrupt
+    /// flag. Control rows are never returned: they are never wrapped
+    /// into model messages.
     pub async fn take_eligible_inputs(&self) -> Result<Vec<InputRow>, EngineError> {
+        Ok(self.consume_inputs(false).await?.messages)
+    }
+
+    /// The C68 final take before the end write: consumes ONLY pending
+    /// control rows (regular inputs stay eligible for the resumer) and
+    /// returns whether a current-epoch control row fired the interrupt.
+    pub async fn take_control_inputs(&self) -> Result<bool, EngineError> {
+        Ok(self.consume_inputs(true).await?.control_interrupt)
+    }
+
+    /// The shared consumption loop. `control_only` selects control rows
+    /// (the pre-end-write final take); otherwise every eligible row is
+    /// consumed in inbox order.
+    async fn consume_inputs(&self, control_only: bool) -> Result<TakeReport, EngineError> {
         if self.core.in_turn.load(Ordering::Acquire) {
             return Err(EngineError::NotAtSafeBoundary {
                 session: self.core.session,
             });
         }
+        let mut report = TakeReport::default();
         let now = self.core.clock.now_ms();
         let rows = self
             .core
             .store
             .eligible_inputs(self.core.session, now)
             .await?;
-        let mut taken = Vec::new();
         for r in rows {
-            let admitted_seq = match consumption_plan(&r) {
-                Consumption::Single(payload) => {
+            match consumption_plan(&r) {
+                Consumption::Control(intent) => {
+                    // The audit append first, then the binding — the
+                    // row may only lose eligibility once its
+                    // `control/interrupt` event exists (the same
+                    // admit-before-consume ordering as message rows).
+                    let stale = self.control_intent_is_stale(&intent).await?;
                     let ev = self
                         .core
-                        .append_event(EventKind::InputAdmitted, payload)
+                        .append_event(EventKind::ControlInterrupt, intent.event_payload(stale))
                         .await?;
-                    ev.seq
+                    if stale {
+                        tracing::info!(
+                            session = %self.core.session.0,
+                            target_epoch = ?intent.target_epoch,
+                            "stale control/interrupt row consumed (audit only)"
+                        );
+                    } else {
+                        // A row for the current episode always
+                        // interrupts (C68/ADR-014): flip the shared
+                        // drain flag — `supervise` and `drain_episode`
+                        // settle at the next safe boundary.
+                        report.control_interrupt = true;
+                        self.core.interrupt.store(true, Ordering::Release);
+                    }
+                    self.bind_consumed(&r, ev.seq).await?;
                 }
-                Consumption::SpillPair { admitted, spill } => {
-                    let (admitted_ev, _spilled_ev) =
-                        self.core.append_input_pair(admitted, spill).await?;
-                    admitted_ev.seq
+                plan => {
+                    if control_only {
+                        continue; // the final take leaves message rows eligible
+                    }
+                    let admitted_seq = match plan {
+                        Consumption::Single(payload) => {
+                            let ev = self
+                                .core
+                                .append_event(EventKind::InputAdmitted, payload)
+                                .await?;
+                            ev.seq
+                        }
+                        Consumption::SpillPair { admitted, spill } => {
+                            let (admitted_ev, _spilled_ev) =
+                                self.core.append_input_pair(admitted, spill).await?;
+                            admitted_ev.seq
+                        }
+                        Consumption::Control(_) => unreachable!("matched above"),
+                    };
+                    if self.bind_consumed(&r, admitted_seq).await? {
+                        report.messages.push(r);
+                    }
                 }
-            };
-            match self
-                .core
-                .store
-                .mark_consumed(self.core.session, r.id, admitted_seq)
-                .await
-            {
-                Ok(()) => taken.push(r),
-                // A concurrent drain bound this row first: our event is a
-                // duplicate take that the epoch fence will shortly fence
-                // out entirely; skip the row, don't fail the drain.
-                Err(kian_store::InboxError::AlreadyConsumed { .. }) => {
-                    tracing::debug!(
-                        session = %self.core.session.0,
-                        input = %r.id,
-                        "input already consumed by a concurrent drain"
-                    );
-                }
-                Err(e) => return Err(e.into()),
             }
         }
-        Ok(taken)
+        Ok(report)
+    }
+
+    /// Binds one row to its committed consumption event's seq. A
+    /// concurrent drain binding the row first is a duplicate take the
+    /// epoch fence will shortly fence out — skipped, never fatal.
+    /// Returns whether this drain owns the binding.
+    async fn bind_consumed(&self, r: &InputRow, seq: u64) -> Result<bool, EngineError> {
+        match self
+            .core
+            .store
+            .mark_consumed(self.core.session, r.id, seq)
+            .await
+        {
+            Ok(()) => Ok(true),
+            // A concurrent drain bound this row first: our event is a
+            // duplicate take that the epoch fence will shortly fence
+            // out entirely; skip the row, don't fail the drain.
+            Err(kian_store::InboxError::AlreadyConsumed { .. }) => {
+                tracing::debug!(
+                    session = %self.core.session.0,
+                    input = %r.id,
+                    "input already consumed by a concurrent drain"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The C68 stale rule (ADR-014): a control row is *stale* when the
+    /// episode it targeted has already settled — the stream carries a
+    /// `session/ended` at the row's `target_epoch`. A row for this
+    /// drain's own claiming epoch can never be stale (no end write
+    /// exists at it yet), and neither can a row targeting an episode a
+    /// takeover resumed after its owner died mid-episode (that episode
+    /// never settled — the resumed work is the work the interrupt
+    /// intended to stop). A `null` target (unreadable stream at admit)
+    /// always interrupts.
+    async fn control_intent_is_stale(
+        &self,
+        intent: &kian_core::control::InterruptIntent,
+    ) -> Result<bool, EngineError> {
+        let Some(target) = intent.target_epoch else {
+            return Ok(false);
+        };
+        if target == self.core.epoch.0 {
+            return Ok(false); // targets this drain's own claim
+        }
+        let events = self.core.store.rebuild(self.core.session).await?;
+        Ok(events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SessionEnded { .. }) && e.epoch.0 == target))
     }
 
     /// Pure read: does the session hold eligible-but-unconsumed input?
@@ -743,18 +880,107 @@ where
     /// Requests an interrupt of the draining session (honored at the
     /// next safe boundary; the drain then settles on abort). Interrupt
     /// of an idle or missing session is a no-op (invariant 5).
+    ///
+    /// C68 (ADR-014): the intent is *durable*. Whenever work may still
+    /// be in flight — a local drain handle exists, or the projection is
+    /// `running`/`recoverable` (the owner is another replica or dead) —
+    /// the control plane admits a reserved control-envelope inbox row
+    /// (idempotent per `(session, target_epoch)`, so repeated RPCs in
+    /// one episode dedupe to one row) *in addition to* the in-memory
+    /// flag. The row survives a crash and crosses replicas as data; the
+    /// owning drain consumes it into a `control/interrupt` event at its
+    /// next boundary. The control plane still never appends events
+    /// itself (constraint 9), and no wake is fired: a drain in flight
+    /// reaches the row at its next boundary take; a dead owner's
+    /// successor reaches it via the takeover path (recovery sweep /
+    /// startup scan). Idle/terminal sessions keep the exact
+    /// `NotDraining`/`UnknownSession` behavior and admit nothing.
     pub async fn interrupt(&self, session: SessionId) -> Result<InterruptOutcome, EngineError> {
-        if let Some(handle) = self.drains.get(&session) {
+        let has_handle = if let Some(handle) = self.drains.get(&session) {
             handle.interrupt();
+            true
+        } else {
+            false
+        };
+
+        // Target epoch = the last event's epoch (the episode the intent
+        // aims to stop); null when the stream is unreadable — the local
+        // flag (if any) still carries the request.
+        let events = match self.store.rebuild(session).await {
+            Ok(events) => Some(events),
+            Err(e) if has_handle => {
+                tracing::warn!(
+                    session = %session.0,
+                    error = %e,
+                    "interrupt: stream unreadable — durable row targets null epoch"
+                );
+                None
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some(events) = events else {
+            self.admit_interrupt_row(session, None).await?;
             return Ok(InterruptOutcome::Requested);
-        }
-        let events = self.store.rebuild(session).await?;
+        };
         if events.is_empty() {
             return Ok(InterruptOutcome::UnknownSession);
         }
-        Ok(InterruptOutcome::NotDraining {
-            state: project(&events)?,
-        })
+        let target_epoch = events.last().map(|e| e.epoch.0);
+        if has_handle {
+            // Best-effort terminal check: a handle on a frozen stream
+            // is a finishing drain — the flag path settles it; no row.
+            let terminal = project(&events).map(|s| s.is_terminal()).unwrap_or(false);
+            if !terminal {
+                self.admit_interrupt_row(session, target_epoch).await?;
+            }
+            return Ok(InterruptOutcome::Requested);
+        }
+        let state = project(&events)?;
+        if state.is_terminal() || state == SessionState::Idle {
+            return Ok(InterruptOutcome::NotDraining { state });
+        }
+        // Running/Recoverable with no local drain: the owner is another
+        // replica or dead. The durable row IS the interrupt — the
+        // consuming drain (takeover or remote owner) honors it.
+        self.admit_interrupt_row(session, target_epoch).await?;
+        Ok(InterruptOutcome::Requested)
+    }
+
+    /// Admits the durable interrupt-intent row (C68). Durable-first
+    /// (constraint 6): the row exists before this returns; no wake —
+    /// see [`Engine::interrupt`].
+    async fn admit_interrupt_row(
+        &self,
+        session: SessionId,
+        target_epoch: Option<u64>,
+    ) -> Result<(), EngineError> {
+        let now = self.clock.now_ms();
+        let intent = kian_core::control::InterruptIntent {
+            reason: None,
+            requested_by: Some(self.config.holder.clone()),
+            requested_at_ms: now,
+            target_epoch,
+        };
+        let input = InputRow {
+            id: Uuid::new_v4(),
+            session,
+            payload: intent.envelope(),
+            admitted_at: now,
+            eligible_at: now,
+            idempotency_key: Some(kian_core::control::InterruptIntent::idempotency_key(
+                &session,
+                target_epoch,
+            )),
+        };
+        let outcome = self.store.admit(input).await?;
+        if outcome.deduplicated {
+            tracing::debug!(
+                session = %session.0,
+                target_epoch = ?target_epoch,
+                "interrupt row deduplicated (one durable intent per episode)"
+            );
+        }
+        Ok(())
     }
 
     /// Startup NoLostWork rebuild: registers a pending wake for every
@@ -866,7 +1092,7 @@ where
     async fn drain_once(
         &self,
         session: &SessionId,
-        interrupt: &AtomicBool,
+        interrupt: &Arc<AtomicBool>,
     ) -> Result<DrainOutcome, EngineError> {
         let lease = self
             .store
@@ -903,14 +1129,18 @@ where
         &self,
         session: &SessionId,
         lease: LeaseRecord,
-        interrupt: &AtomicBool,
+        interrupt: &Arc<AtomicBool>,
     ) -> Result<DrainOutcome, EngineError> {
-        let ctx = DrainCtx::new(
+        // C68: the ctx shares the drain's interrupt flag — an
+        // `interrupt` RPC and a consumed current-epoch control row flip
+        // the same switch.
+        let ctx = DrainCtx::with_interrupt(
             self.store.clone(),
             *session,
             lease.epoch,
             Arc::clone(&self.clock),
             Arc::clone(&self.metrics),
+            Arc::clone(interrupt),
         )
         .await?;
         let mut claimed = false;
@@ -924,7 +1154,7 @@ where
         // session would sit in `running` forever (the startup inbox scan
         // sees nothing for it) and the expired-lease sweep would churn.
         let mut takeover = false;
-        let end_reason: EndReason;
+        let mut end_reason: EndReason;
         'episodes: loop {
             if interrupt.load(Ordering::Acquire) && claimed {
                 end_reason = EndReason::Interrupted;
@@ -957,6 +1187,13 @@ where
                 }
             }
             let taken = ctx.take_eligible_inputs().await?;
+            // C68: a current-epoch control row consumed by that take
+            // flips the shared flag — honor it now, before the
+            // empty-inbox branch below can settle `completed` past it.
+            if ctx.interrupt_requested() && claimed {
+                end_reason = EndReason::Interrupted;
+                break 'episodes;
+            }
             if taken.is_empty() && !takeover {
                 if !claimed {
                     return Ok(DrainOutcome::ReleasedClean);
@@ -1009,6 +1246,25 @@ where
         // releasing ownership; pending work keeps pendingWake registered.
         if ctx.has_eligible_inputs().await? {
             self.wakes.register(session);
+        }
+        // C68 final take: one last control-only pass before the end
+        // write — a current-epoch control row that raced the settle is
+        // consumed here and flips the end write to `interrupted` (the
+        // honest "stop before done"; DESIGN §2.4 records the race). A
+        // stale row is appended for audit and ends nothing. Regular
+        // inputs stay eligible for the resumer (the registered wake).
+        // A settle that broke mid-turn (crash / soft-failure paths)
+        // has no safe boundary: the final take is skipped — the
+        // interrupt flag owns that case, and any pending control row
+        // stays for the resumer.
+        match ctx.take_control_inputs().await {
+            Ok(fired) => {
+                if fired {
+                    end_reason = EndReason::Interrupted;
+                }
+            }
+            Err(EngineError::NotAtSafeBoundary { .. }) => {}
+            Err(e) => return Err(e),
         }
         ctx.end_session(end_reason).await?;
         Ok(DrainOutcome::Ended { reason: end_reason })
@@ -1084,6 +1340,15 @@ async fn heartbeat_loop(
     }
 }
 
+/// What one consumption pass took (C68). Message rows are returned to
+/// the caller; control rows are consumed for audit and — when current
+/// — flip the drain's interrupt flag instead.
+#[derive(Default)]
+struct TakeReport {
+    messages: Vec<InputRow>,
+    control_interrupt: bool,
+}
+
 /// The engine's input-row convention: what one row consumes to. A plain
 /// row's payload IS the message content; a steer row wraps it as
 /// `{"synthetic": true, "content": X}` so the strippable marker survives
@@ -1100,9 +1365,16 @@ enum Consumption {
     /// The C32 pair: `input/admitted` then `input/spilled`, appended
     /// atomically under one CAS (`append_batch`).
     SpillPair { admitted: Value, spill: Value },
+    /// The C68 reserved control envelope: a `control/interrupt` audit
+    /// event, never a message. The row is bound to the event's seq like
+    /// any other consumption.
+    Control(kian_core::control::InterruptIntent),
 }
 
 fn consumption_plan(row: &InputRow) -> Consumption {
+    if let Some(intent) = kian_core::control::InterruptIntent::parse(&row.payload) {
+        return Consumption::Control(intent);
+    }
     if let Some(obj) = row.payload.as_object() {
         if obj.get("synthetic").and_then(Value::as_bool) == Some(true)
             && let Some(content) = obj.get("content")
@@ -2060,6 +2332,508 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        cleanup(&path);
+    }
+
+    // -- C68: durable interrupt intent (ADR-014) -----------------------------
+
+    /// Unit: a reserved control-envelope row consumes to a
+    /// `control/interrupt` audit event — never a message row — and a
+    /// current-epoch row sets the drain's interrupt flag. The final
+    /// control-only take leaves message rows eligible.
+    #[tokio::test]
+    async fn control_row_consumes_to_an_audit_event_and_flips_the_shared_flag() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let ctx = DrainCtx::with_interrupt(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::clone(&flag),
+        )
+        .await
+        .unwrap();
+        ctx.append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+
+        let intent = kian_core::control::InterruptIntent {
+            reason: Some("stop the deploy".into()),
+            requested_by: Some("ops".into()),
+            requested_at_ms: T0,
+            target_epoch: Some(1), // this drain's own claim — current
+        };
+        store.admit(row(sid, 1, intent.envelope())).await.unwrap();
+        store
+            .admit(row(sid, 2, json!("a plain message")))
+            .await
+            .unwrap();
+
+        // The final control-only take consumes just the control row.
+        assert!(ctx.take_control_inputs().await.unwrap());
+        assert!(flag.load(Ordering::Acquire), "current-epoch row interrupts");
+        assert_eq!(
+            store.eligible_inputs(sid, T0).await.unwrap().len(),
+            1,
+            "the message row stays eligible"
+        );
+
+        // The normal take returns ONLY message rows.
+        let taken = ctx.take_eligible_inputs().await.unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].payload, json!("a plain message"));
+
+        let events = events_of(&store, sid).await;
+        let control: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ControlInterrupt)
+            .collect();
+        assert_eq!(control.len(), 1, "exactly one audit event");
+        assert_eq!(
+            control[0].bytes,
+            intent.event_payload(false),
+            "the event payload reproduces the requested intent"
+        );
+        assert!(control[0].bytes.get("stale").is_none());
+        // The control row is bound consumed (inbox empty).
+        assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
+        cleanup(&path);
+    }
+
+    /// Dedupe: repeated `interrupt` RPCs against one episode admit
+    /// exactly one durable row (idempotent by
+    /// `interrupt:<session>:<target_epoch>`) and the drained stream
+    /// carries exactly one `control/interrupt` event.
+    #[tokio::test]
+    async fn repeated_interrupts_in_one_epoch_dedupe_to_one_row_and_one_event() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![vec![
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::Settled),
+            ]])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("input-1"), Some("i1".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await
+        );
+
+        // Two interrupts while the drain is hung mid-turn (same epoch).
+        assert_eq!(
+            eng.interrupt(sid).await.unwrap(),
+            InterruptOutcome::Requested
+        );
+        assert_eq!(
+            eng.interrupt(sid).await.unwrap(),
+            InterruptOutcome::Requested
+        );
+        let eligible = store.eligible_inputs(sid, T0).await.unwrap();
+        let control_rows: Vec<_> = eligible
+            .iter()
+            .filter(|r| kian_core::control::InterruptIntent::is_control_envelope(&r.payload))
+            .collect();
+        assert_eq!(
+            control_rows.len(),
+            1,
+            "one durable intent row per epoch, not two"
+        );
+        assert_eq!(
+            control_rows[0].idempotency_key.as_deref(),
+            Some(kian_core::control::InterruptIntent::idempotency_key(&sid, Some(1)).as_str()),
+            "the idempotency key targets the draining epoch"
+        );
+
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid) && projection_of(&store, sid).await == SessionState::Idle
+            })
+            .await
+        );
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::ControlInterrupt)
+                .count(),
+            1,
+            "exactly one control/interrupt event"
+        );
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Interrupted
+            }
+        ));
+        cleanup(&path);
+    }
+
+    /// C68 crash leg: the interrupt RPC on a replica whose projection is
+    /// `running` (owner elsewhere/dead) records the durable intent; the
+    /// row outlives the crashed owner; the takeover drain consumes it
+    /// and settles `interrupted` — the audit event in the stream.
+    #[tokio::test]
+    async fn durable_interrupt_intent_survives_crash_and_takeover_settles_interrupted() {
+        let (reader, path) = open_store().await;
+        let sid = SessionId::new();
+
+        // Engine A on its own runtime: drains input-1, hangs mid-turn
+        // until the crash flag drops the whole runtime.
+        let crash_now = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&crash_now);
+        let path_a = path.clone();
+        let zombie = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let store_a = EventStore::open(&path_a).await.expect("open A");
+                let driver = Arc::new(ScriptedDriver::scripted(vec![vec![
+                    Step::BeginTurn,
+                    Step::Gate(Arc::new(Notify::new())), // hangs forever
+                ]]));
+                let eng = Engine::with_clock(
+                    store_a,
+                    driver,
+                    EngineConfig::default(),
+                    Arc::new(ManualClock::new(T0)),
+                );
+                eng.admit(sid, json!("input-1"), Some("i1".into()))
+                    .await
+                    .unwrap();
+                eng.wake(sid);
+                while !flag.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }); // rt dropped: every task on it dies mid-turn — the crash
+        });
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&reader, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await
+        );
+
+        // Replica B holds no drain handle: the projection is `running`,
+        // so the interrupt is DURABLE — a control row targeting epoch 1.
+        let store_b = EventStore::open(&path).await.expect("open B");
+        let eng_b = Engine::with_clock(
+            store_b.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig::default(),
+            Arc::new(ManualClock::new(T0)),
+        );
+        assert_eq!(
+            eng_b.interrupt(sid).await.unwrap(),
+            InterruptOutcome::Requested,
+            "running-with-no-local-drain records durable intent"
+        );
+        let eligible = reader.eligible_inputs(sid, T0).await.unwrap();
+        assert_eq!(eligible.len(), 1, "the durable intent row exists");
+        let intent =
+            kian_core::control::InterruptIntent::parse(&eligible[0].payload).expect("envelope");
+        assert_eq!(intent.target_epoch, Some(1), "targets the dead episode");
+
+        // Crash: the runtime (and every task on it) dies before
+        // consuming the row.
+        crash_now.store(true, Ordering::Relaxed);
+        zombie.join().expect("zombie thread finished");
+        assert!(
+            !events_of(&reader, sid)
+                .await
+                .iter()
+                .any(|e| e.kind == EventKind::ControlInterrupt),
+            "A died before consuming the intent"
+        );
+
+        // B's startup scan finds the row; the takeover drain consumes it
+        // and settles `interrupted`.
+        let found = eng_b.startup_rebuild().await.expect("rebuild");
+        assert_eq!(found, 1, "the durable intent row rediscovered");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store_b, sid).await == SessionState::Idle
+            })
+            .await
+        );
+
+        let events = events_of(&store_b, sid).await;
+        let control: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ControlInterrupt)
+            .collect();
+        assert_eq!(control.len(), 1, "the takeover consumed the intent");
+        assert_eq!(control[0].bytes.get("target_epoch"), Some(&json!(1)));
+        assert!(control[0].bytes.get("stale").is_none());
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Interrupted
+            }
+        ));
+        // The takeover's claim is a strictly higher epoch than the row's
+        // target — the un-settled target still interrupts (ADR-014).
+        let last_claim = events
+            .iter()
+            .filter(|e| e.kind == EventKind::DrainClaimed)
+            .map(|e| e.epoch)
+            .next_back()
+            .unwrap();
+        assert!(last_claim.0 > 1);
+        cleanup(&path);
+    }
+
+    /// Stale rule (ADR-014): a control row targeting an episode that
+    /// already settled (`session/ended` at the target epoch) is consumed
+    /// for audit with `"stale": true` and does NOT end the new episode's
+    /// session — the later work the interrupt never aimed at survives.
+    #[tokio::test]
+    async fn stale_epoch_control_row_is_audit_only_and_does_not_end_the_session() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![
+                // episode 1 → soft-failed @1 (failed maps back to Idle,
+                // so a second episode may claim; the ended write at
+                // epoch 1 is what makes a later row stale)
+                vec![
+                    Step::BeginTurn,
+                    Step::EndTurn,
+                    Step::Outcome(LoopOutcome::SoftFailed {
+                        reason: "boom".into(),
+                    }),
+                ],
+                vec![
+                    Step::BeginTurn,
+                    Step::Gate(Arc::clone(&gate)),
+                    Step::EndTurn,
+                    Step::Outcome(LoopOutcome::TurnDone),
+                    Step::Outcome(LoopOutcome::Settled),
+                ],
+            ])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("input-1"), Some("i1".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                let events = events_of(&store, sid).await;
+                events.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::SessionEnded {
+                            reason: kian_core::events::EndReason::Failed
+                        }
+                    )
+                }) && projection_of(&store, sid).await == SessionState::Idle
+            })
+            .await
+        );
+        let events = events_of(&store, sid).await;
+        let tail: Vec<String> = events
+            .iter()
+            .map(|e| format!("{}@{}", e.kind.as_str(), e.epoch.0))
+            .collect();
+        assert!(
+            matches!(events.last().unwrap().kind, EventKind::SessionEnded { .. }),
+            "tail = {tail:?}"
+        );
+        assert_eq!(
+            events.last().unwrap().epoch.0,
+            1,
+            "episode 1 settled at epoch 1"
+        );
+
+        // Episode 2 on new input; the drain hangs mid-turn.
+        eng.admit(sid, json!("input-2"), Some("i2".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart && e.epoch.0 == 2)
+            })
+            .await
+        );
+
+        // A late cross-replica row still targeting the settled epoch 1.
+        let late = kian_core::control::InterruptIntent {
+            reason: Some("too late".into()),
+            requested_by: Some("replica-b".into()),
+            requested_at_ms: T0,
+            target_epoch: Some(1),
+        };
+        store.admit(row(sid, 99, late.envelope())).await.unwrap();
+
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                let events = events_of(&store, sid).await;
+                events.iter().any(|e| e.kind == EventKind::ControlInterrupt)
+                    && matches!(
+                        events.last().unwrap().kind,
+                        EventKind::SessionEnded {
+                            reason: kian_core::events::EndReason::Completed
+                        }
+                    )
+            })
+            .await
+        );
+
+        let events = events_of(&store, sid).await;
+        let control: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ControlInterrupt)
+            .collect();
+        assert_eq!(control.len(), 1);
+        assert_eq!(
+            control[0].bytes.get("stale"),
+            Some(&json!(true)),
+            "stale rows are audit-only"
+        );
+        assert_eq!(control[0].bytes.get("target_epoch"), Some(&json!(1)));
+        // The stale row was still consumed (bound to its audit event).
+        assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
+        // And the drain released without an interrupt break.
+        assert!(!eng.is_draining(&sid));
+        assert_eq!(projection_of(&store, sid).await, SessionState::Completed);
+        cleanup(&path);
+    }
+
+    /// The C68 stop-before-done semantics: a current-epoch control row
+    /// that becomes eligible while the loop is finishing its work is
+    /// honored — the session settles `interrupted`, never `completed`
+    /// (the completed-interrupt race, DESIGN §2.4). Deterministic: the
+    /// row lands while the drain is gated mid-turn; the boundary take
+    /// (or, if it slips past, the final take before the end write)
+    /// consumes it and flips the settle.
+    #[tokio::test]
+    async fn control_row_racing_the_settle_flips_the_end_write_to_interrupted() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![vec![
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::Settled),
+            ]])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("input-1"), Some("i1".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await
+        );
+
+        // The loop's work is done the moment the gate opens — but the
+        // interrupt intent for THIS epoch is already durable and
+        // eligible. The settle must honor it, not complete past it.
+        let intent = kian_core::control::InterruptIntent {
+            reason: None,
+            requested_by: Some("racer".into()),
+            requested_at_ms: T0,
+            target_epoch: Some(1),
+        };
+        store.admit(row(sid, 77, intent.envelope())).await.unwrap();
+        gate.notify_one();
+
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid) && projection_of(&store, sid).await == SessionState::Idle
+            })
+            .await
+        );
+        let events = events_of(&store, sid).await;
+        assert!(
+            events.iter().any(|e| e.kind == EventKind::ControlInterrupt),
+            "the racing intent was consumed"
+        );
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Interrupted
+            }
+        ));
+        assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
+        cleanup(&path);
+    }
+
+    /// C68 + invariant 5: interrupt of an idle, terminal or missing
+    /// session changes nothing — no events AND no durable intent row.
+    #[tokio::test]
+    async fn interrupt_of_idle_or_terminal_session_admits_no_control_row() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+
+        let missing = SessionId::new();
+        assert_eq!(
+            eng.interrupt(missing).await.unwrap(),
+            InterruptOutcome::UnknownSession
+        );
+        assert!(store.eligible_inputs(missing, T0).await.unwrap().is_empty());
+
+        let idle = eng.create_session().await.unwrap();
+        assert_eq!(
+            eng.interrupt(idle).await.unwrap(),
+            InterruptOutcome::NotDraining {
+                state: SessionState::Idle
+            }
+        );
+        assert!(
+            store.eligible_inputs(idle, T0).await.unwrap().is_empty(),
+            "idle sessions admit no durable intent"
+        );
+
+        // Terminal: run one episode to completion, then interrupt.
+        eng.admit(idle, json!("work"), Some("w1".into()))
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, idle).await == SessionState::Completed
+            })
+            .await
+        );
+        assert_eq!(
+            eng.interrupt(idle).await.unwrap(),
+            InterruptOutcome::NotDraining {
+                state: SessionState::Completed
+            }
+        );
+        assert!(
+            store.eligible_inputs(idle, T0).await.unwrap().is_empty(),
+            "terminal sessions admit no durable intent"
         );
         cleanup(&path);
     }

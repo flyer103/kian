@@ -55,6 +55,23 @@ impl Event {
     }
 }
 
+/// The derived event id (C69): `"evt_" + uuid5(session, "kian:event:<seq>")`
+/// — RFC 4122 v5 with the session uuid as the namespace and the literal
+/// `kian:event:<seq>` as the name.
+///
+/// Deterministic and derivable by anyone who knows the session id and
+/// seq, so tooling (CLI `session export --with-event-ids`, the SDK
+/// helper) can reference an event without storing an id. It is **not**
+/// an envelope field and **not** stored: envelope bytes are frozen v0
+/// (constraint 3), and `(session, seq)` is already unique — the id is a
+/// naming convention over that pair, never a second source of truth.
+pub fn event_id(session: &SessionId, seq: u64) -> String {
+    format!(
+        "evt_{}",
+        uuid::Uuid::new_v5(&session.0, format!("kian:event:{seq}").as_bytes())
+    )
+}
+
 /// Why a session ended. Honesty over completion rate (constraint 7):
 /// `Interrupted` is deliberately distinct from `Failed` — an abort or crash
 /// must never be mapped onto `Completed`.
@@ -193,6 +210,19 @@ pub enum EventKind {
     #[serde(rename = "input/spilled")]
     InputSpilled,
 
+    /// Durable interrupt intent (C68, ADR-014): the control plane's
+    /// interrupt request, consumed and appended by the owning drain at a
+    /// safe boundary. Payload schema (owned by C68):
+    /// `{"action": "interrupt", "reason": string|null,
+    /// "requested_by": string|null, "requested_at_ms": u64,
+    /// "target_epoch": u64|null, "stale"?: true}` — `stale` is present
+    /// (and `true`) only when the row's target episode had already
+    /// settled before consumption (the audit-only arm; ends nothing).
+    /// Drain activity (default mapping); not context-bearing — the kind
+    /// never enters a model request (constraint 3).
+    #[serde(rename = "control/interrupt")]
+    ControlInterrupt,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -223,6 +253,7 @@ impl EventKind {
             Self::EvidenceVerdict => "evidence/verdict",
             Self::ChannelDelivered => "channel/delivered",
             Self::InputSpilled => "input/spilled",
+            Self::ControlInterrupt => "control/interrupt",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -292,6 +323,10 @@ mod tests {
             ),
             (EventKind::InputSpilled, r#"{"kind":"input/spilled"}"#),
             (
+                EventKind::ControlInterrupt,
+                r#"{"kind":"control/interrupt"}"#,
+            ),
+            (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
                 },
@@ -304,12 +339,12 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the twenty kinds above (the
+        // The durable set is exactly the twenty-one kinds above (the
         // fourteen frozen by C2 + the additive C14
         // `recovery/budget-reset` + the four additive C18 Phase-2 kinds
-        // + the additive C31 `input/spilled`; additions-only, no
-        // renames).
-        assert_eq!(cases.len(), 20);
+        // + the additive C31 `input/spilled` + the additive C68
+        // `control/interrupt`; additions-only, no renames).
+        assert_eq!(cases.len(), 21);
     }
 
     /// Additions-only regression (C18): every pre-existing kind's golden
@@ -385,6 +420,107 @@ mod tests {
             );
             let back: EventKind = serde_json::from_str(golden).unwrap();
             assert_eq!(&back, kind);
+        }
+    }
+
+    /// Additions-only regression (C68): all twenty pre-C68 kinds' golden
+    /// bytes are frozen exactly as they stood at the end of round 6.
+    /// Like the Phase-1/Phase-2 frozen lists above, this is
+    /// deliberately independent of the growing `cases` array, so the
+    /// C68 `control/interrupt` addition cannot disturb a single
+    /// existing serialization byte.
+    #[test]
+    fn additions_only_regression_round6_all_twenty_kind_bytes_are_frozen() {
+        let frozen_round6: [(EventKind, &str); 20] = [
+            (EventKind::SessionCreated, r#"{"kind":"session/created"}"#),
+            (EventKind::InputAdmitted, r#"{"kind":"input/admitted"}"#),
+            (EventKind::DrainClaimed, r#"{"kind":"drain/claimed"}"#),
+            (EventKind::TurnStart, r#"{"kind":"turn/start"}"#),
+            (EventKind::TurnEnd, r#"{"kind":"turn/end"}"#),
+            (EventKind::StepRequest, r#"{"kind":"step/request"}"#),
+            (
+                EventKind::AssistantMessage,
+                r#"{"kind":"assistant/message"}"#,
+            ),
+            (EventKind::ToolCall, r#"{"kind":"tool/call"}"#),
+            (EventKind::ToolResult, r#"{"kind":"tool/result"}"#),
+            (EventKind::Compact, r#"{"kind":"compact"}"#),
+            (EventKind::SlotBinding, r#"{"kind":"slot/binding"}"#),
+            (EventKind::SlotFallback, r#"{"kind":"slot/fallback"}"#),
+            (EventKind::SlotMigration, r#"{"kind":"slot/migration"}"#),
+            (
+                EventKind::RecoveryBudgetReset,
+                r#"{"kind":"recovery/budget-reset"}"#,
+            ),
+            (EventKind::ThreadStarted, r#"{"kind":"thread/started"}"#),
+            (EventKind::ThreadCompleted, r#"{"kind":"thread/completed"}"#),
+            (EventKind::EvidenceVerdict, r#"{"kind":"evidence/verdict"}"#),
+            (
+                EventKind::ChannelDelivered,
+                r#"{"kind":"channel/delivered"}"#,
+            ),
+            (EventKind::InputSpilled, r#"{"kind":"input/spilled"}"#),
+            (
+                EventKind::SessionEnded {
+                    reason: EndReason::Failed,
+                },
+                r#"{"kind":"session/ended","reason":"failed"}"#,
+            ),
+        ];
+        for (kind, golden) in &frozen_round6 {
+            assert_eq!(
+                &serde_json::to_string(kind).unwrap(),
+                golden,
+                "pre-existing kind {:?} changed bytes (additions-only violated)",
+                kind
+            );
+            let back: EventKind = serde_json::from_str(golden).unwrap();
+            assert_eq!(&back, kind);
+        }
+        assert_eq!(frozen_round6.len(), 20);
+    }
+
+    /// The C68 `control/interrupt` kind round-trips through the full
+    /// envelope with its tabled payload riding opaquely in `bytes`,
+    /// including the audit-only `stale` marker variant.
+    #[test]
+    fn control_interrupt_envelope_round_trips_with_tabled_payload() {
+        for (payload, with_stale) in [
+            (
+                json!({
+                    "action": "interrupt",
+                    "reason": "operator requested",
+                    "requested_by": "ops@replica-a",
+                    "requested_at_ms": 1_762_000_000_000_u64,
+                    "target_epoch": 3
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "action": "interrupt",
+                    "reason": null,
+                    "requested_by": null,
+                    "requested_at_ms": 1_762_000_000_001_u64,
+                    "target_epoch": null,
+                    "stale": true
+                }),
+                true,
+            ),
+        ] {
+            let mut ev = sample_event(EventKind::ControlInterrupt);
+            ev.bytes = payload.clone();
+            let line = serde_json::to_string(&ev).unwrap();
+            let back: Event = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, ev);
+            assert_eq!(tag_of(&line), "control/interrupt");
+            assert_eq!(back.bytes, payload);
+            // The stale marker rides only when set (additive key).
+            if !with_stale {
+                assert!(back.bytes.get("stale").is_none());
+            } else {
+                assert_eq!(back.bytes.get("stale"), Some(&json!(true)));
+            }
         }
     }
 
@@ -546,5 +682,56 @@ mod tests {
         let back: Event = serde_json::from_value(v).unwrap();
         assert_eq!(back.version, 0);
         assert_eq!(back, ev);
+    }
+
+    // -- C69: derived event id -------------------------------------------------
+
+    /// Golden vectors for the derived event id rule: `evt_` + RFC 4122
+    /// v5(session uuid, "kian:event:<seq>"). The literals are generated
+    /// by an independent implementation (Python `uuid.uuid5`) so the
+    /// Rust `uuid` crate and any mirror (SDK, external tooling) are
+    /// pinned to the same bytes.
+    #[test]
+    fn event_id_golden_vectors_match_rfc4122_v5() {
+        let ns = SessionId(Uuid::parse_str("0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b").unwrap());
+        let cases: &[(u64, &str)] = &[
+            (1, "evt_ec671a02-5108-5e7a-811a-3517bea635e6"),
+            (7, "evt_42124c15-3948-56f1-9606-517dc61d2829"),
+            (42, "evt_b1a35135-d4f4-50cd-b457-e8b96fb9e5dd"),
+        ];
+        for (seq, expected) in cases {
+            assert_eq!(&super::event_id(&ns, *seq), expected, "seq {seq}");
+        }
+        // A second namespace pins the "distinct per session" half of the
+        // rule with its own golden literal.
+        let ns2 = SessionId(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        assert_eq!(
+            super::event_id(&ns2, 7),
+            "evt_ac6b5bb7-fa8f-5314-868d-4c342a94d273"
+        );
+    }
+
+    /// The derived id is deterministic, distinct per seq, distinct per
+    /// session, and never collides across a (session × seq) grid.
+    #[test]
+    fn event_id_is_deterministic_and_distinct_per_seq_and_session() {
+        let a = SessionId(Uuid::parse_str("0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b").unwrap());
+        let b = SessionId(Uuid::new_v4());
+        // Determinism.
+        assert_eq!(super::event_id(&a, 1), super::event_id(&a, 1));
+        // Distinct per seq within a session.
+        let ids: Vec<String> = (0..64).map(|seq| super::event_id(&a, seq)).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "ids collide across seq");
+        // Distinct per session at the same seq.
+        assert_ne!(super::event_id(&a, 7), super::event_id(&b, 7));
+        // Every id carries the documented prefix and a v5-shaped uuid.
+        for id in &ids {
+            assert!(id.starts_with("evt_"));
+            assert_eq!(id.len(), "evt_".len() + 36);
+            assert_eq!(id.as_bytes()[18], b'5', "uuid version nibble must be 5");
+        }
     }
 }

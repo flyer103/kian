@@ -146,6 +146,8 @@ impl AsyncJobs {
             // The ack is honest even on the dedupe path: the job IS
             // started (its row exists; an observer is attached).
             is_error: false,
+            // No exec output here — nothing was redacted (C69).
+            redactions: Vec::new(),
         })
     }
 
@@ -172,6 +174,7 @@ impl AsyncJobs {
                     "note": "job already settled; nothing to cancel",
                 }),
                 is_error: false,
+                redactions: Vec::new(),
             });
         }
         let cancelled = store
@@ -192,6 +195,7 @@ impl AsyncJobs {
                     "note": "job settled while cancelling",
                 }),
                 is_error: false,
+                redactions: Vec::new(),
             });
         }
         // Wake the observer so the cancelled completion lands now
@@ -212,6 +216,7 @@ impl AsyncJobs {
                 "job_id": job_id.to_string(),
             }),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 

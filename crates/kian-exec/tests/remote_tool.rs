@@ -63,6 +63,7 @@ impl ExecBackend for CountingLocal {
                 stdout: "tool-ran".into(),
                 stderr: String::new(),
                 timed_out: false,
+                redactions: Vec::new(),
             })
         })
     }

@@ -174,14 +174,21 @@ fn run_blocking(
             }
         }
     }
+    // kian-77: the redaction pass runs before the result leaves the
+    // backend — every caller (tool/result event, transcript envelopes,
+    // retries) only ever sees scrubbed bytes. C69: the same pass now
+    // emits its provenance report, merged across stdout/stderr and
+    // carried on the result.
+    let (stdout, stdout_report) = redactor.redact_with_report(&stdout_t.join());
+    let (stderr, stderr_report) = redactor.redact_with_report(&stderr_t.join());
     Ok(ExecResult {
         exit_code,
-        // kian-77: the redaction pass runs before the result leaves the
-        // backend — every caller (tool/result event, transcript
-        // envelopes, retries) only ever sees scrubbed bytes.
-        stdout: redactor.redact(&stdout_t.join()),
-        stderr: redactor.redact(&stderr_t.join()),
+        stdout,
+        stderr,
         timed_out,
+        redactions: kian_core::secrets::merge_redaction_reports(
+            stdout_report.into_iter().chain(stderr_report),
+        ),
     })
 }
 
@@ -383,19 +390,29 @@ impl ToolProvider for LocalTools {
         let root = self.root.clone();
         let exec = self.exec.clone();
         Box::pin(async move {
+            // C69: the exec arm carries the redaction provenance report
+            // from the backend onto the ToolResult (the loop copies it
+            // into the `tool/result` payload); every other arm leaves
+            // it empty (nothing was redacted).
+            let mut redactions = Vec::new();
             let output = match parsed? {
                 ParsedCall::Exec(cmd) => {
                     // Errors of execution itself are honest tool-level
                     // failures, surfaced as is_error results.
                     match exec.exec(cmd).await {
-                        Ok(r) => json!({
-                            "exit_code": r.exit_code,
-                            "stdout": r.stdout,
-                            "stderr": r.stderr,
-                            "timed_out": r.timed_out,
-                        })
-                        .with_error_flag(r.exit_code != Some(0)),
-                        Err(e) => json!({"error": e.to_string()}).with_error_flag(true),
+                        Ok(r) => {
+                            redactions = r.redactions;
+                            (
+                                json!({
+                                    "exit_code": r.exit_code,
+                                    "stdout": r.stdout,
+                                    "stderr": r.stderr,
+                                    "timed_out": r.timed_out,
+                                }),
+                                r.exit_code != Some(0),
+                            )
+                        }
+                        Err(e) => (json!({"error": e.to_string()}), true),
                     }
                 }
                 ParsedCall::List(rel) => {
@@ -436,6 +453,7 @@ impl ToolProvider for LocalTools {
                 call_id,
                 output: value,
                 is_error,
+                redactions,
             })
         })
     }
@@ -903,6 +921,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.stdout.trim(), "[REDACTED:token]");
+    }
+
+    // -- C69: redaction provenance through the local exec path ---------
+
+    /// The local exec path carries the report on the ExecResult and on
+    /// the ToolResult, while the model-visible `output` keeps exactly
+    /// the four legacy fields (no report inside it).
+    #[tokio::test]
+    async fn local_exec_result_carries_the_redaction_report() {
+        const NAME: &str = "KIAN_LOOP_TEST_SECRET69";
+        const VALUE: &str = "kian69-known-secret-value-abcdefgh";
+        set_env_once(NAME, VALUE);
+        let root = temp_root();
+        let redactor = kian_core::secrets::SecretRedactor::from_env_names(&[NAME.to_string()]);
+        let tools = LocalTools::new(&root).with_redactor(redactor);
+
+        // Backend level: report rides the ExecResult, merged across
+        // stdout and stderr (the known value echoes once in each).
+        let backend = LocalExecBackend::new().with_redactor(
+            kian_core::secrets::SecretRedactor::from_env_names(&[NAME.to_string()]),
+        );
+        let r = backend
+            .exec(ExecCommand {
+                argv: vec![
+                    "bash".into(),
+                    "-c".into(),
+                    format!("echo {VALUE}; echo {VALUE} >&2"),
+                ],
+                env: Default::default(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            r.redactions,
+            vec![kian_core::secrets::Redaction {
+                kind: kian_core::secrets::RedactionKind::KnownValue,
+                name: NAME.to_string(),
+                count: 2,
+            }],
+            "stdout + stderr counts merge into one entry"
+        );
+
+        // Tool level: the ToolResult carries the report; the output has
+        // exactly the four legacy keys and no report inside it.
+        let res = tools
+            .invoke(call(
+                "c1",
+                "exec",
+                serde_json::json!({"argv": ["bash", "-c", format!("echo {NAME}=${NAME}").as_str()]}),
+            ))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let mut keys: Vec<&str> = res
+            .output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["exit_code", "stderr", "stdout", "timed_out"]);
+        assert_eq!(res.redactions.len(), 1);
+        assert_eq!(res.redactions[0].name, NAME);
+
+        // A clean run reports nothing: empty report, key omitted.
+        let clean = tools
+            .invoke(call("c2", "exec", serde_json::json!({"argv": ["true"]})))
+            .await
+            .unwrap();
+        assert!(clean.redactions.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

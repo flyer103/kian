@@ -33,7 +33,7 @@
 //!   "counters": { "inputs_admitted": 1, "drain_claims": 1, "turns": 1,
 //!     "requests": 1, "assistant_messages": 1, "tool_calls": 0,
 //!     "tool_results": 0, "compactions": 0, "budget_resets": 0,
-//!     "pending_eligible_inputs": 0 }
+//!     "pending_eligible_inputs": 0, "pending_control_inputs": 0 }
 //! }
 //! ```
 //!
@@ -55,9 +55,12 @@
 //! }
 //! ```
 //!
-//! **`session export <id> [--since S] [--until U]`** — JSONL, one
-//! frozen v0 event envelope per line (the exact stored bytes), `since
-//! <= seq <= until` (inclusive; defaults: whole stream). Import = one
+//! **`session export <id> [--since S] [--until U] [--with-event-ids]`** —
+//! JSONL, one frozen v0 event envelope per line (the exact stored
+//! bytes), `since <= seq <= until` (inclusive; defaults: whole stream).
+//! `--with-event-ids` (C69, opt-in) adds the derived `event_id` to each
+//! line — presentation only, the envelope bytes and the default export
+//! are unchanged, and import ignores the extra key. Import = one
 //! [`kian_store::EventStore::append`] per line under each event's own
 //! epoch/seq — a re-imported export projects the identical state.
 //!
@@ -206,10 +209,14 @@ pub struct InspectReport {
     pub epoch: u64,
     pub last_event_ts: u64,
     pub counters: Value,
+    /// C67: usage totals, present only when the stream carries
+    /// usage-bearing `turn/end` events (absent → no key, no text lines).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage_metrics::SessionUsageReport>,
 }
 
 /// Event-kind counters, all derived from the stream (constraint 1).
-fn counters(events: &[Event], pending: usize) -> Value {
+fn counters(events: &[Event], pending: usize, pending_control: usize) -> Value {
     let mut c = std::collections::BTreeMap::new();
     let mut count = |name: &str, n: u64| {
         c.insert(name.to_string(), json!(n));
@@ -228,6 +235,9 @@ fn counters(events: &[Event], pending: usize) -> Value {
     count("compactions", kind_count(&EventKind::Compact));
     count("budget_resets", kind_count(&EventKind::RecoveryBudgetReset));
     count("pending_eligible_inputs", pending as u64);
+    // C68: unconsumed reserved control-envelope rows (durable interrupt
+    // intents) — the "pending control" operator line.
+    count("pending_control_inputs", pending_control as u64);
     json!(c)
 }
 
@@ -242,14 +252,25 @@ pub async fn run_inspect(
     let store = open_reader(&db).await?;
     let events = rebuild_session(&store, session).await?;
     let state = project(&events).map_err(|e| format!("projection: {e}"))?;
-    let pending = store
+    let pending_rows = store
         .eligible_inputs(session, now_ms())
         .await
-        .map_err(|e| format!("inbox read: {e}"))?
-        .len();
+        .map_err(|e| format!("inbox read: {e}"))?;
+    let pending = pending_rows.len();
+    // C68: how many of the pending rows are durable interrupt intents.
+    let pending_control = pending_rows
+        .iter()
+        .filter(|r| kian_core::control::InterruptIntent::is_control_envelope(&r.payload))
+        .count();
     store.close().await;
 
     let last = events.last().expect("non-empty by construction");
+    // C67: usage lines only when observed (a pure projection over the
+    // same events already read — no extra store round trip).
+    let usage = {
+        let report = crate::usage_metrics::session_usage_report(session, &events);
+        (report.requests_with_usage > 0).then_some(report)
+    };
     let report = InspectReport {
         session,
         state,
@@ -257,13 +278,14 @@ pub async fn run_inspect(
         next_seq: last.seq + 1,
         epoch: last.epoch.0,
         last_event_ts: last.ts,
-        counters: counters(&events, pending),
+        counters: counters(&events, pending, pending_control),
+        usage,
     };
     if json {
         return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
     }
     let c = &report.counters;
-    Ok(format!(
+    let mut out = format!(
         "session             {}\nstate               {}\nevents              {} (next seq {}, epoch {})\nlast event ts       {}\ninputs admitted     {}\ndrain claims        {}\nturns               {}\nrequests            {}\nassistant messages  {}\ntool calls          {}\ntool results        {}\ncompactions         {}\nbudget resets       {}\npending inputs      {}\n",
         report.session.0,
         serde_json::to_value(report.state)
@@ -284,7 +306,25 @@ pub async fn run_inspect(
         c["compactions"],
         c["budget_resets"],
         c["pending_eligible_inputs"],
-    ))
+    );
+    // C68: pending durable interrupt intents (read-only inbox view) —
+    // rendered only when one exists.
+    if pending_control > 0 {
+        out.push_str(&format!("pending control     {pending_control}\n"));
+    }
+    // C67: usage lines render only when the stream observed usage.
+    if let Some(u) = &report.usage {
+        out.push_str(&format!(
+            "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens,
+            u.cache_creation_input_tokens,
+            u.requests_with_usage,
+            u.unknown_usage_requests,
+        ));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -498,10 +538,17 @@ pub async fn run_replay(
 // session export — event interval → JSONL audit package
 // ---------------------------------------------------------------------------
 
-/// `kian session export <id> [--since S] [--until U] [--out F]`:
-/// writes one frozen v0 envelope per line (the exact stored bytes,
-/// re-serialized identically from the envelope column). `since`/`until`
-/// are inclusive seq bounds.
+/// `kian session export <id> [--since S] [--until U] [--out F]
+/// [--with-event-ids]`: writes one frozen v0 envelope per line (the
+/// exact stored bytes, re-serialized identically from the envelope
+/// column). `since`/`until` are inclusive seq bounds.
+///
+/// `--with-event-ids` (C69, opt-in) adds the derived `event_id`
+/// ([`kian_core::events::event_id`]) to each line — a presentation key
+/// for tooling, never part of the envelope. The default export's bytes
+/// are unchanged; the flag only ever adds a key, and `import_jsonl`
+/// parses the augmented lines unchanged (the envelope ignores unknown
+/// keys), so the field is round-trip-safe, not export-only.
 pub async fn run_export(
     config_path: &Path,
     db: Option<&Path>,
@@ -509,6 +556,7 @@ pub async fn run_export(
     since: Option<u64>,
     until: Option<u64>,
     out: Option<&Path>,
+    with_event_ids: bool,
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
@@ -534,7 +582,18 @@ pub async fn run_export(
         // The envelope column holds serde_json::to_string(event); a
         // canonical re-serialization of the same Event is byte-identical
         // (C5 persist-what-you-send), so round-trips are lossless.
-        jsonl.push_str(&serde_json::to_string(e).map_err(|e| format!("serialize event: {e}"))?);
+        // C69: --with-event-ids re-serializes through a Value to add the
+        // derived id next to the envelope fields — the default path
+        // (the same bytes as before C69) is untouched.
+        let line = if with_event_ids {
+            let mut v = serde_json::to_value(e).map_err(|e| format!("serialize event: {e}"))?;
+            v["event_id"] =
+                serde_json::Value::String(kian_core::events::event_id(&e.session, e.seq));
+            serde_json::to_string(&v).map_err(|e| format!("serialize event: {e}"))?
+        } else {
+            serde_json::to_string(e).map_err(|e| format!("serialize event: {e}"))?
+        };
+        jsonl.push_str(&line);
         jsonl.push('\n');
     }
     match out {
@@ -1041,7 +1100,7 @@ mod tests {
     use kian_core::model::{Epoch, SessionId};
     use serde_json::json;
 
-    use super::{check_model_context, import_jsonl};
+    use super::{check_model_context, import_jsonl, run_export};
 
     fn temp_db_path() -> PathBuf {
         std::env::temp_dir().join(format!("kian-c14-{}.sqlite", uuid::Uuid::new_v4()))
@@ -1173,5 +1232,170 @@ mod tests {
         assert!(err.is_err());
         store.close().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// C69: the default export is byte-identical to the pre-C69 format
+    /// (one canonical `serde_json::to_string(event)` per line — no
+    /// derived-id key anywhere).
+    #[tokio::test]
+    async fn default_export_bytes_are_unchanged_without_the_flag() {
+        let sid = SessionId::new();
+        let mut events = honest_stream(json!([{"role": "user", "content": "hello"}]));
+        events.push(ev(6, 1, EventKind::TurnEnd, json!({"outcome": "ok"})));
+        for e in events.iter_mut() {
+            e.session = sid;
+        }
+        let path = temp_db_path();
+        let store = kian_store::EventStore::open(&path).await.unwrap();
+        for e in &events {
+            store
+                .append(
+                    sid,
+                    e.clone(),
+                    kian_store::AppendGuard {
+                        epoch: e.epoch,
+                        expected_seq: e.seq,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store.close().await;
+
+        let jsonl = run_export(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            sid,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let expected: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(jsonl, expected, "default export bytes must be unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// C69: `--with-event-ids` adds the stable derived id to every line,
+    /// deterministically, without touching any envelope field — and the
+    /// augmented lines re-import into a fresh store whose default export
+    /// is byte-identical to the original one (S7 discipline; the field
+    /// is round-trip-safe, not export-only).
+    #[tokio::test]
+    async fn with_event_ids_export_adds_stable_ids_and_round_trips() {
+        use kian_store::EventStore;
+
+        let sid = SessionId::new();
+        let mut events = honest_stream(json!([{"role": "user", "content": "hello"}]));
+        events.push(ev(6, 1, EventKind::TurnEnd, json!({"outcome": "ok"})));
+        for e in events.iter_mut() {
+            e.session = sid;
+        }
+        let path = temp_db_path();
+        let store = EventStore::open(&path).await.unwrap();
+        for e in &events {
+            store
+                .append(
+                    sid,
+                    e.clone(),
+                    kian_store::AppendGuard {
+                        epoch: e.epoch,
+                        expected_seq: e.seq,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store.close().await;
+
+        let plain = run_export(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            sid,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let with_ids = run_export(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            sid,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let with_ids_again = run_export(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            sid,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_ids, with_ids_again, "derived ids are deterministic");
+
+        // Line-by-line: the derived id is right, and every envelope
+        // field survives the augmentation unchanged.
+        assert_eq!(
+            plain.lines().count(),
+            with_ids.lines().count(),
+            "the flag adds a key per line, never a line"
+        );
+        for (plain_line, id_line) in plain.lines().zip(with_ids.lines()) {
+            let mut augmented: serde_json::Value =
+                serde_json::from_str(plain_line).expect("plain line is an envelope");
+            let line: serde_json::Value =
+                serde_json::from_str(id_line).expect("augmented line still parses as an envelope");
+            let seq = line["seq"].as_u64().unwrap();
+            assert_eq!(
+                line["event_id"].as_str().unwrap(),
+                kian_core::events::event_id(&sid, seq),
+                "event_id must equal the derived id for seq {seq}"
+            );
+            let object = augmented.as_object_mut().unwrap();
+            object.insert("event_id".to_string(), line["event_id"].clone());
+            assert_eq!(augmented, line, "no envelope field changed");
+        }
+
+        // The augmented JSONL re-imports into a fresh store (the
+        // envelope ignores the extra key) and the fresh store's default
+        // export is byte-identical to the original one.
+        let fresh_path = temp_db_path();
+        let fresh = EventStore::open(&fresh_path).await.unwrap();
+        import_jsonl(&fresh, &with_ids).await.unwrap();
+        fresh.close().await;
+        let reexported = run_export(
+            std::path::Path::new("kian.yaml"),
+            Some(&fresh_path),
+            sid,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reexported, plain,
+            "import ignores event_id; re-export is byte-identical"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fresh_path);
     }
 }

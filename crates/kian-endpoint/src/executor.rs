@@ -49,6 +49,7 @@ impl ExecBackend for LocalExecutor {
                         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                         timed_out: false,
+                        redactions: Vec::new(),
                     })
                     .map_err(|error| ExecError::Io(error.to_string())),
                 Some(ms) => {
@@ -63,6 +64,7 @@ impl ExecBackend for LocalExecutor {
                             stdout: String::new(),
                             stderr: String::new(),
                             timed_out: true,
+                            redactions: Vec::new(),
                         }),
                         Ok(output) => output
                             .map(|output| ExecResult {
@@ -70,6 +72,7 @@ impl ExecBackend for LocalExecutor {
                                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                                 timed_out: false,
+                                redactions: Vec::new(),
                             })
                             .map_err(|error| ExecError::Io(error.to_string())),
                     }

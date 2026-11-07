@@ -269,6 +269,7 @@ mod tests {
                 stdout: "out".into(),
                 stderr: String::new(),
                 timed_out: false,
+                redactions: Vec::new(),
             },
         );
         assert_eq!(
@@ -367,6 +368,7 @@ mod tests {
                     stdout: String::new(),
                     stderr: String::new(),
                     timed_out: true,
+                    redactions: Vec::new(),
                 },
             ),
             EndpointFrame::command_failed(

@@ -733,6 +733,7 @@ async fn budget_stop_with_passing_gate_completes_with_verdict_before_end_write()
         ReActConfig {
             slot: kian_core::model::SlotName("main".into()),
             max_iterations: 2,
+            permissions: std::collections::BTreeMap::new(),
         },
     )
     .await;

@@ -95,6 +95,10 @@ impl TransitionTrigger {
             EventKind::SessionEnded { reason } => Self::Ended(*reason),
             EventKind::InputAdmitted => Self::InputAdmitted,
             EventKind::ThreadStarted => Self::ThreadStarted,
+            // C68: the durable interrupt intent is drain activity — it
+            // preserves `running` exactly like every other audit kind
+            // the drain appends mid-episode.
+            EventKind::ControlInterrupt => Self::DrainActivity,
             _ => Self::DrainActivity,
         }
     }
@@ -485,6 +489,34 @@ mod tests {
         let ctx_without = derive_model_context(&without).expect("context without reset event");
         assert_eq!(ctx_with, ctx_without);
         assert_eq!(ctx_with.len(), 1, "exactly the one input message");
+    }
+
+    /// The additive C68 `control/interrupt` kind is explicit drain
+    /// activity: it maps to the state-preserving `DrainActivity`
+    /// trigger (never a transition of its own — the *end write* is what
+    /// settles an interrupt, constraint 4), and a stream containing it
+    /// mid-episode projects `running` exactly like one without it.
+    #[test]
+    fn control_interrupt_maps_to_drain_activity_and_preserves_running() {
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::ControlInterrupt),
+            TransitionTrigger::DrainActivity
+        );
+
+        let mut with = StreamBuilder::new(12);
+        with.push(EventKind::SessionCreated);
+        with.push(EventKind::InputAdmitted);
+        with.claim();
+        with.push(EventKind::ControlInterrupt);
+        assert_eq!(project(&with.build()).unwrap(), SessionState::Running);
+
+        // Mid-episode the intent is recorded; only the end write
+        // settles it (back to Idle via `interrupted`).
+        let mut settled = with;
+        settled.push(EventKind::SessionEnded {
+            reason: EndReason::Interrupted,
+        });
+        assert_eq!(project(&settled.build()).unwrap(), SessionState::Idle);
     }
 
     /// The complete legal transition set of the DESIGN §2.2 machine,

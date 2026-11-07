@@ -128,7 +128,11 @@ impl KianClient {
     }
 
     /// Control plane: request an interrupt; the outcome string is the
-    /// server's worded receipt.
+    /// server's worded receipt. The intent is durable (C68/ADR-014):
+    /// whenever work may still be in flight the server also admits a
+    /// control-envelope inbox row that the owning drain consumes into a
+    /// `control/interrupt` event — the interrupt survives a drain crash
+    /// and crosses replicas. No new wire method.
     pub async fn interrupt(&self, session: &str) -> Result<InterruptResult, ClientError> {
         let result = self.rpc("interrupt", json!({"session": session})).await?;
         Self::parse(result)
@@ -192,5 +196,74 @@ impl KianClient {
     fn parse<T: serde::de::DeserializeOwned>(result: Value) -> Result<T, ClientError> {
         serde_json::from_value(result)
             .map_err(|e| ClientError::Malformed(format!("result shape: {e}")))
+    }
+
+    /// Derived event id (C69) — pure, no I/O: the deterministic id kian
+    /// assigns to a session event. Rule (mirroring
+    /// `kian_core::events::event_id` byte-for-byte, see the crate's
+    /// `derived` module):
+    ///
+    /// ```text
+    /// event_id = "evt_" + uuid5(namespace = <session uuid>,
+    ///                           name    = "kian:event:<seq>")
+    /// ```
+    ///
+    /// RFC 4122 v5 (SHA-1 over `namespace || name`, version/variant
+    /// bits forced). `session` is the session uuid string (hyphenated
+    /// or bare 32-hex, any case); an unparseable session is an honest
+    /// [`ClientError::Malformed`]. Tooling can reference an event
+    /// before fetching it — `kian session export --with-event-ids`
+    /// stamps the same value.
+    pub fn event_id(session: &str, seq: u64) -> Result<String, ClientError> {
+        crate::derived::event_id(session, seq)
+            .ok_or_else(|| ClientError::Malformed(format!("`{session}` is not a session uuid")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KianClient;
+
+    /// C69 golden vectors: the SDK's dependency-free uuid-v5 mirror must
+    /// equal the core rule's literals (generated independently of the
+    /// Rust `uuid` crate — Python `uuid.uuid5`), pinning the two
+    /// implementations to the same bytes.
+    #[test]
+    fn event_id_matches_the_core_golden_vectors() {
+        let ns = "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b";
+        let cases: &[(u64, &str)] = &[
+            (1, "evt_ec671a02-5108-5e7a-811a-3517bea635e6"),
+            (7, "evt_42124c15-3948-56f1-9606-517dc61d2829"),
+            (42, "evt_b1a35135-d4f4-50cd-b457-e8b96fb9e5dd"),
+        ];
+        for (seq, expected) in cases {
+            assert_eq!(
+                &KianClient::event_id(ns, *seq).unwrap(),
+                expected,
+                "seq {seq}"
+            );
+        }
+        // Distinct per session at the same seq.
+        assert_ne!(
+            KianClient::event_id(ns, 7).unwrap(),
+            KianClient::event_id("00000000-0000-0000-0000-000000000001", 7).unwrap()
+        );
+        // Bare-hex and hyphenated spellings of one session agree.
+        assert_eq!(
+            KianClient::event_id(ns, 7).unwrap(),
+            KianClient::event_id("0f9c2a113b4d4e5f8a6b7c8d9e0f1a2b", 7).unwrap()
+        );
+        // Determinism.
+        assert_eq!(
+            KianClient::event_id(ns, 7).unwrap(),
+            KianClient::event_id(ns, 7).unwrap()
+        );
+    }
+
+    /// A malformed session is an honest error, never a garbage id.
+    #[test]
+    fn event_id_rejects_malformed_sessions() {
+        assert!(KianClient::event_id("not-a-uuid", 1).is_err());
+        assert!(KianClient::event_id("", 1).is_err());
     }
 }

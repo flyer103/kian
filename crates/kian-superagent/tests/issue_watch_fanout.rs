@@ -222,9 +222,7 @@ impl ModelProvider for ScriptedProvider {
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 /// One tool call whose arguments are arbitrary JSON (serialized once,
@@ -234,13 +232,11 @@ fn tool_call_chunk(
     name: &str,
     arguments: &Value,
 ) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"tool_calls": [{
-            "index": 0,
-            "id": id,
-            "function": {"name": name, "arguments": arguments.to_string()}
-        }]}),
-    })
+    Ok(ModelChunk::new(json!({"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": arguments.to_string()}
+    }]})))
 }
 
 /// The worker side's inert tool provider (the evidence gate reads the
@@ -262,6 +258,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -652,6 +649,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         ReActConfig {
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 10_000,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
     let worker_loop = Arc::new(ReActLoop::with_config(

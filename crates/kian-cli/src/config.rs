@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use kian_core::model::{AgentDef, Budgets, SlotName, SlotSpec, SlotTarget};
+use kian_core::model::{AgentDef, Budgets, Permission, SlotName, SlotSpec, SlotTarget};
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_orchestrator::recovery::PolicyConfig;
 use kian_superagent::rules::{
@@ -156,6 +156,16 @@ pub struct AgentConfig {
     /// Tool names the agent may call.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Per-call tool permission table (C70 / ADR-015): tool name →
+    /// `allow`/`deny`, closed vocabulary — an unknown value refuses to
+    /// parse. Every key must be present in [`AgentConfig::tools`]
+    /// (fail-closed, validated in [`ServeConfig::validate`]). Absent =
+    /// empty = allow-all with the pre-C70 byte-identical event stream.
+    /// Evaluated on the built-in loop, the plain-session (default) loop
+    /// and the superagent worker loop; a table on the Router/Watchdog
+    /// judge agents refuses boot (never silently ignored).
+    #[serde(default)]
+    pub permissions: BTreeMap<String, Permission>,
     /// Session budgets (A5; `null` = unlimited).
     #[serde(default)]
     pub budgets: BudgetsDef,
@@ -1851,6 +1861,7 @@ impl ServeConfig {
         // fallback) must be configured — a slot pointing nowhere refuses
         // to start.
         self.validate_agent_slots(&self.agent, "agent")?;
+        self.validate_agent_permissions(&self.agent, "agent")?;
 
         // Plugin list: known names only; the loop implies its deps.
         for name in &self.plugins {
@@ -1919,6 +1930,7 @@ impl ServeConfig {
                 )));
             }
             self.validate_agent_slots(agent, &format!("agents.{name}"))?;
+            self.validate_agent_permissions(agent, &format!("agents.{name}"))?;
         }
 
         // Endpoints: unique ids, dialable addresses, sane timeouts.
@@ -2092,6 +2104,17 @@ impl ServeConfig {
                     sa.router.slot, sa.router.agent
                 )));
             }
+            // C70: the Router judge loop does not evaluate permissions
+            // this round (ADR-015) — a table on it would be silently
+            // ignored, so it refuses boot.
+            if !router_agent.permissions.is_empty() {
+                return Err(invalid(format!(
+                    "agents.{} carries a permissions table but the Router judge loop does not \
+                     evaluate permissions (C70/ADR-015) — remove the section or move it to the \
+                     worker/default agent",
+                    sa.router.agent
+                )));
+            }
             // The speculation section must convert cleanly (C39:
             // fail-closed — a zero cap or empty label refuses to start).
             if let Some(speculation) = &sa.router.speculation {
@@ -2199,6 +2222,15 @@ impl ServeConfig {
                         watchdog.agent
                     )));
                 }
+                // C70: same as the Router — the watchdog judge loop does
+                // not evaluate permissions; a table refuses boot.
+                if !watchdog_agent.permissions.is_empty() {
+                    return Err(invalid(format!(
+                        "agents.{} carries a permissions table but the Watchdog judge loop \
+                         does not evaluate permissions (C70/ADR-015) — remove the section",
+                        watchdog.agent
+                    )));
+                }
             }
         }
 
@@ -2219,6 +2251,26 @@ impl ServeConfig {
         // The recovery section must parse through C10's fail-closed
         // loader (unknown classes / malformed actions are errors).
         self.policy()?;
+        Ok(())
+    }
+
+    /// Fail-closed C70 permission check for one agent definition: every
+    /// `permissions:` key must be present in the agent's `tools:` list —
+    /// a policy for a tool the agent cannot call is a config error, never
+    /// a silent no-op.
+    fn validate_agent_permissions(
+        &self,
+        agent: &AgentConfig,
+        label: &str,
+    ) -> Result<(), ConfigError> {
+        for key in agent.permissions.keys() {
+            if !agent.tools.iter().any(|t| t == key) {
+                return Err(invalid(format!(
+                    "{label}.permissions key `{key}` is not in {label}.tools — permission keys \
+                     must name a tool the agent may call",
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2601,6 +2653,121 @@ recovery:
         let msg = err.to_string();
         assert!(msg.contains("/nonexistent/kian.yaml"), "{msg}");
         assert!(msg.contains("cannot read config file"), "{msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // C70: per-call tool permissions (ADR-015)
+    // -----------------------------------------------------------------------
+
+    /// C70: an agent with no `permissions:` section parses to an empty
+    /// table (= allow-all, byte-identical behavior).
+    #[test]
+    fn permissions_absent_defaults_to_empty() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        assert!(cfg.agent.permissions.is_empty(), "absent = empty = allow");
+        let sa = ServeConfig::parse(&superagent_yaml()).expect("superagent config");
+        assert!(sa.named_agent("worker").unwrap().permissions.is_empty());
+    }
+
+    /// C70: `allow`/`deny` parse into the closed `Permission` vocabulary.
+    #[test]
+    fn permissions_allow_and_deny_parse() {
+        let yaml = valid_yaml().replacen(
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    fs_read: allow\n    fs_write: deny\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("permissions parse");
+        assert_eq!(
+            cfg.agent.permissions,
+            BTreeMap::from([
+                ("fs_read".to_string(), Permission::Allow),
+                ("fs_write".to_string(), Permission::Deny),
+            ])
+        );
+    }
+
+    /// C70 (fail-closed): an unknown permission value refuses boot —
+    /// the vocabulary is closed; `ask` is deliberately not in it this
+    /// round (ADR-015).
+    #[test]
+    fn permissions_unknown_value_refuses_boot() {
+        for bad in ["ask", "maybe", "ALLOW"] {
+            let yaml = valid_yaml().replacen(
+                "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+                format!("  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    fs_read: {bad}\n").as_str(),
+                1,
+            );
+            let err = ServeConfig::parse(&yaml).expect_err("unknown value must refuse boot");
+            assert!(
+                err.to_string().contains("permissions"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// C70 (fail-closed): a permission key not present in the agent's
+    /// `tools:` list refuses boot — a policy for a tool the agent cannot
+    /// call is a config error, never a silent no-op.
+    #[test]
+    fn permissions_key_absent_from_agent_tools_refuses_boot() {
+        let yaml = valid_yaml().replacen(
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    not_a_tool: deny\n",
+            1,
+        );
+        let err = ServeConfig::parse(&yaml).expect_err("unknown tool key must refuse boot");
+        let msg = err.to_string();
+        assert!(msg.contains("permissions"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("not_a_tool"),
+            "must name the offending key: {msg}"
+        );
+        assert!(msg.contains("tools"), "must point at the tools list: {msg}");
+
+        // Same discipline for a named agent (the worker template path).
+        let sa = superagent_yaml().replacen(
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    permissions:\n      exec: deny\n",
+            1,
+        );
+        // (exec IS a worker tool — the parse must succeed; the refusal
+        // case below uses a name the worker does not list.)
+        let parsed = ServeConfig::parse(&sa).expect("worker permissions on a listed tool parse");
+        assert_eq!(
+            parsed.named_agent("worker").unwrap().permissions["exec"],
+            Permission::Deny
+        );
+        let sa_bad = superagent_yaml().replacen(
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    permissions:\n      spawn_worker: deny\n",
+            1,
+        );
+        let err = ServeConfig::parse(&sa_bad).expect_err("unlisted key must refuse boot");
+        assert!(err.to_string().contains("spawn_worker"), "{err}");
+    }
+
+    /// C70 (fail-closed): the Router and Watchdog judge loops do not
+    /// evaluate permissions this round (ADR-015) — a permissions table
+    /// on their agents would be silently ignored, so it refuses boot
+    /// instead.
+    #[test]
+    fn permissions_on_judge_agents_refuse_boot() {
+        let router = superagent_yaml().replacen(
+            "    tools: [\"spawn_worker\", \"reply\", \"deliver_structured\"]\n",
+            "    tools: [\"spawn_worker\", \"reply\", \"deliver_structured\"]\n    permissions:\n      reply: deny\n",
+            1,
+        );
+        let err = ServeConfig::parse(&router).expect_err("router permissions must refuse boot");
+        assert!(err.to_string().contains("router"), "{err}");
+
+        let watchdog = watchdog_yaml().replacen(
+            "  watchdog:\n    id: watchdog\n    version: 1\n    model_slots:\n      main:\n        provider: openai\n        model: gpt-watchdog\n    tools: []\n",
+            "  watchdog:\n    id: watchdog\n    version: 1\n    model_slots:\n      main:\n        provider: openai\n        model: gpt-watchdog\n    tools: []\n    permissions:\n      noop: allow\n",
+            1,
+        );
+        let err = ServeConfig::parse(&watchdog).expect_err("watchdog permissions must refuse boot");
+        assert!(err.to_string().contains("watchdog"), "{err}");
     }
 
     // -----------------------------------------------------------------------

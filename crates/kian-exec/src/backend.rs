@@ -274,11 +274,27 @@ impl RemoteExecBackend {
             EnqueueOutcome::Existing(row) => match row.status {
                 QueueStatus::Done => {
                     return match row.outcome.expect("done rows always carry an outcome") {
-                        CommandOutcome::Ok { result } => Ok(ExecResult {
-                            stdout: self.core.redactor.redact(&result.stdout),
-                            stderr: self.core.redactor.redact(&result.stderr),
-                            ..result
-                        }),
+                        // The row was redacted at settlement (C69 report
+                        // rides the durable result); re-redacting is
+                        // idempotent (scrubbed bytes yield an empty
+                        // report) and covers pre-kian-77 rows whose raw
+                        // output still scrubs — the stored report is
+                        // kept and summed with anything newly redacted.
+                        CommandOutcome::Ok { result } => {
+                            let (stdout, stdout_report) =
+                                self.core.redactor.redact_with_report(&result.stdout);
+                            let (stderr, stderr_report) =
+                                self.core.redactor.redact_with_report(&result.stderr);
+                            let stored = result.redactions.clone();
+                            Ok(ExecResult {
+                                stdout,
+                                stderr,
+                                redactions: kian_core::secrets::merge_redaction_reports(
+                                    stored.into_iter().chain(stdout_report).chain(stderr_report),
+                                ),
+                                ..result
+                            })
+                        }
                         other => other.to_exec(),
                     };
                 }
@@ -389,15 +405,24 @@ impl QueueCore {
         // kian-77: the one redaction point on the remote path — before
         // the row is written, so the durable copy (and everything that
         // reads it: waiters, tool results, async completions, replays)
-        // only ever holds scrubbed bytes.
+        // only ever holds scrubbed bytes. C69: the same pass emits its
+        // provenance report, which rides the durable row so deduped
+        // read-backs still answer with the report.
         let outcome = match outcome {
-            CommandOutcome::Ok { result } => CommandOutcome::Ok {
-                result: ExecResult {
-                    stdout: self.redactor.redact(&result.stdout),
-                    stderr: self.redactor.redact(&result.stderr),
-                    ..result
-                },
-            },
+            CommandOutcome::Ok { result } => {
+                let (stdout, stdout_report) = self.redactor.redact_with_report(&result.stdout);
+                let (stderr, stderr_report) = self.redactor.redact_with_report(&result.stderr);
+                CommandOutcome::Ok {
+                    result: ExecResult {
+                        stdout,
+                        stderr,
+                        redactions: kian_core::secrets::merge_redaction_reports(
+                            stdout_report.into_iter().chain(stderr_report),
+                        ),
+                        ..result
+                    },
+                }
+            }
             other => other,
         };
         match self.store.mark_done(command_id, &outcome).await {

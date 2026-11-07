@@ -621,6 +621,7 @@ fn _unused_backend_traits() {
         stdout: String::new(),
         stderr: String::new(),
         timed_out: false,
+        redactions: Vec::new(),
     };
     let _: Option<ExecError> = None;
 }

@@ -366,12 +366,7 @@ impl ModelProvider for ScriptedProvider {
     {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        once(async move {
-            Ok(ModelChunk {
-                delta: json!({"content": "ok"}),
-            })
-        })
-        .boxed()
+        once(async move { Ok(ModelChunk::new(json!({"content": "ok"}))) }).boxed()
     }
 }
 

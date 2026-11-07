@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kian_core::model::{AgentDef, SessionId};
+use kian_core::model::{AgentDef, Permission, SessionId};
 use kian_core::seams::{ChannelAdapter, RecoveryPolicySource, ToolProvider};
 use kian_exec::{
     ConnectionConfig, ConnectionManager, ExecStore, RemoteExecBackend, RemoteExecConfig,
@@ -343,6 +343,13 @@ pub struct SuperAgentPlugin {
     pub worker_agent: AgentDef,
     /// The default agent's compiled definition (plain sessions).
     pub default_agent: AgentDef,
+    /// C70: the worker template's per-call tool permission table
+    /// (`agents.<superagent.worker.agent>.permissions`), evaluated on
+    /// the worker loop before every `tool/call`.
+    pub worker_permissions: BTreeMap<String, Permission>,
+    /// C70: the default agent's permission table, evaluated on the
+    /// plain-session loop.
+    pub default_permissions: BTreeMap<String, Permission>,
     /// The configured resident Router session id — already the kian-62
     /// re-arm walk's *live* session: the pinned id itself when its
     /// stream is non-terminal (or never created), else the deterministic
@@ -658,6 +665,10 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName(self.router_slot.clone()),
                 max_iterations: self.max_iterations,
+                // C70: the Router judge loop does not evaluate
+                // permissions (a table on its agent refuses boot at
+                // config validation — ADR-015).
+                permissions: BTreeMap::new(),
             },
         ));
 
@@ -717,6 +728,10 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
+                // C70: the worker template's permission table rides the
+                // inner ReAct loop (the dsh harness path does not
+                // evaluate it — ADR-015 records the boundary).
+                permissions: self.worker_permissions.clone(),
             },
         ));
         // C54: the worker template's inner loop is config-gated — the
@@ -753,6 +768,10 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
+                // C70: the default agent's permission table (the
+                // plain-session loop is the built-in loop of the
+                // bundle assembly).
+                permissions: self.default_permissions.clone(),
             },
             self.default_gate,
         ));
@@ -796,6 +815,10 @@ impl Plugin for SuperAgentPlugin {
                 ReActConfig {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
+                    // C70: the Watchdog judge loop does not evaluate
+                    // permissions (a table on its agent refuses boot at
+                    // config validation — ADR-015).
+                    permissions: BTreeMap::new(),
                 },
             ));
             kian_superagent::RouterDriver::new(

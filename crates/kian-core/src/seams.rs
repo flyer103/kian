@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::SlotName;
+use crate::secrets::Redaction;
 
 // ---------------------------------------------------------------------------
 // ModelProvider
@@ -36,9 +37,35 @@ pub struct ModelRequest {
 
 /// One streamed response chunk; the delta shape is provider-defined and
 /// opaque to the core.
+///
+/// C67: a chunk may instead (or additionally) carry the provider's
+/// `usage` object **verbatim** — a usage-only frame has `delta: null`
+/// and `usage: Some(…)`; consumers must skip null deltas when
+/// assembling content. The field is additive (serde default, omitted
+/// when `None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelChunk {
     pub delta: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+}
+
+impl ModelChunk {
+    /// A delta-bearing chunk with no usage report.
+    #[must_use]
+    pub fn new(delta: Value) -> Self {
+        Self { delta, usage: None }
+    }
+
+    /// A chunk carrying a (possibly null) delta plus the provider's
+    /// usage object verbatim.
+    #[must_use]
+    pub fn with_usage(delta: Value, usage: Value) -> Self {
+        Self {
+            delta,
+            usage: Some(usage),
+        }
+    }
 }
 
 /// Provider-side failures. Variants pre-align with the pure error
@@ -98,6 +125,13 @@ pub struct ToolResult {
     /// Distinguishes tool-level errors from successful outputs honestly
     /// (constraint 7).
     pub is_error: bool,
+    /// C69 redaction provenance: what the exec redactor scrubbed from
+    /// this result (aggregate counts, never secret values). Additive
+    /// seam field — legacy JSON parses with an empty vec, an empty vec
+    /// serializes without the key, and the report never enters the
+    /// model-visible `output`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions: Vec<Redaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -139,6 +173,13 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// C69 redaction provenance, produced by the redaction pass that
+    /// scrubbed `stdout`/`stderr` (the report travels with the result so
+    /// tool layers can attach it to the `tool/result` event payload).
+    /// Additive: legacy JSON parses with an empty vec; empty serializes
+    /// without the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions: Vec<Redaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -460,6 +501,26 @@ mod tests {
         assert_eq!(back, event);
     }
 
+    /// C67: `ModelChunk.usage` is additive — legacy JSON (no `usage`
+    /// key) parses with `None`, `None` serializes without the key, and
+    /// a usage-carrying chunk round-trips with `delta: null`.
+    #[test]
+    fn model_chunk_usage_is_additive() {
+        let plain = ModelChunk::new(json!({"content": "hi"}));
+        let ser = serde_json::to_value(&plain).unwrap();
+        assert_eq!(ser, json!({"delta": {"content": "hi"}}));
+        let legacy: ModelChunk =
+            serde_json::from_value(json!({"delta": {"content": "hi"}})).unwrap();
+        assert_eq!(legacy, plain);
+        assert_eq!(legacy.usage, None);
+
+        let with = ModelChunk::with_usage(serde_json::Value::Null, json!({"prompt_tokens": 3}));
+        let ser = serde_json::to_value(&with).unwrap();
+        assert_eq!(ser, json!({"delta": null, "usage": {"prompt_tokens": 3}}));
+        let back: ModelChunk = serde_json::from_value(ser).unwrap();
+        assert_eq!(back, with);
+    }
+
     /// The seam support types round-trip through JSON; policy rules come
     /// from declarative config (C10) and must be serde-shaped.
     #[test]
@@ -468,9 +529,7 @@ mod tests {
             slot: SlotName("main".into()),
             body: json!({"messages": []}),
         };
-        let chunk = ModelChunk {
-            delta: json!({"text": "hi"}),
-        };
+        let chunk = ModelChunk::new(json!({"text": "hi"}));
         let schema = ToolSchema {
             name: "fs.read".into(),
             description: "read a file".into(),
@@ -485,6 +544,7 @@ mod tests {
             call_id: "call-1".into(),
             output: json!({"content": "…"}),
             is_error: false,
+            redactions: Vec::new(),
         };
         let cmd = ExecCommand {
             argv: vec!["rg".into(), "-n".into(), "pat".into()],
@@ -499,6 +559,7 @@ mod tests {
             stdout: "match".into(),
             stderr: String::new(),
             timed_out: false,
+            redactions: Vec::new(),
         };
         let rule = PolicyRule {
             class: "rate_limited".into(),

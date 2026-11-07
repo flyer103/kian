@@ -333,6 +333,7 @@ impl WatchdogTools {
             call_id: call.id,
             output: json!({"threads": threads, "count": count}),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -389,6 +390,7 @@ impl WatchdogTools {
                 "events": events.len(),
             }),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -437,6 +439,7 @@ impl WatchdogTools {
                 "deduplicated": receipt.deduplicated,
             }),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -481,6 +484,7 @@ impl WatchdogTools {
                 "truncated": enforced.truncated,
             }),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 }

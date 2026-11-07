@@ -115,6 +115,17 @@ pub struct Budgets {
     pub wall_clock_ms: Option<u64>,
 }
 
+/// Per-call tool permission (C70 / ADR-015): a **closed** vocabulary —
+/// `allow` or `deny`, nothing else parses (fail-closed: an unknown value
+/// refuses boot). `ask` is deliberately absent this round; the closed
+/// shape lets a later confirmation plane add it additively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Allow,
+    Deny,
+}
+
 /// Agent = versioned config (DESIGN §2.1). No runtime state lives here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDef {
@@ -155,9 +166,34 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AgentDef, Budgets, Drain, EnvSpec, Epoch, InputRow, LeaseRecord, SessionId, SlotName,
-        SlotSpec, SlotTarget, Thread,
+        AgentDef, Budgets, Drain, EnvSpec, Epoch, InputRow, LeaseRecord, Permission, SessionId,
+        SlotName, SlotSpec, SlotTarget, Thread,
     };
+
+    /// C70: `Permission` is a closed vocabulary — `allow`/`deny` parse
+    /// and serialize lowercase, and any other value (notably `ask`,
+    /// deferred to a later round) refuses to parse (fail-closed).
+    #[test]
+    fn permission_is_a_closed_vocabulary_fail_closed() {
+        assert_eq!(
+            serde_json::to_value(Permission::Allow).unwrap(),
+            json!("allow")
+        );
+        assert_eq!(
+            serde_json::to_value(Permission::Deny).unwrap(),
+            json!("deny")
+        );
+        let allow: Permission = serde_json::from_value(json!("allow")).unwrap();
+        let deny: Permission = serde_json::from_value(json!("deny")).unwrap();
+        assert_eq!(allow, Permission::Allow);
+        assert_eq!(deny, Permission::Deny);
+        for unknown in ["ask", "Allow", "ALLOW", "maybe", ""] {
+            assert!(
+                serde_json::from_value::<Permission>(json!(unknown)).is_err(),
+                "`{unknown}` must refuse to parse (closed vocabulary, fail-closed)"
+            );
+        }
+    }
 
     #[test]
     fn session_id_and_epoch_are_serde_transparent() {

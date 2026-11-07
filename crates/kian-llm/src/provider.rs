@@ -412,6 +412,14 @@ fn response_stream(
 }
 
 /// Decode one SSE `data:` payload into zero or more stream items.
+///
+/// C67: a frame carrying a `usage` object emits a chunk with
+/// `delta: null` and the usage object **verbatim** (multiple frames all
+/// surface; the consumer applies last-wins). A usage frame never flips
+/// the saw-chunk liveness flag — a stream whose only frames are usage
+/// frames is still an [`ProviderError::EmptyResponse`] soft failure
+/// (constraint 7), while a usage frame after real content does not turn
+/// the response empty.
 fn decode_data(data: &str, flags: &StreamFlags) -> Vec<Result<ModelChunk, ProviderError>> {
     let v: Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -424,18 +432,20 @@ fn decode_data(data: &str, flags: &StreamFlags) -> Vec<Result<ModelChunk, Provid
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         return vec![Err(map_error_payload(err))];
     }
+    let mut items = Vec::new();
     match v.pointer("/choices/0/delta") {
         Some(delta) if !delta.as_object().is_some_and(|o| o.is_empty()) => {
             flags.0.store(true, Ordering::SeqCst);
-            vec![Ok(ModelChunk {
-                delta: delta.clone(),
-            })]
+            items.push(Ok(ModelChunk::new(delta.clone())));
         }
         // Empty deltas (e.g. the trailing finish_reason marker) and
-        // usage-only / keepalive frames carry nothing for the loop; a turn
-        // with only those is an EmptyResponse soft failure (constraint 7).
-        _ => Vec::new(),
+        // keepalive frames carry no content for the loop.
+        _ => {}
     }
+    if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+        items.push(Ok(ModelChunk::with_usage(Value::Null, usage.clone())));
+    }
+    items
 }
 
 /// Map an HTTP error status (with body) onto the classifier-friendly
@@ -1050,6 +1060,134 @@ mod tests {
             serialize_request_body(&built).unwrap(),
             serialize_request_body(&hand_written).unwrap()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // C67: provider usage frames
+    // ------------------------------------------------------------------
+
+    /// A final usage frame after content deltas emits a usage-only chunk
+    /// (Null delta, verbatim usage object) and the turn is NOT an
+    /// EmptyResponse — the delta-bearing frames already flipped the
+    /// liveness flag.
+    #[tokio::test]
+    async fn usage_frame_at_stream_end_is_parsed_verbatim_after_content() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        let usage = json!({
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+            "prompt_tokens_details": {"cached_tokens": 3}
+        });
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_ok(&[
+                r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":3}}}"#,
+                "[DONE]",
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = RecordingSink {
+            log: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider =
+            OpenAiCompatProvider::new(config(&server.uri(), "/chat/completions"), Arc::new(sink));
+        let out = collect(provider.complete(sample_request("m1")).boxed()).await;
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(
+            out[0].as_ref().unwrap(),
+            &ModelChunk::new(json!({"content": "hi"}))
+        );
+        assert_eq!(
+            out[1].as_ref().unwrap(),
+            &ModelChunk::with_usage(Value::Null, usage.clone()),
+            "the usage object rides verbatim with a Null delta"
+        );
+    }
+
+    /// Usage may arrive mid-stream (before [DONE] and even before the
+    /// final delta); multiple usage frames all surface as chunks — the
+    /// consumer applies last-wins.
+    #[tokio::test]
+    async fn mid_stream_and_final_usage_frames_both_surface() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_ok(&[
+                r#"{"usage":{"prompt_tokens":5}}"#,
+                r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
+                r#"{"usage":{"prompt_tokens":9,"completion_tokens":2}}"#,
+                "[DONE]",
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = RecordingSink {
+            log: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider =
+            OpenAiCompatProvider::new(config(&server.uri(), "/chat/completions"), Arc::new(sink));
+        let out = collect(provider.complete(sample_request("m1")).boxed()).await;
+        assert!(out.iter().all(|r| r.is_ok()));
+        let usage_chunks: Vec<&ModelChunk> = out
+            .iter()
+            .map(|r| r.as_ref().unwrap())
+            .filter(|c| c.usage.is_some())
+            .collect();
+        assert_eq!(usage_chunks.len(), 2);
+        assert_eq!(usage_chunks[0].usage, Some(json!({"prompt_tokens": 5})));
+        assert_eq!(
+            usage_chunks[1].usage,
+            Some(json!({"prompt_tokens": 9, "completion_tokens": 2})),
+            "last-wins is the consumer's rule; the provider surfaces every frame"
+        );
+        // Usage chunks carry a Null delta (content never rides on them).
+        assert!(usage_chunks.iter().all(|c| c.delta.is_null()));
+    }
+
+    /// Constraint 7 interaction: a usage frame alone flips nothing — the
+    /// stream is still an EmptyResponse soft failure (the liveness flag
+    /// counts delta-bearing frames only), and the usage chunk still
+    /// surfaces before the error.
+    #[tokio::test]
+    async fn usage_only_stream_is_still_an_empty_response() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_ok(&[
+                r#"{"usage":{"prompt_tokens":5,"completion_tokens":0}}"#,
+                "[DONE]",
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = RecordingSink {
+            log: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider =
+            OpenAiCompatProvider::new(config(&server.uri(), "/chat/completions"), Arc::new(sink));
+        let out = collect(provider.complete(sample_request("m1")).boxed()).await;
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[0].as_ref().unwrap(),
+            &ModelChunk::with_usage(
+                Value::Null,
+                json!({"prompt_tokens": 5, "completion_tokens": 0})
+            )
+        );
+        assert_eq!(out[1].as_ref().unwrap_err(), &ProviderError::EmptyResponse);
     }
 
     // ------------------------------------------------------------------

@@ -8,13 +8,17 @@
 //! - `kian cache-stats [--config <path>] [--session <uuid>] [--json]`
 //!   — S3 cache-byte stability report (C17): prefix hit-rate and
 //!   invalidation-cause counters derived from the event stream.
+//! - `kian usage-stats [--config <path>] [--session <uuid>] [--json]`
+//!   — C67 provider token-usage report: per-store token totals derived
+//!   from `turn/end` usage payloads (verbatim, no pricing).
 //! - `kian session inspect <uuid>` — projection + counters (C14;
 //!   embedded read-only).
 //! - `kian session replay <uuid> [--url <base>]` — re-derive everything
 //!   from events, verify A2 byte-identity, optionally diff against the
 //!   live server projection.
-//! - `kian session export <uuid> [--since S] [--until U] [--out F]` —
-//!   event interval → JSONL audit package.
+//! - `kian session export <uuid> [--since S] [--until U] [--out F]
+//!   [--with-event-ids]` — event interval → JSONL audit package
+//!   (`--with-event-ids` adds the C69 derived event id per line).
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
 //!   `kian recovery budget reset <uuid>` — operator actions (C14).
 //!
@@ -28,12 +32,14 @@ const USAGE: &str = "usage:
   kian serve [--config <path>]          run the kian server (default config: ./kian.yaml)
   kian cache-stats [--config <path>] [--session <uuid>] [--json]
                                          S3 cache-byte stability report (C17)
+  kian usage-stats [--config <path>] [--session <uuid>] [--json]
+                                         provider token-usage report (C67)
   kian session inspect <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          projection + counters (C14)
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
                                          re-derive everything from events (C14)
-  kian session export <uuid> [--since S] [--until U] [--out <file>] [--db <sqlite>] [--config <path>]
-                                         event interval → JSONL audit package (C14)
+  kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--db <sqlite>] [--config <path>]
+                                         event interval → JSONL audit package (C14; --with-event-ids adds the C69 derived id)
   kian wake-now <uuid> [--url <base>] [--config <path>] [--json]
                                          operator wake via the running server (C14)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
@@ -58,6 +64,7 @@ fn main() -> ExitCode {
         }
         Some("serve") => serve(&args[2..]),
         Some("cache-stats") => cache_stats(&args[2..]),
+        Some("usage-stats") => usage_stats(&args[2..]),
         Some("session") => session(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
         Some("mock-channel-send") => mock_channel_send(&args[2..]),
@@ -208,6 +215,70 @@ fn cache_stats(args: &[String]) -> ExitCode {
     }
 }
 
+/// `kian usage-stats [--config <path>] [--session <uuid>] [--json]` —
+/// the C67 provider token-usage report from the configured store
+/// (mirrors `cache-stats`).
+fn usage_stats(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut session: Option<kian_core::model::SessionId> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match iter.next() {
+                Some(s) => match s.parse::<uuid::Uuid>() {
+                    Ok(u) => session = Some(kian_core::model::SessionId(u)),
+                    Err(_) => {
+                        eprintln!("kian: --session requires a uuid\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --session requires a uuid\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown usage-stats option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("kian: cannot start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(kian_cli::usage_metrics::run_usage_stats(
+        &config_path,
+        session,
+        json,
+    )) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: usage-stats failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C14 session commands
 // ---------------------------------------------------------------------------
@@ -223,6 +294,10 @@ struct SessionArgs {
     out: Option<std::path::PathBuf>,
     reason: Option<String>,
     json: bool,
+    /// C69: `session export --with-event-ids` — adds the derived event
+    /// id to each exported line (export path only; other subcommands
+    /// ignore the flag).
+    with_event_ids: bool,
 }
 
 impl Default for SessionArgs {
@@ -237,6 +312,7 @@ impl Default for SessionArgs {
             out: None,
             reason: None,
             json: false,
+            with_event_ids: false,
         }
     }
 }
@@ -283,6 +359,7 @@ fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, S
                 None => return Err(format!("--reason requires a text ({usage_for})")),
             },
             "--json" => out.json = true,
+            "--with-event-ids" => out.with_event_ids = true,
             other if !other.starts_with("--") => {
                 let sid = kian_cli::commands::parse_session(other)
                     .map_err(|e| format!("{e} ({usage_for})"))?;
@@ -378,6 +455,7 @@ fn session(args: &[String]) -> ExitCode {
                 parsed.since,
                 parsed.until,
                 parsed.out.as_deref(),
+                parsed.with_event_ids,
             )) {
                 Ok(out) => {
                     print!("{out}");

@@ -147,6 +147,7 @@ impl ExecBackend for CountingExecutor {
                 stdout: format!("ran-{}", cmd.argv.join("-")),
                 stderr: String::new(),
                 timed_out: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -590,6 +591,7 @@ async fn store_enqueue_dedupe_and_status_transitions() {
             stdout: "done".into(),
             stderr: String::new(),
             timed_out: false,
+            redactions: Vec::new(),
         },
     };
     assert!(store.mark_done(id, &outcome).await.unwrap());
@@ -721,6 +723,7 @@ async fn row_lease_claims_expire_and_redrive_on_sqlite() {
             stdout: "ok".into(),
             stderr: String::new(),
             timed_out: false,
+            redactions: Vec::new(),
         },
     };
     assert!(store.mark_done(id, &outcome).await.unwrap());

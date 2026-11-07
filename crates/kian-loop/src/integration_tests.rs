@@ -4,6 +4,7 @@
 //! provider and (where useful) the tools are mocks — the engine, store,
 //! projections and event ordering are never mocked.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use kian_core::context::derive_model_context;
 use kian_core::events::{EndReason, Event, EventKind};
-use kian_core::model::{SessionId, SlotName};
+use kian_core::model::{Permission, SessionId, SlotName};
 use kian_core::seams::{PolicyRule, RecoveryAction, ToolCall, ToolResult};
 use kian_core::state::{SessionState, project};
 use kian_llm::ProviderRegistry;
@@ -350,6 +351,7 @@ async fn interrupt_during_tool_execution_lands_interrupted() {
                     call_id: call.id,
                     output: json!({"ok": true}),
                     is_error: false,
+                    redactions: Vec::new(),
                 }
             })
         }))
@@ -499,6 +501,7 @@ async fn tool_call_event_is_durable_before_execution() {
                     call_id: call.id,
                     output: json!({"ok": true}),
                     is_error: false,
+                    redactions: Vec::new(),
                 }
             })
         }))
@@ -668,6 +671,7 @@ async fn steer_arriving_mid_turn_lands_at_next_boundary_and_is_consumed() {
                     call_id: call.id,
                     output: json!({"ok": true}),
                     is_error: false,
+                    redactions: Vec::new(),
                 }
             })
         }))
@@ -767,6 +771,7 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
         ReActConfig {
             slot: SlotName("main".into()),
             max_iterations: 2,
+            permissions: std::collections::BTreeMap::new(),
         },
     )
     .await;
@@ -807,5 +812,416 @@ async fn soft_failure_without_matching_rule_still_consults_the_table() {
     assert_eq!(reason, EndReason::Failed);
     assert!(policy.consulted.load(Ordering::SeqCst));
     assert_ne!(CLASS_EMPTY_RESPONSE, "rate_limited");
+    cleanup_db(&h.db_path);
+}
+
+// -- acceptance: C67 turn/end audit enrichment (usage + recovery) ------------
+
+use crate::test_support::usage_chunk;
+use kian_core::context::Message;
+
+fn turn_end_payloads(events: &[Event]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::TurnEnd))
+        .map(|e| e.bytes.clone())
+        .collect()
+}
+
+/// Every `turn/end` variant carries the verbatim provider usage when
+/// observed (final answer and tool-call turns alike), legacy keys stay
+/// untouched, and the usage fact is drain-activity only: the projected
+/// model context is byte-for-byte the pre-C67 shape (A2/A3 untouched).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_end_carries_usage_for_tool_calls_and_final_answer() {
+    let usage1 = json!({"prompt_tokens": 11, "completion_tokens": 4});
+    let usage2 = json!({"prompt_tokens": 30, "completion_tokens": 9});
+    let turns = vec![
+        vec![
+            text_chunk("checking"),
+            tool_call_chunk("call-1", "fs_read", json!({"path": "out.txt"})),
+            usage_chunk(usage1.clone()),
+        ],
+        vec![text_chunk("the value is 42"), usage_chunk(usage2.clone())],
+    ];
+    let (h, _p) = harness(
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("what is the value?")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    let events = events_of(&h.store, sid).await;
+    let payloads = turn_end_payloads(&events);
+    assert_eq!(payloads.len(), 2);
+
+    // Tool-call turn: legacy keys unchanged + verbatim usage.
+    assert_eq!(payloads[0]["iteration"], json!(0));
+    assert_eq!(payloads[0]["tool_calls"], json!(1));
+    assert_eq!(payloads[0]["usage"], usage1, "verbatim, not normalized");
+    assert_eq!(payloads[0].as_object().unwrap().len(), 3);
+
+    // Final-answer turn: same contract.
+    assert_eq!(payloads[1]["iteration"], json!(1));
+    assert_eq!(payloads[1]["outcome"], json!("final_answer"));
+    assert_eq!(payloads[1]["usage"], usage2);
+    assert_eq!(payloads[1].as_object().unwrap().len(), 3);
+
+    // A2/context golden: the usage fact never enters the model context —
+    // `derive_model_context` bytes are exactly the pre-C67 shape (here:
+    // the NoopTools error transcript, projected as before).
+    let context = derive_model_context(&events).expect("context");
+    assert_eq!(
+        context,
+        vec![
+            Message {
+                role: "user".into(),
+                content: json!("what is the value?"),
+                synthetic: false,
+            },
+            Message {
+                role: "assistant".into(),
+                content: json!({"text": "checking", "tool_calls": [
+                    {"id": "call-1", "name": "fs_read", "arguments": {"path": "out.txt"}}
+                ]}),
+                synthetic: false,
+            },
+            Message {
+                role: "assistant".into(),
+                content: json!({"id": "call-1", "name": "fs_read", "arguments": {"path": "out.txt"}}),
+                synthetic: false,
+            },
+            Message {
+                role: "tool".into(),
+                content: json!({"call_id": "call-1", "output": {"error": "invalid tool call: noop"}, "is_error": true}),
+                synthetic: false,
+            },
+            Message {
+                role: "assistant".into(),
+                content: json!({"text": "the value is 42"}),
+                synthetic: false,
+            },
+        ]
+    );
+    let context_bytes = kian_core::context::context_to_bytes(&context);
+    assert!(
+        serde_json::from_slice::<Value>(&context_bytes)
+            .expect("context bytes are json")
+            .to_string()
+            .find("prompt_tokens")
+            .is_none(),
+        "usage must never leak into context bytes"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// A soft failure mid-stream (provider error) after a usage frame keeps
+/// the partial usage on `turn/end` and records the structured recovery
+/// audit: the pure classifier's class plus the declarative policy's
+/// action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_end_soft_failure_carries_partial_usage_and_classified_error() {
+    let turns = vec![vec![
+        usage_chunk(json!({"prompt_tokens": 7, "completion_tokens": 0})),
+        Err(kian_core::seams::ProviderError::RateLimited),
+    ]];
+    let policy = Arc::new(RecordingPolicy {
+        rules: vec![PolicyRule {
+            class: "rate_limited".into(),
+            action: RecoveryAction::BackoffRetry { delay_ms: 1 },
+        }],
+        consulted: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (h, _p) = harness(
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        policy,
+        ReActConfig::default(),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("hello?")).await;
+    assert_eq!(reason, EndReason::Failed);
+
+    let events = events_of(&h.store, sid).await;
+    let payloads = turn_end_payloads(&events);
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["iteration"], json!(0));
+    assert_eq!(payloads[0]["outcome"], json!("soft_failure"));
+    assert_eq!(
+        payloads[0]["usage"],
+        json!({"prompt_tokens": 7, "completion_tokens": 0}),
+        "usage observed before the failure still lands on turn/end"
+    );
+    assert_eq!(
+        payloads[0]["error"],
+        json!({"class": "rate_limited", "action": "backoff_retry"}),
+        "class from the pure classifier, action from the policy table"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// Empty response (no usage, no rule match): the audit carries the
+/// `empty_response` class and action `"none"` — the honest no-rule
+/// spelling — and no `usage` key appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_end_soft_failure_without_rule_records_none_action() {
+    let turns = vec![vec![]];
+    let policy = Arc::new(RecordingPolicy {
+        rules: vec![PolicyRule {
+            class: "rate_limited".into(),
+            action: RecoveryAction::Fail,
+        }],
+        consulted: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (h, _p) = harness(
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        policy,
+        ReActConfig::default(),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("hello?")).await;
+    assert_eq!(reason, EndReason::Failed);
+
+    let events = events_of(&h.store, sid).await;
+    let payloads = turn_end_payloads(&events);
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["outcome"], json!("soft_failure"));
+    assert!(
+        payloads[0].get("usage").is_none(),
+        "no usage observed → no usage key"
+    );
+    assert_eq!(
+        payloads[0]["error"],
+        json!({"class": "empty_response", "action": "none"})
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// No usage observed → the success-path `turn/end` payloads serialize
+/// byte-identically to the pre-C67 legacy shapes (additive keys only,
+/// never a reordered or renamed legacy key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_end_without_usage_is_byte_identical_to_the_legacy_shape() {
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "fs_read", json!({"path": "x"}))],
+        vec![text_chunk("done")],
+    ];
+    let (h, _p) = harness(
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    let events = events_of(&h.store, sid).await;
+    let payloads = turn_end_payloads(&events);
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        serde_json::to_string(&payloads[0]).unwrap(),
+        r#"{"iteration":0,"tool_calls":1}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&payloads[1]).unwrap(),
+        r#"{"iteration":1,"outcome":"final_answer"}"#
+    );
+    cleanup_db(&h.db_path);
+}
+
+// -- acceptance: C70 per-call tool permission provenance --------------------
+
+/// Extracts the `tool/call` payloads from a stream.
+fn tool_call_payloads(events: &[Event]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolCall))
+        .map(|e| e.bytes.clone())
+        .collect()
+}
+
+/// C70 allow path: a non-empty permissions table decides every call —
+/// an explicit `allow` is `policy: configured`, an unnamed tool falls
+/// through to the `policy: default` allow — the tool is invoked as
+/// today in both arms and provenance rides the payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allow_path_invokes_tool_and_records_provenance_default_vs_configured() {
+    let turns = vec![
+        vec![
+            tool_call_chunk("call-1", "fs_read", json!({"path": "a.txt"})),
+            // Second call in the same turn rides stream index 1 (the
+            // helper hardcodes index 0, which would merge the two).
+            Ok(kian_core::seams::ModelChunk::new(json!({"tool_calls": [{
+                "index": 1,
+                "id": "call-2",
+                "function": {"name": "exec", "arguments": "{\"argv\": [\"true\"]}"}
+            }]}))),
+        ],
+        vec![text_chunk("done")],
+    ];
+    let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let config = ReActConfig {
+        permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
+        ..ReActConfig::default()
+    };
+    let (h, _p) = harness(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        config,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed, "allow never aborts the loop");
+
+    // Both calls invoked (the spy provider served them).
+    let invoked = seen.lock().unwrap().len();
+    assert_eq!(invoked, 2, "allow arms invoke as today");
+
+    // Provenance: configured allow + default allow.
+    let events = events_of(&h.store, sid).await;
+    let calls = tool_call_payloads(&events);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0]["permission"],
+        json!({"evaluated": "allow", "policy": "configured", "matched": "fs_read"})
+    );
+    assert_eq!(
+        calls[0]["content"],
+        json!({"id": "call-1", "name": "fs_read", "arguments": {"path": "a.txt"}})
+    );
+    assert_eq!(
+        calls[1]["permission"],
+        json!({"evaluated": "allow", "policy": "default", "matched": "exec"})
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// C70 deny path (fail-closed): the denied tool is NEVER invoked (the
+/// spy counts zero), the `tool/call` carries the deny provenance with
+/// its reason, a synthetic honest error `tool/result` lands next to it,
+/// and the loop continues — the model reacts and the session completes,
+/// never aborts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_path_does_not_invoke_and_emits_honest_error_result() {
+    let turns = vec![
+        vec![tool_call_chunk(
+            "call-1",
+            "fs_write",
+            json!({"path": "a.txt", "content": "x"}),
+        )],
+        vec![text_chunk("handled the denial, done")],
+    ];
+    let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let config = ReActConfig {
+        permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
+        ..ReActConfig::default()
+    };
+    let (h, _p) = harness(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        config,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(
+        reason,
+        EndReason::Completed,
+        "a denied call is a tool failure the model reacts to, never a loop abort"
+    );
+
+    // Zero invocations — the side effect never happened.
+    assert!(seen.lock().unwrap().is_empty(), "deny must not invoke");
+
+    let events = events_of(&h.store, sid).await;
+    // The deny provenance on the logged call (log-before-execute holds:
+    // the attempted call is durable even though it never ran).
+    let calls = tool_call_payloads(&events);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["permission"],
+        json!({
+            "evaluated": "deny",
+            "policy": "configured",
+            "matched": "fs_write",
+            "reason": "tool_denied_by_policy"
+        })
+    );
+    assert_eq!(calls[0]["content"]["name"], json!("fs_write"));
+    // The synthetic honest error result.
+    let results: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolResult))
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].bytes,
+        json!({
+            "role": "tool",
+            "content": {
+                "call_id": "call-1",
+                "output": {"error": "permission denied by policy: fs_write", "policy": "deny"},
+                "is_error": true
+            }
+        })
+    );
+    // The model saw the honest error in its next-turn context
+    // (request bytes changed ONLY through this new tool/result — the
+    // provenance key itself never projects; asserted separately).
+    let messages = derive_model_context(&events).unwrap();
+    let tool_msg = messages.iter().find(|m| m.role == "tool").unwrap();
+    assert_eq!(tool_msg.content["is_error"], json!(true));
+    assert_eq!(
+        tool_msg.content["output"]["error"],
+        json!("permission denied by policy: fs_write")
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// C70 (constraint 3): with NO permissions table configured the
+/// `tool/call` payload is byte-identical to the pre-C70 literal — no
+/// `permission` key at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_permissions_keep_tool_call_payload_byte_identical_to_today() {
+    let turns = vec![
+        vec![tool_call_chunk(
+            "call-1",
+            "fs_read",
+            json!({"path": "a.txt"}),
+        )],
+        vec![text_chunk("done")],
+    ];
+    let (tools, _seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let (h, _p) = harness(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    let events = events_of(&h.store, sid).await;
+    let calls = tool_call_payloads(&events);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::to_string(&calls[0]).unwrap(),
+        r#"{"content":{"arguments":{"path":"a.txt"},"id":"call-1","name":"fs_read"},"role":"assistant"}"#,
+        "absent config → exactly the legacy payload, no permission key"
+    );
     cleanup_db(&h.db_path);
 }

@@ -71,9 +71,7 @@ async fn wait_for_events(
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 /// A `ModelProvider` replaying scripted turns in order (plenty of
@@ -117,6 +115,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }

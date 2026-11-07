@@ -117,6 +117,7 @@ fn ok_outcome() -> CommandOutcome {
             stdout: "out".into(),
             stderr: String::new(),
             timed_out: false,
+            redactions: Vec::new(),
         },
     }
 }
@@ -506,6 +507,7 @@ async fn pg_row_lease_claims_expire_and_redrive() {
             stdout: "ok".into(),
             stderr: String::new(),
             timed_out: false,
+            redactions: Vec::new(),
         },
     };
     assert!(store.mark_done(id, &outcome).await.unwrap());

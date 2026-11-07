@@ -669,6 +669,7 @@ async fn s4_delegation_audit_export_replays() {
         None,
         None,
         Some(&router_out),
+        false,
     )
     .await
     .expect("export router");
@@ -679,6 +680,7 @@ async fn s4_delegation_audit_export_replays() {
         None,
         None,
         Some(&worker_out),
+        false,
     )
     .await
     .expect("export worker");

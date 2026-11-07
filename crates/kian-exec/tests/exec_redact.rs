@@ -112,3 +112,91 @@ async fn remote_exec_output_and_durable_row_carry_no_secret() {
     drop(store);
     let _ = std::fs::remove_file(&db);
 }
+
+/// C69: the remote path's provenance report — the live dispatch
+/// attaches the report to the caller's result, the durable row carries
+/// it, and the deduped read-back (ADR-007 replay) still answers with
+/// the stored report (re-redaction of scrubbed bytes reports nothing,
+/// so the stored entry must survive rather than be clobbered).
+#[tokio::test]
+async fn remote_exec_result_and_row_carry_the_redaction_report() {
+    const NAME: &str = "KIAN_EXEC_TEST_SECRET69";
+    const VALUE: &str = "kian69-remote-secret-value-0123456789";
+    // SAFETY: unique test-only name, constant value.
+    unsafe {
+        std::env::set_var(NAME, VALUE);
+    }
+    let redactor = SecretRedactor::from_env_names(&[NAME.to_string()]);
+
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let endpoint = Arc::new(Endpoint::new(
+        "dev-box",
+        Arc::new(kian_endpoint::LocalExecutor),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(endpoint.serve(listener));
+    let manager = Arc::new(ConnectionManager::new(
+        ConnectionConfig::new(addr).with_backoff(fast_backoff()),
+    ));
+    manager.start();
+    let backend = RemoteExecBackend::with_row_leases_redacting(
+        store.clone(),
+        vec![("dev-box".into(), manager.clone())],
+        "dev-box",
+        RemoteExecConfig {
+            queue_timeout: Duration::from_secs(8),
+            poll_interval: Duration::from_millis(40),
+        },
+        "redact-report-test",
+        Duration::from_secs(8),
+        redactor,
+    )
+    .unwrap();
+
+    let command_id = CommandId::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("kian:redact-report-test:{VALUE}").as_bytes(),
+    );
+    let cmd = ExecCommand {
+        argv: vec![
+            "bash".into(),
+            "-c".into(),
+            format!("echo {VALUE} and again {VALUE}"),
+        ],
+        env: Default::default(),
+        cwd: None,
+        timeout_ms: Some(5_000),
+    };
+
+    // Live dispatch: both echoes counted in one provenance entry.
+    let result = backend
+        .exec_tracked(command_id, "dev-box", cmd.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        result.redactions,
+        vec![kian_core::secrets::Redaction {
+            kind: kian_core::secrets::RedactionKind::KnownValue,
+            name: NAME.to_string(),
+            count: 2,
+        }],
+        "live dispatch reports both redactions"
+    );
+
+    // Deduped read-back from the durable row: the stored report answers.
+    let replay = backend
+        .exec_tracked(command_id, "dev-box", cmd, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.redactions, result.redactions,
+        "the durable row's report survives the read-back"
+    );
+
+    backend.shutdown().await;
+    drop(store);
+    let _ = std::fs::remove_file(&db);
+}

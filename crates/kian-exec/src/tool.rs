@@ -86,8 +86,10 @@ impl ToolProvider for RemoteExecTool {
             let tool_call_ref = call_id.clone();
             // Result shape mirrors the local built-in exec tool exactly:
             // execution failures are honest `is_error` outputs, never fake
-            // successes (constraint 7).
-            let (value, is_error) = match backend
+            // successes (constraint 7). C69: the redaction provenance
+            // report from the settlement pass rides the ToolResult; the
+            // `output` keeps the four legacy fields only.
+            let (value, is_error, redactions) = match backend
                 .exec_tracked(command_id, &endpoint_id, cmd, Some(tool_call_ref))
                 .await
             {
@@ -99,13 +101,19 @@ impl ToolProvider for RemoteExecTool {
                         "timed_out": r.timed_out,
                     }),
                     r.exit_code != Some(0),
+                    r.redactions,
                 ),
-                Err(e) => (serde_json::json!({"error": e.to_string()}), true),
+                Err(e) => (
+                    serde_json::json!({"error": e.to_string()}),
+                    true,
+                    Vec::new(),
+                ),
             };
             Ok(ToolResult {
                 call_id,
                 output: value,
                 is_error,
+                redactions,
             })
         })
     }

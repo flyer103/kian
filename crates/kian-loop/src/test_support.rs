@@ -141,9 +141,13 @@ impl ModelProvider for ScriptedProvider {
 
 /// Convenience: one chunk carrying plain content text.
 pub fn text_chunk(text: &str) -> Result<ModelChunk, ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
+}
+
+/// Convenience (C67): one usage-only chunk — a Null delta plus the
+/// provider's usage object verbatim.
+pub fn usage_chunk(usage: Value) -> Result<ModelChunk, ProviderError> {
+    Ok(ModelChunk::with_usage(Value::Null, usage))
 }
 
 /// Convenience: one chunk requesting a tool call.
@@ -152,13 +156,11 @@ pub fn tool_call_chunk(
     name: &str,
     arguments: Value,
 ) -> Result<ModelChunk, ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"tool_calls": [{
-            "index": 0,
-            "id": id,
-            "function": {"name": name, "arguments": arguments.to_string()}
-        }]}),
-    })
+    Ok(ModelChunk::new(json!({"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": arguments.to_string()}
+    }]})))
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +224,7 @@ impl HookTools {
                     call_id,
                     output,
                     is_error: false,
+                    redactions: Vec::new(),
                 }
             })
         }));

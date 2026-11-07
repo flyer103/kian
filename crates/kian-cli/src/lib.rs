@@ -15,6 +15,9 @@
 //! - [`api`] — axum JSON-RPC + SSE control plane (DESIGN §5)
 //! - [`cache_metrics`] — S3 cache-byte stability report (C17), exposed
 //!   at `GET /metrics` and `kian cache-stats`
+//! - [`usage_metrics`] — C67 provider token-usage report (pure
+//!   projection over `turn/end` payloads), exposed at `GET /metrics`,
+//!   `kian usage-stats` and the `session inspect` usage lines
 //! - [`client`] — thin JSON-RPC HTTP client the session commands use to
 //!   talk to a running `serve` (re-exported from the wire-only
 //!   `kian-sdk` crate, card C46)
@@ -47,6 +50,7 @@ pub mod ops;
 pub mod plugins;
 pub mod server;
 pub mod superagent;
+pub mod usage_metrics;
 pub mod webhook;
 
 #[cfg(test)]

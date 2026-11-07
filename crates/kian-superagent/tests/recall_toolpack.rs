@@ -141,9 +141,7 @@ impl ModelProvider for ScriptedProvider {
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 fn tool_call_chunk(
@@ -152,13 +150,11 @@ fn tool_call_chunk(
     args: Value,
 ) -> Result<ModelChunk, kian_core::seams::ProviderError> {
     let arguments = serde_json::to_string(&args).unwrap();
-    Ok(ModelChunk {
-        delta: json!({"tool_calls": [{
-            "index": 0,
-            "id": id,
-            "function": {"name": name, "arguments": arguments}
-        }]}),
-    })
+    Ok(ModelChunk::new(json!({"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": arguments}
+    }]})))
 }
 
 /// Extracts the `output.thread_id` of a prior tool result from the
@@ -217,6 +213,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true, "stdout": "hi"}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -517,6 +514,7 @@ async fn build_harness(
         ReActConfig {
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 10_000,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
     let worker_loop = Arc::new(ReActLoop::with_config(

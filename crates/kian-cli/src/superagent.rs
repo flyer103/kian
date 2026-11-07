@@ -1588,6 +1588,7 @@ mod tests {
                         call_id: call.id,
                         output: serde_json::json!({"from": call.name}),
                         is_error: false,
+                        redactions: Vec::new(),
                     })
                 })
             }

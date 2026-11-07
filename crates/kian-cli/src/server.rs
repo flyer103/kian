@@ -483,6 +483,14 @@ impl Server {
                 router_agent,
                 worker_agent,
                 default_agent: config.agent_def(),
+                // C70 (ADR-015): the worker template's and the default
+                // agent's permission tables ride their loops; the judge
+                // loops (router/watchdog) refuse a table at validation.
+                worker_permissions: config
+                    .named_agent(&sa.worker.agent)
+                    .map(|a| a.permissions.clone())
+                    .unwrap_or_default(),
+                default_permissions: config.agent.permissions.clone(),
                 router_session,
                 router_rearm: router_re_arm.ended,
                 router_slot: sa.router.slot.clone(),
@@ -543,6 +551,9 @@ impl Server {
                 config: ReActConfig {
                     slot: kian_core::model::SlotName(config.drain.slot.clone()),
                     max_iterations: config.drain.max_iterations,
+                    // C70: the default agent's per-call permission table
+                    // (absent = empty = allow-all, byte-identical).
+                    permissions: config.agent.permissions.clone(),
                 },
                 gate: config.agent.evidence_gate.clone(),
             });
@@ -1115,6 +1126,12 @@ async fn metrics_handler(
         Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
         Err(e) => serde_json::json!({"error": e.to_string()}),
     };
+    // C67: the usage aggregate, derived on read from `turn/end` payloads
+    // (pure projection — no drain ever bumps a counter).
+    let usage = match crate::usage_metrics::usage_stats_report(&server.store, None).await {
+        Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+        Err(e) => serde_json::json!({"error": e.to_string()}),
+    };
     let superagent = match &server.superagent {
         Some(runtime) => runtime.metrics_report(&server.store).await,
         None => serde_json::Value::Null,
@@ -1125,6 +1142,7 @@ async fn metrics_handler(
             "engine": engine,
             "pending_wake_depth": server.engine.pending_wake_depth(),
             "cache": cache,
+            "usage": usage,
             "superagent": superagent,
         })),
     )

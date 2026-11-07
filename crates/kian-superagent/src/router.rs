@@ -959,6 +959,7 @@ impl RouterTools {
             call_id: call.id,
             output,
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -1052,6 +1053,7 @@ impl RouterTools {
                 "truncated": enforced.truncated,
             }),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -1106,6 +1108,7 @@ impl RouterTools {
             call_id: call.id,
             output: json!({"message_id": delivered.receipt.message_id, "sections_delivered": true}),
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 }

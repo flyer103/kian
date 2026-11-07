@@ -156,9 +156,7 @@ impl ModelProvider for PlainProvider {
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 /// The worker side's inert tool provider.
@@ -181,6 +179,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -368,6 +367,7 @@ async fn build_harness(
         ReActConfig {
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 10_000,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
     let other_loop = Arc::new(ReActLoop::with_config(

@@ -148,9 +148,7 @@ impl ModelProvider for ScriptedProvider {
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 fn tool_call_chunk(
@@ -159,13 +157,11 @@ fn tool_call_chunk(
     args: Value,
 ) -> Result<ModelChunk, kian_core::seams::ProviderError> {
     let arguments = serde_json::to_string(&args).unwrap();
-    Ok(ModelChunk {
-        delta: json!({"tool_calls": [{
-            "index": 0,
-            "id": id,
-            "function": {"name": name, "arguments": arguments}
-        }]}),
-    })
+    Ok(ModelChunk::new(json!({"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": arguments}
+    }]})))
 }
 
 /// Serializes the request body once (the search surface).
@@ -262,6 +258,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true, "stdout": "hi"}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -521,6 +518,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
         ReActConfig {
             slot: SlotName("router".into()),
             max_iterations: 10_000,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
     let worker_loop = Arc::new(ReActLoop::with_config(
@@ -534,6 +532,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             // fully observed — comfortably above DEFAULT_MAX_ITERATIONS
             // (32) and far below the defensive cap.
             max_iterations: 20_000,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
 

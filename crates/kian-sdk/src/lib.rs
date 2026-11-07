@@ -18,10 +18,14 @@
 //!
 //! - [`KianClient`] — the transport (`rpc`/`ops`) and the typed surface
 //!   v1 (`create_session`, `submit`, `steer`, `queue`, `interrupt`,
-//!   `projection`, the `events` SSE helper, and the ops wrappers).
+//!   `projection`, the `events` SSE helper, the ops wrappers, and the
+//!   pure derived-event-id helper `KianClient::event_id` (C69)).
 //! - [`ClientError`] — typed, matchable errors (never string-parsed).
 //! - [`SseFrame`] — one parsed frame of the C13 event stream.
 
+// Private: the uuid-v5 mirror behind `KianClient::event_id` (C69). Not
+// part of the frozen wire surface — only the helper is public.
+mod derived;
 pub mod error;
 pub mod sse;
 pub mod transport;

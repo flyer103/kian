@@ -54,7 +54,7 @@ use std::sync::Arc;
 use futures::stream::{BoxStream, StreamExt};
 use kian_core::context::{Message, derive_model_context};
 use kian_core::events::{Event, EventKind};
-use kian_core::model::{AgentDef, SlotName};
+use kian_core::model::{AgentDef, Permission, SlotName};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
     ToolCall, ToolProvider, ToolResult,
@@ -88,6 +88,12 @@ pub struct ReActConfig {
     /// Maximum provider turns per session (counted from the event stream,
     /// so the budget survives episodes and restarts).
     pub max_iterations: usize,
+    /// Per-call tool permission table (C70 / ADR-015): tool name →
+    /// `allow`/`deny`. **Absent = empty = allow-all**, and with an empty
+    /// table the `tool/call` payload stays byte-identical to the pre-C70
+    /// shape (no provenance key at all). A non-empty table decides every
+    /// call — provenance rides the payload on allow, not only on deny.
+    pub permissions: BTreeMap<String, Permission>,
 }
 
 impl Default for ReActConfig {
@@ -95,6 +101,7 @@ impl Default for ReActConfig {
         Self {
             slot: SlotName("main".into()),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            permissions: BTreeMap::new(),
         }
     }
 }
@@ -237,12 +244,23 @@ enum TurnOutcome {
     ToolCalls(usize),
 }
 
+/// One provider turn's terminal state plus the audit facts the
+/// `turn/end` payload needs (C67): the last non-null provider usage
+/// observed across the whole turn — including an attempt that emitted
+/// usage before failing — travels with every outcome variant.
+struct TurnResult {
+    result: Result<TurnOutcome, TurnError>,
+    usage: Option<Value>,
+}
+
 enum TurnError {
     /// Soft failure — reported to the engine as `LoopOutcome::SoftFailed`.
-    Soft(String),
+    /// Carries the structured recovery audit for `turn/end`
+    /// (`{"class", "action"}`, C67).
+    Soft { reason: String, audit: Value },
     /// Hard error (store/append failure): honest `failed`, never retried
-    /// by the loop.
-    Fatal(LoopError),
+    /// by the loop. Also carries the C67 recovery audit.
+    Fatal { error: LoopError, audit: Value },
 }
 
 /// Loop-level failures. Every one degrades honestly to a soft report —
@@ -342,39 +360,58 @@ impl Inner {
         // 4. The provider turn. begin/end bracket every outcome (including
         //    soft failures) so turn events stay balanced in the stream.
         ctx.begin_turn_with(json!({"iteration": iteration})).await?;
-        let flow = match self
+        let turn = self
             .provider_turn(ctx, &binding, &messages, iteration)
-            .await
-        {
+            .await;
+        let usage = turn.usage.as_ref();
+        let flow = match turn.result {
             Ok(TurnOutcome::ToolCalls(n)) => {
-                ctx.end_turn_with(json!({"iteration": iteration, "tool_calls": n}))
-                    .await?;
+                let mut payload = json!({"iteration": iteration, "tool_calls": n});
+                if let Some(u) = usage {
+                    payload["usage"] = u.clone();
+                }
+                ctx.end_turn_with(payload).await?;
                 return Ok(Flow::TurnDone);
             }
+            // Final answer + empty inbox = honest settle. New inputs
+            // (a folded steer) keep the loop going instead.
             Ok(TurnOutcome::FinalAnswer) => {
-                // Final answer + empty inbox = honest settle. New inputs
-                // (a folded steer) keep the loop going instead.
                 if ctx.has_eligible_inputs().await? {
                     Flow::TurnDone
                 } else {
                     Flow::Settled
                 }
             }
-            Err(TurnError::Soft(reason)) => {
-                let _ = ctx
-                    .end_turn_with(json!({"iteration": iteration, "outcome": "soft_failure"}))
-                    .await;
+            Err(TurnError::Soft { reason, audit }) => {
+                let mut payload = json!({
+                    "iteration": iteration,
+                    "outcome": "soft_failure",
+                    "error": audit,
+                });
+                if let Some(u) = usage {
+                    payload["usage"] = u.clone();
+                }
+                let _ = ctx.end_turn_with(payload).await;
                 return Ok(Flow::Soft(reason));
             }
-            Err(TurnError::Fatal(e)) => {
-                let _ = ctx
-                    .end_turn_with(json!({"iteration": iteration, "outcome": "error"}))
-                    .await;
-                return Err(e);
+            Err(TurnError::Fatal { error, audit }) => {
+                let mut payload = json!({
+                    "iteration": iteration,
+                    "outcome": "error",
+                    "error": audit,
+                });
+                if let Some(u) = usage {
+                    payload["usage"] = u.clone();
+                }
+                let _ = ctx.end_turn_with(payload).await;
+                return Err(error);
             }
         };
-        ctx.end_turn_with(json!({"iteration": iteration, "outcome": "final_answer"}))
-            .await?;
+        let mut payload = json!({"iteration": iteration, "outcome": "final_answer"});
+        if let Some(u) = usage {
+            payload["usage"] = u.clone();
+        }
+        ctx.end_turn_with(payload).await?;
         Ok(flow)
     }
 
@@ -405,14 +442,15 @@ impl Inner {
     /// Runs one provider turn: persist the A2 audit copy, call the slot
     /// (with C8 fallback traversal), assemble the streamed response, then
     /// either dispatch tool calls (log-before-execute) or return a final
-    /// answer.
+    /// answer. The returned [`TurnResult`] carries the last non-null
+    /// provider usage observed across the turn (C67), on every path.
     async fn provider_turn(
         &self,
         ctx: &DrainCtx,
         binding: &SlotBinding,
         messages: &[Message],
         iteration: usize,
-    ) -> Result<TurnOutcome, TurnError> {
+    ) -> TurnResult {
         let target = binding.target.clone();
 
         // Deterministic tool order (the request body freezes the tools
@@ -424,18 +462,24 @@ impl Inner {
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called.
         let body = build_chat_body(&target.model, &chat, &schemas);
-        ctx.append(
-            EventKind::StepRequest,
-            json!({
-                "slot": self.config.slot.0,
-                "provider": target.provider,
-                "model": target.model,
-                "iteration": iteration,
-                "body": body,
-            }),
-        )
-        .await
-        .map_err(TurnError::fatal)?;
+        if let Err(e) = ctx
+            .append(
+                EventKind::StepRequest,
+                json!({
+                    "slot": self.config.slot.0,
+                    "provider": target.provider,
+                    "model": target.model,
+                    "iteration": iteration,
+                    "body": body,
+                }),
+            )
+            .await
+        {
+            return TurnResult {
+                result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                usage: None,
+            };
+        }
 
         // complete_turn rebuilds the body per (fallback) target so the
         // model name always matches the provider actually called.
@@ -454,13 +498,24 @@ impl Inner {
             Arc::new(CtxSlotSink { ctx: ctx.clone() }),
         );
 
-        // Assemble the streamed deltas.
+        // Assemble the streamed deltas. Usage-only chunks (C67) carry a
+        // Null delta — they never assemble content, but the last
+        // non-null usage is captured across the whole turn, including an
+        // attempt that emitted usage before failing.
         let mut text = String::new();
         let mut calls: BTreeMap<u64, CallAcc> = BTreeMap::new();
+        let mut usage: Option<Value> = None;
         let mut stream_error: Option<ProviderError> = None;
         while let Some(item) = stream.next().await {
             match item {
-                Ok(chunk) => assemble_delta(&chunk.delta, &mut text, &mut calls),
+                Ok(chunk) => {
+                    if let Some(u) = chunk.usage.as_ref().filter(|u| !u.is_null()) {
+                        usage = Some(u.clone()); // last wins
+                    }
+                    if !chunk.delta.is_null() {
+                        assemble_delta(&chunk.delta, &mut text, &mut calls);
+                    }
+                }
                 Err(e) => {
                     stream_error = Some(e);
                     break;
@@ -471,16 +526,31 @@ impl Inner {
             let class = error_class(&e);
             let action = consult_policy(self.policy.as_ref(), class);
             let note = action_note(action);
-            return Err(TurnError::Soft(format!(
-                "provider error ({class}): {e}{note}"
-            )));
+            let audit = recovery_audit(self.policy.as_ref(), provider_error_class(&e));
+            return TurnResult {
+                result: Err(TurnError::Soft {
+                    reason: format!("provider error ({class}): {e}{note}"),
+                    audit,
+                }),
+                usage,
+            };
         }
         if text.is_empty() && calls.is_empty() {
             // Constraint 7: an empty model response is a soft failure
             // routed to the recovery policy — never a completion.
             let action = consult_policy(self.policy.as_ref(), CLASS_EMPTY_RESPONSE);
             let note = action_note(action);
-            return Err(TurnError::Soft(format!("empty model response{note}")));
+            let audit = recovery_audit(
+                self.policy.as_ref(),
+                kian_orchestrator::recovery::ErrorClass::EmptyResponse,
+            );
+            return TurnResult {
+                result: Err(TurnError::Soft {
+                    reason: format!("empty model response{note}"),
+                    audit,
+                }),
+                usage,
+            };
         }
 
         let tool_calls: Vec<ToolCall> = calls.into_values().map(CallAcc::finish).collect();
@@ -493,30 +563,71 @@ impl Inner {
                     .collect(),
             );
         }
-        ctx.append(
-            EventKind::AssistantMessage,
-            json!({"role": "assistant", "content": content}),
-        )
-        .await
-        .map_err(TurnError::fatal)?;
+        if let Err(e) = ctx
+            .append(
+                EventKind::AssistantMessage,
+                json!({"role": "assistant", "content": content}),
+            )
+            .await
+        {
+            return TurnResult {
+                result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                usage,
+            };
+        }
 
         if tool_calls.is_empty() {
-            return Ok(TurnOutcome::FinalAnswer);
+            return TurnResult {
+                result: Ok(TurnOutcome::FinalAnswer),
+                usage,
+            };
         }
 
         let n = tool_calls.len();
         // Log-before-execute (invariant 1): each `tool/call` event is
-        // durable before `invoke` runs.
+        // durable before `invoke` runs — for BOTH C70 arms. The deny arm
+        // logs the call (with its deny provenance) and then never
+        // invokes; the honest audit record of the attempted call exists
+        // either way.
         for call in tool_calls {
-            ctx.append(
-                EventKind::ToolCall,
-                json!({
-                    "role": "assistant",
-                    "content": {"id": call.id, "name": call.name, "arguments": call.arguments}
-                }),
-            )
-            .await
-            .map_err(TurnError::fatal)?;
+            // C70 (ADR-015): evaluate the per-call permission once,
+            // before the `tool/call` append. `None` = no table
+            // configured → the legacy byte-identical payload, invoke
+            // as today.
+            let decision = evaluate_permission(&self.config.permissions, &call.name);
+            if let Err(e) = ctx
+                .append(EventKind::ToolCall, tool_call_payload(&call, decision))
+                .await
+            {
+                return TurnResult {
+                    result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                    usage,
+                };
+            }
+            // Deny: no tool side effect. The model sees an honest error
+            // result next turn and reacts — a denied call is a tool
+            // failure, never a loop abort.
+            if matches!(decision, Some(PermissionDecision::Deny)) {
+                let denied = ToolResult {
+                    call_id: call.id.clone(),
+                    output: json!({
+                        "error": format!("permission denied by policy: {}", call.name),
+                        "policy": "deny"
+                    }),
+                    is_error: true,
+                    redactions: Vec::new(),
+                };
+                if let Err(e) = ctx
+                    .append(EventKind::ToolResult, tool_result_payload(&denied))
+                    .await
+                {
+                    return TurnResult {
+                        result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                        usage,
+                    };
+                }
+                continue;
+            }
             let result = match self.tools.invoke(call.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -526,24 +637,28 @@ impl Inner {
                         call_id: call.id.clone(),
                         output: json!({"error": e.to_string()}),
                         is_error: true,
+                        redactions: Vec::new(),
                     }
                 }
             };
-            ctx.append(
-                EventKind::ToolResult,
-                json!({
-                    "role": "tool",
-                    "content": {
-                        "call_id": result.call_id,
-                        "output": result.output,
-                        "is_error": result.is_error
-                    }
-                }),
-            )
-            .await
-            .map_err(TurnError::fatal)?;
+            // C69: redaction provenance rides the payload OUTSIDE
+            // `content` — the model-visible wire shape (and therefore
+            // request bytes and prefix cache) never sees it; the key is
+            // omitted entirely when nothing was redacted.
+            if let Err(e) = ctx
+                .append(EventKind::ToolResult, tool_result_payload(&result))
+                .await
+            {
+                return TurnResult {
+                    result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                    usage,
+                };
+            }
         }
-        Ok(TurnOutcome::ToolCalls(n))
+        TurnResult {
+            result: Ok(TurnOutcome::ToolCalls(n)),
+            usage,
+        }
     }
 }
 
@@ -552,8 +667,64 @@ impl Inner {
 // ---------------------------------------------------------------------------
 
 impl TurnError {
-    fn fatal(e: EngineError) -> Self {
-        Self::Fatal(e.into())
+    /// A hard (store/append) failure with its C67 recovery audit. The
+    /// class follows the existing pure classifier's vocabulary
+    /// (`Engine` → `store_failure`; context/slot errors are outside it
+    /// and classify as `unknown`), the action comes from the table.
+    fn fatal(e: EngineError, policy: &dyn RecoveryPolicySource) -> Self {
+        let error = LoopError::Engine(e);
+        let audit = recovery_audit(policy, loop_error_class(&error));
+        Self::Fatal { error, audit }
+    }
+}
+
+/// The class of a loop-level hard error, aligned with the existing pure
+/// classifier (`recovery::classify`): engine failures are store
+/// failures; context-projection and slot-resolution errors sit outside
+/// its vocabulary and classify as `unknown` — the same result
+/// `classify(RecoveryError::Unknown(_))` yields.
+fn loop_error_class(e: &LoopError) -> kian_orchestrator::recovery::ErrorClass {
+    match e {
+        LoopError::Engine(_) => kian_orchestrator::recovery::ErrorClass::StoreFailure,
+        LoopError::Context(_) | LoopError::Slot(_) => {
+            kian_orchestrator::recovery::ErrorClass::Unknown
+        }
+    }
+}
+
+/// The class of a provider error via the existing pure classifier
+/// (C10): `classify(RecoveryError::Provider(e))`.
+fn provider_error_class(e: &ProviderError) -> kian_orchestrator::recovery::ErrorClass {
+    kian_orchestrator::recovery::classify(
+        &kian_orchestrator::recovery::RecoveryError::Provider(e.clone()),
+        &kian_orchestrator::recovery::ClassifyCtx { attempt: 0 },
+    )
+}
+
+/// The C67 `turn/end` `error` audit object: the pure classifier's class
+/// name plus the declarative policy's disposition name — `"none"` when
+/// no rule covers the class (the honest no-rule spelling).
+fn recovery_audit(
+    policy: &dyn RecoveryPolicySource,
+    class: kian_orchestrator::recovery::ErrorClass,
+) -> Value {
+    let action = consult_policy(policy, class.name());
+    json!({
+        "class": class.name(),
+        "action": action_name(action.as_ref()),
+    })
+}
+
+/// The disposition-name spelling of a policy action (the `ActionDef`
+/// names of `kian.yaml`), or `"none"` when no rule matched.
+fn action_name(action: Option<&RecoveryAction>) -> &'static str {
+    match action {
+        None => "none",
+        Some(RecoveryAction::BackoffRetry { .. }) => "backoff_retry",
+        Some(RecoveryAction::CompressThenRetry) => "compress_then_retry",
+        Some(RecoveryAction::Failover) => "failover",
+        Some(RecoveryAction::InterruptAsk) => "interrupt_ask",
+        Some(RecoveryAction::Fail) => "fail",
     }
 }
 
@@ -655,6 +826,98 @@ pub fn to_chat_message(m: &Message) -> Option<ChatMessage> {
         "assistant" => assistant_message(&m.content),
         _ => Some(string_or_compact(&m.role, &m.content)),
     }
+}
+
+/// The C70 permission decision for one tool call (ADR-015). Evaluated
+/// once per call, before the `tool/call` append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionDecision {
+    /// Explicitly allowed by the configured table.
+    AllowConfigured,
+    /// Not named by the (non-empty) table — the default allow.
+    AllowDefault,
+    /// Explicitly denied by the configured table: no invocation.
+    Deny,
+}
+
+/// The deny `reason` string on the provenance object (closed).
+const PERMISSION_DENY_REASON: &str = "tool_denied_by_policy";
+
+/// Evaluates the per-call permission table (C70 / ADR-015):
+///
+/// - empty table → `None`: no table is configured, the `tool/call`
+///   payload stays byte-identical to the pre-C70 shape (constraint 3 —
+///   cache-byte stability) and the call invokes as today;
+/// - non-empty table → every call gets a decision: an explicit entry is
+///   `configured` (allow or deny), an unnamed tool falls through to the
+///   **default allow** — provenance is recorded on the action either way
+///   (provenance-on-the-action), not only on deny.
+fn evaluate_permission(
+    permissions: &BTreeMap<String, Permission>,
+    tool: &str,
+) -> Option<PermissionDecision> {
+    if permissions.is_empty() {
+        return None;
+    }
+    match permissions.get(tool) {
+        Some(Permission::Allow) => Some(PermissionDecision::AllowConfigured),
+        Some(Permission::Deny) => Some(PermissionDecision::Deny),
+        None => Some(PermissionDecision::AllowDefault),
+    }
+}
+
+/// The `tool/call` event payload: the frozen `{role, content}` shape
+/// plus, only when a permission table is configured (C70), the additive
+/// top-level `permission` provenance key **outside `content`** — the
+/// projection reads `role`/`content` only, so request bytes are
+/// identical with and without it.
+fn tool_call_payload(call: &ToolCall, decision: Option<PermissionDecision>) -> Value {
+    let mut payload = json!({
+        "role": "assistant",
+        "content": {"id": call.id, "name": call.name, "arguments": call.arguments}
+    });
+    if let Some(decision) = decision {
+        payload["permission"] = match decision {
+            PermissionDecision::AllowConfigured => json!({
+                "evaluated": "allow", "policy": "configured", "matched": call.name
+            }),
+            PermissionDecision::AllowDefault => json!({
+                "evaluated": "allow", "policy": "default", "matched": call.name
+            }),
+            PermissionDecision::Deny => json!({
+                "evaluated": "deny",
+                "policy": "configured",
+                "matched": call.name,
+                "reason": PERMISSION_DENY_REASON
+            }),
+        };
+    }
+    payload
+}
+
+/// The `tool/result` event payload: `{role, content}` plus, only when
+/// the exec redactor scrubbed something (C69), the provenance report as
+/// an additive top-level `redactions` key **outside `content`** — the
+/// model-visible wire shape (`to_chat_message` reads `content` only) is
+/// byte-identical either way, so request bytes and the provider prefix
+/// cache never see the report.
+fn tool_result_payload(result: &ToolResult) -> Value {
+    let mut payload = json!({
+        "role": "tool",
+        "content": {
+            "call_id": result.call_id,
+            "output": result.output,
+            "is_error": result.is_error
+        }
+    });
+    if !result.redactions.is_empty() {
+        // A failed serialization degrades to omitting the key (the
+        // report is provenance, never correctness-critical).
+        if let Ok(report) = serde_json::to_value(&result.redactions) {
+            payload["redactions"] = report;
+        }
+    }
+    payload
 }
 
 /// `{role, content}` from a plain string, or the compact serialization
@@ -785,11 +1048,16 @@ fn action_note(action: Option<RecoveryAction>) -> String {
 mod tests {
     use crate::react::{
         CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop, assemble_delta, consult_policy,
-        to_chat_message,
+        to_chat_message, tool_result_payload,
     };
     use crate::test_support::{NoopPolicy, NoopTools, agent_def};
-    use kian_core::context::Message;
+    use kian_core::context::{Message, derive_model_context};
+    use kian_core::events::{Event, EventKind};
+    use kian_core::model::SessionId;
+    use kian_core::seams::{ToolCall, ToolResult};
+    use kian_core::secrets::{Redaction, RedactionKind};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn msg(role: &str, content: serde_json::Value) -> Message {
         Message {
@@ -797,6 +1065,104 @@ mod tests {
             content,
             synthetic: false,
         }
+    }
+
+    /// C69: the `tool/result` payload carries the redaction report as
+    /// an additive top-level key OUTSIDE `content`, and omits it when
+    /// nothing was redacted — the un-redacted payload is byte-identical
+    /// to the pre-C69 literal.
+    #[test]
+    fn tool_result_payload_carries_redactions_outside_content() {
+        let plain = ToolResult {
+            call_id: "call-1".into(),
+            output: json!({"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": false}),
+            is_error: false,
+            redactions: Vec::new(),
+        };
+        let payload = tool_result_payload(&plain);
+        assert_eq!(
+            payload,
+            json!({
+                "role": "tool",
+                "content": {
+                    "call_id": "call-1",
+                    "output": {"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": false},
+                    "is_error": false
+                }
+            }),
+            "no redactions → no key, bytes unchanged"
+        );
+
+        let redacted = ToolResult {
+            call_id: "call-2".into(),
+            output: json!({"exit_code": 0, "stdout": "[REDACTED:token]", "stderr": "", "timed_out": false}),
+            is_error: false,
+            redactions: vec![Redaction {
+                kind: RedactionKind::TokenPattern,
+                name: "ghp_".into(),
+                count: 1,
+            }],
+        };
+        let payload = tool_result_payload(&redacted);
+        assert_eq!(
+            payload["redactions"],
+            json!([{"kind": "token_pattern", "name": "ghp_", "count": 1}])
+        );
+        // The report sits outside `content`; content itself is exactly
+        // the four legacy fields.
+        assert!(payload["content"].get("redactions").is_none());
+        assert_eq!(payload["content"]["call_id"], json!("call-2"));
+    }
+
+    /// C69 (constraint 3): the additive `redactions` payload key never
+    /// reaches the model context — the projection reads `role`/`content`
+    /// only, so request bytes are identical with and without the key.
+    #[test]
+    fn redactions_payload_key_never_enters_the_model_context() {
+        let session = SessionId::new();
+        let bytes = tool_result_payload(&ToolResult {
+            call_id: "call-9".into(),
+            output: json!({"content": "scrubbed"}),
+            is_error: false,
+            redactions: vec![Redaction {
+                kind: RedactionKind::EnvLine,
+                name: "MY_SERVICE_TOKEN".into(),
+                count: 2,
+            }],
+        });
+        let with = Event {
+            seq: 2,
+            session,
+            epoch: kian_core::model::Epoch(1),
+            ts: 1,
+            kind: EventKind::ToolResult,
+            bytes: bytes.clone(),
+            version: 0,
+        };
+        let mut without_bytes = bytes.clone();
+        without_bytes.as_object_mut().unwrap().remove("redactions");
+        let without = Event {
+            bytes: without_bytes,
+            ..with.clone()
+        };
+        let base = Event {
+            seq: 1,
+            session,
+            epoch: kian_core::model::Epoch(0),
+            ts: 0,
+            kind: EventKind::SessionCreated,
+            bytes: json!({}),
+            version: 0,
+        };
+        let ctx_with = derive_model_context(&[base.clone(), with]).unwrap();
+        let ctx_without = derive_model_context(&[base, without]).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(ctx_with.len(), 1);
+        // And the projected message is the frozen wire shape.
+        let chat = to_chat_message(&ctx_with[0]).unwrap();
+        assert_eq!(chat.role, "tool");
+        assert_eq!(chat.tool_call_id.as_deref(), Some("call-9"));
+        assert_eq!(chat.content.as_deref(), Some("{\"content\":\"scrubbed\"}"));
     }
 
     /// Dialect v2 (kian-61): a projected tool round trip maps to the
@@ -878,6 +1244,144 @@ mod tests {
 
     // -- pure-unit sections ---------------------------------------------------
 
+    /// C70 (ADR-015): with no permissions table configured, evaluation
+    /// returns `None` — the `tool/call` payload stays byte-identical to
+    /// the pre-C70 shape (cache-byte stability). A non-empty table
+    /// decides every call: an explicit entry is `configured`, an absent
+    /// entry falls through to the default allow.
+    #[test]
+    fn permission_evaluation_covers_absent_default_and_configured() {
+        use crate::react::{PermissionDecision, evaluate_permission};
+        use kian_core::model::Permission;
+
+        let empty: BTreeMap<String, Permission> = BTreeMap::new();
+        assert_eq!(evaluate_permission(&empty, "fs_write"), None);
+
+        let table: BTreeMap<String, Permission> = BTreeMap::from([
+            ("fs_read".to_string(), Permission::Allow),
+            ("fs_write".to_string(), Permission::Deny),
+        ]);
+        assert_eq!(
+            evaluate_permission(&table, "fs_read"),
+            Some(PermissionDecision::AllowConfigured)
+        );
+        assert_eq!(
+            evaluate_permission(&table, "fs_write"),
+            Some(PermissionDecision::Deny)
+        );
+        // A tool the table does not name: the default allow, provenance
+        // still recorded (provenance-on-the-action).
+        assert_eq!(
+            evaluate_permission(&table, "exec"),
+            Some(PermissionDecision::AllowDefault)
+        );
+    }
+
+    /// C70: the allow/deny provenance shapes on `tool/call` — additive
+    /// top-level `permission` key outside `content`, `content` exactly
+    /// the legacy `{id, name, arguments}` triple.
+    #[test]
+    fn tool_call_payload_carries_permission_provenance_outside_content() {
+        use crate::react::{evaluate_permission, tool_call_payload};
+        use kian_core::model::Permission;
+
+        let call = ToolCall {
+            id: "call-7".into(),
+            name: "fs_write".into(),
+            arguments: json!({"path": "a.txt"}),
+        };
+
+        // No table → byte-identical legacy payload (no key at all).
+        let empty: BTreeMap<String, Permission> = BTreeMap::new();
+        let legacy = tool_call_payload(&call, evaluate_permission(&empty, &call.name));
+        assert_eq!(
+            legacy,
+            json!({
+                "role": "assistant",
+                "content": {"id": "call-7", "name": "fs_write", "arguments": {"path": "a.txt"}}
+            })
+        );
+
+        // Configured allow.
+        let table: BTreeMap<String, Permission> =
+            BTreeMap::from([("fs_read".to_string(), Permission::Allow)]);
+        let allowed = tool_call_payload(&call, evaluate_permission(&table, &call.name)); // default arm
+        assert_eq!(
+            allowed["permission"],
+            json!({"evaluated": "allow", "policy": "default", "matched": "fs_write"})
+        );
+        assert_eq!(allowed["content"], legacy["content"]);
+
+        // Configured deny.
+        let table: BTreeMap<String, Permission> =
+            BTreeMap::from([("fs_write".to_string(), Permission::Deny)]);
+        let denied = tool_call_payload(&call, evaluate_permission(&table, &call.name));
+        assert_eq!(
+            denied["permission"],
+            json!({
+                "evaluated": "deny",
+                "policy": "configured",
+                "matched": "fs_write",
+                "reason": "tool_denied_by_policy"
+            })
+        );
+        assert_eq!(denied["content"], legacy["content"]);
+    }
+
+    /// C70 (constraint 3): the additive `permission` payload key never
+    /// reaches the model context — the projection reads `role`/`content`
+    /// only, so the projected message (and therefore request bytes) is
+    /// identical with and without the key.
+    #[test]
+    fn permission_payload_key_never_enters_the_model_context() {
+        use crate::react::{PermissionDecision, tool_call_payload};
+        use kian_core::seams::ToolCall;
+
+        let session = SessionId::new();
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "fs_read".into(),
+            arguments: json!({"path": "a.txt"}),
+        };
+        let with_bytes = tool_call_payload(&call, Some(PermissionDecision::Deny));
+        let mut without_bytes = with_bytes.clone();
+        without_bytes.as_object_mut().unwrap().remove("permission");
+        let with = Event {
+            seq: 2,
+            session,
+            epoch: kian_core::model::Epoch(1),
+            ts: 1,
+            kind: EventKind::ToolCall,
+            bytes: with_bytes,
+            version: 0,
+        };
+        let without = Event {
+            bytes: without_bytes,
+            ..with.clone()
+        };
+        let base = Event {
+            seq: 1,
+            session,
+            epoch: kian_core::model::Epoch(0),
+            ts: 0,
+            kind: EventKind::SessionCreated,
+            bytes: json!({}),
+            version: 0,
+        };
+        let ctx_with = derive_model_context(&[base.clone(), with]).unwrap();
+        let ctx_without = derive_model_context(&[base, without]).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(ctx_with.len(), 1);
+        // The projected message is the frozen wire shape (the per-call
+        // transcript duplicate, dropped from the chat body downstream).
+        assert_eq!(ctx_with[0].role, "assistant");
+        assert_eq!(
+            ctx_with[0].content,
+            json!({"id": "call-1", "name": "fs_read", "arguments": {"path": "a.txt"}})
+        );
+        assert!(!ctx_with[0].synthetic);
+    }
+
     #[test]
     fn delta_assembly_concatenates_content_fragments() {
         let mut text = String::new();
@@ -957,6 +1461,65 @@ mod tests {
     }
 
     // -- engine integration sections live in integration_tests.rs -------------
+
+    /// C67: the recovery audit carries the pure classifier's class name
+    /// plus the policy disposition name, `"none"` when no rule covers
+    /// the class; provider classes flow through the existing pure
+    /// classifier and loop-level hard errors map onto its vocabulary.
+    #[test]
+    fn recovery_audit_carries_class_and_policy_action() {
+        use kian_core::seams::{PolicyRule, RecoveryPolicySource};
+        use kian_orchestrator::recovery::ErrorClass;
+        use serde_json::json;
+
+        struct Table(Vec<PolicyRule>);
+        impl RecoveryPolicySource for Table {
+            fn table(&self) -> Vec<PolicyRule> {
+                self.0.clone()
+            }
+        }
+        let with_rule = Table(vec![PolicyRule {
+            class: "store_failure".into(),
+            action: kian_core::seams::RecoveryAction::Fail,
+        }]);
+        assert_eq!(
+            super::recovery_audit(&with_rule, ErrorClass::StoreFailure),
+            json!({"class": "store_failure", "action": "fail"})
+        );
+        assert_eq!(
+            super::recovery_audit(&with_rule, ErrorClass::EmptyResponse),
+            json!({"class": "empty_response", "action": "none"}),
+            "no covering rule → the honest none spelling"
+        );
+
+        // Provider classes route through the pure classifier (C10).
+        assert_eq!(
+            super::provider_error_class(&kian_core::seams::ProviderError::RateLimited),
+            ErrorClass::RateLimited
+        );
+        assert_eq!(
+            super::provider_error_class(&kian_core::seams::ProviderError::Unavailable(
+                "upstream 503".into()
+            )),
+            ErrorClass::ProviderDown
+        );
+
+        // Loop-level hard errors stay inside the classifier vocabulary.
+        assert_eq!(
+            super::loop_error_class(&super::LoopError::Engine(
+                kian_orchestrator::EngineError::NotAtSafeBoundary {
+                    session: kian_core::model::SessionId::new(),
+                }
+            )),
+            ErrorClass::StoreFailure
+        );
+        assert_eq!(
+            super::loop_error_class(&super::LoopError::Slot(
+                kian_llm::slots::SlotError::UnknownSlot("aux".into())
+            )),
+            ErrorClass::Unknown
+        );
+    }
 
     #[test]
     fn react_config_defaults_are_sane() {

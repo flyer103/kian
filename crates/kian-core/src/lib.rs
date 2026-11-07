@@ -15,10 +15,12 @@
 //! - [`events`] — event classification and envelope, schema v0 (DESIGN §3.1, §3.3)
 //! - [`state`] — session state machine and pure projection (DESIGN §2.2)
 //! - [`context`] — model-context projection `derive_model_context` (DESIGN §3.2, constraints 2/3)
+//! - [`control`] — reserved control-envelope convention (C68/ADR-014, durable interrupt intent)
 //! - [`invariants`] — the six semantic invariants + NoHalfTerminated as assertion predicates
 //! - [`seams`] — seam trait definitions (DESIGN §6.2); impl crates re-export
 
 pub mod context;
+pub mod control;
 pub mod events;
 pub mod invariants;
 pub mod model;

@@ -280,6 +280,7 @@ impl RecallTools {
             call_id: call.id,
             output: body,
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -375,6 +376,7 @@ impl RecallTools {
             call_id: call.id,
             output: body,
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 
@@ -445,6 +447,7 @@ impl RecallTools {
             call_id: call.id,
             output: body,
             is_error: false,
+            redactions: Vec::new(),
         })
     }
 }

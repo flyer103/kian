@@ -142,19 +142,15 @@ impl ModelProvider for ScriptedProvider {
 }
 
 fn text_chunk(text: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"content": text}),
-    })
+    Ok(ModelChunk::new(json!({"content": text})))
 }
 
 fn tool_call_chunk(id: &str, name: &str) -> Result<ModelChunk, kian_core::seams::ProviderError> {
-    Ok(ModelChunk {
-        delta: json!({"tool_calls": [{
-            "index": 0,
-            "id": id,
-            "function": {"name": name, "arguments": "{\"argv\":[\"echo\",\"hi\"]}"}
-        }]}),
-    })
+    Ok(ModelChunk::new(json!({"tool_calls": [{
+        "index": 0,
+        "id": id,
+        "function": {"name": name, "arguments": "{\"argv\":[\"echo\",\"hi\"]}"}
+    }]})))
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +181,7 @@ impl ToolProvider for FakeTools {
                 call_id: call.id,
                 output: json!({"ok": true, "stdout": "hi"}),
                 is_error: false,
+                redactions: Vec::new(),
             })
         })
     }
@@ -498,6 +495,7 @@ fn build_harness(
         ReActConfig {
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 16,
+            permissions: std::collections::BTreeMap::new(),
         },
     ));
 

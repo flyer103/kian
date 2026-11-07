@@ -437,9 +437,17 @@ async fn steer_lands_at_next_safe_boundary_with_strippable_synthetic_marker() {
     // exported stream projects a context whose stripped form equals the
     // context of the same stream with the synthetic input event removed
     // — byte-for-byte, nothing else changed.
-    let jsonl = run_export(&f.config, Some(&f.sqlite), sid_of(&sid), None, None, None)
-        .await
-        .expect("export");
+    let jsonl = run_export(
+        &f.config,
+        Some(&f.sqlite),
+        sid_of(&sid),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("export");
     let exported: Vec<Event> = jsonl
         .lines()
         .map(|l| serde_json::from_str(l).expect("exported envelope"))
@@ -597,9 +605,17 @@ async fn interrupt_mid_tool_settles_on_abort_and_resumes_honestly() {
     // Honesty through export: the exported audit package carries BOTH
     // end writes in order, and a re-import projects the identical
     // (completed) state — no relabeling anywhere.
-    let jsonl = run_export(&f.config, Some(&f.sqlite), sid_of(&sid), None, None, None)
-        .await
-        .expect("export");
+    let jsonl = run_export(
+        &f.config,
+        Some(&f.sqlite),
+        sid_of(&sid),
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("export");
     let exported: Vec<Event> = jsonl
         .lines()
         .map(|l| serde_json::from_str(l).expect("exported envelope"))

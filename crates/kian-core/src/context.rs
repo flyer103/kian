@@ -121,6 +121,10 @@ fn is_context_bearing(kind: &EventKind) -> bool {
         // (not silently in the catch-all) per the C18 guard pattern: a
         // future context-bearing addition must edit this match.
         EventKind::InputSpilled => false,
+        // C68 addition: `control/interrupt` is drain-activity audit
+        // data (the durable interrupt intent), never a message — the
+        // kind must not appear in a model request (constraint 3).
+        EventKind::ControlInterrupt => false,
         _ => false,
     }
 }
@@ -652,6 +656,65 @@ mod tests {
         let mut shaped = started();
         shaped.user("q");
         shaped.push(EventKind::InputSpilled, json!({"no_role": true}));
+        let ctx = derive_model_context(&shaped.build()).unwrap();
+        assert_eq!(ctx, vec![user_msg("q")]);
+    }
+
+    /// C68: `control/interrupt` is non-context-bearing — a stream
+    /// containing it derives a byte-identical context (and request
+    /// bytes) to the same stream without it, whatever position it sits
+    /// at and whatever its payload shape (constraint 3: the durable
+    /// interrupt intent is audit data, never a context mutation).
+    #[test]
+    fn control_interrupt_leaves_model_context_unchanged() {
+        let intent = json!({
+            "action": "interrupt",
+            "reason": "operator requested",
+            "requested_by": "replica-a",
+            "requested_at_ms": 1_762_000_000_000_u64,
+            "target_epoch": 1
+        });
+
+        let mut with = started();
+        with.user("hello");
+        with.push(crate::events::EventKind::ControlInterrupt, intent);
+        with.assistant(json!("working"));
+        // The stale variant directly between context-bearing messages —
+        // position must not matter, only the kind does.
+        with.push(
+            crate::events::EventKind::ControlInterrupt,
+            json!({
+                "action": "interrupt",
+                "reason": null,
+                "requested_by": null,
+                "requested_at_ms": 1_762_000_000_001_u64,
+                "target_epoch": null,
+                "stale": true
+            }),
+        );
+
+        let mut without = started();
+        without.user("hello");
+        without.assistant(json!("working"));
+
+        let ctx_with = derive_model_context(&with.build()).unwrap();
+        let ctx_without = derive_model_context(&without.build()).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(
+            context_to_bytes(&ctx_with),
+            context_to_bytes(&ctx_without),
+            "control/interrupt must not change a single context/request byte"
+        );
+
+        // A message-shaped control payload is skipped unparsed — even a
+        // payload that would be malformed for a context-bearing kind
+        // must not error here.
+        let mut shaped = started();
+        shaped.user("q");
+        shaped.push(
+            crate::events::EventKind::ControlInterrupt,
+            json!({"no_role": true}),
+        );
         let ctx = derive_model_context(&shaped.build()).unwrap();
         assert_eq!(ctx, vec![user_msg("q")]);
     }
