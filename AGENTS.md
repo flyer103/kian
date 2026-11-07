@@ -93,8 +93,8 @@ consistent: `cargo test -p kian-cli --test docs_map`.
 - `docs/SPEC.md` — WHAT: positioning, user/ops interfaces, scope.
 - `design/DESIGN.md` — HOW: execution model (Admit→Wake→Drain→Promote), session state machine,
   three-layer recovery, event schema versioning, plugin system, crate map, super-agent bundle.
-- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-015 tool permission
-  provenance.
+- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-016 memory
+  as events.
 - `the design notes` — structured synthesis of the design inputs.
 - `a vendored archive/` — frozen snapshots (WeChat super-agent article; dsh README/architecture;
   cordis README/primer; Feishu kian design rev 1425; Feishu an internal design review rev 47).
@@ -119,6 +119,10 @@ when the owner asks. Negative results commit documentation only — never broken
   JSON-RPC methods/params/results, error codes, SSE frames, metrics keys, the webhook status matrix
   and KiandProto frames. **Any wire change starts here** and updates this file first; `kian-sdk`,
   code and tests are reconciled in the same change.
+- `design/MEMORY-MODEL.md` — the normative memory contract (source of truth, proposed): notes as
+  non-context events, the dreaming drain, creation-time injection, representations as projections.
+  **Any memory semantic change starts here**; the kind bytes stay in EVENT-MODEL, the wire in
+  API-CONTRACT, the placement in DESIGN.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.

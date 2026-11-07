@@ -29,6 +29,7 @@ Kian is **not**:
 | P6 | Multi-model | Slot semantics in Kian, access resilience in the gateway |
 | P7 | Task-centric orchestration | An agent is one form of tool |
 | P8 | Governance as default | permission/approval/audit/quota must fail closed |
+| P9 | Long-range memory | Knowledge must survive the session boundary: notes, offline consolidation (dreaming), a bounded injected index — without forking the event stream |
 
 ## 2. User Interface
 
@@ -183,7 +184,9 @@ derivation, an event slice) / Iteration (aggregate counters + events) / Event (a
 modified) / Thread (independent event stream + version pin; task-centric delegation).
 
 The event envelope, the complete kind catalog, payload contracts and the event-change protocol
-are normative in [design/EVENT-MODEL.md](../design/EVENT-MODEL.md).
+are normative in [design/EVENT-MODEL.md](../design/EVENT-MODEL.md). The memory model — notes,
+dreaming, injection, representations — is normative in
+[design/MEMORY-MODEL.md](../design/MEMORY-MODEL.md).
 
 ## 5. Scope
 
@@ -323,6 +326,22 @@ Out of scope (recorded, not silently dropped): the `ask` permission/confirmation
 (ADR-015 records the shape; blocking confirmation is a separate design decision), token pricing/cost
 conversion (usage persists verbatim; pricing is a projection-layer decision), CMA wire
 compatibility, and cross-replica interrupt latency beyond "next safe boundary" (ADR-014).
+
+### Agent memory (designed; not landed)
+
+Scope: knowledge that survives a session boundary (P9). The normative contract is
+[design/MEMORY-MODEL.md](../design/MEMORY-MODEL.md); the rationale is
+[ADR-016](../design/decisions/ADR-016-memory-as-events.md). Nothing here is landed: this table
+records the agreed phases, not shipped status.
+
+| Phase | Module | Contents | Status |
+|--------|--------|----------|--------|
+| P1 | Notes + dreaming | `memory/note` as the 22nd durable kind (non-context, `DrainActivity`, additions-only), one memory session per agent scope, a dream request as a reserved inbox row over a bounded source range, `kian memory list/show/verify/dream`; provenance (`derived_from`) and `status`/`verified_by` are payload fields; no injection, no cadence | designed |
+| P2 | Injection | One creation-time `input/admitted` with `synthetic:true`, verified notes only, hard caps (default 20 items / 4 KiB), index-only over cap, never on resume/migration; additive non-context provenance; renderer frozen | designed |
+| P3 | Representations | Disposable projections over notes (index/map) rebuilt on demand, recall integration, declarative dreaming cadence/budget | designed |
+
+Non-goals recorded with the phases: no in-session memory tool (P1), no mid-session memory updates
+(P2), no representation as truth or unbounded build (P3), no cross-agent shared memory (open).
 
 ### Deferred (unchanged)
 | Item | Reason |

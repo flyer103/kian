@@ -428,6 +428,11 @@ declaration order `role`, `content`, `synthetic` only when true, object keys lex
 owned by the provider ( `build_chat_body` above): both are prompt-prefix bytes, and changing
 either is a constraint-3 event (observable invalidation + golden-hash update).
 
+**Memory injection (designed, not landed)** is the only sanctioned extension of this section: one
+creation-time `input/admitted` with `synthetic:true`, appended before the first `turn/start`, with
+a frozen renderer and hard caps — so the injected index joins the shared prefix instead of rewriting
+a live session's context. Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
+
 **The loop conventions (built-in ReAct loop, frozen after merge, additions-only)**: the built-in
 loop (kian-loop) is a passenger inside the drain — it interacts with the engine only through the
 `DrainCtx` surface (append, begin/end turn with payload, take eligible inputs at safe boundaries,
@@ -814,6 +819,10 @@ Router's own context stays the cheap Inline views + ids of what arrived; anythin
 raw, a sibling event, a worker's summary) is one recall hop away, audited as a `tool/result` on
 the Router's stream. No capability may push global state into Router context — that is the
 cache-byte-stability and cost discipline of §3.2/§4.1 applied to the super-agent layer.
+
+Memory notes are ordinary durable events, so the same `RecallPort` reaches one by its derived event
+id with no separate index; a representation (index/map over notes) is a disposable projection,
+never a second truth. Contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §7.
 
 ### 4.6 Resident re-arm
 
@@ -1341,6 +1350,11 @@ graph TB
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
+
+**Agent memory (designed, not landed).** Only the `memory/note` kind and a pure `project_notes` fold
+live in `kian-core`; the dreamer prompt, cadence and caps land as a bundle crate beside
+`kian-superagent`; the verbs ride `kian-cli`. Placement and non-goals are fixed by
+[MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
 **SDK freeze and versioning.** The `kian-sdk` public surface *is* the frozen wire
 contract: after it is **additive-only** — removing or reshaping a method, param, response
