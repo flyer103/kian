@@ -236,6 +236,21 @@ Landed shape (P2a):
   predecessor — unlike snapshots (R6 insert-only) this is safe because the whole version flips
   atomically and no reader may treat a view as truth. Rebuilds run under the `views:all`
   maintenance lease (liveness only), the store key pinned before any stream is read.
+- **Incremental rebuild (R9-10).** The maintenance tick is incremental: a session whose head is
+  unchanged since the last publication is *reused*, not re-derived — a stored row whose
+  `row_version` equals the live head was derived from an identical stream (streams are
+  append-only under CAS guards, so the head determines the stream). An unchanged store is a
+  no-op tick (one index-only heads scan, one pending-inbox scan, four digest verifications,
+  nothing published); per-tick fold work is proportional to the *changed* sessions. Publication
+  is the same one-transaction version flip, expressed as a delta (upserts for changed sessions,
+  deletes for gone sessions, state flip to the merged set's digest). The `ticket_stage` view is
+  all-or-nothing: its global folds read board-kind events across every session and
+  `pending_inbox` moves with `eligible_at` alone, so a board-kind change, a session deletion or
+  a pending drift re-derives the whole board — from a kind-filtered events read plus the worker
+  streams, never from every session's full stream. Any doubt about the stored views (absent
+  state, digest mismatch, undecodable payload) falls back to the full rebuild — the self-heal a
+  per-tick full rebuild used to give. Read semantics are unchanged: the merged row set is
+  byte-identical to a full rebuild's, pinned to the same store key.
 
 Rules:
 
@@ -334,6 +349,11 @@ Landed shape (P2b):
   after a verified package exists. It never rewrites events or changes event bytes.
 - It reports counters on `/metrics` (planned additive namespace `read` / `event_stream`;
   API-CONTRACT owns the exact keys).
+- **Per-tick cost is proportional to the change (R9-10), not to total history.** The view
+  rebuilder's whole-store reads are index-only aggregates (session heads, pending-inbox counts);
+  streams are re-read and re-folded only for sessions whose head moved, and the folds yield to
+  the runtime between sessions. The snapshot builder's candidate scan stays an index-only
+  `GROUP BY` bounded by its `LIMIT`.
 
 ## 10. Change protocol
 

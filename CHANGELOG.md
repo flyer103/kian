@@ -630,3 +630,59 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   decision is deliberately deferred to the SDK freeze — downstream matches should carry a `_`
   arm meanwhile. Docs drift (F4) and default-on maintenance cost (F6) are owned by follow-up
   cards, not this change. No new event kind; no wire change; no migration.
+
+## 2026-11-08 — read model R9-10: incremental view rebuild — default-green
+
+- **Problem (R9-08 F6, follow-up card t_988f5de3).** The default-on view maintenance ticker
+  (`read_model.views`, enabled, `interval_ms` 60 000) did recurring O(total history) work on the
+  serving runtime: every tick re-read and re-folded every session's whole stream (CHANGELOG P2a
+  bench: 66.5 ms at 1 000 sessions / 5.2k events, growing linearly).
+- **Remedy chosen (1 + 3 of the card's candidates; the default stays ON — an idle tick is now
+  near-free, so the 60 s cadence costs ~0.01–0.1 % of one core even at 10k sessions).** The
+  rebuild is **incremental**: one index-only `GROUP BY session` heads scan diffs live heads
+  against the stored rows' `row_version`s; only moved/new sessions are re-read and re-folded,
+  with a `yield_now()` between sessions (the folds never monopolize the runtime worker).
+  Publication becomes a **delta transaction** per view (upsert changed rows, delete gone
+  sessions, flip `view_state` to the merged set's digest at the pinned key) — same one-tx
+  version-flip atomicity, writes proportional to the change. Soundness: streams are append-only
+  under CAS guards, so equal head ⇒ identical stream ⇒ the reused row is byte-identical to a
+  re-derivation. `ticket_stage` is all-or-nothing (its global folds read board-kind events
+  store-wide and `pending_inbox` moves with `eligible_at` alone): a board-kind delta, a change
+  to a session already on the board, a deletion, or a pending drift re-derives the whole board
+  from a **kind-filtered events read** (`thread/started`, `thread/completed`, `session/ended`,
+  `input/admitted`, `tool/call`, `tool/result`, `channel/delivered`) plus the worker streams —
+  never from every session's full stream; otherwise only the state flips to the new key. Any
+  doubt about the stored views (absent state, digest mismatch, undecodable ticket payload)
+  falls back to the full rebuild (`rebuild_views_full`, kept as first-build path, self-heal and
+  bench baseline) — a tampered view still heals on the next tick. Read semantics unchanged
+  (R1/R8): the merged row set is byte-identical to a full rebuild's at the same pinned store
+  key; the freshness gate, digest check and honest fallbacks are untouched. The snapshot
+  builder's 30 s candidate scan stays an index-only `GROUP BY` bounded by its `LIMIT`
+  (documented in READ-MODEL §9).
+- **Store surface (both backends, dialect SQL in `kian-store` `sqlite.rs`/`postgres.rs`):**
+  `session_heads`, `pending_input_counts`, `events_where_kinds`, `view_publish_delta`. The board
+  fold core moved from `ticket_rows` to `ticket_rows_from(all_events, worker_streams)` with the
+  kind-filtered input equivalent by construction (`board_kinds_stay_in_sync` pins the seven
+  kinds to the enum). `RebuildOutcome` gains `derived` and `board_refreshed` counters.
+- **Equivalence executed** (`views_e2e`): `incremental_rebuild_equals_full_after_partial_changes`
+  (2 grown + 1 new + 1 deleted session ⇒ `derived == 3`, all four views equal the honest full
+  derivations, deleted rows gone), `incremental_tick_after_no_changes_is_a_noop` (`derived == 0`,
+  `views == 0`, views stay fresh), `plain_append_does_not_refresh_the_board` (delta-scoped board
+  trigger; ticket view exact via the key flip), `tampered_view_self_heals_on_the_next_incremental_tick`,
+  `pending_inbox_drift_without_appends_refreshes_tickets` (the §6 declared bound holds without
+  appends), plus the pre-existing P2a suite (equivalence, stale/corrupt fallback, lease,
+  pre-v4 reader) unchanged and green. Config unchanged (`read_model.views` default
+  enabled / 60 000 ms; no migration, no wire change, no new event kind).
+- **Benchmark** (`cargo bench -p kian-cli --bench read_path -- views`, sqlite, criterion 0.5,
+  M-series laptop; 1k = 800 plain + 200 workers ≈ 5.2k events, 10k = 8 000 + 2 000 ≈ 52k
+  events): full rebuild **64.8 ms @1k / 696.8 ms @10k**; incremental idle tick
+  **6.0 ms / 60.1 ms** (heads + pending scans + four digest verifications); incremental tick
+  after 10 plain sessions grew **26.8 ms / 78.7 ms** — marginal cost per changed session
+  **≈2.1 ms @1k and ≈1.9 ms @10k** (flat across a 10× store: proportional to the change, the
+  ~20 ms constant is the four publication commits); board-refreshing tick (one worker grew)
+  **24.2 ms / 226.2 ms** vs the honest full board derivation 30.1 ms / 340.9 ms. Verification
+  notes (honest): all four gates green on the final tree (build, `cargo test --workspace`
+  0 failures, clippy `--all-targets -D warnings`, fmt `--check`); docs_map green. Env-gated
+  suites (`KIAN_PG_URL` etc.) skipped by design; the new store SQL is dispatched per backend
+  but only the sqlite paths ran. READ-MODEL §6 (incremental rebuild bullet) and §9 (per-tick
+  cost rule) updated in the same change.

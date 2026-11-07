@@ -975,8 +975,48 @@ pub async fn ticket_board(store: &EventStore, now_ms: u64) -> CmdResult<Vec<Tick
     ticket_rows(store, &streams, now_ms).await
 }
 
-/// The pure-ish core of the board derivation over already-read streams
-/// (the only store access left is the per-worker pending-inbox read).
+/// The board's global fold input kinds (R9-10): every kind the three
+/// store-wide folds read — worker discovery and the passthrough
+/// registry (`thread/started`, `thread/completed`, `session/ended`,
+/// worker `input/admitted`) and the outbox status (`tool/call`,
+/// `tool/result`, `channel/delivered`). The string list feeds the
+/// store's kind-filtered read ([`EventStore::events_where_kinds`]);
+/// [`is_board_event`] is the Rust-side membership test over a stream.
+/// The two stay pinned to the enum by `board_kinds_stay_in_sync`.
+pub(crate) fn board_event_kind_names() -> [&'static str; 7] {
+    [
+        "thread/started",
+        "thread/completed",
+        "session/ended",
+        "input/admitted",
+        "tool/call",
+        "tool/result",
+        "channel/delivered",
+    ]
+}
+
+/// Whether one event feeds the board's global folds (R9-10) — the
+/// change trigger for the `ticket_stage` view: a session whose stream
+/// contains no board event cannot move the board, however much it
+/// grows.
+pub(crate) fn is_board_event(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::ThreadStarted
+            | EventKind::ThreadCompleted
+            | EventKind::SessionEnded { .. }
+            | EventKind::InputAdmitted
+            | EventKind::ToolCall
+            | EventKind::ToolResult
+            | EventKind::ChannelDelivered
+    )
+}
+
+/// The full-streams form of the board derivation (the honest path and
+/// the full-rebuild path): the global fold input is the concatenation
+/// of every session's stream. The incremental path calls
+/// [`ticket_rows_from`] directly with a kind-filtered read instead —
+/// equivalent by construction (the folds read board kinds only).
 pub(crate) async fn ticket_rows(
     store: &EventStore,
     streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
@@ -986,13 +1026,29 @@ pub(crate) async fn ticket_rows(
     for events in streams.values() {
         all_events.extend(events.iter().cloned());
     }
+    ticket_rows_from(store, &all_events, streams, now_ms).await
+}
+
+/// The pure-ish core of the board derivation over already-read events:
+/// `all_events` is the global fold input (worker discovery, registry,
+/// outbox — the folds only ever read [`board_event_kind_names`] kinds,
+/// so a kind-filtered store read is an equivalent input), `streams` carries
+/// the full streams of the discovered workers (the only per-session
+/// streams the board needs; the only store access left is the
+/// per-worker pending-inbox read).
+pub(crate) async fn ticket_rows_from(
+    store: &EventStore,
+    all_events: &[Event],
+    streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
+    now_ms: u64,
+) -> CmdResult<Vec<TicketRow>> {
     // Worker discovery: `thread/started` across every stream (a
     // Router's dispatch side names the workers; worker-side lineage
     // names them too). BTreeSet ⇒ deterministic uuid order.
-    let workers = kian_superagent::worker_sessions(&all_events);
+    let workers = kian_superagent::worker_sessions(all_events);
     // Topic binding: the same disposable registry projection the
     // runtime rebuilds, inverted to worker → topics.
-    let registry = kian_superagent::PassthroughRegistry::rebuild(&all_events);
+    let registry = kian_superagent::PassthroughRegistry::rebuild(all_events);
     let mut worker_topics: std::collections::BTreeMap<SessionId, Vec<String>> =
         std::collections::BTreeMap::new();
     for topic in registry.topics() {
@@ -1010,7 +1066,7 @@ pub(crate) async fn ticket_rows(
     // event id) and matches no alias — but the target conversation is
     // derivable from the worker's own stream (its admitted wrappers)
     // and its registry topics, so both paths feed the view.
-    let outbox_status = kian_superagent::OutboxStatus::from_events(&all_events);
+    let outbox_status = kian_superagent::OutboxStatus::from_events(all_events);
     let mut thread_aliases: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
         std::collections::BTreeMap::new();
     let mut worker_aliases: std::collections::BTreeMap<SessionId, Vec<String>> =
@@ -1596,11 +1652,72 @@ pub async fn run_memory_verify(
 mod tests {
     use std::path::PathBuf;
 
-    use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
+    use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
     use kian_core::model::{Epoch, SessionId};
     use serde_json::json;
 
-    use super::{check_model_context, import_jsonl, run_export};
+    use super::{
+        board_event_kind_names, check_model_context, import_jsonl, is_board_event, run_export,
+    };
+
+    /// R9-10: the store-side kind strings, the Rust-side membership
+    /// test and the enum must name the same seven board kinds — the
+    /// incremental board rebuild's soundness rests on the folds seeing
+    /// exactly their input kinds.
+    #[test]
+    fn board_kinds_stay_in_sync() {
+        let ev = |kind| Event {
+            seq: 1,
+            session: SessionId(uuid::Uuid::nil()),
+            epoch: Epoch::GENESIS,
+            ts: 1,
+            kind,
+            bytes: json!({}),
+            version: SCHEMA_VERSION,
+        };
+        let names = board_event_kind_names();
+        for (name, event) in [
+            ("thread/started", ev(EventKind::ThreadStarted)),
+            ("thread/completed", ev(EventKind::ThreadCompleted)),
+            (
+                "session/ended",
+                ev(EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                }),
+            ),
+            ("input/admitted", ev(EventKind::InputAdmitted)),
+            ("tool/call", ev(EventKind::ToolCall)),
+            ("tool/result", ev(EventKind::ToolResult)),
+            ("channel/delivered", ev(EventKind::ChannelDelivered)),
+        ] {
+            assert!(is_board_event(&event), "{name} must be a board kind");
+            assert_eq!(event.kind.as_str(), name);
+            assert!(names.contains(&name), "{name} missing from the store list");
+        }
+        assert_eq!(names.len(), 7);
+        // The store list carries no non-board kind either: every name
+        // is one of the enum spellings above.
+        let board_strs = [
+            EventKind::ThreadStarted.as_str(),
+            EventKind::ThreadCompleted.as_str(),
+            EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            }
+            .as_str(),
+            EventKind::InputAdmitted.as_str(),
+            EventKind::ToolCall.as_str(),
+            EventKind::ToolResult.as_str(),
+            EventKind::ChannelDelivered.as_str(),
+        ];
+        for name in names {
+            assert!(
+                board_strs.contains(&name),
+                "{name} in the store list is not a board kind"
+            );
+        }
+        assert!(!is_board_event(&ev(EventKind::TurnEnd)));
+        assert!(!is_board_event(&ev(EventKind::SessionCreated)));
+    }
 
     fn temp_db_path() -> PathBuf {
         std::env::temp_dir().join(format!("kian-c14-{}.sqlite", uuid::Uuid::new_v4()))

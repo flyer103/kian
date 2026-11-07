@@ -695,3 +695,102 @@ pub(crate) async fn view_drop(pool: &PgPool, view: &str) -> Result<(), StoreErro
     tx.commit().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// incremental maintenance reads/writes (R9-10)
+// ---------------------------------------------------------------------------
+
+/// R9-10: one line per live session with its head seq — the view
+/// rebuilder's change detector. Index-only over the events PK.
+pub(crate) const SESSION_HEADS_SQL: &str =
+    "SELECT session, MAX(seq) FROM events GROUP BY session ORDER BY session ASC";
+
+/// R9-10: pending-eligible inbox counts per session in one grouped read
+/// (the `ticket_stage` view's `pending_inbox` drift check).
+pub(crate) const PENDING_COUNTS_SQL: &str = "SELECT session, COUNT(*) FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= $1::bigint GROUP BY session ORDER BY session ASC";
+
+/// R9-10: per-row upsert for the incremental publication.
+pub(crate) const VIEW_ROW_UPSERT_SQL: &str = "INSERT INTO view_rows (view, session, row_version, payload)\nVALUES ($1, $2, $3, $4)\nON CONFLICT(view, session) DO UPDATE SET\n    row_version = excluded.row_version,\n    payload = excluded.payload";
+
+pub(crate) const VIEW_ROW_DELETE_ONE_SQL: &str =
+    "DELETE FROM view_rows WHERE view = $1 AND session = $2";
+
+/// Every live session's head seq, session-ascending.
+pub(crate) async fn session_heads(pool: &PgPool) -> Result<Vec<(String, i64)>, StoreError> {
+    Ok(sqlx::query_as(SESSION_HEADS_SQL).fetch_all(pool).await?)
+}
+
+/// Pending-eligible input counts per session at `now_ms`.
+pub(crate) async fn pending_input_counts(
+    pool: &PgPool,
+    now_ms: u64,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    Ok(sqlx::query_as(PENDING_COUNTS_SQL)
+        .bind(se_i64(now_ms, "pending counts now_ms")?)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Every event of the given kinds across the whole store, `(session,
+/// seq)`-ascending (the board's global fold input; see the sqlite twin).
+pub(crate) async fn events_where_kinds(
+    pool: &PgPool,
+    kinds: &[&str],
+) -> Result<Vec<Event>, StoreError> {
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT session, version, envelope FROM events \
+         WHERE kind = ANY($1::text[]) ORDER BY session ASC, seq ASC",
+    )
+    .bind(kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (session_col, version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session.0.to_string() != session_col {
+            return Err(StoreError::CorruptRow {
+                session: event.session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// The incremental publication (R9-10): ONE transaction — delete the
+/// gone sessions' rows, upsert the changed rows, flip `view_state`.
+/// Same atomic version-flip shape as [`view_publish`], writes
+/// proportional to the change.
+pub(crate) async fn view_publish_delta(
+    pool: &PgPool,
+    p: &crate::views::publish::PublishDelta<'_>,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    for session in p.gone_sessions {
+        sqlx::query(VIEW_ROW_DELETE_ONE_SQL)
+            .bind(p.view)
+            .bind(session)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for row in p.rows {
+        sqlx::query(VIEW_ROW_UPSERT_SQL)
+            .bind(p.view)
+            .bind(&row.session)
+            .bind(se_i64(row.row_version, "view row_version")?)
+            .bind(&row.payload)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(VIEW_STATE_UPSERT_SQL)
+        .bind(p.view)
+        .bind(p.events_total)
+        .bind(p.max_seq)
+        .bind(p.digest)
+        .bind(p.built_at)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}

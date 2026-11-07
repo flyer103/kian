@@ -36,6 +36,21 @@
 //! pinned key: an append racing the build makes the live key diverge,
 //! so the just-built version reads stale and is never served.
 //!
+//! R9-10 made the rebuild **incremental**: a session whose head is
+//! unchanged since the last publication is reused, not re-derived (a
+//! row whose `row_version` equals the live head was derived from an
+//! identical stream — streams are append-only under CAS guards, so the
+//! head determines the stream). An unchanged store is a no-op tick;
+//! per-tick work is proportional to the *changed* sessions. Any doubt
+//! about the stored views (absent state, digest mismatch, undecodable
+//! ticket payload) falls back to [`rebuild_views_full`] — the self-heal
+//! a per-tick full rebuild used to give. The `ticket_stage` view is
+//! all-or-nothing (its global folds read board-kind events across
+//! every session, and `pending_inbox` moves with `eligible_at` alone):
+//! a board-kind change, a deletion, or a pending drift re-derives the
+//! whole board from a kind-filtered read plus the worker streams —
+//! never from every session's full stream.
+//!
 //! ## No control read consumes a view (R8)
 //!
 //! Views live here and in `kian-store` only. The control plane
@@ -50,7 +65,9 @@
 //! observability bound (§6): `pending_inbox` (an inbox row can become
 //! eligible with no append, via `eligible_at`) and the derived stage's
 //! dependence on it — both are as of the last rebuild. The rendered
-//! board is therefore ≤ one rebuild interval old on those two fields.
+//! board is therefore ≤ one rebuild interval old on those two fields
+//! (the incremental tick compares live pending counts with the stored
+//! rows every beat, so the bound holds without a full re-derivation).
 
 use std::collections::BTreeMap;
 
@@ -267,19 +284,38 @@ fn cache_entry(report: &crate::cache_metrics::SessionCacheReport) -> CacheEntry 
 /// What one [`rebuild_views`] run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildOutcome {
-    /// Sessions read and derived.
+    /// Sessions covered by the published views (the live row set).
     pub sessions: usize,
-    /// Views published atomically (always all four on success).
+    /// Sessions actually read and folded this tick (R9-10): unchanged
+    /// sessions are reused, not re-derived — the per-tick cost is
+    /// proportional to this number, not to total history.
+    pub derived: usize,
+    /// Views published atomically (all four on a real tick; `0` when
+    /// the tick was a no-op — nothing changed, nothing published).
     pub views: usize,
+    /// Whether the ticket board was re-derived this tick (a board-kind
+    /// change, a deletion, or a `pending_inbox` drift).
+    pub board_refreshed: bool,
     /// Another holder's lease was live — nothing rebuilt (R9:
     /// idempotent under retry).
     pub lease_held: bool,
 }
 
 /// Rebuilds and publishes every view under the `views:all` maintenance
-/// lease (READ-MODEL §6/§9). The store key is pinned **before** any
-/// stream is read; publication records that pinned key, so a racing
-/// append makes this whole version stale and it is never served.
+/// lease (READ-MODEL §6/§9), **incrementally** (R9-10): sessions whose
+/// head moved since the last publication are re-derived; every other
+/// stored row is reused verbatim (a row whose `row_version` equals the
+/// live head was derived from an identical stream — streams are
+/// append-only under CAS guards, so the head determines the stream).
+/// An unchanged store is a no-op tick. Any doubt about the stored
+/// views (absent state, digest mismatch, undecodable ticket payload)
+/// falls back to [`rebuild_views_full`] — the self-heal a per-tick
+/// full rebuild used to give.
+///
+/// The store key is pinned **before** any read; publication records
+/// that pinned key, so an append racing the build makes this whole
+/// version stale and it is never served. Read semantics are unchanged
+/// (R1/R8): the merged row set is byte-identical to a full rebuild's.
 pub async fn rebuild_views(
     store: &EventStore,
     holder: &str,
@@ -292,13 +328,306 @@ pub async fn rebuild_views(
     {
         return Ok(RebuildOutcome {
             sessions: 0,
+            derived: 0,
             views: 0,
+            board_refreshed: false,
+            lease_held: true,
+        });
+    }
+    let outcome = incremental_under_lease(store, now_ms).await;
+    let _ = store.maintenance_lease_release(VIEW_SCOPE, holder).await;
+    outcome
+}
+
+/// The pre-R9-10 rebuild: re-derive every session's whole stream and
+/// republish all four views. Still the first-build path, the fallback
+/// on any doubt about the stored views, and the equivalence baseline
+/// for the incremental path's tests and benchmarks.
+pub async fn rebuild_views_full(
+    store: &EventStore,
+    holder: &str,
+    now_ms: u64,
+) -> CmdResult<RebuildOutcome> {
+    if !store
+        .maintenance_lease_try_acquire(VIEW_SCOPE, holder, VIEW_LEASE_TTL_MS, now_ms)
+        .await
+        .map_err(|e| format!("view lease: {e}"))?
+    {
+        return Ok(RebuildOutcome {
+            sessions: 0,
+            derived: 0,
+            views: 0,
+            board_refreshed: false,
             lease_held: true,
         });
     }
     let outcome = rebuild_under_lease(store, now_ms).await;
     let _ = store.maintenance_lease_release(VIEW_SCOPE, holder).await;
     outcome
+}
+
+/// Reads one view's stored rows and verifies the digest over exactly
+/// the bytes read. `None` on any doubt (absent tables/state, digest
+/// mismatch, store error) — the caller falls back to the full rebuild.
+async fn stored_view_verified(store: &EventStore, view: &str) -> Option<Vec<ViewRow>> {
+    let state = store.view_state(view).await.ok()??;
+    let rows = store.view_rows(view).await.ok()??;
+    if view_rows_digest(view, &rows) != state.digest {
+        tracing::warn!(view, "stored view digest mismatch — full rebuild");
+        return None;
+    }
+    Some(rows)
+}
+
+/// One incremental tick under the lease. See [`rebuild_views`].
+async fn incremental_under_lease(store: &EventStore, now_ms: u64) -> CmdResult<RebuildOutcome> {
+    // Pin the freshness key first: rows are only ever served at exactly
+    // this store version.
+    let key = store
+        .view_store_key()
+        .await
+        .map_err(|e| format!("view store key: {e}"))?;
+
+    // The reuse base: all four views must be present and digest-clean.
+    // Any doubt → the full rebuild (self-heal).
+    let (Some(directory), Some(usage), Some(cache), Some(tickets)) = (
+        stored_view_verified(store, VIEW_DIRECTORY).await,
+        stored_view_verified(store, VIEW_USAGE).await,
+        stored_view_verified(store, VIEW_CACHE).await,
+        stored_view_verified(store, VIEW_TICKETS).await,
+    ) else {
+        return rebuild_under_lease(store, now_ms).await;
+    };
+
+    // The change detector: live heads vs the stored row versions (all
+    // three per-session views carry the same head as row_version; a
+    // disagreement anywhere counts as a change — the set must be
+    // internally consistent to be a reuse base).
+    let heads: BTreeMap<String, u64> = store
+        .session_heads()
+        .await
+        .map_err(|e| format!("view session heads: {e}"))?
+        .into_iter()
+        .collect();
+    let stored_head = |rows: &Vec<ViewRow>, session: &str| {
+        rows.binary_search_by(|r| r.session.as_str().cmp(session))
+            .ok()
+            .map(|i| rows[i].row_version)
+    };
+    let changed: Vec<String> = heads
+        .iter()
+        .filter(|(session, head)| {
+            stored_head(&directory, session) != Some(**head)
+                || stored_head(&usage, session) != Some(**head)
+                || stored_head(&cache, session) != Some(**head)
+        })
+        .map(|(session, _)| session.clone())
+        .collect();
+    let gone: Vec<String> = directory
+        .iter()
+        .filter(|r| !heads.contains_key(&r.session))
+        .map(|r| r.session.clone())
+        .collect();
+
+    // `pending_inbox` drift (the §6 declared bound): an inbox row can
+    // become eligible with no append, so the live per-worker counts are
+    // compared with the stored ticket rows every tick.
+    let pending: BTreeMap<String, u64> = store
+        .pending_input_counts(now_ms)
+        .await
+        .map_err(|e| format!("view pending counts: {e}"))?
+        .into_iter()
+        .collect();
+    let mut tickets_drift = false;
+    for row in &tickets {
+        let entry: TicketEntry = match serde_json::from_str(&row.payload) {
+            Ok(entry) => entry,
+            Err(_) => {
+                tickets_drift = true; // undecodable → force the board refresh
+                break;
+            }
+        };
+        let live = pending.get(&row.session).copied().unwrap_or(0);
+        if live != entry.pending_inbox {
+            tickets_drift = true;
+            break;
+        }
+    }
+
+    // The idle tick: nothing changed anywhere and the board inputs are
+    // as stored — publish nothing (the views are already fresh at this
+    // key; the default-on ticker costs one heads scan, one pending
+    // scan and four digest verifications).
+    if changed.is_empty() && gone.is_empty() && !tickets_drift {
+        return Ok(RebuildOutcome {
+            sessions: directory.len(),
+            derived: 0,
+            views: 0,
+            board_refreshed: false,
+            lease_held: false,
+        });
+    }
+
+    // Derive ONLY the changed sessions (yield between sessions so a
+    // large change set cannot monopolize the runtime worker — R9-10).
+    // Board trigger, refined to the DELTA: the board's global folds
+    // read board-kind events only, so a plain session growing by
+    // non-board events cannot move the board; but a session already on
+    // the board has row fields derived from its whole stream (`events`
+    // count, stage inputs), so ANY append to it refreshes the board.
+    let mut board_touched = !gone.is_empty() || tickets_drift;
+    let mut new_directory = Vec::with_capacity(changed.len());
+    let mut new_usage = Vec::with_capacity(changed.len());
+    let mut new_cache = Vec::with_capacity(changed.len());
+    for session in &changed {
+        let sid: SessionId = session
+            .parse()
+            .map(SessionId)
+            .map_err(|e| format!("view session id `{session}`: {e}"))?;
+        let events = store
+            .rebuild(sid)
+            .await
+            .map_err(|e| format!("view read events for {sid:?}: {e}"))?;
+        let prev_head = stored_head(&directory, session).unwrap_or(0);
+        let on_board = stored_head(&tickets, session).is_some();
+        if on_board
+            || events
+                .iter()
+                .any(|e| e.seq > prev_head && crate::commands::is_board_event(e))
+        {
+            board_touched = true;
+        }
+        new_directory.push(row(session, directory_entry(sid, &events)?, &events));
+        new_usage.push(row(
+            session,
+            usage_entry(&crate::usage_metrics::session_usage_report(sid, &events)),
+            &events,
+        ));
+        new_cache.push(row(
+            session,
+            cache_entry(&crate::cache_metrics::session_cache_report(sid, &events)),
+            &events,
+        ));
+        tokio::task::yield_now().await;
+    }
+
+    // Merge: reused rows (unchanged, minus gone) ++ the new rows, then
+    // publish each view as ONE delta transaction at the pinned key —
+    // upserts for the changed sessions, deletes for the gone ones, and
+    // the state flip to the merged set's digest.
+    let merged = |stored: Vec<ViewRow>, fresh: Vec<ViewRow>| {
+        let mut rows: Vec<ViewRow> = stored
+            .into_iter()
+            .filter(|r| !gone.contains(&r.session) && !changed.iter().any(|c| c == &r.session))
+            .collect();
+        rows.extend(fresh);
+        rows.sort_by(|a, b| a.session.cmp(&b.session));
+        rows
+    };
+    let merged_directory = merged(directory, new_directory);
+    let merged_usage = merged(usage, new_usage);
+    let merged_cache = merged(cache, new_cache);
+    for (view, all_rows) in [
+        (VIEW_DIRECTORY, &merged_directory),
+        (VIEW_USAGE, &merged_usage),
+        (VIEW_CACHE, &merged_cache),
+    ] {
+        store
+            .view_publish_delta(
+                view,
+                // upserts: only the changed sessions' rows (unchanged
+                // rows stay physically in place; the merged set's
+                // digest covers exactly the bytes that remain)
+                &all_rows
+                    .iter()
+                    .filter(|r| changed.iter().any(|c| c == &r.session))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &gone,
+                &view_rows_digest(view, all_rows),
+                key,
+                now_ms,
+            )
+            .await
+            .map_err(|e| format!("view publish delta `{view}`: {e}"))?;
+    }
+
+    // The ticket board: an all-or-nothing view (its global folds read
+    // board-kind events across every session). Board inputs moved, a
+    // session went away, or pending drifted → re-derive the whole
+    // board from the kind-filtered read + worker streams. Otherwise
+    // the stored rows are exact — flip ONLY the state to the new key
+    // (a delta publication with no row writes; the rows and their
+    // digest are unchanged) so the freshness gate keeps holding.
+    let board_refreshed = board_touched;
+    if board_touched {
+        let kinds = crate::commands::board_event_kind_names();
+        let board_events = store
+            .events_where_kinds(&kinds)
+            .await
+            .map_err(|e| format!("view board events: {e}"))?;
+        let mut worker_streams = BTreeMap::new();
+        for worker in kian_superagent::worker_sessions(&board_events) {
+            worker_streams.insert(
+                worker,
+                store
+                    .rebuild(worker)
+                    .await
+                    .map_err(|e| format!("view read events for {worker:?}: {e}"))?,
+            );
+            tokio::task::yield_now().await;
+        }
+        let mut ticket_rows_out = Vec::new();
+        for t in
+            crate::commands::ticket_rows_from(store, &board_events, &worker_streams, now_ms).await?
+        {
+            let first_ts = worker_streams
+                .get(&t.session)
+                .and_then(|events| events.first())
+                .map(|e| e.ts)
+                .ok_or_else(|| format!("ticket session {} missing from streams", t.session.0))?;
+            let entry = TicketEntry {
+                session: t.session.0.to_string(),
+                thread: t.thread.map(|th| th.to_string()),
+                topic: t.topic.clone(),
+                stage: t.stage.as_str().to_string(),
+                thread_status: t.thread_status.clone(),
+                pending_inbox: t.pending_inbox as u64,
+                first_ts,
+                events: t.events as u64,
+                parked: t.parked.clone(),
+            };
+            ticket_rows_out.push(ViewRow {
+                session: t.session.0.to_string(),
+                row_version: first_ts_version(&worker_streams, &t.session),
+                payload: serde_json::to_string(&entry).map_err(|e| e.to_string())?,
+            });
+        }
+        store
+            .view_publish(VIEW_TICKETS, ticket_rows_out, key, now_ms)
+            .await
+            .map_err(|e| format!("view publish `{VIEW_TICKETS}`: {e}"))?;
+    } else {
+        store
+            .view_publish_delta(
+                VIEW_TICKETS,
+                &[],
+                &[],
+                &view_rows_digest(VIEW_TICKETS, &tickets),
+                key,
+                now_ms,
+            )
+            .await
+            .map_err(|e| format!("view publish delta `{VIEW_TICKETS}`: {e}"))?;
+    }
+
+    Ok(RebuildOutcome {
+        sessions: merged_directory.len(),
+        derived: changed.len(),
+        views: 4,
+        board_refreshed,
+        lease_held: false,
+    })
 }
 
 async fn rebuild_under_lease(store: &EventStore, now_ms: u64) -> CmdResult<RebuildOutcome> {
@@ -384,7 +713,9 @@ async fn rebuild_under_lease(store: &EventStore, now_ms: u64) -> CmdResult<Rebui
     }
     Ok(RebuildOutcome {
         sessions: sessions.len(),
+        derived: sessions.len(),
         views: 4,
+        board_refreshed: true,
         lease_held: false,
     })
 }

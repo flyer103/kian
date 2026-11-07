@@ -442,6 +442,290 @@ async fn rebuild_lease_excludes_concurrent_rebuilders() {
     cleanup(&path);
 }
 
+/// R9-10: an incremental tick on an UNCHANGED store is a no-op — zero
+/// sessions derived, nothing published, every view stays fresh (the
+/// default-on 60 s ticker must not re-fold O(total history) per beat).
+#[tokio::test]
+async fn incremental_tick_after_no_changes_is_a_noop() {
+    let path = temp_db("idle");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 5, 2, 21).await;
+    let first = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        .await
+        .unwrap();
+    assert_eq!(first.sessions, 7);
+    assert_eq!(first.views, 4);
+    assert_eq!(first.derived, 7, "the first build derives every session");
+
+    // Nothing appended between the ticks: the second tick derives zero
+    // sessions and publishes nothing, and the views remain fresh.
+    let second = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+        .await
+        .unwrap();
+    assert!(!second.lease_held);
+    assert_eq!(second.derived, 0, "an idle tick folds nothing");
+    assert_eq!(second.views, 0, "an idle tick publishes nothing");
+    assert!(kian_cli::views::fresh_usage(&store).await.is_some());
+    assert!(kian_cli::views::fresh_tickets(&store).await.is_some());
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R9-10: the incremental rebuild after PARTIAL changes (appends to a
+/// few sessions, one new session, one deleted session) derives only the
+/// changed sessions and lands exactly the views a full rebuild would —
+/// reused rows for untouched sessions, re-derived rows for the rest,
+/// the deleted session's rows gone (READ-MODEL §6 equivalence holds).
+#[tokio::test]
+async fn incremental_rebuild_equals_full_after_partial_changes() {
+    let path = temp_db("delta");
+    let store = EventStore::open(&path).await.unwrap();
+    let sessions = seed_store(&store, 6, 3, 33).await;
+    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        .await
+        .unwrap();
+
+    // Two plain sessions grow (a turn each), one brand-new session
+    // appears, and one plain session leaves the online store (the
+    // retention shape — deleted behind the API's back, exactly what an
+    // archived session looks like to the next tick).
+    for &sid in &sessions[0..2] {
+        let head = store.head(sid).await.unwrap().next_seq;
+        push(
+            &store,
+            sid,
+            head,
+            Epoch(1),
+            EventKind::TurnEnd,
+            json!({"iteration": 0, "outcome": "final_answer",
+                   "usage": {"input_tokens": 5, "output_tokens": 1}}),
+        )
+        .await;
+    }
+    let fresh = SessionId::new();
+    push(
+        &store,
+        fresh,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    push(
+        &store,
+        fresh,
+        2,
+        Epoch(1),
+        EventKind::InputAdmitted,
+        json!({"role": "user", "content": "new"}),
+    )
+    .await;
+    if let EventStore::Sqlite(pool) = &store {
+        sqlx::query("DELETE FROM events WHERE session = ?")
+            .bind(sessions[2].0.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200)
+        .await
+        .unwrap();
+    assert!(!out.lease_held);
+    assert_eq!(out.derived, 3, "two grown sessions + the new session");
+    assert_eq!(out.sessions, 9, "6 plain + 3 workers - 1 deleted + 1 new");
+
+    // Every view now equals the honest full derivation on the same
+    // store (the equivalence a full rebuild guarantees, held by the
+    // incremental path: reused rows are byte-identical folds).
+    let via_view = kian_cli::usage_metrics::usage_stats_report(&store, None, true)
+        .await
+        .unwrap();
+    let honest = kian_cli::usage_metrics::usage_stats_report(&store, None, false)
+        .await
+        .unwrap();
+    assert_eq!(via_view, honest, "usage view equals full derivation");
+
+    let via_view = kian_cli::cache_metrics::cache_stats_report(&store, None, true)
+        .await
+        .unwrap();
+    let honest = kian_cli::cache_metrics::cache_stats_report(&store, None, false)
+        .await
+        .unwrap();
+    assert_eq!(via_view, honest, "cache view equals full derivation");
+
+    let entries = kian_cli::views::fresh_directory(&store)
+        .await
+        .expect("fresh after the incremental tick");
+    let live: std::collections::BTreeSet<String> =
+        entries.iter().map(|e| e.session.clone()).collect();
+    assert_eq!(entries.len(), 9);
+    assert!(
+        !live.contains(&sessions[2].0.to_string()),
+        "deleted session gone"
+    );
+    assert!(live.contains(&fresh.0.to_string()), "new session present");
+    for entry in &entries {
+        let sid: uuid::Uuid = entry.session.parse().unwrap();
+        let events = store.rebuild(SessionId(sid)).await.unwrap();
+        assert_eq!(entry.events, events.len() as u64);
+        assert_eq!(entry.version, events.last().unwrap().seq);
+    }
+
+    let now = 1_762_000_060_000;
+    let entries = kian_cli::views::fresh_tickets(&store)
+        .await
+        .expect("fresh tickets");
+    let view_rows: Vec<_> = entries.iter().map(|e| e.to_row(now).unwrap()).collect();
+    let honest_rows = kian_cli::commands::ticket_board(&store, now).await.unwrap();
+    assert_eq!(view_rows, honest_rows, "ticket view equals the board");
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R9-10: a tampered row breaks the stored digest — the incremental
+/// path must NOT reuse the tampered view; the next tick discards and
+/// fully rebuilds it (the self-heal a per-tick full rebuild used to
+/// give, preserved).
+#[tokio::test]
+async fn tampered_view_self_heals_on_the_next_incremental_tick() {
+    let path = temp_db("heal");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 4, 2, 44).await;
+    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        .await
+        .unwrap();
+    if let EventStore::Sqlite(pool) = &store {
+        sqlx::query("UPDATE view_rows SET payload = ? WHERE view = 'session_directory'")
+            .bind(r#"{"session":"x","state":"running","events":999}"#)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    // The stored digest no longer covers the stored bytes; the next
+    // tick must NOT reuse the tampered rows — it discards and fully
+    // rebuilds the view (self-heal preserved).
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+        .await
+        .unwrap();
+    assert!(out.derived > 0, "digest mismatch ⇒ full re-derivation");
+    let entries = kian_cli::views::fresh_directory(&store)
+        .await
+        .expect("fresh and intact after self-heal");
+    assert_eq!(entries.len(), 6);
+    for entry in &entries {
+        assert_ne!(entry.events, 999, "no tampered payload survived");
+    }
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R9-10: `pending_inbox` can move with no append at all (an inbox row
+/// crossing its `eligible_at`). The incremental tick must detect the
+/// drift against the stored ticket rows and refresh the board (the
+/// §6 declared staleness bound stays ≤ one rebuild interval).
+#[tokio::test]
+async fn pending_inbox_drift_without_appends_refreshes_tickets() {
+    let path = temp_db("drift");
+    let store = EventStore::open(&path).await.unwrap();
+    let sessions = seed_store(&store, 2, 1, 55).await;
+    let worker = sessions[2]; // seed_store: plain sessions first, workers after
+    // An inbox row that is NOT yet eligible at t=1_000 but is at t=6_000.
+    store
+        .admit(kian_core::model::InputRow {
+            id: uuid::Uuid::new_v4(),
+            session: worker,
+            payload: json!({"role": "user", "content": "later"}),
+            admitted_at: 900,
+            eligible_at: 5_000,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+
+    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        .await
+        .unwrap();
+    let entries = kian_cli::views::fresh_tickets(&store)
+        .await
+        .expect("fresh at t=1_000");
+    assert_eq!(entries.len(), 1);
+    // seed_store's own queued row is eligible; the t=5_000 row is not.
+    assert_eq!(entries[0].pending_inbox, 1, "only the seed row is eligible");
+
+    // Time passes; no appends. The tick compares live pending counts
+    // with the stored rows, sees the drift, refreshes the board.
+    let out = kian_cli::views::rebuild_views(&store, "builder", 6_000)
+        .await
+        .unwrap();
+    assert!(out.board_refreshed, "pending drift forces a board refresh");
+    let entries = kian_cli::views::fresh_tickets(&store)
+        .await
+        .expect("fresh at t=6_000");
+    assert_eq!(entries[0].pending_inbox, 2, "the later row became eligible");
+    let honest = kian_cli::commands::ticket_board(&store, 6_000)
+        .await
+        .unwrap();
+    assert_eq!(entries[0].to_row(6_000).unwrap(), honest[0]);
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R9-10: the board trigger is the DELTA, not the stream — a plain
+/// session (its history carries `input/admitted`, a board kind)
+/// growing by a non-board event must NOT re-fold the board; the ticket
+/// view stays exact via the state-only key flip.
+#[tokio::test]
+async fn plain_append_does_not_refresh_the_board() {
+    let path = temp_db("plainappend");
+    let store = EventStore::open(&path).await.unwrap();
+    let sessions = seed_store(&store, 4, 2, 66).await;
+    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        .await
+        .unwrap();
+
+    // A turn on a plain session: head moves, no board event in the delta.
+    let head = store.head(sessions[0]).await.unwrap().next_seq;
+    push(
+        &store,
+        sessions[0],
+        head,
+        Epoch(1),
+        EventKind::TurnEnd,
+        json!({"iteration": 0, "outcome": "final_answer",
+               "usage": {"input_tokens": 4, "output_tokens": 1}}),
+    )
+    .await;
+
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+        .await
+        .unwrap();
+    assert_eq!(out.derived, 1, "only the grown session");
+    assert!(
+        !out.board_refreshed,
+        "a plain non-board delta must not re-fold the board"
+    );
+    assert_eq!(out.views, 4);
+
+    // And the ticket view is still served and still exact.
+    let now = 1_762_000_060_000;
+    let entries = kian_cli::views::fresh_tickets(&store)
+        .await
+        .expect("fresh after the key flip");
+    let view_rows: Vec<_> = entries.iter().map(|e| e.to_row(now).unwrap()).collect();
+    let honest_rows = kian_cli::commands::ticket_board(&store, now).await.unwrap();
+    assert_eq!(view_rows, honest_rows);
+
+    store.close().await;
+    cleanup(&path);
+}
+
 /// A read-only reader of a store last migrated before v4 (no view
 /// tables) sees "no view" — never an error — and the honest derivation
 /// answers.

@@ -247,47 +247,72 @@ fn bench_read_path(c: &mut Criterion) {
 /// Store shape: 800 plain sessions (usage-bearing turns) + 200 worker
 /// sessions (`thread/started` lineage) ≈ 5.2k events.
 fn bench_views(c: &mut Criterion) {
+    bench_views_at(c, "1k_sessions", 800, 200, 30, Duration::from_secs(6));
+}
+
+/// R9-10: the same read benches at 10k sessions (8 000 plain + 2 000
+/// workers ≈ 52k events) — the incremental-tick benches here are the
+/// acceptance numbers (per-tick work proportional to *changed*
+/// sessions, at both store sizes).
+fn bench_views_10k(c: &mut Criterion) {
+    bench_views_at(c, "10k_sessions", 8_000, 2_000, 20, Duration::from_secs(5));
+}
+
+fn bench_views_at(
+    c: &mut Criterion,
+    tag: &str,
+    plain: u64,
+    workers: u64,
+    sample_size: usize,
+    measurement_time: Duration,
+) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("bench runtime");
 
-    let dir = std::env::temp_dir().join(format!("kian-bench-views-{}", Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("kian-bench-views-{tag}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("bench dir");
     let db = dir.join("bench-views.sqlite");
 
+    let now = 1_762_000_060_000;
+
     let store = runtime.block_on(async {
         let store = EventStore::open(&db).await.expect("open store");
-        for p in 0..800u64 {
+        let mut plain_sessions = Vec::new();
+        for p in 0..plain {
             let sid = SessionId(Uuid::new_v4());
             seed_plain(&store, sid, p).await;
+            plain_sessions.push(sid);
         }
-        for w in 0..200u64 {
+        let mut worker_sessions = Vec::new();
+        for w in 0..workers {
             let sid = SessionId(Uuid::new_v4());
             seed_worker(&store, sid, w).await;
+            worker_sessions.push(sid);
         }
         if let EventStore::Sqlite(pool) = &store {
             let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                 .execute(pool)
                 .await;
         }
-        // Build the views once; no further appends, so every read below
-        // is fresh (the exact-version gate holds through the benches).
+        // Build the views once (the first build is a full rebuild); no
+        // further appends outside the changed-tick benches, so the
+        // read benches below stay fresh (the exact-version gate holds).
         kian_cli::views::rebuild_views(&store, "bench", 0)
             .await
             .expect("bench view rebuild");
-        store
+        (store, plain_sessions, worker_sessions)
     });
+    let (store, plain_sessions, worker_sessions) = store;
 
     let mut group = c.benchmark_group("views");
     group
-        .sample_size(30)
-        .measurement_time(Duration::from_secs(6));
-
-    let now = 1_762_000_060_000;
+        .sample_size(sample_size)
+        .measurement_time(measurement_time);
 
     // The board from the fresh view: two small queries + digest + decode.
-    group.bench_function("board_from_view_1k_sessions", |b| {
+    group.bench_function(format!("board_from_view_{tag}"), |b| {
         b.iter(|| {
             runtime.block_on(async {
                 let entries = kian_cli::views::fresh_tickets(&store)
@@ -305,7 +330,7 @@ fn bench_views(c: &mut Criterion) {
 
     // The honest fallback: every stream rebuilt, worker discovery, one
     // pending-inbox query per worker.
-    group.bench_function("board_full_derivation_1k_sessions", |b| {
+    group.bench_function(format!("board_full_derivation_{tag}"), |b| {
         b.iter(|| {
             runtime.block_on(kian_cli::commands::ticket_board(
                 &store,
@@ -315,7 +340,7 @@ fn bench_views(c: &mut Criterion) {
     });
 
     // The usage aggregate from the fresh view vs the full scan.
-    group.bench_function("usage_from_view_1k_sessions", |b| {
+    group.bench_function(format!("usage_from_view_{tag}"), |b| {
         b.iter(|| {
             runtime.block_on(kian_cli::usage_metrics::usage_stats_report(
                 &store,
@@ -324,7 +349,7 @@ fn bench_views(c: &mut Criterion) {
             ))
         })
     });
-    group.bench_function("usage_full_derivation_1k_sessions", |b| {
+    group.bench_function(format!("usage_full_derivation_{tag}"), |b| {
         b.iter(|| {
             runtime.block_on(kian_cli::usage_metrics::usage_stats_report(
                 &store,
@@ -334,15 +359,94 @@ fn bench_views(c: &mut Criterion) {
         })
     });
 
-    // One maintenance rebuild of all four views (the off-serving-path
-    // cost the ticker pays per beat at this store size).
-    group.bench_function("rebuild_maintenance_1k_sessions", |b| {
+    // The pre-R9-10 maintenance beat: one FULL rebuild of all four
+    // views (every stream re-read and re-folded) — the baseline the
+    // incremental ticks are measured against.
+    group.bench_function(format!("rebuild_full_{tag}"), |b| {
+        b.iter(|| runtime.block_on(kian_cli::views::rebuild_views_full(&store, "bench", 0)))
+    });
+
+    // R9-10: the incremental tick on an UNCHANGED store — one heads
+    // scan, one pending scan, four digest verifications, zero folds.
+    group.bench_function(format!("rebuild_incremental_idle_{tag}"), |b| {
         b.iter(|| runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0)))
     });
+
+    // R9-10: the incremental tick after 10 plain sessions grew by one
+    // event each (a non-board change: the ticket rows are republished
+    // verbatim, the board is not re-folded). The appends happen
+    // outside the timed window (iter_custom).
+    {
+        let changed: Vec<SessionId> = plain_sessions.iter().take(10).copied().collect();
+        group.bench_function(format!("rebuild_incremental_10_changed_{tag}"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    runtime.block_on(async {
+                        for sid in &changed {
+                            append_turn_end(&store, *sid).await;
+                        }
+                    });
+                    let start = std::time::Instant::now();
+                    let _ = runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0));
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
+
+    // R9-10: the incremental tick after ONE worker session grew (a
+    // board-relevant change: the whole board re-derives from the
+    // kind-filtered read + worker streams, not from every stream).
+    {
+        let worker = worker_sessions[0];
+        group.bench_function(format!("rebuild_incremental_1_board_changed_{tag}"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    runtime.block_on(async {
+                        append_turn_end(&store, worker).await;
+                    });
+                    let start = std::time::Instant::now();
+                    let _ = runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0));
+                    total += start.elapsed();
+                }
+                total
+            })
+        });
+    }
 
     group.finish();
     runtime.block_on(store.close());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Appends one usage-bearing `turn/end` to a session (the bench's
+/// per-tick change; sessions grow across samples, exactly what a live
+/// store looks like to successive ticks).
+async fn append_turn_end(store: &EventStore, sid: SessionId) {
+    let head = store.head(sid).await.expect("head").next_seq;
+    store
+        .append(
+            sid,
+            Event {
+                seq: head,
+                session: sid,
+                epoch: Epoch(1),
+                ts: 1_762_000_000_000 + head,
+                kind: EventKind::TurnEnd,
+                bytes: json!({"iteration": 0, "outcome": "final_answer",
+                              "usage": {"prompt_tokens": 3, "completion_tokens": 1}}),
+                version: SCHEMA_VERSION,
+            },
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: head,
+            },
+        )
+        .await
+        .expect("bench append");
 }
 
 /// A plain session: created → input → claimed → two usage-bearing turns.
@@ -436,5 +540,5 @@ async fn seed_worker(store: &EventStore, sid: SessionId, w: u64) {
     }
 }
 
-criterion_group!(benches, bench_read_path, bench_views);
+criterion_group!(benches, bench_read_path, bench_views, bench_views_10k);
 criterion_main!(benches);

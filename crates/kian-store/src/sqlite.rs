@@ -728,3 +728,113 @@ pub(crate) async fn view_drop(pool: &SqlitePool, view: &str) -> Result<(), Store
     tx.commit().await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// incremental maintenance reads/writes (R9-10)
+// ---------------------------------------------------------------------------
+
+/// R9-10: one line per live session with its head seq — the view
+/// rebuilder's change detector. Index-only over the events PK (`session,
+/// seq`): no envelope decode, no per-session queries.
+pub(crate) const SESSION_HEADS_SQL: &str =
+    "SELECT session, MAX(seq) FROM events GROUP BY session ORDER BY session ASC";
+
+/// R9-10: pending-eligible inbox counts per session in one grouped read
+/// (the `ticket_stage` view's `pending_inbox` drift check — an inbox row
+/// can become eligible with no append, so heads alone cannot detect it).
+pub(crate) const PENDING_COUNTS_SQL: &str = "SELECT session, COUNT(*) FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 GROUP BY session ORDER BY session ASC";
+
+/// R9-10: per-row upsert for the incremental publication (replaces only
+/// the changed sessions' rows; unchanged rows stay physically in place).
+pub(crate) const VIEW_ROW_UPSERT_SQL: &str = "INSERT INTO view_rows (view, session, row_version, payload)\nVALUES (?1, ?2, ?3, ?4)\nON CONFLICT(view, session) DO UPDATE SET\n    row_version = excluded.row_version,\n    payload = excluded.payload";
+
+pub(crate) const VIEW_ROW_DELETE_ONE_SQL: &str =
+    "DELETE FROM view_rows WHERE view = ?1 AND session = ?2";
+
+/// Every live session's head seq, session-ascending.
+pub(crate) async fn session_heads(pool: &SqlitePool) -> Result<Vec<(String, i64)>, StoreError> {
+    Ok(sqlx::query_as(SESSION_HEADS_SQL).fetch_all(pool).await?)
+}
+
+/// Pending-eligible input counts per session at `now_ms`.
+pub(crate) async fn pending_input_counts(
+    pool: &SqlitePool,
+    now_ms: i64,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    Ok(sqlx::query_as(PENDING_COUNTS_SQL)
+        .bind(now_ms)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Every event of the given kinds across the whole store, `(session,
+/// seq)`-ascending — the ticket board's global fold input without
+/// reading every full stream (the folds ignore all other kinds, so the
+/// derived board is identical by construction). The kind list is a
+/// compile-time constant of the board, never user input.
+pub(crate) async fn events_where_kinds(
+    pool: &SqlitePool,
+    kinds: &[&str],
+) -> Result<Vec<Event>, StoreError> {
+    let placeholders = vec!["?"; kinds.len()].join(", ");
+    let sql = format!(
+        "SELECT session, version, envelope FROM events WHERE kind IN ({placeholders}) \
+         ORDER BY session ASC, seq ASC"
+    );
+    let mut query = sqlx::query_as::<_, (String, i64, String)>(&sql);
+    for kind in kinds {
+        query = query.bind(kind);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (session_col, version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session.0.to_string() != session_col {
+            return Err(StoreError::CorruptRow {
+                session: event.session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// The incremental publication (R9-10): ONE transaction that deletes
+/// the gone sessions' rows, upserts the changed sessions' rows and
+/// flips `view_state` to the new digest + pinned key. Same atomic
+/// shape as [`view_publish`] — a crash leaves the previous complete
+/// version or the new one, never half a view — but the writes are
+/// proportional to the change, not to the row count.
+pub(crate) async fn view_publish_delta(
+    pool: &SqlitePool,
+    p: &crate::views::publish::PublishDelta<'_>,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    for session in p.gone_sessions {
+        sqlx::query(VIEW_ROW_DELETE_ONE_SQL)
+            .bind(p.view)
+            .bind(session)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for row in p.rows {
+        sqlx::query(VIEW_ROW_UPSERT_SQL)
+            .bind(p.view)
+            .bind(&row.session)
+            .bind(se_i64(row.row_version, "view row_version")?)
+            .bind(&row.payload)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(VIEW_STATE_UPSERT_SQL)
+        .bind(p.view)
+        .bind(p.events_total)
+        .bind(p.max_seq)
+        .bind(p.digest)
+        .bind(p.built_at)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}

@@ -34,6 +34,7 @@
 //!
 //! The dialect SQL lives in [`crate::sqlite`] / [`crate::postgres`].
 
+use kian_core::events::Event;
 use sha2::{Digest, Sha256};
 
 use crate::event_store::{EventStore, StoreError, to_i64};
@@ -256,6 +257,87 @@ impl EventStore {
             EventStore::Postgres(pool) => crate::postgres::view_drop(pool, view).await,
         }
     }
+
+    /// R9-10 (incremental rebuild): every live session's head seq in
+    /// one index-only aggregate — the change detector's whole-store
+    /// read. A stored view row whose `row_version` equals the live
+    /// head covers an identical stream (streams are append-only under
+    /// CAS guards, so the head determines the stream), which is what
+    /// makes row reuse sound.
+    pub async fn session_heads(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        let heads = match self {
+            EventStore::Sqlite(pool) => crate::sqlite::session_heads(pool).await,
+            EventStore::Postgres(pool) => crate::postgres::session_heads(pool).await,
+        }?;
+        Ok(heads
+            .into_iter()
+            .map(|(session, head)| (session, head.max(0) as u64))
+            .collect())
+    }
+
+    /// R9-10: pending-eligible inbox counts per session in one grouped
+    /// read — the `ticket_stage` drift check (`pending_inbox` moves
+    /// with `eligible_at` alone, no append).
+    pub async fn pending_input_counts(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        let counts = match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::pending_input_counts(pool, to_i64(now_ms, "pending counts now_ms")?)
+                    .await
+            }
+            EventStore::Postgres(pool) => crate::postgres::pending_input_counts(pool, now_ms).await,
+        }?;
+        Ok(counts
+            .into_iter()
+            .map(|(session, count)| (session, count.max(0) as u64))
+            .collect())
+    }
+
+    /// R9-10: every event of `kinds` across the whole store,
+    /// `(session, seq)`-ascending — the ticket board's global fold
+    /// input (the board folds ignore every other kind, so deriving
+    /// from this read equals deriving from all full streams). `kinds`
+    /// is the board's compile-time kind set, never user input.
+    pub async fn events_where_kinds(&self, kinds: &[&str]) -> Result<Vec<Event>, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::events_where_kinds(pool, kinds).await,
+            EventStore::Postgres(pool) => crate::postgres::events_where_kinds(pool, kinds).await,
+        }
+    }
+
+    /// R9-10: the incremental publication — ONE transaction that
+    /// deletes the gone sessions' rows, upserts the changed sessions'
+    /// rows and flips `view_state` to the digest over the MERGED row
+    /// set at the pinned key. Same atomic version-flip guarantee as
+    /// [`EventStore::view_publish`] (a crash leaves the previous
+    /// complete version or the new one); the caller owns computing the
+    /// merged digest, exactly the bytes a full publish of the same set
+    /// would record.
+    pub async fn view_publish_delta(
+        &self,
+        view: &str,
+        rows: &[ViewRow],
+        gone_sessions: &[String],
+        digest: &str,
+        key: StoreKey,
+        built_at: u64,
+    ) -> Result<(), StoreError> {
+        let payload = crate::views::publish::PublishDelta {
+            view,
+            rows,
+            gone_sessions,
+            events_total: to_i64(key.events_total, "view events_total")?,
+            max_seq: to_i64(key.max_seq, "view max_seq")?,
+            digest,
+            built_at: to_i64(built_at, "view built_at")?,
+        };
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::view_publish_delta(pool, &payload).await,
+            EventStore::Postgres(pool) => crate::postgres::view_publish_delta(pool, &payload).await,
+        }
+    }
 }
 
 /// The cross-backend publication payload (dialect functions bind it).
@@ -265,6 +347,19 @@ pub(crate) mod publish {
     pub(crate) struct Publish<'a> {
         pub view: &'a str,
         pub rows: &'a [ViewRow],
+        pub events_total: i64,
+        pub max_seq: i64,
+        pub digest: &'a str,
+        pub built_at: i64,
+    }
+
+    /// The incremental publication payload (R9-10): only the changed
+    /// rows are upserted and the gone sessions' rows deleted, in one
+    /// transaction with the state flip.
+    pub(crate) struct PublishDelta<'a> {
+        pub view: &'a str,
+        pub rows: &'a [ViewRow],
+        pub gone_sessions: &'a [String],
         pub events_total: i64,
         pub max_seq: i64,
         pub digest: &'a str,
