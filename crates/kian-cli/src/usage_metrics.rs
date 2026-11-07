@@ -245,6 +245,22 @@ pub async fn run_usage_stats(
             .await
             .map_err(|e| format!("store: {e}"))?
     };
+    // Archived first (R7, R9-08 F3): a per-session read must never
+    // silently zero-report a session whose data left the online store.
+    if let Some(session) = session
+        && let Some(m) = store
+            .archived_session(session)
+            .await
+            .map_err(|e| format!("archive marker read: {e}"))?
+    {
+        store.close().await;
+        return Err(format!(
+            "session {} is archived (online rows removed; package {}): \
+             its usage history lives in the package — restore it first — \
+             kian session import {} --db <fresh.sqlite>",
+            session.0, m.package_path, m.package_path
+        ));
+    }
     let report = usage_stats_report(&store, session, config.read_model.views.enabled)
         .await
         .map_err(|e| format!("usage stats: {e}"))?;

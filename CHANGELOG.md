@@ -593,3 +593,40 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   boundary and the allowlist is explicit ids only. READ-MODEL §4.2 landed shape + §11 P3
   `planned` → `landed` + header; API-CONTRACT §1/§5.3/§5.4/§6/§10.2. No new event kind; the
   planned `read` metrics object remains planned (P0-owned surface).
+- **Read model review R9-08 fixes — package identity, archived aggregate reads, snapshot trust
+  (R9-08a)** — default-green. Fixes the three findings of the round-9 independent review
+  (REQUEST-CHANGES; fix card opened from it). **F1 package identity:**
+  `session import`/`archive verify` now refuse a package whose rows name a different session
+  than its manifest — `verify_package` cross-checks every `events.jsonl` event's and every
+  `inputs.jsonl` row's `session` against `manifest.session`, refusing with the line number and
+  both session ids (the manifest is not self-hashed, so hand-editing `session` alone passed
+  every hash check; a hash-consistent identity-inconsistent package previously imported,
+  restoring events under one id while reporting another). `verify_package` now returns the
+  parsed rows (`VerifiedPackage`) and `run_import` appends exactly those rows — the files are
+  never re-read after verification (the verify/use gap is closed). **F3 archived aggregate
+  reads:** `usage-stats --session` and `cache-stats --session` check the archived marker first
+  and refuse with the package path and import guidance — never a silent zero report (R7's
+  "any read whose range touches archived data MUST report `archived` explicitly";
+  READ-MODEL §7 read behavior updated). Whole-store aggregates are unchanged (online window
+  only). **F2 snapshot trust documented:** READ-MODEL §5 gains the explicit trust boundary —
+  load-time verification is builder attestation + digest↔columns integrity; a
+  poisoned-but-self-consistent row (columns rewritten together with a recomputed
+  `kian-snapshot-v1` digest, `verified=1`) is not detectable at load and is served; the table
+  sits inside the same trust boundary as `events`, must never be copied between stores, and
+  drop/rebuild from the stream is always safe. This corrects the P1 entry's wording above:
+  `corrupt_unverified_and_tampered_snapshots_are_ignored` covers digest-stale tampering (and
+  unverified rows) only — it is not a general tamper guarantee, and the new
+  `self_consistent_poisoned_snapshot_is_served_builder_attestation_only` pins the documented
+  (served) behaviour so the claim and the test agree. No Merkle/proof mechanism (a deliberate
+  non-goal). Executed evidence: `import_refuses_an_identity_inconsistent_package` (a
+  hash-consistent forged package refused by `archive verify` on the manifest's own id AND by
+  `session import`; the target store stays empty; the honest package still verifies),
+  `usage_stats_refuses_an_archived_session`, `cache_stats_refuses_an_archived_session`
+  (kian-cli e2e; both also pin that the whole-store report is unaffected — red before the fix:
+  the same commands returned all-zero reports / accepted the forged package),
+  `self_consistent_poisoned_snapshot_is_served_builder_attestation_only` (kian-orchestrator).
+  **F5 note (SDK compat):** `SseFrame` (`kian-sdk/src/sse.rs`) is not `#[non_exhaustive]`;
+  marking it is itself a source-compat change for downstream exhaustive matches, so the
+  decision is deliberately deferred to the SDK freeze — downstream matches should carry a `_`
+  arm meanwhile. Docs drift (F4) and default-on maintenance cost (F6) are owned by follow-up
+  cards, not this change. No new event kind; no wire change; no migration.

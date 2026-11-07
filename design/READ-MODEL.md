@@ -175,6 +175,18 @@ Landed shape (P3):
   result. If verification metadata is missing, replay fails, or the tail exceeds the configured
   cap, the reader MUST rebuild from the stream (honest fallback) — never serve a partially
   applied snapshot.
+- **Trust boundary (R9-08).** Load-time verification is **builder attestation + digest↔columns
+  integrity**, nothing more: the `verified` flag and the digest are written by the builder the
+  table already trusts, so a row whose stored columns were rewritten *together with a recomputed
+  digest* (a poisoned-but-self-consistent row) is **not detectable at load and is served** — the
+  loader cannot distinguish it from an honest build. This is the documented behaviour
+  (`self_consistent_poisoned_snapshot_is_served_builder_attestation_only`); the
+  "corrupt/unverified/tampered snapshots are ignored" guarantee covers exactly the rows whose
+  digest is stale or whose `verified` flag is clear. Consequences: `projection_snapshots` sits
+  inside the same trust boundary as the `events` table itself (whoever can poison one can poison
+  the other — there is nothing extra to gain); the table MUST never be copied between stores or
+  restored from an untrusted dump; dropping and rebuilding it from the stream is always safe. No
+  Merkle/proof mechanism is planned (§12 non-goal).
 - **Crash and rollback.** Build-verify-publish is insert-only; orphans are GC-able. Disabling the
   builder (config) makes all snapshots invisible; the stream is unaffected.
 
@@ -252,9 +264,12 @@ Rules:
 - **Read behavior.** Any read of an archived session returns the explicit `archived` error
   (`API-CONTRACT` code). `session inspect` reports archived plus the package path;
   `session export` reads the package and MUST be byte-identical; `session replay` refuses online
-  replay with import guidance.
+  replay with import guidance. The per-session aggregate reads (`usage-stats --session`,
+  `cache-stats --session`) refuse with the archived marker and import guidance — never a silent
+  zero report (R7; R9-08 F3). Whole-store aggregates report the online window only.
 - **Import.** `kian session import <package>` verifies the manifest, then restores the session
-  into a store for replay/forensics; a corrupt package or an existing session id is refused.
+  into a store for replay/forensics; a corrupt package, a package whose rows name a different
+  session than its manifest (package identity), or an existing session id is refused.
 - **Invariant amendment.** The inbox is audit-visible via the online store **or a verified
   archive package** — superseding the current "audit-visible forever in the store" wording
   (`crates/kian-store/src/inbox.rs`, `migrations.rs` comments) in the same change.
@@ -287,10 +302,14 @@ Landed shape (P2b):
   the planned `-32005` had been taken by the round-8 memory registry) with package guidance.
   `session inspect` reports archived + the package path; `session export` serves the package
   byte-identically (hashes re-verified on the way out); `session replay` refuses online replay
-  with import guidance.
-- **Import.** `kian session import <package>` verifies the manifest, refuses a corrupt package
-  or an existing session id, and restores the events (under their own epoch/seq) and the full
-  input rows into the target store — the restored stream projects and re-exports identically.
+  with import guidance; the per-session aggregate reads (`usage-stats --session`,
+  `cache-stats --session`) refuse the same way (R9-08 F3 — never a silent zero report).
+- **Import.** `kian session import <package>` verifies the manifest, refuses a corrupt package,
+  a package whose rows name a different session than its manifest (every event and input row's
+  session is cross-checked against `manifest.session`; the manifest is not self-hashed, so
+  identity is a first-class check), or an existing session id, and restores the events (under
+  their own epoch/seq) and the full input rows — exactly the rows verification replayed, never a
+  re-read — into the target store; the restored stream projects and re-exports identically.
 - **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass
   (the round-9 plan's non-goal list keeps cron cadence out of scope).
 

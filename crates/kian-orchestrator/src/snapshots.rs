@@ -995,6 +995,70 @@ mod tests {
         cleanup(&path);
     }
 
+    /// R9-08 F2: the documented trust assumption, pinned honestly. A row
+    /// poisoned together with its digest (self-consistent, `verified=1`)
+    /// is NOT detectable at load — load-time verification is builder
+    /// attestation + digest↔columns integrity (READ-MODEL §5 trust
+    /// boundary). This test asserts the documented behaviour (the row is
+    /// SERVED) so no reader mistakes `..._are_ignored` above for a
+    /// general tamper guarantee. The table must live inside the same
+    /// trust boundary as `events` and never be copied between stores.
+    #[tokio::test]
+    async fn self_consistent_poisoned_snapshot_is_served_builder_attestation_only() {
+        let path = temp_db_path();
+        let store = EventStore::open(&path).await.expect("open");
+        let sid = SessionId(Uuid::new_v4());
+        seed_random(&store, sid, 30, 5, 0).await;
+        build_snapshot(&store, sid, &build_cfg(1), "builder", 1_000)
+            .await
+            .expect("build");
+        let version = store.version(sid).await.unwrap();
+        let truth = load_projection(&store, sid, version, &ReadModelConfig::default())
+            .await
+            .expect("truth");
+
+        if let EventStore::Sqlite(pool) = &store {
+            // Poison the state column AND recompute the digest over the
+            // stored columns with the documented `kian-snapshot-v1`
+            // recipe — the row is now internally consistent and attested.
+            let (context, provenance): (String, String) = sqlx::query_as(
+                "SELECT context, context_provenance FROM projection_snapshots WHERE session = ?",
+            )
+            .bind(sid.0.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let poisoned_state = r#"{"state":"completed","episode_end":null}"#.to_string();
+            let digest = snapshot_digest(&poisoned_state, &context, &provenance);
+            sqlx::query(
+                "UPDATE projection_snapshots SET state = ?, digest = ?, verified = 1 WHERE session = ?",
+            )
+            .bind(&poisoned_state)
+            .bind(&digest)
+            .bind(sid.0.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+
+            let loaded = load_projection(&store, sid, version, &enabled_read())
+                .await
+                .expect("load");
+            assert_eq!(
+                loaded.from_snapshot,
+                Some(version),
+                "documented behaviour: a self-consistent attested row is served"
+            );
+            assert_eq!(loaded.state, SessionState::Completed);
+            assert_ne!(
+                loaded.state, truth.state,
+                "the poison changed the answer — this is exactly why the table must stay inside the events trust boundary"
+            );
+        }
+
+        store.close().await;
+        cleanup(&path);
+    }
+
     /// A tail beyond the configured cap skips the snapshot (full
     /// rebuild) — the cap bounds replay work.
     #[tokio::test]

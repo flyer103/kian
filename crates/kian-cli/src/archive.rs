@@ -141,10 +141,10 @@ pub async fn write_package(
     // A verified package already on disk: keep it (retry after a crash
     // between write and commit must not churn bytes).
     if dir.join("manifest.json").is_file()
-        && let Ok((d, m)) = verify_package(&dir, Some(session)).await
-        && m.event_count == events.len() as u64
+        && let Ok(pkg) = verify_package(&dir, Some(session)).await
+        && pkg.manifest.event_count == events.len() as u64
     {
-        return Ok((d, m));
+        return Ok((pkg.dir, pkg.manifest));
     }
 
     let inputs = store
@@ -194,13 +194,27 @@ pub async fn write_package(
     Ok((dir, manifest))
 }
 
+/// A fully verified package: the manifest plus the exact rows
+/// verification replayed. [`run_import`] appends **these** rows — the
+/// files are never re-read after verification (no verify/use gap).
+#[derive(Debug)]
+pub struct VerifiedPackage {
+    pub dir: PathBuf,
+    pub manifest: ArchiveManifest,
+    pub events: Vec<Event>,
+    pub inputs: Vec<kian_store::ArchivedInput>,
+}
+
 /// Phase 2 — verify a package: hashes recomputed, every line re-parsed,
-/// counts and seq bounds cross-checked against the manifest. `None` on
-/// success is impossible; errors are honest refusals naming the file.
+/// **every row's session cross-checked against the manifest's** (the
+/// manifest is not self-hashed, so identity is a first-class check, not
+/// a hash side effect — R9-08 F1), and counts and seq bounds
+/// cross-checked against the manifest. Errors are honest refusals
+/// naming the file and line.
 pub async fn verify_package(
     dir: &Path,
     expect_session: Option<SessionId>,
-) -> Result<(PathBuf, ArchiveManifest), String> {
+) -> Result<VerifiedPackage, String> {
     let manifest_bytes = std::fs::read(dir.join("manifest.json"))
         .map_err(|e| format!("read {}: {e}", dir.join("manifest.json").display()))?;
     let manifest: ArchiveManifest = serde_json::from_slice(&manifest_bytes)
@@ -249,7 +263,8 @@ pub async fn verify_package(
         ));
     }
 
-    // Replay: every line must parse as its typed row, and the counts /
+    // Replay: every line must parse as its typed row, every row must
+    // name the manifest's session (package identity), and the counts /
     // seq bounds must agree with the manifest — no silent truncation.
     let events_text = String::from_utf8(events_bytes).map_err(|e| format!("events.jsonl: {e}"))?;
     let mut events: Vec<Event> = Vec::new();
@@ -259,6 +274,15 @@ pub async fn verify_package(
         }
         let e: Event = serde_json::from_str(line)
             .map_err(|e| format!("events.jsonl line {}: not an event envelope: {e}", i + 1))?;
+        if e.session.0.to_string() != manifest.session {
+            return Err(format!(
+                "events.jsonl line {}: row session {} does not match manifest session {} \
+                 (package identity mismatch)",
+                i + 1,
+                e.session.0,
+                manifest.session
+            ));
+        }
         events.push(e);
     }
     if events.len() as u64 != manifest.event_count {
@@ -277,26 +301,41 @@ pub async fn verify_package(
         ));
     }
     let inputs_text = String::from_utf8(inputs_bytes).map_err(|e| format!("inputs.jsonl: {e}"))?;
-    let mut inputs = 0u64;
+    let mut input_rows: Vec<kian_store::ArchivedInput> = Vec::new();
     for (i, line) in inputs_text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        serde_json::from_str::<kian_store::ArchivedInput>(line).map_err(|e| {
+        let r: kian_store::ArchivedInput = serde_json::from_str(line).map_err(|e| {
             format!(
                 "inputs.jsonl line {}: not an archived input row: {e}",
                 i + 1
             )
         })?;
-        inputs += 1;
+        if r.session.0.to_string() != manifest.session {
+            return Err(format!(
+                "inputs.jsonl line {}: row session {} does not match manifest session {} \
+                 (package identity mismatch)",
+                i + 1,
+                r.session.0,
+                manifest.session
+            ));
+        }
+        input_rows.push(r);
     }
-    if inputs != manifest.input_count {
+    if input_rows.len() as u64 != manifest.input_count {
         return Err(format!(
-            "inputs.jsonl holds {inputs} rows, manifest says {}",
+            "inputs.jsonl holds {} rows, manifest says {}",
+            input_rows.len(),
             manifest.input_count
         ));
     }
-    Ok((dir.to_path_buf(), manifest))
+    Ok(VerifiedPackage {
+        dir: dir.to_path_buf(),
+        manifest,
+        events,
+        inputs: input_rows,
+    })
 }
 
 /// The manifest's sha256 (the marker's package identity).
@@ -454,8 +493,8 @@ async fn archive_one(
     // kept byte-for-byte).
     let (dir, manifest) = write_package(store, root, c.session, &c.terminal_state).await?;
     // Phase 2: verify the package on disk.
-    let (_, verified) = verify_package(&dir, Some(c.session)).await?;
-    if verified != manifest {
+    let pkg = verify_package(&dir, Some(c.session)).await?;
+    if pkg.manifest != manifest {
         return Err("package changed under the writer".into());
     }
     // Byte-parity: the package's events file equals a fresh derivation
@@ -519,7 +558,9 @@ pub async fn run_archive_verify(
             package_dir(Path::new(&config.retention.archive_dir), session)
         }
     };
-    let (dir, manifest) = verify_package(&dir, Some(session)).await?;
+    let pkg = verify_package(&dir, Some(session)).await?;
+    let dir = pkg.dir;
+    let manifest = pkg.manifest;
 
     // Online cross-check when the rows are still there.
     let online = store
@@ -587,11 +628,13 @@ pub async fn run_import(
             package.display()
         ));
     }
-    let (_, manifest) = verify_package(package, None).await?;
-    let sid: uuid::Uuid = manifest
-        .session
-        .parse()
-        .map_err(|e| format!("manifest session `{}` is not a uuid: {e}", manifest.session))?;
+    let pkg = verify_package(package, None).await?;
+    let sid: uuid::Uuid = pkg.manifest.session.parse().map_err(|e| {
+        format!(
+            "manifest session `{}` is not a uuid: {e}",
+            pkg.manifest.session
+        )
+    })?;
     let session = SessionId(sid);
 
     // The target: an explicit --db, else the config's sqlite path.
@@ -639,17 +682,12 @@ pub async fn run_import(
         ));
     }
 
-    // Restore events under their own epoch/seq (the import_jsonl
-    // doctrine) and the full input rows verbatim.
-    let events_text = std::fs::read_to_string(package.join("events.jsonl"))
-        .map_err(|e| format!("read events.jsonl: {e}"))?;
+    // Restore the EXACT rows verification replayed (under their own
+    // epoch/seq — the import_jsonl doctrine) and the full input rows
+    // verbatim. The files are never re-read after verification: what
+    // was verified is what is appended (no verify/use gap, R9-08 F1).
     let mut restored = 0u64;
-    for (i, line) in events_text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Event =
-            serde_json::from_str(line).map_err(|e| format!("events.jsonl line {}: {e}", i + 1))?;
+    for (i, event) in pkg.events.iter().enumerate() {
         store
             .append(
                 event.session,
@@ -660,31 +698,22 @@ pub async fn run_import(
                 },
             )
             .await
-            .map_err(|e| format!("line {}: append: {e}", i + 1))?;
+            .map_err(|e| format!("events.jsonl line {}: append: {e}", i + 1))?;
         restored += 1;
     }
-    let inputs_text = std::fs::read_to_string(package.join("inputs.jsonl"))
-        .map_err(|e| format!("read inputs.jsonl: {e}"))?;
-    let mut inputs: Vec<kian_store::ArchivedInput> = Vec::new();
-    for line in inputs_text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        inputs.push(serde_json::from_str(line).map_err(|e| format!("inputs.jsonl row: {e}"))?);
-    }
     let inputs_restored = store
-        .archive_inputs_insert(&inputs)
+        .archive_inputs_insert(&pkg.inputs)
         .await
         .map_err(|e| format!("restore inputs: {e}"))?;
     store.close().await;
 
     let report = json!({
-        "session": manifest.session,
+        "session": pkg.manifest.session,
         "package": package.display().to_string(),
         "target": target.display().to_string(),
         "events_restored": restored,
         "inputs_restored": inputs_restored,
-        "terminal_state": manifest.terminal_state,
+        "terminal_state": pkg.manifest.terminal_state,
     });
     if json {
         return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
@@ -695,7 +724,7 @@ pub async fn run_import(
         inputs_restored,
         session.0,
         target.display(),
-        manifest.terminal_state,
+        pkg.manifest.terminal_state,
         session.0,
         target.display()
     ))

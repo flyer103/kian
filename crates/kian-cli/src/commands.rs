@@ -683,7 +683,9 @@ async fn export_from_package(
     with_event_ids: bool,
 ) -> CmdResult<String> {
     let dir = std::path::Path::new(&m.package_path);
-    let (_, manifest) = crate::archive::verify_package(dir, Some(session)).await?;
+    let manifest = crate::archive::verify_package(dir, Some(session))
+        .await?
+        .manifest;
     let since = since.unwrap_or(1);
     let until = until.unwrap_or(u64::MAX);
     let text = std::fs::read_to_string(dir.join("events.jsonl"))

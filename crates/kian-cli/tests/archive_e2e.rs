@@ -425,6 +425,157 @@ async fn eligibility_is_terminal_only_and_window_respected() {
     let _ = std::fs::remove_dir_all(&cfg_dir);
 }
 
+/// F1 (R9-08): a package whose rows name a different session than its
+/// manifest is refused by BOTH verify and import. The manifest is not
+/// self-hashed, so hand-editing `manifest.session` alone passes every
+/// hash check — identity is a first-class refusal, not a hash side
+/// effect. The forged package keeps every hash consistent (only the
+/// manifest's `session` field and the directory name change), so this
+/// exercises the identity check alone.
+#[tokio::test]
+async fn import_refuses_an_identity_inconsistent_package() {
+    let db = temp_db("identity");
+    let archive_root = temp_dir("identity-root");
+    let cfg_dir = temp_dir("identity-cfg");
+    let store = EventStore::open(&db).await.expect("open");
+    let sid = seed_terminal(&store, true).await;
+    store.close().await;
+    let config = write_config(&cfg_dir, &db, &retention_yaml(&archive_root, 0));
+
+    // Phase 1 only: an honest package on disk for `sid` (no commit).
+    let writer = EventStore::open(&db).await.unwrap();
+    let (dir, _) = kian_cli::archive::write_package(&writer, &archive_root, sid, "completed")
+        .await
+        .expect("write package");
+    writer.close().await;
+
+    // Forge: identical events/inputs bytes (both file hashes and the
+    // aggregate still match), manifest renamed to another session, and
+    // the package directory renamed to match the forged id — every
+    // pre-R9-08 check passes on this package.
+    let forged = SessionId::new();
+    let forged_dir = archive_root.join(forged.0.to_string());
+    std::fs::create_dir_all(&forged_dir).unwrap();
+    std::fs::copy(dir.join("events.jsonl"), forged_dir.join("events.jsonl")).unwrap();
+    std::fs::copy(dir.join("inputs.jsonl"), forged_dir.join("inputs.jsonl")).unwrap();
+    let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+    let forged_manifest = manifest.replace(
+        &format!("\"session\": \"{}\"", sid.0),
+        &format!("\"session\": \"{}\"", forged.0),
+    );
+    assert_ne!(
+        manifest, forged_manifest,
+        "the manifest session field must be rewritten"
+    );
+    std::fs::write(forged_dir.join("manifest.json"), &forged_manifest).unwrap();
+
+    // `archive verify` on the manifest's OWN id refuses.
+    let err = kian_cli::archive::run_archive_verify(&config, None, forged, false)
+        .await
+        .expect_err("verify must refuse the identity-inconsistent package");
+    assert!(err.contains("does not match manifest session"), "{err}");
+
+    // `session import` refuses, and the target store stays empty —
+    // nothing restored under either the rows' session or the manifest's.
+    let fresh = temp_db("identity-import");
+    let err = kian_cli::archive::run_import(&forged_dir, Some(&fresh), &config, false)
+        .await
+        .expect_err("import must refuse the identity-inconsistent package");
+    assert!(err.contains("does not match manifest session"), "{err}");
+    // The refusal fires before the target store is even touched: the
+    // file was never created (or, if a stale file existed, holds
+    // nothing under either session id).
+    if fresh.exists() {
+        assert!(
+            online_events(&fresh, sid).await.is_empty(),
+            "nothing may be restored under the rows' session"
+        );
+        let probe = EventStore::open_read_only(&fresh).await.unwrap();
+        assert_eq!(
+            probe.version(forged).await.unwrap(),
+            0,
+            "nothing under the manifest's session either"
+        );
+        probe.close().await;
+    }
+    cleanup_db(&fresh);
+
+    // The honest package is untouched by the forgery: it still verifies.
+    let out = kian_cli::archive::run_archive_verify(&config, None, sid, false)
+        .await
+        .expect("the honest package still verifies");
+    assert!(out.contains("verified"), "{out}");
+
+    cleanup_db(&db);
+    let _ = std::fs::remove_dir_all(&archive_root);
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+}
+
+/// F3 (R9-08): `usage-stats --session` must not silently zero-report an
+/// archived session — R7's explicit `archived` signal with import
+/// guidance, the same class of refusal as `session replay`.
+#[tokio::test]
+async fn usage_stats_refuses_an_archived_session() {
+    let db = temp_db("arch-usage");
+    let archive_root = temp_dir("arch-usage-root");
+    let cfg_dir = temp_dir("arch-usage-cfg");
+    let store = EventStore::open(&db).await.expect("open");
+    let sid = seed_terminal(&store, false).await;
+    store.close().await;
+    let config = write_config(&cfg_dir, &db, &retention_yaml(&archive_root, 0));
+    kian_cli::archive::run_archive_run(&config, None, false)
+        .await
+        .expect("archive");
+
+    let err = kian_cli::usage_metrics::run_usage_stats(&config, Some(sid), false)
+        .await
+        .expect_err("usage-stats must report archived, not zeros");
+    assert!(err.contains("is archived"), "{err}");
+    assert!(err.contains("session import"), "import guidance: {err}");
+
+    // The whole-store report (no per-session range) is unaffected.
+    let ok = kian_cli::usage_metrics::run_usage_stats(&config, None, false)
+        .await
+        .expect("whole-store report still works");
+    assert!(ok.contains("sessions"), "{ok}");
+
+    cleanup_db(&db);
+    let _ = std::fs::remove_dir_all(&archive_root);
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+}
+
+/// F3 (R9-08): `cache-stats --session` — same archived refusal as
+/// usage-stats (both per-session aggregate reads answer R7's signal).
+#[tokio::test]
+async fn cache_stats_refuses_an_archived_session() {
+    let db = temp_db("arch-cache");
+    let archive_root = temp_dir("arch-cache-root");
+    let cfg_dir = temp_dir("arch-cache-cfg");
+    let store = EventStore::open(&db).await.expect("open");
+    let sid = seed_terminal(&store, false).await;
+    store.close().await;
+    let config = write_config(&cfg_dir, &db, &retention_yaml(&archive_root, 0));
+    kian_cli::archive::run_archive_run(&config, None, false)
+        .await
+        .expect("archive");
+
+    let err = kian_cli::cache_metrics::run_cache_stats(&config, Some(sid), false)
+        .await
+        .expect_err("cache-stats must report archived, not zeros");
+    assert!(err.contains("is archived"), "{err}");
+    assert!(err.contains("session import"), "import guidance: {err}");
+
+    // The whole-store report (no per-session range) is unaffected.
+    let ok = kian_cli::cache_metrics::run_cache_stats(&config, None, false)
+        .await
+        .expect("whole-store report still works");
+    assert!(ok.contains("sessions"), "{ok}");
+
+    cleanup_db(&db);
+    let _ = std::fs::remove_dir_all(&archive_root);
+    let _ = std::fs::remove_dir_all(&cfg_dir);
+}
+
 /// `session import` refuses an existing session id — never merges,
 /// never overwrites.
 #[tokio::test]
