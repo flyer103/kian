@@ -165,6 +165,10 @@ change (§15).
 
 - The adapter resolves the **latest** `context_token` it has seen for that `user_id` (§5) and
   builds the §2.4 payload. `client_id` is generated per delivery.
+- **Recipient allowlist.** The `target.user_id` must be a key of the channel's `topics` table
+  (§9): a delivery naming any other user is an honest `DeliveryFailed` naming the allowlist —
+  never a silent send, and never wire traffic. The reply target is model-controlled, so this
+  check is a security boundary, not a convenience.
 - Resolve only on `ret == 0`: a receipt is minted from the response `message_id` (numeric ids
   stringified losslessly); a `ret == 0` response without one falls back to the request `client_id`
   we generated — never an invented server id.
@@ -180,8 +184,11 @@ change (§15).
 ## 5. The `context_token` rule
 
 1. The adapter caches, **in memory only**, the latest `context_token` per `(channel, from_user_id)`,
-   updated from every inbound message **before** the event is fanned out to subscribers. The cache
-   is transport state: not persisted, not an event, rebuilt by the next inbound message.
+   updated from every **admitted** inbound message — one whose sender passed the §3 allowlist —
+   **before** the event is fanned out to subscribers. A message from a non-allowlisted sender
+   updates nothing: its `context_token` is never cached, so a sender the allowlist rejected never
+   becomes a reachable recipient. The cache is transport state: not persisted, not an event,
+   rebuilt by the next admitted inbound message.
 2. A send always echoes the latest token seen for that user — the official client's behaviour.
    Kian does not attempt to bind a reply to one specific inbound message id.
 3. **No token ⇒ no send.** A user we have never received from cannot be reached; the adapter
@@ -209,7 +216,9 @@ rename) at the configured `credentials_file` path:
 
 - **Location** is an explicit config path (`credentials_file`), required for a configured channel.
   Never inside `kian.yaml`, never in git, never in the repo working tree by default (the README
-  example uses `./.state/`, a path the operator gitignores).
+  example uses `./.state/`, a path the operator gitignores). A relative `credentials_file` resolves
+  against the process working directory — run `kian serve` and `kian wechat login` from the same
+  directory, or use an absolute path. A parent directory created by the write is mode `0700`.
 - **Never an environment variable.** This is the one deliberate deviation from the
   static-secret/env-only rule: the token is *issued* by a QR flow and *rotates* by re-login, so a
   deployment-time env var would be stale by construction. The deviation, its blast radius and its
@@ -245,7 +254,7 @@ Validation (all fail-closed at startup, each naming the offending key):
 | single channel | at most one `type: wechat` per config (mirrors the single-`github` rule) |
 | `topics` | required and non-empty; each key is a `from_user_id`, each value a routing topic |
 | `credentials_file` | required; missing/unreadable/malformed file refuses startup naming `kian wechat login` |
-| `api_base` | defaults to `https://ilinkai.weixin.qq.com`; must parse as an https URL |
+| `api_base` | defaults to `https://ilinkai.weixin.qq.com`; must be an `http(s)://` URL with a non-empty host — `https` in production; plain `http://` is accepted deliberately so local mock-iLink tests and deployments work |
 | `poll_timeout_ms` | optional; defaults above the server's ~35 s hold |
 | cross-references | every `subscriptions[].channel`, `speak_rules[].channel`, `untrusted_channels[]` and `intake.thread_keys[].channel` naming this channel keeps validating |
 | trust | the channel is **forced** untrusted; the config cannot turn the marker off (§9) |
@@ -264,14 +273,17 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 - Runs the QR flow: fetch the QR (`get_bot_qrcode`), print `qrcode_img_content` as the URL to open
   in WeChat, then long-poll `get_qrcode_status`.
 - Handles every status of §2.1: `wait` (keep polling), `scaned` (keep polling), `scaned_but_redirect`
-  (switch to `redirect_host` and continue), `need_verifycode`/`verify_code_blocked` (prompt the
-  operator for the code), `binded_redirect` (treat as success only when a token is present, else an
-  error), `confirmed` (write the file), `expired` (re-fetch the QR, bounded refresh count, then
-  fail).
+  (switch to `redirect_host` and continue), `need_verifycode`/`verify_code_blocked` (instruct the
+  operator — the code is entered on the phone; there is no code-submit endpoint in the frozen
+  facts, so the flow keeps polling), `binded_redirect` (treat as success only when a token is
+  present, else an error), `confirmed` (write the file), `expired` (re-fetch the QR, bounded
+  refresh count, then fail).
 - Writes the credential file atomically with mode `0600`; prints account/user ids and the resolved
   path — never the token.
-- Exit code is non-zero on any failure (network, timeout, expiry, unwritable path) with a clear
-  message; `--json` prints one machine-readable object (status, ids, credential path, no token).
+- Exit code is non-zero on any failure (network, transport failure, expiry, unwritable path) with
+  a clear message; `--json` prints one machine-readable object (status, ids, credential path, no
+  token). A client-side timeout on the ~35 s status long-poll is **not** a failure: it is treated
+  as `wait` and re-polled (§11).
 - Serve never performs the login flow: a configured channel without a usable credential file
   refuses to start and names this command.
 
@@ -279,6 +291,12 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 
 - **Allowlist first.** `topics` is the receive allowlist: a message from a `from_user_id` that is
   not a key of the table is dropped with an audit line before any mapping (§3 rule 4).
+- **The send target must be an allowlisted user.** The send path enforces the same `topics`
+  table the receive path enforces: a `ChannelDelivery` whose `target.user_id` is not a key of
+  `topics` is an honest `DeliveryFailed` naming the allowlist, before any token lookup or wire
+  traffic (§4). Together with §5.1 (tokens are cached only for admitted senders) this makes the
+  allowlist bidirectional: a model-controlled reply target can only ever be an operator-approved
+  user, so a prompt-injected reply cannot exfiltrate to a sender the operator never admitted.
 - **Untrusted by default, forced.** The channel is added to the assembly's `runtime_untrusted_set`,
   so every admitted input carries the `"untrusted": true` provenance marker and the judge/reasoner
   treats the text as data, never instructions. WeChat text is attacker-controllable by definition;
@@ -311,7 +329,7 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 | Condition | Detection | Behavior | Blast radius |
 |---|---|---|---|
 | Stale bot token | `errcode == -14` | Pause **all** iLink requests for 1 h (mirroring the official client), audit line, sends return `Unavailable` naming `kian wechat login`; poll the credential file's mtime (≤5 s) and resume on change | this channel only |
-| Client-side long-poll timeout | client timeout at `poll_timeout_ms` | Normal and expected (the server holds the request): return an empty batch and re-poll; no backoff, no audit noise above debug | this channel only |
+| Client-side long-poll timeout | client timeout at `poll_timeout_ms` | Normal and expected (the server holds the request): return an empty batch and re-poll; no backoff, no audit noise above debug. Applies to the `getupdates` receive poll **and** the `get_qrcode_status` login long-poll alike — a timed-out status poll is treated as `wait` and re-polled, never a fatal login error | this channel only |
 | `ret != 0` / other `errcode` | response fields | Backoff 2 s doubling to a 30 s cap, audit line with the code, retry the same request | this channel only |
 | Empty model response / policy rejection | upstream | not this contract — the loop's honesty rules apply; a rejected send never becomes a `channel/delivered` | sessions unchanged |
 | Missing `context_token` for a target | adapter cache lookup | `Unavailable` with the explicit "proactive push unsupported" reason (§5) | that send |
@@ -323,6 +341,12 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 
 No degradation path turns into a `completed` session or a silent swallow: every one is an audit
 line plus an honest error at the seam.
+
+Two observability notes on the `-14` pause. First, it is observed as an **audit line plus an
+in-process counter** (`stale_pauses`); by design there is no `/metrics` key for it. Second, a
+pause opened by a *send*-side `-14` is only cleared by the receive driver's credential-mtime
+watcher inside `run()`: a channel with no live receive driver (no subscriber ever started `run()`)
+stays `Unavailable` after a re-login until the process restarts.
 
 ## 12. Non-goals (phase 2)
 
@@ -372,6 +396,10 @@ unverified until actually executed.
    `NO_PROXY=127.0.0.1,localhost`; the live iLink call is external HTTPS.
 7. Media, typing, `notifystart`/`notifystop`, group chat, multi-account and proactive push are out
    of scope (phase 2).
+8. Whether the adapter must send to the `baseurl` the login response carries (recorded in the
+   credential file's `base_url`) instead of the configured `api_base` is **UNVERIFIED** — the
+   adapter uses `api_base` for every call and treats the recorded `base_url` as diagnostics-only;
+   settle in L3.
 
 ## 15. Change protocol
 
