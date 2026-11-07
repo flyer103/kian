@@ -713,3 +713,24 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   **not** applied — AGENTS.md is a protected file and the write required owner approval that
   did not arrive in this run. `SseFrame #[non_exhaustive]` stays deferred to the SDK freeze
   (F5, recorded with its reason in the R9-08a entry).
+
+## 2026-11-08 — round-10 WeChat iLink channel: contract, decision, pointers (in progress, documentation only)
+
+- **`design/CHANNEL-WECHAT.md` (proposed)** — the normative `type: wechat` channel contract: the
+  frozen iLink protocol mapping (endpoints, headers, `WeixinMessage`, the `sendmessage` payload),
+  the `ChannelEvent`/`ChannelDelivery` mapping, the `context_token` rule, the `0600` credential-file
+  schema and lifecycle, the config/CLI contract (`kian wechat login`), the receive allowlist,
+  dedupe (`message_id` ring + `(session, event_id)` idempotency), the empty-cursor bound (no
+  position table), the failure/degradation table, phase-2 non-goals, L1/L2/L3 acceptance and the
+  full UNVERIFIED list.
+- **`design/decisions/ADR-018-wechat-ilink-channel.md`** — a native adapter in the bundle rather
+  than the OpenClaw bridge, 公众号, 微信客服 or personal-account hooks; the QR-issued token as a
+  deliberate deviation from the env-only static-secret rule; best-effort consequences (operator
+  re-login on `-14`, reply-only so no proactive push, phase-2 media).
+- **Pointers**: DESIGN §4.2 channel row, §6.2 seam row, §7 bundle note; SPEC §3.2 operator verb,
+  §5 channel row (in progress) and the credential deviation; README features / docs map / Channels
+  config / environment-contract exception; `docs_map` `AUTHORED` + the SPEC §5 keyword.
+- **No code, no wire, no event kind** — `API-CONTRACT.md` and `EVENT-MODEL.md` show zero diff. The
+  adapter (`kian-superagent`) and the config/CLI half (`kian-cli`) land in the following cards; the
+  SPEC/DESIGN rows flip to `landed` at closeout. L3 (real QR scan + phone) is owner-run and stays
+  unverified until executed.

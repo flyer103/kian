@@ -722,6 +722,7 @@ receipt/ok ⇒ delivered. No durable outbox state exists anywhere.
 | Email/docs | Structured summary drafting |
 | Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
 | Lark/Feishu | the first *real* adapter: IM row — same ImPolicy (≤100 words) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default |
+| WeChat (iLink) | the third *real* adapter, **best-effort by contract** (ADR-018; [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md)): receive is one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink Bot API (`POST /ilink/bot/getupdates`, server-held ~35 s) mapping each text message to one provenance-carrying `ChannelEvent` (`message_id` → `event_id` as a lossless decimal string, `from_user_id` → `sender.user_id`, `group` always `None`, text only); the config `topics` table doubles as the receive allowlist (unknown sender → honest drop + audit); send is `POST /ilink/bot/sendmessage` echoing the **latest inbound `context_token`** for that user — reply-only, since with no token there is no deliverable send, so no proactive push — resolving only on `ret == 0`; the credential is a QR-issued session token in a local 0600 file written by `kian wechat login` (explicit config path, never in `kian.yaml`, never logged — the one deliberate deviation from the env-only static-secret rule), and `errcode -14` pauses the channel for an hour and resumes on a credentials-file change; no position table (empty cursor, honest idempotent re-poll), no new surface, no new event kind; a protocol break degrades this channel only |
 
 ### 4.3 BYOM endpoint (kiand daemon / endpoint SDK)
 
@@ -1290,7 +1291,7 @@ Every seam names three roles: **Service Definition** (the trait) / **Provider** 
 | `ModelProvider` | `complete(req: ModelRequest) -> Stream<ModelChunk>` | openai-compat (covers OR/kimi/ds) | any |
 | `ExecBackend` | `exec(cmd, env) -> ExecResult` | local / remote-endpoint (kiand, endpoint SDK) | sandbox/cloud machines |
 | `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | **dsh bridge (`kian-dsh`,: a `dsh --profile sdk` child over stdio JSON-lines, ADR-010 mapping)**, custom loops |
-| `ChannelAdapter` | `subscribe -> Stream<ChannelEvent>`; `send(out) -> Future<SendReceipt>` | — | lark/im/github |
+| `ChannelAdapter` | `subscribe -> Stream<ChannelEvent>`; `send(out) -> Future<SendReceipt>` | — | lark/im/github/wechat (the wechat adapter is best-effort: reverse-documented iLink protocol, [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md), ADR-018) |
 | `ToolProvider` | `schemas -> Vec<ToolSchema>`; `invoke(call)` | built-in fs/exec/kiand | any |
 | `RecoveryPolicySource` | `table -> Vec<PolicyRule>` | config file | any |
 | `WatchdogSource` | `health -> Stream<HealthEvent>` | kiand heartbeat | any |
@@ -1374,7 +1375,7 @@ graph TB
 | kian-memory | The memory bundle (MEMORY-MODEL Phase 1): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), and `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
-| kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies | profile assembly |
+| kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies, and the real channel adapters (lark, github, wechat) plus the mock channel | profile assembly |
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
@@ -1387,6 +1388,18 @@ caps) landed as the `kian-memory` bundle (row above); the `memory:` config secti
 `memory_dream` ops method and the `kian memory create/dream/list/show/verify` verbs ride
 `kian-cli`. Injection (P2) and representations (P3) remain designed. Placement and non-goals are
 fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
+
+**Channels (bundle, ADR-018 — round 10, in progress).** The real `ChannelAdapter` implementations
+live in `kian-superagent` — `lark`, `github`, the round-10 `wechat`, and the mock channel; the seam
+definition stays in `kian-core::seams`. The WeChat channel is **best-effort by contract** and
+poll-shaped: one long-poll loop per configured channel, `message_id` → `event_id` (lossless decimal
+string), the config `topics` table as the receive allowlist, reply-only sends keyed by the latest
+inbound `context_token`, a QR-issued bot token in a `0600` credential file written by
+`kian wechat login` (the recorded deviation from env-only secrets), and `errcode -14` → an hour's
+pause that resumes when the credentials file changes. No position table, no new surface, no new
+event kind. The protocol mapping, credential/config/CLI contract, degradation table and unverified
+list are fixed by [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md); the rationale is
+[ADR-018](decisions/ADR-018-wechat-ilink-channel.md).
 
 **SDK freeze and versioning.** The `kian-sdk` public surface *is* the frozen wire
 contract: after it is **additive-only** — removing or reshaping a method, param, response

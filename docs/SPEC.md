@@ -166,7 +166,9 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, tickets.
+  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, tickets,
+  channel credentials (`kian wechat login` — the QR flow writes the WeChat channel's credential
+  file; no other channel needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
 
 ### 3.3 Operational flows
@@ -230,6 +232,7 @@ only status is recorded here.
 | Ablation benchmark (§7.1 shape) | Deterministic with/without-passthrough comparison in kian's native units (Router judge turns + request bytes); directionality asserted, both configurations must complete | landed |
 | Untrusted-input marking | `"untrusted": true` in the provenance wrapper for configured channels (real channels default untrusted); judge-prompt and recall-hop hygiene | landed |
 | Real lark channel adapter | Feishu IM receive/send over the open APIs; env-only credentials (`KIAN_LARK_*`), fail-closed startup; default-untrusted | landed |
+| WeChat iLink channel | `type: wechat`, **best-effort by contract** ([CHANNEL-WECHAT.md](../design/CHANNEL-WECHAT.md), [ADR-018](../design/decisions/ADR-018-wechat-ilink-channel.md)): one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink API (`getupdates` ~35 s hold), `message_id` → `event_id`, the config `topics` table as the receive allowlist, reply-only sends echoing the latest inbound `context_token`, QR-issued bot token in a `0600` credential file written by `kian wechat login` (no env var), `errcode -14` → pause + resume on file change, empty cursor with no position table, text-only/single-account phase 1, forced untrusted; no new surface, no new event kind | in progress (spec landed; adapter/CLI/QA pending) |
 | Plugin SDK + Footprint Ladder | Static plugin system + Footprint Ladder landed across the capability sets; SDK extraction → the hosted set (below) | partial |
 | Audit export/replay tooling | `session export`/re-import (byte-identical) + delegation-audit replay assertions — demonstrated by earlier work, recorded here; no new work | **Demonstrated** |
 
@@ -302,7 +305,11 @@ artifact.** Semantics: DESIGN §4.7; operator surface: the README's bundle-polic
 Known deviations, kept visible (the honest v1 record): a kian **Ticket v1 = one worker
 session** (one `thread/started`), not the prototype's full resumable lifecycle; **an ended
 ticket resumes via fresh Eval** (release-to-Router, new accept, new mandate), not same-Mandate
-resume; and **the panel is the CLI** (`kian tickets` — the stage board), not a web UI.
+resume; **the panel is the CLI** (`kian tickets` — the stage board), not a web UI; and the
+**WeChat channel's credential is a QR-issued session token in a local `0600` credential file**
+(written by `kian wechat login`), not an env-var static secret — the one deliberate break from the
+secrets discipline, bounded and recorded in
+[ADR-018](../design/decisions/ADR-018-wechat-ilink-channel.md).
 
 ### Event-model enhancements
 

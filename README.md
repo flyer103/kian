@@ -24,8 +24,9 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   default, postgres for replicas (`KIAN_PG_URL`).
 - **Super-agent bundle** — Router/Worker over Thread delegation, event subscriptions,
   evidence-gated completion, and channel output policies — all outside the core.
-- **Real channels and intake economics** — Lark IM and GitHub (webhook + poll), two-level
-  admission filtering, Inline/Spill shaping, Chain of Recall, and untrusted-input marking.
+- **Real channels and intake economics** — Lark IM, GitHub (webhook + poll) and WeChat iLink
+  (best-effort long-poll, QR login), two-level admission filtering, Inline/Spill shaping, Chain
+  of Recall, and untrusted-input marking.
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
 - **BYOM execution** — a `kiand` endpoint over a durable, at-least-once command queue with a
@@ -74,6 +75,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
 | [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phase 1 landed; injection/representations designed) |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
+| [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation (proposed) |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
@@ -308,7 +310,7 @@ cargo run -p kian-cli --bin kian -- mock-channel-send mock-im --text "deploy ple
 curl -s localhost:7433/metrics | jq .superagent   # evidence / subscription / channel counters
 ```
 
-### Channels (GitHub, Lark)
+### Channels (GitHub, Lark, WeChat)
 
 Channels admit external events into subscriptions. `type: github` mounts the `POST /webhooks/github`
 receiver; the topic-mapping table doubles as the receive allowlist. The same channel can poll with
@@ -328,11 +330,25 @@ superagent:
       lark:
         topics: { "oc_xxxxxxxxxxxxxxxx": "team-im" }
         poll_interval_ms: 2000
+    wechat:
+      type: wechat
+      wechat:
+        topics: { "oXXXX@im.wechat": "wechat" }     # sender → topic; also the allowlist
+        credentials_file: ./.state/wechat-credentials.json   # written by `kian wechat login`
 ```
 
+`type: wechat` is **best-effort by contract**: one long-poll loop per channel over Tencent's
+reverse-documented iLink Bot API (~35 s server hold), text-only receive, and reply-only sends that
+echo the latest inbound `context_token` — so it cannot message a user who has not messaged the bot
+first. A stale token (`errcode -14`) pauses that channel and resumes when the credential file
+changes ([design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md)).
+
 Credentials are **env-only** (`KIAN_GITHUB_TOKEN`, `KIAN_GITHUB_WEBHOOK_SECRET`,
-`KIAN_LARK_APP_ID`/`*_SECRET`) and absent values refuse to start when the capability is configured.
-The webhook receiver verifies before it parses (size cap → content-type → HMAC constant-time
+`KIAN_LARK_APP_ID`/`*_SECRET`) and absent values refuse to start when the capability is configured
+— with one deliberate exception: the WeChat token is *issued* by a QR scan, so it lives in the
+local `0600` credential file named by `wechat.credentials_file`, never in an env var or
+`kian.yaml` ([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). The webhook receiver
+verifies before it parses (size cap → content-type → HMAC constant-time
 compare → rate limit), and real channels are untrusted-by-default. A complete live dogfood lives in
 [examples/issue-watch](examples/issue-watch/README.md).
 
@@ -538,7 +554,9 @@ Default CI needs none of these — every gated suite **skips with a log line, ne
 | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` / `KIAN_LARK_CHAT_ID` / `KIAN_LARK_POLL_CHAT` | lark channel and live smoke | skip |
 | `KIAN_API_KEY` | live-provider smoke | skip |
 
-Secrets and URLs are env-only, never config values. Executed live records live in
+Secrets and URLs are env-only, never config values — the WeChat bot token is the one documented
+exception: it is issued by a QR scan and kept in a `0600` file
+([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). Executed live records live in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Crate map

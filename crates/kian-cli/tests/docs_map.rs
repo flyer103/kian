@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// Authored markdown surfaces of the docs map (AGENTS.md §Docs map).
 /// `design/EVENT-MODEL.md` is the normative event contract, so its
 /// outbound links are part of the enforced set too.
-const AUTHORED: [&str; 9] = [
+const AUTHORED: [&str; 10] = [
     "README.md",
     "AGENTS.md",
     "docs/SPEC.md",
@@ -19,6 +19,7 @@ const AUTHORED: [&str; 9] = [
     "design/API-CONTRACT.md",
     "design/MEMORY-MODEL.md",
     "design/READ-MODEL.md",
+    "design/CHANNEL-WECHAT.md",
     "the design notes",
 ];
 
@@ -189,8 +190,10 @@ fn spec_capability_table_names_each_landed_capability() {
         .unwrap_or(spec.len());
     let section = &spec[start..end];
 
-    // One keyword per landed capability plus the audit-export record;
-    // each must appear in the section text.
+    // One keyword per capability recorded in this section — the landed
+    // set plus the round-10 WeChat row (whose status reads `in progress`
+    // until the closeout flips it); the audit-export record carries its
+    // own keyword. Each must appear in the section text.
     let landed = [
         "Inline/Spill",
         "Recall toolpack",
@@ -203,6 +206,7 @@ fn spec_capability_table_names_each_landed_capability() {
         "Ablation",
         "Untrusted-input marking",
         "lark channel adapter",
+        "WeChat iLink channel",
         "Audit export/replay tooling",
     ];
     let missing: Vec<&str> = landed
