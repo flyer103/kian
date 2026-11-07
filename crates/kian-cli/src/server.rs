@@ -433,6 +433,13 @@ impl Server {
             // validation caps them at one — the single receiver route
             // feeds exactly one).
             let mut github_channels = std::collections::BTreeMap::new();
+            // the wechat iLink channels (config validation caps them
+            // at one — phase 1 is single-account). The credential file
+            // is loaded fail-closed here: a missing/unreadable/
+            // malformed file refuses startup naming
+            // `kian wechat login` (the token never lives in
+            // kian.yaml and never in an env var — ADR-018).
+            let mut wechat_channels = std::collections::BTreeMap::new();
             // the timer input sources (a channel like any other —
             // the system clock times the cadence).
             let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
@@ -495,6 +502,23 @@ impl Server {
                                 ServeError::Assembly(format!("lark channel `{name}`: {e}"))
                             })?;
                         lark_channels.insert(name.clone(), Arc::new(adapter));
+                    }
+                    "wechat" => {
+                        let section = channel.wechat.as_ref().ok_or_else(|| {
+                            ServeError::Config(crate::config::ConfigError::Invalid(format!(
+                                "superagent.channels `{name}` (type wechat) requires a `wechat:` section"
+                            )))
+                        })?;
+                        // Fail-closed on the credential file (the
+                        // error names `kian wechat login`); the
+                        // adapter adopts a re-issued token later by
+                        // watching the file's mtime — no restart.
+                        let runtime = section.to_runtime(name).map_err(ServeError::Config)?;
+                        let adapter = kian_superagent::WechatChannel::new(name.clone(), runtime)
+                            .map_err(|e| {
+                                ServeError::Assembly(format!("wechat channel `{name}`: {e}"))
+                            })?;
+                        wechat_channels.insert(name.clone(), Arc::new(adapter));
                     }
                     // Unknown types were rejected at parse time.
                     _ => {}
@@ -578,6 +602,7 @@ impl Server {
                 mock_channels,
                 lark_channels,
                 github_channels,
+                wechat_channels,
                 timer_channels,
                 watchdog,
                 worker_gate,

@@ -52,6 +52,9 @@
 //!   (`POST /webhooks/github`: HMAC-verified GitHub deliveries handed
 //!   to the subscription pipeline), trait-isolated like the control
 //!   and ops planes (ADR-011)
+//! - [`wechat_login`] — `kian wechat login`: the WeChat iLink QR flow
+//!   that writes the channel's 0600 credential file (ids printed,
+//!   never the token)
 pub mod api;
 pub mod archive;
 pub mod async_bridge;
@@ -67,6 +70,7 @@ pub mod superagent;
 pub mod usage_metrics;
 pub mod views;
 pub mod webhook;
+pub mod wechat_login;
 
 #[cfg(test)]
 mod tests {

@@ -60,6 +60,9 @@ const USAGE: &str = "usage:
                                          'what is it waiting for' stage
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event
+  kian wechat login [--config <path>] [--channel <name>] [--json]
+                                         WeChat QR login → the channel's 0600 credential file
+                                         (prints account/user ids, never the token)
   kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
                                   [--url <base>] [--config <path>] [--json]
                                          demo channel injection via ops
@@ -95,6 +98,7 @@ fn main() -> ExitCode {
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
+        Some("wechat") => wechat(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -921,6 +925,72 @@ fn parse_memory_args(args: &[String], usage_for: &str) -> Result<MemoryArgs, Str
 /// subcommand with a positional selector).
 fn sub_is_show(usage_for: &str) -> bool {
     usage_for.ends_with("show")
+}
+
+/// `kian wechat login [--config <path>] [--channel <name>] [--json]` —
+/// the WeChat iLink QR login (writes the channel's 0600 credential
+/// file; prints account/user ids, never the token; non-zero exit on
+/// any failure).
+fn wechat(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("kian: `wechat` requires a subcommand (login)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    if sub != "login" {
+        eprintln!("kian: unknown wechat subcommand `{sub}`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let mut login_args = kian_cli::wechat_login::WechatLoginArgs::default();
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => login_args.config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--channel" => match iter.next() {
+                Some(c) => login_args.channel = Some(c.clone()),
+                None => {
+                    eprintln!("kian: --channel requires a channel name\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => login_args.json = true,
+            other => {
+                eprintln!("kian: unknown wechat login option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("kian: cannot start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(kian_cli::wechat_login::run_login(&login_args)) {
+        Ok(summary) => {
+            print!("{summary}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if login_args.json {
+                // Machine-readable failure (still no token — the error
+                // strings never carry one).
+                println!("{}", serde_json::json!({"status": "error", "error": e}));
+            } else {
+                eprintln!("kian: wechat login failed — {e}");
+            }
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `kian lease inspect [--db <sqlite>] [--json]`

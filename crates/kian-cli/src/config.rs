@@ -1440,6 +1440,12 @@ pub struct ChannelConfig {
     /// mounts the `POST /webhooks/github` receiver route.
     #[serde(default)]
     pub github: Option<GitHubChannelSection>,
+    /// The wechat section — required when (and only when)
+    /// `type: wechat` (fail-closed both directions, validated in
+    /// [`ServeConfig::parse`]). The bot token lives only in the
+    /// credential file written by `kian wechat login` — never here.
+    #[serde(default)]
+    pub wechat: Option<WechatChannelSection>,
 }
 
 /// The `superagent.channels.<name>.github:` section (adapter +
@@ -1768,6 +1774,60 @@ impl LarkChannelSection {
     }
 }
 
+/// The `superagent.channels.<name>.wechat:` section
+/// (CHANNEL-WECHAT §7). Credentials are deliberately absent: the bot
+/// token is issued by the QR flow and lives only in the file at
+/// `credentials_file` — written by `kian wechat login`, never in
+/// `kian.yaml`, never an env var (ADR-018's recorded deviation).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WechatChannelSection {
+    /// iLink API base (overridable for private deployments and local
+    /// mocks; must be an http(s) URL).
+    #[serde(default = "default_wechat_api_base")]
+    pub api_base: String,
+    /// Path of the credential file written by `kian wechat login`
+    /// (required, fail-closed at serve assembly: missing/unreadable/
+    /// malformed refuses startup naming the command).
+    pub credentials_file: String,
+    /// `from_user_id` → routing topic. The keys are exactly the
+    /// senders the receive loop admits (the allowlist); at least one
+    /// entry is required (fail-closed).
+    pub topics: BTreeMap<String, String>,
+    /// Client long-poll deadline, milliseconds (the server holds the
+    /// request ~35 s; the client waits longer).
+    #[serde(default = "default_wechat_poll_timeout_ms")]
+    pub poll_timeout_ms: u64,
+}
+
+fn default_wechat_api_base() -> String {
+    kian_superagent::WECHAT_DEFAULT_API_BASE.to_string()
+}
+
+fn default_wechat_poll_timeout_ms() -> u64 {
+    kian_superagent::wechat::DEFAULT_POLL_TIMEOUT.as_millis() as u64
+}
+
+impl WechatChannelSection {
+    /// Converts to the bundle's runtime config, fail-closed on the
+    /// credential file: a missing/unreadable/malformed file is a
+    /// startup error naming `kian wechat login` (the operator action)
+    /// — never a silent default, never a token in `kian.yaml`.
+    pub fn to_runtime(&self, name: &str) -> Result<kian_superagent::WechatConfig, ConfigError> {
+        let mut config = kian_superagent::WechatConfig::new(
+            self.api_base.clone(),
+            self.credentials_file.trim(),
+            self.topics.clone(),
+        );
+        config.poll_timeout = std::time::Duration::from_millis(self.poll_timeout_ms);
+        config
+            .validate()
+            .map(|_| ())
+            .map_err(|e| invalid(format!("superagent.channels `{name}` (type wechat): {e}")))?;
+        Ok(config)
+    }
+}
+
 /// Wire form of a subscription rule's match condition (the natural
 /// YAML/JSON spelling of the plan's `always|mentions(str)|topic(str)`):
 /// the bare keyword `always`, or a one-key map `{mentions: t}` /
@@ -1965,6 +2025,7 @@ impl SuperAgentConfig {
         for (name, channel) in &self.channels {
             if channel.channel_type == kian_superagent::LARK_CHANNEL_TYPE
                 || channel.channel_type == kian_superagent::GITHUB_CHANNEL_TYPE
+                || channel.channel_type == kian_superagent::WECHAT_CHANNEL_TYPE
             {
                 set.insert(name.clone());
             }
@@ -1976,8 +2037,8 @@ impl SuperAgentConfig {
 /// Every channel adapter type `serve` knows how to build (v1:
 /// the first-class mock; adds the real lark adapter; the
 /// timer input source; the github channel + webhook
-/// receiver).
-pub const KNOWN_CHANNEL_TYPES: [&str; 4] = ["mock-im", "lark", "timer", "github"];
+/// receiver; the wechat iLink channel).
+pub const KNOWN_CHANNEL_TYPES: [&str; 5] = ["mock-im", "lark", "timer", "github", "wechat"];
 
 /// One remote execution endpoint (over the durable queue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2431,6 +2492,65 @@ impl ServeConfig {
                     }
                     (None, _) => {}
                 }
+                // the `wechat:` section is presence-locked to
+                // `type: wechat` in both directions; its shape
+                // validates fail-closed (the credential FILE is
+                // deliberately not checked here — `kian wechat login`
+                // runs before it exists; serve assembly's
+                // `to_runtime` is the fail-closed credential gate).
+                match (&channel.wechat, channel.channel_type.as_str()) {
+                    (Some(section), "wechat") => {
+                        if section.credentials_file.trim().is_empty() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.credentials_file is \
+                                 required (the path `kian wechat login` writes; the bot token \
+                                 never lives in kian.yaml)"
+                            )));
+                        }
+                        if section.topics.is_empty() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.topics must declare at \
+                                 least one user id → topic entry (the receive allowlist)"
+                            )));
+                        }
+                        for (user_id, topic) in &section.topics {
+                            if user_id.trim().is_empty() || topic.trim().is_empty() {
+                                return Err(invalid(format!(
+                                    "superagent.channels `{name}`.wechat.topics entries must \
+                                     be non-empty (`{user_id}`)"
+                                )));
+                            }
+                        }
+                        if section.poll_timeout_ms == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.poll_timeout_ms must be \
+                                 > 0 (above the server's ~35 s hold)"
+                            )));
+                        }
+                        let api_base = section.api_base.trim();
+                        if !kian_superagent::wechat::is_http_base(api_base) {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.api_base must be an \
+                                 http(s):// URL with a non-empty host (https in production; \
+                                 http:// is accepted for local mocks), got `{}`",
+                                section.api_base
+                            )));
+                        }
+                    }
+                    (Some(_), other) => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}`: the `wechat:` section belongs to \
+                             `type: wechat` channels only (this channel is `type: {other}`)"
+                        )));
+                    }
+                    (None, "wechat") => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}` (type wechat) requires a `wechat:` \
+                             section (api_base?, credentials_file, topics, poll_timeout_ms?)"
+                        )));
+                    }
+                    (None, _) => {}
+                }
             }
             // at most one `type: github` channel — the single
             // `POST /webhooks/github` route feeds exactly one channel
@@ -2444,6 +2564,20 @@ impl ServeConfig {
                 return Err(invalid(
                     "superagent.channels may declare at most one `type: github` channel (the \
                      single POST /webhooks/github route feeds exactly one)",
+                ));
+            }
+            // at most one `type: wechat` channel — phase 1 is a
+            // single-account channel (CHANNEL-WECHAT §12; the
+            // credential file names one bot token).
+            let wechat_count = sa
+                .channels
+                .values()
+                .filter(|channel| channel.channel_type == kian_superagent::WECHAT_CHANNEL_TYPE)
+                .count();
+            if wechat_count > 1 {
+                return Err(invalid(
+                    "superagent.channels may declare at most one `type: wechat` channel \
+                     (phase 1 is single-account: one credential file, one bot token)",
                 ));
             }
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
@@ -4019,6 +4153,215 @@ recovery:
         // A blank token is a missing token.
         let err = github.to_runtime("github", Some("  ".into())).unwrap_err();
         assert!(err.to_string().contains("KIAN_GITHUB_TOKEN"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // the wechat channel wire layer (CHANNEL-WECHAT §7)
+    // -----------------------------------------------------------------------
+
+    fn wechat_yaml(extra: &str) -> String {
+        superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            &format!("  channels:\n    wechat:\n      type: wechat\n{extra}    mock-im:"),
+            1,
+        )
+    }
+
+    /// A wechat section over a temp credential path (the file itself is
+    /// written by the caller — `to_runtime` loads it fail-closed).
+    fn wechat_section_with_credentials(tag: &str) -> (String, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "kian-wechat-cfg-{tag}-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        kian_superagent::wechat::credentials::save(
+            &path,
+            &kian_superagent::wechat::credentials::WechatCredentials::new(
+                "https://ilinkai.weixin.qq.com",
+                "fake-bot-token-cfg",
+                "fake-bot-1",
+                "fake-user-1",
+                1730000000000,
+            ),
+        )
+        .expect("write credential fixture");
+        (
+            format!(
+                "      wechat:\n        credentials_file: \"{}\"\n        topics:\n          oUSER@im.wechat: wechat\n",
+                path.display()
+            ),
+            path,
+        )
+    }
+
+    #[test]
+    fn wechat_channel_config_parses_with_defaults() {
+        let (section, _path) = wechat_section_with_credentials("defaults");
+        let cfg = ServeConfig::parse(&wechat_yaml(&section)).expect("wechat config parses");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let wechat = sa.channels["wechat"].wechat.as_ref().expect("section");
+        assert_eq!(wechat.api_base, "https://ilinkai.weixin.qq.com");
+        assert_eq!(wechat.poll_timeout_ms, 45_000);
+        assert_eq!(
+            wechat.topics,
+            BTreeMap::from([("oUSER@im.wechat".to_string(), "wechat".to_string())])
+        );
+
+        // Explicit overrides parse.
+        let overrides = format!(
+            "      wechat:\n        api_base: \"http://127.0.0.1:9\"\n        poll_timeout_ms: 5000\n        credentials_file: \"{}\"\n        topics:\n          oUSER@im.wechat: wechat\n",
+            std::env::temp_dir()
+                .join("kian-wechat-unused.json")
+                .display()
+        );
+        let cfg = ServeConfig::parse(&wechat_yaml(&overrides)).expect("overrides parse");
+        let wechat = cfg.superagent.as_ref().unwrap().channels["wechat"]
+            .wechat
+            .as_ref()
+            .unwrap();
+        assert_eq!(wechat.api_base, "http://127.0.0.1:9");
+        assert_eq!(wechat.poll_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn wechat_channel_section_is_fail_closed() {
+        // `type: wechat` without a `wechat:` section.
+        let err = ServeConfig::parse(&wechat_yaml("")).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a `wechat:` section"),
+            "{err}"
+        );
+
+        // A `wechat:` section on a non-wechat channel.
+        let misplaced = superagent_yaml().replacen(
+            "    mock-im:\n      type: mock-im",
+            "    mock-im:\n      type: mock-im\n      wechat:\n        credentials_file: ./x.json\n        topics:\n          oU: wechat",
+            1,
+        );
+        let err = ServeConfig::parse(&misplaced).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to `type: wechat` channels only"),
+            "{err}"
+        );
+
+        // Degenerate shapes refuse (fail-closed, never defaults).
+        for (extra, needle) in [
+            (
+                "      wechat:\n        topics:\n          oUSER@im.wechat: wechat\n",
+                "credentials_file",
+            ),
+            (
+                "      wechat:\n        credentials_file: \"  \"\n        topics:\n          oU: wechat\n",
+                "credentials_file",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        topics: {}\n",
+                "at least one user id",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        topics:\n          \"\": wechat\n",
+                "must be non-empty",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        topics:\n          oU: \"  \"\n",
+                "must be non-empty",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        poll_timeout_ms: 0\n        topics:\n          oU: wechat\n",
+                "poll_timeout_ms must be > 0",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        api_base: \"ftp://bad\"\n        topics:\n          oU: wechat\n",
+                "http(s):// URL",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        api_base: \"http://\"\n        topics:\n          oU: wechat\n",
+                "non-empty host",
+            ),
+        ] {
+            let err = ServeConfig::parse(&wechat_yaml(extra)).unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn at_most_one_wechat_channel_per_config() {
+        let doubled = superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            "  channels:\n    wx1:\n      type: wechat\n      wechat:\n        credentials_file: ./a.json\n        topics:\n          oU: wechat\n    wx2:\n      type: wechat\n      wechat:\n        credentials_file: ./b.json\n        topics:\n          oV: wechat\n    mock-im:",
+            1,
+        );
+        let err = ServeConfig::parse(&doubled).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most one `type: wechat` channel"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wechat_credentials_fail_closed_at_conversion_naming_the_command() {
+        // Parse is credential-agnostic (login runs before the file
+        // exists); `to_runtime` (serve assembly) is the fail-closed
+        // gate.
+        let missing = "      wechat:\n        credentials_file: ./does-not-exist-wechat.json\n        topics:\n          oUSER@im.wechat: wechat\n";
+        let cfg =
+            ServeConfig::parse(&wechat_yaml(missing)).expect("config parses without the file");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let section = sa.channels["wechat"].wechat.as_ref().unwrap();
+        let err = section.to_runtime("wechat").unwrap_err().to_string();
+        assert!(
+            err.contains("kian wechat login"),
+            "the startup error must name the command: {err}"
+        );
+
+        // A present, valid file converts to the runtime config with
+        // the contract fields.
+        let (section_yaml, path) = wechat_section_with_credentials("converts");
+        let cfg = ServeConfig::parse(&wechat_yaml(&section_yaml)).expect("parses");
+        let section = cfg.superagent.as_ref().unwrap().channels["wechat"]
+            .wechat
+            .as_ref()
+            .unwrap();
+        let runtime = section.to_runtime("wechat").expect("converts");
+        assert_eq!(runtime.api_base, "https://ilinkai.weixin.qq.com");
+        assert_eq!(runtime.credentials_file, path);
+        assert_eq!(runtime.poll_timeout.as_millis(), 45_000);
+        assert_eq!(runtime.topics["oUSER@im.wechat"], "wechat");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wechat_channels_are_untrusted_by_default_and_cross_reference() {
+        let (section, path) = wechat_section_with_credentials("untrusted");
+        // A subscription + speak rule + untrusted_channels listing all
+        // reference the wechat channel by name and validate.
+        let yaml = wechat_yaml(&section)
+            .replace(
+                "  subscriptions:",
+                "  subscriptions:\n    - channel: wechat\n      match: always\n      route: router",
+            )
+            .replace("  channels:", "  untrusted_channels: [wechat]\n  channels:");
+        let cfg = ServeConfig::parse(&yaml).expect("cross-references validate");
+        let sa = cfg.superagent.as_ref().unwrap();
+        // Forced untrusted: listed or not, the wechat channel is in
+        // the runtime set (no opt-out).
+        let set = sa.runtime_untrusted_set().expect("set converts");
+        assert!(set.contains("wechat"), "wechat is untrusted by default");
+
+        // An unknown cross-reference still refuses.
+        let bad = wechat_yaml(&section).replace(
+            "  subscriptions:",
+            "  subscriptions:\n    - channel: wechat-ghost\n      match: always\n      route: router",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not declared in superagent.channels"),
+            "{err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

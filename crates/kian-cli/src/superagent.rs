@@ -1136,6 +1136,11 @@ pub struct SuperAgentServices {
     /// adapters. The receiver plane (server.rs) hands verified
     /// deliveries to the single channel through this map.
     pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
+    /// WeChat channels by configured name — the iLink long-poll
+    /// adapters (phase 1: single account). Exposed for observability
+    /// (paused/stale counters); the receive drivers self-start with
+    /// the subscription consumers.
+    pub wechat_channels: BTreeMap<String, Arc<kian_superagent::WechatChannel>>,
     /// Adapters in config order (consumer spawn order).
     pub adapters: Vec<Arc<dyn ChannelAdapter>>,
     /// The worker's evidence gate config (shared counters).

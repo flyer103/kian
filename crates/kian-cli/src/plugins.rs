@@ -424,6 +424,13 @@ pub struct SuperAgentPlugin {
     /// receiver hands verified deliveries to the single channel
     /// through the `WebhookPlane` implementation in `server.rs`.
     pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
+    /// WeChat channels by configured name: the iLink long-poll
+    /// adapters built by the server over the credential file
+    /// (fail-closed at assembly), registered alongside the others.
+    /// Their receive driver self-starts with the subscription
+    /// consumers (`subscribe` starts it); nothing here knows WeChat
+    /// exists beyond the registry entry.
+    pub wechat_channels: BTreeMap<String, Arc<kian_superagent::WechatChannel>>,
     /// The worker's evidence gate (mounts on the worker wrapper).
     pub worker_gate: EvidenceGateConfig,
     /// The default agent's evidence gate (mounts on the plain loop).
@@ -571,6 +578,7 @@ impl Plugin for SuperAgentPlugin {
             self.mock_channels.len()
                 + self.lark_channels.len()
                 + self.github_channels.len()
+                + self.wechat_channels.len()
                 + self.timer_channels.len(),
         );
         for (name, mock) in &self.mock_channels {
@@ -591,6 +599,14 @@ impl Plugin for SuperAgentPlugin {
         for (name, github) in &self.github_channels {
             channels.register(name.clone(), Arc::clone(github) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(github) as Arc<dyn ChannelAdapter>);
+        }
+        // the wechat iLink adapter rides the same registry + consumer
+        // spawn; its receive half is its own long-poll loop (started
+        // by `subscribe` inside the consumer spawn — consumers first,
+        // so no polled event lands before a subscriber exists).
+        for (name, wechat) in &self.wechat_channels {
+            channels.register(name.clone(), Arc::clone(wechat) as Arc<dyn ChannelAdapter>);
+            adapters.push(Arc::clone(wechat) as Arc<dyn ChannelAdapter>);
         }
         // the timers ride the same registry + consumer spawn (a
         // timer is a channel — nothing here knows a watchdog exists).
@@ -906,6 +922,7 @@ impl Plugin for SuperAgentPlugin {
             mock_channels: self.mock_channels,
             lark_channels: self.lark_channels,
             github_channels: self.github_channels,
+            wechat_channels: self.wechat_channels,
             adapters,
             worker_gate: self.worker_gate,
             subscription_metrics,
