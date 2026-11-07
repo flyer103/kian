@@ -180,6 +180,11 @@ row-payload shapes must not be confused with event payloads:
 | `{"content":X,"dream":M}` | ONE `input/admitted` `{role:"user",content:X,dream:M}` (M is the trusted dream marker, §4.2) |
 | `{"kian":{"type":"control","action":"interrupt",...}}` | `control/interrupt` (never a message) |
 
+Every envelope is an **exact key-set match**: a row payload with extra keys is ordinary content —
+the `synthetic` arm consumes only at exactly `{synthetic,content}` (kian-96, review N-1), so a public
+superset key set passes the wire guard and lands as plain nested content, never as a client-minted
+strippable marker.
+
 ## 5. Invariants (must hold for every change)
 
 1. **Sole truth**: all session state is a projection of the event stream; projections are

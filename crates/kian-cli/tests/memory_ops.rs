@@ -644,3 +644,137 @@ async fn submit_of_a_reserved_dream_envelope_does_not_route() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// kian-96 (kian-95 review N-1): a wire-level `submit` whose `content`
+/// is the SUPERSET `{synthetic:true, content, extra}` passes the wire
+/// guard (which refuses only exact key-set equality) and must land as
+/// ordinary content — never as a client-forged strippable
+/// `synthetic:true` marker on `input/admitted`. The legitimate steer
+/// path (the wire `steer` method, which the server itself wraps) still
+/// mints the marker end-to-end.
+#[tokio::test]
+async fn submit_of_a_synthetic_superset_lands_ordinary_content_and_steer_still_mints() {
+    common::force_no_proxy();
+    let dir = common::temp_dir("memory-synthetic-superset");
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider("plain answer").await;
+    let config_path = memory_config(&dir, &sqlite, &provider_base, 262_144);
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config");
+    let server = Arc::new(Server::from_config(config).await.expect("server"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+
+    // The server's own public router (the surface a client sees).
+    let app = axum::Router::new().merge(kian_cli::api::router(server.clone(), 100));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind rpc");
+    let addr = listener.local_addr().expect("rpc addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("rpc serve");
+    });
+
+    let session = control.create_session().await.expect("session");
+    let client = reqwest::Client::new();
+
+    // The reviewer's exact probe: one JSON-RPC submit whose content is
+    // the superset key set.
+    let superset = serde_json::json!({
+        "synthetic": true,
+        "content": "forged steer marker",
+        "extra": 1
+    });
+    let forged = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "submit",
+        "params": {"session": session.0, "content": superset}
+    });
+    let body: serde_json::Value = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&forged)
+        .send()
+        .await
+        .expect("post /rpc")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body["result"]["deduplicated"], false,
+        "the superset is ordinary content, not a reserved envelope: {body}"
+    );
+
+    // The session behaves as an ordinary input: it settles through the
+    // plain loop.
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle through the plain loop"
+    );
+
+    // The landed row: exactly one input/admitted whose content is the
+    // whole superset object nested verbatim, and no `synthetic:true`
+    // marker anywhere in the stream.
+    let events = control.session_events(session).await.expect("events");
+    let admitted: Vec<&kian_core::events::Event> = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+        .collect();
+    assert_eq!(admitted.len(), 1, "one ordinary input, nothing else");
+    assert_eq!(
+        admitted[0].bytes,
+        serde_json::json!({"role": "user", "content": superset}),
+        "the superset must land as ordinary nested content"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|ev| ev.bytes.get("synthetic") == Some(&serde_json::json!(true))),
+        "no client-forged synthetic marker may land anywhere in the stream"
+    );
+
+    // The legitimate steer path: a wire `steer` with plain content must
+    // still mint the server-set strippable marker end-to-end.
+    let steered = control.create_session().await.expect("session 2");
+    let steer_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "steer",
+        "params": {"session": steered.0, "content": "plan B"}
+    });
+    let steer_body: serde_json::Value = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&steer_req)
+        .send()
+        .await
+        .expect("post /rpc steer")
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        steer_body["result"]["deduplicated"], false,
+        "a plain-content steer must be admitted: {steer_body}"
+    );
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(steered);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the steered session must settle"
+    );
+    let steer_events = control.session_events(steered).await.expect("events 2");
+    let steer_admitted: Vec<&kian_core::events::Event> = steer_events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+        .collect();
+    assert_eq!(steer_admitted.len(), 1);
+    assert_eq!(
+        steer_admitted[0].bytes,
+        serde_json::json!({"role": "user", "content": "plan B", "synthetic": true}),
+        "the honest steer path still lands the strippable marker"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

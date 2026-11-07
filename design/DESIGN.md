@@ -226,8 +226,10 @@ control plane (`admit`/`steer`) only writes inbox rows. When the drain takes a r
 boundary it appends one `input/admitted` event carrying the §3.2 message payload
 (`{"role","content","synthetic"?}`) and binds the row to that event's seq via the 
 event-driven consumption guard. The input-payload convention: a plain row's payload *is* the
-message content; a steer row wraps it as `{"synthetic": true, "content": X}` so the strippable
-marker survives the inbox work-trip. The spill envelope extends this row-level convention: a
+message content; a steer row wraps it as `{"synthetic": true, "content": X}` (exactly those two
+keys — kian-96, review N-1: a superset key set stays ordinary content, so the public wire cannot
+mint the strippable marker) so the marker survives the inbox work-trip. The spill envelope extends
+this row-level convention: a
 row payload of exactly `{"content": X, "spill": Y}` consumes as **two events in one fenced write
 batch** — `input/admitted` carrying `{"role": "user", "content": X}` exactly as the bare content
 would have produced, followed immediately by `input/spilled` carrying the opaque sidecar verbatim —

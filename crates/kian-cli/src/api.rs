@@ -229,10 +229,14 @@ fn session_of(params: &Value) -> Result<SessionId, (i64, String)> {
 /// Reserved row-envelope key sets (DESIGN §3.1, MEMORY-MODEL §5 D1):
 /// `{content, dream}` (the ops-plane dream admit), `{content, spill}`
 /// (the Inline/Spill shape) and `{synthetic, content}` (the strippable
-/// steer marker). Only trusted internal callers produce these shapes;
-/// a public `submit`/`steer`/`queue` carrying one would let client
-/// content forge a marker the server is documented to set itself
-/// (kian-94, review B-2′), so the wire refuses them (`-32602`).
+/// steer marker). Only the server's internal planes produce these
+/// shapes — and the drain (`consumption_plan`) consumes each envelope
+/// only at exactly two keys (kian-96, review N-1), so a superset that
+/// passes this guard lands as ordinary nested content, never as a
+/// client-minted marker. A public `submit`/`steer`/`queue` carrying an
+/// exact reserved shape would let client content forge a marker the
+/// server is documented to set itself (kian-94, review B-2′), so the
+/// wire refuses them (`-32602`).
 fn is_reserved_envelope(content: &Value) -> bool {
     let Some(obj) = content.as_object() else {
         return false;
