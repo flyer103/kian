@@ -157,8 +157,8 @@ excluded) — the definition lives here, once; the proof is recorded in §5's Ph
 - Audit: event-stream interval export + replay (A1/A2).
 
 ### 3.2 Operational actions
-- `kian` CLI: serve (single machine), session inspect/replay/export, wake-now, lease inspect,
-  recovery budget reset.
+- `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`, C69),
+  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats (C67), tickets.
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
 
 ### 3.3 Operational flows
@@ -297,6 +297,30 @@ Known deviations, kept visible (the round's honest v1 record): a kian **Ticket v
 session** (one `thread/started`), not the prototype's full resumable lifecycle; **an ended
 ticket resumes via fresh Eval** (release-to-Router, new accept, new mandate), not same-Mandate
 resume; and **the panel is the CLI** (`kian tickets` — the stage board), not a web UI.
+
+### Phase 7 (event-model enhancements borrowed from CMA, landed 2026-11-07)
+
+Round 7 (cards kian-79…kian-83, plan `round7-plan.md`) borrowed event-model ideas from Anthropic's
+Claude Managed Agents catalog — provider usage facts, a persisted interrupt intent, derived event
+ids, redaction/permission provenance — as **design inspiration only** (no wire-protocol
+dependency). **Exactly one new event kind this round (`control/interrupt`, C68): the durable set
+grows 20 → 21.** Everything else is an additive payload key on a frozen wrapper, a pure
+projection, or a config-first capability; no model-request or context-projection byte changed
+anywhere (cache-byte stability, constraint 3). Semantics: DESIGN §3.1/§3.2/§3.3/§6.2; operator
+surfaces: the README Phase-7 section.
+
+| Item | Contents (card) | Status |
+|------|-----------------|--------|
+| Provider usage + structured recovery on `turn/end` | `ModelChunk.usage` additive seam; the openai-compat provider parses SSE `usage` objects verbatim (last frame wins; a usage-only frame never flips the empty-response liveness flag); `turn/end` carries `"usage"` verbatim plus `"error": {class, action}` on soft-failure/error outcomes (C10 classifier + declarative policy, `"none"` when no rule); pure projection `kian-cli::usage_metrics` powers `kian usage-stats`, the `GET /metrics` `"usage"` aggregate and `session inspect` usage lines — no pricing, no normalization in core (kian-79, plan C67). Tests: `usage_frame_at_stream_end_is_parsed_verbatim_after_content`, `mid_stream_and_final_usage_frames_both_surface`, `usage_only_stream_is_still_an_empty_response`, `turn_end_carries_usage_for_tool_calls_and_final_answer` (incl. the A2 context golden), `turn_end_soft_failure_carries_partial_usage_and_classified_error`, `turn_end_without_usage_is_byte_identical_to_the_legacy_shape`, `recovery_audit_carries_class_and_policy_action`, `usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store` | landed |
+| Durable interrupt intent | The 21st kind `control/interrupt` (drain-activity, non-context; [ADR-014](../design/decisions/ADR-014-durable-interrupt-intent.md)): `interrupt` admits a reserved control-envelope inbox row (idempotent per `(session, target_epoch)`) alongside the in-memory flag; the owning drain consumes it at a safe boundary, appends the audit event and settles `interrupted` — so the intent survives a drain crash and crosses replicas best-effort. Stale rule: a row whose target episode already settled appends `"stale": true` and ends nothing; idle/terminal sessions keep `not_draining`/`unknown_session` and admit nothing (kian-80, plan C68). Tests: `durable_interrupt_intent_survives_crash_and_takeover_settles_interrupted`, `repeated_interrupts_in_one_epoch_dedupe_to_one_row_and_one_event`, `stale_epoch_control_row_is_audit_only_and_does_not_end_the_session`, `control_row_racing_the_settle_flips_the_end_write_to_interrupted`, `interrupt_of_idle_or_terminal_session_admits_no_control_row`, `control_interrupt_leaves_model_context_unchanged`, `additions_only_regression_round6_all_twenty_kind_bytes_are_frozen` (+ golden count 21) | landed |
+| Derived event id + redaction provenance | `kian_core::events::event_id` = `"evt_" + uuid5(session, "kian:event:<seq>")` (pure, never stored, never an envelope field), mirrored dependency-free in the SDK; `kian session export --with-event-ids` (opt-in, default export bytes unchanged, re-import round-trips). `SecretRedactor::redact_with_report` emits `{kind, name, count}` provenance; the report rides the additive `redactions` key on `tool/result` payloads outside `content` — what was redacted, never the values (kian-81, plan C69). Tests: `event_id_golden_vectors_match_rfc4122_v5`, `event_id_is_deterministic_and_distinct_per_seq_and_session`, `event_id_matches_the_core_golden_vectors`, `default_export_bytes_are_unchanged_without_the_flag`, `with_event_ids_export_adds_stable_ids_and_round_trips`, `report_counts_all_three_kinds_and_text_matches_plain_redact`, `remote_exec_result_and_row_carry_the_redaction_report`, `tool_result_payload_carries_redactions_outside_content`, `redactions_payload_key_never_enters_the_model_context` | landed |
+| Per-call tool permission provenance | `agent.permissions` (tool name → `allow\|deny`, closed vocabulary, fail-closed parse: unknown value / key ∉ `tools` / table on a judge agent refuse boot; [ADR-015](../design/decisions/ADR-015-tool-permission-provenance.md)): evaluated once per call **before** the `tool/call` append (log-before-execute holds on both arms), recorded as the additive top-level `permission: {evaluated, policy, matched}` key — allows are audited exactly like denials; a deny never invokes and appends an honest-error `tool/result` the model reacts to; absent table = payload byte-identical (kian-82, plan C70). Tests: `permission_is_a_closed_vocabulary_fail_closed`, `permissions_unknown_value_refuses_boot`, `permissions_key_absent_from_agent_tools_refuse_boot`, `permissions_on_judge_agents_refuse_boot`, `allow_path_invokes_tool_and_records_provenance_default_vs_configured`, `deny_path_does_not_invoke_and_emits_honest_error_result`, `absent_permissions_keep_tool_call_payload_byte_identical_to_today`, `permission_payload_key_never_enters_the_model_context` | landed |
+| Closeout | This record + DESIGN/README/CHANGELOG alignment + docs-map link check (kian-83, plan C71) | landed |
+
+Out of scope this round (recorded, not silently dropped): the `ask` permission/confirmation plane
+(ADR-015 records the shape; blocking confirmation is a separate round), token pricing/cost
+conversion (usage persists verbatim; pricing is a projection-layer decision), CMA wire
+compatibility, and cross-replica interrupt latency beyond "next safe boundary" (ADR-014).
 
 ### Deferred (unchanged)
 | Item | Reason |

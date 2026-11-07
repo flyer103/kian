@@ -26,7 +26,7 @@ been demonstrated.
 | [docs/overview.md](docs/overview.md) | **Start here** | The problem, the execution model, architecture, crate map, S1–S8 proofs, design-input map |
 | [docs/SPEC.md](docs/SPEC.md) | Spec (WHAT) | Positioning, user interfaces, scope, milestones |
 | [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
-| [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-013 (012 landed, 013 draft): each decision with its alternatives and trade-offs |
+| [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-015 (append-only): each decision with its alternatives and trade-offs |
 | [the design notes](the design notes) | Research | Structured digest of the five design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live positive via the contract-v0 peer (`contrib/dsh-v0-peer/`), and the C57 stock-dsh contract survey |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Runbook | Operating postgres mode: `KIAN_PG_URL`, `drain.holder`, migrations, the S8 live replay |
@@ -44,9 +44,9 @@ checks that every relative link in `README.md`, `AGENTS.md`, `docs/SPEC.md`, `de
 | Property | Value |
 |----------|-------|
 | Crates | 13 (`cargo build --workspace`) |
-| Tests | 949 at the Phase-6 closeout, all default-green with zero credentials (`cargo test --workspace`; more as later cards land regression tests) |
-| Event kinds | 20, append-only (additions only, never renamed) |
-| ADRs | 13 (ADR-012 landed, ADR-013 draft) |
+| Tests | 1009 at the Phase-7 closeout, all default-green with zero credentials (`cargo test --workspace`) |
+| Event kinds | 21, append-only (additions only, never renamed; `control/interrupt` added round 7) |
+| ADRs | 15 (ADR-014/015 landed round 7; ADR-013 draft) |
 | Acceptance | S1–S5 and S7 default-green; S6 live leg green via the contract-v0 peer (`contrib/dsh-v0-peer/`, supersedes the 2026-11-01 honest negative — [run log](#live-dsh-bridge-run-log-manual-env-gated)); S8 env-gated (`KIAN_PG_URL`) |
 
 Phase history, one line each (details in the [phase sections](#phase-1-acceptance-checklist-s1s3)
@@ -69,6 +69,11 @@ below):
   (ADR-012), thread-intake projection (ADR-013), outbox bounded retry, policy versioning (P6b);
   issue-watch v2 multi-Ticket dogfood validated live with its gap-fix wave (P6c). Zero new event
   kinds.
+- **Phase 7 — event-model round (borrowed from CMA)**: provider usage + structured recovery
+  audit on `turn/end` (`kian usage-stats`, `/metrics` usage), the durable interrupt intent
+  (`control/interrupt`, the 21st kind, ADR-014), the derived event id
+  (`session export --with-event-ids`) + redaction provenance, and per-call tool permission
+  provenance (`agent.permissions`, ADR-015). One new event kind.
 
 ## Quickstart
 
@@ -118,6 +123,36 @@ Two rules are fail-closed and worth knowing before you edit anything: a missing 
 refuses to start (a policy table is never implied), and a provider whose `api_key_env` variable is
 unset refuses to start (secrets are never read from the file). A malformed config never degrades
 into a running server.
+
+#### Tool permissions (per-call governance)
+
+An agent may carry a per-call permission table — tool name → `allow`/`deny` (closed vocabulary):
+
+```yaml
+agent:
+  id: my-agent
+  tools: ["fs_read", "fs_write", "exec"]
+  permissions:
+    fs_read: allow      # explicit allow (policy: configured)
+    fs_write: deny      # denied per call (never invoked)
+```
+
+Semantics ([ADR-015](design/decisions/ADR-015-tool-permission-provenance.md)):
+
+- **Absent = empty = allow-all**, and with no table the event stream is byte-identical to a
+  server without the feature.
+- The decision is evaluated **before** the call is logged and recorded on the `tool/call` event
+  as provenance (`permission: {evaluated, policy, matched}`) — allows are audited exactly like
+  denials; the key never enters the model request.
+- A **deny** never invokes the tool; the model receives an honest error result
+  (`permission denied by policy: <tool>`) and reacts — a denied call is a tool failure, never a
+  session abort.
+- Fail-closed: an unknown value (`ask` is deferred to a later round) or a key not present in
+  `tools:` refuses to start. Tables evaluate on the built-in loop, plain sessions and the
+  superagent worker template; a table on the Router/Watchdog judge agents refuses to start
+  (it would be silently ignored).
+- The `tools:` list itself is unchanged: it filters what the model *sees*; `permissions` decide
+  what *runs*.
 
 ### 3. Serve
 
@@ -230,6 +265,15 @@ model context       1 of 1 requests byte-identical   <- A2: replay derives the s
 ```
 exported 9 events (seq 1..=9) to audit.jsonl
 ```
+
+Audit export & redaction provenance (C69): `session export --with-event-ids` adds the
+deterministic derived event id (`evt_` + uuid5 of `(session, seq)`, the same value the SDK's
+`KianClient::event_id` computes) to each JSONL line — opt-in, default export bytes unchanged,
+re-import ignores the extra key. When exec output was scrubbed by the kian-77 redactor, the
+`tool/result` payload carries an additive top-level `redactions` report
+(`[{"kind": "known_value"|"token_pattern"|"env_line", "name": …, "count": n}]`, outside
+`content`, omitted when nothing was redacted) — the audit stream now records *what* was
+redacted, never the values, and the model-visible bytes are unchanged either way.
 ```json
 {
   "sessions": 2,
@@ -248,7 +292,15 @@ prefix broke. `compact` is the **only** counted invalidation cause — any other
 reported as `unexpected_prefix_change` and is a bug. One request in this session, so there are no
 pairs to compare yet.
 
-`GET /metrics` carries the engine counters and the same cache report:
+`kian usage-stats` (C67) reports provider token usage from the same event stream — providers'
+`usage` objects persist verbatim on `turn/end` and the projection sums token totals per store
+(no pricing; the provider's own numbers):
+
+```bash
+target/debug/kian usage-stats --config kian.yaml --json
+```
+
+`GET /metrics` carries the engine counters, the same cache report, and the usage aggregate:
 
 ```bash
 curl -s localhost:7433/metrics | jq '{engine: .engine, pending_wake_depth, cache: .cache}'
@@ -1015,6 +1067,15 @@ client.wake_now(&session).await?;
 Golden wire fixtures (`crates/kian-sdk/tests/fixtures/`) pin the request/response bytes of
 every method.
 
+**Interrupt is durable (C68, ADR-014).** `interrupt` flips the in-memory flag *and* admits a
+reserved control-envelope inbox row targeting the current episode (idempotent per epoch), so the
+intent survives a drain crash — the takeover drain consumes the row, appends a
+`control/interrupt` audit event, and settles `interrupted`. Interrupting a session whose
+projection is `running`/`recoverable` but owned elsewhere (or by a dead replica) returns
+`requested` — the durable row is honored at the owner's next safe boundary. Idle/terminal
+sessions still answer `not_draining`/`unknown_session` and admit nothing. Operators can see
+unconsumed intents in `kian session inspect` (the `pending control` line).
+
 ### dsh bridge config (S6)
 
 The bridge (C54) is mounted on the worker template, config-gated and **default off**
@@ -1221,3 +1282,36 @@ gap-fix suites are the proof they close.
 Phase-6 final four-gate run (card C66 closeout, kian-78, 2026-11-04): `cargo build
 --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all -- --check` — all green (docs-only closeout; recorded in the kanban handoff).
+
+## Phase 7 (event-model round: usage audit, durable interrupt, event ids, provenance)
+
+Round 7 (cards kian-79…kian-83, plan `round7-plan.md`) borrowed event-model ideas from Anthropic's
+Claude Managed Agents catalog as design inspiration only — no wire-protocol dependency.
+**Exactly one new event kind (`control/interrupt`): the durable set grows 20 → 21.** Everything
+else is an additive payload key, a pure projection, or a config-first capability; request bytes,
+tool schemas and context-projection bytes are untouched (each card asserts it — cache-byte
+stability). The landed record with named tests is [SPEC §5 Phase 7](docs/SPEC.md); semantics in
+[DESIGN](design/DESIGN.md) §2.4/§3.1/§3.2/§3.3/§6.2/§15.
+
+### Operator surfaces
+
+| Surface | What it does |
+|---------|--------------|
+| `kian usage-stats [--config …] [--session <uuid>] [--json]` | Provider token usage projected from `turn/end` events (per-session and whole-store totals; no pricing — the provider's own numbers, persisted verbatim). Same aggregate on `GET /metrics` (`"usage"`) and in `session inspect` (only when observed). |
+| `kian session export <uuid> … --with-event-ids` | Adds the deterministic derived event id (`evt_` + uuid5 over `(session, seq)`, the same value the SDK's `KianClient::event_id` computes) to each JSONL line. Opt-in; default export bytes unchanged; re-import round-trips. |
+| Durable interrupt (SDK `interrupt`) | The intent is now a durable inbox row (idempotent per epoch), not just a flag: it survives a drain crash, the takeover settles `interrupted`, and cross-replica owners honor it at their next safe boundary. `session inspect` shows pending intents (`pending control`). [ADR-014](design/decisions/ADR-014-durable-interrupt-intent.md). |
+| `agent.permissions` (config) | Per-call tool governance: tool name → `allow`/`deny`, fail-closed, provenance on every `tool/call`, deny never invokes (honest error result). See [Tool permissions](#tool-permissions-per-call-governance) above; [ADR-015](design/decisions/ADR-015-tool-permission-provenance.md). |
+| Redaction provenance (automatic) | When the kian-77 redactor scrubs exec output, the `tool/result` payload records *what* was redacted (`redactions: [{kind, name, count}]`, never the values). See the export section above. |
+
+Run the round's surfaces against an existing store:
+
+```bash
+target/debug/kian usage-stats --config kian.yaml          # or --json
+target/debug/kian session inspect <uuid> --config kian.yaml   # usage lines + pending control
+target/debug/kian session export <uuid> --with-event-ids --out audit.jsonl --config kian.yaml
+```
+
+Round-7 four-gate run (card C71 closeout, kian-83, 2026-11-07): `cargo build --workspace`,
+`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, plus `cargo test -p kian-cli --test docs_map` — all green
+(docs-only closeout; unverified items recorded in the [CHANGELOG](CHANGELOG.md) Phase-7 entry).

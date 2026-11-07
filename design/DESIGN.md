@@ -322,6 +322,25 @@ drains) is byte-identical; write acceptance never consults lease state (ADR-005 
 only). Postgres mode requires an explicit unique `drain.holder` (fail-closed at startup, C51): two replicas sharing a
 holder string would defeat the same-holder condition.
 
+C68 refinement (durable interrupt intent, ADR-014): an `interrupt` RPC is durable *in addition to* the in-memory
+flag — whenever work may still be in flight (a local drain handle, or a `running`/`recoverable` projection whose
+owner is another replica or dead), the control plane admits a reserved control-envelope inbox row targeting the
+last event's epoch; the owning drain consumes it at a safe boundary into a `control/interrupt` event and settles
+`interrupted`. Idle/terminal sessions keep the exact `NotDraining`/`UnknownSession` behavior and admit nothing.
+Two races are settled explicitly:
+
+- **Completed-interrupt race.** A current-epoch intent that becomes eligible while the loop is finishing its work
+  is honored, not completed past: the boundary take after the settle (and, as the last line of defense, one final
+  control-only take immediately before the end write) consumes the row and flips the end write from `completed`
+  (or `failed`) to `interrupted` — the honest stop-before-done. The final take consumes *only* control rows;
+  regular pending inputs stay eligible for the resumer's registered wake.
+- **Stale-epoch rule.** A row whose target episode already settled (the stream carries a `session/ended` at the
+  row's `target_epoch`) is consumed for audit with `"stale": true` and ends nothing — a later episode the intent
+  never aimed at must survive. A row targeting an *un-settled* episode always interrupts, including one whose
+  owner died and a takeover claim resumed: the resumed work is the work the interrupt intended to stop, so the
+  takeover settles `interrupted` (the crash-safe path — the durable row outlives the dead owner and the startup
+  inbox scan hands it to the takeover).
+
 ## 3. Event model and schema evolution
 
 ### 3.1 Event classification (borrowing dsh's durable/live split)
@@ -331,7 +350,7 @@ holder string would defeat the same-holder condition.
 | Durable events | turn/start, step/request, assistant/message (sent bytes), tool/call, tool/result, input/admitted, drain/claimed, session/ended | ✅ append-only | Truth and replay |
 | Live events | streaming chunks, heartbeats, progress notifications | ❌ not persisted | UI/observability (derived from durable events or via a side channel) |
 
-The durable kind set is exactly twenty (C18 + C31): the fifteen kinds frozen through Phase 1
+The durable kind set is exactly twenty-one (C18 + C31 + C68): the fifteen kinds frozen through Phase 1
 (fourteen by C2 + the additive C14 `recovery/budget-reset`) plus the four Phase-2 additions —
 `thread/started`, `thread/completed`, `evidence/verdict`, `channel/delivered` — and the Phase-3
 addition `input/spilled`, all additions-only (no renames, no reformats of existing kinds) and all
@@ -345,6 +364,15 @@ any spill index is a disposable projection over it). The pair is produced by the
 write: the `{"content", "spill"}` envelope is a **row-level convention** riding in the existing
 inbox row `payload` — not an event-payload change; the C4 frozen event payload contracts are
 untouched, and the envelope never appears in any committed event.
+
+C68 addition (`control/interrupt`, ADR-014): the twenty-first kind is the **durable interrupt
+intent** — drain-activity, non-context-bearing (never a message, never in a model request,
+constraint 3), carrying `{"action":"interrupt","reason","requested_by","requested_at_ms",
+"target_epoch","stale"?}`. Like the spill envelope, the control envelope
+`{"kian":{"type":"control","action":"interrupt",…}}` is a row-level convention in the inbox row
+payload; the control plane admits the row (idempotent per `(session, target_epoch)`) and only the
+owning drain appends the event — the layered iron rule (constraint 9) is untouched: the control
+plane still writes nothing but the inbox.
 
 ### 3.2 Model-context projection (the implementation core of A2/A3)
 
@@ -414,6 +442,30 @@ timeout and reports `timed_out` as an honest error result. Wiring: kian-loop dep
 kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resolution +
 `complete_turn`), matching the §7 crate map edge `KLD → KO`.
 
+**C67 audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
+keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
+payloads replay byte-identically: `"usage": <provider usage JSON verbatim>` when the provider
+reported usage for the turn (the openai-compat provider parses the SSE `usage` object verbatim,
+last frame wins, and a usage-only frame never flips the constraint-7 empty-response liveness
+flag), and `"error": {"class": <pure classifier class>, "action": <policy disposition or
+"none">}` on `soft_failure` / `error` outcomes (class from the C10 pure classifier; action from
+the declarative table's disposition names; context-projection and slot errors classify as
+`unknown`, engine/store errors as `store_failure`). The `ModelChunk` seam gained the additive
+`usage: Option<Value>` for transport. The `kian usage-stats` command, the `GET /metrics`
+`"usage"` aggregate and the `session inspect` usage lines are pure projections over these
+payloads (`kian-cli::usage_metrics`, pattern of C17): per-session and per-store totals for
+`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` plus
+`requests_with_usage` / `unknown_usage_requests` counts. Usage is never normalized or priced in
+core (§15).
+
+Round-7 payload additions on the frozen C4/C11 contracts (C69/C70, same discipline as C67 —
+additive top-level keys **outside `content`**, omitted when unset, never in
+`derive_model_context` or request bytes): `tool/result` payloads may carry the `redactions`
+provenance report (§6.2, C69) and `tool/call` payloads may carry the `permission` provenance
+object (§6.2, [ADR-015](decisions/ADR-015-tool-permission-provenance.md), C70). The C4 message
+shape inside `bytes.content` and the C11 key set (`iteration`, `outcome`, `tool_calls`, …) are
+unchanged; both keys are drain-activity audit surface only.
+
 ### 3.3 Schema versioning
 
 - Event envelope carries a version field; JSON encoding (v0).
@@ -434,6 +486,15 @@ kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resol
   INSERT; pg: identity column), never the random uuid. Same-millisecond admits consume in
   admission order: the worker-template classification reads a stream's *first* input, and
   cross-replica replay must be deterministic.
+- C69 (derived event id): every `(session, seq)` pair has a deterministic external id — `"evt_" +
+  RFC 4122 v5(namespace = session uuid, name = "kian:event:<seq>")` — defined by the pure function
+  `kian_core::events::event_id` and mirrored dependency-free in the SDK (`KianClient::event_id`,
+  golden-pinned to the same literals, generated by an independent implementation). It is never an
+  envelope field and never stored: envelope bytes stay frozen v0, and `(session, seq)` remains the
+  only identity — the id is a naming convention over that pair, never a second source of truth.
+  Surfaces: `kian session export --with-event-ids` adds the id to each JSONL line as a presentation
+  key (opt-in; default export bytes unchanged; `import_jsonl` ignores the extra key, so the
+  augmented lines round-trip — verified by test, not export-only).
 
 ## 4. Super-agent reference architecture (bundle, not core)
 
@@ -1043,6 +1104,32 @@ recorded in the closing bullets).
   describes only bundle-layer work. Zero new event kinds throughout; the durable set
   stays 20 for the whole round.
 
+Round-7 additions keep the same discipline (each an additive payload key or a config-first
+capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-intent.md) and
+[ADR-015](decisions/ADR-015-tool-permission-provenance.md)):
+
+- **C67 (kian-79)** — provider usage + structured recovery on `turn/end`: the openai-compat
+  provider persists the provider's `usage` object verbatim; `turn/end` carries it plus
+  `{"class","action"}` on soft-failure/error outcomes. §15 cost note.
+- **C68 (kian-80)** — durable interrupt intent: the 21st kind `control/interrupt` (the round's
+  only new kind) + the reserved control envelope through the inbox; §2.4/§3.1 notes.
+- **C69 (kian-81)** — derived event id + redaction provenance: §6.2 note.
+- **C70 (kian-82) — per-call tool permission provenance** (allow/deny, fail-closed; `ask`
+  deferred): `agent.permissions` / `agents.<id>.permissions` maps tool name → closed
+  `Permission {Allow, Deny}` (unknown values refuse to parse; keys must be in the agent's
+  `tools:`; both fail-closed). `ReActConfig.permissions` evaluates once per call **before** the
+  `tool/call` append (log-before-execute holds on both arms) and records the decision as the
+  additive top-level `permission` key `{evaluated, policy: default|configured, matched}` —
+  provenance-on-the-action, so an *allow* is audited exactly like a deny. The deny arm never
+  invokes and appends a synthetic honest-error `tool/result`
+  (`{"error":"permission denied by policy: <tool>","policy":"deny"}`) — a denied call is a tool
+  failure the model reacts to, never a loop abort. With no table configured the key is omitted:
+  the payload is byte-identical to pre-C70 (constraint 3). Evaluated on the built-in, the
+  plain-session (default agent) and worker-template loops; the Router/Watchdog judge loops do
+  not evaluate a table — one on their agents refuses boot (never silently ignored). The
+  `AgentDef.tools` schema filter (what the model *sees*) is untouched; permissions decide what
+  *runs*.
+
 ## 5. Control-plane protocol (P5 protocolized)
 
 Unified semantics (portable across harnesses/channels):
@@ -1175,6 +1262,29 @@ The async exec pattern (C37, ADR-008) adds no new seam: `AsyncResultSink` is a n
 assembly callback (kian-exec → kian-cli completion bridge), not a provider/plugin
 extension point — the `ToolProvider` role already covers the model-visible `start`/`stop`
 pair, and the completion path is the ordinary Admit→Wake→Promote cycle, not a channel.
+
+C69 (redaction provenance): the kian-77 redactor emits a structured report alongside its
+scrubbing — `SecretRedactor::redact_with_report` returns `(text, Vec<Redaction{kind, name,
+count}>)` with the closed kind set `known_value` / `token_pattern` / `env_line` (aggregate
+counts sorted by `(kind, name)`, never secret values); `redact` delegates to it, so the
+redacted text is byte-identical to kian-77's. The report rides the additive
+`ExecResult.redactions` seam field — including the durable remote-exec queue row, so an
+ADR-007 deduped read-back still answers with the stored report — is copied onto
+`ToolResult.redactions` by the local (`LocalTools` exec) and remote (`RemoteExecTool`)
+paths, and lands on the `tool/result` event payload as an additive top-level `redactions`
+key **outside `content`**, omitted when empty. The context projection reads `role`/
+`content` only, so the key never enters `derive_model_context` or request bytes
+(constraint 3). The async `start`/`stop` acks and the async completion envelope carry no
+report: their payload content is model-visible, and the completion keeps the four legacy
+exec fields only.
+
+C70 (tool permission provenance, ADR-015): the `ToolProvider` seam is unchanged — the
+per-call allow/deny decision is a *loop* concern, evaluated on the built-in ReAct loop before
+the `tool/call` append from the declarative `ReActConfig.permissions` table (the footprint
+ladder's configuration rung: no new trait, no new provider). Provenance rides the `tool/call`
+payload as the additive top-level `permission` key outside `content` (the same projection
+discipline as C69's `redactions`); a denied call never reaches `invoke` — the seam sees only
+permitted calls, and the model sees an honest error `tool/result` instead.
 
 ### 6.3 Footprint Ladder (capability growth ladder)
 
@@ -1405,6 +1515,10 @@ wake transport (C52) is an advisory accelerator — availability never depends o
   ~30× cheaper) — cache hit rate is Kian's first-class metric.
 - Compression is the only deliberate invalidation point: compression policy = a cost/context-
   quality tradeoff, configurable.
+- Token usage is a durable fact (C67): providers' `usage` objects persist verbatim on `turn/end`
+  (drain-activity, never context-bearing) and `kian usage-stats` / `GET /metrics` project token
+  totals from them. Pricing/cost conversion is deliberately a projection-layer decision outside
+  core — the event stream carries the provider's own numbers, unnormalized.
 
 ## 16. Migration and compatibility
 
