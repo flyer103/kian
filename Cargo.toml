@@ -6,6 +6,7 @@ members = [
     "crates/kian-orchestrator",
     "crates/kian-llm",
     "crates/kian-loop",
+    "crates/kian-memory",
     "crates/kian-endpoint",
     "crates/kian-exec",
     "crates/kian-plugin",
@@ -60,6 +61,8 @@ kian-store = { path = "crates/kian-store" }
 kian-orchestrator = { path = "crates/kian-orchestrator" }
 kian-llm = { path = "crates/kian-llm" }
 kian-loop = { path = "crates/kian-loop" }
+# the memory bundle (MEMORY-MODEL Phase 1): kian-core + orchestrator + loop only.
+kian-memory = { path = "crates/kian-memory" }
 kian-endpoint = { path = "crates/kian-endpoint" }
 kian-exec = { path = "crates/kian-exec" }
 kian-plugin = { path = "crates/kian-plugin" }

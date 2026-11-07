@@ -355,7 +355,7 @@ Two races are settled explicitly:
 | Durable events | turn/start, step/request, assistant/message (sent bytes), tool/call, tool/result, input/admitted, drain/claimed, session/ended | ✅ append-only | Truth and replay |
 | Live events | streaming chunks, heartbeats, progress notifications | ❌ not persisted | UI/observability (derived from durable events or via a side channel) |
 
-The durable kind set is exactly twenty-one: the fifteen kinds frozen through 
+The durable kind set is exactly twenty-two: the fifteen kinds frozen through 
 (fourteen by + the additive `recovery/budget-reset`) plus the four additions —
 `thread/started`, `thread/completed`, `evidence/verdict`, `channel/delivered` — and the 
 addition `input/spilled`, all additions-only (no renames, no reformats of existing kinds) and all
@@ -378,6 +378,20 @@ constraint 3), carrying `{"action":"interrupt","reason","requested_by","requeste
 payload; the control plane admits the row (idempotent per `(session, target_epoch)`) and only the
 owning drain appends the event — the layered iron rule (constraint 9) is untouched: the control
 plane still writes nothing but the inbox.
+
+Addition (`memory/note`, MEMORY-MODEL Phase 1 — landed): the twenty-second kind is a **memory
+note** — a note is a claim: non-context-bearing, append-only, latest-per-subject; the fail-closed
+fold (`parse_note`/`project_notes`/`verify_note`) lives in `kian-core::memory` as a disposable
+projection, never as state outside the event stream. The kind is emitted only by a dreaming drain
+of the memory session (`kian-memory`, §7): the dream request is a **marked** inbox row — the
+ops-plane envelope `{content, dream}` (the rendered prompt plus the trusted, server-set `dream`
+marker) under the idempotency key `dream:<source>:<from>:<to>` — consumed through the normal
+`input/admitted` path as one event carrying the additive, non-context `dream` key. The row shape
+is a reserved envelope in the spill/steer sense, and the public wire (`submit`/`steer`/`queue`)
+refuses all three reserved envelope key sets with `-32602` — only the ops plane admits them, so
+the marker cannot be forged from client content (kian-94, review B-2′); routing and provenance
+read the marker, never message text — no new execution mode (the layered iron rule holds
+unchanged).
 
 ### 3.2 Model-context projection (the implementation core of A2/A3)
 
@@ -1318,6 +1332,7 @@ graph TB
  KE[kian-exec<br/>KiandProto server half:<br/>ConnectionManager<br/>+ durable queue]
  KP[kian-plugin<br/>Ctx/Plugin/Disposer/dispatch]
  KLD[kian-loop<br/>LoopDriver seam + built-in ReAct]
+ KM[kian-memory<br/>dreaming drain bundle:<br/>prompt/parser/DreamDriver]
  KEP[kian-endpoint<br/>endpoint SDK library (KiandProto endpoint side)]
  KSA[kian-superagent<br/>Router/Worker bundle + channel templates]
  KCL[kian-cli<br/>serve/run/inspect/replay/export]
@@ -1326,7 +1341,8 @@ graph TB
  end
  KC --> KS
  KO --> KC & KS
- KL & KP & KLD --> KO
+ KL & KP & KLD & KM --> KO
+ KM --> KLD
  KE --> KC & KS
  KSA --> KP & KO & KLD
  KCL --> KO
@@ -1343,6 +1359,7 @@ graph TB
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines commands and correlates results by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations, `RemoteExecBackend` (enqueue-first `ExecBackend`: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`), and `RemoteExecTool` (the same `exec` tool schema as the local built-in, routed through a configured endpoint). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
+| kian-memory | The memory bundle (MEMORY-MODEL Phase 1): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), and `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies | profile assembly |
@@ -1351,10 +1368,13 @@ graph TB
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
 
-**Agent memory (designed, not landed).** Only the `memory/note` kind and a pure `project_notes` fold
-live in `kian-core`; the dreamer prompt, cadence and caps land as a bundle crate beside
-`kian-superagent`; the verbs ride `kian-cli`. Placement and non-goals are fixed by
-[MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
+**Agent memory (MEMORY-MODEL Phase 1 — landed).** The `memory/note` kind and the pure fail-closed
+`parse_note`/`project_notes`/`verify_note` functions live in `kian-core::memory`; the dreamer
+(deterministic prompt with machine-parseable header, fail-closed note parser, `DreamDriver`,
+caps) landed as the `kian-memory` bundle (row above); the `memory:` config section, the
+`memory_dream` ops method and the `kian memory create/dream/list/show/verify` verbs ride
+`kian-cli`. Injection (P2) and representations (P3) remain designed. Placement and non-goals are
+fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
 **SDK freeze and versioning.** The `kian-sdk` public surface *is* the frozen wire
 contract: after it is **additive-only** — removing or reshaping a method, param, response

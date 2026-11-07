@@ -91,7 +91,7 @@ constraint 3: cache-byte stability).
 State is **read only from the projection** (`project(events)`), never from a column or cached
 field. `recoverable` and `archived` are liveness/ops overlays, not event-sourced transitions.
 
-## 3. Kind catalog (21, additions-only)
+## 3. Kind catalog (22, additions-only)
 
 Payload schemas below are the **frozen** shape at schema v0 unless marked additive. "Additive"
 keys are optional, omitted when unset, and leave legacy event bytes byte-identical. Emitters name
@@ -100,7 +100,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | Kind | Ctx | State | Payload (payload = `bytes`) | Emitter | Notes |
 |---|---|---|---|---|---|
 | `session/created` | — | Created | `{}` | orchestrator | First event of a stream. |
-| `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}` | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). |
+| `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}`; additive: `"dream":{"source_session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>,"scope":<str>}` | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). `dream` (§4.2) is the ops-set dream marker — trusted routing/provenance, never read from content. |
 | `drain/claimed` | — | Claimed | `{"holder":<str>,"epoch":<u64>}` | orchestrator | Claim audit. Epoch is the fencing token; claim admission is conditional (ADR-009). |
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |
 | `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
@@ -119,6 +119,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `channel/delivered` | — | DrainActivity | `{"channel":<str>,"target":<json>,"policy":<str>,"words"?<u64>,"truncated":<bool>}`; additive: `"attempt"`,`"first_attempt_ms"` | superagent/channel | Honest delivery receipt; no receipt means no delivery. |
 | `input/spilled` | — | DrainActivity | `{"event_id":<str>,"channel":<str>,"topic":<str\|null>,"raw":<verbatim channel payload>}` | orchestrator (consumption) | Non-context sibling of the Inline `input/admitted`; recall reads the raw from here. |
 | `control/interrupt` | — | DrainActivity | `{"action":"interrupt","reason":<str\|null>,"requested_by":<str\|null>,"requested_at_ms":<u64>,"target_epoch":<u64\|null>,"stale"?:true}` | orchestrator (consumption) | Durable interrupt intent audit (ADR-014). Never a message, never context. |
+| `memory/note` | — | DrainActivity | `{"subject":<non-empty str>,"text":<str>,"status":"candidate"\|"verified"\|"stale","derived_from":[{"session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>}],"verified_by"?:{"method":"transcript"\|"evidence_gate"\|"human","ref":<str>}}`; additive: `"redactions":[{"kind","name","count"}]` | memory dreamer drain | A note is a claim (MEMORY-MODEL): non-context, append-only, latest-per-subject; the fold lives in `kian-core::memory`. `text` passes the secret redactor before append (§4.2). |
 | `session/ended` | — | Ended | envelope-level `"reason":"completed"\|"cancelled"\|"interrupted"\|"failed"`; `bytes: {}` | orchestrator | **One atomic append** with the transition (`NoHalfTerminated`). `interrupted`/`failed` return the session to `idle` (resumable); only `completed`/`cancelled` are terminal. |
 
 ## 4. Cross-cutting payload contracts
@@ -138,6 +139,14 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   `"error": {"class","action"}`.
 - `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (ADR-015).
 - `tool/result`: `"redactions": [{"kind","name","count"}]`.
+- `input/admitted`: `"dream": {"source_session","start_seq","end_seq","scope"}` — the trusted
+  dream marker, set only by the ops plane's `memory_dream` admit (the public wire refuses the
+  reserved envelope key sets with `-32602`, so client content cannot land one; kian-94, review
+  B-2′). Dreamer routing and note
+  provenance read this marker, never message content (a user-typed `[kian-dream: …]` header is
+  ordinary content); omitted on every other row.
+- `memory/note`: `"redactions": [{"kind","name","count"}]` — note `text` passes the secret
+  redactor before append; the report is aggregate counts only (the `tool/result` precedent).
 
 Rule: an additive key must leave legacy event bytes byte-identical and must not change
 `derive_model_context` output or model request bytes. If a proposed field is model-visible, it is
@@ -161,13 +170,14 @@ only `compact` may invalidate the prefix (`unexpected_prefix_change` must stay z
 
 ### 4.5 Reserved inbox-row envelopes (pre-event, NOT event kinds)
 
-The control plane writes only inbox rows; the drain consumes them into events. Three reserved
+The control plane writes only inbox rows; the drain consumes them into events. Four reserved
 row-payload shapes must not be confused with event payloads:
 
 | Row payload | Consumed into |
 |---|---|
 | `{"synthetic":true,"content":X}` | `input/admitted` `{role:"user",content:X,synthetic:true}` |
 | `{"content":X,"spill":Y}` | the `input/admitted` + `input/spilled` pair in one fenced batch |
+| `{"content":X,"dream":M}` | ONE `input/admitted` `{role:"user",content:X,dream:M}` (M is the trusted dream marker, §4.2) |
 | `{"kian":{"type":"control","action":"interrupt",...}}` | `control/interrupt` (never a message) |
 
 ## 5. Invariants (must hold for every change)

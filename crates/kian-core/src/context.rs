@@ -125,6 +125,11 @@ fn is_context_bearing(kind: &EventKind) -> bool {
         // data (the durable interrupt intent), never a message — the
         // kind must not appear in a model request (constraint 3).
         EventKind::ControlInterrupt => false,
+        // addition: a memory note is a *claim* about the agent
+        // (MEMORY-MODEL), not a message — appended by the dreamer
+        // drain and folded by `kian-core::memory`; it never re-enters
+        // a model context (constraint 3).
+        EventKind::MemoryNote => false,
         _ => false,
     }
 }
@@ -715,6 +720,66 @@ mod tests {
             crate::events::EventKind::ControlInterrupt,
             json!({"no_role": true}),
         );
+        let ctx = derive_model_context(&shaped.build()).unwrap();
+        assert_eq!(ctx, vec![user_msg("q")]);
+    }
+
+    /// `memory/note` is non-context-bearing — a stream containing
+    /// notes derives a byte-identical context to the same stream
+    /// without them (a note is a *claim* the dreamer drain appends,
+    /// never a message; MEMORY-MODEL), whatever position they sit at
+    /// and whatever their payload shape (constraint 3).
+    #[test]
+    fn memory_note_leaves_model_context_unchanged() {
+        let note = json!({
+            "subject": "deploys via the dsh bridge",
+            "text": "Verify the environment before suggesting commands.",
+            "status": "verified",
+            "derived_from": [{
+                "session": "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b",
+                "start_seq": 4,
+                "end_seq": 38
+            }],
+            "verified_by": {"method": "transcript", "ref": "seq range [4,38)"}
+        });
+        let candidate = json!({
+            "subject": "prefers concise replies",
+            "text": "Keep answers short.",
+            "status": "candidate",
+            "derived_from": [{
+                "session": "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b",
+                "start_seq": 4,
+                "end_seq": 9
+            }]
+        });
+
+        let mut with = started();
+        with.user("hello");
+        with.push(EventKind::MemoryNote, note);
+        with.assistant(json!("working"));
+        // A second note directly between context-bearing messages —
+        // position must not matter, only the kind does.
+        with.push(EventKind::MemoryNote, candidate);
+
+        let mut without = started();
+        without.user("hello");
+        without.assistant(json!("working"));
+
+        let ctx_with = derive_model_context(&with.build()).unwrap();
+        let ctx_without = derive_model_context(&without.build()).unwrap();
+        assert_eq!(ctx_with, ctx_without);
+        assert_eq!(
+            context_to_bytes(&ctx_with),
+            context_to_bytes(&ctx_without),
+            "memory/note must not change a single context byte"
+        );
+
+        // A message-shaped note payload is skipped unparsed — even a
+        // payload that would be malformed for a context-bearing kind
+        // must not error here.
+        let mut shaped = started();
+        shaped.user("q");
+        shaped.push(EventKind::MemoryNote, json!({"no_role": true}));
         let ctx = derive_model_context(&shaped.build()).unwrap();
         assert_eq!(ctx, vec![user_msg("q")]);
     }

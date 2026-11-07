@@ -32,6 +32,9 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   heartbeat watchdog; offline work parks and resumes honestly.
 - **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
   the same `LoopDriver` seam and event kinds.
+- **Agent memory (notes + dreaming)** — the memory session's drain reads a bounded transcript
+  range and appends `memory/note` events (claims with provenance and verification state);
+  `kian memory create/dream/list/show/verify`. Injection is a later phase.
 - **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats, `/metrics`, and a
   frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider; one Rust process plus
@@ -65,7 +68,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/DESIGN.md](design/DESIGN.md) | The blueprint (HOW): execution model, recovery, plugin system, bundle |
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
-| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract (proposed): notes, dreaming, injection, representations |
+| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phase 1 landed; injection/representations designed) |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
@@ -442,6 +445,37 @@ The decision is evaluated **before** the call is logged and recorded as provenan
 the model receives an honest error result and reacts. Unknown values and keys outside `tools:`
 refuse to start. Absent table = empty = allow-all, byte-identical to a server without the feature.
 
+### Agent memory (notes + dreaming)
+
+Memory is a bundle over the same event stream: a memory session whose drain ("dreaming") reads a
+bounded range of a source session's transcript and appends `memory/note` events — immutable claims
+keyed by subject, carrying provenance (`derived_from`) and a fail-closed
+`candidate|verified|stale` status. Notes are non-context events: no session's model request bytes
+change. Absent the `memory:` section, behavior is byte-identical (memory off).
+
+```yaml
+memory:
+  scope: my-agent            # the agent identity whose memory this is
+  dreamer:
+    agent: my-agent          # a named agents: entry or the default agent: id
+    max_bytes_read: 262144   # default 256 KiB; an over-budget dream is refused, not truncated
+    max_notes: 20            # default; an over-cap answer is refused, not truncated
+```
+
+With the server running (`memory dream` goes through the `memory_dream` ops method):
+
+```bash
+MEM=$(target/debug/kian memory create --config kian.yaml --json | jq -r .session)
+target/debug/kian memory dream --session "$MEM" --source "$SID" --from 1 --to 9 --config kian.yaml
+target/debug/kian memory list   --session "$MEM" --config kian.yaml   # the projected notes
+target/debug/kian memory show   --session "$MEM" deploys.rollback --config kian.yaml
+target/debug/kian memory verify --session "$MEM" --config kian.yaml   # re-check ranges offline
+```
+
+A dream is idempotent per `(source, range)` — repeating the same range is a no-op, and a drain
+crash resumes without duplicate notes (dedupe on `(subject, derived_from)`). Injection into new
+sessions is Phase 2 (designed, not landed).
+
 ### Operator surfaces
 
 | Surface | What it does |
@@ -484,6 +518,7 @@ Secrets and URLs are env-only, never config values. Executed live records live i
 | `kian-orchestrator` | Admit → Wake → Drain → Promote engine and the bounded three-layer recovery subsystem |
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
+| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
 | `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |

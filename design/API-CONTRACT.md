@@ -76,6 +76,8 @@ suffix.
 | -32002 | session_busy | An ops action requires an idle session; a drain holds it | ops |
 | -32003 | session_terminal | The session is terminal (completed/cancelled/archived) | ops |
 | -32004 | session_idle | `recovery_budget_reset` on a session whose recovery budget was never consumed | ops |
+| -32005 | memory_not_configured | `memory_dream` on a server without a `memory:` section — a closed refusal, never a silent no-op | ops |
+| -32006 | dream_range_too_large | `memory_dream` over a source range whose transcript exceeds `memory.dreamer.max_bytes_read` — refused, not truncated | ops |
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
 new documented code.
@@ -85,7 +87,7 @@ new documented code.
 | Field | Contract |
 |---|---|
 | `session` | UUID string (hyphenated, 36 chars) |
-| `content` | Any JSON value; typical use is a string or a structured message. Input semantics (synthetic markers, Inline/Spill shaping, provenance wrappers) are owned by DESIGN/EVENT-MODEL, not by this wire |
+| `content` | Any JSON value except a reserved row-envelope key set — an object whose keys are exactly `{content,dream}`, `{content,spill}` or `{synthetic,content}` is `-32602`: those shapes are admitted only by the server's internal planes (§4.2), never by public input. Typical use is a string or a structured message. Input semantics (synthetic markers, Inline/Spill shaping, provenance wrappers) are owned by DESIGN/EVENT-MODEL, not by this wire |
 | `idempotency_key` | Optional string. Replaying it for the same session does not create a second durable row; the result reports `deduplicated: true` |
 | `projection.state` | `idle \| running \| completed \| cancelled` — the event-derived states. `recoverable` is a liveness overlay (DESIGN §2.2) and `archived` has no v0 event, so neither can appear in a pure projection |
 | `topic` | Optional string; JSON `null` when absent |
@@ -121,7 +123,8 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 - `create_session` takes no params; the default agent, model slots and tools come from `kian.yaml`.
   The new session is `idle`.
 - `submit` admits one durable input row before any wake fires (admit-before-wake). The result only
-  reports idempotency; progress is observed on the event stream.
+  reports idempotency; progress is observed on the event stream. A `content` that is a reserved
+  row-envelope key set (§2.3) is refused with `-32602` before anything is admitted.
 - `steer` uses the same admit path as `submit` but carries the strippable synthetic marker; it lands
   at the next provider-turn safe boundary and never inside an in-flight provider turn.
 - `queue` uses the same admit path; the input is promoted at the next safe boundary and never
@@ -150,11 +153,12 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 | `wake_now` | `{"session":"<uuid>"}` | `{"outcome":"started" \| "folded"}` |
 | `recovery_budget_reset` | `{"session":"<uuid>","reason":"<string>"?}` | `{"seq":<u64>,"epoch":<u64>,"ts":<u64>}` |
 | `mock_channel_send` | `{"channel":"<string>","topic":"<string>"?,"payload":<any>}` | `{"event_id":"<string>","channel":"<string>","topic":"<string>" \| null}` |
+| `memory_dream` | `{"session":"<uuid>","source":"<uuid>","from_seq":<u64>,"to_seq":<u64>}` | `{"session":<uuid>,"source":<uuid>,"from_seq":<u64>,"to_seq":<u64>,"deduplicated":<bool>,"bytes_read":<u64>,"prompt_bytes":<u64>}` |
 
 ### 4.2 Semantics
 
-- `wake_now` is advisory. `started` = no drain was in flight and one was spawned; `folded` = a drain
-  was already running and the wake folded onto the in-process wake registry. A wake over an empty
+- `wake_now` is advisory. `started` = no drain was in flight and one was spawned; `folded` = a
+  drain was already running and the wake folded onto the in-process wake registry. A wake over an empty
   inbox is a no-op drain that exits; the session state does not change.
 - `recovery_budget_reset` appends a `recovery/budget-reset` event (an explicit append — never a
   silent counter wipe) and returns its stream position. `reason` is optional and is recorded in the
@@ -162,10 +166,33 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 - `mock_channel_send` requires the super-agent assembly and a configured mock channel; an unknown
   channel is `-32000` with the configured channel list in the message. The injected `event_id` is
   the subscription admit's idempotency key, so re-injecting the same id never double-admits.
+- `memory_dream` (round 8, MEMORY-MODEL Phase 1) requires a `memory:` section (`-32005` otherwise).
+  `session` is the operator-created memory session (`kian memory create`); `source` names the
+  session whose half-open range `[from_seq, to_seq)` is consolidated. The range must satisfy
+  `1 <= from_seq < to_seq <=` the source head (the source's last event seq + 1, read from the
+  rebuilt stream; anything else is `-32602` — refused at admission, never a silent truncation).
+  The server reads the range, refuses honestly when the rendered transcript exceeds
+  `memory.dreamer.max_bytes_read` (`-32006` — never truncates), renders the deterministic dream
+  prompt through `kian-memory` and admits ONE durable inbox row (the ops-plane dream envelope:
+  exactly `{"content": <rendered prompt>, "dream": <trusted marker>}` — the marker carries
+  source + range + scope and is set by the server, never derived from message text), under the
+  idempotency key `dream:<source>:<from>:<to>`, which wakes the dreamer drain.
+  The public control plane (`submit`/`steer`/`queue`) refuses this reserved envelope shape with
+  `-32602` (§2.3), so only the ops plane can land a marked row — no client content can forge the
+  marker (kian-94, review B-2′).
+  Repeating the same range is a no-op: `deduplicated: true` — while the row is still pending via
+  the inbox idempotency key, and after its `input/admitted` landed via the stream itself (the
+  trusted `dream` marker carries source + range), including on a session that has since settled.
+  Dreamer routing and note provenance read the marker only: a plain `submit` whose text mimics
+  the `[kian-dream: …]` prompt header is ordinary content and never routes onto the dreamer. A
+  terminal memory session refuses a NEW range (`-32003`); a dream settles its memory session
+  (notes land, then the end write), so a new range goes on a fresh memory session. An unknown
+  `session` is `-32001`; an unknown or empty `source` range is `-32001` / `-32602`.
 
 ### 4.3 Errors
 
-`-32600`, `-32601`, `-32602`, `-32000`, `-32001`, `-32002`, `-32003`, `-32004` (§2.2).
+`-32600`, `-32601`, `-32602`, `-32000`, `-32001`, `-32002`, `-32003`, `-32004`, `-32005`,
+`-32006` (§2.2).
 
 ## 5. Event stream — `GET /sessions/{id}/events`
 
@@ -204,8 +231,9 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}` |
 | `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
+| `memory` | object or `null` | Dream counters of the memory assembly (dreams, read/parse/append failures, notes appended/deduped); `null` when no `memory:` section assembled |
 
-The five top-level keys are stable; nested counters are additive. Consumers must ignore unknown
+The six top-level keys are stable; nested counters are additive. Consumers must ignore unknown
 keys and unknown nested fields. `engine` and `pending_wake_depth` are process-local, while `cache`
 and `usage` are pure projections over durable events — a restart resets the former and not the
 latter.

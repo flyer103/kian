@@ -283,8 +283,8 @@ fn event_model_catalog_matches_core_kinds() {
 
     assert_eq!(
         coded.len(),
-        21,
-        "expected 21 EventKind variants, got {coded:?}"
+        22,
+        "expected 22 EventKind variants, got {coded:?}"
     );
     assert_eq!(
         documented.len(),
@@ -334,8 +334,8 @@ fn api_contract_method_catalog_matches_dispatch() {
 
     assert_eq!(
         coded.len(),
-        9,
-        "expected 9 JSON-RPC methods (6 control + 3 ops), got {coded:?}"
+        10,
+        "expected 10 JSON-RPC methods (6 control + 4 ops), got {coded:?}"
     );
     assert_eq!(
         documented,

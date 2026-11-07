@@ -226,12 +226,38 @@ fn session_of(params: &Value) -> Result<SessionId, (i64, String)> {
     Ok(SessionId(uuid))
 }
 
+/// Reserved row-envelope key sets (DESIGN §3.1, MEMORY-MODEL §5 D1):
+/// `{content, dream}` (the ops-plane dream admit), `{content, spill}`
+/// (the Inline/Spill shape) and `{synthetic, content}` (the strippable
+/// steer marker). Only trusted internal callers produce these shapes;
+/// a public `submit`/`steer`/`queue` carrying one would let client
+/// content forge a marker the server is documented to set itself
+/// (kian-94, review B-2′), so the wire refuses them (`-32602`).
+fn is_reserved_envelope(content: &Value) -> bool {
+    let Some(obj) = content.as_object() else {
+        return false;
+    };
+    obj.len() == 2
+        && obj.contains_key("content")
+        && ["dream", "spill", "synthetic"]
+            .iter()
+            .any(|k| obj.contains_key(*k))
+}
+
 fn input_params(params: &Value) -> Result<(SessionId, Value, Option<String>), (i64, String)> {
     let session = session_of(params)?;
     let content = params
         .get("content")
         .cloned()
         .ok_or_else(|| (CODE_INVALID_PARAMS, "missing `content`".to_string()))?;
+    if is_reserved_envelope(&content) {
+        return Err((
+            CODE_INVALID_PARAMS,
+            "`content` is a reserved row-envelope key set ({content,dream} / {content,spill} \
+             / {synthetic,content}); only the server's internal planes admit those rows"
+                .to_string(),
+        ));
+    }
     let idempotency_key = params
         .get("idempotency_key")
         .and_then(Value::as_str)
@@ -316,4 +342,67 @@ async fn session_events_sse(State(state): State<AppState>, Path(id): Path<String
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{CODE_INVALID_PARAMS, input_params, is_reserved_envelope};
+
+    /// Exactly the three reserved two-key shapes are refused; anything
+    /// else (extra keys, single keys, other pairs, non-objects) stays
+    /// ordinary client content.
+    #[test]
+    fn reserved_envelope_detection_is_exact() {
+        for reserved in [
+            json!({"content": "x", "dream": {"source_session": "ghost"}}),
+            json!({"content": "x", "spill": {"raw": 1}}),
+            json!({"synthetic": true, "content": "plan B"}),
+        ] {
+            assert!(is_reserved_envelope(&reserved), "{reserved}");
+        }
+        for ordinary in [
+            json!("plain text"),
+            json!({"content": "x"}),
+            json!({"content": "x", "dream": 1, "extra": 2}),
+            json!({"dream": 1, "spill": 2}),
+            json!({"synthetic": true}),
+            json!({"content": "x", "unrelated": {"dream": 1}}),
+        ] {
+            assert!(!is_reserved_envelope(&ordinary), "{ordinary}");
+        }
+    }
+
+    /// The wire-level guard (kian-94, review B-2′): `input_params` maps
+    /// a reserved envelope to `-32602` and passes ordinary structured
+    /// content through untouched.
+    #[test]
+    fn input_params_refuses_reserved_envelopes() {
+        let params = json!({
+            "session": "00000000-0000-0000-0000-000000000001",
+            "content": {"content": "x", "dream": {"source_session": "00000000-0000-0000-0000-000000000002"}},
+        });
+        match input_params(&params) {
+            Err((code, msg)) => {
+                assert_eq!(code, CODE_INVALID_PARAMS);
+                assert!(msg.contains("reserved"), "{msg}");
+            }
+            Ok(ok) => panic!("a reserved envelope must be refused, got {ok:?}"),
+        }
+        let ordinary = json!({
+            "session": "00000000-0000-0000-0000-000000000001",
+            "content": {"content": "x", "unrelated": true},
+            "idempotency_key": "k",
+        });
+        let (session, content, key) = input_params(&ordinary).expect("ordinary object content");
+        assert_eq!(
+            session.0,
+            "00000000-0000-0000-0000-000000000001"
+                .parse::<uuid::Uuid>()
+                .unwrap()
+        );
+        assert_eq!(content, json!({"content": "x", "unrelated": true}));
+        assert_eq!(key.as_deref(), Some("k"));
+    }
 }

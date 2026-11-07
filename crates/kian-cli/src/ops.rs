@@ -1,17 +1,19 @@
 //! Operational plane (+ the `mock_channel_send` demo
 //! injection): the server surface behind `kian wake-now`,
-//! `kian recovery budget reset` and `kian mock-channel-send`.
+//! `kian recovery budget reset`, `kian mock-channel-send` and
+//! `kian memory dream`.
 //!
 //! This module is deliberately **separate** from [`crate::api`] (the
 //! control plane): the control plane obeys the layered iron rule —
 //! inbox writes and projection reads only — while these are explicit
 //! *operator* actions (trigger a wake; append a recovery-budget-reset
-//! event; inject a demo event onto a configured mock channel). The
-//! wire and its semantics are untouched; the ops lane mounts at
-//! `POST /ops/rpc` and mirrors the same structural discipline: handlers
-//! speak JSON and call **nothing but** the [`OpsPlane`] trait — no
-//! engine, no store, no execution symbols (the extended iron-rule test
-//! greps this module too).
+//! event; inject a demo event onto a configured mock channel; admit
+//! one dream request onto the memory session). The wire and its
+//! semantics are untouched; the ops lane mounts at `POST /ops/rpc`
+//! and mirrors the same structural discipline: handlers speak JSON
+//! and call **nothing but** the [`OpsPlane`] trait — no engine, no
+//! store, no execution symbols (the extended iron-rule test greps
+//! this module too).
 //!
 //! Wire (JSON-RPC 2.0, same error-code table as the control plane):
 //!
@@ -26,6 +28,14 @@
 //!   injection; DESIGN §5 note) → `{"event_id", "channel", "topic?}` —
 //!   one event onto the named mock channel; the subscription engine
 //!   routes it per the configured rules.
+//! - `memory_dream {session, source, from_seq, to_seq}` → the dream
+//!   request of round-8 plan §2.3: the server reads the source range
+//!   (refusing honestly over `max_bytes_read`), renders the prompt
+//!   through `kian-memory` and admits ONE durable inbox row (role
+//!   user, the rendered prompt) onto the memory session under the
+//!   idempotency key `dream:<source>:<from>:<to>` — repeating the
+//!   same range is a no-op. Memory must be configured (`memory:`
+//!   section); otherwise `-32005`.
 
 use std::sync::Arc;
 
@@ -67,6 +77,20 @@ pub trait OpsPlane: Send + Sync {
         topic: Option<String>,
         payload: Value,
     ) -> BoxFuture<'_, Result<MockSendReceipt, OpsError>>;
+
+    /// Admits one dream request onto the memory session (round-8 plan
+    /// §2.3): reads the source range `[from_seq, to_seq)`, renders the
+    /// deterministic dream prompt and admits it as ONE durable inbox
+    /// row (role user) under the idempotency key
+    /// `dream:<source>:<from>:<to>` — a repeated range is a no-op
+    /// (the existing inbox dedupe). The admit wakes the session.
+    fn memory_dream(
+        &self,
+        session: SessionId,
+        source: SessionId,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> BoxFuture<'_, Result<DreamAdmitReceipt, OpsError>>;
 }
 
 /// Outcome of an operator wake.
@@ -105,6 +129,25 @@ pub struct MockSendReceipt {
     pub topic: Option<String>,
 }
 
+/// Receipt of one admitted dream request (the `memory_dream` result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DreamAdmitReceipt {
+    /// The memory session the dream row landed on.
+    pub session: SessionId,
+    /// The source session whose range is being consolidated.
+    pub source: SessionId,
+    /// The half-open range `[from_seq, to_seq)`.
+    pub from_seq: u64,
+    pub to_seq: u64,
+    /// True when the idempotency key already existed — a repeated
+    /// range admitted nothing (the honest no-op).
+    pub deduplicated: bool,
+    /// Bytes of source transcript actually read (under the cap).
+    pub bytes_read: u64,
+    /// Bytes of the whole rendered dream prompt.
+    pub prompt_bytes: u64,
+}
+
 /// Operational-plane failures.
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -118,6 +161,44 @@ pub enum OpsError {
         "session {session:?} is idle; its recovery budget was never consumed (wake-now it first)"
     )]
     SessionIdle { session: SessionId },
+    #[error(
+        "memory is not configured (no `memory:` section in kian.yaml) — memory_dream is refused"
+    )]
+    MemoryNotConfigured,
+    #[error("unknown source session {source_session:?}")]
+    UnknownSource { source_session: SessionId },
+    #[error(
+        "source range [{from_seq},{to_seq}) of {source_session:?} carries no events — nothing to dream over"
+    )]
+    EmptySourceRange {
+        source_session: SessionId,
+        from_seq: u64,
+        to_seq: u64,
+    },
+    #[error(
+        "source range [{from_seq},{to_seq}) of {source_session:?} renders {bytes} transcript bytes over the configured max_bytes_read {cap} — refused, not truncated"
+    )]
+    SourceRangeTooLarge {
+        source_session: SessionId,
+        from_seq: u64,
+        to_seq: u64,
+        bytes: u64,
+        cap: u64,
+    },
+    /// A dream source range outside the source stream (kian-91, review
+    /// B-1): `memory_dream` refuses unless the range satisfies
+    /// `1 <= from_seq < to_seq <=` the source head — the source's last
+    /// event seq plus one, read from the rebuilt stream. Refused at
+    /// admission; never a silent truncation.
+    #[error(
+        "source range [{from_seq},{to_seq}) of {source_session:?} is out of bounds: must satisfy 1 <= from_seq < to_seq <= {head_next_seq} (the source head)"
+    )]
+    SourceRangeOutOfBounds {
+        source_session: SessionId,
+        from_seq: u64,
+        to_seq: u64,
+        head_next_seq: u64,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -127,6 +208,11 @@ const CODE_UNKNOWN_SESSION: i64 = -32001;
 const CODE_SESSION_BUSY: i64 = -32002;
 const CODE_SESSION_TERMINAL: i64 = -32003;
 const CODE_SESSION_IDLE: i64 = -32004;
+/// Memory is not configured (`memory_dream` on a memory-off server).
+const CODE_MEMORY_NOT_CONFIGURED: i64 = -32005;
+/// A dream source range over the configured `max_bytes_read` cap
+/// (refused honestly, never truncated).
+const CODE_DREAM_RANGE_TOO_LARGE: i64 = -32006;
 const CODE_INTERNAL: i64 = -32000;
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
@@ -200,6 +286,52 @@ fn ops_err(e: OpsError) -> (i64, String) {
                 session.0
             ),
         ),
+        OpsError::MemoryNotConfigured => (
+            CODE_MEMORY_NOT_CONFIGURED,
+            "memory is not configured (no `memory:` section in kian.yaml)".into(),
+        ),
+        OpsError::UnknownSource { source_session } => (
+            CODE_UNKNOWN_SESSION,
+            format!("unknown source session {:?}", source_session.0),
+        ),
+        OpsError::EmptySourceRange {
+            source_session,
+            from_seq,
+            to_seq,
+        } => (
+            CODE_INVALID_PARAMS,
+            format!(
+                "source range [{from_seq},{to_seq}) of {:?} carries no events",
+                source_session.0
+            ),
+        ),
+        OpsError::SourceRangeTooLarge {
+            source_session,
+            from_seq,
+            to_seq,
+            bytes,
+            cap,
+        } => (
+            CODE_DREAM_RANGE_TOO_LARGE,
+            format!(
+                "source range [{from_seq},{to_seq}) of {:?} renders {bytes} transcript bytes \
+                 over the configured max_bytes_read {cap} — refused, not truncated",
+                source_session.0
+            ),
+        ),
+        OpsError::SourceRangeOutOfBounds {
+            source_session,
+            from_seq,
+            to_seq,
+            head_next_seq,
+        } => (
+            CODE_INVALID_PARAMS,
+            format!(
+                "source range [{from_seq},{to_seq}) of {:?} is out of bounds: must satisfy \
+                 1 <= from_seq < to_seq <= {head_next_seq} (the source head) — refused, not truncated",
+                source_session.0
+            ),
+        ),
         OpsError::Internal(msg) => (CODE_INTERNAL, msg),
     }
 }
@@ -254,10 +386,29 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
                 "topic": receipt.topic,
             }))
         }
+        "memory_dream" => {
+            let session = session_params(params)?;
+            let source = source_params(params)?;
+            let (from_seq, to_seq) = range_params(params)?;
+            let receipt = state
+                .plane
+                .memory_dream(session, source, from_seq, to_seq)
+                .await
+                .map_err(ops_err)?;
+            Ok(json!({
+                "session": receipt.session.0,
+                "source": receipt.source.0,
+                "from_seq": receipt.from_seq,
+                "to_seq": receipt.to_seq,
+                "deduplicated": receipt.deduplicated,
+                "bytes_read": receipt.bytes_read,
+                "prompt_bytes": receipt.prompt_bytes,
+            }))
+        }
         other => Err((
             CODE_METHOD_NOT_FOUND,
             format!(
-                "unknown method `{other}` (ops set: wake_now, recovery_budget_reset, mock_channel_send)"
+                "unknown method `{other}` (ops set: wake_now, recovery_budget_reset, mock_channel_send, memory_dream)"
             ),
         )),
     }
@@ -280,6 +431,46 @@ fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
         )
     })?;
     Ok(SessionId(uuid))
+}
+
+/// The `source` param of `memory_dream` (a uuid string).
+fn source_params(params: &Value) -> Result<SessionId, (i64, String)> {
+    let s = params
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            (
+                CODE_INVALID_PARAMS,
+                "missing `source` (uuid string)".to_string(),
+            )
+        })?;
+    let uuid: uuid::Uuid = s
+        .parse()
+        .map_err(|_| (CODE_INVALID_PARAMS, format!("`source` `{s}` is not a uuid")))?;
+    Ok(SessionId(uuid))
+}
+
+/// The `from_seq`/`to_seq` params of `memory_dream`: two u64s naming
+/// the half-open range `[from_seq, to_seq)` — an inverted or empty
+/// range is a parameter error (dreams are never over nothing).
+fn range_params(params: &Value) -> Result<(u64, u64), (i64, String)> {
+    let seq = |key: &str| -> Result<u64, (i64, String)> {
+        params.get(key).and_then(Value::as_u64).ok_or_else(|| {
+            (
+                CODE_INVALID_PARAMS,
+                format!("missing `{key}` (u64 seq number)"),
+            )
+        })
+    };
+    let from = seq("from_seq")?;
+    let to = seq("to_seq")?;
+    if from >= to {
+        return Err((
+            CODE_INVALID_PARAMS,
+            format!("`from_seq` {from} must be < `to_seq` {to} (half-open range)"),
+        ));
+    }
+    Ok((from, to))
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +550,62 @@ mod tests {
         assert_eq!(code, -32602);
     }
 
+    /// `memory_dream` dispatches through the trait and reports the
+    /// receipt; malformed ranges are parameter errors.
+    #[tokio::test]
+    async fn ops_dispatch_dreams_through_the_trait() {
+        let plane = Arc::new(FakePlane::default());
+        let sid = SessionId::new();
+        let source = SessionId::new();
+        let state = AppState {
+            plane: plane.clone(),
+        };
+
+        let out = dispatch(
+            &state,
+            "memory_dream",
+            &json!({
+                "session": sid.0.to_string(),
+                "source": source.0.to_string(),
+                "from_seq": 1,
+                "to_seq": 4,
+            }),
+        )
+        .await
+        .expect("dream dispatch");
+        assert_eq!(out["deduplicated"], false);
+        assert_eq!(out["bytes_read"], 42);
+        assert_eq!(
+            *plane.dream_calls.lock().unwrap(),
+            vec![(sid, source, 1, 4)]
+        );
+
+        // An inverted range never reaches the plane.
+        let (code, _) = dispatch(
+            &state,
+            "memory_dream",
+            &json!({
+                "session": sid.0.to_string(),
+                "source": source.0.to_string(),
+                "from_seq": 4,
+                "to_seq": 4,
+            }),
+        )
+        .await
+        .expect_err("inverted range");
+        assert_eq!(code, -32602);
+
+        // Missing source is a parameter error too.
+        let (code, _) = dispatch(
+            &state,
+            "memory_dream",
+            &json!({"session": sid.0.to_string(), "from_seq": 1, "to_seq": 4}),
+        )
+        .await
+        .expect_err("missing source");
+        assert_eq!(code, -32602);
+    }
+
     /// Error codes stay distinguishable (fail-closed, honest errors).
     #[test]
     fn ops_error_codes_are_distinct() {
@@ -375,12 +622,59 @@ mod tests {
         }
     }
 
+    /// The memory error codes (round 8): the two new closed refusals
+    /// plus the reused codes the dream path maps onto.
+    #[test]
+    fn ops_memory_error_codes_are_distinct() {
+        let sid = SessionId::new();
+        let cases = [
+            (OpsError::MemoryNotConfigured, -32005_i64),
+            (
+                OpsError::SourceRangeTooLarge {
+                    source_session: sid,
+                    from_seq: 1,
+                    to_seq: 9,
+                    bytes: 4096,
+                    cap: 1024,
+                },
+                -32006,
+            ),
+            (
+                OpsError::SourceRangeOutOfBounds {
+                    source_session: sid,
+                    from_seq: 2,
+                    to_seq: 509,
+                    head_next_seq: 10,
+                },
+                -32602,
+            ),
+            (
+                OpsError::UnknownSource {
+                    source_session: sid,
+                },
+                -32001,
+            ),
+            (
+                OpsError::EmptySourceRange {
+                    source_session: sid,
+                    from_seq: 1,
+                    to_seq: 2,
+                },
+                -32602,
+            ),
+        ];
+        for (err, code) in cases {
+            assert_eq!(super::ops_err(err).0, code);
+        }
+    }
+
     /// A recording fake: proves the handler layer speaks only OpsPlane.
     #[derive(Default)]
     pub struct FakePlane {
         pub wake_calls: Mutex<Vec<SessionId>>,
         pub reset_calls: Mutex<Vec<(SessionId, Option<String>)>>,
         pub mock_sends: Mutex<Vec<(String, Option<String>, serde_json::Value)>>,
+        pub dream_calls: Mutex<Vec<(SessionId, SessionId, u64, u64)>>,
     }
 
     impl OpsPlane for FakePlane {
@@ -409,7 +703,7 @@ mod tests {
             channel: String,
             topic: Option<String>,
             payload: serde_json::Value,
-        ) -> BoxFuture<'_, Result<super::MockSendReceipt, OpsError>> {
+        ) -> BoxFuture<'static, Result<super::MockSendReceipt, OpsError>> {
             self.mock_sends
                 .lock()
                 .unwrap()
@@ -419,6 +713,30 @@ mod tests {
                     event_id: "evt-1".into(),
                     channel,
                     topic,
+                })
+            })
+        }
+
+        fn memory_dream(
+            &self,
+            session: SessionId,
+            source: SessionId,
+            from_seq: u64,
+            to_seq: u64,
+        ) -> BoxFuture<'static, Result<super::DreamAdmitReceipt, OpsError>> {
+            self.dream_calls
+                .lock()
+                .unwrap()
+                .push((session, source, from_seq, to_seq));
+            Box::pin(async move {
+                Ok(super::DreamAdmitReceipt {
+                    session,
+                    source,
+                    from_seq,
+                    to_seq,
+                    deduplicated: false,
+                    bytes_read: 42,
+                    prompt_bytes: 128,
                 })
             })
         }

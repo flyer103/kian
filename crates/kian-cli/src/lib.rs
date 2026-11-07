@@ -25,8 +25,12 @@
 //!   / wake-now / lease / recovery budget reset) with documented
 //!   `--json` schemas
 //! - [`config`] — `kian.yaml` loading, fail-closed on malformed config
+//! - [`memory`] — the agent-memory assembly (round 8): the
+//!   config-gated dream-routing driver and the source-transcript
+//!   rendering behind the `memory_dream` ops method and the
+//!   `kian memory` verbs
 //! - [`ops`] — the operational plane (`POST /ops/rpc`: `wake_now`,
-//!   `recovery_budget_reset`, and the demo injection
+//!   `recovery_budget_reset`, `memory_dream` and the demo injection
 //!   `mock_channel_send`), trait-isolated like the control plane
 //! - [`plugins`] — built-in static plugins (openai-compat, local-tools,
 //!   react-loop; adds superagent and remote-exec) registered via
@@ -46,6 +50,7 @@ pub mod cache_metrics;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod memory;
 pub mod ops;
 pub mod plugins;
 pub mod server;

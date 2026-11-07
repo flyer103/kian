@@ -31,6 +31,14 @@
 //! level: the frozen event payload contracts are untouched, the sidecar
 //! never enters model context (`input/spilled` is non-context-bearing),
 //! and rows without the envelope consume byte-identically to before.
+//! The dream envelope (kian-91, review B-2) extends the convention the
+//! same way: a row payload of exactly
+//! `{"content": <rendered dream prompt>, "dream": <trusted marker>}`
+//! consumes as ONE `input/admitted` carrying
+//! `{"role": "user", "content": <content>, "dream": <marker>}` — the
+//! marker is additive and non-context (dreamer routing and provenance
+//! read it, never message text; `derive_model_context` output is
+//! unchanged).
 //!
 //! extends the same row-level convention with the reserved control
 //! envelope `{"kian": {"type": "control", "action": "interrupt", …}}`
@@ -1355,10 +1363,17 @@ struct TakeReport {
 /// the inbox round-trip (DESIGN §3.2 payload contract); the spill
 /// envelope `{"content": X, "spill": Y}` (exactly those two keys)
 /// consumes to the admitted message plus its non-context-bearing sidecar
-/// in one fenced write batch. The envelope is a row-level convention
-/// only — the committed event payload contracts are unchanged. Like the
-/// steer wrapper before it, the exact two-key shape is reserved: a plain
-/// payload of that precise shape is read as an envelope, not content.
+/// in one fenced write batch; the dream envelope
+/// `{"content": X, "dream": M}` (exactly those two keys — kian-91,
+/// review B-2) consumes to ONE admitted message carrying the trusted,
+/// server-set `dream` marker alongside `role`/`content` (the marker is
+/// additive and non-context: dreamer routing and provenance read it,
+/// never the message text). The envelopes are row-level conventions
+/// only — the committed event payload contracts are unchanged (the
+/// marker rides EVENT-MODEL §4.2's additive provenance keys). Like the
+/// steer wrapper before it, each exact two-key shape is reserved: a
+/// plain payload of that precise shape is read as an envelope, not
+/// content.
 enum Consumption {
     /// One `input/admitted` event (the entire legacy surface).
     Single(Value),
@@ -1390,6 +1405,17 @@ fn consumption_plan(row: &InputRow) -> Consumption {
                 admitted: json!({"role": "user", "content": content}),
                 spill: spill.clone(),
             };
+        }
+        if obj.len() == 2
+            && let (Some(content), Some(dream)) = (obj.get("content"), obj.get("dream"))
+        {
+            // kian-91 (review B-2): the ops plane's dream admit. The
+            // marker rides the admitted payload verbatim — additive,
+            // non-context (derive_model_context reads role/content
+            // only, so request bytes are unchanged).
+            return Consumption::Single(
+                json!({"role": "user", "content": content, "dream": dream}),
+            );
         }
     }
     Consumption::Single(json!({"role": "user", "content": row.payload}))
@@ -1884,6 +1910,69 @@ mod tests {
         assert!(
             !context_blob.contains("the full verbatim channel payload"),
             "the sidecar must never enter model context"
+        );
+        cleanup(&path);
+    }
+
+    /// kian-91 (review B-2): the dream envelope row — exactly
+    /// `{"content": X, "dream": M}` — consumes to ONE `input/admitted`
+    /// carrying `role`+`content`+the marker verbatim (no sibling event),
+    /// and the additive marker leaves the projected model context
+    /// byte-identical to the same stream without it (constraint 3).
+    #[tokio::test]
+    async fn dream_envelope_consumes_to_one_admitted_with_marker() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let marker = json!({
+            "source_session": "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b",
+            "start_seq": 1,
+            "end_seq": 4,
+            "scope": "ops-agent",
+        });
+        let prompt = "[kian-dream: scope=\"ops-agent\" range=[1,4)]\n\ndream body";
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": prompt, "dream": marker.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "exactly one input/admitted event");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": prompt, "dream": marker}),
+            "the marker rides the admitted payload verbatim"
+        );
+        // Constraint-3 witness: the additive, non-context marker leaves
+        // derive_model_context byte-identical (the same stream without
+        // the key derives the same context).
+        let mut bare = events.clone();
+        for ev in &mut bare {
+            if ev.kind == EventKind::InputAdmitted {
+                ev.bytes.as_object_mut().unwrap().remove("dream");
+            }
+        }
+        let with_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&events).unwrap())
+                .unwrap();
+        let without_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&bare).unwrap())
+                .unwrap();
+        assert_eq!(with_marker, without_marker);
+        assert!(with_marker.contains("dream body"));
+        assert!(
+            !with_marker.contains("source_session"),
+            "the marker must never enter model context"
         );
         cleanup(&path);
     }

@@ -99,6 +99,11 @@ impl TransitionTrigger {
             // preserves `running` exactly like every other audit kind
             // the drain appends mid-episode.
             EventKind::ControlInterrupt => Self::DrainActivity,
+            // a memory note owns no trigger-table row: it rides the
+            // additions-only drain-activity default (appended by the
+            // dreamer drain while `running`, rejected elsewhere by the
+            // table, not by a row of its own).
+            EventKind::MemoryNote => Self::DrainActivity,
             _ => Self::DrainActivity,
         }
     }
@@ -517,6 +522,63 @@ mod tests {
             reason: EndReason::Interrupted,
         });
         assert_eq!(project(&settled.build()).unwrap(), SessionState::Idle);
+    }
+
+    /// The additive `memory/note` kind is drain activity by the
+    /// additions-only default: it owns no trigger-table row, is legal
+    /// only while `running` (appended by the dreamer drain mid-episode),
+    /// and is rejected from `idle` (no claim, no drain) and from every
+    /// terminal state (frozen streams).
+    #[test]
+    fn memory_note_is_drain_activity_legal_only_while_running() {
+        use super::TransitionTrigger as T;
+        assert_eq!(
+            TransitionTrigger::from_event_kind(&EventKind::MemoryNote),
+            T::DrainActivity
+        );
+
+        // Legal mid-drain (after drain/claimed): the dreamer drain
+        // appends notes before its end write.
+        let mut b = StreamBuilder::new(31);
+        b.push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::StepRequest)
+            .push(EventKind::MemoryNote)
+            .push(EventKind::AssistantMessage)
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            });
+        assert_eq!(project(&b.build()), Ok(Completed));
+
+        // Rejected from idle: no ownership, no drain activity.
+        let mut idle = StreamBuilder::new(32);
+        idle.push(EventKind::SessionCreated)
+            .push(EventKind::InputAdmitted)
+            .push(EventKind::MemoryNote);
+        assert_eq!(
+            project(&idle.build()),
+            Err(ProjectionError::Illegal(super::IllegalTransition {
+                from: Some(Idle),
+                on: DrainActivity,
+            }))
+        );
+
+        // Rejected from terminal: terminal states are frozen.
+        let mut terminal = StreamBuilder::new(33);
+        terminal
+            .push(EventKind::SessionCreated)
+            .claim()
+            .push(EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            })
+            .push(EventKind::MemoryNote);
+        assert_eq!(
+            project(&terminal.build()),
+            Err(ProjectionError::Illegal(super::IllegalTransition {
+                from: Some(Completed),
+                on: DrainActivity,
+            }))
+        );
     }
 
     /// The complete legal transition set of the DESIGN §2.2 machine,

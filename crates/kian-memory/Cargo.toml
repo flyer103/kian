@@ -1,0 +1,36 @@
+[package]
+name = "kian-memory"
+description = "Memory bundle (MEMORY-MODEL Phase 1): the dreaming drain — dream prompt, fail-closed note parser, DreamDriver"
+version.workspace = true
+edition.workspace = true
+
+# DESIGN §7: a bundle layer, not core (MEMORY-MODEL §8 constraint 10):
+# the dreamer prompt/parser/driver live here, beside the loop, with NO
+# provider/channel specifics. The only kian dependencies are the narrow
+# waist plus the loop it wraps:
+#   kian-core         — the memory vocabulary (Note/NoteStatus/…) + events
+#   kian-orchestrator — DrainCtx (the fenced append surface the driver uses)
+#   kian-loop         — the built-in ReActLoop DreamDriver wraps
+# Enforced by tests/narrow_waist.rs (the same property `cargo tree -p
+# kian-memory -e normal` reports).
+
+[dependencies]
+kian-core.workspace = true
+kian-orchestrator.workspace = true
+kian-loop.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Test-only: a real sqlite store drives DrainCtx and a scripted model
+# rides the provider registry for the DreamDriver tests (the kian-loop
+# precedent — dev-only, never a production edge; the production waist
+# is enforced by tests/narrow_waist.rs over [dependencies]).
+kian-store.workspace = true
+kian-llm.workspace = true
+tokio.workspace = true
+uuid.workspace = true

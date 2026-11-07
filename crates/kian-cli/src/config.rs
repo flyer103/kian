@@ -90,6 +90,13 @@ pub struct ServeConfig {
     /// remote exec.
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+    /// The `memory:` section (round-8 plan, kian-87). `None` (the
+    /// section absent) is memory **off**: the assembly, the ops plane
+    /// and every existing behavior are byte-identical. Present parses
+    /// fail-closed (unknown keys refuse) and switches the plain
+    /// assembly onto the dream-routing driver.
+    #[serde(default)]
+    pub memory: Option<MemorySection>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -226,6 +233,59 @@ pub struct ProviderConfig {
 
 fn default_chat_path() -> String {
     "/chat/completions".into()
+}
+
+// ---------------------------------------------------------------------------
+// memory section (round-8 plan, kian-87)
+// ---------------------------------------------------------------------------
+
+/// The `memory:` section: the memory scope plus the dreamer caps.
+/// Absent = memory off (the caller's "off", never an error); present is
+/// validated fail-closed in [`ServeConfig::validate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySection {
+    /// The memory scope: the agent identity whose memory this is
+    /// (MEMORY-MODEL — scope = Agent identity). Must name a configured
+    /// agent (the default `agent:` id or an `agents:` entry); it rides
+    /// the dream prompt header verbatim.
+    pub scope: String,
+    /// The dreamer assembly.
+    pub dreamer: DreamerSection,
+}
+
+/// The `memory.dreamer` block: which agent dreams, and the caps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreamerSection {
+    /// The agent that runs the dreaming drain (a named `agents:` entry
+    /// or the default `agent:` id). Its loop is wrapped in the
+    /// `DreamDriver`; its `main` slot drives the dream turns.
+    pub agent: String,
+    /// Max bytes of source transcript one dream may read (default
+    /// 256 KiB, `kian_memory::DEFAULT_MAX_BYTES_READ`). Must be > 0.
+    #[serde(default)]
+    pub max_bytes_read: Option<u64>,
+    /// Max notes one dream answer may carry (default 20,
+    /// `kian_memory::DEFAULT_MAX_NOTES`); over-cap is refused. Must
+    /// be > 0.
+    #[serde(default)]
+    pub max_notes: Option<u64>,
+}
+
+impl DreamerSection {
+    /// The caps in force (explicit values or the bundle defaults).
+    /// The values were already validated positive; this only fills
+    /// defaults.
+    #[must_use]
+    pub fn caps(&self) -> kian_memory::MemoryConfig {
+        kian_memory::MemoryConfig {
+            max_bytes_read: self
+                .max_bytes_read
+                .unwrap_or(kian_memory::DEFAULT_MAX_BYTES_READ),
+            max_notes: self.max_notes.unwrap_or(kian_memory::DEFAULT_MAX_NOTES),
+        }
+    }
 }
 
 /// The `drain:` section.
@@ -1933,6 +1993,48 @@ impl ServeConfig {
             self.validate_agent_permissions(agent, &format!("agents.{name}"))?;
         }
 
+        // The memory section (round-8 plan, kian-87): present parses
+        // fail-closed and cross-references configured agents. Absent is
+        // memory off — nothing below runs.
+        if let Some(memory) = &self.memory {
+            if self.superagent.is_some() {
+                return Err(invalid(
+                    "memory: the agent-memory bundle (Phase 1) assembles on the \
+                     built-in assembly; a `superagent:` section alongside `memory:` \
+                     is refused — fail-closed, never half-assembled",
+                ));
+            }
+            if memory.scope.trim().is_empty() || memory.scope.contains('"') {
+                return Err(invalid(
+                    "memory.scope must be a non-empty agent id without double quotes \
+                     (it rides the dream prompt header verbatim)",
+                ));
+            }
+            if self.dreamer_agent(&memory.scope).is_none() {
+                return Err(invalid(format!(
+                    "memory.scope `{}` names no configured agent (the default agent id or an `agents:` entry)",
+                    memory.scope
+                )));
+            }
+            let dreamer_id = &memory.dreamer.agent;
+            let Some(dreamer) = self.dreamer_agent(dreamer_id) else {
+                return Err(invalid(format!(
+                    "memory.dreamer.agent `{dreamer_id}` names no configured agent (the default agent id or an `agents:` entry)"
+                )));
+            };
+            if !dreamer.model_slots.contains_key("main") {
+                return Err(invalid(format!(
+                    "memory.dreamer.agent `{dreamer_id}` must define slot `main` (the dream-turn slot)"
+                )));
+            }
+            if memory.dreamer.max_bytes_read == Some(0) {
+                return Err(invalid("memory.dreamer.max_bytes_read must be > 0"));
+            }
+            if memory.dreamer.max_notes == Some(0) {
+                return Err(invalid("memory.dreamer.max_notes must be > 0"));
+            }
+        }
+
         // Endpoints: unique ids, dialable addresses, sane timeouts.
         let mut seen_endpoint = std::collections::BTreeSet::new();
         for ep in &self.endpoints {
@@ -2314,6 +2416,20 @@ impl ServeConfig {
         self.agents.get(id)
     }
 
+    /// Resolves an agent id the memory section may reference: a named
+    /// `agents:` entry, or the default `agent:` section's own id.
+    /// Anything else is `None` (validation refuses it fail-closed).
+    #[must_use]
+    pub fn dreamer_agent(&self, id: &str) -> Option<&AgentConfig> {
+        self.named_agent(id).or({
+            if id == self.agent.id {
+                Some(&self.agent)
+            } else {
+                None
+            }
+        })
+    }
+
     /// The recovery policy section, parsed fail-closed by.
     pub fn policy(&self) -> Result<PolicyConfig, ConfigError> {
         // Re-serialize just the recovery node; PolicyConfig accepts the
@@ -2334,6 +2450,17 @@ impl ServeConfig {
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
         self.agents.get(id).map(agent_def_of)
+    }
+
+    /// The compiled definition an agent id the memory section may
+    /// reference resolves to (`None` when it names no configured
+    /// agent) — [`Self::named_agent_def`] plus the default agent.
+    #[must_use]
+    pub fn dreamer_agent_def(&self, id: &str) -> Option<AgentDef> {
+        if id == self.agent.id {
+            return Some(self.agent_def());
+        }
+        self.named_agent_def(id)
     }
 }
 
@@ -4077,6 +4204,128 @@ recovery:
         assert!(
             err.to_string().contains("superagent.mandate.default_scope"),
             "{err}"
+        );
+    }
+
+    // -- memory section (round 8, kian-87) ------------------------
+
+    /// A minimal memory block: the default agent as both scope and
+    /// dreamer, caps defaulting.
+    fn memory_yaml() -> String {
+        valid_yaml().replace(
+            "drain:",
+            "memory:\n  scope: default\n  dreamer:\n    agent: default\ndrain:",
+        )
+    }
+
+    /// Absent block = memory off (None), byte-identical legacy shape.
+    #[test]
+    fn memory_absent_block_is_off() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        assert!(cfg.memory.is_none());
+    }
+
+    /// A memory block naming configured agents parses and resolves.
+    #[test]
+    fn memory_block_parses_and_resolves_agents() {
+        let cfg = ServeConfig::parse(&memory_yaml()).expect("valid config");
+        let memory = cfg.memory.as_ref().expect("memory on");
+        assert_eq!(memory.scope, "default");
+        assert_eq!(memory.dreamer.agent, "default");
+        assert_eq!(memory.dreamer.caps(), kian_memory::MemoryConfig::default());
+        assert!(cfg.dreamer_agent("default").is_some());
+        assert!(cfg.dreamer_agent("nope").is_none());
+    }
+
+    /// Explicit caps ride through; a named dreamer agent resolves too.
+    #[test]
+    fn memory_explicit_caps_and_named_dreamer_parse() {
+        let yaml = valid_yaml().replace(
+            "drain:",
+            "agents:\n  dreamer:\n    id: dreamer\n    model_slots:\n      main:\n        provider: openai\n        model: gpt-cheap\nmemory:\n  scope: default\n  dreamer:\n    agent: dreamer\n    max_bytes_read: 1024\n    max_notes: 5\ndrain:",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("valid config");
+        let caps = cfg.memory.as_ref().expect("memory on").dreamer.caps();
+        assert_eq!(caps.max_bytes_read, 1024);
+        assert_eq!(caps.max_notes, 5);
+    }
+
+    /// The fail-closed matrix: unknown keys, blank/quoted scope,
+    /// unresolvable agents, missing `main` slot, zero caps, and the
+    /// superagent mix — every one refuses.
+    #[test]
+    fn memory_validation_is_fail_closed() {
+        let cases = [
+            (
+                "unknown key",
+                "memory:\n  scope: default\n  cadence: hourly\n  dreamer:\n    agent: default\n",
+                "cadence",
+            ),
+            (
+                "unknown dreamer key",
+                "memory:\n  scope: default\n  dreamer:\n    agent: default\n    model: x\n",
+                "model",
+            ),
+            (
+                "blank scope",
+                "memory:\n  scope: \" \"\n  dreamer:\n    agent: default\n",
+                "memory.scope",
+            ),
+            (
+                "quoted scope",
+                "memory:\n  scope: \"no\\\"good\"\n  dreamer:\n    agent: default\n",
+                "memory.scope",
+            ),
+            (
+                "scope names no agent",
+                "memory:\n  scope: ghost\n  dreamer:\n    agent: default\n",
+                "memory.scope `ghost`",
+            ),
+            (
+                "dreamer names no agent",
+                "memory:\n  scope: default\n  dreamer:\n    agent: ghost\n",
+                "memory.dreamer.agent `ghost`",
+            ),
+            (
+                "dreamer without main slot",
+                "agents:\n  dreamer:\n    id: dreamer\n    model_slots:\n      side:\n        provider: openai\n        model: gpt-cheap\nmemory:\n  scope: default\n  dreamer:\n    agent: dreamer\n",
+                "slot `main`",
+            ),
+            (
+                "zero max_bytes_read",
+                "memory:\n  scope: default\n  dreamer:\n    agent: default\n    max_bytes_read: 0\n",
+                "max_bytes_read",
+            ),
+            (
+                "zero max_notes",
+                "memory:\n  scope: default\n  dreamer:\n    agent: default\n    max_notes: 0\n",
+                "max_notes",
+            ),
+        ];
+        for (label, block, needle) in cases {
+            let yaml = format!("{block}\n{}", valid_yaml());
+            let err = ServeConfig::parse(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "{label} must refuse with `{needle}`: {err}"
+            );
+        }
+    }
+
+    /// `memory:` alongside `superagent:` refuses (the P1 bundle
+    /// assembles on the built-in assembly only — fail-closed, never
+    /// half-assembled).
+    #[test]
+    fn memory_refuses_the_superagent_mix() {
+        // Append the memory block to a full superagent config.
+        let yaml = format!(
+            "{}\nmemory:\n  scope: kian-router\n  dreamer:\n    agent: kian-router\n",
+            superagent_yaml()
+        );
+        let err = ServeConfig::parse(&yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("superagent"),
+            "the mix must refuse: {err}"
         );
     }
 }

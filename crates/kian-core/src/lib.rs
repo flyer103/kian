@@ -16,6 +16,8 @@
 //! - [`state`] — session state machine and pure projection (DESIGN §2.2)
 //! - [`context`] — model-context projection `derive_model_context` (DESIGN §3.2, constraints 2/3)
 //! - [`control`] — reserved control-envelope convention (ADR-014, durable interrupt intent)
+//! - [`memory`] — the `memory/note` fold: fail-closed payload parsing, the
+//!   latest-per-subject projection and range verification (MEMORY-MODEL §3)
 //! - [`invariants`] — the six semantic invariants + NoHalfTerminated as assertion predicates
 //! - [`seams`] — seam trait definitions (DESIGN §6.2); impl crates re-export
 
@@ -23,6 +25,7 @@ pub mod context;
 pub mod control;
 pub mod events;
 pub mod invariants;
+pub mod memory;
 pub mod model;
 pub mod seams;
 pub mod secrets;

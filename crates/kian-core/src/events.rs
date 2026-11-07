@@ -223,6 +223,22 @@ pub enum EventKind {
     #[serde(rename = "control/interrupt")]
     ControlInterrupt,
 
+    /// A memory note (MEMORY-MODEL, ADR-016): a *claim* about the agent,
+    /// extracted from a source session's transcript by the dreamer drain
+    /// and appended to the memory session's stream. Payload schema
+    /// (owned by the memory dreamer drain): `{"subject": <non-empty
+    /// str>, "text": <str>, "status": "candidate"|"verified"|"stale",
+    /// "derived_from": [{"session": <uuid-str>, "start_seq": <u64>,
+    /// "end_seq": <u64>}], "verified_by"?: {"method":
+    /// "transcript"|"evidence_gate"|"human", "ref": <str>}}` —
+    /// `verified_by` rides only on verified notes. Non-context-bearing
+    /// (a note is never a message, constraint 3); drain activity (the
+    /// additions-only default) — legal only while `running`; the
+    /// latest-per-subject fold is a projection in `kian-core::memory`,
+    /// never state outside the stream.
+    #[serde(rename = "memory/note")]
+    MemoryNote,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -254,6 +270,7 @@ impl EventKind {
             Self::ChannelDelivered => "channel/delivered",
             Self::InputSpilled => "input/spilled",
             Self::ControlInterrupt => "control/interrupt",
+            Self::MemoryNote => "memory/note",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -326,6 +343,7 @@ mod tests {
                 EventKind::ControlInterrupt,
                 r#"{"kind":"control/interrupt"}"#,
             ),
+            (EventKind::MemoryNote, r#"{"kind":"memory/note"}"#),
             (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
@@ -339,12 +357,13 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the twenty-one kinds above (the
-        // fourteen frozen by + the additive
+        // The durable set is exactly the twenty-two kinds above (the
+        // fourteen v0-frozen kinds + the additive
         // `recovery/budget-reset` + the four additive bundle kinds
         // + the additive `input/spilled` + the additive
-        // `control/interrupt`; additions-only, no renames).
-        assert_eq!(cases.len(), 21);
+        // `control/interrupt` + the additive `memory/note`;
+        // additions-only, no renames).
+        assert_eq!(cases.len(), 22);
     }
 
     /// Additions-only regression: every pre-existing kind's golden
@@ -522,6 +541,111 @@ mod tests {
                 assert_eq!(back.bytes.get("stale"), Some(&json!(true)));
             }
         }
+    }
+
+    /// The `memory/note` kind round-trips through the full envelope with
+    /// its tabled payload (round-8 plan §2.1) riding opaquely in `bytes`;
+    /// `verified_by` is the one optional key (absent for notes that have
+    /// not been verified yet).
+    #[test]
+    fn memory_note_envelope_round_trips_with_tabled_payload() {
+        let verified = json!({
+            "subject": "deploys via the dsh bridge",
+            "text": "The team deploys through the dsh bridge; verify the environment before suggesting commands.",
+            "status": "verified",
+            "derived_from": [{
+                "session": "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b",
+                "start_seq": 4,
+                "end_seq": 38
+            }],
+            "verified_by": {"method": "transcript", "ref": "seq range [4,38) read back from the source stream"}
+        });
+        let candidate = json!({
+            "subject": "prefers concise replies",
+            "text": "Keep answers short and to the point.",
+            "status": "candidate",
+            "derived_from": [{
+                "session": "0f9c2a11-3b4d-4e5f-8a6b-7c8d9e0f1a2b",
+                "start_seq": 4,
+                "end_seq": 9
+            }]
+        });
+        for (payload, has_verified_by) in [(verified, true), (candidate, false)] {
+            let mut ev = sample_event(EventKind::MemoryNote);
+            ev.bytes = payload.clone();
+            let line = serde_json::to_string(&ev).unwrap();
+            let back: Event = serde_json::from_str(&line).unwrap();
+            assert_eq!(back, ev);
+            assert_eq!(tag_of(&line), "memory/note");
+            assert_eq!(back.bytes, payload);
+            // The optional key rides only when set (additive key).
+            if has_verified_by {
+                assert!(back.bytes.get("verified_by").is_some());
+            } else {
+                assert!(back.bytes.get("verified_by").is_none());
+            }
+        }
+    }
+
+    /// Additions-only regression: all twenty-one pre-`memory/note` kinds'
+    /// golden bytes are frozen exactly as they stood at the end of round
+    /// 7 (the twenty of `frozen_all` plus `control/interrupt`). Like the
+    /// frozen lists above, this is deliberately independent of the
+    /// growing `cases` array, so the `memory/note` addition cannot
+    /// disturb a single existing serialization byte.
+    #[test]
+    fn additions_only_regression_round8_kind_bytes_are_frozen() {
+        let frozen_round7: [(EventKind, &str); 21] = [
+            (EventKind::SessionCreated, r#"{"kind":"session/created"}"#),
+            (EventKind::InputAdmitted, r#"{"kind":"input/admitted"}"#),
+            (EventKind::DrainClaimed, r#"{"kind":"drain/claimed"}"#),
+            (EventKind::TurnStart, r#"{"kind":"turn/start"}"#),
+            (EventKind::TurnEnd, r#"{"kind":"turn/end"}"#),
+            (EventKind::StepRequest, r#"{"kind":"step/request"}"#),
+            (
+                EventKind::AssistantMessage,
+                r#"{"kind":"assistant/message"}"#,
+            ),
+            (EventKind::ToolCall, r#"{"kind":"tool/call"}"#),
+            (EventKind::ToolResult, r#"{"kind":"tool/result"}"#),
+            (EventKind::Compact, r#"{"kind":"compact"}"#),
+            (EventKind::SlotBinding, r#"{"kind":"slot/binding"}"#),
+            (EventKind::SlotFallback, r#"{"kind":"slot/fallback"}"#),
+            (EventKind::SlotMigration, r#"{"kind":"slot/migration"}"#),
+            (
+                EventKind::RecoveryBudgetReset,
+                r#"{"kind":"recovery/budget-reset"}"#,
+            ),
+            (EventKind::ThreadStarted, r#"{"kind":"thread/started"}"#),
+            (EventKind::ThreadCompleted, r#"{"kind":"thread/completed"}"#),
+            (EventKind::EvidenceVerdict, r#"{"kind":"evidence/verdict"}"#),
+            (
+                EventKind::ChannelDelivered,
+                r#"{"kind":"channel/delivered"}"#,
+            ),
+            (EventKind::InputSpilled, r#"{"kind":"input/spilled"}"#),
+            (
+                EventKind::ControlInterrupt,
+                r#"{"kind":"control/interrupt"}"#,
+            ),
+            (
+                EventKind::SessionEnded {
+                    reason: EndReason::Failed,
+                },
+                r#"{"kind":"session/ended","reason":"failed"}"#,
+            ),
+        ];
+        for (kind, golden) in &frozen_round7 {
+            assert_eq!(
+                &serde_json::to_string(kind).unwrap(),
+                golden,
+                "pre-existing kind {:?} changed bytes (additions-only violated)",
+                kind
+            );
+            let back: EventKind = serde_json::from_str(golden).unwrap();
+            assert_eq!(&back, kind);
+        }
+        assert_eq!(frozen_round7.len(), 21);
     }
 
     /// The `input/spilled` kind round-trips through the full envelope

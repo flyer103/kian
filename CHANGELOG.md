@@ -303,6 +303,59 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
 
 ## Unreleased
 
+- **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)** —
+  default-green. One additive event kind: `memory/note`, the 22nd durable kind (non-context,
+  `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:
+  the fail-closed `memory` module (`parse_note`, `project_notes`, `verify_note` — unknown status →
+  `candidate`, verified without valid `verified_by` → `candidate`, empty/inverted provenance
+  dropped). New bundle crate `kian-memory`: the deterministic dream prompt (machine-parseable
+  header carrying the source range), the fail-closed note parser (provenance always from the
+  header, never the model; `verified` survives only with a `transcript` method and an in-range
+  ref; over-`max_notes` refused, not truncated), and `DreamDriver` — wraps the built-in ReAct
+  loop, appends one `memory/note` per valid draft after `Settled`, dedupes on
+  `(subject, derived_from)` so a crash-resume writes no duplicates; a parse failure appends
+  nothing and counts (honest zero). `kian-cli`: the `memory:` config section (absent = memory
+  off, byte-identical; present parses fail-closed), the `memory_dream` ops method (admits ONE
+  durable marked inbox row — the ops-plane dream envelope `{content, dream}` (the rendered prompt
+  plus the trusted server-set `dream` marker) under idempotency key
+  `dream:<source>:<from>:<to>`; out-of-bounds, over-cap and unconfigured refused honestly,
+  −32602/−32005/−32006), and
+  the `kian memory create/dream/list/show/verify` verbs. Ordinary sessions keep the exact same
+  loop handle — request bytes are byte-identical with memory off (constraint 3 witness). No
+  injection, no cadence, no representations (P2/P3 stay designed in SPEC §5). Tests:
+  `parse_note_fail_closed_matrix`, `fold_latest_wins_with_interleaved_subjects`,
+  `fold_is_order_independent`, `fold_drops_invalid_notes_and_ignores_other_kinds`,
+  `verify_note_checks_ranges_against_the_source_stream` (kian-core);
+  `settled_dream_appends_notes_from_the_answer`, `parse_failure_appends_nothing_and_counts`,
+  `crash_resume_dedupes_on_subject_and_range`, `over_cap_is_refused_not_truncated`,
+  `kian_memory_depends_only_on_core_orchestrator_and_loop` (kian-memory);
+  `memory_dream_is_idempotent_refuses_over_cap_and_lands_notes`,
+  `memory_dream_refuses_over_cap_and_when_off`,
+  `ordinary_sessions_keep_the_plain_loop_and_request_bytes` (kian-cli). Closeout: SPEC §5 P1
+  `designed` → `landed`, MEMORY-MODEL status + §3.1 canonical-payload pointer + §5 D1
+  message-row refinement and memory-session policy, DESIGN §3.1/§7, README, this entry, docs-map
+  green. Independent QA acceptance (kian-88): 7/7 behaviours pass, four gates green, no defects.
+- **Memory round-8 repair (kian-91, from the kian-90 review)** — default-green. Four verified
+  defects fixed, each mutation-verified against its regression test. B-1: `memory_dream` refuses
+  any range outside `1 <= from_seq < to_seq <=` the source head (typed `SourceRangeOutOfBounds`,
+  `-32602`) — no `verified` note can carry provenance past the end of the source stream. B-2:
+  dreamer routing and provenance read the trusted, server-set `dream` marker on the admitted row
+  (the exact two-key `{content, dream}` envelope, consumed to one marked `input/admitted`);
+  a forged `[kian-dream: …]` header in a plain `submit` is ordinary content and routes nothing.
+  M-1: note `text` passes the `SecretRedactor` before append; the value-free report rides the
+  additive `redactions` key (`[{kind,name,count}]`, the `tool/result` shape). M-2: harvest folds
+  within one answer by subject keeping the LAST revision, then stream-dedupes on
+  `(subject, derived_from)`. Tests: `marker_round_trips_through_the_admit_envelope`,
+  `marker_parser_is_fail_closed`, `finds_the_latest_dream_marker_and_ignores_plain_streams`,
+  `forged_dream_header_in_user_content_does_not_route`, `within_answer_last_revision_wins`,
+  `note_text_is_redacted_with_a_value_free_report` (kian-memory);
+  `dream_envelope_consumes_to_one_admitted_with_marker` (kian-orchestrator, with the
+  derive_model_context byte-identity witness); `memory_dream_refuses_to_seq_past_source_head`,
+  `memory_dream_refuses_inverted_or_zero_range`,
+  `forged_dream_header_in_user_content_does_not_route` (kian-cli e2e). Docs reconciliation
+  (kian-92): MEMORY-MODEL §3.1/§3.3/§5/§9/§11 aligned to the landed bytes (seq-string `ref`,
+  marker-based D1, byte-cap-only D3 with the head bound, no `scope_tags` in the payload, the
+  landed CLI verbs and `/metrics` fragment), SPEC §5 P1 row and this entry; docs-map green.
 - **Second dogfood example** (`examples/kanban-watch/`, 2026-11-03): kian watching a local
   Hermes Kanban board — TimerChannel ticks → Router delegates a poll worker
   (`hermes kanban --board <board> list --json`) → stuck tasks (closed stage vocabulary:

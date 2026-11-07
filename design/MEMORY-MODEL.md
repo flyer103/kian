@@ -1,8 +1,8 @@
-# Kian — Memory Model (normative, accepted)
+# Kian — Memory Model (normative)
 
-> **Status: accepted (owner gate, 2026-11-07); design only, Phase 1 not landed.** The semantics
-> below are normative for the Phase 1 implementation; the module status remains `designed` in SPEC
-> §5 until the kind and the fold land.
+> **Status: accepted (owner gate, 2026-11-07); Phase 1 (notes + dreaming) landed 2026-11-07.**
+> Injection (§6) and representations (§7) remain designed; SPEC §5 records Phase 1 as `landed`
+> and P2/P3 as `designed`.
 >
 > **Change protocol:** any memory semantic change starts here. The event payload bytes are
 > normative in [design/EVENT-MODEL.md](EVENT-MODEL.md); the external wire (RPC, CLI, SSE, metrics)
@@ -66,19 +66,20 @@ canonical shape lives in EVENT-MODEL and this file links to it.
 
 ## 3. Notes as events
 
-### 3.1 The kind (proposed: `memory/note`)
+### 3.1 The kind (`memory/note`, landed)
 
-One new durable kind, non-context-bearing, `DrainActivity`, emitted only by a memory-session drain.
-The payload shape is normative in EVENT-MODEL §3; the semantic fields are:
+One durable kind, non-context-bearing, `DrainActivity`, emitted only by a memory-session drain.
+The **canonical byte shape** is the `memory/note` row in [EVENT-MODEL.md](EVENT-MODEL.md) §3 —
+the table below is semantic commentary on those fields, and on any disagreement EVENT-MODEL wins
+and both files are corrected in the same change. The semantic fields:
 
 | Field | Rule |
 |---|---|
 | `subject` | Non-empty stable key within the memory scope. The fold key. |
-| `text` | The claim. Markdown allowed. Passes the secret redactor before append; the redaction report rides the additive (non-context) key. |
+| `text` | The claim. Markdown allowed. Redacted through the `SecretRedactor` before append (kian-91); the value-free report (`[{kind,name,count}]`, the `tool/result` shape) rides the additive, non-context `redactions` key. |
 | `status` | Closed vocabulary `candidate \| verified \| stale`; unknown value is fail-closed to `candidate` (never injectable). |
-| `derived_from` | Non-empty list of `{session, from_seq, to_seq}` ranges (`[from_seq, to_seq)`). The evidence the claim is about. |
-| `verified_by` | Required iff `status=verified`; closed vocabulary `transcript \| evidence_gate \| human` + `ref` (an event id). Absent otherwise. |
-| `scope_tags` | Optional, non-authoritative labels. |
+| `derived_from` | Non-empty list of `{session, start_seq, end_seq}` ranges (`[start_seq, end_seq)`, the EVENT-MODEL field names). The evidence the claim is about. |
+| `verified_by` | Required iff `status=verified`. `ref` is the **source seq the claim was re-checked at, carried as a string**: the dreamer parser requires it to parse as a seq inside the note's `derived_from` range — it is never an event id. The method vocabulary is closed exactly as implemented: the fold parser (`kian-core::memory`) accepts `transcript \| evidence_gate \| human`, while the only P1 producer (the dreamer parser) accepts and emits `transcript` alone (`evidence_gate`/`human` are reserved vocabulary with no producer yet). Absent otherwise. |
 
 ### 3.2 Fold rule (append-only, no mutation)
 
@@ -96,10 +97,11 @@ never stored in a column (constraint 1).
 ### 3.3 Invariants
 
 - **N1** A note is never rewritten after append; corrections are new revisions.
-- **N2** `derived_from` is non-empty; each range satisfies `from_seq < to_seq`.
+- **N2** `derived_from` is non-empty; each range satisfies `start_seq < end_seq`.
 - **N3** `status=verified` requires `verified_by`; `candidate`/`stale` must not carry it.
-- **N4** A note never carries secrets: the payload is redacted with the same reporter as
-  model-visible content, and the redaction report rides outside the claim.
+- **N4** A note never carries secrets: `text` passes the same `SecretRedactor` as model-visible
+  exec output before the append is durable (kian-91), and the value-free report rides outside the
+  claim on the additive `redactions` key (`[{kind,name,count}]`, the `tool/result` precedent).
 - **N5** Notes are scoped to exactly one memory scope; cross-scope references are forbidden in P1.
 - **N6** The note fold is byte-deterministic for a given stream (subject lexicographic ordering when
   rendered); the renderer is frozen content (constraint 3) because its output is injected.
@@ -132,16 +134,33 @@ Rules:
 A dreaming run is **a normal drain of the memory session** — not a new execution mode. It inherits
 crash recovery, epoch fencing, budget, one-shot guards and audit from the existing substrate.
 
-- **D1** The run is triggered by a durable inbox row on the memory session, a reserved envelope
-  (pre-event, like the interrupt control row):
-  `{"kian":{"type":"dream","source_session":"<uuid>","from_seq":<u64>,"to_seq":<u64>,
-  "idempotency_key":"<str>"}}`. The owning memory-session drain consumes it at a safe boundary and
-  appends the rendered dream prompt as `input/admitted`.
+**Memory-session policy (as landed):** the memory session is operator-created (`kian memory
+create`); its scope is the configured agent id (`memory.scope` in `kian.yaml`). There is no
+derived-session-id machinery — no hashing of scope ids into session ids, no implicit session
+creation on first dream. The session is plain until a dream request lands on it, and it is drained
+only by dreaming runs (§2: it never receives channel inputs).
+
+- **D1** The run is triggered by a **marked** durable inbox row on the memory session — admitted
+  only by the ops plane (`memory_dream`): exactly `{content, dream}`, the rendered dream prompt as
+  `content` plus the trusted, server-set `dream` marker (`{source_session, start_seq, end_seq,
+  scope}`), under idempotency key `dream:<source_session>:<from_seq>:<to_seq>`. The drain's
+  consumption plan consumes it through the normal path into ONE `input/admitted` payload carrying
+  `role`/`content` plus the non-context `dream` key. Dreamer routing and note provenance read
+  **only the marker** (fail-closed parse); the prompt's `[kian-dream: …]` first line is
+  model-readability, never a trust decision — a plain `submit` whose text mimics it is ordinary
+  content and never routes onto the dreamer (kian-91, review B-2). The two-key row shape is a
+  reserved envelope in the spill/steer sense — the public wire (`submit`/`steer`/`queue`) refuses
+  all three reserved envelope key sets (`{content,dream}`, `{content,spill}`, `{synthetic,content}`)
+  with `-32602`, so only the ops plane's admit can land a marked row; no client content can forge
+  the marker (kian-94, review B-2′). The layered iron rule and the existing admission
+  semantics hold unchanged.
 - **D2** Dreaming reads the source session **read-only** (recall / scan). It never appends to the
   source session's stream — that would pollute a live drain's context and invalidate its prefix
   (constraint 3).
-- **D3** The source range is bounded by policy (max bytes, max events); an over-budget request is
-  refused at admission honestly, not silently truncated.
+- **D3** The source range is bounded by policy: it must lie within the source head
+  (`1 <= from_seq < to_seq <=` the source's `head.next_seq`), and the rendered transcript must fit
+  `memory.dreamer.max_bytes_read` — the byte cap; no event-count cap exists. An out-of-bounds or
+  over-budget request is refused at admission honestly, never silently truncated.
 - **D4** Every note carries non-empty `derived_from` pointing into the read range (N2). A note
   without provenance is not written.
 - **D5** `verified` may only be claimed when the run (or a later run) re-read the evidence in the
@@ -149,8 +168,9 @@ crash recovery, epoch fencing, budget, one-shot guards and audit from the existi
 - **D6** Idempotency: one dream request per `(source_session, [from_seq, to_seq))`. A repeated
   request is a no-op (the existing inbox idempotency key applies).
 - **D7** Budget and boundedness: the existing declarative recovery policy governs fallbacks and is
-  one-shot guarded per action; per-run caps `max_notes`, `max_bytes_read`, and a scope-level
-  `runs/hour` live in config (config-first, no core code).
+  one-shot guarded per action; the per-run caps that exist in P1 are `max_notes` and
+  `max_bytes_read` (`memory.dreamer.*` in `kian.yaml`, config-first, no core code). No scope-level
+  rate cap (`runs/hour`) is implemented — dreaming is explicit-only (§11.2).
 - **D8** One writer: only a drain of the memory session appends notes — there is no shared mutable
   page (this is why the article's concurrent-write data loss cannot occur here).
 - **D9** Dreaming never injects; injection is a separate read at session creation (§6).
@@ -210,9 +230,12 @@ Injection is the only path by which memory becomes model-visible.
 
 ## 9. Operations and observability
 
-- CLI (wire owned by API-CONTRACT): `kian memory list|show|verify|dream|stats`.
-- Metrics: notes by status written; verification rate; stale ratio; injection items/bytes and
-  truncations; dream runs, bytes read, model cost; escape counters (references that do not resolve).
+- CLI (wire owned by API-CONTRACT): `kian memory create|dream|list|show|verify` (no `stats` verb
+  in P1).
+- Metrics: the `memory` fragment of `GET /metrics` — `scope`, `dreams`, `read_failures`,
+  `parse_failures`, `notes_appended`, `notes_deduped` (stream crash-resume dedupe),
+  `append_failures`. Notes-by-status, verification-rate and injection metrics are designed with
+  their phases, not landed.
 - Audit: the memory session's stream is the audit trail; `session export --with-event-ids` already
   captures it.
 
@@ -249,6 +272,9 @@ end-to-end (real process/CLI).
    merge rule (two notes, one canonical subject) is not designed yet.
 6. **Cross-scope reads**: the Router could benefit from worker memory. Deferred until the permission
    model for memory reads is designed.
+7. **Subject tagging**: `scope_tags` (optional, non-authoritative labels on notes) has no producer
+   and no consumer in P1 and is not part of the payload contract (EVENT-MODEL §3); it stays a
+   deferred idea until a consumer is designed.
 
 ## 12. Phase non-goals (explicit)
 

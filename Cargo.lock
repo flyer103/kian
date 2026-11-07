@@ -896,6 +896,7 @@ dependencies = [
  "kian-exec",
  "kian-llm",
  "kian-loop",
+ "kian-memory",
  "kian-orchestrator",
  "kian-plugin",
  "kian-sdk",
@@ -993,6 +994,24 @@ dependencies = [
  "futures",
  "kian-core",
  "kian-llm",
+ "kian-orchestrator",
+ "kian-store",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kian-memory"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kian-core",
+ "kian-llm",
+ "kian-loop",
  "kian-orchestrator",
  "kian-store",
  "serde",

@@ -52,6 +52,17 @@ const USAGE: &str = "usage:
   kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
                                   [--url <base>] [--config <path>] [--json]
                                          demo channel injection via ops
+  kian memory create [--config <path>] [--json]
+                                         operator-owned memory session (via createSession)
+  kian memory dream --session <uuid> --source <uuid> --from <seq> --to <seq>
+                                 [--url <base>] [--config <path>] [--json]
+                                         one dream request via the memory_dream ops method
+  kian memory list --session <uuid> [--db <sqlite>] [--config <path>] [--json]
+                                         the projected notes of a memory session
+  kian memory show --session <uuid> <event-id|subject> [--db <sqlite>] [--config <path>] [--json]
+                                         one note by event id or subject
+  kian memory verify --session <uuid> [--db <sqlite>] [--config <path>] [--json]
+                                         re-check derived_from ranges against the sources
   kian --version                        print the version
 ";
 
@@ -68,6 +79,7 @@ fn main() -> ExitCode {
         Some("session") => session(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
         Some("mock-channel-send") => mock_channel_send(&args[2..]),
+        Some("memory") => memory(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
@@ -587,6 +599,230 @@ fn mock_channel_send(args: &[String]) -> ExitCode {
         ),
         "mock-channel-send",
     )
+}
+
+/// `kian memory create|dream|list|show|verify …` — the memory verbs
+/// (round-8 plan, kian-87).
+fn memory(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!(
+            "kian: `memory` requires a subcommand (create, dream, list, show, verify)\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    };
+    let usage_for = format!("kian memory {sub}");
+    let rest = &args[1..];
+
+    // `create` has no session flag.
+    if sub == "create" {
+        let mut config = std::path::PathBuf::from("kian.yaml");
+        let mut json = false;
+        let mut iter = rest.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--config" => match iter.next() {
+                    Some(p) => config = p.into(),
+                    None => {
+                        eprintln!("kian: --config requires a path\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                "--json" => json = true,
+                other => {
+                    eprintln!("kian: unknown memory create option `{other}`\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        return run_command(
+            kian_cli::commands::run_memory_create(&config, json),
+            "memory create",
+        );
+    }
+
+    let parsed = match parse_memory_args(rest, &usage_for) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kian: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match sub {
+        "dream" => {
+            let (Some(session), Some(source), Some(from), Some(to)) = (
+                parsed.session,
+                parsed.source,
+                parsed.from_seq,
+                parsed.to_seq,
+            ) else {
+                eprintln!(
+                    "kian: memory dream requires --session, --source, --from and --to\n{USAGE}"
+                );
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_dream(
+                    &parsed.config,
+                    parsed.url.as_deref(),
+                    session,
+                    source,
+                    from,
+                    to,
+                    parsed.json,
+                ),
+                "memory dream",
+            )
+        }
+        "list" => {
+            let Some(session) = parsed.session else {
+                eprintln!("kian: memory list requires a session uuid\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_list(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    parsed.json,
+                ),
+                "memory list",
+            )
+        }
+        "show" => {
+            let (Some(session), Some(selector)) = (parsed.session, parsed.selector.clone()) else {
+                eprintln!(
+                    "kian: memory show requires a session uuid and an <event-id|subject>\n{USAGE}"
+                );
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_show(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    &selector,
+                    parsed.json,
+                ),
+                "memory show",
+            )
+        }
+        "verify" => {
+            let Some(session) = parsed.session else {
+                eprintln!("kian: memory verify requires a session uuid\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_verify(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    parsed.json,
+                ),
+                "memory verify",
+            )
+        }
+        other => {
+            eprintln!("kian: unknown memory subcommand `{other}`\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The shared flag set of the memory subcommands (`create` uses a
+/// subset by hand).
+struct MemoryArgs {
+    config: std::path::PathBuf,
+    db: Option<std::path::PathBuf>,
+    url: Option<String>,
+    session: Option<kian_core::model::SessionId>,
+    source: Option<kian_core::model::SessionId>,
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+    selector: Option<String>,
+    json: bool,
+}
+
+impl Default for MemoryArgs {
+    fn default() -> Self {
+        Self {
+            config: std::path::PathBuf::from("kian.yaml"),
+            db: None,
+            url: None,
+            session: None,
+            source: None,
+            from_seq: None,
+            to_seq: None,
+            selector: None,
+            json: false,
+        }
+    }
+}
+
+fn parse_memory_args(args: &[String], usage_for: &str) -> Result<MemoryArgs, String> {
+    let mut out = MemoryArgs::default();
+    let mut iter = args.iter();
+    let uuid =
+        |raw: &str, flag: &str, usage_for: &str| -> Result<kian_core::model::SessionId, String> {
+            kian_cli::commands::parse_session(raw).map_err(|e| format!("{e} ({usage_for}; {flag})"))
+        };
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => out.config = p.into(),
+                None => return Err(format!("--config requires a path ({usage_for})")),
+            },
+            "--db" => match iter.next() {
+                Some(p) => out.db = Some(p.into()),
+                None => return Err(format!("--db requires a path ({usage_for})")),
+            },
+            "--url" => match iter.next() {
+                Some(u) => out.url = Some(u.to_string()),
+                None => return Err(format!("--url requires a base URL ({usage_for})")),
+            },
+            "--session" => match iter.next() {
+                Some(s) => out.session = Some(uuid(s, "--session", usage_for)?),
+                None => return Err(format!("--session requires a uuid ({usage_for})")),
+            },
+            "--source" => match iter.next() {
+                Some(s) => out.source = Some(uuid(s, "--source", usage_for)?),
+                None => return Err(format!("--source requires a uuid ({usage_for})")),
+            },
+            "--from" => match iter.next() {
+                Some(raw) => {
+                    out.from_seq = Some(
+                        raw.parse()
+                            .map_err(|_| format!("--from requires a seq number, got `{raw}`"))?,
+                    );
+                }
+                None => return Err(format!("--from requires a seq number ({usage_for})")),
+            },
+            "--to" => match iter.next() {
+                Some(raw) => {
+                    out.to_seq = Some(
+                        raw.parse()
+                            .map_err(|_| format!("--to requires a seq number, got `{raw}`"))?,
+                    );
+                }
+                None => return Err(format!("--to requires a seq number ({usage_for})")),
+            },
+            "--json" => out.json = true,
+            // `show`'s positional <event-id|subject> (event ids are
+            // uuid-shaped; subjects are free text).
+            other
+                if !other.starts_with("--") && out.selector.is_none() && sub_is_show(usage_for) =>
+            {
+                out.selector = Some(other.to_string());
+            }
+            other => return Err(format!("unknown option `{other}` ({usage_for})")),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the flag set is being parsed for `memory show` (the only
+/// subcommand with a positional selector).
+fn sub_is_show(usage_for: &str) -> bool {
+    usage_for.ends_with("show")
 }
 
 /// `kian lease inspect [--db <sqlite>] [--json]`

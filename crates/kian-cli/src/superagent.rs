@@ -326,12 +326,17 @@ impl kian_superagent::RecallPort for StoreRecall {
 
 /// The driver every assembled engine runs: the built-in plain loop, or
 /// the super-agent three-way router (built-in behavior with the bundle
-/// mounted). Both variants share `Ctx = DrainCtx`.
+/// mounted), or the dream-routing memory assembly (a `memory:` section;
+/// ordinary sessions keep the plain loop's exact handle). All variants
+/// share `Ctx = DrainCtx`.
 pub enum ServeLoopDriver {
     /// built-in: one loop, the default agent (unchanged behavior).
     Plain(Arc<ReActLoop>),
     /// Super-agent: resident Router / spawned workers / plain sessions.
     SuperAgent(Arc<SuperAgentDriver>),
+    /// Agent memory (round 8): plain sessions unchanged, the dreamer
+    /// agent's DreamDriver for sessions carrying a dream request.
+    Memory(Arc<crate::memory::MemoryLoopDriver>),
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +464,7 @@ impl LoopDriver for ServeLoopDriver {
         match self {
             Self::Plain(loop_) => loop_.drive(ctx),
             Self::SuperAgent(driver) => driver.drive(ctx),
+            Self::Memory(driver) => driver.drive(ctx),
         }
     }
 }

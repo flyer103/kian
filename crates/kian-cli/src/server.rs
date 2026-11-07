@@ -31,7 +31,10 @@ use kian_store::EventStore;
 
 use crate::api::{ControlError, ControlPlane};
 use crate::config::{DshHarnessConfig, ServeConfig};
-use crate::ops::{MockSendReceipt, OpsError, OpsPlane, ResetReceipt, WakeReceipt};
+use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
+use crate::ops::{
+    DreamAdmitReceipt, MockSendReceipt, OpsError, OpsPlane, ResetReceipt, WakeReceipt,
+};
 use crate::plugins::{
     LocalToolsPlugin, OpenAiCompatPlugin, ReActPlugin, RemoteExecPlugin, SuperAgentPlugin,
 };
@@ -70,6 +73,11 @@ pub struct Server {
     /// The super-agent runtime (present iff the `superagent:` section
     /// is configured): mock channels, metrics surfaces, watchdog.
     superagent: Option<Arc<SuperAgentRuntime>>,
+    /// The assembled agent-memory plan (present iff a `memory:`
+    /// section is configured): the scope, the caps and the shared
+    /// dream driver the `memory_dream` ops method and the `memory`
+    /// metrics fragment read.
+    memory: Option<Arc<MemoryAssembly>>,
     /// The webhook receiver secret (present iff a `type: github`
     /// channel is configured — the route is configured). Env-only:
     /// `KIAN_GITHUB_WEBHOOK_SECRET`, fail-closed at assembly.
@@ -223,6 +231,13 @@ impl Server {
             // Explicit config opt-out: fully disabled (no patterns).
             kian_core::secrets::SecretRedactor::default()
         };
+        // The memory redactor (kian-91, review M-1): note text passes
+        // the secret redactor before append. It shares the exec
+        // redactor's configured secret names but is NOT bound to the
+        // exec opt-out — that config is about byte-exact exec OUTPUT;
+        // memory notes are durable claims, so pattern scanning stays on
+        // (the safe default for a surface with no configured names).
+        let memory_redactor = kian_core::secrets::SecretRedactor::from_env_names(&secret_env_names);
         let exec_env_policy = config
             .tools
             .exec_env
@@ -562,7 +577,7 @@ impl Server {
         let plugin_disposer = plugins.activate(&mut ctx)?;
 
         // -- 3. driver resolution -----------------------------------------
-        let (driver, services) = if superagent_cfg.is_some() {
+        let (mut driver, services) = if superagent_cfg.is_some() {
             let services = ctx
                 .resolve::<SuperAgentServices>()
                 .ok_or_else(|| ServeError::Assembly("superagent plugin did not register".into()))?;
@@ -575,6 +590,34 @@ impl Server {
                 .resolve::<ReActLoop>()
                 .ok_or_else(|| ServeError::Assembly("react-loop plugin did not register".into()))?;
             (Arc::new(ServeLoopDriver::Plain(loop_)), None)
+        };
+        // The memory assembly (a `memory:` section): ordinary sessions
+        // keep the exact plain-loop handle above — the router only
+        // adds the dream side for streams carrying a dream request
+        // (config-gated; with no section the driver is untouched).
+        let memory = match (&config.memory, driver.as_ref()) {
+            (Some(section), ServeLoopDriver::Plain(plain)) => {
+                let dream = build_dream_driver(
+                    &config,
+                    section,
+                    &ctx,
+                    Arc::clone(&policy),
+                    memory_redactor.clone(),
+                )?;
+                let caps = section.dreamer.caps();
+                let scope = section.scope.clone();
+                let assembly = Arc::new(MemoryAssembly::new(scope, caps, Arc::clone(&dream)));
+                let router = Arc::new(MemoryLoopDriver::new(Arc::clone(plain), dream));
+                driver = Arc::new(ServeLoopDriver::Memory(router));
+                Some(assembly)
+            }
+            (Some(_), _) => {
+                // Unreachable: validation refuses memory + superagent.
+                return Err(ServeError::Assembly(
+                    "memory: the section is only supported on the built-in assembly".into(),
+                ));
+            }
+            (None, _) => None,
         };
         let _ = superagent_services;
 
@@ -607,6 +650,7 @@ impl Server {
             recovery_tick_ms: config.drain.heartbeat_interval_ms,
             pg_pool: pg_pool.clone(),
             superagent: None,
+            memory,
             webhook_secret,
             webhook_limits,
             startup_order: Arc::clone(&startup_order),
@@ -1064,6 +1108,239 @@ impl OpsPlane for Server {
             })
         })
     }
+
+    fn memory_dream(
+        &self,
+        session: SessionId,
+        source: SessionId,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> BoxFuture<'_, Result<DreamAdmitReceipt, OpsError>> {
+        Box::pin(async move {
+            // Memory off is a closed refusal, never a silent no-op.
+            let memory = self.memory.as_ref().ok_or(OpsError::MemoryNotConfigured)?;
+
+            // Read-before-act on the memory session: an unknown id is a
+            // typo; a terminal stream is frozen (no new dreams land).
+            let events = self
+                .store
+                .rebuild(session)
+                .await
+                .map_err(|e| OpsError::Internal(format!("memory_dream: {e}")))?;
+            if events.is_empty() {
+                return Err(OpsError::UnknownSession { session });
+            }
+
+            // Idempotency, first window: the dream prompt's
+            // `input/admitted` row IS the durable record of the
+            // request (its header carries source + range), so a
+            // repeated range is derivable from the stream alone —
+            // including on a frozen (completed) memory session, where
+            // it stays an honest no-op forever. A range still pending
+            // in the inbox (admitted but not yet consumed) dedupes on
+            // the idempotency key at the admit below (second window).
+            for ev in &events {
+                if let Some(header) = dream_header_of_stream(ev)
+                    && header.source_session == source
+                    && header.start_seq == from_seq
+                    && header.end_seq == to_seq
+                {
+                    tracing::info!(
+                        session = %session.0,
+                        source = %source.0,
+                        "dream request already in the stream — no-op"
+                    );
+                    return Ok(DreamAdmitReceipt {
+                        session,
+                        source,
+                        from_seq,
+                        to_seq,
+                        deduplicated: true,
+                        bytes_read: 0,
+                        prompt_bytes: 0,
+                    });
+                }
+            }
+
+            let state = kian_core::state::project(&events)
+                .map_err(|e| OpsError::Internal(format!("memory_dream: {e}")))?;
+            if state.is_terminal() {
+                // A dream settles its memory session (the kian-86
+                // contract: notes land, then the end write). A NEW
+                // range on the frozen session refuses honestly — the
+                // operator dreams it on a fresh memory session.
+                return Err(OpsError::SessionTerminal { session });
+            }
+
+            // Read the source range and render the transcript under the
+            // cap — an over-cap range is refused honestly, never
+            // truncated (round-8 plan D3).
+            let source_events = self
+                .store
+                .rebuild(source)
+                .await
+                .map_err(|e| OpsError::Internal(format!("memory_dream source read: {e}")))?;
+            if source_events.is_empty() {
+                return Err(OpsError::UnknownSource {
+                    source_session: source,
+                });
+            }
+            // B-1 (kian-91): the range must lie inside the source
+            // stream, bounded by its head — the LAST event's seq + 1,
+            // read from the rebuilt stream itself (constraint 1: never
+            // a column). A `to_seq` past the head would silently clip
+            // the transcript (MEMORY-MODEL D3) while every note's
+            // `derived_from` keeps the inflated range — provenance
+            // naming events that do not exist (L2). Closed refusal, no
+            // admission, no partial state.
+            let head_next_seq = source_events
+                .last()
+                .map(|ev| ev.seq + 1)
+                .expect("non-empty source");
+            if from_seq < 1 || from_seq >= to_seq || to_seq > head_next_seq {
+                return Err(OpsError::SourceRangeOutOfBounds {
+                    source_session: source,
+                    from_seq,
+                    to_seq,
+                    head_next_seq,
+                });
+            }
+            let range: Vec<kian_core::events::Event> = source_events
+                .iter()
+                .filter(|ev| ev.seq >= from_seq && ev.seq < to_seq)
+                .cloned()
+                .collect();
+            if range.is_empty() {
+                return Err(OpsError::EmptySourceRange {
+                    source_session: source,
+                    from_seq,
+                    to_seq,
+                });
+            }
+            let transcript = render_transcript(&range);
+            let bytes_read = transcript.len() as u64;
+            if bytes_read > memory.config().max_bytes_read {
+                return Err(OpsError::SourceRangeTooLarge {
+                    source_session: source,
+                    from_seq,
+                    to_seq,
+                    bytes: bytes_read,
+                    cap: memory.config().max_bytes_read,
+                });
+            }
+
+            // ONE durable inbox row under the dream idempotency key; the
+            // admit wakes. B-2 (kian-91): the row is the ops-plane
+            // dream envelope — the rendered prompt as `content` plus
+            // the trusted, server-set `dream` marker (exactly those two
+            // keys). The drain consumes it to one `input/admitted`
+            // carrying the marker; routing and provenance read the
+            // marker, NEVER the message text, so a forged
+            // `[kian-dream: ...]` header in a plain submit cannot flip
+            // a session onto the dreamer. A repeated range dedupes onto
+            // the existing row (no-op).
+            let prompt = kian_memory::render_dream_prompt(
+                memory.scope(),
+                source,
+                from_seq,
+                to_seq,
+                &transcript,
+            );
+            let prompt_bytes = prompt.len() as u64;
+            let payload =
+                kian_memory::dream_admit_payload(memory.scope(), source, from_seq, to_seq, &prompt);
+            let key = kian_memory::dream_idempotency_key(source, from_seq, to_seq);
+            let outcome = self
+                .engine
+                .admit(session, payload, Some(key))
+                .await
+                .map_err(|e| OpsError::Internal(format!("memory_dream admit: {e}")))?;
+            tracing::info!(
+                session = %session.0,
+                source = %source.0,
+                range = ?(from_seq, to_seq),
+                deduplicated = outcome.deduplicated,
+                "dream request admitted"
+            );
+            Ok(DreamAdmitReceipt {
+                session,
+                source,
+                from_seq,
+                to_seq,
+                deduplicated: outcome.deduplicated,
+                bytes_read,
+                prompt_bytes,
+            })
+        })
+    }
+}
+
+/// The dream header of one event, if that event is a dream-prompt
+/// `input/admitted` row (thin per-event view of
+/// [`kian_memory::dream_request_in`]).
+fn dream_header_of_stream(ev: &kian_core::events::Event) -> Option<kian_memory::DreamHeader> {
+    kian_memory::dream_request_in(std::slice::from_ref(ev))
+}
+
+/// Builds the dreamer side of the memory assembly: the configured
+/// dreamer agent's own ReAct loop (its `main` slot, its tools, its
+/// permission table, its evidence gate) wrapped in the
+/// [`kian_memory::DreamDriver`]. Fail-closed like every other loop
+/// build (unlisted tools refuse to boot). `redactor` is the assembly's
+/// configured secret redactor — note text passes it before append
+/// (kian-91, review M-1 / MEMORY-MODEL N4).
+fn build_dream_driver(
+    config: &ServeConfig,
+    section: &crate::config::MemorySection,
+    ctx: &kian_plugin::Ctx,
+    policy: Arc<kian_orchestrator::recovery::PolicyTable>,
+    redactor: kian_core::secrets::SecretRedactor,
+) -> Result<Arc<kian_memory::DreamDriver>, ServeError> {
+    let registry = ctx
+        .resolve::<kian_llm::turn::ProviderRegistry>()
+        .ok_or_else(|| ServeError::Assembly("memory: ProviderRegistry not registered".into()))?;
+    let tools = ctx
+        .resolve::<dyn kian_core::seams::ToolProvider>()
+        .ok_or_else(|| ServeError::Assembly("memory: ToolProvider not registered".into()))?;
+    let agent_cfg = config
+        .dreamer_agent(&section.dreamer.agent)
+        .ok_or_else(|| {
+            ServeError::Assembly(format!(
+                "memory.dreamer.agent `{}` names no configured agent",
+                section.dreamer.agent
+            ))
+        })?;
+    // The dreamer's `tools:` list filters the mounted surface —
+    // fail-closed against typos, exactly like the default agent's.
+    let unmatched = kian_loop::tools::unmatched_tool_names(&agent_cfg.tools, &tools.schemas());
+    if !unmatched.is_empty() {
+        return Err(ServeError::Assembly(format!(
+            "memory.dreamer agent `{}` lists tools not mounted by the tool provider: {unmatched:?}",
+            agent_cfg.id
+        )));
+    }
+    let tools = Arc::new(kian_loop::tools::FilteredTools::new(
+        tools,
+        &agent_cfg.tools,
+    ));
+    let agent = config
+        .dreamer_agent_def(&section.dreamer.agent)
+        .expect("validated: the agent id resolves");
+    let react = ReActLoop::with_evidence_gate(
+        agent,
+        registry,
+        tools,
+        policy as Arc<dyn kian_core::seams::RecoveryPolicySource>,
+        ReActConfig {
+            slot: kian_core::model::SlotName("main".into()),
+            max_iterations: config.drain.max_iterations,
+            permissions: agent_cfg.permissions.clone(),
+        },
+        agent_cfg.evidence_gate.clone(),
+    );
+    Ok(Arc::new(
+        kian_memory::DreamDriver::new(react, section.dreamer.caps()).with_redactor(redactor),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1413,12 @@ async fn metrics_handler(
         Some(runtime) => runtime.metrics_report(&server.store).await,
         None => serde_json::Value::Null,
     };
+    // the dream counters (present iff a `memory:` section assembled;
+    // pure reads of the shared driver's atomics).
+    let memory = match &server.memory {
+        Some(assembly) => assembly.metrics_report(),
+        None => serde_json::Value::Null,
+    };
     (
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({
@@ -1144,6 +1427,7 @@ async fn metrics_handler(
             "cache": cache,
             "usage": usage,
             "superagent": superagent,
+            "memory": memory,
         })),
     )
         .into_response()

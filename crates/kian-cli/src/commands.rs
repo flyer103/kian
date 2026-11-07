@@ -1092,6 +1092,324 @@ pub async fn run_budget_reset(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// memory verbs (round-8 plan, kian-87)
+// ---------------------------------------------------------------------------
+
+/// `kian memory create [--config <path>] [--json]`: the operator-owned
+/// memory session — the existing `create_session` control method over
+/// the running server, printed as the session id. Requires a
+/// configured `memory:` section (the dreamer agent must exist); the
+/// session is plain until a dream request lands on it.
+pub async fn run_memory_create(config_path: &Path, json: bool) -> CmdResult<String> {
+    let config = ServeConfig::load(config_path).map_err(|e| format!("memory create: {e}"))?;
+    if config.memory.is_none() {
+        return Err(
+            "memory is not configured (no `memory:` section in kian.yaml) — \
+             add one before creating memory sessions"
+                .into(),
+        );
+    }
+    let client = KianClient::new(resolve_url(None, config_path)?);
+    let result = client
+        .rpc("create_session", json!({}))
+        .await
+        .map_err(|e| format!("memory create: {e}"))?;
+    let session = result
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": session,
+            "dreamer": config.memory.as_ref().expect("checked").dreamer.agent,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    Ok(format!(
+        "session             {session}\nnext                `kian memory dream --session {session} ...`\n"
+    ))
+}
+
+/// `kian memory dream --session <uuid> --source <uuid> --from <n>
+/// --to <n>`: one dream request via the `memory_dream` ops method on
+/// the running server.
+pub async fn run_memory_dream(
+    config_path: &Path,
+    url: Option<&str>,
+    session: SessionId,
+    source: SessionId,
+    from_seq: u64,
+    to_seq: u64,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let result = client
+        .ops(
+            "memory_dream",
+            json!({
+                "session": session.0.to_string(),
+                "source": source.0.to_string(),
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+            }),
+        )
+        .await
+        .map_err(|e| format!("memory dream: {e}"))?;
+    if json {
+        return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+    }
+    let deduplicated = result
+        .get("deduplicated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let note = if deduplicated {
+        "deduplicated        the same range was already admitted — a no-op"
+    } else {
+        "admitted            one dream row (role user, the rendered prompt); the drain wakes"
+    };
+    Ok(format!(
+        "session             {}\nsource              {}\nrange               [{from_seq},{to_seq})\nbytes read          {}\nprompt bytes        {}\n{note}\n",
+        result.get("session").and_then(Value::as_str).unwrap_or("?"),
+        result.get("source").and_then(Value::as_str).unwrap_or("?"),
+        result
+            .get("bytes_read")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("prompt_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    ))
+}
+
+/// The projected note set of a memory session (the read side of
+/// `list`/`show`/`verify` — one shared rebuild).
+async fn memory_notes(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+) -> CmdResult<(EventStore, Vec<kian_core::memory::Note>)> {
+    let db = resolve_db(db, config_path)?;
+    let store = open_reader(&db).await?;
+    let events = rebuild_session(&store, session).await?;
+    Ok((store, kian_core::memory::project_notes(&events)))
+}
+
+/// `kian memory list --session <uuid>`: the projected notes, subject
+/// order (the fold is deterministic).
+pub async fn run_memory_list(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    json: bool,
+) -> CmdResult<String> {
+    let (store, notes) = memory_notes(config_path, db, session).await?;
+    store.close().await;
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": session.0,
+            "notes": notes,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let mut out = format!(
+        "session             {}\nnotes               {}\n",
+        session.0,
+        notes.len()
+    );
+    for note in &notes {
+        let ranges = note
+            .derived_from
+            .iter()
+            .map(|r| format!("{}:[{},{}))", r.session.0, r.start_seq, r.end_seq))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "{:<20} {:<9} seq {:<4} {}\n",
+            note.subject,
+            status_str(note.status),
+            note.seq,
+            ranges
+        ));
+    }
+    Ok(out)
+}
+
+fn status_str(status: kian_core::memory::NoteStatus) -> &'static str {
+    match status {
+        kian_core::memory::NoteStatus::Candidate => "candidate",
+        kian_core::memory::NoteStatus::Verified => "verified",
+        kian_core::memory::NoteStatus::Stale => "stale",
+    }
+}
+
+/// `kian memory show --session <uuid> <event-id | subject>`: one note
+/// by its carrying event's derived id, or by subject (the latest
+/// revision the fold keeps).
+pub async fn run_memory_show(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    selector: &str,
+    json: bool,
+) -> CmdResult<String> {
+    let db_path = resolve_db(db, config_path)?;
+    let store = open_reader(&db_path).await?;
+    let events = rebuild_session(&store, session).await?;
+
+    // (a) a derived event id names the exact carrying event.
+    let mut found: Option<(String, kian_core::memory::Note)> = None;
+    for ev in &events {
+        if !matches!(ev.kind, EventKind::MemoryNote) {
+            continue;
+        }
+        let id = kian_core::events::event_id(&ev.session, ev.seq);
+        if id == selector {
+            if let Some(note) = kian_core::memory::parse_note(ev.kind, &ev.bytes) {
+                let mut note = note;
+                note.seq = ev.seq;
+                found = Some((id, note));
+            }
+            break;
+        }
+    }
+    // (b) else a subject names the fold's latest revision.
+    if found.is_none() {
+        let notes = kian_core::memory::project_notes(&events);
+        found = notes
+            .into_iter()
+            .map(|note| (kian_core::events::event_id(&session, note.seq), note))
+            .find(|(_, note)| note.subject == selector);
+    }
+    store.close().await;
+
+    let Some((event_id, note)) = found else {
+        return Err(format!(
+            "no memory note matches `{selector}` (an event id or a note subject of session {})",
+            session.0
+        ));
+    };
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": session.0,
+            "event_id": event_id,
+            "note": note,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let ranges = note
+        .derived_from
+        .iter()
+        .map(|r| format!("{}:[{},{}))", r.session.0, r.start_seq, r.end_seq))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verified_by = note
+        .verified_by
+        .as_ref()
+        .map(|v| format!("{} (ref {})", method_str(v), v.r#ref))
+        .unwrap_or_else(|| "-".into());
+    Ok(format!(
+        "session             {}\nevent               {event_id} (seq {})\nsubject             {}\nstatus              {}\ntext                {}\nderived from        {ranges}\nverified by         {verified_by}\n",
+        session.0,
+        note.seq,
+        note.subject,
+        status_str(note.status),
+        note.text
+    ))
+}
+
+fn method_str(v: &kian_core::memory::VerifiedBy) -> &str {
+    match v.method {
+        kian_core::memory::VerifyMethod::Transcript => "transcript",
+        kian_core::memory::VerifyMethod::EvidenceGate => "evidence_gate",
+        kian_core::memory::VerifyMethod::Human => "human",
+    }
+}
+
+/// One `kian memory verify` line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NoteVerification {
+    pub subject: String,
+    pub status: &'static str,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `kian memory verify --session <uuid>`: re-check every projected
+/// note's `derived_from` ranges against the source streams (pure
+/// [`kian_core::memory::verify_note`] over rebuilt streams — no
+/// server needed).
+pub async fn run_memory_verify(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    json: bool,
+) -> CmdResult<String> {
+    let (store, notes) = memory_notes(config_path, db, session).await?;
+    let mut results = Vec::with_capacity(notes.len());
+    for note in &notes {
+        // verify_note checks one note against ONE source stream; a
+        // note with ranges across sessions verifies per source group.
+        let mut ok = true;
+        let mut error = None;
+        let mut by_session: std::collections::BTreeMap<
+            SessionId,
+            Vec<kian_core::memory::DerivedRange>,
+        > = std::collections::BTreeMap::new();
+        for range in &note.derived_from {
+            by_session.entry(range.session).or_default().push(*range);
+        }
+        for (source, ranges) in by_session {
+            let events = store
+                .rebuild(source)
+                .await
+                .map_err(|e| format!("verify: source {source:?} read: {e}"))?;
+            let mut group = note.clone();
+            group.derived_from = ranges;
+            if let Err(e) = kian_core::memory::verify_note(&group, &events) {
+                ok = false;
+                error = Some(e.to_string());
+                break;
+            }
+        }
+        results.push(NoteVerification {
+            subject: note.subject.clone(),
+            status: status_str(note.status),
+            ok,
+            error,
+        });
+    }
+    store.close().await;
+    let verified = results.iter().filter(|r| r.ok).count();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": session.0,
+            "verified": verified,
+            "failed": results.len() - verified,
+            "results": results,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let mut out = format!(
+        "session             {}\nverified            {} of {}\n",
+        session.0,
+        verified,
+        results.len()
+    );
+    for r in &results {
+        let verdict = if r.ok {
+            "ok".to_string()
+        } else {
+            format!("FAILED — {}", r.error.as_deref().unwrap_or("?"))
+        };
+        out.push_str(&format!("{:<20} {:<9} {verdict}\n", r.subject, r.status));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1397,5 +1715,262 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&fresh_path);
+    }
+
+    // -- memory verbs (round 8, kian-87) ---------------------------
+
+    use super::{run_memory_list, run_memory_show, run_memory_verify};
+    use kian_store::EventStore;
+
+    /// Seeds one memory session (created + three note events, one a
+    /// later revision of the same subject) and one source session
+    /// whose stream covers seq [1,5); returns (db path, memory sid,
+    /// source sid).
+    async fn seed_memory_store() -> (PathBuf, SessionId, SessionId) {
+        let memory_sid = SessionId::new();
+        let source_sid = SessionId::new();
+        let path = temp_db_path();
+        let store = EventStore::open(&path).await.unwrap();
+
+        // Per-session seq: append with the event's own seq as the
+        // expectedSeq guard (events land in order).
+        async fn append(
+            store: &EventStore,
+            sid: SessionId,
+            seq: u64,
+            epoch: Epoch,
+            kind: EventKind,
+            bytes: serde_json::Value,
+        ) {
+            let e = Event {
+                seq,
+                session: sid,
+                epoch,
+                ts: 1_761_900_000_000 + seq,
+                kind,
+                bytes,
+                version: SCHEMA_VERSION,
+            };
+            store
+                .append(
+                    sid,
+                    e,
+                    kian_store::AppendGuard {
+                        epoch,
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // The source session: seq 1..5 (created + input + answer +
+        // turn end).
+        append(
+            &store,
+            source_sid,
+            1,
+            Epoch::GENESIS,
+            EventKind::SessionCreated,
+            json!({}),
+        )
+        .await;
+        append(
+            &store,
+            source_sid,
+            2,
+            Epoch(1),
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "the deploy broke"}),
+        )
+        .await;
+        append(
+            &store,
+            source_sid,
+            3,
+            Epoch(1),
+            EventKind::AssistantMessage,
+            json!({"role": "assistant", "content": {"text": "rolled back"}}),
+        )
+        .await;
+        append(
+            &store,
+            source_sid,
+            4,
+            Epoch(1),
+            EventKind::TurnEnd,
+            json!({"outcome": "ok"}),
+        )
+        .await;
+
+        // The memory session: created + notes (seq 1..4).
+        append(
+            &store,
+            memory_sid,
+            1,
+            Epoch::GENESIS,
+            EventKind::SessionCreated,
+            json!({}),
+        )
+        .await;
+        append(
+            &store,
+            memory_sid,
+            2,
+            Epoch(1),
+            EventKind::MemoryNote,
+            json!({
+                "subject": "deploys via dsh bridge",
+                "text": "old text",
+                "status": "candidate",
+                "derived_from": [{"session": source_sid.0, "start_seq": 1, "end_seq": 5}],
+            }),
+        )
+        .await;
+        append(
+            &store,
+            memory_sid,
+            3,
+            Epoch(1),
+            EventKind::MemoryNote,
+            json!({
+                "subject": "deploys via dsh bridge",
+                "text": "Deploys go through the dsh bridge.",
+                "status": "verified",
+                "verified_by": {"method": "transcript", "ref": "3"},
+                "derived_from": [{"session": source_sid.0, "start_seq": 1, "end_seq": 5}],
+            }),
+        )
+        .await;
+        append(
+            &store,
+            memory_sid,
+            4,
+            Epoch(1),
+            EventKind::MemoryNote,
+            json!({
+                "subject": "broken range",
+                "text": "Points outside the source stream.",
+                "status": "candidate",
+                "derived_from": [{"session": source_sid.0, "start_seq": 8, "end_seq": 12}],
+            }),
+        )
+        .await;
+        store.close().await;
+        (path, memory_sid, source_sid)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn memory_list_reports_the_fold() {
+        let (path, memory_sid, _source) = seed_memory_store().await;
+        let out = run_memory_list(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            false,
+        )
+        .await
+        .unwrap();
+        // Latest revision wins; subject-lexicographic order.
+        assert!(out.contains("notes               2"), "{out}");
+        assert!(out.contains("broken range"), "{out}");
+        assert!(out.contains("deploys via dsh bridge"), "{out}");
+        assert!(out.contains("verified"), "{out}");
+        assert!(
+            !out.contains("old text"),
+            "stale revision must not surface: {out}"
+        );
+
+        let json_out = run_memory_list(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            true,
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(value["notes"].as_array().unwrap().len(), 2);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn memory_show_resolves_subject_and_event_id() {
+        let (path, memory_sid, _source) = seed_memory_store().await;
+        let out = run_memory_show(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            "deploys via dsh bridge",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Deploys go through the dsh bridge."), "{out}");
+        assert!(out.contains("verified"), "{out}");
+
+        // The derived event id of the latest revision also resolves.
+        let event_id = kian_core::events::event_id(&memory_sid, 4);
+        let out = run_memory_show(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            &event_id,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("seq 4"), "{out}");
+
+        // Unknown selector is an honest error.
+        let err = run_memory_show(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            "no-such-subject",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no memory note matches"), "{err}");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn memory_verify_rechecks_ranges_against_the_source() {
+        let (path, memory_sid, _source) = seed_memory_store().await;
+        let out = run_memory_verify(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("verified            1 of 2"), "{out}");
+        assert!(out.contains("broken range"), "{out}");
+        assert!(
+            out.contains("FAILED"),
+            "the out-of-stream range must fail honestly: {out}"
+        );
+
+        let json_out = run_memory_verify(
+            std::path::Path::new("kian.yaml"),
+            Some(&path),
+            memory_sid,
+            true,
+        )
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(value["verified"], 1);
+        assert_eq!(value["failed"], 1);
+        cleanup(&path);
     }
 }
