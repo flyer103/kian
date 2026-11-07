@@ -26,6 +26,7 @@
 |---|---|---|---|
 | Control plane | `POST /rpc` (JSON-RPC 2.0) | always | none (v0; see §2.4) |
 | Event stream | `GET /sessions/{id}/events` (SSE) | always | none |
+| Fan-in event stream | `GET /events` (SSE, §5.4) | `api.event_stream.enabled` (default true); otherwise the path 404s | none |
 | Operational plane | `POST /ops/rpc` (JSON-RPC 2.0) | always | none |
 | Metrics | `GET /metrics` (JSON) | always | none |
 | GitHub webhook | `POST /webhooks/github` | only when a `type: github` channel is configured; otherwise the path 404s | HMAC-SHA256 |
@@ -247,19 +248,62 @@ emits `done` immediately.
 > [READ-MODEL.md](READ-MODEL.md); this file only fixes wire shapes. The P0 items (projection
 > `version`/`since`/`unchanged`, SSE `id:` + `Last-Event-ID` resume) have landed and are normative
 > in §3.1/§3.2 and §5.1/§5.2 above. The P2b item (`-32007 archived`) has landed too and is
-> normative in §2.2.
+> normative in §2.2. The P3 fan-in stream has landed and is normative in §5.4.
 
-- Planned fan-in (P3, OSS): `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`, tail-only (no
-  resume), explicit allowlist of at most 64 sessions, `id: <uuid>:<seq>`, no wildcard, HTTP 400
-  on malformed/over-cap; an unknown listed session emits one `event: error` naming it and the
-  stream continues.
+- ~~Planned fan-in (P3, OSS)~~ — **landed**: `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`
+  is normative in §5.4 (tail-only, explicit allowlist ≤ 64, `id: <uuid>:<seq>`, no wildcard,
+  HTTP 400 on malformed/over-cap, one `event: error` per unknown listed session then continue).
 - ~~Planned error code (P2b, append-only registry): `-32005 archived`~~ — **landed as
   `-32007 archived`** (§2.2): the round-8 memory surface had already taken `-32005`/`-32006`,
   and the registry is append-only, so `archived` is the next free code. Every read of an
   archived session (`projection`, the SSE stream) answers `-32007` / one `event: error` frame
   with package guidance — never `unknown_session`, never a silent truncation.
-- Planned metrics (additive): `read` object (`unchanged`, `delta_reads`, `resync`, `full_scans`)
-  and `event_stream` object (`subscribers`, `sessions_watched`, `events_sent`).
+- Planned metrics (additive): the `event_stream` object (`subscribers`, `sessions_watched`,
+  `events_sent`) has landed (§6); the `read` object (`unchanged`, `delta_reads`, `resync`,
+  `full_scans`) remains planned.
+
+### 5.4 Fan-in event stream — `GET /events` (READ-MODEL P3, normative)
+
+> Change class: **additive** (§9.2) — a new path, a new metrics key, a new SDK frame variant;
+> no existing surface, frame or code changed.
+
+Server-sent events over `text/event-stream`: the explicit-allowlist multi-session tail stream
+(READ-MODEL §4.2). Mounted iff `api.event_stream.enabled` (default `true`); a disabled server
+mounts no route and the path 404s. Same v0 trust boundary as §2.4 — no authn/authz, the
+deployment is the boundary, and the allowlist is **explicit session ids only**.
+
+**Request.** `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`
+
+| Parameter | Contract |
+|---|---|
+| `sessions` | Required, exactly once. Comma-separated explicit session uuids — the allowlist. 1–64 entries (counted before dedup; duplicates collapse). **No wildcard** in OSS: `*` is refused by name, and a principal-scoped wildcard would be a hosted-layer additive extension |
+| `kinds` | Optional, exactly once. Comma-separated event kinds (the EVENT-MODEL §3 catalog); unknown kind or empty token is malformed. Absent = every kind |
+| other keys | Ignored (forward compatibility, the §2.1 posture) |
+| `Last-Event-ID` | Ignored — P3 v0 is tail-only; per-session resume stays on §5.1/§5.2 |
+
+Malformed (missing/repeated `sessions`, a non-UUID id, an empty entry, over-cap, malformed
+`kinds`) is **HTTP 400** with a plain-text body (not a JSON-RPC envelope — the same posture as a
+malformed path id in §5.1).
+
+**Frames.**
+
+| Frame | `id` | `data` | Meaning |
+|---|---|---|---|
+| `event: kian` | `<session-uuid>:<seq>` | One event JSON envelope (EVENT-MODEL §1) | One event of one watched session |
+| `event: error` | — | The error message, naming the session | One listed session failed (unknown, archived, unreadable); it is dropped and the stream continues with the others |
+
+- Tail-only: the connection starts at each listed session's current head (one version query per
+  session) — pre-connect events are never replayed and never scanned.
+- No ordering across sessions is implied or promised. Per session, `seq` is strictly increasing
+  on the connection (the compound id carries the position).
+- Polling uses the §5.1 cadence (`sse.poll_interval_ms`); each poll reads only the bounded
+  tails — per-poll work is O(new events), never O(history).
+- A watched session that ends is delivered through its `session/ended` event (subject to the
+  kind filter) and then dropped — its stream is frozen. The stream closes when every listed
+  session has ended or errored. There is no `done` frame; that is a per-session concept.
+- Backpressure is bounded: one poll cycle emits at most a fixed batch of frames (512) before
+  yielding, and a consumer that stops reading suspends the poll loop outright — the server never
+  buffers unbounded data on a slow consumer's behalf.
 
 ## 6. Metrics — `GET /metrics`
 
@@ -273,11 +317,12 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
 | `memory` | object or `null` | Dream counters of the memory assembly (dreams, read/parse/append failures, notes appended/deduped); `null` when no `memory:` section assembled |
+| `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |
 
-The six top-level keys are stable; nested counters are additive. Consumers must ignore unknown
+The seven top-level keys are stable; nested counters are additive. Consumers must ignore unknown
 keys and unknown nested fields. `engine` and `pending_wake_depth` are process-local, while `cache`
 and `usage` are pure projections over durable events — a restart resets the former and not the
-latter.
+latter. `event_stream` is process-local like `engine`.
 
 ## 7. GitHub webhook — `POST /webhooks/github`
 
@@ -430,6 +475,7 @@ pin the current bytes. KiandProto carries its own `PROTOCOL_VERSION`. There is n
 | Method catalog ↔ dispatch arms | `docs_map.rs` catalog-drift test |
 | Request/response bytes per client method | `kian-sdk/tests/golden_wire.rs` + `tests/fixtures/` |
 | SSE frames and termination | `kian-sdk` SSE parser tests, `kian-cli/tests/e2e_serve.rs` |
+| Fan-in frames, caps, filters, tail-only start | `kian-cli/tests/fan_in_e2e.rs`, `kian-sdk` SSE parser tests (`KianFanIn`) |
 | Webhook verification order and status matrix | `kian-cli/tests/webhook_receiver.rs` |
 | Ops error mapping | `kian-cli/tests/ops_commands.rs` |
 | Iron rule (no execution symbols in handler modules) | `kian-cli/tests/iron_rule.rs` |

@@ -11,7 +11,8 @@
 > provenance, tail replay, the maintenance builder). **P2a landed** (materialized views:
 > session directory, usage, ticket stage, cache, the kind index). **P2b landed** (opt-in
 > export-only retention: the archive package, the two-phase verified commit, `session import`,
-> the `-32007 archived` read error). P3 remains proposed. The
+> the `-32007 archived` read error). **P3 landed** (the explicit-allowlist fan-in event
+> stream: `GET /events`, caps, kind filter, the `event_stream` metrics). The
 > phase table in §11 records the agreed target; each phase flips to `landed` in the change that
 > implements it and updates this header.
 
@@ -137,6 +138,26 @@ The decision record for this contract is
 - `kinds` is an optional allowlist. A malformed or over-cap request is HTTP 400. An unknown
   listed session is one `event: error` frame naming it; the stream continues with the others.
 - Backpressure is bounded; slow consumers are disconnected rather than causing unbounded buffering.
+
+Landed shape (P3):
+
+- **Tail-only start.** The connection establishes each listed session's cursor with ONE head
+  query (`version`); the pre-connection history is never replayed and never scanned — the
+  "no full-history polling" rule holds at connect time, not only per poll.
+- **Poll loop.** Each cycle reads every watched session's bounded tail (`(last, head]` — the
+  same `events_after` read §4.1 uses); per-poll work stays O(new events). A terminal session
+  is delivered through its `session/ended` event (subject to the kind filter) and then dropped
+  from the watch; the stream closes when every listed session has ended or errored. There is no
+  `done` frame — that is a per-session concept.
+- **Backpressure, concretely.** One cycle emits at most 512 frames before yielding, and the
+  poll loop is driven by the consumer's reads: a stalled consumer suspends polling outright, so
+  the server never buffers unbounded data on its behalf (a slow consumer is flow-controlled,
+  not a memory risk). An explicit idle-disconnect is not implemented in v0 — a stalled
+  connection holds at most its ≤ 64 watched sessions and one bounded batch.
+- **Config.** `api.event_stream.enabled` in `kian.yaml`, default **true**; disabled mounts no
+  route (the path 404s). Explicit ids only — `*` is refused by name (no wildcard in OSS).
+- **Metrics.** The `/metrics` `event_stream` object: `subscribers` / `sessions_watched` (live
+  gauges, settled symmetrically by a connection-lifetime guard) and `events_sent` (counter).
 
 ## 5. Snapshots (P1)
 
@@ -314,7 +335,7 @@ Landed shape (P2b):
 | P1 | snapshots (state + context with provenance), verified publish, tail replay | landed | L1 equivalence incl. compact; L2 resume/crash; bench: 10k-event resume = O(tail); request bytes unchanged |
 | P2a | session directory, usage/stage views, kind index | landed | L1 rebuild equivalence; L2 operator surfaces on 1k sessions; corrupt/stale fallback |
 | P2b | opt-in export-only archive, import, retention | landed | L2 archive→verify→delete→inspect; export byte parity; corrupt package refused; crash windows |
-| P3 | explicit-allowlist fan-in stream, caps, filters, metrics | planned | L2 two-session fan-in; filters/caps/unknown-id; reconnect per-session unaffected; no wildcard |
+| P3 | explicit-allowlist fan-in stream, caps, filters, metrics | landed | L2 two-session fan-in; filters/caps/unknown-id; reconnect per-session unaffected; no wildcard |
 
 ## 12. Non-goals
 

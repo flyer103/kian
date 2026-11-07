@@ -561,3 +561,35 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   (pre-v5 read-only reader). READ-MODEL §11 P2b `planned` → `landed` + §7 landed shape +
   header; API-CONTRACT §2.2/§3.2/§3.3/§5.3 updated. No new event kind; no transparent cold
   tier; no automatic retention cadence.
+- **Read model P3 — explicit-allowlist fan-in event stream (round 9, R9-06)** — default-green.
+  `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]` (API-CONTRACT §5.4, normative; change
+  class additive): an explicit allowlist of at most 64 sessions per connection (counted before
+  dedup), **no wildcard** (`*` refused by name — the owner gate), HTTP 400 with a plain-text
+  body on missing/repeated `sessions`, a non-UUID id, an empty entry, over-cap, or a `kinds`
+  entry outside the EVENT-MODEL catalog (the validation table is pinned to `EventKind::as_str`
+  by `known_event_kinds_table_matches_the_core_catalog`). Tail-only: the connection establishes
+  each cursor with ONE head query (new `ControlPlane::session_version`) — pre-connect history is
+  never replayed (`fan_in_interleaves_two_sessions_tail_only`); each poll cycle reads the same
+  bounded `events_after` tails §4.1 uses, so per-poll work stays O(new events). Frames carry
+  `id: <session>:<seq>`; no cross-session ordering is promised; per session the seq is strictly
+  increasing. An unknown or archived listed session emits exactly one `event: error` frame
+  naming it and the stream continues (`fan_in_unknown_session_errors_once_and_continues`); the
+  `kinds` filter applies server-side and a terminal session is delivered through its
+  `session/ended` event then dropped, the stream closing when every listed session has ended or
+  errored — no `done` frame (`fan_in_kind_filter_and_terminal_close`). Backpressure is bounded
+  twice over: ≤ 512 frames per yielded cycle (the cursor advances only to the last emitted seq,
+  so nothing is dropped or re-emitted), and a stalled consumer suspends the poll loop outright —
+  the server never buffers unbounded data on its behalf. Config `api.event_stream.enabled`
+  (default **true**, fail-closed parse; disabled mounts no route — 404:
+  `fan_in_disabled_by_config_forty_fours`). `/metrics` gains the `event_stream` object
+  (`subscribers`, `sessions_watched`, `events_sent`; a connection-lifetime guard settles the
+  gauges on disconnect: `fan_in_metrics_track_the_open_connection`,
+  `fan_in_metrics_settle_to_zero_after_drop`). The per-session resume surface is untouched
+  (`per_session_stream_resume_unaffected_by_fan_in`; the full resume suite stays in
+  `read_path_e2e.rs`). `kian-sdk`: the SSE parser splits compound ids additively
+  (`SseFrame::KianFanIn`; old id-less and numeric-id fixtures still parse) and
+  `KianClient::fan_in` sends the exact wire request (byte-level request-line pinning in
+  `golden_wire.rs`, incl. the 400 mapping). No authz change: the deployment remains the trust
+  boundary and the allowlist is explicit ids only. READ-MODEL §4.2 landed shape + §11 P3
+  `planned` → `landed` + header; API-CONTRACT §1/§5.3/§5.4/§6/§10.2. No new event kind; the
+  planned `read` metrics object remains planned (P0-owned surface).

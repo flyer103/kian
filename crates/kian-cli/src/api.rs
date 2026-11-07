@@ -15,9 +15,10 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -28,6 +29,7 @@ use futures::future::BoxFuture;
 use kian_core::events::Event;
 use kian_core::model::SessionId;
 use kian_core::state::SessionState;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -78,6 +80,11 @@ pub trait ControlPlane: Send + Sync {
         session: SessionId,
         after: u64,
     ) -> BoxFuture<'_, Result<EventTailRead, ControlError>>;
+    /// READ-MODEL §4.2 (P3): the current head version of one session
+    /// — the tail-only fan-in's start point. One indexed head query:
+    /// the pre-connection history is never replayed and never scanned.
+    /// `0` (no events) maps to [`ControlError::UnknownSession`].
+    fn session_version(&self, session: SessionId) -> BoxFuture<'_, Result<u64, ControlError>>;
 }
 
 /// The versioned projection result (READ-MODEL §3). `unchanged`
@@ -154,15 +161,45 @@ const CODE_INVALID_REQUEST: i64 = -32600;
 struct AppState {
     plane: Arc<dyn ControlPlane>,
     sse_poll_ms: u64,
+    /// The fan-in metrics handle (READ-MODEL §4.2 / API-CONTRACT §6),
+    /// present iff the route is mounted (`api.event_stream.enabled`).
+    event_stream: Option<Arc<EventStreamMetrics>>,
 }
 
 /// Builds the built-in control-plane router.
 pub fn router(plane: Arc<dyn ControlPlane>, sse_poll_ms: u64) -> Router {
-    let state = AppState { plane, sse_poll_ms };
-    Router::new()
+    router_with_event_stream(
+        plane,
+        sse_poll_ms,
+        Arc::new(EventStreamMetrics::new()),
+        true,
+    )
+}
+
+/// [`router`] with an explicit fan-in event-stream plan
+/// (READ-MODEL §4.2, P3): the shared metrics handle `/metrics`
+/// reports, and the `api.event_stream.enabled` gate. Disabled mounts
+/// no `/events` route — the path 404s exactly like an unconfigured
+/// webhook receiver.
+pub fn router_with_event_stream(
+    plane: Arc<dyn ControlPlane>,
+    sse_poll_ms: u64,
+    event_stream: Arc<EventStreamMetrics>,
+    event_stream_enabled: bool,
+) -> Router {
+    let event_stream = event_stream_enabled.then_some(event_stream);
+    let state = AppState {
+        plane,
+        sse_poll_ms,
+        event_stream,
+    };
+    let mut router = Router::new()
         .route("/rpc", post(rpc))
-        .route("/sessions/{id}/events", get(session_events_sse))
-        .with_state(state)
+        .route("/sessions/{id}/events", get(session_events_sse));
+    if state.event_stream.is_some() {
+        router = router.route("/events", get(fan_in_events_sse));
+    }
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +540,405 @@ async fn session_events_sse(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// SSE fan-in `GET /events` (READ-MODEL §4.2, P3 — explicit-allowlist
+// multi-session stream)
+// ---------------------------------------------------------------------------
+
+/// The fan-in allowlist cap (READ-MODEL §4.2 / API-CONTRACT §5.4): at
+/// most 64 sessions per connection. A fixed contract constant, not a
+/// tunable — more listed ids (before dedup) is HTTP 400.
+pub const MAX_FAN_IN_SESSIONS: usize = 64;
+
+/// The per-cycle frame cap (bounded backpressure, READ-MODEL §4.2): one
+/// poll cycle emits at most this many frames before yielding to the
+/// consumer, so a connection never buffers more than one bounded batch
+/// however fast the watched sessions append. The watch state advances
+/// only to the last emitted seq, so the next cycle continues exactly
+/// where the batch stopped — nothing is dropped, nothing re-emitted.
+const MAX_FAN_IN_BATCH: usize = 512;
+
+/// The durable kind names (EVENT-MODEL §3 catalog) the optional
+/// `kinds` allowlist may name. A listed kind outside this set is a
+/// malformed request (HTTP 400), never a silently-empty filter. The
+/// sync test below pins this table against `EventKind::as_str`.
+const KNOWN_EVENT_KINDS: [&str; 22] = [
+    "session/created",
+    "input/admitted",
+    "drain/claimed",
+    "turn/start",
+    "turn/end",
+    "step/request",
+    "assistant/message",
+    "tool/call",
+    "tool/result",
+    "compact",
+    "slot/binding",
+    "slot/fallback",
+    "slot/migration",
+    "recovery/budget-reset",
+    "thread/started",
+    "thread/completed",
+    "evidence/verdict",
+    "channel/delivered",
+    "input/spilled",
+    "control/interrupt",
+    "memory/note",
+    "session/ended",
+];
+
+/// The parsed fan-in request: an explicit session allowlist (ordered,
+/// deduped, ≤ [`MAX_FAN_IN_SESSIONS`]) and an optional kind allowlist.
+#[derive(Debug)]
+struct FanInQuery {
+    sessions: Vec<SessionId>,
+    kinds: Option<Vec<&'static str>>,
+}
+
+/// Parses the `GET /events` query pairs. `Err` is the HTTP 400 body —
+/// malformed means: `sessions` missing/repeated, a non-UUID id
+/// (including `*` — there is **no wildcard** in OSS), an empty entry,
+/// over-cap, a repeated `kinds` parameter, an empty kind token, or a
+/// kind outside the EVENT-MODEL catalog.
+fn fan_in_query(pairs: &[(String, String)]) -> Result<FanInQuery, String> {
+    let mut sessions_raw: Option<&str> = None;
+    let mut kinds_raw: Option<&str> = None;
+    for (key, value) in pairs {
+        // `sessions`/`kinds` must appear exactly once; unknown keys are
+        // ignored (forward compatibility, the same posture as unknown
+        // JSON-RPC params).
+        let slot = match key.as_str() {
+            "sessions" => &mut sessions_raw,
+            "kinds" => &mut kinds_raw,
+            _ => continue,
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return Err(format!("`{key}` must appear exactly once"));
+        }
+    }
+    let raw = sessions_raw.ok_or_else(|| {
+        "`sessions` is required: GET /events?sessions=<uuid,...>[&kinds=<kind,...>]".to_string()
+    })?;
+    let mut sessions: Vec<SessionId> = Vec::new();
+    let mut listed = 0usize;
+    for token in raw.split(',') {
+        let token = token.trim();
+        listed += 1;
+        if token.is_empty() {
+            return Err("`sessions` contains an empty entry".into());
+        }
+        if token == "*" {
+            return Err(
+                "no wildcard: `sessions` must be an explicit allowlist of session uuids".into(),
+            );
+        }
+        let uuid: uuid::Uuid = token.parse().map_err(|_| {
+            format!("`sessions` entry `{token}` is not a uuid (no wildcard: explicit ids only)")
+        })?;
+        let session = SessionId(uuid);
+        if !sessions.contains(&session) {
+            sessions.push(session);
+        }
+    }
+    if listed > MAX_FAN_IN_SESSIONS {
+        return Err(format!(
+            "`sessions` lists {listed} ids; the fan-in allowlist is capped at \
+             {MAX_FAN_IN_SESSIONS}"
+        ));
+    }
+    if sessions.is_empty() {
+        return Err("`sessions` must list at least one session uuid".into());
+    }
+    let kinds = match kinds_raw {
+        None => None,
+        Some(raw) => {
+            let mut kinds: Vec<&'static str> = Vec::new();
+            for token in raw.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    return Err("`kinds` contains an empty entry".into());
+                }
+                let known = KNOWN_EVENT_KINDS
+                    .iter()
+                    .find(|kind| **kind == token)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "`kinds` entry `{token}` is not a known event kind \
+                             (the EVENT-MODEL catalog)"
+                        )
+                    })?;
+                if !kinds.contains(&known) {
+                    kinds.push(known);
+                }
+            }
+            if kinds.is_empty() {
+                return Err("`kinds` must name at least one event kind".into());
+            }
+            Some(kinds)
+        }
+    };
+    Ok(FanInQuery { sessions, kinds })
+}
+
+/// The fan-in metrics fragment (API-CONTRACT §6, the `event_stream`
+/// object). `subscribers` and `sessions_watched` are live gauges
+/// (open fan-in connections / sessions they still watch); `events_sent`
+/// is a monotonic counter (process-local, like `engine`).
+#[derive(Debug, Default)]
+pub struct EventStreamMetrics {
+    subscribers: AtomicU64,
+    sessions_watched: AtomicU64,
+    events_sent: AtomicU64,
+}
+
+/// The `/metrics` view of [`EventStreamMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct EventStreamSnapshot {
+    pub subscribers: u64,
+    pub sessions_watched: u64,
+    pub events_sent: u64,
+}
+
+impl EventStreamMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current snapshot (Relaxed loads — these are observability
+    /// counters, not synchronization).
+    pub fn snapshot(&self) -> EventStreamSnapshot {
+        EventStreamSnapshot {
+            subscribers: self.subscribers.load(Ordering::Relaxed),
+            sessions_watched: self.sessions_watched.load(Ordering::Relaxed),
+            events_sent: self.events_sent.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One watched session of an open fan-in connection: its uuid and the
+/// last seq this connection emitted (its private tail cursor).
+struct FanInWatch {
+    session: SessionId,
+    last: u64,
+}
+
+/// Connection-lifetime accounting: decrements the metrics gauges when
+/// the stream is dropped (client disconnect or server-side close) —
+/// including the sessions still watched at that moment.
+struct FanInGuard {
+    metrics: Arc<EventStreamMetrics>,
+    watched: AtomicU64,
+}
+
+impl FanInGuard {
+    fn session_added(&self) {
+        self.watched.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .sessions_watched
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn session_dropped(&self) {
+        self.watched.fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .sessions_watched
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for FanInGuard {
+    fn drop(&mut self) {
+        self.metrics.subscribers.fetch_sub(1, Ordering::Relaxed);
+        self.metrics
+            .sessions_watched
+            .fetch_sub(self.watched.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]` — the
+/// explicit-allowlist fan-in stream (READ-MODEL §4.2, API-CONTRACT
+/// §5.4). Tail-only: the connection starts at each listed session's
+/// current head (one version query per session — no history replay, no
+/// history scan) and then polls bounded tails. There is no resume
+/// header support in P3 — a `Last-Event-ID` header is ignored;
+/// per-session resume stays on `GET /sessions/{id}/events`.
+///
+/// Frames: `event: kian` with `id: <session>:<seq>` (the data is the
+/// event envelope, exactly the per-session stream's shape) and
+/// `event: error` — one frame per failed listed session (unknown,
+/// archived, or unreadable), naming it; the stream continues with the
+/// others. No ordering across sessions is implied; per session the
+/// seq is strictly increasing on the connection. A session that ends
+/// is delivered through its `session/ended` event and then dropped
+/// from the watch; the stream closes when every listed session has
+/// ended or errored (there is no `done` frame — that is a per-session
+/// concept).
+async fn fan_in_events_sse(
+    State(state): State<AppState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let Some(metrics) = state.event_stream.clone() else {
+        // Unreachable while mounted (the route is only mounted when
+        // enabled); kept fail-closed anyway.
+        return (StatusCode::NOT_FOUND, "event stream disabled").into_response();
+    };
+    let query = match fan_in_query(&pairs) {
+        Ok(query) => query,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let poll = Duration::from_millis(state.sse_poll_ms);
+    metrics.subscribers.fetch_add(1, Ordering::Relaxed);
+    let guard = Arc::new(FanInGuard {
+        metrics: Arc::clone(&metrics),
+        watched: AtomicU64::new(0),
+    });
+    let kinds = query.kinds.clone();
+    let setup: Vec<SessionId> = query.sessions.clone();
+
+    // State machine per cycle: establish the tail cursors on the first
+    // cycle (emitting one error frame per unlistable session), then
+    // poll every watched session's bounded tail. Backpressure is
+    // bounded twice over: the unfold future is only advanced when the
+    // consumer reads (a slow or stalled consumer suspends polling
+    // outright — the server never buffers on its behalf), and one
+    // cycle emits at most MAX_FAN_IN_BATCH frames before yielding.
+    let stream = futures::stream::unfold(
+        (
+            Arc::clone(&state.plane),
+            Vec::<FanInWatch>::new(),
+            setup,
+            kinds,
+            metrics,
+            guard,
+            false, // tail cursors established?
+            false, // close after this yield?
+        ),
+        move |(plane, mut watch, setup, kinds, metrics, guard, mut initialized, mut done)| {
+            async move {
+                if done {
+                    return None;
+                }
+                let mut items: Vec<Result<SseEvent, Infallible>> = Vec::new();
+                if !initialized {
+                    // Tail-only start (READ-MODEL §4.2): one head query
+                    // per listed session; the pre-connect history is
+                    // never replayed. An unlistable session gets its
+                    // one error frame and is skipped — the stream
+                    // continues with the others.
+                    for session in setup.iter().copied() {
+                        match plane.session_version(session).await {
+                            Ok(version) => {
+                                watch.push(FanInWatch {
+                                    session,
+                                    last: version,
+                                });
+                                guard.session_added();
+                            }
+                            Err(e) => {
+                                let (_, message) = control_err(e);
+                                items.push(Ok(SseEvent::default()
+                                    .event("error")
+                                    .data(format!("{message} — dropped from this stream"))));
+                            }
+                        }
+                    }
+                    initialized = true;
+                    if watch.is_empty() {
+                        done = true;
+                    }
+                } else {
+                    loop {
+                        let mut i = 0;
+                        while i < watch.len() && items.len() < MAX_FAN_IN_BATCH {
+                            let FanInWatch { session, last } = watch[i];
+                            match plane.session_events_after(session, last).await {
+                                Err(e) => {
+                                    let (_, message) = control_err(e);
+                                    items.push(Ok(SseEvent::default()
+                                        .event("error")
+                                        .data(format!("{message} — dropped from this stream"))));
+                                    watch.remove(i);
+                                    guard.session_dropped();
+                                }
+                                Ok(tail) => {
+                                    // Emit up to the batch cap; the
+                                    // cursor advances only to the last
+                                    // emitted seq so the next cycle
+                                    // resumes exactly there.
+                                    let mut emitted = last;
+                                    let mut capped = false;
+                                    for event in &tail.events {
+                                        if items.len() >= MAX_FAN_IN_BATCH {
+                                            capped = true;
+                                            break;
+                                        }
+                                        emitted = event.seq;
+                                        let wanted = kinds.as_ref().is_none_or(|kinds| {
+                                            kinds.contains(&event.kind.as_str())
+                                        });
+                                        if wanted {
+                                            items.push(Ok(SseEvent::default()
+                                                .event("kian")
+                                                .id(format!("{}:{}", session.0, event.seq))
+                                                .data(
+                                                    serde_json::to_string(event)
+                                                        .unwrap_or_default(),
+                                                )));
+                                            metrics.events_sent.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    watch[i].last = emitted;
+                                    if tail.terminal && !capped {
+                                        // Frozen stream, fully
+                                        // delivered: nothing more to
+                                        // observe on this session.
+                                        watch.remove(i);
+                                        guard.session_dropped();
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if watch.is_empty() {
+                            // Every listed session has ended or
+                            // errored: close after this yield.
+                            done = true;
+                            break;
+                        }
+                        if items.is_empty() {
+                            // Nothing new for anyone: wait one
+                            // interval, poll again.
+                            tokio::time::sleep(poll).await;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                Some((
+                    futures::stream::iter(items),
+                    (
+                        plane,
+                        watch,
+                        setup,
+                        kinds,
+                        metrics,
+                        guard,
+                        initialized,
+                        done,
+                    ),
+                ))
+            }
+        },
+    )
+    .flatten();
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -584,5 +1020,183 @@ mod tests {
         assert_eq!(code, -32007);
         assert!(msg.contains("archived"), "{msg}");
         assert!(msg.contains("session import"), "{msg}");
+    }
+
+    // READ-MODEL §4.2 (P3): the fan-in query parser.
+
+    fn uuid_str(n: u8) -> String {
+        format!("00000000-0000-0000-0000-{n:012x}")
+    }
+
+    /// The happy path parses an explicit allowlist (order preserved,
+    /// duplicates collapsed) and an optional kind allowlist (known
+    /// kinds only).
+    #[test]
+    fn fan_in_query_parses_allowlists() {
+        use super::{MAX_FAN_IN_SESSIONS, fan_in_query};
+        let a = uuid_str(1);
+        let b = uuid_str(2);
+        let query = fan_in_query(&[
+            ("sessions".into(), format!("{a},{b},{a}")),
+            ("kinds".into(), "input/admitted,turn/end".into()),
+        ])
+        .expect("valid query");
+        assert_eq!(query.sessions.len(), 2, "duplicates collapse");
+        assert_eq!(query.sessions[0].0.to_string(), a);
+        assert_eq!(query.sessions[1].0.to_string(), b);
+        assert_eq!(
+            query.kinds.as_deref(),
+            Some(&["input/admitted", "turn/end"][..])
+        );
+        // No kinds filter when the parameter is absent.
+        let query = fan_in_query(&[("sessions".into(), a.clone())]).expect("valid query");
+        assert!(query.kinds.is_none());
+        // Unknown query keys are ignored.
+        let query = fan_in_query(&[("sessions".into(), a), ("future".into(), "x".into())])
+            .expect("unknown keys ignored");
+        assert_eq!(query.sessions.len(), 1);
+        // Exactly at the cap parses; one over is refused.
+        let at_cap: Vec<(String, String)> = (0..MAX_FAN_IN_SESSIONS)
+            .map(|n| ("sessions".into(), uuid_str(n as u8)))
+            .collect();
+        let joined = at_cap
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        fan_in_query(&[("sessions".into(), joined.clone())]).expect("cap is inclusive");
+        let over = format!("{joined},{}", uuid_str(63)); // 65th listed entry
+        let err = fan_in_query(&[("sessions".into(), over)]).unwrap_err();
+        assert!(err.contains("capped at 64"), "{err}");
+    }
+
+    /// Malformed requests are refused: missing/repeated `sessions`,
+    /// empty entries, non-UUID ids, the wildcard, an over-cap listing,
+    /// repeated `kinds`, empty kind tokens, unknown kinds.
+    #[test]
+    fn fan_in_query_refuses_malformed_requests() {
+        use super::fan_in_query;
+        let a = uuid_str(1);
+        for (pairs, why) in [
+            (vec![], "sessions is required"),
+            (
+                vec![("sessions".into(), String::new())],
+                "empty sessions value",
+            ),
+            (vec![("sessions".into(), format!("{a},"))], "empty entry"),
+            (
+                vec![("sessions".into(), format!("{a},not-a-uuid"))],
+                "non-uuid entry",
+            ),
+            (vec![("sessions".into(), "*".into())], "no wildcard"),
+            (
+                vec![
+                    ("sessions".into(), a.clone()),
+                    ("sessions".into(), a.clone()),
+                ],
+                "repeated sessions parameter",
+            ),
+            (
+                vec![("sessions".into(), a), ("kinds".into(), String::new())],
+                "empty kinds value",
+            ),
+            (
+                vec![
+                    ("sessions".into(), uuid_str(1)),
+                    ("kinds".into(), "input/admitted".into()),
+                    ("kinds".into(), "turn/end".into()),
+                ],
+                "repeated kinds parameter",
+            ),
+            (
+                vec![
+                    ("sessions".into(), uuid_str(1)),
+                    ("kinds".into(), "no/such-kind".into()),
+                ],
+                "unknown kind",
+            ),
+        ] {
+            let err = fan_in_query(&pairs).map(|_| ()).unwrap_err();
+            assert!(!err.is_empty(), "{why}: empty refusal");
+            match why {
+                "sessions is required" => assert!(err.contains("`sessions` is required")),
+                "no wildcard" => assert!(err.contains("no wildcard"), "{err}"),
+                "unknown kind" => assert!(err.contains("no/such-kind"), "{err}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The `kinds` validation table is exactly the EVENT-MODEL §3
+    /// catalog: every `EventKind` variant's durable name is present,
+    /// and the table has no extra entries.
+    #[test]
+    fn known_event_kinds_table_matches_the_core_catalog() {
+        use kian_core::events::{EndReason, EventKind};
+        let variants = [
+            EventKind::SessionCreated,
+            EventKind::InputAdmitted,
+            EventKind::DrainClaimed,
+            EventKind::TurnStart,
+            EventKind::TurnEnd,
+            EventKind::StepRequest,
+            EventKind::AssistantMessage,
+            EventKind::ToolCall,
+            EventKind::ToolResult,
+            EventKind::Compact,
+            EventKind::SlotBinding,
+            EventKind::SlotFallback,
+            EventKind::SlotMigration,
+            EventKind::RecoveryBudgetReset,
+            EventKind::ThreadStarted,
+            EventKind::ThreadCompleted,
+            EventKind::EvidenceVerdict,
+            EventKind::ChannelDelivered,
+            EventKind::InputSpilled,
+            EventKind::ControlInterrupt,
+            EventKind::MemoryNote,
+            EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            },
+        ];
+        let table = super::KNOWN_EVENT_KINDS;
+        assert_eq!(table.len(), variants.len(), "table/variant count drift");
+        for variant in &variants {
+            assert!(
+                table.contains(&variant.as_str()),
+                "kind `{}` missing from the fan-in kinds table",
+                variant.as_str()
+            );
+        }
+    }
+
+    /// The fan-in metrics gauges count subscribers and watched sessions
+    /// symmetrically: adds and drops cancel, and the guard's drop
+    /// settles whatever remained.
+    #[test]
+    fn fan_in_metrics_settle_to_zero_after_drop() {
+        use std::sync::Arc;
+
+        use super::{EventStreamMetrics, FanInGuard};
+        let metrics = Arc::new(EventStreamMetrics::new());
+        {
+            let guard = Arc::new(FanInGuard {
+                metrics: Arc::clone(&metrics),
+                watched: std::sync::atomic::AtomicU64::new(0),
+            });
+            metrics
+                .subscribers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            guard.session_added();
+            guard.session_added();
+            guard.session_dropped();
+            let mid = metrics.snapshot();
+            assert_eq!(mid.subscribers, 1);
+            assert_eq!(mid.sessions_watched, 1);
+        }
+        let end = metrics.snapshot();
+        assert_eq!(end.subscribers, 0);
+        assert_eq!(end.sessions_watched, 0);
+        assert_eq!(end.events_sent, 0);
     }
 }

@@ -109,6 +109,11 @@ pub struct ServeConfig {
     /// archive directory and at least one online-window threshold.
     #[serde(default)]
     pub retention: RetentionSection,
+    /// The `api:` section (READ-MODEL §4.2, P3). Absent = the defaults:
+    /// the fan-in event stream enabled, explicit session allowlists
+    /// only (no wildcard in OSS).
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -499,6 +504,46 @@ impl Default for SseConfig {
 
 fn default_poll_ms() -> u64 {
     100
+}
+
+// ---------------------------------------------------------------------------
+// the `api` section (READ-MODEL §4.2, P3 — the fan-in event stream)
+// ---------------------------------------------------------------------------
+
+/// The `api:` section. The `event_stream` gate is default **on**: the
+/// fan-in stream is a read-only observability surface behind the same
+/// v0 trust boundary (API-CONTRACT §2.4 — the deployment is the
+/// boundary; the allowlist is explicit session ids only, never a
+/// wildcard). Disabling mounts no `/events` route — the path 404s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    /// The `api.event_stream:` subsection.
+    #[serde(default)]
+    pub event_stream: EventStreamSection,
+}
+
+/// The `api.event_stream:` subsection (READ-MODEL §4.2 / API-CONTRACT
+/// §5.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventStreamSection {
+    /// Whether `GET /events` (the explicit-allowlist fan-in stream) is
+    /// mounted. Default `true`.
+    #[serde(default = "default_event_stream_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for EventStreamSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_event_stream_enabled(),
+        }
+    }
+}
+
+fn default_event_stream_enabled() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -4691,6 +4736,42 @@ recovery:
         assert!(
             ServeConfig::parse(&typo).is_err(),
             "deny_unknown_fields must refuse the typo'd key"
+        );
+    }
+
+    // -- api.event_stream (READ-MODEL §4.2, P3) ---------------------
+
+    /// Default: the fan-in event stream is ON (the section is absent —
+    /// an explicit session allowlist only, never a wildcard).
+    #[test]
+    fn event_stream_defaults_to_enabled() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        assert!(cfg.api.event_stream.enabled);
+        cfg.validate().expect("defaults validate");
+    }
+
+    /// The gate parses explicitly in both directions and refuses
+    /// unknown keys (deny_unknown_fields at both levels).
+    #[test]
+    fn event_stream_gate_parses_fail_closed() {
+        let off = valid_yaml() + "api:\n  event_stream:\n    enabled: false\n";
+        let cfg = ServeConfig::parse(&off).expect("parse");
+        assert!(!cfg.api.event_stream.enabled);
+        cfg.validate().expect("explicit off validates");
+
+        let on = valid_yaml() + "api:\n  event_stream:\n    enabled: true\n";
+        let cfg = ServeConfig::parse(&on).expect("parse");
+        assert!(cfg.api.event_stream.enabled);
+
+        let typo = valid_yaml() + "api:\n  event_stream:\n  enbled: true\n";
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "a typo'd gate key must refuse, not silently default"
+        );
+        let typo = valid_yaml() + "api:\n  wildcard: true\n";
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "an unknown api key must refuse"
         );
     }
 }

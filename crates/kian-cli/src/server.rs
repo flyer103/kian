@@ -29,7 +29,7 @@ use kian_orchestrator::{Engine, EngineConfig, EngineError, InterruptOutcome};
 use kian_plugin::{Ctx as PluginCtx, Disposer, PluginError};
 use kian_store::EventStore;
 
-use crate::api::{ControlError, ControlPlane};
+use crate::api::{ControlError, ControlPlane, EventStreamMetrics};
 use crate::config::{DshHarnessConfig, ServeConfig};
 use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
 use crate::ops::{
@@ -100,6 +100,14 @@ pub struct Server {
     /// may consult fresh materialized views (READ-MODEL §6; a disabled
     /// gate hides every view).
     views_enabled: bool,
+    /// The fan-in event-stream metrics (READ-MODEL §4.2, P3): the
+    /// shared counters the `/metrics` `event_stream` fragment reports
+    /// and every open `GET /events` connection bumps.
+    event_stream: Arc<EventStreamMetrics>,
+    /// Whether `GET /events` (the fan-in stream) is mounted —
+    /// `api.event_stream.enabled`, default true. Disabled mounts no
+    /// route: the path 404s.
+    event_stream_enabled: bool,
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
@@ -689,6 +697,7 @@ impl Server {
             holder: config.drain.holder.clone(),
         });
         let views_enabled = config.read_model.views.enabled;
+        let event_stream_enabled = config.api.event_stream.enabled;
         let engine = Engine::new_with_read_model(store.clone(), driver, engine_config, read_model);
 
         // The bundle's inbox port learns the engine (the cycle
@@ -719,6 +728,8 @@ impl Server {
             snapshot_maintenance,
             views_maintenance,
             views_enabled,
+            event_stream: Arc::new(EventStreamMetrics::new()),
+            event_stream_enabled,
             _plugin_disposer: plugin_disposer,
         };
 
@@ -778,9 +789,14 @@ impl Server {
     pub fn router(self: &Arc<Self>) -> axum::Router {
         let plane: Arc<dyn ControlPlane> = self.clone();
         let ops: Arc<dyn OpsPlane> = self.clone();
-        let router = crate::api::router(plane, self.sse_poll_ms)
-            .merge(metrics_router(self.clone()))
-            .merge(crate::ops::router(ops));
+        let router = crate::api::router_with_event_stream(
+            plane,
+            self.sse_poll_ms,
+            Arc::clone(&self.event_stream),
+            self.event_stream_enabled,
+        )
+        .merge(metrics_router(self.clone()))
+        .merge(crate::ops::router(ops));
         // the fourth surface — the inbound webhook receiver,
         // mounted **only** when the route is configured (a `type:
         // github` channel exists; assembly already refused to start
@@ -1144,6 +1160,25 @@ impl ControlPlane for Server {
                 events: tail.events,
                 terminal: tail.terminal,
             })
+        })
+    }
+
+    /// READ-MODEL §4.2 (P3): the fan-in's tail-only start point — one
+    /// indexed head query (the pre-connect history is never replayed
+    /// nor scanned). An event-less session is `unknown_session`; an
+    /// archived one answers the typed `-32007` refusal.
+    fn session_version(&self, session: SessionId) -> BoxFuture<'_, Result<u64, ControlError>> {
+        Box::pin(async move {
+            self.refuse_archived(session).await?;
+            let version = self
+                .store
+                .version(session)
+                .await
+                .map_err(|e| ControlError::Internal(format!("version: {e}")))?;
+            if version == 0 {
+                return Err(ControlError::UnknownSession { session });
+            }
+            Ok(version)
         })
     }
 }
@@ -1638,6 +1673,12 @@ async fn metrics_handler(
         Some(assembly) => assembly.metrics_report(),
         None => serde_json::Value::Null,
     };
+    // the fan-in event-stream gauges (READ-MODEL §4.2 / API-CONTRACT
+    // §6): open `GET /events` connections, the sessions they still
+    // watch, and the frames they have emitted (process-local, like
+    // `engine`).
+    let event_stream =
+        serde_json::to_value(server.event_stream.snapshot()).unwrap_or(serde_json::Value::Null);
     (
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({
@@ -1647,6 +1688,7 @@ async fn metrics_handler(
             "usage": usage,
             "superagent": superagent,
             "memory": memory,
+            "event_stream": event_stream,
         })),
     )
         .into_response()

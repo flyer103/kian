@@ -610,3 +610,107 @@ async fn rpc_error_codes_are_matchable_never_string_parsed() {
     assert!(errs[2].is_session_terminal());
     assert!(errs[3].is_internal());
 }
+
+// ---------------------------------------------------------------------------
+// Fan-in helper (READ-MODEL §4.2 / API-CONTRACT §5.4, P3): the compound
+// `id: <session>:<seq>` frames and the exact `GET /events` request line.
+// ---------------------------------------------------------------------------
+
+/// READ-MODEL §4.2 (P3): `fan_in` sends the exact wire request —
+/// `GET /events?sessions=<a>,<b>[&kinds=…]`, no `Last-Event-ID` (the
+/// fan-in is tail-only) — and the compound `id: <session>:<seq>` frames
+/// parse as `KianFanIn`.
+#[tokio::test]
+async fn fan_in_helper_sends_the_allowlist_and_parses_compound_ids() {
+    let other = "99999999-8888-7777-6666-555555555555";
+    let (listener, base) = bind().await;
+    let stream = format!(
+        "event: kian\nid: {SID}:3\ndata: {{\"seq\":3,\"kind\":\"turn/end\",\"session\":\"{SID}\"}}\n\n\
+         event: kian\nid: {other}:9\ndata: {{\"seq\":9,\"kind\":\"turn/end\",\"session\":\"{other}\"}}\n\n\
+         event: error\ndata: unknown session 00000000-0000-0000-0000-000000000000\n\n"
+    );
+    let expected_line =
+        format!("GET /events?sessions={SID},{other}&kinds=turn/end,input/admitted HTTP/1.1");
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (line, _ctype, body, head) = read_request(&mut sock).await;
+        assert_eq!(
+            line, expected_line,
+            "the fan-in request line is the contract"
+        );
+        assert_eq!(body, Vec::<u8>::new(), "fan-in GET carries no body");
+        assert!(
+            !head.to_ascii_lowercase().contains("last-event-id"),
+            "the tail-only fan-in must never send Last-Event-ID"
+        );
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(stream.as_bytes()).await.unwrap();
+        sock.shutdown().await.ok();
+    });
+
+    let client = KianClient::new(&base);
+    let mut frames = client
+        .fan_in(&[SID, other], Some(&["turn/end", "input/admitted"]))
+        .await
+        .expect("fan-in open");
+    let first = tokio::time::timeout(Duration::from_secs(5), frames.next())
+        .await
+        .expect("sse frame timeout")
+        .expect("stream ended early")
+        .expect("frame");
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut out = Vec::new();
+        while let Some(item) = frames.next().await {
+            out.push(item.expect("frame"));
+            if matches!(out.last(), Some(SseFrame::Error(_))) {
+                break;
+            }
+        }
+        out
+    })
+    .await
+    .expect("drain timeout");
+    server.await.unwrap();
+
+    match first {
+        SseFrame::KianFanIn { session, seq, data } => {
+            assert_eq!(session, SID);
+            assert_eq!(seq, 3);
+            assert_eq!(data["kind"], "turn/end");
+        }
+        other => panic!("expected KianFanIn, got {other:?}"),
+    }
+    assert_eq!(rest.len(), 2, "{rest:?}");
+    assert!(matches!(
+        &rest[0],
+        SseFrame::KianFanIn { session, seq, .. } if *session == other && *seq == 9
+    ));
+    assert!(matches!(
+        &rest[1],
+        SseFrame::Error(msg) if msg.contains("unknown session")
+    ));
+
+    // An over-cap / malformed listing surfaces as the server's HTTP 400
+    // through the typed transport error.
+    let (listener, base) = bind().await;
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let (line, _ctype, _body, _head) = read_request(&mut sock).await;
+        assert!(line.starts_with("GET /events?sessions=*"), "{line}");
+        let head = "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nno wildcard";
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.shutdown().await.ok();
+    });
+    let err = KianClient::new(&base)
+        .fan_in(&["*"], None)
+        .await
+        .err()
+        .expect("the wildcard must be refused by the server");
+    assert!(
+        matches!(err, ClientError::Http(ref e) if e.contains("400")),
+        "{err:?}"
+    );
+    server.await.unwrap();
+}

@@ -28,6 +28,16 @@ pub enum SseFrame {
     /// only this variant; one never emitting ids yields only
     /// [`SseFrame::Kian`].
     KianWithId { id: u64, data: Value },
+    /// `event: kian` with `id: <session>:<seq>` (READ-MODEL §4.2, the
+    /// P3 fan-in stream): one event of one watched session, plus the
+    /// session uuid and seq the compound id carries. The fan-in is
+    /// tail-only — there is no resume; the split id exists for
+    /// per-session ordering checks, not reconnection.
+    KianFanIn {
+        session: String,
+        seq: u64,
+        data: Value,
+    },
     /// `event: done` — the terminal event was observed; the stream is
     /// complete.
     Done,
@@ -63,6 +73,42 @@ impl KianClient {
     ) -> Result<impl Stream<Item = Result<SseFrame, ClientError>> + Send + 'static, ClientError>
     {
         self.events_impl(session, Some(last_event_id)).await
+    }
+
+    /// Opens the fan-in event stream (READ-MODEL §4.2 / API-CONTRACT
+    /// §5.4): `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`.
+    /// `sessions` is the explicit allowlist (the caller caps it at 64);
+    /// `kinds` is an optional kind allowlist (`None` = every kind).
+    /// Tail-only: the stream starts at each session's current head —
+    /// no `Last-Event-ID` is sent and none is honored. A malformed or
+    /// over-cap request surfaces as [`ClientError::Http`] (the
+    /// server's HTTP 400).
+    pub async fn fan_in(
+        &self,
+        sessions: &[&str],
+        kinds: Option<&[&str]>,
+    ) -> Result<impl Stream<Item = Result<SseFrame, ClientError>> + Send + 'static, ClientError>
+    {
+        let mut url = format!("{}/events?sessions={}", self.base, sessions.join(","));
+        if let Some(kinds) = kinds
+            && !kinds.is_empty()
+        {
+            url.push_str("&kinds=");
+            url.push_str(&kinds.join(","));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(format!("{url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Http(format!("{url}: status {status}: {text}")));
+        }
+        Ok(frames(resp))
     }
 
     async fn events_impl(
@@ -210,14 +256,35 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
                 .map_err(|e| ClientError::Malformed(format!("kian frame data is not JSON: {e}")))?;
             match id {
                 None => Ok(Some(SseFrame::Kian(data))),
-                Some(raw) => {
-                    let id = raw.parse::<u64>().map_err(|_| {
-                        ClientError::Malformed(format!(
+                Some(raw) => match raw.parse::<u64>() {
+                    // READ-MODEL §4.1: the per-session seq id.
+                    Ok(seq) => Ok(Some(SseFrame::KianWithId { id: seq, data })),
+                    // READ-MODEL §4.2: the fan-in compound id
+                    // `<session-uuid>:<seq>`.
+                    Err(_) => match raw.rsplit_once(':') {
+                        Some((session, seq)) => {
+                            let seq = seq.parse::<u64>().map_err(|_| {
+                                ClientError::Malformed(format!(
+                                    "kian frame id `{raw}` is neither a numeric seq nor \
+                                     a <session>:<seq> pair"
+                                ))
+                            })?;
+                            if session.is_empty() {
+                                return Err(ClientError::Malformed(format!(
+                                    "kian frame id `{raw}` names no session"
+                                )));
+                            }
+                            Ok(Some(SseFrame::KianFanIn {
+                                session: session.to_owned(),
+                                seq,
+                                data,
+                            }))
+                        }
+                        None => Err(ClientError::Malformed(format!(
                             "kian frame id `{raw}` is not a numeric seq"
-                        ))
-                    })?;
-                    Ok(Some(SseFrame::KianWithId { id, data }))
-                }
+                        ))),
+                    },
+                },
             }
         }
         "done" => Ok(Some(SseFrame::Done)),
@@ -304,5 +371,41 @@ mod tests {
             parse_frame(b"id: 9\nevent: done\ndata: ended\n\n").ok(),
             Some(Some(SseFrame::Done))
         );
+    }
+
+    /// READ-MODEL §4.2 (P3): a `kian` frame with the compound fan-in
+    /// id `<session-uuid>:<seq>` parses as `KianFanIn` (carrying the
+    /// session, the seq and the data); the plain numeric id still
+    /// parses as `KianWithId`; an id that is neither shape stays an
+    /// honest Malformed error.
+    #[test]
+    fn parse_frame_splits_fan_in_ids() {
+        let sid = "00000000-0000-0000-0000-000000000042";
+        let raw = format!("event: kian\nid: {sid}:7\ndata: {{\"seq\":7}}\n\n");
+        assert_eq!(
+            parse_frame(raw.as_bytes()).unwrap(),
+            Some(SseFrame::KianFanIn {
+                session: sid.to_string(),
+                seq: 7,
+                data: serde_json::json!({"seq": 7})
+            })
+        );
+        // No space after the colon is legal SSE.
+        let raw = format!("event: kian\nid:{sid}:7\ndata: {{\"seq\":7}}\n\n");
+        assert!(matches!(
+            parse_frame(raw.as_bytes()).unwrap(),
+            Some(SseFrame::KianFanIn { seq: 7, .. })
+        ));
+        // Neither shape: no colon at all.
+        assert!(parse_frame(b"event: kian\nid: abc\ndata: {\"seq\":1}\n\n").is_err());
+        // Compound shape with a non-numeric seq.
+        assert!(
+            parse_frame(
+                b"event: kian\nid: 00000000-0000-0000-0000-000000000001:x\ndata: {\"seq\":1}\n\n"
+            )
+            .is_err()
+        );
+        // Compound shape naming no session.
+        assert!(parse_frame(b"event: kian\nid: :7\ndata: {\"seq\":7}\n\n").is_err());
     }
 }
