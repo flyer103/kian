@@ -1189,3 +1189,134 @@ async fn pg_views_publish_reads_and_freshness() {
             .is_none()
     );
 }
+
+/// v5 (READ-MODEL §7, P2b): the archive marker table exists on pg, the
+/// eligibility scan lists terminal sessions, the two-phase commit
+/// deletes the online rows and writes the marker atomically, the retry
+/// is the idempotent no-op, the OnlineMoved fence refuses a stream
+/// that appended after verification, and full input rows round-trip —
+/// the pg twin of the in-module sqlite suite.
+#[tokio::test]
+async fn pg_archive_marker_commit_and_inputs() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("applied versions");
+    assert!(
+        versions.contains(&5),
+        "open_postgres applies v5, got {versions:?}"
+    );
+
+    // A terminal session with a consumed input row.
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 4, Epoch(1)).await;
+    pg.store
+        .append_end(
+            sid,
+            ev(
+                sid,
+                5,
+                Epoch(1),
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+            ),
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: 5,
+            },
+        )
+        .await
+        .expect("end write");
+    let row = InputRow {
+        id: Uuid::new_v4(),
+        session: sid,
+        payload: json!({"pg": true}),
+        admitted_at: T0,
+        eligible_at: T0,
+        idempotency_key: Some("pg-k1".into()),
+    };
+    pg.store.admit(row.clone()).await.expect("admit");
+    pg.store
+        .mark_consumed(sid, row.id, 2)
+        .await
+        .expect("consume");
+
+    // Eligibility: terminal sessions only, with counts/bytes facts.
+    let candidates = pg.store.archive_candidates().await.expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].session, sid);
+    assert_eq!(candidates[0].last_seq, 5);
+    assert_eq!(candidates[0].event_count, 5);
+    assert_eq!(candidates[0].input_count, 1);
+    assert_eq!(candidates[0].terminal_state, "completed");
+
+    // Full input rows read back with the audit columns.
+    let inputs = pg.store.archived_inputs_all(sid).await.expect("inputs");
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].consumed_by_seq, Some(2));
+
+    // The two-phase commit: marker + delete atomically, idempotent
+    // retry, and the OnlineMoved fence first.
+    let marker = kian_store::ArchivedMarker {
+        session: sid,
+        last_seq: 5,
+        event_count: 5,
+        input_count: 1,
+        package_path: "/tmp/pg-pkg".into(),
+        events_sha256: "e".repeat(64),
+        inputs_sha256: "i".repeat(64),
+        manifest_sha256: "aa".into(),
+        archived_at: 42,
+    };
+    let err = pg
+        .store
+        .archive_commit(&marker, 4)
+        .await
+        .expect_err("OnlineMoved must refuse");
+    assert!(
+        matches!(err, kian_store::ArchiveError::OnlineMoved { .. }),
+        "{err:?}"
+    );
+    assert_eq!(pg.store.rebuild(sid).await.expect("rebuild").len(), 5);
+
+    assert_eq!(
+        pg.store.archive_commit(&marker, 5).await.expect("commit"),
+        kian_store::ArchiveCommitOutcome::Committed
+    );
+    assert!(pg.store.rebuild(sid).await.expect("rebuild").is_empty());
+    let m = pg
+        .store
+        .archived_session(sid)
+        .await
+        .expect("marker read")
+        .expect("marker exists");
+    assert_eq!(m.manifest_sha256, "aa");
+    assert_eq!(
+        pg.store
+            .archive_commit(&marker, 5)
+            .await
+            .expect("idempotent retry"),
+        kian_store::ArchiveCommitOutcome::AlreadyArchived
+    );
+
+    // Input rows restore verbatim on pg too.
+    let fresh = PgStore::open().await;
+    let n = fresh
+        .store
+        .archive_inputs_insert(&inputs)
+        .await
+        .expect("insert");
+    assert_eq!(n, 1);
+    let back = fresh
+        .store
+        .archived_inputs_all(sid)
+        .await
+        .expect("read back");
+    assert_eq!(back, inputs);
+    fresh.finish().await;
+    pg.finish().await;
+}

@@ -13,6 +13,10 @@
 //!
 //! Modules:
 //! - [`api`] — axum JSON-RPC + SSE control plane (DESIGN §5)
+//! - [`archive`] — export-only retention (READ-MODEL §7, P2b): the
+//!   archive package (`events.jsonl` + `inputs.jsonl` +
+//!   `manifest.json`), the two-phase write → verify → commit flow and
+//!   the `kian archive run|verify` / `kian session import` commands
 //! - [`cache_metrics`] — cache-byte stability report, exposed
 //!   at `GET /metrics` and `kian cache-stats`
 //! - [`usage_metrics`] — provider token-usage report (pure
@@ -49,6 +53,7 @@
 //!   to the subscription pipeline), trait-isolated like the control
 //!   and ops planes (ADR-011)
 pub mod api;
+pub mod archive;
 pub mod async_bridge;
 pub mod cache_metrics;
 pub mod client;

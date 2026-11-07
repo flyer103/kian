@@ -103,6 +103,12 @@ pub struct ServeConfig {
     /// hides every snapshot — the honest full-derivation fallback.
     #[serde(default)]
     pub read_model: ReadModelSection,
+    /// The `retention:` section (READ-MODEL §7, P2b). Absent = retention
+    /// **off**: nothing is ever archived or deleted, byte-identical to
+    /// pre-P2b. Present parses fail-closed; enabling requires an
+    /// archive directory and at least one online-window threshold.
+    #[serde(default)]
+    pub retention: RetentionSection,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -601,6 +607,39 @@ fn default_snapshots_keep_n() -> u64 {
 }
 fn default_snapshots_interval_ms() -> u64 {
     30_000
+}
+
+// ---------------------------------------------------------------------------
+// the `retention` section (READ-MODEL §7, P2b)
+// ---------------------------------------------------------------------------
+
+/// The `retention:` section. Default: **disabled** — retention is
+/// strictly opt-in (the owner gate: export-only archive, terminal
+/// sessions only, no transparent cold tier). With the section absent
+/// or `enabled: false`, behavior is byte-identical to pre-P2b: nothing
+/// is ever archived or deleted. Enabling parses fail-closed: an
+/// archive directory and at least one online-window threshold must be
+/// named explicitly — an enabled-but-vague retention never starts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSection {
+    /// Whether `kian archive run` may archive anything at all.
+    /// Default `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The directory archive packages are written under (one
+    /// subdirectory per session). Required when enabled.
+    #[serde(default)]
+    pub archive_dir: String,
+    /// Online-window threshold: terminal sessions younger than this
+    /// (ms since their `session/ended`) stay online. At least one of
+    /// `min_age_ms` / `min_bytes` must be set when enabled.
+    #[serde(default)]
+    pub min_age_ms: Option<u64>,
+    /// Online-window threshold: terminal sessions smaller than this
+    /// (bytes of online event + input storage) stay online.
+    #[serde(default)]
+    pub min_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2051,6 +2090,27 @@ impl ServeConfig {
                 return Err(invalid(
                     "read_model.views.interval_ms must be >= 100 (a tighter cadence only burns the maintenance lease)",
                 ));
+            }
+        }
+
+        // retention (READ-MODEL §7, P2b): opt-in and fail-closed. An
+        // enabled retention without an archive directory, or without
+        // any online-window threshold at all, refuses to start — an
+        // ambiguous "archive everything now" is never a default.
+        {
+            let r = &self.retention;
+            if r.enabled {
+                if r.archive_dir.trim().is_empty() {
+                    return Err(invalid(
+                        "retention.archive_dir is required when retention is enabled",
+                    ));
+                }
+                if r.min_age_ms.is_none() && r.min_bytes.is_none() {
+                    return Err(invalid(
+                        "retention requires at least one online-window threshold \
+                         (min_age_ms and/or min_bytes) when enabled",
+                    ));
+                }
             }
         }
 
@@ -4575,6 +4635,59 @@ recovery:
 ",
             valid_yaml()
         );
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse the typo'd key"
+        );
+    }
+
+    // -- retention (READ-MODEL §7, P2b) ------------------------------
+
+    /// Default: retention OFF — nothing is archived, nothing is
+    /// deleted, byte-identical to pre-P2b (the owner gate).
+    #[test]
+    fn retention_defaults_to_off() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid config");
+        assert!(!cfg.retention.enabled);
+        assert!(cfg.retention.archive_dir.is_empty());
+        assert!(cfg.retention.min_age_ms.is_none());
+        assert!(cfg.retention.min_bytes.is_none());
+        cfg.validate().expect("defaults validate");
+    }
+
+    /// An enabled retention requires an archive dir and at least one
+    /// online-window threshold — both refusals are fail-closed, and an
+    /// unknown key refuses too.
+    #[test]
+    fn retention_enabled_parses_fail_closed() {
+        // No archive dir: refuses (parse validates fail-closed).
+        let bad = valid_yaml() + "retention:\n  enabled: true\n  min_age_ms: 1000\n";
+        let err = ServeConfig::parse(&bad).expect_err("enabled without archive_dir must refuse");
+        assert!(err.to_string().contains("archive_dir"), "{err}");
+
+        // No threshold at all: refuses.
+        let bad = valid_yaml() + "retention:\n  enabled: true\n  archive_dir: /tmp/a\n";
+        let err = ServeConfig::parse(&bad).expect_err("no threshold must refuse");
+        assert!(err.to_string().contains("threshold"), "{err}");
+
+        // Fully specified: validates.
+        let good = valid_yaml()
+            + "retention:\n  enabled: true\n  archive_dir: /tmp/kian-archive\n  min_age_ms: 86400000\n  min_bytes: 10485760\n";
+        let cfg = ServeConfig::parse(&good).expect("parse");
+        assert!(cfg.retention.enabled);
+        assert_eq!(cfg.retention.min_age_ms, Some(86_400_000));
+        assert_eq!(cfg.retention.min_bytes, Some(10_485_760));
+        cfg.validate().expect("fully specified validates");
+
+        // A disabled retention with vague values still validates (the
+        // gate is `enabled`, and off means off).
+        let off = valid_yaml() + "retention:\n  archive_dir: \"\"\n";
+        let cfg = ServeConfig::parse(&off).expect("parse");
+        assert!(!cfg.retention.enabled);
+        cfg.validate().expect("off validates regardless");
+
+        // Unknown key: refuses (deny_unknown_fields).
+        let typo = valid_yaml() + "retention:\n  enbled: true\n";
         assert!(
             ServeConfig::parse(&typo).is_err(),
             "deny_unknown_fields must refuse the typo'd key"

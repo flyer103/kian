@@ -6,10 +6,12 @@
 //! permission to accept stale writes (ADR-005).
 //!
 //! Consumption is event-driven: an input stops being eligible only when
-//! [`EventStore::mark_consumed`] ties it to an event that is *already
-//! committed* in the session's stream. There is no operation that takes
+//! [`EventStore::mark_consumed`] ties it to an event that is *already*
+//! committed in the session's stream. There is no operation that takes
 //! eligibility away while destroying the row — the inbox row itself is
-//! durable and audit-visible forever.
+//! durable and audit-visible in the online store, and remains
+//! audit-visible inside the verified archive package after an opt-in
+//! retention archive (READ-MODEL §7, P2b; [`crate::archive`]).
 //!
 //! the inbox surface dispatches over the same
 //! [`EventStore`](crate::event_store::EventStore) enum as the event
@@ -532,7 +534,9 @@ mod tests {
             .await
             .expect("consume via seq 2");
         assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
-        // The durable row itself still exists — audit-visible, not deleted.
+        // The durable row itself still exists — audit-visible, not
+        // deleted (an archived session's rows live on in its verified
+        // package, READ-MODEL §7).
         assert_eq!(row_count(&store, "SELECT COUNT(*) FROM inputs").await, 1);
         let consumed_by: Option<i64> =
             sqlx::query_scalar("SELECT consumed_by_seq FROM inputs WHERE id = ?")

@@ -1053,6 +1053,7 @@ impl ControlPlane for Server {
 
     fn projection(&self, session: SessionId) -> BoxFuture<'_, Result<SessionState, ControlError>> {
         Box::pin(async move {
+            self.refuse_archived(session).await?;
             self.engine.projection(session).await.map_err(|e| match e {
                 EngineError::Projection(kian_core::state::ProjectionError::EmptyStream) => {
                     ControlError::UnknownSession { session }
@@ -1067,6 +1068,7 @@ impl ControlPlane for Server {
         session: SessionId,
     ) -> BoxFuture<'_, Result<Vec<Event>, ControlError>> {
         Box::pin(async move {
+            self.refuse_archived(session).await?;
             let events = self
                 .store
                 .rebuild(session)
@@ -1085,6 +1087,7 @@ impl ControlPlane for Server {
         since: Option<u64>,
     ) -> BoxFuture<'_, Result<crate::api::ProjectionRead, ControlError>> {
         Box::pin(async move {
+            self.refuse_archived(session).await?;
             let read = self
                 .engine
                 .projection_versioned(session, since)
@@ -1118,6 +1121,7 @@ impl ControlPlane for Server {
         after: u64,
     ) -> BoxFuture<'_, Result<crate::api::EventTailRead, ControlError>> {
         Box::pin(async move {
+            self.refuse_archived(session).await?;
             let tail = kian_orchestrator::read::events_after(&self.store, session, after)
                 .await
                 .map_err(|e| match e {
@@ -1141,6 +1145,24 @@ impl ControlPlane for Server {
                 terminal: tail.terminal,
             })
         })
+    }
+}
+
+impl Server {
+    /// READ-MODEL §7 (P2b): the archived guard shared by every session
+    /// read on the plane — an archived session answers the typed
+    /// `archived` error (`-32007`), never an empty-scan
+    /// `unknown_session`. One indexed PK lookup on the marker table
+    /// (absent table = pre-v5 store = never archived).
+    async fn refuse_archived(&self, session: SessionId) -> Result<(), ControlError> {
+        match self.store.archived_session(session).await {
+            Ok(Some(m)) => Err(ControlError::Archived {
+                session,
+                archived_at: m.archived_at,
+            }),
+            Ok(None) => Ok(()),
+            Err(e) => Err(ControlError::Internal(format!("archive marker read: {e}"))),
+        }
     }
 }
 

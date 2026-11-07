@@ -23,11 +23,16 @@
 //! - [`views`] — materialized-view rows + per-view freshness/corruption
 //!   state (READ-MODEL §6, migration v4): disposable observability
 //!   accelerators, never truth
+//! - [`archive`] — export-only retention (READ-MODEL §7, migration v5):
+//!   the archived marker, the terminal-only eligibility scan and the
+//!   single-transaction marker-CAS + online-row delete behind a
+//!   verified archive package
 //! - [`wake`] — the postgres LISTEN/NOTIFY wake transport (advisory;
 //!   /ADR-009)
 //! - [`migrations`] — adjacent migration chains, one per backend (DESIGN
 //!   §3.3)
 
+pub mod archive;
 pub mod event_store;
 pub mod inbox;
 pub mod migrations;
@@ -38,6 +43,9 @@ pub mod wake;
 mod postgres;
 mod sqlite;
 
+pub use archive::{
+    ArchiveCandidate, ArchiveCommitOutcome, ArchiveError, ArchivedInput, ArchivedMarker,
+};
 pub use event_store::{AppendGuard, EventStore, Head, StoreError};
 pub use inbox::{AdmitOutcome, InboxError, SessionInbox};
 pub use snapshots::{SnapshotCandidate, SnapshotRow};

@@ -9,7 +9,9 @@
 > Status: **P0 landed** (version + unchanged/delta reads, resumable per-session streams, the
 > drain context cache). **P1 landed** (verified snapshots of state + model context with
 > provenance, tail replay, the maintenance builder). **P2a landed** (materialized views:
-> session directory, usage, ticket stage, cache, the kind index). P2b–P3 remain proposed. The
+> session directory, usage, ticket stage, cache, the kind index). **P2b landed** (opt-in
+> export-only retention: the archive package, the two-phase verified commit, `session import`,
+> the `-32007 archived` read error). P3 remains proposed. The
 > phase table in §11 records the agreed target; each phase flips to `landed` in the change that
 > implements it and updates this header.
 
@@ -238,6 +240,39 @@ Rules:
 - **Audit invariance.** Exporting from `(online store + archive packages)` equals the
   pre-archive export byte-for-byte.
 
+Landed shape (P2b):
+
+- **Config.** `retention:` in `kian.yaml` — `enabled` (default **false**, strictly opt-in),
+  `archive_dir` (required when enabled), `min_age_ms` and/or `min_bytes` (at least one required
+  when enabled; both configured ⇒ both must be met — the conservative window). Fail-closed
+  parse: an enabled-but-vague retention refuses to start.
+- **Marker.** Migration v5 `archived_sessions` (one row per archived session: range, counts,
+  package path, per-file + manifest sha256, archived_at). Infrastructure, never truth; a
+  read-only reader of a pre-v5 store reads it as "not archived".
+- **Package.** `<archive_dir>/<session>/events.jsonl + inputs.jsonl + manifest.json`
+  (`format_version: 1`). `events.jsonl` is byte-identical to `session export`'s default output
+  by construction (shared serializer); `inputs.jsonl` carries the full inbox rows including
+  `consumed_by_seq`/`admitted_seq`; the manifest carries the §7 identity fields plus the
+  aggregate sha256 over the digest pair. Written via a temp directory + one atomic rename.
+- **Two-phase commit.** `kian archive run` scans terminal candidates (`session/ended` is the
+  last committed event), then per session: write (idempotent — an existing verified package is
+  kept) → verify (hashes recomputed, every line re-parsed, counts/seq bounds cross-checked,
+  byte-parity against a fresh stream derivation) → `archive_commit` (marker CAS + online-row
+  delete in ONE transaction, fenced on the online event count the package was verified
+  against — a resumed session aborts `OnlineMoved` and nothing is deleted). The events/inputs
+  delete exists in exactly one guarded site (`kian-store`'s archive module; the crate's
+  append-only review assertion carves out that file alone).
+- **Reads.** `projection` and the SSE stream answer `-32007 archived` (API-CONTRACT §2.2;
+  the planned `-32005` had been taken by the round-8 memory registry) with package guidance.
+  `session inspect` reports archived + the package path; `session export` serves the package
+  byte-identically (hashes re-verified on the way out); `session replay` refuses online replay
+  with import guidance.
+- **Import.** `kian session import <package>` verifies the manifest, refuses a corrupt package
+  or an existing session id, and restores the events (under their own epoch/seq) and the full
+  input rows into the target store — the restored stream projects and re-exports identically.
+- **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass
+  (the round-9 plan's non-goal list keeps cron cadence out of scope).
+
 ## 8. Bounded staleness and degradation (P2/P3)
 
 - **Read classes.** Control reads read the primary. Observability reads may use a read replica
@@ -278,7 +313,7 @@ Rules:
 | P0 | version + unchanged/delta reads, resumable SSE, drain context cache, bench | landed | L1 unit; L2 e2e (resume, unchanged); L3 chaos unchanged; bench: unchanged read = 1 head query, SSE poll = O(Δ) |
 | P1 | snapshots (state + context with provenance), verified publish, tail replay | landed | L1 equivalence incl. compact; L2 resume/crash; bench: 10k-event resume = O(tail); request bytes unchanged |
 | P2a | session directory, usage/stage views, kind index | landed | L1 rebuild equivalence; L2 operator surfaces on 1k sessions; corrupt/stale fallback |
-| P2b | opt-in export-only archive, import, retention | planned | L2 archive→verify→delete→inspect; export byte parity; corrupt package refused; crash windows |
+| P2b | opt-in export-only archive, import, retention | landed | L2 archive→verify→delete→inspect; export byte parity; corrupt package refused; crash windows |
 | P3 | explicit-allowlist fan-in stream, caps, filters, metrics | planned | L2 two-session fan-in; filters/caps/unknown-id; reconnect per-session unaffected; no wildcard |
 
 ## 12. Non-goals

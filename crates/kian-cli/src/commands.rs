@@ -241,7 +241,10 @@ fn counters(events: &[Event], pending: usize, pending_control: usize) -> Value {
     json!(c)
 }
 
-/// `kian session inspect <id>`: projection + counters, read-only.
+/// `kian session inspect <id>`: projection + counters, read-only. An
+/// archived session reports the archive marker plus the package path
+/// (READ-MODEL §7) — an explicit `archived` answer, never an empty
+/// projection.
 pub async fn run_inspect(
     config_path: &Path,
     db: Option<&Path>,
@@ -250,6 +253,32 @@ pub async fn run_inspect(
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
+    // Archived first: online rows are gone, so the ordinary path would
+    // misreport the session as unknown.
+    if let Some(m) = store
+        .archived_session(session)
+        .await
+        .map_err(|e| format!("archive marker read: {e}"))?
+    {
+        store.close().await;
+        let report = json!({
+            "session": session.0.to_string(),
+            "archived": true,
+            "state": "archived",
+            "package_path": m.package_path,
+            "last_seq": m.last_seq,
+            "event_count": m.event_count,
+            "input_count": m.input_count,
+            "archived_at": m.archived_at,
+        });
+        if json {
+            return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+        }
+        return Ok(format!(
+            "session             {}\nstate               archived\nonline rows         removed (archived {})\npackage             {}\nevents              {} (seq 1..={})\ninputs              {}\n",
+            session.0, m.archived_at, m.package_path, m.event_count, m.last_seq, m.input_count,
+        ));
+    }
     let events = rebuild_session(&store, session).await?;
     let state = project(&events).map_err(|e| format!("projection: {e}"))?;
     let pending_rows = store
@@ -452,6 +481,21 @@ pub async fn run_replay(
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
+    // Archived: online replay is impossible (the rows are gone). Point
+    // at import instead — the explicit guidance, never a silent
+    // unknown-session (READ-MODEL §7).
+    if let Some(m) = store
+        .archived_session(session)
+        .await
+        .map_err(|e| format!("archive marker read: {e}"))?
+    {
+        store.close().await;
+        return Err(format!(
+            "session {} is archived (online rows removed; package {}): \
+             restore it first — kian session import {} --db <fresh.sqlite>",
+            session.0, m.package_path, m.package_path
+        ));
+    }
     let events = rebuild_session(&store, session).await?;
     store.close().await;
 
@@ -560,6 +604,17 @@ pub async fn run_export(
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
+    // Archived: the export MUST be byte-identical, so it is served
+    // from the verified package (hashes re-checked on the way out)
+    // rather than an online scan of empty tables (READ-MODEL §7).
+    if let Some(m) = store
+        .archived_session(session)
+        .await
+        .map_err(|e| format!("archive marker read: {e}"))?
+    {
+        store.close().await;
+        return export_from_package(&m, session, since, until, out, with_event_ids).await;
+    }
     let events = rebuild_session(&store, session).await?;
     store.close().await;
 
@@ -611,6 +666,78 @@ pub async fn run_export(
             // JSONL to stdout: the caller (main) prints it verbatim.
             Ok(jsonl)
         }
+    }
+}
+
+/// Serves `session export` for an archived session from its package:
+/// the file's hashes are re-verified, then the requested `[since,
+/// until]` lines are emitted with their stored bytes — byte-identical
+/// to the pre-archive export by construction (the same lines, the same
+/// serializer).
+async fn export_from_package(
+    m: &kian_store::ArchivedMarker,
+    session: SessionId,
+    since: Option<u64>,
+    until: Option<u64>,
+    out: Option<&Path>,
+    with_event_ids: bool,
+) -> CmdResult<String> {
+    let dir = std::path::Path::new(&m.package_path);
+    let (_, manifest) = crate::archive::verify_package(dir, Some(session)).await?;
+    let since = since.unwrap_or(1);
+    let until = until.unwrap_or(u64::MAX);
+    let text = std::fs::read_to_string(dir.join("events.jsonl"))
+        .map_err(|e| format!("read {}: {e}", dir.join("events.jsonl").display()))?;
+    let selected: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            serde_json::from_str::<Event>(line)
+                .map(|e| e.seq >= since && e.seq <= until)
+                .unwrap_or(false)
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err(format!(
+            "no events in [{since}, {until_}] for session {sid} (archived range 1..={last})",
+            until_ = until.min(manifest.last_seq),
+            sid = session.0,
+            last = manifest.last_seq
+        ));
+    }
+    let mut jsonl = String::new();
+    for &line in &selected {
+        if with_event_ids {
+            // Same augmentation as the online path: the derived
+            // event_id is added next to the envelope fields, never
+            // inside them.
+            let mut v: serde_json::Value = serde_json::from_str(line)
+                .map_err(|e| format!("package line is not an envelope: {e}"))?;
+            let seq = v
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("package line carries no seq")?;
+            v["event_id"] = serde_json::Value::String(kian_core::events::event_id(&session, seq));
+            jsonl
+                .push_str(&serde_json::to_string(&v).map_err(|e| format!("serialize event: {e}"))?);
+        } else {
+            jsonl.push_str(line);
+        }
+        jsonl.push('\n');
+    }
+    match out {
+        Some(path) => {
+            std::fs::write(path, &jsonl).map_err(|e| format!("write {}: {e}", path.display()))?;
+            Ok(format!(
+                "exported {} events (seq {}..={}) to {} (from archive package {})",
+                selected.len(),
+                since,
+                until.min(manifest.last_seq),
+                path.display(),
+                m.package_path
+            ))
+        }
+        None => Ok(jsonl),
     }
 }
 

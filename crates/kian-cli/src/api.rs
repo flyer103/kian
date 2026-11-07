@@ -118,6 +118,16 @@ pub enum ControlError {
         since: u64,
         version: u64,
     },
+    /// READ-MODEL §7 (P2b): the session's online range was archived —
+    /// an explicit refusal naming the package, never a silent
+    /// truncation (`-32007`).
+    #[error(
+        "session {session:?} is archived (online range removed at {archived_at}); use the archive package / session import"
+    )]
+    Archived {
+        session: SessionId,
+        archived_at: u64,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -126,6 +136,11 @@ pub enum ControlError {
 const CODE_UNKNOWN_SESSION: i64 = -32001;
 /// JSON-RPC error code for server-side failures.
 const CODE_INTERNAL: i64 = -32000;
+/// JSON-RPC error code for an archived session (READ-MODEL §7). The
+/// planned P2b code in API-CONTRACT §5.3 was `-32005`, but the
+/// append-only registry had already given `-32005`/`-32006` to the
+/// round-8 memory surface — `archived` is the next free code.
+pub const CODE_ARCHIVED: i64 = -32007;
 /// Standard JSON-RPC codes.
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
@@ -201,6 +216,19 @@ fn control_err(e: ControlError) -> (i64, String) {
             format!(
                 "since {since} is ahead of session {:?} version {version} \
                  (client ahead or another store)",
+                session.0
+            ),
+        ),
+        // READ-MODEL §7: the explicit archived refusal, wire-coded
+        // `-32007` with the package guidance in the message.
+        ControlError::Archived {
+            session,
+            archived_at,
+        } => (
+            CODE_ARCHIVED,
+            format!(
+                "session {:?} is archived (online range removed at {archived_at}); \
+                 use the archive package / `kian session import`",
                 session.0
             ),
         ),
@@ -535,5 +563,26 @@ mod tests {
         );
         assert_eq!(content, json!({"content": "x", "unrelated": true}));
         assert_eq!(key.as_deref(), Some("k"));
+    }
+
+    /// READ-MODEL §7 (P2b): the archived session read error is the
+    /// typed `-32007` refusal with package guidance in the message —
+    /// never `unknown_session`, never a silent truncation.
+    #[test]
+    fn archived_error_maps_to_the_archived_code() {
+        use super::{ControlError, control_err};
+        use kian_core::model::SessionId;
+        let session = SessionId(
+            "00000000-0000-0000-0000-000000000009"
+                .parse::<uuid::Uuid>()
+                .unwrap(),
+        );
+        let (code, msg) = control_err(ControlError::Archived {
+            session,
+            archived_at: 42,
+        });
+        assert_eq!(code, -32007);
+        assert!(msg.contains("archived"), "{msg}");
+        assert!(msg.contains("session import"), "{msg}");
     }
 }

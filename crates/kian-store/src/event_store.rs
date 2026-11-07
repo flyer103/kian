@@ -1221,7 +1221,15 @@ mod review {
 
     /// The events table is append-only by construction: no statement that
     /// could rewrite or remove a committed row may exist anywhere in this
-    /// crate. The forbidden fragments are assembled from split pieces so
+    /// crate — with ONE deliberate carve-out. `src/archive.rs` (READ-MODEL
+    /// §7, P2b) deletes a terminal session's online events/inputs rows in
+    /// one transaction with the archived-marker CAS, reachable only after
+    /// the caller verified the archive package; that module's own tests
+    /// pin the guard (never delete before a verified package, never a
+    /// non-terminal session, never on an online head that moved). Every
+    /// other file stays under the original forbidden-fragment rule.
+    ///
+    /// The forbidden fragments are assembled from split pieces so
     /// this file itself cannot contain them literally.
     #[test]
     fn no_rewrite_statement_against_events_table_in_crate_source() {
@@ -1240,11 +1248,37 @@ mod review {
             src.display()
         );
         for f in files {
+            // The single sanctioned delete site (see this test's docs).
+            if f.file_name().is_some_and(|n| n == "archive.rs") {
+                continue;
+            }
             let content = fs::read_to_string(&f).unwrap_or_default().to_lowercase();
             for pat in &forbidden {
                 assert!(
                     !content.contains(pat),
                     "append-only violation: {pat:?} found in {}",
+                    f.display()
+                );
+            }
+        }
+    }
+
+    /// The archive carve-out is exactly one file: any *second* file that
+    /// names the events table in a removing statement must grow its own
+    /// reviewed justification, not silently ride `archive.rs`'s.
+    #[test]
+    fn archive_delete_carve_out_is_confined_to_the_archive_module() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources_under(&src, &mut files);
+        let pat = ["del", "ete from ev", "ents"].concat();
+        for f in files {
+            let content = fs::read_to_string(&f).unwrap_or_default().to_lowercase();
+            if content.contains(&pat) {
+                assert_eq!(
+                    f.file_name().and_then(|n| n.to_str()),
+                    Some("archive.rs"),
+                    "an events-table delete exists outside the archive module: {}",
                     f.display()
                 );
             }

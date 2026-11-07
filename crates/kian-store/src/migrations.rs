@@ -42,7 +42,9 @@ const V0_EVENTS: Migration = Migration {
 /// being eligible only when its `consumed_by_seq` references a committed
 /// event of the same session — the row itself is never removed before
 /// that consumption event exists (and never removed after, either: the
-/// inbox is audit-visible).
+/// inbox stays audit-visible — online, or inside a verified archive
+/// package once the terminal session leaves the store through the
+/// opt-in retention path, READ-MODEL §7 / migration v5).
 ///
 /// `claims` holds the lease per session. `epoch` doubles as the durable
 /// epoch high-water mark: issuance always takes
@@ -94,6 +96,25 @@ const V4_VIEWS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS view_rows (\n    view TEXT NOT NULL,\n    session TEXT NOT NULL,\n    row_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    PRIMARY KEY (view, session)\n);\nCREATE TABLE IF NOT EXISTS view_state (\n    view TEXT PRIMARY KEY,\n    events_total INTEGER NOT NULL,\n    max_seq INTEGER NOT NULL,\n    digest TEXT NOT NULL,\n    built_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
 };
 
+/// v5 — the archive marker table (READ-MODEL §7, P2b). One row per
+/// session whose online rows left the store through the export-only
+/// retention path: the verified package's identity (path + hashes) and
+/// range. The marker is the read surfaces' signal to answer `archived`
+/// (`-32007`) instead of `unknown_session`.
+///
+/// The marker is **infrastructure, not truth**: it records that a
+/// verified package exists and where; the package itself carries the
+/// events and inputs. Insertion is CAS (first marker wins) and shares
+/// one transaction with the online-row delete in
+/// [`crate::archive::archive_commit`] — a crash leaves the online rows
+/// and no marker, or the marker and no online rows, never anything
+/// in between.
+const V5_ARCHIVED_SESSIONS: Migration = Migration {
+    version: 5,
+    name: "v5_archived_sessions",
+    up: "CREATE TABLE IF NOT EXISTS archived_sessions (\n    session TEXT PRIMARY KEY,\n    last_seq INTEGER NOT NULL,\n    event_count INTEGER NOT NULL,\n    input_count INTEGER NOT NULL,\n    package_path TEXT NOT NULL,\n    events_sha256 TEXT NOT NULL,\n    inputs_sha256 TEXT NOT NULL,\n    manifest_sha256 TEXT NOT NULL,\n    archived_at INTEGER NOT NULL\n)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -103,6 +124,7 @@ pub fn chain() -> &'static [Migration] {
         V2_INBOX_ADMIT_ORDER,
         V3_PROJECTION_SNAPSHOTS,
         V4_VIEWS,
+        V5_ARCHIVED_SESSIONS,
     ]
 }
 
@@ -195,6 +217,14 @@ const PG_V4_VIEWS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS view_rows (\n    view TEXT NOT NULL,\n    session TEXT NOT NULL,\n    row_version BIGINT NOT NULL,\n    payload TEXT NOT NULL,\n    PRIMARY KEY (view, session)\n);\nCREATE TABLE IF NOT EXISTS view_state (\n    view TEXT PRIMARY KEY,\n    events_total BIGINT NOT NULL,\n    max_seq BIGINT NOT NULL,\n    digest TEXT NOT NULL,\n    built_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
 };
 
+/// v5 (postgres chain) — the archive marker table, pg DDL (same
+/// version, name and shape as the sqlite generation, READ-MODEL §7).
+const PG_V5_ARCHIVED_SESSIONS: Migration = Migration {
+    version: 5,
+    name: "v5_archived_sessions",
+    up: "CREATE TABLE IF NOT EXISTS archived_sessions (\n    session TEXT PRIMARY KEY,\n    last_seq BIGINT NOT NULL,\n    event_count BIGINT NOT NULL,\n    input_count BIGINT NOT NULL,\n    package_path TEXT NOT NULL,\n    events_sha256 TEXT NOT NULL,\n    inputs_sha256 TEXT NOT NULL,\n    manifest_sha256 TEXT NOT NULL,\n    archived_at BIGINT NOT NULL\n)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -206,6 +236,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V2_INBOX_ADMIT_ORDER,
         PG_V3_PROJECTION_SNAPSHOTS,
         PG_V4_VIEWS,
+        PG_V5_ARCHIVED_SESSIONS,
     ]
 }
 
@@ -641,6 +672,55 @@ mod tests {
                 "    built_at BIGINT NOT NULL\n",
                 ");\n",
                 "CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
+            )
+        );
+    }
+
+    /// v5 is a committed generation the moment it ships: pinned
+    /// byte-for-byte like v0–v4 (append-only chain).
+    #[test]
+    fn v5_generation_sql_is_frozen() {
+        let v5: &Migration = &chain()[5];
+        assert_eq!(v5.version, 5);
+        assert_eq!(v5.name, "v5_archived_sessions");
+        assert_eq!(
+            v5.up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS archived_sessions (\n",
+                "    session TEXT PRIMARY KEY,\n",
+                "    last_seq INTEGER NOT NULL,\n",
+                "    event_count INTEGER NOT NULL,\n",
+                "    input_count INTEGER NOT NULL,\n",
+                "    package_path TEXT NOT NULL,\n",
+                "    events_sha256 TEXT NOT NULL,\n",
+                "    inputs_sha256 TEXT NOT NULL,\n",
+                "    manifest_sha256 TEXT NOT NULL,\n",
+                "    archived_at INTEGER NOT NULL\n",
+                ")",
+            )
+        );
+    }
+
+    /// The pg v5 generation is pinned like its sqlite twin.
+    #[test]
+    fn pg_v5_generation_sql_is_frozen() {
+        let pg = pg_chain();
+        assert_eq!(pg[5].version, 5);
+        assert_eq!(pg[5].name, "v5_archived_sessions");
+        assert_eq!(
+            pg[5].up,
+            concat!(
+                "CREATE TABLE IF NOT EXISTS archived_sessions (\n",
+                "    session TEXT PRIMARY KEY,\n",
+                "    last_seq BIGINT NOT NULL,\n",
+                "    event_count BIGINT NOT NULL,\n",
+                "    input_count BIGINT NOT NULL,\n",
+                "    package_path TEXT NOT NULL,\n",
+                "    events_sha256 TEXT NOT NULL,\n",
+                "    inputs_sha256 TEXT NOT NULL,\n",
+                "    manifest_sha256 TEXT NOT NULL,\n",
+                "    archived_at BIGINT NOT NULL\n",
+                ")",
             )
         );
     }

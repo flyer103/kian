@@ -514,3 +514,50 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   view **486 µs** vs **30.5 ms** full derivation (≈63×); usage aggregate **1.63 ms** vs
   **28.4 ms** (≈17×); one maintenance rebuild of all four views **66.5 ms**, off the serving
   path. READ-MODEL §11 P2a `planned` → `landed` + header updated; docs-map green.
+- **Read model P2b — opt-in export-only retention, archive verify/import (R9-05)** —
+  default-green. Retention is strictly opt-in (`retention:` in `kian.yaml`, default **off** —
+  absent/vague parses fail-closed: an enabled retention without `archive_dir` or without at
+  least one online-window threshold (`min_age_ms`/`min_bytes`) refuses to start;
+  `retention_defaults_to_off`, `retention_enabled_parses_fail_closed`). Migration v5
+  `archived_sessions` on both chains (v0–v4 frozen, goldens `v5_generation_sql_is_frozen` /
+  `pg_v5_generation_sql_is_frozen`): one infrastructure marker row per archived session —
+  range, counts, package path, per-file + manifest sha256. The package
+  (`<archive_dir>/<session>/`): `events.jsonl` (the exact `session export` bytes, shared
+  serializer), `inputs.jsonl` (full inbox rows incl. `consumed_by_seq`/`admitted_seq`) and
+  `manifest.json` (format_version 1, seq bounds, counts, per-file + aggregate sha256,
+  created_at, backend, terminal state), written via temp dir + one atomic rename. The
+  two-phase commit (`kian-store` `archive_commit`, the ONLY events/inputs delete site — the
+  crate's append-only review assertion now carves out exactly `archive.rs` and a second
+  assertion pins the carve-out to that one file): marker insert under CAS + online-row delete
+  in ONE transaction, fenced on the online event count the verified package covers — a session
+  that appended after verification aborts `OnlineMoved` and deletes nothing
+  (`commit_refuses_an_online_stream_that_moved`); first marker wins
+  (`commit_refuses_a_conflicting_marker`); retry with the same package is the idempotent
+  no-op (`commit_deletes_online_rows_and_writes_the_marker_atomically`). Eligibility is
+  terminal-only — the last committed event must be `session/ended`
+  (`candidates_lists_terminal_sessions_only`,
+  `candidates_ignores_a_mid_stream_end_event`). Reads answer the typed `archived` error:
+  `-32007` (API-CONTRACT §2.2; the plan's planned `-32005` had been taken by the round-8
+  memory registry, so `archived` is the next free code) on `projection` and the SSE stream
+  (`archived_error_maps_to_the_archived_code`); `session inspect` reports archived + the
+  package path; `session export` serves the package byte-identically (hashes re-verified on
+  the way out); `session replay` refuses online replay pointing at import. `kian archive
+  run|verify` and `kian session import <package>` (manifest verified, corrupt package or
+  existing session id refused, events restored under their own epoch/seq, input rows
+  restored verbatim). The "inbox audit-visible forever" wording in `migrations.rs`/`inbox.rs`
+  is amended to "online store or verified archive package" (READ-MODEL §7). Executed evidence
+  (`tests/archive_e2e.rs`): `archive_verify_delete_inspect_with_export_byte_parity` (the full
+  L2 flow — pre/post-archive default, `--with-event-ids` and range exports byte-equal; import
+  re-export parity; identical projection state; the consumed_by_seq audit column survives),
+  `corrupt_package_is_refused_and_never_deletes` (tampered events/manifest refused by verify
+  AND import; the write-without-commit crash window leaves online rows + no marker; the retry
+  completes and a second run is the idempotent no-op),
+  `eligibility_is_terminal_only_and_window_respected` (disabled retention refuses; the age
+  window holds; a live session is never archived),
+  `import_refuses_an_existing_session` (never merges, never overwrites); pg twin
+  `pg_archive_marker_commit_and_inputs` (env-gated, live PG: marker, candidates, commit,
+  fence, idempotent retry, input round-trip); store unit suite incl.
+  `input_rows_round_trip_with_audit_columns`, `absent_marker_table_reads_as_not_archived`
+  (pre-v5 read-only reader). READ-MODEL §11 P2b `planned` → `landed` + §7 landed shape +
+  header; API-CONTRACT §2.2/§3.2/§3.3/§5.3 updated. No new event kind; no transparent cold
+  tier; no automatic retention cadence.

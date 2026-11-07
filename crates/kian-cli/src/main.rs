@@ -18,7 +18,12 @@
 //!   live server projection.
 //! - `kian session export <uuid> [--since S] [--until U] [--out F]
 //!   [--with-event-ids]` — event interval → JSONL audit package
-//!   (`--with-event-ids` adds the derived event id per line).
+//!   (`--with-event-ids` adds the derived event id per line). An
+//!   archived session exports from its verified package, byte-identical
+//!   to the pre-archive export.
+//! - `kian archive run|verify` — opt-in export-only retention
+//!   (READ-MODEL §7): package → verify → commit, and package
+//!   re-verification. `kian session import <package>` restores one.
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
 //!   `kian recovery budget reset <uuid>` — operator actions.
 //!
@@ -40,6 +45,12 @@ const USAGE: &str = "usage:
                                          re-derive everything from events
   kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--db <sqlite>] [--config <path>]
                                          event interval → JSONL audit package (--with-event-ids adds the derived event id)
+  kian session import <package-dir> [--db <sqlite>] [--config <path>] [--json]
+                                         verify + restore an archive package into a store (replay/forensics)
+  kian archive run [--db <sqlite>] [--config <path>] [--json]
+                                         one opt-in retention pass (write → verify → commit per terminal session)
+  kian archive verify <uuid> [--db <sqlite>] [--config <path>] [--json]
+                                         verify a session's archive package (hashes, replay, counts)
   kian wake-now <uuid> [--url <base>] [--config <path>] [--json]
                                          operator wake via the running server
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
@@ -77,6 +88,7 @@ fn main() -> ExitCode {
         Some("cache-stats") => cache_stats(&args[2..]),
         Some("usage-stats") => usage_stats(&args[2..]),
         Some("session") => session(&args[2..]),
+        Some("archive") => archive(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
         Some("mock-channel-send") => mock_channel_send(&args[2..]),
         Some("memory") => memory(&args[2..]),
@@ -410,12 +422,55 @@ fn run_command(
     }
 }
 
-/// `kian session inspect|replay|export <uuid> [flags]`
+/// `kian session inspect|replay|export|import ...`
 fn session(args: &[String]) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("kian: `session` requires a subcommand (inspect, replay, export)\n{USAGE}");
+        eprintln!(
+            "kian: `session` requires a subcommand (inspect, replay, export, import)\n{USAGE}"
+        );
         return ExitCode::from(2);
     };
+    // `session import <package-dir>` takes a directory, not a uuid —
+    // parse it with its own flag loop.
+    if sub == "import" {
+        let mut config = std::path::PathBuf::from("kian.yaml");
+        let mut db: Option<std::path::PathBuf> = None;
+        let mut package: Option<std::path::PathBuf> = None;
+        let mut json = false;
+        let mut iter = args[1..].iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--config" => match iter.next() {
+                    Some(p) => config = p.into(),
+                    None => {
+                        eprintln!("kian: --config requires a path\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                "--db" => match iter.next() {
+                    Some(p) => db = Some(p.into()),
+                    None => {
+                        eprintln!("kian: --db requires a path\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                "--json" => json = true,
+                other if !other.starts_with("--") => package = Some(other.into()),
+                other => {
+                    eprintln!("kian: unknown option `{other}` (session import)\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let Some(package) = package else {
+            eprintln!("kian: session import requires a package directory\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        return run_command(
+            kian_cli::archive::run_import(&package, db.as_deref(), &config, json),
+            "session import",
+        );
+    }
     let usage_for = format!("kian session {sub}");
     let parsed = match parse_session_args(&args[1..], &usage_for) {
         Ok(p) => p,
@@ -481,6 +536,49 @@ fn session(args: &[String]) -> ExitCode {
         }
         other => {
             eprintln!("kian: unknown session subcommand `{other}`\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian archive run|verify [flags]` — the retention commands
+/// (READ-MODEL §7, P2b). `run` is one opt-in retention pass; `verify`
+/// re-checks a session's package.
+fn archive(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("kian: `archive` requires a subcommand (run, verify)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let usage_for = format!("kian archive {sub}");
+    let parsed = match parse_session_args(&args[1..], &usage_for) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kian: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match sub {
+        "run" => run_command(
+            kian_cli::archive::run_archive_run(&parsed.config, parsed.db.as_deref(), parsed.json),
+            "archive run",
+        ),
+        "verify" => {
+            let Some(session) = parsed.session else {
+                eprintln!("kian: {usage_for} requires a session uuid\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::archive::run_archive_verify(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    parsed.json,
+                ),
+                "archive verify",
+            )
+        }
+        other => {
+            eprintln!("kian: unknown archive subcommand `{other}`\n{USAGE}");
             ExitCode::from(2)
         }
     }

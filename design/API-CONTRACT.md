@@ -78,6 +78,7 @@ suffix.
 | -32004 | session_idle | `recovery_budget_reset` on a session whose recovery budget was never consumed | ops |
 | -32005 | memory_not_configured | `memory_dream` on a server without a `memory:` section — a closed refusal, never a silent no-op | ops |
 | -32006 | dream_range_too_large | `memory_dream` over a source range whose transcript exceeds `memory.dreamer.max_bytes_read` — refused, not truncated | ops |
+| -32007 | archived | The session's online range has been archived (READ-MODEL §7, P2b); use the archive package / `session import` | both RPC + SSE |
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
 new documented code.
@@ -140,13 +141,15 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   state (the read costs one version check, no stream scan); any older value returns the full
   `{"version":V,"state":…}`. `since > version` is `-32602` (the client is ahead or pointed at
   another store — an explicit refusal, never a silent resync); a non-u64 `since` (including
-  explicit `null`) is likewise `-32602`. A session with no events is `-32001` either way. The
+  explicit `null`) is likewise `-32602`. A session with no events is `-32001` either way. An
+  archived session (online range removed, READ-MODEL §7) is `-32007` — an explicit refusal
+  naming the archive package, never an empty projection. The
   payload is always derived from one committed prefix (READ-MODEL R2: a concurrent append may
   make an answer stale, never mixed).
 
 ### 3.3 Errors
 
-`-32600`, `-32601`, `-32602`, `-32000`, `-32001` (§2.2).
+`-32600`, `-32601`, `-32602`, `-32000`, `-32001`, `-32007` (§2.2).
 
 ## 4. Operational plane — `POST /ops/rpc`
 
@@ -237,20 +240,24 @@ that is ahead of the durable head, not a number, or inside an archived range is 
 replays its remaining events and closes with `done`; a connection resumed at the terminal head
 emits `done` immediately.
 
-### 5.3 Planned: read-model surface (READ-MODEL P2b/P3)
+### 5.3 Planned: read-model surface (READ-MODEL P3)
 
 > Planned additive surface. Each item lands with the READ-MODEL phase that implements it; until
 > then v0 behavior above is normative and nothing here is callable. Semantics are owned by
 > [READ-MODEL.md](READ-MODEL.md); this file only fixes wire shapes. The P0 items (projection
 > `version`/`since`/`unchanged`, SSE `id:` + `Last-Event-ID` resume) have landed and are normative
-> in §3.1/§3.2 and §5.1/§5.2 above.
+> in §3.1/§3.2 and §5.1/§5.2 above. The P2b item (`-32007 archived`) has landed too and is
+> normative in §2.2.
 
 - Planned fan-in (P3, OSS): `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`, tail-only (no
   resume), explicit allowlist of at most 64 sessions, `id: <uuid>:<seq>`, no wildcard, HTTP 400
   on malformed/over-cap; an unknown listed session emits one `event: error` naming it and the
   stream continues.
-- Planned error code (P2b, append-only registry): `-32005 archived` — the session's online range
-  has been archived; use the archive package / `session import`.
+- ~~Planned error code (P2b, append-only registry): `-32005 archived`~~ — **landed as
+  `-32007 archived`** (§2.2): the round-8 memory surface had already taken `-32005`/`-32006`,
+  and the registry is append-only, so `archived` is the next free code. Every read of an
+  archived session (`projection`, the SSE stream) answers `-32007` / one `event: error` frame
+  with package guidance — never `unknown_session`, never a silent truncation.
 - Planned metrics (additive): `read` object (`unchanged`, `delta_reads`, `resync`, `full_scans`)
   and `event_stream` object (`subscribers`, `sessions_watched`, `events_sent`).
 
