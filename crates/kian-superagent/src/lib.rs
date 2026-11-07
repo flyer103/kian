@@ -123,6 +123,7 @@ pub mod templates;
 pub mod timer;
 pub mod toolpack;
 pub mod watchdog;
+pub mod wechat;
 pub mod worker;
 
 pub use dsh::{
@@ -205,6 +206,11 @@ pub use watchdog::{
     ESCALATE_TOOL, INTERVENE_TOOL, LIST_THREADS_TOOL, READ_PROGRESS_TOOL, WATCHDOG_BOOTSTRAP_KEY,
     WATCHDOG_PROMPT_TEMPLATE, WATCHDOG_TOOLS, WatchdogProfile, WatchdogPrompt, WatchdogTools,
     watchdog_template,
+};
+pub use wechat::{
+    DEFAULT_API_BASE as WECHAT_DEFAULT_API_BASE, SEND_SPLIT_CHARS,
+    SUBSCRIBER_CAPACITY as WECHAT_SUBSCRIBER_CAPACITY, WECHAT_CHANNEL_TYPE, WechatChannel,
+    WechatConfig, WechatError, message_to_event, split_text,
 };
 pub use worker::{
     Delegation, DelegationPair, LineagePlan, MANDATE_KEY, MandateRevalidation, PortFor,
