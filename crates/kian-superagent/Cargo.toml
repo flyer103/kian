@@ -8,7 +8,7 @@ edition.workspace = true
 # outside the narrow waist: it depends on the core (seams + concept
 # model), on the plugin registry, and on `kian-orchestrator` for *types
 # only* (`WakeOutcome`) — every execution capability reaches the bundle
-# through the `InboxWriter` port (card C23). Assembly (kian-cli)
+# through the `InboxWriter` port. Assembly (kian-cli)
 # implements the port over the real engine. Enforced textually by
 # tests/iron_rule.rs.
 
@@ -16,7 +16,7 @@ edition.workspace = true
 kian-core.workspace = true
 kian-plugin.workspace = true
 kian-orchestrator.workspace = true
-# C25: the worker wrapper reuses the C24 evidence gate's public, pure
+# the worker wrapper reuses the evidence gate's public, pure
 # evaluation (`evaluate_evidence_gate` / `CheckSpec` / verdict payload)
 # instead of duplicating gate semantics. Types + pure functions only —
 # no execution surface flows from this edge (iron rule still holds).
@@ -28,16 +28,16 @@ serde_json.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# C44: the lark channel adapter dials the Feishu open APIs over HTTP.
+# the lark channel adapter dials the Feishu open APIs over HTTP.
 # The dependency lives in the bundle (Footprint-Ladder level 2 plugin
 # code), never in the core; the crate's iron rule is unaffected (the
 # adapter reaches no execution surface).
 reqwest.workspace = true
-# C54: the S6 dsh mapping contract (C53) moved into the bridge crate
+# the dsh mapping contract moved into the bridge crate
 # and is re-exported from `kian_superagent::dsh` — types only, the
 # bundle never drives the bridge (assembly mounts it config-gated).
 kian-dsh.workspace = true
-# C63: the policy-version template fingerprints (sha256, display-truncated)
+# the policy-version template fingerprints (sha256, display-truncated)
 # — pure rendering over prompt bytes, no execution surface.
 sha2.workspace = true
 
@@ -45,11 +45,11 @@ sha2.workspace = true
 kian-store.workspace = true
 kian-llm.workspace = true
 tracing-subscriber.workspace = true
-# C56: the `run_tickets` CLI surface (kian-cli) is exercised from
+# the `run_tickets` CLI surface (kian-cli) is exercised from
 # tests/stage_projection.rs over a fixture db. A dev-dependency edge
 # crate→assembly is legal (dev-deps may be cyclic); no production edge
 # is added — the bundle still never names kian-cli in src/.
 kian-cli.workspace = true
-# C44: the scripted-HTTP-mock lark tests serve canned Feishu responses
+# the scripted-HTTP-mock lark tests serve canned Feishu responses
 # from an in-process axum server (no credentials, no network).
 axum.workspace = true

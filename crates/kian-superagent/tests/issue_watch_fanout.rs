@@ -1,8 +1,8 @@
-//! The C64 end-to-end fixture test: issue-watch multi-Ticket fan-out
+//! The end-to-end fixture test: issue-watch multi-Ticket fan-out
 //! over a real engine — mock providers on both sides, the github
 //! adapter's poll-receive mode reading **scripted REST list pages**
 //! from an in-process axum server. No credentials, no real network
-//! (the live leg is the next card, C65).
+//! (the live leg is the next step).
 //!
 //! The four-gate flow asserted here, against committed sqlite streams:
 //!
@@ -12,14 +12,14 @@
 //!    adapter-declared `explicit` on human issue authorship makes the
 //!    mandate strength `explicit`);
 //! 2. a follow-up comment on the **live** issue thread admits to that
-//!    worker with **zero Router judge turns** (C59 ownership: the
-//!    registry routes by the C61 thread-key topic; the Router session
+//!    worker with **zero Router judge turns** (ownership: the
+//!    registry routes by the thread-key topic; the Router session
 //!    neither wakes nor drains for the event);
-//! 3. the worker completes; the Router delivers the triage draft as a
+//! 3. The worker completes; the Router delivers the triage draft as a
 //!    structured github comment **under speak-rules** (the `result-ready`
 //!    gate admits the Result; an attempted echo/ack Decision is an
-//!    honest tool error with zero adapter sends, the C58 discipline);
-//! 4. the stage projection observes the ticket's transitions
+//!    honest tool error with zero adapter sends, the discipline);
+//! 4. The stage projection observes the ticket's transitions
 //!    (working mid-flight → idle after completion);
 //! 5. a second live issue fans out **independently** — two tickets,
 //!    one source: two `thread/started` delegations, two workers, two
@@ -274,7 +274,7 @@ impl RecoveryPolicySource for NoopPolicy {
 
 // ---------------------------------------------------------------------------
 // Assembly surface: the late-bound inbox + per-hold stream port over
-// the real engine (the C25/C27 shape).
+// the real engine (the shape).
 // ---------------------------------------------------------------------------
 
 struct LateEngineInbox {
@@ -488,7 +488,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     assert_eq!(
         issue_101.topic.as_deref(),
         Some("github:flyer103/kian#101"),
-        "the poll topic is the C61 thread key"
+        "the poll topic is the thread key"
     );
 
     // -- the scripted Router judge (the mandate-bearing accept) -------------
@@ -496,12 +496,12 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     // parks after each tool-executing turn — the next admitted input
     // re-drives it):
     //   1. issue #101 arrives → an attempted ack `reply` — suppressed by
-    //      the `result-ready` speak rule (the honest C58 error the model
+    //      the `result-ready` speak rule (the honest error the model
     //      sees; zero adapter sends);
     //   2. → `spawn_worker` with the channel wrapper (the accept with
     //      Mandate — the wrapper's adapter-declared explicit makes the
     //      strength explicit);
-    //   3. the completion report arrives → `deliver_structured` (the
+    //   3. The completion report arrives → `deliver_structured` (the
     //      triage draft — a Result, admitted by result-ready);
     //   4. issue #102 → `spawn_worker` (the independent fan-out);
     //   5. report #2 → `deliver_structured` on issue #102.
@@ -604,9 +604,9 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     });
     let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
 
-    // The dispatch tools: spawn + the channel sends, under the C58/C60
+    // The dispatch tools: spawn + the channel sends, under the
     // policies (speak: result-ready; mandate: the triage scope) and the
-    // C59 shared ownership registry.
+    // shared ownership registry.
     let spawner = Arc::new(WorkerSpawner::new(
         router,
         &worker_agent,
@@ -678,7 +678,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     );
     // The worker wrapper holds the MOUNTED router inbox (assembly's
     // wiring): a completion report admitted to the Router ticks the
-    // residency counter a parked resident polls (kian-63) — the raw
+    // residency counter a parked resident polls — the raw
     // engine inbox would fold the wake into the parked drain and the
     // judge turn would never fire.
     let worker_side = WorkerLoopDriver::new(
@@ -818,7 +818,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         .handle_event(comment_991.clone())
         .await
         .expect("route");
-    // The live Executor owns the follow-up (C59): the row goes to the
+    // The live Executor owns the follow-up: the row goes to the
     // worker, and the Router was neither admitted nor woken.
     assert_eq!(
         outcome,
@@ -898,7 +898,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         posts[0].1["body"]
     );
     // The ack attempt never sent: exactly one POST total (the ack was
-    // suppressed before the adapter — the C58 deliver-or-discard).
+    // suppressed before the adapter — the deliver-or-discard).
     // (posts.len() == 1 asserted above is exactly that.)
 
     // Stage transition: the ticket is terminal. The projection's arm 5
@@ -908,7 +908,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     // `last_input > last_claim` and arm 5 (`queued`) matches before
     // arm 6 (`idle`) can — the ticket never projects `working` or
     // `awaiting-*` again, and the terminal facts are asserted directly
-    // below (recorded as a gap for the C65 live run to observe).
+    // below (recorded as a gap for the live run to observe).
     let worker_events = store.rebuild(worker_a).await.expect("rebuild");
     let stage = project_stage(&worker_events, 0, &NoOutbox);
     assert!(

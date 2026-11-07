@@ -1,4 +1,4 @@
-//! Completion-bridge integration tests (card C37, ADR-008), over the
+//! Completion-bridge integration tests (ADR-008), over the
 //! **real** engine + event store + an engine-backed `InboxWriter`
 //! port (the test-local, driver-generic twin of the assembly's
 //! `EngineInbox`) — no in-process shortcuts for the admit path. The

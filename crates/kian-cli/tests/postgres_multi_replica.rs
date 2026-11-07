@@ -1,17 +1,17 @@
-//! S8 — the multi-replica acceptance e2e (card C52, round-4 plan §3:
-//! "S1 lifted to multi-process scale").
+//! — the multi-replica acceptance e2e (plan §3:
+//! " lifted to multi-process scale").
 //!
 //! Two `kian serve` replicas over ONE postgres database: a submitted
 //! task is claimed and drained by replica A; A is `kill -9`'d
 //! mid-provider-turn; replica B's recovery sweep takes over the
-//! expired lease (C47 conditional claim), replays, and completes —
+//! expired lease (conditional claim), replays, and completes —
 //! zero lost work, exactly one end write, and a stale-epoch probe
 //! write "from A" (A's frozen epoch, issued directly against the
 //! store) is rejected: `NoSplitBrainWrite` between processes.
 //!
 //! Env-gated on `KIAN_PG_URL` (absent → SKIP with a log line, never
-//! fail — the C44 pattern). Child processes are driven the way
-//! `chaos_s1`/`restart_serve` drive them; localhost runs under
+//! fail — the pattern). Child processes are driven the way
+//! `chaos_recovery`/`restart_serve` drive them; localhost runs under
 //! `NO_PROXY` (AGENTS.md). Lease timing is bounded, not sleep-raced:
 //! takeover is bounded by `lease_ttl_ms + heartbeat_interval_ms` and
 //! every wait is a deadline-poll.
@@ -33,9 +33,7 @@ fn gated() -> bool {
     match std::env::var("KIAN_PG_URL") {
         Ok(url) if !url.is_empty() => true,
         _ => {
-            eprintln!(
-                "SKIP: KIAN_PG_URL is not set — S8 multi-replica e2e disabled (C52 env gate)"
-            );
+            eprintln!("SKIP: KIAN_PG_URL is not set — multi-replica e2e disabled (env gate)");
             false
         }
     }
@@ -57,7 +55,7 @@ fn with_db(base: &str, db: &str) -> String {
 }
 
 /// One replica's config: postgres storage over `KIAN_C52_PG_URL`, a
-/// unique explicit holder (C47 condition (c) — config validation
+/// unique explicit holder (condition (c) — config validation
 /// refuses the default under postgres), and a short lease so B's
 /// takeover is bounded by `ttl + heartbeat`.
 fn write_replica_config(
@@ -164,20 +162,20 @@ async fn rpc(
         .expect("rpc json")
 }
 
-/// S8: two replicas, one postgres DB, kill -9 the drain owner
+/// two replicas, one postgres DB, kill -9 the drain owner
 /// mid-provider-turn, the survivor's sweep takes over and completes,
 /// and the killed replica's frozen epoch can never write again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s8_two_replicas_kill9_takeover_no_split_brain() {
+async fn multi_replica_two_replicas_kill9_takeover_no_split_brain() {
     force_no_proxy();
     if !gated() {
         return;
     }
 
     // Throwaway database shared by both replicas (one DB, two
-    // processes — the hosted topology this card exists for).
+    // processes —.
     let base = std::env::var("KIAN_PG_URL").unwrap();
-    let db = format!("kian_cli_s8_{}", uuid::Uuid::new_v4().simple());
+    let db = format!("kian_cli_multi_replica_{}", uuid::Uuid::new_v4().simple());
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&base)
@@ -196,7 +194,7 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
     // released; request #2 (replica B's re-drive) answers normally.
     let (provider_base, mock) = spawn_mock_provider(1).await;
 
-    let dir = temp_dir("s8");
+    let dir = temp_dir("multi-replica");
     let port_a = free_port().await;
     let port_b = free_port().await;
     let config_a = write_replica_config(
@@ -204,14 +202,14 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
         "replica-a.yaml",
         &provider_base,
         &format!("127.0.0.1:{port_a}"),
-        "s8-replica-a",
+        "replica-a",
     );
     let config_b = write_replica_config(
         &dir,
         "replica-b.yaml",
         &provider_base,
         &format!("127.0.0.1:{port_b}"),
-        "s8-replica-b",
+        "replica-b",
     );
     let base_a = format!("http://127.0.0.1:{port_a}");
     let base_b = format!("http://127.0.0.1:{port_b}");
@@ -267,7 +265,7 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
         .next_back()
         .unwrap_or_default();
     assert_eq!(
-        last_claim_holder, "s8-replica-a",
+        last_claim_holder, "replica-a",
         "replica A must hold the claim before the kill (got {last_claim_holder:?})"
     );
 
@@ -350,7 +348,7 @@ async fn s8_two_replicas_kill9_takeover_no_split_brain() {
     // -- NoSplitBrainWrite between processes --------------------------------
     // A "zombie" write with A's frozen epoch, issued directly against
     // the store at the current head: the epoch fence (not any lease)
-    // rejects it — S1's guarantee, now at multi-process scale.
+    // rejects it — 's guarantee, now at multi-process scale.
     let head = reader.head(sid).await.unwrap();
     assert!(
         head.epoch.0 > epoch_a,

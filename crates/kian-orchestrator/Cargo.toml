@@ -20,7 +20,7 @@ dashmap.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]
-# C52 wake-transport tests create a throwaway postgres database from
+# wake-transport tests create a throwaway postgres database from
 # KIAN_PG_URL before opening the store on it (dev-only; the crate itself
 # stays store-agnostic).
 sqlx.workspace = true

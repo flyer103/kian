@@ -1,9 +1,9 @@
-//! Evidence-gate tests (card C24 acceptance).
+//! Evidence-gate tests (acceptance).
 //!
 //! Two layers:
 //! - pure unit tests over hand-built event streams (table-driven per
 //!   check, verdict payload golden form, attempt counting, serde);
-//! - engine integration tests driving the *real* C9 engine with the
+//! - engine integration tests driving the *real* engine with the
 //!   gate-enabled built-in loop (honesty, bounded retries, default-off,
 //!   provider-call-count invariance).
 
@@ -278,7 +278,7 @@ fn verdict_payload_golden_form() {
         &stream,
     );
     let payload = verdict_payload(BUILTIN_GATE_NAME, &verdict);
-    // The exact C18 payload schema, field for field.
+    // The exact payload schema, field for field.
     assert_eq!(
         payload,
         json!({
@@ -320,7 +320,7 @@ fn verdict_payload_golden_form() {
 #[test]
 fn default_config_is_disabled_with_zero_retries() {
     let cfg = EvidenceGateConfig::default();
-    assert!(!cfg.enabled, "Phase-1 behavior unchanged by default");
+    assert!(!cfg.enabled, "default behavior unchanged");
     assert!(cfg.checks.is_empty());
     assert_eq!(cfg.max_retries, 0);
 }
@@ -684,7 +684,7 @@ async fn gate_execution_leaves_provider_request_count_unchanged() {
     cleanup_db(&h_on.db_path);
 }
 
-/// Default-off regression: the Phase-1 loop (`ReActLoop::new` semantics —
+/// Default-off regression: the built-in loop (`ReActLoop::new` semantics —
 /// gate disabled) never appends a verdict event.
 #[tokio::test]
 async fn gate_disabled_by_default_appends_no_verdict_events() {

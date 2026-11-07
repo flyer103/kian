@@ -1,4 +1,4 @@
-//! `kian.yaml` configuration loading (card C13).
+//! `kian.yaml` configuration loading.
 //!
 //! Storage (sqlite), model slots, session/drain budgets, recovery policy
 //! tables, providers and the plugin list. Loading is **fail-closed**: a
@@ -53,7 +53,7 @@ fn invalid(msg: impl Into<String>) -> ConfigError {
 pub struct ServeConfig {
     /// Bind address, `"host:port"` (parsed and validated).
     pub listen: String,
-    /// Storage (sqlite default; postgres since C51).
+    /// Storage (sqlite default; postgres since).
     pub storage: StorageConfig,
     /// The agent definition (id, model slots, tools, session budgets).
     pub agent: AgentConfig,
@@ -71,22 +71,22 @@ pub struct ServeConfig {
     /// SSE poll interval.
     #[serde(default)]
     pub sse: SseConfig,
-    /// The `recovery:` section, parsed fail-closed by C10's
+    /// The `recovery:` section, parsed fail-closed by 's
     /// [`PolicyConfig`]. Kept as raw YAML so this crate never forks the
     /// policy schema.
     pub recovery: serde_yaml::Value,
-    /// Additional named agent definitions (C27; id → definition). The
+    /// Additional named agent definitions (id → definition). The
     /// single `agent:` section remains the **default agent** shorthand —
     /// plain sessions always run it. Router/Worker definitions live here
     /// and are referenced from the `superagent:` section.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
-    /// The `superagent:` section (C27). `None` (the section absent) is
-    /// the Phase-1 configuration: no bundle is assembled and every
+    /// The `superagent:` section. `None` (the section absent) is
+    /// the built-in configuration: no bundle is assembled and every
     /// existing behavior is unchanged.
     #[serde(default)]
     pub superagent: Option<SuperAgentConfig>,
-    /// Remote execution endpoints (C27 over the C20 queue). Empty = no
+    /// Remote execution endpoints (over the queue). Empty = no
     /// remote exec.
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
@@ -100,7 +100,7 @@ fn default_plugins() -> Vec<String> {
     ]
 }
 
-/// Storage selection (C51): `event_store: sqlite` (the default — Phase-1
+/// Storage selection: `event_store: sqlite` (the default — built-in
 /// behavior, byte-identical) or `event_store: postgres` (the hosted
 /// substrate; one server, one database). The sqlite path and the pg URL
 /// env are mutually exclusive — a config that names storage the active
@@ -131,9 +131,9 @@ impl StorageConfig {
     }
 }
 
-/// The `storage.postgres` section (C51). The database URL — which may
+/// The `storage.postgres` section. The database URL — which may
 /// carry a password — is read from the named environment variable at
-/// startup: env-only, never a config value (the C13 secrets rule).
+/// startup: env-only, never a config value (the secrets rule).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PostgresStorageConfig {
@@ -156,11 +156,11 @@ pub struct AgentConfig {
     /// Tool names the agent may call.
     #[serde(default)]
     pub tools: Vec<String>,
-    /// Per-call tool permission table (C70 / ADR-015): tool name →
+    /// Per-call tool permission table (ADR-015): tool name →
     /// `allow`/`deny`, closed vocabulary — an unknown value refuses to
     /// parse. Every key must be present in [`AgentConfig::tools`]
     /// (fail-closed, validated in [`ServeConfig::validate`]). Absent =
-    /// empty = allow-all with the pre-C70 byte-identical event stream.
+    /// empty = allow-all with the legacy byte-identical event stream.
     /// Evaluated on the built-in loop, the plain-session (default) loop
     /// and the superagent worker loop; a table on the Router/Watchdog
     /// judge agents refuses boot (never silently ignored).
@@ -169,10 +169,10 @@ pub struct AgentConfig {
     /// Session budgets (A5; `null` = unlimited).
     #[serde(default)]
     pub budgets: BudgetsDef,
-    /// Evidence-gate tuning (C24, wired by the C27 assembly): the
+    /// Evidence-gate tuning (wired by the assembly): the
     /// default agent's gate mounts on the built-in loop's stop path; a
     /// superagent worker agent's gate mounts on the worker wrapper.
-    /// Default is disabled — Phase-1 behavior unchanged.
+    /// Default is disabled — built-in behavior unchanged.
     #[serde(default)]
     pub evidence_gate: EvidenceGateConfig,
 }
@@ -287,11 +287,11 @@ pub struct ToolsConfig {
     /// Default local exec timeout, milliseconds.
     #[serde(default = "default_exec_timeout")]
     pub exec_timeout_ms: u64,
-    /// kian-77: the exec child environment policy (`tools.exec_env`).
+    /// the exec child environment policy (`tools.exec_env`).
     /// Default `inherit` = today's behavior (compatibility clause).
     #[serde(default)]
     pub exec_env: ExecEnvSection,
-    /// kian-77: the exec output redaction config (`tools.exec_redact`).
+    /// the exec output redaction config (`tools.exec_redact`).
     /// Redaction is ON by default — it only scrubs what is persisted,
     /// never what the child does.
     #[serde(default)]
@@ -309,7 +309,7 @@ impl Default for ToolsConfig {
     }
 }
 
-/// The `tools.exec_env:` section (kian-77 fix ①: secrets never reach
+/// The `tools.exec_env:` section (fix ①: secrets never reach
 /// spawned children).
 ///
 /// ```yaml
@@ -363,14 +363,14 @@ impl ExecEnvSection {
     }
 }
 
-/// The `tools.exec_redact:` section (kian-77 fix ②: no configured
+/// The `tools.exec_redact:` section (fix ②: no configured
 /// secret persists into the event stream).
 ///
 /// ```yaml
 /// tools:
 ///   exec_redact:
-///     enabled: true          # default
-///     env_names: [MY_EXTRA_TOKEN]  # beyond the auto-collected ones
+///     enabled: true # default
+///     env_names: [MY_EXTRA_TOKEN] # beyond the auto-collected ones
 /// ```
 ///
 /// The assembly auto-collects every secret name kian.yaml itself
@@ -430,7 +430,7 @@ fn default_poll_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// C54: the `superagent.harness` section (the S6 dsh bridge mount)
+// the `superagent.harness` section (the dsh bridge mount)
 // ---------------------------------------------------------------------------
 
 /// The `superagent.harness:` section. Every harness is default-off;
@@ -438,7 +438,7 @@ fn default_poll_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
-    /// The S6 dsh bridge (C54, ADR-010 / DESIGN §16): the worker
+    /// The dsh bridge (ADR-010 / DESIGN §16): the worker
     /// template's inner loop becomes the `DshDriver`, driving a
     /// `dsh --profile sdk` child process; dsh keeps its interaction
     /// model, kian owns durability.
@@ -528,12 +528,12 @@ impl DshHarnessConfig {
 }
 
 // ---------------------------------------------------------------------------
-// C27: super-agent + endpoint configuration
+// super-agent + endpoint configuration
 // ---------------------------------------------------------------------------
 
 /// The `superagent:` section. Presence switches `serve` into the
 /// super-agent assembly (bundle plugins, resident Router, subscription
-/// engine); absence keeps the Phase-1 single-agent server byte-for-byte.
+/// engine); absence keeps the built-in single-agent server byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuperAgentConfig {
@@ -546,7 +546,7 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::subscription_rules`].
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionRuleDef>,
-    /// Admission classes (C36, the article §3.1 Fast Path): a
+    /// Admission classes (the article §3.1 Fast Path): a
     /// provenance-keyed filter evaluated *before* the rule set and
     /// before any model call. Wire form: `{channel, topic?, sender?,
     /// class: candidate | explicit-only | ignore}`; converted
@@ -555,14 +555,14 @@ pub struct SuperAgentConfig {
     /// behavior, unchanged.
     #[serde(default)]
     pub classes: Vec<AdmissionClassDef>,
-    /// C33 admission-time Inline/Spill shaping. Absent preserves the
-    /// pre-C33 infinite cap and byte-identical legacy wrapper.
+    /// admission-time Inline/Spill shaping. Absent preserves the
+    /// legacy infinite cap and byte-identical legacy wrapper.
     #[serde(default)]
     pub shaping: Option<ChannelShapingConfig>,
-    /// C43 untrusted-input marking (prompt-injection hygiene):
+    /// untrusted-input marking (prompt-injection hygiene):
     /// channels whose events admit with `"untrusted": true` inside
     /// the provenance wrapper's `content`. Honest labeling only —
-    /// never a drop/allow decision. Real channels (lark, C44) belong
+    /// never a drop/allow decision. Real channels (lark) belong
     /// here; absent = every channel trusted (today's behavior).
     /// Every entry must be declared in `channels:` (fail-closed
     /// cross-reference).
@@ -573,24 +573,24 @@ pub struct SuperAgentConfig {
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelConfig>,
     /// Mount the async `start()`/`stop()` tool pair on the Router
-    /// profile and the worker template (C37, ADR-008). Default off —
+    /// profile and the worker template (ADR-008). Default off —
     /// the article's own "not default-on". Requires a non-empty
-    /// `endpoints:` list (the pair routes through the C20 queue);
+    /// `endpoints:` list (the pair routes through the queue);
     /// enabling it without endpoints refuses to start (fail-closed).
     #[serde(default)]
     pub async_tools: bool,
-    /// C54: the harness section — external agent harnesses the worker
+    /// the harness section — external agent harnesses the worker
     /// template can run instead of the built-in loop. Default off;
     /// absence keeps the built-in worker loop byte-for-byte.
     #[serde(default)]
     pub harness: HarnessConfig,
-    /// The recall toolpack (C35, the Chain of Recall): read-only
+    /// The recall toolpack (the Chain of Recall): read-only
     /// `recall_event` / `recall_neighbors` / `recall_thread` tools.
     /// Default: mounted on the Router profile, opt-in per worker
     /// template, with bounded tool-output caps.
     #[serde(default)]
     pub recall: RecallConfig,
-    /// Watchdog Session v2 (C40): the resident model-in-the-loop
+    /// Watchdog Session v2: the resident model-in-the-loop
     /// progress judge. Absent (the default) = no watchdog session, no
     /// change to today's behavior. Present = assembly mounts the
     /// watchdog loop on the fixed session and bootstraps its judge
@@ -598,7 +598,7 @@ pub struct SuperAgentConfig {
     /// (`route: {session: <uuid>}`) over a `type: timer` channel.
     #[serde(default)]
     pub watchdog: Option<WatchdogConfig>,
-    /// C58 output-side speak-rules: the *whether-to-send* gate on the
+    /// output-side speak-rules: the *whether-to-send* gate on the
     /// Router's `reply`/`deliver_structured` tools (attention
     /// economics — DESIGN §4.2). Absent (the default) = every send
     /// passes, byte-identical to today. Converted fail-closed by
@@ -606,30 +606,30 @@ pub struct SuperAgentConfig {
     /// must be declared in `channels:` (fail-closed cross-reference).
     #[serde(default)]
     pub speak_rules: Vec<SpeakRuleDef>,
-    /// C59 follow-up ownership: a person's follow-up belongs to the
+    /// follow-up ownership: a person's follow-up belongs to the
     /// live Ticket's Executor (reference 002). On (the default), the
     /// fan-out admits to live subscribers only — an all-ended topic
     /// releases to the Router as a fresh evaluation
     /// (`released_to_eval`) — and `spawn_worker` refuses a topic
     /// correlation a live worker already owns with an honest tool
     /// error naming the owner (the Router may only stop it).
-    /// `false` restores the pre-C59 behavior.
+    /// `false` restores the legacy behavior.
     #[serde(default = "default_followup_ownership")]
     pub followup_ownership: bool,
-    /// C63 policy/prompt versioning: the policy revision the resident
+    /// policy/prompt versioning: the policy revision the resident
     /// profiles render into their bootstrap prompts as a
     /// `[policy <label>]` header, plus the drift-notice gate. Absent
     /// (`version` unset) = today's bytes, byte-identical.
     #[serde(default)]
     pub policy: PolicyVersionConfig,
-    /// C60 (ADR-012) mandate issuance: per-worker-template scope
+    /// (ADR-012) mandate issuance: per-worker-template scope
     /// texts bounding every delegation `spawn_worker` issues. Absent
     /// (the default) = no mandate — wrappers stay byte-identical
     /// legacy. Converted fail-closed by
     /// [`SuperAgentConfig::mandate_policy`].
     #[serde(default)]
     pub mandate: MandateConfig,
-    /// C62 outbox bounded retry (`superagent.outbox`): stored work
+    /// outbox bounded retry (`superagent.outbox`): stored work
     /// for the write side — bounded backoff, per-`(ticket,
     /// conversation)` ordering, park with a visible stage. Absent
     /// (the default) = the legacy single-attempt send path,
@@ -637,9 +637,9 @@ pub struct SuperAgentConfig {
     /// fail-closed by [`SuperAgentConfig::outbox_config`].
     #[serde(default)]
     pub outbox: Option<OutboxConfigDef>,
-    /// C61/ADR-013 thread-key intake (`superagent.intake`): the
+    /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
-    /// surfaces in the C33 Inline `neighbors` block (`thread_key`) as
+    /// surfaces in the Inline `neighbors` block (`thread_key`) as
     /// recall context — correlation is context only, never a routing
     /// input (routing stays topic-keyed; poll-mode github topics are
     /// the derived keys themselves, produced at adapter mapping time).
@@ -648,14 +648,14 @@ pub struct SuperAgentConfig {
     pub intake: IntakeConfig,
 }
 
-/// C59's default: follow-up ownership is **on** — the honest default
+/// 's default: follow-up ownership is **on** — the honest default
 /// is the rule, opt-out is explicit.
 fn default_followup_ownership() -> bool {
     true
 }
 
 impl SuperAgentConfig {
-    /// Converts the C58 speak-rule table to the bundle policy,
+    /// Converts the speak-rule table to the bundle policy,
     /// fail-closed: an unknown condition spelling or an empty channel
     /// refuses to start, never silently defaults. Errors carry the
     /// rule's index.
@@ -672,7 +672,7 @@ impl SuperAgentConfig {
         Ok(kian_superagent::SpeakPolicy::from_rules(rules))
     }
 
-    /// Converts the C63 policy-version section to the bundle's
+    /// Converts the policy-version section to the bundle's
     /// [`kian_superagent::PolicyVersion`], fingerprinted against the
     /// resident profiles' prompt templates (the judge and watchdog
     /// defaults) so a label always names the template bytes it was
@@ -690,7 +690,7 @@ impl SuperAgentConfig {
         })
     }
 
-    /// Converts the C60 mandate section to the bundle's
+    /// Converts the mandate section to the bundle's
     /// [`kian_superagent::MandatePolicy`]. `None` when nothing is
     /// configured (no mandate issued — byte-identical legacy
     /// wrappers).
@@ -698,7 +698,7 @@ impl SuperAgentConfig {
         self.mandate.to_policy()
     }
 
-    /// Converts the C62 outbox section to the bundle's
+    /// Converts the outbox section to the bundle's
     /// [`kian_superagent::OutboxConfig`], fail-closed (a broken
     /// schedule refuses to start). `Ok(None)` when nothing is
     /// configured (the legacy single-attempt send path,
@@ -725,7 +725,7 @@ impl SuperAgentConfig {
     }
 }
 
-/// The C62 `superagent.outbox` section:
+/// The `superagent.outbox` section:
 /// `{max_attempts?, backoff_start_ms?, backoff_cap_ms?}` — every
 /// field optional; an empty section enables the outbox with the
 /// defaults (6 attempts, backoff 2s doubling, cap 60s).
@@ -737,11 +737,11 @@ pub struct OutboxConfigDef {
     pub backoff_cap_ms: Option<u64>,
 }
 
-/// The C61 `superagent.intake` section (ADR-013):
+/// The `superagent.intake` section (ADR-013):
 /// `{thread_keys: [{channel, key: [group?, <payload-field>…]}]}`.
 ///
 /// The derived key (`<channel>:<group>#<key>`, percent-encoded
-/// components — collision-free by construction) surfaces in the C33
+/// components — collision-free by construction) surfaces in the
 /// Inline `neighbors` block as `thread_key` recall context. Keys are
 /// **config-owned**: a config change is a new key, and old streams
 /// keep their topics (cache-stable, no rewrite). Absent section = no
@@ -811,7 +811,7 @@ impl IntakeConfig {
     }
 }
 
-/// The C63 `superagent.policy` section:
+/// The `superagent.policy` section:
 /// `{version: <label>, notify_live: bool}`.
 ///
 /// - `version` (optional) — the policy revision label rendered into
@@ -855,7 +855,7 @@ impl PolicyVersionConfig {
     }
 }
 
-/// The C60 `superagent.mandate` section (ADR-012):
+/// The `superagent.mandate` section (ADR-012):
 /// `{scopes: {<worker-template-id>: <scope text>}, default_scope: <text>}`.
 ///
 /// - `scopes` — worker template id (`agents.<id>`) → the
@@ -921,7 +921,7 @@ impl MandateConfig {
     }
 }
 
-/// One `superagent.speak_rules` entry (C58):
+/// One `superagent.speak_rules` entry:
 /// `{channel, when: always | ack-first-only | decision-needed |
 /// result-ready | never, per_topic_ack?}` — the condition under which
 /// a send may leave the channel, evaluated before the §4.2 shaping
@@ -943,7 +943,7 @@ pub struct SpeakRuleDef {
 }
 
 impl SpeakRuleDef {
-    /// Converts to the bundle rule (C58), fail-closed. Messages are
+    /// Converts to the bundle rule, fail-closed. Messages are
     /// index-free; [`SuperAgentConfig::speak_policy`] prefixes them.
     pub fn to_rule(&self) -> Result<kian_superagent::SpeakRule, ConfigError> {
         self.to_rule_inner().map_err(invalid)
@@ -968,7 +968,7 @@ impl SpeakRuleDef {
     }
 }
 
-/// The additive `superagent.watchdog:` section (C40): the resident
+/// The additive `superagent.watchdog:` section: the resident
 /// watchdog session binding. The timer input source itself is a
 /// channel (`superagent.channels.<name>` with `type: timer`); this
 /// section names the judge session and its agent.
@@ -985,12 +985,12 @@ pub struct WatchdogConfig {
     pub agent: String,
 }
 
-/// The additive `superagent.recall:` section (C35): the recall
+/// The additive `superagent.recall:` section: the recall
 /// toolpack's mount gates and caps. `router` defaults on (the Router
 /// is the global-observability seat and rides the event stream via
 /// recall, not via its own context), `worker` defaults off (opt-in
 /// per worker template). The caps bound what one recall tool output
-/// may re-inject verbatim — recall reuses the C33 shaping vocabulary
+/// may re-inject verbatim — recall reuses the shaping vocabulary
 /// for excerpts and association ids, but its verbatim bound is its
 /// own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1047,7 +1047,7 @@ fn default_recall_neighbor_window() -> u64 {
     kian_superagent::DEFAULT_NEIGHBOR_WINDOW
 }
 
-/// The additive `superagent.shaping:` section (C33). The cap applies to
+/// The additive `superagent.shaping:` section. The cap applies to
 /// the serialized raw channel payload at admission, never to committed
 /// context. Omitted cap = infinity; omitted excerpt length = 50 chars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1089,14 +1089,14 @@ pub struct SuperAgentRouterConfig {
     /// `model_slots`).
     #[serde(default = "default_router_slot")]
     pub slot: String,
-    /// The Router profile's speculation budget (C39). Absent (the
+    /// The Router profile's speculation budget. Absent (the
     /// default) disables speculation: `spawn_worker` with
     /// `speculative: true` is refused with an honest tool error.
     #[serde(default)]
     pub speculation: Option<SpeculationDef>,
 }
 
-/// The `superagent.router.speculation` section (C39):
+/// The `superagent.router.speculation` section:
 /// `{max_outstanding, label, silent_repro?}` — the Router profile's
 /// speculation budget plus the silent-repro prompt template (a config
 /// artifact: prose, editable without code).
@@ -1116,7 +1116,7 @@ pub struct SpeculationDef {
 }
 
 impl SpeculationDef {
-    /// Converts to the bundle policy (C39), fail-closed: a zero cap or
+    /// Converts to the bundle policy, fail-closed: a zero cap or
     /// an empty label is a config error, never a silent default.
     pub fn to_policy(&self) -> Result<kian_superagent::SpeculationPolicy, ConfigError> {
         if self.max_outstanding == 0 {
@@ -1166,17 +1166,17 @@ pub struct SuperAgentWorkerConfig {
 pub struct ChannelConfig {
     #[serde(rename = "type")]
     pub channel_type: String,
-    /// The C44 lark section — required when (and only when)
+    /// The lark section — required when (and only when)
     /// `type: lark` (fail-closed both directions, validated in
     /// [`ServeConfig::parse`]).
     #[serde(default)]
     pub lark: Option<LarkChannelSection>,
-    /// The C40 timer section — required when (and only when)
+    /// The timer section — required when (and only when)
     /// `type: timer` (fail-closed both directions, validated in
     /// [`ServeConfig::parse`]).
     #[serde(default)]
     pub timer: Option<TimerChannelSection>,
-    /// The C48/C49 github section — required when (and only when)
+    /// The github section — required when (and only when)
     /// `type: github` (fail-closed both directions, validated in
     /// [`ServeConfig::parse`]). Configuring a github channel is what
     /// mounts the `POST /webhooks/github` receiver route.
@@ -1184,12 +1184,12 @@ pub struct ChannelConfig {
     pub github: Option<GitHubChannelSection>,
 }
 
-/// The `superagent.channels.<name>.github:` section (C48 adapter +
-/// C49 receiver): the topic-mapping allowlist, the events filter and
+/// The `superagent.channels.<name>.github:` section (adapter +
+/// receiver): the topic-mapping allowlist, the events filter and
 /// the webhook receiver limits. Credentials are deliberately absent:
 /// the send token comes from `KIAN_GITHUB_TOKEN` and the webhook
 /// secret from `KIAN_GITHUB_WEBHOOK_SECRET` (assembly, fail-closed) —
-/// tokens never live in `kian.yaml` (the C13 secrets discipline).
+/// tokens never live in `kian.yaml` (the secrets discipline).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubChannelSection {
@@ -1199,7 +1199,7 @@ pub struct GitHubChannelSection {
     /// Topic mapping table: `owner/repo` → topic, optionally
     /// narrowed per PR with an exact `owner/repo#N` → topic key. The
     /// keys are also the receive allowlist: a delivery from an
-    /// unmapped repo is an honest drop (the C48 contract). In
+    /// unmapped repo is an honest drop (the contract). In
     /// poll-receive mode the table keys are still the allowlist (the
     /// polled repo must be mapped); the routing topic of a polled
     /// event is its derived thread key, not the table value.
@@ -1211,21 +1211,21 @@ pub struct GitHubChannelSection {
     /// (fail-closed); receive-only needs none.
     #[serde(default)]
     pub send: bool,
-    /// Webhook receiver limits (C49). Defaults are the receiver
+    /// Webhook receiver limits. Defaults are the receiver
     /// module's (`WebhookLimits::default`).
     #[serde(default)]
     pub webhook: GitHubWebhookLimitsSection,
-    /// C64: is webhook receive mounted for this channel? Default
-    /// `true` (the C48/C49 shape); `false` on a poll-only channel
+    /// is webhook receive mounted for this channel? Default
+    /// `true` (the shape); `false` on a poll-only channel
     /// keeps the webhook route — and its env-only secret
     /// requirement — unconfigured (poll mode is *beside* the webhook
     /// surface, and a deployment that receives no webhooks mounts no
     /// signature-verifying route).
     #[serde(default = "default_github_webhook_receive")]
     pub webhook_receive: bool,
-    /// C64: the poll-receive mode. Present (with `webhook_receive` at
+    /// the poll-receive mode. Present (with `webhook_receive` at
     /// its default) the channel receives webhooks **and** polls;
-    /// absent the channel is exactly the C48/C49 shape.
+    /// absent the channel is exactly the shape.
     #[serde(default)]
     pub poll: Option<GitHubPollSection>,
 }
@@ -1238,12 +1238,12 @@ fn default_github_api_base() -> String {
     kian_superagent::GITHUB_DEFAULT_API_BASE.to_string()
 }
 
-/// The default bounded first-poll backfill window (C64): 24 hours. A
+/// The default bounded first-poll backfill window: 24 hours. A
 /// fresh deployment admits at most the issues/comments updated in
 /// this window — never the repo's whole history.
 pub const DEFAULT_POLL_BACKFILL_MS: u64 = 86_400_000;
 
-/// The C64 `superagent.channels.<name>.github.poll:` section:
+/// The `superagent.channels.<name>.github.poll:` section:
 /// `{repo, interval_ms, kinds, since_field?, backfill_ms?}` — the
 /// poll-receive mode beside webhook receive. `repo` must be a
 /// `owner/repo` key of the channel's `topics` table (the receive
@@ -1268,7 +1268,7 @@ pub struct GitHubPollSection {
     pub backfill_ms: Option<u64>,
 }
 
-/// The `superagent.channels.<name>.github.webhook:` limits (C49):
+/// The `superagent.channels.<name>.github.webhook:` limits:
 /// body cap + per-source token bucket. All fields optional (the
 /// manual `Default` mirrors the per-field serde defaults — a derived
 /// `Default` would silently zero every limit); zero values refuse to
@@ -1309,7 +1309,7 @@ fn default_webhook_rate_refill() -> u64 {
 
 impl GitHubChannelSection {
     /// Converts to the bundle's runtime config, fail-closed on every
-    /// degenerate field (the C48 validation). `token` is the env-only
+    /// degenerate field (the validation). `token` is the env-only
     /// credential filled by assembly (`KIAN_GITHUB_TOKEN`; `send:
     /// true` without it is a startup error, receive/poll need none).
     pub fn to_runtime(
@@ -1321,7 +1321,7 @@ impl GitHubChannelSection {
             api_base: self.api_base.clone(),
             topics: self.topics.clone(),
             events: self.events.clone(),
-            // C43: GitHub payloads are attacker-influible text — the
+            // GitHub payloads are attacker-influible text — the
             // channel is untrusted, no opt-out (the lark discipline).
             untrusted: true,
             send: self.send,
@@ -1336,7 +1336,7 @@ impl GitHubChannelSection {
         Ok(config)
     }
 
-    /// The poll section as the bundle's runtime config (C64),
+    /// The poll section as the bundle's runtime config,
     /// fail-closed on kind spellings and degenerate bounds.
     fn poll_runtime(&self, name: &str) -> Result<Option<kian_superagent::PollConfig>, ConfigError> {
         let Some(section) = &self.poll else {
@@ -1387,7 +1387,7 @@ impl GitHubChannelSection {
         Ok(())
     }
 
-    /// The C49 receiver limits (defaults where unset).
+    /// The receiver limits (defaults where unset).
     pub fn webhook_limits(&self) -> crate::webhook::WebhookLimits {
         crate::webhook::WebhookLimits {
             max_body_bytes: self.webhook.max_body_bytes,
@@ -1397,7 +1397,7 @@ impl GitHubChannelSection {
     }
 }
 
-/// The `superagent.channels.<name>.timer:` section (C40): the timer
+/// The `superagent.channels.<name>.timer:` section: the timer
 /// input source's cadence. The adapter emits
 /// `ChannelEvent{channel:<name>, topic, event_id:"tick-<n>",
 /// payload:{"tick":n}}` every `interval_ms`; `emit_on_start` fires one
@@ -1444,10 +1444,10 @@ impl TimerChannelSection {
     }
 }
 
-/// The `superagent.channels.<name>.lark:` section (C44). Credentials
+/// The `superagent.channels.<name>.lark:` section. Credentials
 /// are deliberately absent: `app_id`/`app_secret` come from the
 /// environment (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`) at assembly
-/// — tokens never live in `kian.yaml` (the C13 secrets discipline).
+/// — tokens never live in `kian.yaml` (the secrets discipline).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LarkChannelSection {
@@ -1474,7 +1474,7 @@ impl LarkChannelSection {
     /// Converts to the bundle's runtime config, fail-closed on
     /// credentials: absent or blank `KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`
     /// is a startup error naming the env vars — never a silent default
-    /// and never a config-file token (C13/C44).
+    /// and never a config-file token.
     pub fn to_runtime(
         &self,
         name: &str,
@@ -1524,7 +1524,7 @@ pub enum RuleMatcherDef {
 }
 
 /// Wire form of a rule's route: the bare keyword `router`,
-/// `{passthrough: {correlate_by: topic}}`, or — C40, additive —
+/// `{passthrough: {correlate_by: topic}}`, or —, additive —
 /// `{session: <uuid>}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1558,7 +1558,7 @@ pub struct SubscriptionRuleDef {
     pub route: RouteDef,
 }
 
-/// One admission-class entry (C36 wire form): a provenance key
+/// One admission-class entry (wire form): a provenance key
 /// `(channel, topic?, sender?)` → `class`. `topic`/`sender` are
 /// optional pins; the class keyword is validated fail-closed in
 /// [`SuperAgentConfig::admission_classes`].
@@ -1645,7 +1645,7 @@ impl SuperAgentConfig {
                 } => Route::Passthrough {
                     correlate_by: CorrelateBy::Topic,
                 },
-                // C40: a config-addressed fixed session (the timer's
+                // a config-addressed fixed session (the timer's
                 // ticks → the watchdog). Fail-closed on the uuid.
                 RouteDef::Session { session } => Route::Session(kian_core::model::SessionId(
                     uuid::Uuid::parse_str(session).map_err(|_| {
@@ -1670,7 +1670,7 @@ impl SuperAgentConfig {
         Ok(SubscriptionRuleSet::new(rules))
     }
 
-    /// Converts the C43 `untrusted_channels` list into the runtime
+    /// Converts the `untrusted_channels` list into the runtime
     /// set, fail-closed: empty entries, duplicates and channels not
     /// declared in `channels` are errors, never defaults.
     pub fn untrusted_channel_set(&self) -> Result<std::collections::BTreeSet<String>, ConfigError> {
@@ -1696,7 +1696,7 @@ impl SuperAgentConfig {
         Ok(set)
     }
 
-    /// The runtime untrusted set (C43 + C44 + C48): the configured
+    /// The runtime untrusted set (+ +): the configured
     /// `untrusted_channels` list **plus every lark- and github-typed
     /// channel** — real inbound text is attacker-controllable, so a
     /// real channel is untrusted by default (listing it again is
@@ -1715,13 +1715,13 @@ impl SuperAgentConfig {
     }
 }
 
-/// Every channel adapter type `serve` knows how to build (C27 v1:
-/// the first-class mock; C44 adds the real lark adapter; C40 the
-/// timer input source; C48/C49 the github channel + webhook
+/// Every channel adapter type `serve` knows how to build (v1:
+/// the first-class mock; adds the real lark adapter; the
+/// timer input source; the github channel + webhook
 /// receiver).
 pub const KNOWN_CHANNEL_TYPES: [&str; 4] = ["mock-im", "lark", "timer", "github"];
 
-/// One remote execution endpoint (over the C20 durable queue).
+/// One remote execution endpoint (over the durable queue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
@@ -1779,7 +1779,7 @@ impl ServeConfig {
 
     /// Cross-reference validation (references resolve, semantics sane).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Storage (C51): the backend picks its required section, and any
+        // Storage: the backend picks its required section, and any
         // storage config the active backend would IGNORE is refused —
         // fail-closed, never a silently skipped path or credential.
         match self.storage.event_store.as_str() {
@@ -1803,7 +1803,7 @@ impl ServeConfig {
                 }
                 let pg = self.storage.postgres.as_ref().ok_or_else(|| {
                     invalid(
-                        "storage.event_store: postgres requires a storage.postgres section with url_env (env-only URLs, the C13 secrets rule)",
+                        "storage.event_store: postgres requires a storage.postgres section with url_env (env-only URLs, the secrets rule)",
                     )
                 })?;
                 if pg.url_env.trim().is_empty() {
@@ -1811,7 +1811,7 @@ impl ServeConfig {
                         "storage.postgres.url_env must name the environment variable holding the database URL",
                     ));
                 }
-                // C47 condition (c) depends on this: two replicas sharing
+                // condition (c) depends on this: two replicas sharing
                 // a holder string would defeat same-holder claim
                 // admission, so the default holder refuses to start.
                 if self.drain.holder.trim().is_empty() {
@@ -1821,7 +1821,7 @@ impl ServeConfig {
                 }
                 if self.drain.holder == default_holder() {
                     return Err(invalid(format!(
-                        "storage.event_store: postgres requires an explicit unique drain.holder — the default `{}` is refused: two replicas sharing a holder would defeat same-holder claim admission (C47/ADR-009)",
+                        "storage.event_store: postgres requires an explicit unique drain.holder — the default `{}` is refused: two replicas sharing a holder would defeat same-holder claim admission (ADR-009)",
                         default_holder()
                     )));
                 }
@@ -1882,7 +1882,7 @@ impl ServeConfig {
             }
         }
 
-        // C27: the bundle plugins are presence-locked to their config
+        // the bundle plugins are presence-locked to their config
         // sections — fail-closed in BOTH directions so neither a stale
         // plugin list nor a stray section boots half-assembled.
         let has_superagent_plugin = self.plugins.iter().any(|p| p == "superagent");
@@ -1899,7 +1899,7 @@ impl ServeConfig {
                  must be enabled together",
             ));
         }
-        // C37: the async pair routes through the C20 queue — gating it
+        // the async pair routes through the queue — gating it
         // on without endpoints would mount tools with nowhere to run.
         if self.superagent.as_ref().is_some_and(|sa| sa.async_tools) && self.endpoints.is_empty() {
             return Err(invalid(
@@ -1909,7 +1909,7 @@ impl ServeConfig {
         }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
             return Err(invalid(
-                "plugin `react-loop` is the Phase-1 loop; with the \
+                "plugin `react-loop` is the baseline loop; with the \
                  `superagent` plugin the assembly builds the loop itself",
             ));
         }
@@ -1974,7 +1974,7 @@ impl ServeConfig {
                         KNOWN_CHANNEL_TYPES.join(", ")
                     )));
                 }
-                // C44: the `lark:` section is presence-locked to
+                // the `lark:` section is presence-locked to
                 // `type: lark` in both directions, and its contents
                 // validate fail-closed (a lark channel is unusable
                 // without a real topic map and a positive cadence).
@@ -2014,7 +2014,7 @@ impl ServeConfig {
                     }
                     (None, _) => {}
                 }
-                // C40: the `timer:` section is presence-locked to
+                // the `timer:` section is presence-locked to
                 // `type: timer` in both directions; its cadence
                 // validates fail-closed.
                 match (&channel.timer, channel.channel_type.as_str()) {
@@ -2035,7 +2035,7 @@ impl ServeConfig {
                     }
                     (None, _) => {}
                 }
-                // C48/C49: the `github:` section is presence-locked
+                // the `github:` section is presence-locked
                 // to `type: github` in both directions; its pure
                 // shape validates fail-closed, and the webhook
                 // limits must be real limits (zero refuses).
@@ -2072,7 +2072,7 @@ impl ServeConfig {
                     (None, _) => {}
                 }
             }
-            // C49: at most one `type: github` channel — the single
+            // at most one `type: github` channel — the single
             // `POST /webhooks/github` route feeds exactly one channel
             // (two channels would make delivery routing ambiguous).
             let github_count = sa
@@ -2104,18 +2104,18 @@ impl ServeConfig {
                     sa.router.slot, sa.router.agent
                 )));
             }
-            // C70: the Router judge loop does not evaluate permissions
+            // the Router judge loop does not evaluate permissions
             // this round (ADR-015) — a table on it would be silently
             // ignored, so it refuses boot.
             if !router_agent.permissions.is_empty() {
                 return Err(invalid(format!(
                     "agents.{} carries a permissions table but the Router judge loop does not \
-                     evaluate permissions (C70/ADR-015) — remove the section or move it to the \
+                     evaluate permissions (ADR-015) — remove the section or move it to the \
                      worker/default agent",
                     sa.router.agent
                 )));
             }
-            // The speculation section must convert cleanly (C39:
+            // The speculation section must convert cleanly (
             // fail-closed — a zero cap or empty label refuses to start).
             if let Some(speculation) = &sa.router.speculation {
                 speculation.to_policy()?;
@@ -2147,7 +2147,7 @@ impl ServeConfig {
             // Wire-form rules must convert cleanly (unknown matcher/route
             // spellings refuse to start).
             sa.subscription_rules()?;
-            // C36: classes cross-reference declared channels and convert
+            // classes cross-reference declared channels and convert
             // cleanly (unknown class keywords refuse to start).
             for (i, class) in sa.classes.iter().enumerate() {
                 if !sa.channels.contains_key(&class.channel) {
@@ -2159,7 +2159,7 @@ impl ServeConfig {
                 }
             }
             sa.admission_classes()?;
-            // C58: speak rules convert cleanly and cross-reference
+            // speak rules convert cleanly and cross-reference
             // declared channels (fail-closed — an unknown condition
             // spelling or an undeclared channel refuses to start).
             sa.speak_policy()?;
@@ -2172,26 +2172,26 @@ impl ServeConfig {
                     )));
                 }
             }
-            // C63: the policy-version label is header-safe (fail-closed
+            // the policy-version label is header-safe (fail-closed
             // — it rides persisted bootstrap prompts and must parse
             // back unambiguously).
             sa.policy.validate()?;
-            // C60: the mandate scope texts are non-blank (fail-closed —
+            // the mandate scope texts are non-blank (fail-closed —
             // an empty authority string is never issued).
             sa.mandate.validate()?;
-            // C62: the outbox schedule converts cleanly (fail-closed —
+            // the outbox schedule converts cleanly (fail-closed —
             // a broken retry bound or backoff refuses to start).
             sa.outbox_config()?;
-            // C43: the untrusted-channel list cross-references the
+            // the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
-            // C61/ADR-013: the intake thread-keys cross-reference the
+            // /ADR-013: the intake thread-keys cross-reference the
             // declared channels and convert cleanly (fail-closed —
             // an undeclared channel or an empty key list refuses to
             // start, never a silently dead derivation).
             sa.intake
                 .to_runtime(&sa.channels.keys().cloned().collect())?;
-            // C40: the watchdog binding cross-references convert
+            // the watchdog binding cross-references convert
             // cleanly — a fixed session uuid distinct from the Router
             // session, an agent that exists and carries a strong
             // `main` slot (the worker-template shape).
@@ -2222,12 +2222,12 @@ impl ServeConfig {
                         watchdog.agent
                     )));
                 }
-                // C70: same as the Router — the watchdog judge loop does
+                // same as the Router — the watchdog judge loop does
                 // not evaluate permissions; a table refuses boot.
                 if !watchdog_agent.permissions.is_empty() {
                     return Err(invalid(format!(
                         "agents.{} carries a permissions table but the Watchdog judge loop \
-                         does not evaluate permissions (C70/ADR-015) — remove the section",
+                         does not evaluate permissions (ADR-015) — remove the section",
                         watchdog.agent
                     )));
                 }
@@ -2248,13 +2248,13 @@ impl ServeConfig {
             return Err(invalid("sse.poll_interval_ms must be > 0"));
         }
 
-        // The recovery section must parse through C10's fail-closed
+        // The recovery section must parse through 's fail-closed
         // loader (unknown classes / malformed actions are errors).
         self.policy()?;
         Ok(())
     }
 
-    /// Fail-closed C70 permission check for one agent definition: every
+    /// Fail-closed permission check for one agent definition: every
     /// `permissions:` key must be present in the agent's `tools:` list —
     /// a policy for a tool the agent cannot call is a config error, never
     /// a silent no-op.
@@ -2314,7 +2314,7 @@ impl ServeConfig {
         self.agents.get(id)
     }
 
-    /// The recovery policy section, parsed fail-closed by C10.
+    /// The recovery policy section, parsed fail-closed by.
     pub fn policy(&self) -> Result<PolicyConfig, ConfigError> {
         // Re-serialize just the recovery node; PolicyConfig accepts the
         // bare `budget:`/`rules:` section shape.
@@ -2329,7 +2329,7 @@ impl ServeConfig {
         agent_def_of(&self.agent)
     }
 
-    /// The compiled definition of a named agent (C27; `None` when the id
+    /// The compiled definition of a named agent (`None` when the id
     /// is not configured).
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
@@ -2382,7 +2382,7 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
 
 #[cfg(test)]
 mod tests {
-    // -- kian-77: tools.exec_env / tools.exec_redact -----------------------
+    // -- tools.exec_env / tools.exec_redact -----------------------
 
     /// Defaults: inherit (compatibility clause) + redaction on.
     #[test]
@@ -2480,7 +2480,7 @@ recovery:
         assert_eq!(policy.rules.len(), 2);
     }
 
-    /// C51 golden fixture: a config with NO `event_store:` key parses to
+    /// golden fixture: a config with NO `event_store:` key parses to
     /// exactly today's sqlite storage — default backend, path read
     /// verbatim, no postgres section — and serializes back to today's
     /// bytes. The sqlite default is byte-identical, not merely similar.
@@ -2502,7 +2502,7 @@ recovery:
         );
     }
 
-    /// C51: sqlite mode without a path refuses (the pre-C51 required
+    /// sqlite mode without a path refuses (the legacy required
     /// field's behavior, now enforced at validation with a clearer
     /// message).
     #[test]
@@ -2519,7 +2519,7 @@ recovery:
         );
     }
 
-    /// C51: an unknown backend name refuses, never falls back.
+    /// an unknown backend name refuses, never falls back.
     #[test]
     fn unknown_event_store_backend_refuses() {
         let yaml = valid_yaml().replace("storage:\n", "storage:\n  event_store: mysql\n");
@@ -2527,7 +2527,7 @@ recovery:
         assert!(err.to_string().contains("mysql"), "{}", err.to_string());
     }
 
-    /// C51: postgres mode without the `storage.postgres` section refuses.
+    /// postgres mode without the `storage.postgres` section refuses.
     #[test]
     fn postgres_mode_requires_the_postgres_section() {
         let yaml = valid_yaml().replace(
@@ -2542,7 +2542,7 @@ recovery:
         );
     }
 
-    /// C51: postgres mode parses with an explicit holder and an env-only
+    /// postgres mode parses with an explicit holder and an env-only
     /// URL name; the URL itself never appears in the config.
     #[test]
     fn postgres_mode_parses_with_explicit_holder() {
@@ -2656,10 +2656,10 @@ recovery:
     }
 
     // -----------------------------------------------------------------------
-    // C70: per-call tool permissions (ADR-015)
+    // per-call tool permissions (ADR-015)
     // -----------------------------------------------------------------------
 
-    /// C70: an agent with no `permissions:` section parses to an empty
+    /// an agent with no `permissions:` section parses to an empty
     /// table (= allow-all, byte-identical behavior).
     #[test]
     fn permissions_absent_defaults_to_empty() {
@@ -2669,7 +2669,7 @@ recovery:
         assert!(sa.named_agent("worker").unwrap().permissions.is_empty());
     }
 
-    /// C70: `allow`/`deny` parse into the closed `Permission` vocabulary.
+    /// `allow`/`deny` parse into the closed `Permission` vocabulary.
     #[test]
     fn permissions_allow_and_deny_parse() {
         let yaml = valid_yaml().replacen(
@@ -2687,7 +2687,7 @@ recovery:
         );
     }
 
-    /// C70 (fail-closed): an unknown permission value refuses boot —
+    /// (fail-closed): an unknown permission value refuses boot —
     /// the vocabulary is closed; `ask` is deliberately not in it this
     /// round (ADR-015).
     #[test]
@@ -2706,7 +2706,7 @@ recovery:
         }
     }
 
-    /// C70 (fail-closed): a permission key not present in the agent's
+    /// (fail-closed): a permission key not present in the agent's
     /// `tools:` list refuses boot — a policy for a tool the agent cannot
     /// call is a config error, never a silent no-op.
     #[test]
@@ -2747,7 +2747,7 @@ recovery:
         assert!(err.to_string().contains("spawn_worker"), "{err}");
     }
 
-    /// C70 (fail-closed): the Router and Watchdog judge loops do not
+    /// (fail-closed): the Router and Watchdog judge loops do not
     /// evaluate permissions this round (ADR-015) — a permissions table
     /// on their agents would be silently ignored, so it refuses boot
     /// instead.
@@ -2771,12 +2771,12 @@ recovery:
     }
 
     // -----------------------------------------------------------------------
-    // C27: super-agent configuration
+    // super-agent configuration
     // -----------------------------------------------------------------------
 
     const ROUTER_SESSION: &str = "11111111-2222-3333-4444-555555555555";
 
-    /// A full super-agent profile (the C27 golden shape): named router
+    /// A full super-agent profile (the golden shape): named router
     /// and worker agents, resident router session, subscriptions over a
     /// mock-im channel, and one remote endpoint.
     fn superagent_yaml() -> String {
@@ -2905,12 +2905,12 @@ recovery:
     }
 
     // -------------------------------------------------------------------
-    // C40: watchdog + timer configuration
+    // watchdog + timer configuration
     // -------------------------------------------------------------------
 
     const WATCHDOG_SESSION: &str = "99999999-8888-7777-6666-555555555555";
 
-    /// The golden profile plus the C40 surface: a watchdog agent and
+    /// The golden profile plus the surface: a watchdog agent and
     /// binding, a `type: timer` channel, and a session-routed rule.
     fn watchdog_yaml() -> String {
         superagent_yaml()
@@ -3108,7 +3108,7 @@ recovery:
         assert!(shaping.neighbor_fields.is_empty());
     }
 
-    /// C35: the `superagent.recall:` section is additive — a legacy
+    /// the `superagent.recall:` section is additive — a legacy
     /// config parses with the toolpack default-on for the Router and
     /// off for workers (the Default impl agrees with the serde
     /// defaults), and an explicit section converts to the bundle caps.
@@ -3173,7 +3173,7 @@ recovery:
         assert!(error.contains("inline_cap_byte"));
     }
 
-    /// C43: the untrusted-channel list parses, defaults to empty
+    /// the untrusted-channel list parses, defaults to empty
     /// (every channel trusted = today's behavior), and converts to
     /// the runtime set.
     #[test]
@@ -3198,7 +3198,7 @@ recovery:
         assert!(sa.untrusted_channel_set().unwrap().is_empty());
     }
 
-    /// C43 fail-closed: an entry naming an undeclared channel refuses
+    /// fail-closed: an entry naming an undeclared channel refuses
     /// to start, as do empty entries and duplicates.
     #[test]
     fn superagent_untrusted_channels_cross_reference_declared_channels() {
@@ -3233,7 +3233,7 @@ recovery:
     }
 
     // -----------------------------------------------------------------------
-    // C44: the lark channel wire layer
+    // the lark channel wire layer
     // -----------------------------------------------------------------------
 
     /// A lark channel declaration spliced into the golden fixture (the
@@ -3376,11 +3376,11 @@ recovery:
         assert_eq!(
             set,
             std::collections::BTreeSet::from(["lark".to_string()]),
-            "real channels are untrusted by default (C43+C44)"
+            "real channels are untrusted by default"
         );
 
         // Without any lark channel the runtime set equals the legacy
-        // configured set exactly (C43 behavior unchanged).
+        // configured set exactly (behavior unchanged).
         let plain = ServeConfig::parse(&superagent_yaml()).expect("golden parses");
         let sa = plain.superagent.as_ref().unwrap();
         assert!(sa.runtime_untrusted_set().unwrap().is_empty());
@@ -3399,7 +3399,7 @@ recovery:
         assert_eq!(worker.version, 7, "agent version is the pin");
     }
 
-    /// C36: the `classes:` wire layer parses, converts fail-closed to
+    /// the `classes:` wire layer parses, converts fail-closed to
     /// the bundle's table, resolves most-specific-wins through the
     /// converted form, and unknown spellings/undeclared channels
     /// refuse to start.
@@ -3496,8 +3496,8 @@ recovery:
 
     #[test]
     fn superagent_unknown_channel_type_is_rejected() {
-        // C44 note: the fixture originally used `lark` as the unknown
-        // type; lark is a real adapter now. C49 note: same story for
+        // note: the fixture originally used `lark` as the unknown
+        // type; lark is a real adapter now. note: same story for
         // `github` — the probe rides a still-unknown spelling so the
         // unknown-type arm keeps its subject.
         let err =
@@ -3511,7 +3511,7 @@ recovery:
     }
 
     // -------------------------------------------------------------------
-    // C48/C49: the github channel + webhook receiver wire layer
+    // the github channel + webhook receiver wire layer
     // -------------------------------------------------------------------
 
     /// A github channel declaration spliced into the golden fixture
@@ -3546,12 +3546,12 @@ recovery:
         assert_eq!(limits, crate::webhook::WebhookLimits::default());
 
         // The runtime config converts (receive-only needs no token)
-        // and is untrusted by construction (C43/C48, no opt-out).
+        // and is untrusted by construction (no opt-out).
         let runtime = github.to_runtime("github", None).expect("converts");
         assert!(runtime.untrusted);
         assert_eq!(runtime.token, None);
 
-        // C43: github-typed channels join the runtime untrusted set
+        // github-typed channels join the runtime untrusted set
         // automatically, like lark.
         let untrusted = sa.runtime_untrusted_set().unwrap();
         assert!(untrusted.contains("github"));
@@ -3750,7 +3750,7 @@ recovery:
         );
         let err = ServeConfig::parse(&yaml).unwrap_err();
         assert!(
-            err.to_string().contains("react-loop` is the Phase-1 loop"),
+            err.to_string().contains("react-loop` is the baseline loop"),
             "{}",
             err
         );
@@ -3785,8 +3785,8 @@ recovery:
     }
 
     #[test]
-    fn phase1_config_without_superagent_section_still_parses() {
-        // The round-1 fixture (no agents/superagent/endpoints keys at all)
+    fn baseline_config_without_superagent_section_still_parses() {
+        // The fixture (no agents/superagent/endpoints keys at all)
         // must parse identically — the additions are all optional.
         let cfg = ServeConfig::parse(&valid_yaml()).expect("phase-1 config");
         assert!(cfg.superagent.is_none());
@@ -3796,7 +3796,7 @@ recovery:
     }
 
     // ------------------------------------------------------------------
-    // C39: the speculation section
+    // the speculation section
     // ------------------------------------------------------------------
 
     #[test]
@@ -3874,7 +3874,7 @@ recovery:
     }
 
     // ------------------------------------------------------------------
-    // C58: the superagent.speak_rules section
+    // the superagent.speak_rules section
     // ------------------------------------------------------------------
 
     #[test]
@@ -3957,7 +3957,7 @@ recovery:
     }
 
     // ------------------------------------------------------------------
-    // C63: the superagent.policy section
+    // the superagent.policy section
     // ------------------------------------------------------------------
 
     #[test]
@@ -4015,7 +4015,7 @@ recovery:
     }
 
     // ------------------------------------------------------------------
-    // C60: the superagent.mandate section
+    // the superagent.mandate section
     // ------------------------------------------------------------------
 
     #[test]

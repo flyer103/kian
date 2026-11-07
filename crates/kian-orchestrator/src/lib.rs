@@ -13,11 +13,11 @@
 //! and are consumed through the seam traits in `kian_core::seams`.
 //!
 //! Modules:
-//! - [`engine`] — Admit → Wake → Drain → Promote (DESIGN §2.3, card C9)
-//! - [`wake`] — the foldable/losable pendingWake registry (card C9)
+//! - [`engine`] — Admit → Wake → Drain → Promote (DESIGN §2.3)
+//! - [`wake`] — the foldable/losable pendingWake registry
 //! - [`metrics`] — orchestrator counters: state transitions, drain
-//!   depth/duration, pendingWake traffic (card C9)
-//! - [`recovery`] — three-layer recovery (DESIGN §2.4, card C10)
+//!   depth/duration, pendingWake traffic
+//! - [`recovery`] — three-layer recovery (DESIGN §2.4)
 pub mod engine;
 pub mod metrics;
 pub mod recovery;

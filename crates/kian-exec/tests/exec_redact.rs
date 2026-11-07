@@ -1,4 +1,4 @@
-//! kian-77: remote-exec redaction acceptance — a command whose output
+//! remote-exec redaction acceptance — a command whose output
 //! carries a configured secret must persist **no** secret verbatim, not
 //! in the caller's result, not in the durable queue row (the ADR-007
 //! replay source), matching the local exec path's guarantees.
@@ -30,7 +30,7 @@ fn fast_backoff() -> BackoffConfig {
     }
 }
 
-/// The G4 leak, replayed through the real remote path: the endpoint's
+/// The leak, replayed through the real remote path: the endpoint's
 /// child inherits the server environment (the endpoint daemon and the
 /// test share one process here), prints the secret, and both the
 /// caller's result AND the durable queue row must come back redacted.
@@ -113,7 +113,7 @@ async fn remote_exec_output_and_durable_row_carry_no_secret() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// C69: the remote path's provenance report — the live dispatch
+/// the remote path's provenance report — the live dispatch
 /// attaches the report to the caller's result, the durable row carries
 /// it, and the deduped read-back (ADR-007 replay) still answers with
 /// the stored report (re-redaction of scrubbed bytes reports nothing,

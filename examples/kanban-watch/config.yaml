@@ -1,11 +1,11 @@
-# kian serve config — examples/kanban-watch (dogfood round 2)
+# kian serve config — examples/kanban-watch (dogfood)
 #
 # The kanban-watch dogfood: a TimerChannel ticks the resident Router; the
 # Router delegates polling and stage classification to fresh worker
-# sessions; everything lands in durable event streams under .state/kian.db.
+# sessions; everything lands in durable event streams under.state/kian.db.
 #
 # Credentials are env-only (never in this file):
-#   DRY_RUN          — "0" is the ONLY value that lets a worker write to
+#   DRY_RUN — "0" is the ONLY value that lets a worker write to
 #                      the watched board (reclaim/unblock/comment);
 #                      anything else = dry-run
 # The model provider is the LOCAL vadis gateway (127.0.0.1:8290,
@@ -85,7 +85,7 @@ superagent:
     router: false
     worker: false
 
-# The local vadis gateway, reached DIRECTLY. Wire dialect v2 (kian-61):
+# The local vadis gateway, reached DIRECTLY. Wire dialect v2:
 # dotless tool names, assistant `tool_calls` with string arguments —
 # vadis is a pass-through OpenAI-compatible endpoint and accepts it.
 providers:
@@ -102,7 +102,7 @@ tools:
 drain:
   max_iterations: 32
 
-# Required, no silent defaults (the C10 rule). Network hiccups on the
+# Required, no silent defaults (the rule). Network hiccups on the
 # model side back off once; anything unrecognized fails honestly.
 recovery:
   rules:

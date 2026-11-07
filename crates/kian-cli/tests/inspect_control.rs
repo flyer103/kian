@@ -1,4 +1,4 @@
-//! E2E acceptance for the C68 operator surface: `kian session inspect`
+//! E2E acceptance for the operator surface: `kian session inspect`
 //! shows the `pending control` line (and the
 //! `counters.pending_control_inputs` JSON key) for a session holding an
 //! unconsumed durable interrupt-intent row, and omits both otherwise.

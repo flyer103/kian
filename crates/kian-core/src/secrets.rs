@@ -1,7 +1,7 @@
-//! kian-77: exec secret hygiene — redaction of exec output and the child
-//! environment policy (C65 live finding G4, severity HIGH).
+//! exec secret hygiene — redaction of exec output and the child
+//! environment policy (live finding, severity HIGH).
 //!
-//! The C65 live run proved two facts about the exec surface:
+//! The live run proved two facts about the exec surface:
 //!
 //! 1. **Environment passthrough**: a worker that runs `env`/`printenv`
 //!    through the exec tool writes every server secret verbatim into
@@ -23,7 +23,7 @@
 //!   **only** the configured variables plus `DRY_RUN` (the example's
 //!   dry-run contract rides the environment); secrets never reach the
 //!   child in the first place. `Inherit` is today's behavior and stays
-//!   the config default (kian-77 compatibility clause).
+//!   the config default (compatibility clause).
 //!
 //! Redaction is belt-and-suspenders by design: the allowlist bounds what
 //! the child can *see*; the redactor bounds what the audit stream *keeps*
@@ -34,17 +34,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 /// The env var the example's dry-run contract rides on; always forwarded
-/// to allowlisted children when set in the parent (kian-77).
+/// to allowlisted children when set in the parent.
 pub const DRY_RUN_ENV: &str = "DRY_RUN";
 
 /// Placeholder substituted for a redacted secret value.
 pub const REDACTED: &str = "[REDACTED]";
 
 // ---------------------------------------------------------------------------
-// Redaction provenance (C69)
+// Redaction provenance
 // ---------------------------------------------------------------------------
 
-/// Which redaction pass produced a report entry (C69). The closed
+/// Which redaction pass produced a report entry. The closed
 /// vocabulary mirrors the [`SecretRedactor`] passes: known configured
 /// value / well-known token shape / secret-shaped env-dump line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,7 +114,7 @@ pub fn merge_redaction_reports<I: IntoIterator<Item = Redaction>>(reports: I) ->
 ///
 /// 1. **Known values** — the exact current value of every configured
 ///    secret env var (`[REDACTED:<NAME>]`). This is the precise fix for
-///    the G4 leak: the leaked bytes are exactly these values.
+///    the leak: the leaked bytes are exactly these values.
 /// 2. **Token patterns** — well-known token shapes (`ghp_`, `github_pat_`,
 ///    `sk-`, `xox?-`, AWS `AKIA…`) with conservative minimum lengths, so
 ///    unknown secrets of a known shape still never persist.
@@ -196,13 +196,13 @@ impl SecretRedactor {
 
     /// Returns `text` with every secret replaced by its placeholder.
     /// Byte-identical to the report path — this is exactly
-    /// [`Self::redact_with_report`] with the report discarded (C69).
+    /// [`Self::redact_with_report`] with the report discarded.
     #[must_use]
     pub fn redact(&self, text: &str) -> String {
         self.redact_with_report(text).0
     }
 
-    /// C69: [`Self::redact`] plus a provenance report — one
+    /// [`Self::redact`] plus a provenance report — one
     /// [`Redaction`] entry per (kind, name) with the number of
     /// redactions applied. The returned text is byte-identical to
     /// [`Self::redact`]; the report is aggregate counts only and never
@@ -270,7 +270,7 @@ fn is_token_char(c: char) -> bool {
 }
 
 /// Redacts well-known token shapes (`ghp_…`, `sk-…`, …) → `[REDACTED:token]`.
-/// C69: also reports one count per matched token prefix.
+/// also reports one count per matched token prefix.
 fn redact_token_patterns_with_report(text: &str) -> (String, ReportCounts) {
     let mut counts: ReportCounts = std::collections::BTreeMap::new();
     let mut bump = |prefix: &str| {
@@ -343,7 +343,7 @@ fn is_secret_shaped_name(name: &str) -> bool {
 /// Redacts the value half of secret-shaped `NAME=value` lines →
 /// `NAME=[REDACTED]`. Catches environment dumps of secrets the deployer
 /// never listed (defense in depth behind the known-value pass).
-/// C69: also reports one count per secret-shaped NAME.
+/// also reports one count per secret-shaped NAME.
 fn redact_env_lines_with_report(text: &str) -> (String, ReportCounts) {
     let mut counts: ReportCounts = std::collections::BTreeMap::new();
     let mut out = String::with_capacity(text.len());
@@ -379,7 +379,7 @@ fn redact_env_lines_with_report(text: &str) -> (String, ReportCounts) {
 // ExecEnvPolicy
 // ---------------------------------------------------------------------------
 
-/// What environment spawned exec children see (kian-77 fix ①).
+/// What environment spawned exec children see (fix ①).
 ///
 /// - `Inherit` — today's behavior: the child sees the full server
 ///   environment (the config default; compatibility clause).
@@ -554,7 +554,7 @@ mod tests {
         assert!(out.contains("ghp_abcdefghijklmnopqrstuvwx"));
     }
 
-    // -- C69: redaction provenance -------------------------------------------
+    // -- redaction provenance -------------------------------------------
 
     #[test]
     fn report_counts_all_three_kinds_and_text_matches_plain_redact() {

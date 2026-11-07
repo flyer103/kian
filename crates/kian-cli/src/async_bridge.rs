@@ -1,4 +1,4 @@
-//! The async-job completion bridge (card C37, ADR-008): the kian-cli
+//! The async-job completion bridge (ADR-008): the kian-cli
 //! assembly half of the async `start()`/`stop()` pattern.
 //!
 //! When a job settles, the [`kian_exec::AsyncJobs`] observer hands the
@@ -8,7 +8,7 @@
 //! 1. **admit** the result to the originating session's inbox as a
 //!    provenance-wrapped `{"kian":{"type":"async_result",…}}` content
 //!    envelope (the same content-embedding discipline as channel
-//!    provenance and the C21 endpoint-health payload — the frozen C4
+//!    provenance and the endpoint-health payload — the frozen
 //!    payload contract is untouched, and no new event kind exists);
 //! 2. **wake** the session, strictly after the row is durable.
 //!
@@ -219,7 +219,7 @@ pub fn session_for_call(store: EventStore) -> SessionForCall {
         let store = store.clone();
         let call_id = call_id.to_string();
         Box::pin(async move {
-            // C51: same lookup, per dialect — sqlite's json_extract vs
+            // same lookup, per dialect — sqlite's json_extract vs
             // pg's jsonb path. Both derive the answer purely from the
             // committed event log (constraint 1).
             let rows: Result<Vec<(String,)>, sqlx::Error> = match &store {

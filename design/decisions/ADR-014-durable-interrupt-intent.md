@@ -1,8 +1,8 @@
 # ADR-014: Durable interrupt intent — the `control/interrupt` event and the reserved control envelope
 
-- **Status**: draft (C68 / kian-80; append-only — ADR-001…013 immutable)
+- **Status**: draft (; append-only — ADR-001…013 immutable)
 - **Date**: 2026-11-07
-- **Context**: Round-7 plan §2.2/§3 card C68. Until now an `interrupt` RPC flipped an in-memory
+- **Context**: plan §2.2/§3. Until now an `interrupt` RPC flipped an in-memory
   flag on the draining replica: the intent died with the process (a crash between request and the
   next safe boundary silently dropped it) and never crossed replicas (an interrupt aimed at a
   session owned by another replica was a no-op `not_draining`). Kian's own vocabulary already has
@@ -23,7 +23,7 @@
    `Engine::interrupt` writes a reserved control-envelope inbox row —
    `{"kian":{"type":"control","action":"interrupt","reason":…,"requested_at_ms":…,
    "target_epoch":…}}`, an exact single-key row-level convention like the steer wrapper and the
-   C32 spill envelope before it — *in addition to* the in-memory flag when a local drain handle
+    spill envelope before it — *in addition to* the in-memory flag when a local drain handle
    exists. The row is idempotent per `interrupt:<session>:<target_epoch>`, so repeated RPCs in
    one episode dedupe to exactly one row. Idle/terminal sessions keep the exact
    `NotDraining`/`UnknownSession` behavior and admit nothing (invariant 5).
@@ -50,7 +50,7 @@
    - *takeover*: the targeted episode never settled — its owner died mid-episode and the
      taker is resuming that same unfinished work, which is precisely what the interrupt
      intended to stop.
-   This reconciles the two acceptance behaviors the round-7 plan demands (crash → takeover
+   This reconciles the two acceptance behaviors the plan demands (crash → takeover
    settles `interrupted`; a late row against a settled epoch does not end the new episode) under
    one decidable predicate: *did the target episode settle?* — derived purely from the event
    stream, never from scattered state (constraint 1).

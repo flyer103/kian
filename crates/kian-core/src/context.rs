@@ -55,9 +55,9 @@ pub struct Message {
 
 /// Named context-projection errors.
 ///
-/// Envelope discipline reuses [`ProjectionError`] (C3) so the two
+/// Envelope discipline reuses [`ProjectionError`] so the two
 /// projections cannot drift on envelope checks; payload and compact-range
-/// errors are C4's own.
+/// errors are 's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum ContextError {
     /// Envelope check failed (empty stream, non-monotone seq, foreign
@@ -98,7 +98,7 @@ pub enum ContextError {
 /// envelope or audit data — `step/request` is the A2 audit copy of a whole
 /// request, not a message, so it never re-enters the context.
 ///
-/// The C18 Phase-2 kinds are named *explicitly* in the skip branch: they
+/// The bundle kinds are named *explicitly* in the skip branch: they
 /// are lineage/audit/receipt data by contract, so a stream containing
 /// them derives exactly the context of the same stream without them.
 /// Skipping them is not silent inheritance of the catch-all — a future
@@ -109,19 +109,19 @@ fn is_context_bearing(kind: &EventKind) -> bool {
         | EventKind::AssistantMessage
         | EventKind::ToolCall
         | EventKind::ToolResult => true,
-        // C18 Phase-2 additions: non-context-bearing (thread lineage,
+        // bundle additions: non-context-bearing (thread lineage,
         // evidence verdicts, delivery receipts).
         EventKind::ThreadStarted
         | EventKind::ThreadCompleted
         | EventKind::EvidenceVerdict
         | EventKind::ChannelDelivered => false,
-        // C31 Phase-3 addition: the spilled raw is deliberately kept
+        // later addition: the spilled raw is deliberately kept
         // out of the model context — the Inline form carried by its
         // sibling `input/admitted` is what the model sees. Named here
-        // (not silently in the catch-all) per the C18 guard pattern: a
+        // (not silently in the catch-all) per the guard pattern: a
         // future context-bearing addition must edit this match.
         EventKind::InputSpilled => false,
-        // C68 addition: `control/interrupt` is drain-activity audit
+        // addition: `control/interrupt` is drain-activity audit
         // data (the durable interrupt intent), never a message — the
         // kind must not appear in a model request (constraint 3).
         EventKind::ControlInterrupt => false,
@@ -320,7 +320,7 @@ pub fn strip_synthetic(messages: &[Message]) -> Vec<Message> {
 /// `true`), object keys lexicographic (`serde_json::Map` is a `BTreeMap`;
 /// `preserve_order` must never be enabled). The same logical context
 /// always serializes to identical bytes — this is the basis of the A2
-/// golden-bytes tests, the C14 replay diff and the C17 prefix-hash
+/// golden-bytes tests, the replay diff and the prefix-hash
 /// comparison. Changing this form is a deliberate prefix-cache
 /// invalidation and a constraint-3 event.
 #[must_use]
@@ -552,13 +552,13 @@ mod tests {
         );
     }
 
-    /// C18: the four Phase-2 kinds are non-context-bearing — a stream
+    /// the four bundle kinds are non-context-bearing — a stream
     /// containing them derives a byte-identical context to the same
     /// stream without them (constraints 1 and 3: the additions are audit
     /// data, never a context mutation), and a stream containing *only*
     /// new kinds derives an empty context.
     #[test]
-    fn phase2_kinds_leave_model_context_unchanged() {
+    fn bundle_kinds_leave_model_context_unchanged() {
         let mut with = started();
         with.user("hello");
         with.push(
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(
             context_to_bytes(&ctx_with),
             context_to_bytes(&ctx_without),
-            "Phase-2 kinds must not change a single context byte"
+            "non-baseline kinds must not change a single context byte"
         );
 
         // A stream of only new kinds (on top of create/claim) is context
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(derive_model_context(&only_new.build()).unwrap(), Vec::new());
     }
 
-    /// C31: `input/spilled` is non-context-bearing — a stream containing
+    /// `input/spilled` is non-context-bearing — a stream containing
     /// it derives a byte-identical context to the same stream without it
     /// (the spilled raw is audit data for the recall path, never a
     /// context mutation; the Inline form in its sibling
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(ctx, vec![user_msg("q")]);
     }
 
-    /// C68: `control/interrupt` is non-context-bearing — a stream
+    /// `control/interrupt` is non-context-bearing — a stream
     /// containing it derives a byte-identical context (and request
     /// bytes) to the same stream without it, whatever position it sits
     /// at and whatever its payload shape (constraint 3: the durable
@@ -769,7 +769,7 @@ mod tests {
 
     /// A2 golden-bytes: the same stream yields byte-identical context on
     /// first pass, on rebuild, and on replay-from-export (each event
-    /// serialized to JSONL and re-parsed, the C14 export shape).
+    /// serialized to JSONL and re-parsed, the export shape).
     #[test]
     fn golden_bytes_first_pass_rebuild_and_replay_from_export() {
         let mut b = started();
@@ -941,8 +941,8 @@ mod tests {
         b.user("A"); // seq 2
         b.assistant(json!("B")); // seq 3
         b.user("C"); // seq 4
-        b.compact(2, 4, "S1"); // seq 5
-        let at = b.compact(3, 5, "S2"); // seq 6, overlaps [2,4)
+        b.compact(2, 4, "seg1"); // seq 5
+        let at = b.compact(3, 5, "seg2"); // seq 6, overlaps [2,4)
         assert_eq!(
             derive_model_context(&b.build()),
             Err(ContextError::OverlappingCompactRange {

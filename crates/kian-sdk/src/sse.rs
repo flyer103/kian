@@ -1,6 +1,6 @@
-//! The C13 `events` SSE helper: `GET {base}/sessions/{id}/events`.
+//! The `events` SSE helper: `GET {base}/sessions/{id}/events`.
 //!
-//! The stream frames exactly three event names (per the frozen C13
+//! The stream frames exactly three event names (per the frozen
 //! contract): `kian` (one session event, serialized JSON), `done` (the
 //! session ended — the server freezes the stream), and `error` (the
 //! read failed; data is the message). Keep-alive comment frames are
@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::error::ClientError;
 use crate::transport::KianClient;
 
-/// One parsed frame of the C13 SSE event stream.
+/// One parsed frame of the SSE event stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SseFrame {
     /// `event: kian` — one session event (`data` is its JSON).
@@ -102,7 +102,7 @@ impl futures::Stream for SseFrames {
                         "sse body: {e}"
                     )))));
                 }
-                // Server closed the stream; per C13 that follows
+                // Server closed the stream; per that follows
                 // `done`/`error` — the stream simply ends.
                 None => return std::task::Poll::Ready(None),
             }
@@ -151,7 +151,7 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
                 saw_field = true;
             }
             // `id:` / `retry:` and any future field are not part of the
-            // C13 contract; ignoring them is additive-safe.
+            // contract; ignoring them is additive-safe.
             _ => {}
         }
     }
@@ -159,7 +159,7 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
         return Ok(None);
     }
     let Some(event) = event else {
-        // Data-only frame (default `message` event): not part of C13.
+        // Data-only frame (default `message` event): not part of.
         return Ok(None);
     };
     match event.as_str() {
@@ -170,7 +170,7 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
         "done" => Ok(Some(SseFrame::Done)),
         "error" => Ok(Some(SseFrame::Error(data))),
         other => Err(ClientError::Malformed(format!(
-            "unknown sse event `{other}` (C13 set: kian, done, error)"
+            "unknown sse event `{other}` (frozen set: kian, done, error)"
         ))),
     }
 }
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(frame_boundary(b"no terminator yet"), None);
     }
 
-    /// Keep-alive comments are skipped; the three C13 frames parse;
+    /// Keep-alive comments are skipped; the three frames parse;
     /// unknown names and bad JSON are honest errors.
     #[test]
     fn parse_frame_handles_the_c13_set() {
@@ -213,7 +213,7 @@ mod tests {
         assert!(parse_frame(b"event: surprise\ndata: x\n\n").is_err());
         assert!(parse_frame(b"event: kian\ndata: not-json\n\n").is_err());
 
-        // Data-only frame (default event) is not C13 — skipped.
+        // Data-only frame (default event) is not — skipped.
         assert_eq!(parse_frame(b"data: hello\n\n").ok(), Some(None));
     }
 }

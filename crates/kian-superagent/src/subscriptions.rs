@@ -1,4 +1,4 @@
-//! The subscription service (card C23): consume `ChannelEvent` streams
+//! The subscription service: consume `ChannelEvent` streams
 //! from registered [`ChannelAdapter`]s, evaluate the declarative rule
 //! set, admit a provenance-wrapped input to the routed target — the row
 //! durable **before** the wake fires (invariant 1) — then wake it.
@@ -6,7 +6,7 @@
 //! Routing (DESIGN §4.1): `router` rules admit to the configured
 //! resident Router session; `passthrough` rules correlate the event's
 //! topic through [`PassthroughRegistry`], admitting straight into the
-//! owning worker's inbox without Router judgment. Since C38 the
+//! owning worker's inbox without Router judgment. Since the
 //! registry is many-to-many: **one row per subscriber** is admitted
 //! (idempotent per `(session, event_id)` — the store's dedupe index is
 //! per-session), so workers sharing a topic observe each other's
@@ -18,30 +18,30 @@
 //! Router judges the first event of an unknown topic and the spawner
 //! binds the worker; both transitions leave an audit log line).
 //!
-//! C59 (follow-up ownership): fan-out admits to **live** subscribers
+//! (follow-up ownership): fan-out admits to **live** subscribers
 //! only — the registry's liveness projection filters ended workers out
 //! of the admission set, so an event never strands on a terminal
 //! session. A topic whose subscribers have *all* ended falls back to
 //! the Router as a **release to fresh evaluation** (002's Ticket-end
 //! rule), audited with the closed `released_to_eval` reason code and
 //! naming the released topic. Config-gated by
-//! `superagent.followup_ownership` (default on); off restores the
-//! pre-C59 behavior (every historical subscriber admits).
+//! `superagent.followup_ownership` (default ); off restores the
+//! legacy behavior (every historical subscriber admits).
 //!
-//! C60 (ADR-012 mandate revalidation): before a follow-up admits to a
+//! (ADR-012 mandate revalidation): before a follow-up admits to a
 //! live subscriber, its mandate is revalidated — `strength: explicit`
 //! passes; `inferred` passes while its `policy_version` is still the
-//! current pointer (`superagent.policy.version`, C63). A released
+//! current pointer (`superagent.policy.version`). A released
 //! worker drops out of the admission set with an honest audit line
 //! (`released_to_eval`), and a set emptied entirely by releases is the
 //! same release-to-fresh-eval as an all-ended topic. Legacy workers
-//! (no mandate object) always pass — pre-C60 authority is never
+//! (no mandate object) always pass — legacy authority is never
 //! retroactively narrowed.
 //!
 //! Events matching no rule are dropped with an audit log line and no
 //! inbox row — an honest no-op, never a silent swallow.
 //!
-//! C57: every drop/admit audit line stamps a machine-stable
+//! every drop/admit audit line stamps a machine-stable
 //! `reason=<code>` from the closed [`crate::reasons::IntakeReason`]
 //! vocabulary (single source of truth: the admit lines and the
 //! assembly counters both render through
@@ -76,18 +76,18 @@ pub enum RoutingOutcome {
         session: SessionId,
         deduplicated: bool,
     },
-    /// Fan-out (C38): the event was admitted to every subscriber of
+    /// Fan-out: the event was admitted to every subscriber of
     /// the passthrough topic — one record per durable row, in
     /// subscriber-set (sorted) order. Returned only for sets of two or
     /// more.
     FannedOut { admitted: Vec<FanoutAdmission> },
     /// No rule matched: audit-logged, no inbox row, no wake.
     DroppedNoRule,
-    /// C36 admission class `ignore`: the event's provenance resolved
+    /// admission class `ignore`: the event's provenance resolved
     /// to Ignore — audit-logged and counted, no inbox row, no wake,
     /// decided before the rule set and before any model call.
     DroppedIgnored,
-    /// C36 admission class `explicit-only` without an explicit-request
+    /// admission class `explicit-only` without an explicit-request
     /// signal (no @-mention, no adapter-declared `explicit: true`):
     /// audit-logged and counted, no inbox row, no wake.
     DroppedNotExplicit,
@@ -108,7 +108,7 @@ pub struct FanoutAdmission {
 /// Holds the passthrough registry behind a lock: it is runtime-mutable
 /// (the spawner registers workers) yet disposable — a restart replaces
 /// it wholesale with the projection rebuilt from event streams
-/// ([`SubscriptionService::install_registry`]). Since C59 the lock
+/// ([`SubscriptionService::install_registry`]). Since the lock
 /// lives behind a shared `Arc` ([`SubscriptionService::shared_registry`])
 /// so the Router's tool surface (the `spawn_worker` ownership check)
 /// and the fan-out path read the *same* projection — one ownership
@@ -118,25 +118,25 @@ pub struct SubscriptionService {
     rules: SubscriptionRuleSet,
     classes: AdmissionClassTable,
     shaping: ShapingConfig,
-    /// C43: channels whose events wrap with the untrusted bit. Empty
+    /// channels whose events wrap with the untrusted bit. Empty
     /// (the default) marks nothing — every wrapper stays byte-for-byte
     /// the legacy form.
     untrusted_channels: std::collections::BTreeSet<String>,
-    /// C59: the follow-up-ownership gate (`superagent.followup_ownership`,
-    /// default on). On, fan-out admits to live subscribers only and an
+    /// the follow-up-ownership gate (`superagent.followup_ownership`,
+    /// default ). On, fan-out admits to live subscribers only and an
     /// all-ended set releases the topic to the Router (fresh Eval);
-    /// off, every historical subscriber admits — the pre-C59 behavior.
+    /// off, every historical subscriber admits — the legacy behavior.
     followup_ownership: bool,
-    /// C60 (ADR-012): the current policy-version pointer (the C63
+    /// (ADR-012): the current policy-version pointer (the
     /// label, `superagent.policy.version`) the live-subscriber
     /// revalidation compares each mandate against. `None` (the
     /// default) is the honest `none` label: an unversioned deployment
     /// never releases on version drift, and a `none`-stamped mandate
     /// matches it.
     policy_pointer: Option<String>,
-    /// C61/ADR-013: the configured thread-key derivations
+    /// /ADR-013: the configured thread-key derivations
     /// (`superagent.intake.thread_keys`). Correlation is context
-    /// only: the derived key surfaces in the C33 Inline `neighbors`
+    /// only: the derived key surfaces in the Inline `neighbors`
     /// block (`thread_key`) so the Router and workers reach sibling
     /// threads through the recall toolpack — it never routes (the
     /// subscription rules stay topic-keyed; a poll-mode adapter's
@@ -168,7 +168,7 @@ impl SubscriptionService {
         }
     }
 
-    /// [`SubscriptionService::new`] plus the C36 admission-class
+    /// [`SubscriptionService::new`] plus the admission-class
     /// table: the provenance-keyed Fast Path evaluated **before** the
     /// rule set. An empty table is exactly `new` (today's behavior).
     pub fn with_classes(
@@ -191,15 +191,15 @@ impl SubscriptionService {
         }
     }
 
-    /// Sets the C59 follow-up-ownership gate (`superagent.followup_ownership`,
-    /// default on). `false` restores the pre-C59 behavior: the fan-out
+    /// Sets the follow-up-ownership gate (`superagent.followup_ownership`,
+    /// default ). `false` restores the legacy behavior: the fan-out
     /// admission set is every historical subscriber, live or ended.
     pub fn with_followup_ownership(mut self, enabled: bool) -> Self {
         self.followup_ownership = enabled;
         self
     }
 
-    /// Sets the C60 current policy-version pointer
+    /// Sets the current policy-version pointer
     /// (`superagent.policy.version`): the label the live-subscriber
     /// mandate revalidation compares against on every follow-up
     /// (ADR-012: `explicit` passes; `inferred` passes only while its
@@ -210,7 +210,7 @@ impl SubscriptionService {
         self
     }
 
-    /// Shares the registry (C59): the handle returned here is the one
+    /// Shares the registry: the handle returned here is the one
     /// this service reads and writes — installing it into the Router's
     /// tool surface gives both sides one ownership projection. A
     /// startup [`SubscriptionService::install_registry`] through either
@@ -219,7 +219,7 @@ impl SubscriptionService {
         Arc::clone(&self.registry)
     }
 
-    /// Adopts an already-shared registry handle (C59 assembly wiring):
+    /// Adopts an already-shared registry handle (assembly wiring):
     /// after this the service and every other holder of the Arc read
     /// and write one projection. Call before any
     /// [`SubscriptionService::shared_registry`] handle is taken, so no
@@ -229,7 +229,7 @@ impl SubscriptionService {
         self
     }
 
-    /// Runtime transition of the C59 liveness projection: marks a
+    /// Runtime transition of the liveness projection: marks a
     /// worker's stream ended. The topic sets keep the worker as a
     /// historical subscriber; the fan-out live view drops it.
     pub fn mark_worker_ended(&self, worker: SessionId) {
@@ -239,14 +239,14 @@ impl SubscriptionService {
             .mark_ended(worker);
     }
 
-    /// Sets the C33 admission-time shaping policy. The default (infinite
+    /// Sets the admission-time shaping policy. The default (infinite
     /// cap) is byte-identical to the legacy single-row wrapper.
     pub fn with_shaping(mut self, shaping: ShapingConfig) -> Self {
         self.shaping = shaping;
         self
     }
 
-    /// Sets the C43 untrusted-channel list (prompt-injection
+    /// Sets the untrusted-channel list (prompt-injection
     /// hygiene): events from these channels admit with
     /// `"untrusted": true` inside the wrapper's `content`. Honest
     /// labeling only — routing, classes and rules are unchanged.
@@ -255,7 +255,7 @@ impl SubscriptionService {
         self
     }
 
-    /// Sets the C61 thread-key derivations
+    /// Sets the thread-key derivations
     /// (`superagent.intake.thread_keys`): the derived key of an
     /// over-cap (spilled) event surfaces in its Inline `neighbors`
     /// block as `thread_key` recall context. Context only — never a
@@ -271,7 +271,7 @@ impl SubscriptionService {
     }
 
     /// Runtime registration of a passthrough binding (the worker
-    /// spawner, C25). Restart-equivalent state comes from
+    /// spawner). Restart-equivalent state comes from
     /// [`SubscriptionService::install_registry`] instead.
     pub fn register_topic(&self, topic: impl Into<String>, worker: SessionId) {
         self.registry
@@ -308,7 +308,7 @@ impl SubscriptionService {
         &self,
         event: ChannelEvent,
     ) -> Result<RoutingOutcome, InboxWriteError> {
-        // C36 Fast Path first: the admission class over provenance
+        // Fast Path first: the admission class over provenance
         // decides in code, before the rule set and before any model
         // call could be spent. `Candidate` (and an absent table) falls
         // through unchanged; both drop shapes are honest no-ops —
@@ -354,14 +354,14 @@ impl SubscriptionService {
         // The subscriber set for the matched rule. `router` routes (and
         // the empty-set fallback) are the single target; passthrough
         // resolves the topic's set — zero (fallback), one, or many.
-        // `session` (C40) pins the event to one config-addressed fixed
+        // `session` pins the event to one config-addressed fixed
         // session — the timer's ticks reach the watchdog this way.
-        // C59: with follow-up ownership on (the default), the
+        // with follow-up ownership on (the default), the
         // admission set is the *live* subscriber set — an all-ended
         // topic releases to the Router as a fresh evaluation
         // (`released_to_eval`), the bootstrap-empty fallback keeps its
         // `admitted_router` shape.
-        // C60 (ADR-012): each live subscriber's mandate is
+        // (ADR-012): each live subscriber's mandate is
         // revalidated under the same lock — `explicit` passes,
         // `inferred` passes while its `policy_version` is the current
         // pointer, and a release drops the worker from the admission
@@ -405,7 +405,7 @@ impl SubscriptionService {
                 match resolution {
                     Some((live, historical, released)) if !historical.is_empty() => {
                         if self.followup_ownership {
-                            // C60: the honest release audit — one line
+                            // the honest release audit — one line
                             // per released worker, naming the stale
                             // version and the closed reason code.
                             for (worker, from_version) in &released {
@@ -423,8 +423,8 @@ impl SubscriptionService {
                                 );
                             }
                             if live.is_empty() {
-                                // Release to fresh evaluation (C59, 002's
-                                // Ticket-end rule; C60 adds the mandate
+                                // Release to fresh evaluation (002's
+                                // Ticket-end rule; adds the mandate
                                 // path into the same release): every
                                 // live subscriber is gone — ended, or
                                 // released by revalidation — the
@@ -469,13 +469,13 @@ impl SubscriptionService {
             }
         };
 
-        // C33: shape exactly once here, before any inbox row exists.
-        // Committed events are never re-read or re-shaped. C43: the
+        // shape exactly once here, before any inbox row exists.
+        // Committed events are never re-read or re-shaped. The
         // untrusted bit is decided by channel config at this same
         // pre-admission point — labeling, never filtering.
         let untrusted = self.untrusted_channels.contains(&event.channel);
         let mut payload = shape_channel_input_marked(&event, &self.shaping, untrusted);
-        // C61 (ADR-013): correlation is context only — the derived
+        // (ADR-013): correlation is context only — the derived
         // thread key joins the over-cap Inline `neighbors` block for
         // recall hops. An under-cap wrapper carries the raw verbatim
         // (no neighbors block to stamp); an empty config stamps
@@ -504,7 +504,7 @@ impl SubscriptionService {
             {
                 Ok(receipt) => {
                     self.inbox.wake(target);
-                    // C57: the admit line's code comes from the same
+                    // the admit line's code comes from the same
                     // mapping the assembly counters use — audit and
                     // metrics cannot disagree.
                     let reason = routed_reason(target, self.router_session, receipt.deduplicated);
@@ -799,7 +799,7 @@ mod tests {
         let mut rebuilt = PassthroughRegistry::new();
         rebuilt.register("pr-9", worker);
         service.install_registry(rebuilt);
-        // C38: resolve returns the subscriber set (singleton here).
+        // resolve returns the subscriber set (singleton here).
         assert_eq!(
             service.registry_snapshot().resolve("pr-9"),
             std::collections::BTreeSet::from([worker])
@@ -818,8 +818,8 @@ mod tests {
         assert_eq!(service.router_session(), router);
     }
 
-    /// C38-only port: per-`(session, event_id)` dedup plus a mutable
-    /// single-subscriber failure, leaving the Phase-2 `ScriptedInbox`
+    /// -only port: per-`(session, event_id)` dedup plus a mutable
+    /// single-subscriber failure, leaving the bundle `ScriptedInbox`
     /// fixture unchanged.
     struct FanoutInbox {
         admits: Mutex<Vec<(SessionId, Option<String>)>>,
@@ -881,7 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_admits_one_durable_row_per_subscriber() {
-        // C38: one topic, two registered workers — one event admits one
+        // one topic, two registered workers — one event admits one
         // row per subscriber (same event id key, per session), each
         // with its own wake, in deterministic set order; a single
         // registered worker keeps the Routed outcome (asserted above).
@@ -926,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_partial_failure_still_admits_and_wakes_the_others() {
-        // C38 retry semantics: subscriber A's admit fails mid-set — the
+        // retry semantics: subscriber A's admit fails mid-set — the
         // loop continues, B's row is durable and B wakes, A never
         // wakes, and the error surfaces for the adapter's idempotent
         // retry (which then admits only A's missing row).
@@ -976,7 +976,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C59: follow-up ownership — live-only fan-out + release fallback
+    // follow-up ownership — live-only fan-out + release fallback
     // -----------------------------------------------------------------
 
     /// A follow-up on a topic with one live subscriber admits to that
@@ -1064,7 +1064,7 @@ mod tests {
         );
     }
 
-    /// `superagent.followup_ownership: false` restores the pre-C59
+    /// `superagent.followup_ownership: false` restores the legacy
     /// behavior: every historical subscriber — ended or not — admits.
     #[tokio::test]
     async fn ownership_off_restores_ended_subscriber_admission() {
@@ -1089,7 +1089,7 @@ mod tests {
         );
     }
 
-    /// The shared-registry handle (C59 assembly wiring): the service
+    /// The shared-registry handle (assembly wiring): the service
     /// and an outside holder observe one projection — a registration
     /// through the service is visible through the Arc, and a startup
     /// `install_registry` through the service reaches the Arc holder.
@@ -1118,10 +1118,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C43: untrusted-input marking end-to-end through the service
+    // untrusted-input marking end-to-end through the service
     // -----------------------------------------------------------------
 
-    /// C43-only port: records the admitted payload bytes (the Phase-2
+    /// -only port: records the admitted payload bytes (the bundle
     /// `ScriptedInbox` fixture discards them and stays untouched).
     struct MarkingInbox {
         payloads: Mutex<Vec<(SessionId, Value)>>,
@@ -1234,7 +1234,7 @@ mod tests {
     }
 
     /// The default service (no list configured) marks nothing — the
-    /// pre-C43 behavior, byte-for-byte.
+    /// legacy behavior, byte-for-byte.
     #[tokio::test]
     async fn absent_untrusted_config_is_byte_identical_to_legacy() {
         let inbox = MarkingInbox::new();
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     /// Over-cap + listed channel: the Inline view carries the bit and
-    /// the spill sidecar stays the exact C32 shape with the raw
+    /// the spill sidecar stays the exact shape with the raw
     /// verbatim (the marker rides content only).
     #[tokio::test]
     async fn over_cap_untrusted_event_marks_the_inline_view_and_keeps_the_sidecar_verbatim() {
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C40: the session route
+    // the session route
     // -----------------------------------------------------------------
 
     /// A `Route::Session` rule admits to the configured fixed session

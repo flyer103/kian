@@ -1,9 +1,9 @@
-//! C63: policy/prompt versioning + drift marking.
+//! policy/prompt versioning + drift marking.
 //!
 //! Prompts and policy rules are unversioned config today; the prototype
 //! versions the Policy (rules + accept mode + source parts, 001/007) and
 //! marks overridden defaults "default updated" on upgrade. Kian's v1
-//! shape, zero new event kinds (round-6 §2):
+//! shape, zero new event kinds (§2):
 //!
 //! - **Version** — a [`PolicyVersion`] is a label plus the sha256
 //!   fingerprints of the prompt templates it was rendered from. The
@@ -44,7 +44,7 @@ use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 
 /// Display label for "no policy header" in drift records, audit lines
 /// and marker keys (`[policy none→v2]`). Stable — it is part of the
-/// marker idempotency key, so it never changes spelling after C63.
+/// marker idempotency key, so it never changes spelling after.
 pub const NO_POLICY_LABEL: &str = "none";
 
 // ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ pub fn with_policy_header(label: Option<&str>, rendered: String) -> String {
 }
 
 /// Extracts the label from a persisted prompt's `[policy <label>]`
-/// header, if any. `None` for legacy prompts (pre-C63 bootstraps carry
+/// header, if any. `None` for legacy prompts (legacy bootstraps carry
 /// no header — honestly reported as [`NO_POLICY_LABEL`] by
 /// [`DriftRecord::persisted_label`], never guessed).
 #[must_use]

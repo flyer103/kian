@@ -1,13 +1,13 @@
-# ADR-010: The S6 dsh mapping contract — harness events onto the existing Kian kind set
+# ADR-010: The dsh mapping contract — harness events onto the existing Kian kind set
 
-- **Status**: accepted for the contract (C53 lands the mapping module + conformance
-  fixture; C54 implements the `kian-dsh` bridge driver against it)
+- **Status**: accepted for the contract ( lands the mapping module + conformance
+  fixture; implements the `kian-dsh` bridge driver against it)
 - **Date**: 2026-11-01
-- **Context**: SPEC S6 and DESIGN §16 pin the S6 shape as a *mapping protocol*
+- **Context**: SPEC and DESIGN §16 pin the shape as a *mapping protocol*
   between dsh session-log semantics and the Kian EventStore — "harness events → a
-  Kian durable-event subset". The round-4 additions-only contract adds **zero**
+  Kian durable-event subset". The additions-only contract adds **zero**
   event kinds, so the mapping must select from the existing twenty; the two
-  closest calls were pre-recorded in the round-4 plan §2. The bridge itself (C54)
+  closest calls were pre-recorded in the plan §2. The bridge itself 
   drives a `dsh --profile sdk` child over stdio; any dsh-side plugin (the
   `dsh-superagent-prototype` lineage, ecosystem-owned, outside this repo) must
   satisfy this contract to be kian-compatible.
@@ -21,7 +21,7 @@
      | dsh durable kind | kian kind | payload rule |
      |---|---|---|
      | `user/message` | `input/admitted` | `{"role":"user","content":<verbatim>}` (+ `synthetic` when the peer marks an injected message) |
-     | `system/message` | `input/admitted` | `{"role":"system","content":<verbatim>}` — **closest call #1**: legal under the frozen C4 message contract (any non-empty role) and honest: it *is* an admitted input |
+     | `system/message` | `input/admitted` | `{"role":"system","content":<verbatim>}` — **closest call #1**: legal under the frozen message contract (any non-empty role) and honest: it *is* an admitted input |
      | `assistant/message` | `assistant/message` | `{"role":"assistant","content":<assembled content verbatim>}` |
      | `assistant/attempt` | `step/request` | the attempt's assembled request bytes ride `body` verbatim; the envelope's `slot`/`provider`/`model`/`iteration` come from the bridge session's binding. An attempt with no following `assistant/message` **is** the honest failure trace — **closest call #2**, no `attempt/*` kind exists |
      | `tool/call` | `tool/call` | `{"role":"assistant","content":{"id","name","arguments"}}` (the loop's log-before-execute shape) |
@@ -62,7 +62,7 @@
 
 - **Alternatives considered**:
   1. New `attempt/*`, `harness/*` or `generation/*` event kinds — rejected: the
-     round-4 additions-only contract is empty, and every fact in the table is
+      additions-only contract is empty, and every fact in the table is
      expressible with existing kinds; a mapped session must replay through the
      *unmodified* `derive_model_context`, which the conformance fixture asserts.
   2. Mapping dsh `turn/*` onto Kian `turn/*` and folding steps away — rejected:
@@ -74,17 +74,17 @@
      rejected: it puts foreign authoritative state inside the Kian stream
      (constraint 1) and breaks byte-stable replay (constraint 3).
   4. A post-hoc request logger when the peer cannot emit pre-flight bytes —
-     rejected by the card and by constraint 2: an honest documented stop beats a
+     rejected by this decision and by constraint 2: an honest documented stop beats a
      best-effort audit.
-- **Consequences**: the contract is provable without Node/dsh — the C53
+- **Consequences**: the contract is provable without Node/dsh — the 
   conformance fixture (`dsh-fixture-peer` + scripted JSONL) runs in default CI
   and pins both mapping directions, the steer/interrupt translation, the
   ordering rule and the honest-error discipline; the live `KIAN_DSH_BIN` smoke
-  (C54) is env-gated and CI-excluded. Mapped payloads must keep riding the
+   is env-gated and CI-excluded. Mapped payloads must keep riding the
   frozen payload shapes the built-in loop emits (verified byte-for-byte by the
   fixture's A2-style context assert).
 - **Rollback Trigger**: a dsh-side contract amendment (new kinds, new frames)
   that cannot be expressed additively — the mapping table is then renegotiated
-  in a new plan round, not patched in place.
+  in a new design decision, not patched in place.
 - **Cost Impact**: zero new infrastructure, zero core-crate changes; one
   pure module + fixture scripts in the bundle.

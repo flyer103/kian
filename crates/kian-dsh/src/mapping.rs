@@ -1,10 +1,10 @@
-//! The S6 dsh mapping contract (ADR-010, DESIGN §16) — harness session-log
+//! The dsh mapping contract (ADR-010, DESIGN §16) — harness session-log
 //! semantics translated onto the existing Kian durable-event subset.
 //!
-//! This module is *the contract*, not the bridge: C54's driver embeds it, and
+//! This module is *the contract*, not the bridge: 's driver embeds it, and
 //! any dsh-side plugin (the `dsh-superagent-prototype` lineage, ecosystem-
 //! owned, outside this repo) must satisfy it to be kian-compatible. It is
-//! bundle-level by design (card C53): the `kian-core` kind set and
+//! bundle-level by design: the `kian-core` kind set and
 //! [`kian_core::context::derive_model_context`] are untouched — the mapping
 //! only *selects* existing kinds and shapes their payloads exactly as the
 //! built-in loop already does.
@@ -378,8 +378,8 @@ impl DshMapper {
     }
 
     /// `user/message` / `system/message` → `input/admitted` with the
-    /// frozen message payload (`role` any non-empty string — the C4
-    /// contract the closest call #1 relies on). A `synthetic: true`
+    /// frozen message payload (`role` any non-empty string — the
+    /// contract the closest call #1 relies ). A `synthetic: true`
     /// marker on the dsh event (an injected steer message) rides through
     /// so replay can strip it (A6).
     fn map_input(&self, ev: &DshEvent, role: &str) -> Result<Mapped, ContractError> {
@@ -554,7 +554,7 @@ impl DshMapper {
 
 /// The bridge-side half of a peer session: enforces the frame protocol
 /// (ready-first, logical-format declaration) around [`DshMapper`]. This is
-/// the piece C54's driver embeds; it performs no I/O — lines in, mapping
+/// the piece 's driver embeds; it performs no I/O — lines in, mapping
 /// results out, honest errors instead of best-effort behavior.
 #[derive(Debug, Clone)]
 pub struct PeerSession {
@@ -572,7 +572,7 @@ impl PeerSession {
 
     /// Accepts one wire line from the peer. `Ok(None)` covers the `ready`
     /// handshake and explicitly-absorbed episode events; every mapped kian
-    /// event comes back as `Ok(Some(Mapped::Event { .. }))`, ready to ride
+    /// event comes back as `Ok(Some(Mapped::Event {.. }))`, ready to ride
     /// the ordinary fenced append path (the drain stays the sole writer).
     pub fn accept_line(&mut self, line: &str) -> Result<Option<Mapped>, ContractError> {
         match parse_peer_frame(line)? {
@@ -603,7 +603,7 @@ impl PeerSession {
 }
 
 //
-// C54 driver accessors (additive; the mapping semantics are unchanged)
+// driver accessors (additive; the mapping semantics are unchanged)
 //
 impl PeerSession {
     /// Whether a dsh step is currently open (a `step/start` without

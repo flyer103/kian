@@ -1,12 +1,12 @@
-//! Operational plane (card C14 + the C27 `mock_channel_send` demo
+//! Operational plane (+ the `mock_channel_send` demo
 //! injection): the server surface behind `kian wake-now`,
 //! `kian recovery budget reset` and `kian mock-channel-send`.
 //!
 //! This module is deliberately **separate** from [`crate::api`] (the
-//! C13 control plane): the control plane obeys the layered iron rule —
+//! control plane): the control plane obeys the layered iron rule —
 //! inbox writes and projection reads only — while these are explicit
 //! *operator* actions (trigger a wake; append a recovery-budget-reset
-//! event; inject a demo event onto a configured mock channel). The C13
+//! event; inject a demo event onto a configured mock channel). The
 //! wire and its semantics are untouched; the ops lane mounts at
 //! `POST /ops/rpc` and mirrors the same structural discipline: handlers
 //! speak JSON and call **nothing but** the [`OpsPlane`] trait — no
@@ -22,7 +22,7 @@
 //!   `{"seq": u64, "epoch": u64, "ts": u64}` — the appended
 //!   `recovery/budget-reset` event's position. The reset is an explicit
 //!   event; there is no silent counter wipe.
-//! - `mock_channel_send {channel, topic?, payload}` (C27, demo/S4
+//! - `mock_channel_send {channel, topic?, payload}` (demo/
 //!   injection; DESIGN §5 note) → `{"event_id", "channel", "topic?}` —
 //!   one event onto the named mock channel; the subscription engine
 //!   routes it per the configured rules.
@@ -57,8 +57,8 @@ pub trait OpsPlane: Send + Sync {
         reason: Option<String>,
     ) -> BoxFuture<'_, Result<ResetReceipt, OpsError>>;
 
-    /// Inject one demo event onto a configured mock channel (C27, the
-    /// S4 stand-in path). The subscription engine routes it per the
+    /// Inject one demo event onto a configured mock channel (the
+    /// stand-in path). The subscription engine routes it per the
     /// configured rules — this method only hands the event to the
     /// channel.
     fn mock_channel_send(
@@ -95,7 +95,7 @@ pub struct ResetReceipt {
     pub ts: u64,
 }
 
-/// Receipt of a demo channel injection (C27).
+/// Receipt of a demo channel injection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockSendReceipt {
     /// The injected event's id (the subscription admit's idempotency
@@ -141,7 +141,7 @@ struct AppState {
     plane: Arc<dyn OpsPlane>,
 }
 
-/// Builds the C14 operational router (`POST /ops/rpc`).
+/// Builds the operational router (`POST /ops/rpc`).
 pub fn router(plane: Arc<dyn OpsPlane>) -> Router {
     Router::new()
         .route("/ops/rpc", post(rpc))

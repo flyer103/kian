@@ -1,7 +1,7 @@
-//! `RemoteExecTool` — remote exec as a model-visible tool (card C20).
+//! `RemoteExecTool` — remote exec as a model-visible tool.
 //!
 //! Implements [`ToolProvider`] with the **same `exec` tool schema as the
-//! local built-in** (kian-loop C11), so a worker's model sees one uniform
+//! local built-in** (kian-loop), so a worker's model sees one uniform
 //! exec interface whether it runs locally or on a `kiand` endpoint. The
 //! difference is entirely in routing: `invoke` derives the durable command
 //! id deterministically from the calling tool-call id and goes through
@@ -86,7 +86,7 @@ impl ToolProvider for RemoteExecTool {
             let tool_call_ref = call_id.clone();
             // Result shape mirrors the local built-in exec tool exactly:
             // execution failures are honest `is_error` outputs, never fake
-            // successes (constraint 7). C69: the redaction provenance
+            // successes (constraint 7). The redaction provenance
             // report from the settlement pass rides the ToolResult; the
             // `output` keeps the four legacy fields only.
             let (value, is_error, redactions) = match backend
@@ -120,8 +120,8 @@ impl ToolProvider for RemoteExecTool {
 }
 
 /// Same argument contract as the local built-in `exec` tool (kian-loop
-/// C11): argv vector, optional cwd/timeout_ms, env empty. Shared by
-/// the sync `RemoteExecTool` and the async `start` tool (C37) — one
+/// ): argv vector, optional cwd/timeout_ms, env empty. Shared by
+/// the sync `RemoteExecTool` and the async `start` tool — one
 /// uniform argument surface.
 pub(crate) fn parse_exec(args: &serde_json::Value) -> Result<ExecCommand, ToolError> {
     let argv = args

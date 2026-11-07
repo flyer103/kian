@@ -6,7 +6,7 @@ the sole truth, a `drain` is the execution hold interval, and **the agent loop i
 flow inside a drain**. Super-agent (Router/Worker, event subscriptions, BYOM endpoints) is a
 *bundle* on top of the core, never core behavior.
 
-`crates/` (when it exists), `docs/`, `design/`, and this file are the product. `docs/SPEC.md` is
+`crates/`, `docs/`, `design/`, and this file are the product. `docs/SPEC.md` is
 the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (append-only),
 `the design notes` + `a vendored archive/` the frozen research inputs.
 
@@ -84,16 +84,18 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-(Workspace does not exist yet — these become the CI gates the moment `crates/` lands. Until then
-the gates are: every doc change keeps the docs map consistent and every ADR link resolves.)
+These are the CI gates on every push ([`.github/workflows/gates.yml`](.github/workflows/gates.yml)).
+A docs-only change that skips the full workspace run must still keep links and crate mappings
+consistent: `cargo test -p kian-cli --test docs_map`.
 
 ## Repo layout
 
-- `docs/SPEC.md` — WHAT: positioning, user/ops interfaces, acceptance scenarios S1–S7, phases.
+- `docs/SPEC.md` — WHAT: positioning, user/ops interfaces, scope.
 - `design/DESIGN.md` — HOW: execution model (Admit→Wake→Drain→Promote), session state machine,
   three-layer recovery, event schema versioning, plugin system, crate map, super-agent bundle.
-- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-006 model slots.
-- `the design notes` — structured synthesis of the four design inputs.
+- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-015 tool permission
+  provenance.
+- `the design notes` — structured synthesis of the design inputs.
 - `a vendored archive/` — frozen snapshots (WeChat super-agent article; dsh README/architecture;
   cordis README/primer; Feishu kian design rev 1425; Feishu an internal design review rev 47).
 
@@ -105,14 +107,50 @@ when the owner asks. Negative results commit documentation only — never broken
 
 ## Docs map
 
-- `README.md` — what kian is, the one-line claim, the docs map.
+- `README.md` — the product entry point (see the README policy below): one-line claim, features,
+  quickstart, advanced usage, docs map.
 - `docs/SPEC.md` — the contract (WHAT). Changing scope means changing this file in the same change.
 - `design/DESIGN.md` — the blueprint (HOW). Any crate/seam/invariant change updates it in the same
   change.
 - `design/EVENT-MODEL.md` — the normative event contract (source of truth): envelope, the complete
   21-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
   and updates this file first; code/tests must be reconciled in the same change.
+- `design/API-CONTRACT.md` — the normative external API contract (source of truth): endpoints,
+  JSON-RPC methods/params/results, error codes, SSE frames, metrics keys, the webhook status matrix
+  and KiandProto frames. **Any wire change starts here** and updates this file first; `kian-sdk`,
+  code and tests are reconciled in the same change.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.
 - `a vendored archive/` — immutable archive; new inputs append new files with Archived headers.
+
+## README policy
+
+`README.md` is the product entry point, not a changelog: it is a concise demo of the core product
+plus minimal usage of advanced capabilities. Keep this shape, top to bottom: one-liner + problem →
+`## Features` (capability bullets — never an implementation/storage/deployment metadata list) →
+`## How it works` → `## Docs map` → `## Quickstart` (copy-paste commands that run) →
+`## Advanced usage` (one short config/CLI example per capability) → `## Environment contract` →
+`## Crate map` → `## Examples`.
+
+**Never add to README** — these live in their owning docs:
+
+- status tables, test counts, event-kind/ADR counts, acceptance checklists, four-gate records —
+  [CHANGELOG.md](CHANGELOG.md), [docs/SPEC.md](docs/SPEC.md), [docs/overview.md](docs/overview.md);
+- release history and internal work-plan narratives — [CHANGELOG.md](CHANGELOG.md), SPEC §5;
+- verbose live-run logs and benchmark methodology — runbooks, CHANGELOG, SPEC;
+- semantic detail already owned by SPEC / DESIGN / EVENT-MODEL — link to it, never restate it.
+
+**When changing README**, in the same change:
+
+1. Fix cross-references: this file's docs map and any SPEC/DESIGN/runbook sentence pointing at a
+   README section (no stale pointer to a removed README section).
+2. Preserve the anchors other docs link to (`#quickstart`, `#environment-contract`,
+   `#live-dsh-bridge-run-log-manual-env-gated`, `#tool-permissions-per-call-governance`).
+3. Keep every relative link resolvable and every crate named; `cargo test -p kian-cli --test
+   docs_map` is the gate.
+4. Keep Quickstart commands executable against this tree, YAML snippets parseable, and abridged
+   output marked as abridged.
+5. Adding a capability = one line in `## Features` + one usage example in `## Advanced usage`; its
+   semantics stay in SPEC / DESIGN / EVENT-MODEL.
+

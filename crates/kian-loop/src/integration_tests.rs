@@ -1,5 +1,5 @@
-//! Engine integration tests for the built-in ReAct loop (card C11
-//! acceptance). Each test drives the *real* C9 engine (sqlite store,
+//! Engine integration tests for the built-in ReAct loop (
+//! acceptance). Each test drives the *real* engine (sqlite store,
 //! admit/wake/drain) with the loop mounted as its `LoopDriver`; the
 //! provider and (where useful) the tools are mocks — the engine, store,
 //! projections and event ordering are never mocked.
@@ -815,7 +815,7 @@ async fn soft_failure_without_matching_rule_still_consults_the_table() {
     cleanup_db(&h.db_path);
 }
 
-// -- acceptance: C67 turn/end audit enrichment (usage + recovery) ------------
+// -- acceptance: turn/end audit enrichment (usage + recovery) ------------
 
 use crate::test_support::usage_chunk;
 use kian_core::context::Message;
@@ -831,7 +831,7 @@ fn turn_end_payloads(events: &[Event]) -> Vec<Value> {
 /// Every `turn/end` variant carries the verbatim provider usage when
 /// observed (final answer and tool-call turns alike), legacy keys stay
 /// untouched, and the usage fact is drain-activity only: the projected
-/// model context is byte-for-byte the pre-C67 shape (A2/A3 untouched).
+/// model context is byte-for-byte the legacy shape (A2/A3 untouched).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_end_carries_usage_for_tool_calls_and_final_answer() {
     let usage1 = json!({"prompt_tokens": 11, "completion_tokens": 4});
@@ -872,7 +872,7 @@ async fn turn_end_carries_usage_for_tool_calls_and_final_answer() {
     assert_eq!(payloads[1].as_object().unwrap().len(), 3);
 
     // A2/context golden: the usage fact never enters the model context —
-    // `derive_model_context` bytes are exactly the pre-C67 shape (here:
+    // `derive_model_context` bytes are exactly the legacy shape (here:
     // the NoopTools error transcript, projected as before).
     let context = derive_model_context(&events).expect("context");
     assert_eq!(
@@ -1005,7 +1005,7 @@ async fn turn_end_soft_failure_without_rule_records_none_action() {
 }
 
 /// No usage observed → the success-path `turn/end` payloads serialize
-/// byte-identically to the pre-C67 legacy shapes (additive keys only,
+/// byte-identically to the legacy shapes (additive keys only,
 /// never a reordered or renamed legacy key).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_end_without_usage_is_byte_identical_to_the_legacy_shape() {
@@ -1038,7 +1038,7 @@ async fn turn_end_without_usage_is_byte_identical_to_the_legacy_shape() {
     cleanup_db(&h.db_path);
 }
 
-// -- acceptance: C70 per-call tool permission provenance --------------------
+// -- acceptance: per-call tool permission provenance --------------------
 
 /// Extracts the `tool/call` payloads from a stream.
 fn tool_call_payloads(events: &[Event]) -> Vec<Value> {
@@ -1049,7 +1049,7 @@ fn tool_call_payloads(events: &[Event]) -> Vec<Value> {
         .collect()
 }
 
-/// C70 allow path: a non-empty permissions table decides every call —
+/// allow path: a non-empty permissions table decides every call —
 /// an explicit `allow` is `policy: configured`, an unnamed tool falls
 /// through to the `policy: default` allow — the tool is invoked as
 /// today in both arms and provenance rides the payload.
@@ -1107,7 +1107,7 @@ async fn allow_path_invokes_tool_and_records_provenance_default_vs_configured() 
     cleanup_db(&h.db_path);
 }
 
-/// C70 deny path (fail-closed): the denied tool is NEVER invoked (the
+/// deny path (fail-closed): the denied tool is NEVER invoked (the
 /// spy counts zero), the `tool/call` carries the deny provenance with
 /// its reason, a synthetic honest error `tool/result` lands next to it,
 /// and the loop continues — the model reacts and the session completes,
@@ -1190,8 +1190,8 @@ async fn deny_path_does_not_invoke_and_emits_honest_error_result() {
     cleanup_db(&h.db_path);
 }
 
-/// C70 (constraint 3): with NO permissions table configured the
-/// `tool/call` payload is byte-identical to the pre-C70 literal — no
+/// (constraint 3): with NO permissions table configured the
+/// `tool/call` payload is byte-identical to the legacy literal — no
 /// `permission` key at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_permissions_keep_tool_call_payload_byte_identical_to_today() {

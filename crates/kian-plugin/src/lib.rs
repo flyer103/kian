@@ -3,7 +3,7 @@
 //! DESIGN §7 assigns this crate the key interfaces `Ctx`, `Plugin`,
 //! `Disposer`; the design mapping lives in DESIGN §6 ("Plugin system
 //! (Cordis-inspired, Rust-ized)"). Static, compile-time registration only
-//! in Phase 1 (ADR-004) — no dynamic loading.
+//! in built-in (ADR-004) — no dynamic loading.
 //!
 //! The seam *definitions* live in [`kian_core::seams`]; this crate consumes
 //! them and never redefines them.

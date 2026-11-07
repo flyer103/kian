@@ -1,11 +1,11 @@
-//! Channel output policies (card C26, DESIGN §4.2 templates), plus the
-//! C58 output-side speak-rules (the *whether-to-send* gate).
+//! Channel output policies (DESIGN §4.2 templates), plus the
+//! output-side speak-rules (the *whether-to-send* gate).
 //!
 //! Bandwidth matching: the Router's channel replies are *shaped before
 //! the send* — the adapter delivers what it is given (the
 //! `ChannelDelivery` contract), so the word limit and the section
 //! contract live here, in the bundle, never in a channel adapter and
-//! never in the core (the card's placement rule).
+//! never in the core (the placement rule).
 //!
 //! - [`ImPolicy`] — the DESIGN §4.2 IM row: a ≤`max_words` hard rule.
 //!   Word count = whitespace tokens of the plain-text reply. An
@@ -15,16 +15,16 @@
 //! - [`StructuredPolicy`] — the §4.2 structured-delivery row: a payload
 //!   missing a required section is **rejected honestly** (an error to
 //!   the loop), never silently sent.
-//! - [`SpeakPolicy`] (C58) — the §4.2 *whether-to-send* gate: which
+//! - [`SpeakPolicy`] — the §4.2 *whether-to-send* gate: which
 //!   sends may leave a channel at all, evaluated **before** the
 //!   shaping policies (a suppressed send is never shaped, never sent,
-//!   and leaves no `channel/delivered` — the C39 deliver-or-discard
+//!   and leaves no `channel/delivered` — the deliver-or-discard
 //!   discipline). [`SpeakTracker`] is the ack-once memory: a
 //!   disposable projection over the Router's own `channel/delivered`
 //!   events, rebuilt from the stream, never persisted.
 //!
 //! Both policies append `channel/delivered` after the send succeeds;
-//! the payload builders here produce the C18 §2 golden schema
+//! the payload builders here produce the §2 golden schema
 //! `{channel, target, policy, words?, truncated}`.
 //!
 //! All functions are pure — no ports, no I/O — so placement and
@@ -83,7 +83,7 @@ pub struct EnforcedReply {
     pub truncated: bool,
 }
 
-/// Whitespace-token count of `text` (the card's word-count definition).
+/// Whitespace-token count of `text` (the word-count definition).
 #[must_use]
 pub fn count_words(text: &str) -> u64 {
     text.split_whitespace().count() as u64
@@ -160,7 +160,7 @@ impl StructuredPolicy {
     }
 }
 
-/// The `channel/delivered` payload for an IM reply (C18 §2 schema;
+/// The `channel/delivered` payload for an IM reply (§2 schema;
 /// `words` records the delivered count).
 #[must_use]
 pub fn im_delivered_payload(channel: &str, target: &Value, reply: &EnforcedReply) -> Value {
@@ -174,7 +174,7 @@ pub fn im_delivered_payload(channel: &str, target: &Value, reply: &EnforcedReply
 }
 
 /// The `channel/delivered` payload for a structured delivery (no word
-/// count — `words` is omitted per the C18 §2 schema).
+/// count — `words` is omitted per the §2 schema).
 #[must_use]
 pub fn structured_delivered_payload(channel: &str, target: &Value) -> Value {
     json!({
@@ -186,7 +186,7 @@ pub fn structured_delivered_payload(channel: &str, target: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Output-side speak-rules (C58, DESIGN §4.2 + §4.7)
+// Output-side speak-rules (DESIGN §4.2 + §4.7)
 // ---------------------------------------------------------------------------
 
 /// The closed `when` vocabulary of a [`SpeakRule`] — the prototype's
@@ -339,7 +339,7 @@ pub enum SpeakVerdict {
 
 /// The configured speak-rule table (`superagent.speak_rules`). An empty
 /// table — the default, and what an absent config section produces —
-/// admits every send: byte-identical to the pre-C58 behavior.
+/// admits every send: byte-identical to the legacy behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SpeakPolicy {
     rules: Vec<SpeakRule>,
@@ -412,7 +412,7 @@ pub fn speak_key(target: &Value) -> String {
     target.to_string()
 }
 
-/// The ack-once memory (C58): which `(channel, topic)` pairs the Router
+/// The ack-once memory: which `(channel, topic)` pairs the Router
 /// has already spoken to. A **disposable projection** over the Router's
 /// own `channel/delivered` events — [`SpeakTracker::from_events`]
 /// rebuilds it from the stream (at boot, and in tests from any

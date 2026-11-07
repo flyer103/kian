@@ -1,4 +1,4 @@
-//! Server assembly and the iron-rule boundary (card C13).
+//! Server assembly and the iron-rule boundary.
 //!
 //! [`Server`] owns everything the HTTP layer must NOT touch directly:
 //! the plugin `Ctx` activations (via their [`Disposer`]), the sqlite
@@ -59,10 +59,10 @@ pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
     sse_poll_ms: u64,
-    /// Recovery-sweep period (C15). Equals `drain.heartbeat_interval_ms`;
+    /// Recovery-sweep period. Equals `drain.heartbeat_interval_ms`;
     /// see [`Server::serve`] for the documented bound.
     recovery_tick_ms: u64,
-    /// The shared pg pool under postgres mode (C52): the wake-transport
+    /// The shared pg pool under postgres mode: the wake-transport
     /// listener's dedicated connection is checked out of this pool in
     /// [`Server::serve`]. `None` under sqlite (no transport — the
     /// in-process wake registry is the whole story).
@@ -70,16 +70,16 @@ pub struct Server {
     /// The super-agent runtime (present iff the `superagent:` section
     /// is configured): mock channels, metrics surfaces, watchdog.
     superagent: Option<Arc<SuperAgentRuntime>>,
-    /// The C49 webhook receiver secret (present iff a `type: github`
+    /// The webhook receiver secret (present iff a `type: github`
     /// channel is configured — the route is configured). Env-only:
     /// `KIAN_GITHUB_WEBHOOK_SECRET`, fail-closed at assembly.
     webhook_secret: Option<String>,
-    /// The C49 receiver limits from the (single) github section.
+    /// The receiver limits from the (single) github section.
     webhook_limits: WebhookLimits,
-    /// This assembly's recorded startup sequence (the C27 test hook).
+    /// This assembly's recorded startup sequence (the test hook).
     startup_order: crate::superagent::StartupOrder,
     /// Keeps the plugin-registered services alive for the server's
-    /// lifetime; dropping it would unregister them (C7 disposer).
+    /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
 }
 
@@ -109,7 +109,7 @@ impl Server {
 
     /// Full assembly from an already-loaded config.
     ///
-    /// Startup order is load-bearing (C27): config → providers →
+    /// Startup order is load-bearing: config → providers →
     /// plugins → store → engine → **inbox rebuild** → superagent
     /// services (registry rebuild, subscription consumers, watchdog) →
     /// the caller binds the listener. The subscription engine is never
@@ -143,18 +143,18 @@ impl Server {
         let superagent_cfg = config.superagent.as_ref();
         let has_remote = !config.endpoints.is_empty();
 
-        // C49: the webhook receiver's env-only secret + limits (filled
+        // the webhook receiver's env-only secret + limits (filled
         // by the github arm below; present iff the route is
         // configured, consumed by the Server construction below).
         let mut webhook_secret: Option<String> = None;
         let mut webhook_limits = WebhookLimits::default();
 
         // The exec store opens before activation (plugin apply is sync).
-        // C51: one server, one database — under `event_store: postgres`
+        // one server, one database — under `event_store: postgres`
         // the event store and the exec store share ONE pg pool, opened
-        // here before either adopts it. The URL is env-only (the C13
+        // here before either adopts it. The URL is env-only (the
         // secrets rule); config validation already refused the default
-        // drain.holder for postgres (C47 condition (c)).
+        // drain.holder for postgres (condition (c)).
         let pg_pool = if config.storage.is_postgres() {
             let url_env = &config
                 .storage
@@ -195,7 +195,7 @@ impl Server {
         };
 
         let mut ctx = PluginCtx::new();
-        // kian-77: the exec secret hygiene pair, built once and shared
+        // the exec secret hygiene pair, built once and shared
         // by the local tool surface and the remote-exec queue:
         //
         // - the redactor's known values are the *configured* secrets —
@@ -245,7 +245,7 @@ impl Server {
                 redactor: exec_redactor,
             });
         }
-        // The event store opens before activation too: the C37
+        // The event store opens before activation too: the
         // completion bridge (inside the superagent plugin) reads
         // session projections and committed `tool/call` events.
         let store = match pg_pool.as_ref() {
@@ -261,13 +261,13 @@ impl Server {
             let worker_agent = config
                 .named_agent_def(&sa.worker.agent)
                 .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
-            // C37: the async pair mounts on BOTH profiles, config-gated
+            // the async pair mounts on BOTH profiles, config-gated
             // (default off — the AgentDefs are untouched when off).
             let mut router_agent = router_agent;
             let mut worker_agent = worker_agent;
             kian_superagent::mount_async_tools(&mut router_agent, sa.async_tools);
             kian_superagent::mount_async_tools(&mut worker_agent, sa.async_tools);
-            // C35: the recall toolpack — default on for the Router
+            // the recall toolpack — default on for the Router
             // profile, opt-in per worker template (config-gated).
             kian_superagent::mount_recall_tools(&mut router_agent, sa.recall.router);
             kian_superagent::mount_recall_tools(&mut worker_agent, sa.recall.worker);
@@ -279,9 +279,9 @@ impl Server {
                 uuid::Uuid::parse_str(&sa.router.session_id)
                     .map_err(|_| ServeError::Assembly("router session id is not a uuid".into()))?,
             );
-            // kian-62: the boot-time re-arm walk. A resident Router that
+            // the boot-time re-arm walk. A resident Router that
             // ended terminally (session/ended{completed|cancelled} —
-            // e.g. the loop's lifetime iteration budget exhausting) is
+            // e.g. The loop's lifetime iteration budget exhausting) is
             // frozen; the consumed bootstrap row can never re-wake it.
             // The walk resolves the live session down the deterministic
             // successor chain (uuid5) and assembly binds THAT session
@@ -311,7 +311,7 @@ impl Server {
                     "superagent: resident Router re-armed onto a successor session"
                 );
             }
-            // C40: the resident watchdog binding (optional). The agent
+            // the resident watchdog binding (optional). The agent
             // is worker-template shaped; the read/intervene surface
             // mounts on it the same way the async/recall pairs mount.
             let mut watchdog = match &sa.watchdog {
@@ -321,7 +321,7 @@ impl Server {
                             ServeError::Assembly("watchdog session id is not a uuid".into())
                         })?,
                     );
-                    // kian-62: the same re-arm walk for the resident
+                    // the same re-arm walk for the resident
                     // watchdog (it can terminally end exactly like the
                     // Router; the timer rule's Route::Session target
                     // becomes the resolved live session).
@@ -359,29 +359,29 @@ impl Server {
             };
             let rules = sa.subscription_rules().map_err(ServeError::Config)?;
             let classes = sa.admission_classes().map_err(ServeError::Config)?;
-            // C63: the configured policy version (`superagent.policy
+            // the configured policy version (`superagent.policy
             // .version`), fingerprinted over the resident prompt
             // templates; `None` = today's bytes, byte-identical.
             let policy_version = sa.policy_version();
             if let Some(watchdog_profile) = watchdog.as_mut() {
                 watchdog_profile.policy_version = policy_version.clone();
             }
-            // C43 + C44: the configured list plus every lark-typed
+            // +: the configured list plus every lark-typed
             // channel (real channels are untrusted by default).
             let untrusted_channels = sa.runtime_untrusted_set().map_err(ServeError::Config)?;
             let inbox = crate::superagent::EngineInbox::new();
 
-            // Mock channels by configured name; C44 lark channels read
+            // Mock channels by configured name; lark channels read
             // their credentials from the environment here (fail-closed:
             // a lark channel without KIAN_LARK_APP_ID/KIAN_LARK_APP_SECRET
             // refuses to start — tokens never live in kian.yaml).
             let mut mock_channels = std::collections::BTreeMap::new();
             let mut lark_channels = std::collections::BTreeMap::new();
-            // C48/C49: the webhook-fed github channels (config
+            // the webhook-fed github channels (config
             // validation caps them at one — the single receiver route
             // feeds exactly one).
             let mut github_channels = std::collections::BTreeMap::new();
-            // C40: the timer input sources (a channel like any other —
+            // the timer input sources (a channel like any other —
             // the system clock times the cadence).
             let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
             for (name, channel) in &sa.channels {
@@ -449,11 +449,11 @@ impl Server {
                 }
             }
 
-            // C49: a webhook-**receiving** github channel configures the
+            // a webhook-**receiving** github channel configures the
             // webhook receiver route — and a configured route without
             // its env-only secret refuses to start (fail-closed, the
-            // C13 secrets discipline: never a signature-less receiver,
-            // never a secret in kian.yaml). C64: a poll-only channel
+            // secrets discipline: never a signature-less receiver,
+            // never a secret in kian.yaml). a poll-only channel
             // (`webhook_receive: false`) mounts no receiver route and
             // needs no secret — poll mode is beside the webhook
             // surface, and a deployment that receives no webhooks
@@ -483,7 +483,7 @@ impl Server {
                 router_agent,
                 worker_agent,
                 default_agent: config.agent_def(),
-                // C70 (ADR-015): the worker template's and the default
+                // (ADR-015): the worker template's and the default
                 // agent's permission tables ride their loops; the judge
                 // loops (router/watchdog) refuse a table at validation.
                 worker_permissions: config
@@ -507,7 +507,7 @@ impl Server {
                 policy_notify_live: sa.policy.notify_live,
                 mandate: sa.mandate_policy(),
                 outbox: sa.outbox_config().map_err(ServeError::Config)?,
-                // C61/ADR-013: the thread-key derivations (validated at
+                // /ADR-013: the thread-key derivations (validated at
                 // parse; converted again here — one shape, both gates).
                 thread_keys: sa
                     .intake
@@ -544,14 +544,14 @@ impl Server {
             });
             None // services resolve from the Ctx after activation
         } else {
-            // Phase-1 mode: exactly the round-1 loop plugin.
+            // built-in mode: exactly the loop plugin.
             plugins.register(ReActPlugin {
                 agent: config.agent_def(),
                 policy: Arc::clone(&policy) as Arc<PolicyTable>,
                 config: ReActConfig {
                     slot: kian_core::model::SlotName(config.drain.slot.clone()),
                     max_iterations: config.drain.max_iterations,
-                    // C70: the default agent's per-call permission table
+                    // the default agent's per-call permission table
                     // (absent = empty = allow-all, byte-identical).
                     permissions: config.agent.permissions.clone(),
                 },
@@ -586,7 +586,7 @@ impl Server {
         };
         let engine = Engine::new(store.clone(), driver, engine_config);
 
-        // The bundle's inbox port learns the engine (the C23 cycle
+        // The bundle's inbox port learns the engine (the cycle
         // breaker closes here, before any wake can fire).
         let superagent = match services {
             Some(services) => {
@@ -639,7 +639,7 @@ impl Server {
         Ok(server)
     }
 
-    /// This assembly's recorded startup sequence (the C27 acceptance
+    /// This assembly's recorded startup sequence (the acceptance
     /// hook: subscription/watchdog starts must follow
     /// `startup_rebuild_done`).
     pub fn startup_order(&self) -> Vec<&'static str> {
@@ -650,7 +650,7 @@ impl Server {
     }
 
     /// The super-agent runtime handle (present iff a `superagent:`
-    /// section assembled this server). Embedders and the S4 e2e tests
+    /// section assembled this server). Embedders and the e2e tests
     /// reach the mock channels (delivery capture) through this — the
     /// same handle the ops plane's `mock_channel_send` uses.
     pub fn superagent_runtime(&self) -> Option<&Arc<SuperAgentRuntime>> {
@@ -659,12 +659,12 @@ impl Server {
 
     /// The HTTP router for this server. The control-plane handlers see
     /// only the [`ControlPlane`] trait object — never the engine or
-    /// store. The merged `/metrics` route (C17 observability) lives in
+    /// store. The merged `/metrics` route (observability) lives in
     /// this module, not `api`: it reads counters and derives the cache
     /// report from the store, which the iron-rule handler module must
-    /// not even name. The `/ops/rpc` plane (C14 operator actions:
+    /// not even name. The `/ops/rpc` plane (operator actions:
     /// `wake_now`, `recovery_budget_reset`) is merged here too, behind
-    /// its own [`OpsPlane`] trait — the control plane's Phase-1 wire
+    /// its own [`OpsPlane`] trait — the control plane's built-in wire
     /// surface stays untouched.
     pub fn router(self: &Arc<Self>) -> axum::Router {
         let plane: Arc<dyn ControlPlane> = self.clone();
@@ -672,10 +672,10 @@ impl Server {
         let router = crate::api::router(plane, self.sse_poll_ms)
             .merge(metrics_router(self.clone()))
             .merge(crate::ops::router(ops));
-        // C49: the fourth surface — the inbound webhook receiver,
+        // the fourth surface — the inbound webhook receiver,
         // mounted **only** when the route is configured (a `type:
         // github` channel exists; assembly already refused to start
-        // without the env-only secret). The C13 wire surface, the ops
+        // without the env-only secret). The wire surface, the ops
         // plane and the metrics route are untouched.
         match self.webhook_secret.clone() {
             Some(secret) => {
@@ -692,7 +692,7 @@ impl Server {
 
     /// Serves on `addr` until the process is stopped.
     ///
-    /// Also spawns the S1 recovery-detection ticker (C15, DESIGN §13
+    /// Also spawns the recovery-detection ticker (DESIGN §13
     /// availability target): every `recovery_tick_ms` the engine sweeps
     /// expired leases and wakes `running` sessions whose drain owner
     /// died — including killed-mid-turn sessions whose inbox is empty
@@ -732,7 +732,7 @@ impl Server {
                 }
             });
         }
-        // C52 wake transport (postgres mode only): a relay task holds
+        // wake transport (postgres mode only): a relay task holds
         // one dedicated pooled connection LISTENing on `kian_wake` and
         // fires the local engine `wake` per notification — the
         // cross-replica accelerator. Advisory by contract (ADR-009
@@ -794,7 +794,7 @@ impl Server {
         axum::serve(
             listener,
             self.router()
-                // C49: peer connect info feeds the webhook receiver's
+                // peer connect info feeds the webhook receiver's
                 // per-source rate-limit buckets (additive — every
                 // other surface ignores it).
                 .into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -857,7 +857,7 @@ impl ControlPlane for Server {
     ) -> BoxFuture<'_, Result<bool, ControlError>> {
         // `queue` differs from `submit` only in intent: it lands in the
         // same durable inbox; a drain in flight folds the wake and
-        // consumes it in the same sweep (C16 batch semantics).
+        // consumes it in the same sweep (batch semantics).
         Box::pin(async move {
             self.engine
                 .admit(session, content, idempotency_key)
@@ -919,7 +919,7 @@ fn internal(op: &'static str) -> impl Fn(EngineError) -> ControlError + Send + S
 }
 
 // ---------------------------------------------------------------------------
-// OpsPlane: the C14 operator surface (wake-now, recovery budget reset)
+// OpsPlane: the operator surface (wake-now, recovery budget reset)
 // ---------------------------------------------------------------------------
 
 /// Wall-clock milliseconds for operator event timestamps (the engine's
@@ -982,7 +982,7 @@ impl OpsPlane for Server {
                 return Err(OpsError::SessionTerminal { session });
             }
             if state == kian_core::state::SessionState::Idle {
-                // The C3 table maps the (additive) reset kind to drain
+                // The table maps the (additive) reset kind to drain
                 // activity — legal only while running. An idle session
                 // never consumed a recovery budget anyway.
                 return Err(OpsError::SessionIdle { session });
@@ -1034,7 +1034,7 @@ impl OpsPlane for Server {
         payload: serde_json::Value,
     ) -> BoxFuture<'_, Result<MockSendReceipt, OpsError>> {
         Box::pin(async move {
-            // Demo/S4 injection (C27): one event onto a configured mock
+            // Demo/ injection: one event onto a configured mock
             // channel; the subscription engine does the rest. Only the
             // superagent assembly carries channels — anything else is
             // an honest error, never a silent no-op.
@@ -1067,7 +1067,7 @@ impl OpsPlane for Server {
 }
 
 // ---------------------------------------------------------------------------
-// WebhookPlane: the C49 inbound surface's sole capability (verify +
+// WebhookPlane: the inbound surface's sole capability (verify +
 // hand the verified delivery to the subscription pipeline — an inbox
 // write, control-plane-legal)
 // ---------------------------------------------------------------------------
@@ -1101,7 +1101,7 @@ impl WebhookPlane for Server {
 }
 
 // ---------------------------------------------------------------------------
-// GET /metrics — C17 observability (engine counters + S3 cache report)
+// GET /metrics — observability (engine counters + cache report)
 // ---------------------------------------------------------------------------
 
 fn metrics_router(server: Arc<Server>) -> axum::Router {
@@ -1110,10 +1110,10 @@ fn metrics_router(server: Arc<Server>) -> axum::Router {
         .with_state(server)
 }
 
-/// Read-only observability: engine counters (C9) plus the S3
-/// cache-byte stability report (C17) derived from the event stream —
+/// Read-only observability: engine counters plus the
+/// cache-byte stability report derived from the event stream —
 /// a pure projection, so it is as durable as the log itself. With the
-/// superagent assembly mounted, the C27 fragment adds evidence-verdict,
+/// superagent assembly mounted, the fragment adds evidence-verdict,
 /// subscription, channel-policy and watchdog counters.
 async fn metrics_handler(
     axum::extract::State(server): axum::extract::State<Arc<Server>>,
@@ -1126,7 +1126,7 @@ async fn metrics_handler(
         Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
         Err(e) => serde_json::json!({"error": e.to_string()}),
     };
-    // C67: the usage aggregate, derived on read from `turn/end` payloads
+    // the usage aggregate, derived on read from `turn/end` payloads
     // (pure projection — no drain ever bumps a counter).
     let usage = match crate::usage_metrics::usage_stats_report(&server.store, None).await {
         Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),

@@ -1,6 +1,6 @@
-//! The narrow-waist gate (C54): `kian-dsh` depends on no kian crate
+//! The narrow-waist gate: `kian-dsh` depends on no kian crate
 //! beyond `kian-core` (the seam types + the shared event vocabulary
-//! the C53 mapping selects from). Enforced statically over the
+//! the mapping selects from). Enforced statically over the
 //! manifest — the same property `cargo tree -p kian-dsh` reports.
 
 use std::collections::BTreeSet;
@@ -31,6 +31,6 @@ fn kian_dsh_adds_no_kian_core_crate_dependency_beyond_the_seam_types() {
     assert_eq!(
         kian_deps,
         BTreeSet::from(["kian-core".to_owned()]),
-        "the S6 bridge stays on the narrow waist: kian-core only"
+        "the dsh bridge stays on the narrow waist: kian-core only"
     );
 }

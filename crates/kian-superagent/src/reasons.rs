@@ -1,4 +1,4 @@
-//! Closed decision-reason vocabularies (card C57, round-6 plan): the
+//! Closed decision-reason vocabularies (plan): the
 //! machine-stable reason codes stamped on every intake audit line and
 //! the assembly metrics snapshot, plus the judge-side decision-tag
 //! convention rendered into the Router's prompt template.
@@ -33,21 +33,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::subscriptions::RoutingOutcome;
 
-/// The closed intake-reason vocabulary (C57). One code per decision;
+/// The closed intake-reason vocabulary. One code per decision;
 /// `code()` is the stable machine spelling used in audit lines and
 /// metric keys, `display()` the human table.
 ///
 /// `ReleasedToEval` is defined now and lands with the follow-up
-/// ownership card (C59): an all-ended subscriber set releases the
+/// ownership card: an all-ended subscriber set releases the
 /// topic to a fresh evaluation. Until then no code path produces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntakeReason {
     /// No subscription rule matched the event.
     NoRule,
-    /// The C36 admission class resolved to `ignore`.
+    /// The admission class resolved to `ignore`.
     ClassIgnored,
-    /// The C36 admission class is `explicit-only` and the event
+    /// The admission class is `explicit-only` and the event
     /// carried no explicit-request signal.
     NotExplicit,
     /// Admitted to the Router (a `router` rule, or the empty-set
@@ -55,13 +55,13 @@ pub enum IntakeReason {
     AdmittedRouter,
     /// Admitted directly to a target without Router judgment: a
     /// passthrough subscriber, or a `Route::Session` fixed target
-    /// (the C40 watchdog ticks) — the shared "no judge turn spent"
+    /// (the watchdog ticks) — the shared "no judge turn spent"
     /// code, the closed set has no per-route variant.
     AdmittedPassthrough,
     /// The `(session, event_id)` row already existed — exactly one
     /// durable row either way (idempotent admission).
     Deduplicated,
-    /// Reserved for C59: an all-ended subscriber set falls back to the
+    /// Reserved for: an all-ended subscriber set falls back to the
     /// Router as a *release to fresh evaluation*, not a plain admit.
     ReleasedToEval,
 }
@@ -108,7 +108,7 @@ impl IntakeReason {
     }
 }
 
-/// The closed judge-side decision-tag vocabulary (C57): the four tags
+/// The closed judge-side decision-tag vocabulary: the four tags
 /// the Router is instructed to spell in its reply text, one per batch
 /// decision. Convention, not contract — the durable trace of a Router
 /// decision is the existing event triple; the tag makes the *model's*

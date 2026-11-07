@@ -143,33 +143,32 @@ implementation ever enters its dependency tree.
 | `kian-exec` | KiandProto **server half**: connection manager, durable command queue with row leases, heartbeat watchdog |
 | `kian-superagent` | The super-agent *bundle*: Router/Worker templates, event subscriptions, channels, output policies, recall, watchdog v2 |
 | `kian-sdk` | Wire-only embedded client (frozen JSON-RPC + SSE surface, typed errors); depends on no kian crate |
-| `kian-dsh` | The S6 bridge: a `LoopDriver` that drives a `dsh` child over stdio and maps its events onto existing kinds; depends on `kian-core` only |
+| `kian-dsh` | The dsh bridge: a `LoopDriver` that drives a `dsh` child over stdio and maps its events onto existing kinds; depends on `kian-core` only |
 | `kian-cli` | The `kian` binary: `serve` assembly, operator CLI (`inspect`/`replay`/`export`/`wake-now`), the GitHub webhook receiver |
 | `kiand` | The endpoint daemon binary (`kian-endpoint` + a thin main) |
 
-## 5. What has been demonstrated (S1–S8)
+## 5. What has been demonstrated
 
-Scenario definitions live in [SPEC §2.5](SPEC.md); status is recorded here and in the README
-acceptance checklists. "Default-green" means it runs in `cargo test --workspace` on any machine with
-no credentials and no services.
+Status is recorded here and in the [CHANGELOG](../CHANGELOG.md). "Default-green" means it runs in
+`cargo test --workspace` on any machine with no credentials and no services.
 
-| # | Scenario | Status | One-line proof |
-|---|----------|--------|----------------|
-| S1 | Crash recovery: `kill -9` mid-drain, restart, no lost work | **done** — default-green | `crates/kian-cli/tests/chaos_s1.rs`: `chaos_s1_six_kill_points_repeated_runs_all_green` (six kill points — after admit, after claim, mid-provider-turn, mid-tool, before/after the end write — × repeated runs, restart on the same sqlite: no lost work, no half-terminated session, monotone epochs) and `chaos_s1_zombie_old_epoch_writes_all_rejected_across_kill_window` |
-| S2 | Steer / interrupt semantics and honesty | **done** — default-green | `crates/kian-cli/tests/s2_steer_interrupt.rs`: `steer_lands_at_next_safe_boundary_with_strippable_synthetic_marker` (no input lands inside an in-flight provider turn), `interrupt_mid_tool_settles_on_abort_and_resumes_honestly` (interrupt ≠ failed), `interrupt_of_idle_and_completed_sessions_is_a_noop` |
-| S3 | Cache-byte stability | **done** — default-green | `crates/kian-cli/tests/s3_cache_stability.rs`: `s3_consecutive_requests_share_prefix_and_metrics_expose_it` and `s3_compact_event_bumps_the_invalidation_cause_counter` — only `compact` breaks the prefix, `unexpected_prefix_change` stays zero, exposed on `GET /metrics` and `kian cache-stats` |
-| S4 | Super-agent demo: IM request → Router judges → Worker completes → ≤100-word reply + structured delivery | **done** — default-green | `crates/kian-cli/tests/s4_superagent_demo.rs` (8 tests) plus the negative path where a gate-failed worker never reaches delivered |
-| S5 | BYOM: cloud loop + `kiand` execution + watchdog detects an offline endpoint | **done** — default-green | `crates/kian-cli/tests/s5_byom_e2e.rs`: exec round-trip through the durable queue, kill -9 while queued → row parks honestly, watchdog health input within the documented detection bound, reconnect drains, timeout is an honest error |
-| S6 | Harness integration: dsh interaction unchanged, made durable | **demonstrated — fixture-proven; live leg green via the contract-v0 peer** | `crates/kian-dsh/tests/driver_bridge.rs` + `crates/kian-superagent/tests/dsh_conformance.rs` (every mapping row, replay byte parity) + `crates/kian-cli/tests/dsh_bridge.rs` (mounted e2e, kill-9 takeover, child crash → `interrupted`); the live leg (env-gated on `KIAN_DSH_BIN`) ran green on 2026-11-02 with `contrib/dsh-v0-peer/dsh-v0-peer.mjs` (adapts stock dsh 0.2.1-rc.5 JSON-RPC onto contract v0) and real `deepseek-chat` — full mapped chain, honest `Settled`; details in [runbook-dsh.md](runbook-dsh.md) |
-| S7 | Audit export / replay: a byte-identical replayable package | **demonstrated** — default-green | `kian session export` / re-import round-trips byte-identically (`crates/kian-cli/tests/ops_commands.rs`), and `s4_delegation_audit_export_replays` replays both streams of a delegation |
-| S8 | Multi-replica takeover: two replicas over one postgres, `kill -9` the drain owner mid-drain | **demonstrated** — env-gated (`KIAN_PG_URL`) | `crates/kian-cli/tests/postgres_s8.rs::s8_two_replicas_kill9_takeover_no_split_brain`: real `kian serve` children, real `kill -9`, the survivor completes, exactly one end write, and a stale-epoch probe write from the dead replica is rejected |
+| Capability | Status | One-line proof |
+|------------|--------|----------------|
+| Crash recovery: `kill -9` mid-drain, restart, no lost work | **done** — default-green | `crates/kian-cli/tests/chaos_recovery.rs`: six kill points (after admit, after claim, mid-provider-turn, mid-tool, before/after the end write) over repeated runs on the same sqlite — no lost work, no half-terminated session, monotone epochs; stale-epoch writes are rejected |
+| Steer / interrupt semantics and honesty | **done** — default-green | `crates/kian-cli/tests/steer_interrupt.rs`: steer lands at the next safe boundary (no input inside an in-flight provider turn); interrupt settles on abort and resumes honestly (interrupt ≠ failed); idle/terminal interrupts are no-ops |
+| Cache-byte stability | **done** — default-green | `crates/kian-cli/tests/cache_stability.rs`: consecutive requests share the byte prefix; only `compact` breaks it and counts under the `compact` cause; `unexpected_prefix_change` stays zero — exposed on `GET /metrics` and `kian cache-stats` |
+| Super-agent demo: IM request → Router judges → Worker completes → ≤100-word reply + structured delivery | **done** — default-green | `crates/kian-cli/tests/superagent_demo.rs` (8 tests) plus the negative path where a gate-failed worker never reaches delivered |
+| BYOM: cloud loop + `kiand` execution + watchdog detects an offline endpoint | **done** — default-green | `crates/kian-cli/tests/byom_e2e.rs`: exec round-trip through the durable queue, kill -9 while queued → row parks honestly, watchdog health input within the documented bound, reconnect drains, timeout is an honest error |
+| Harness integration: dsh interaction unchanged, made durable | **demonstrated — fixture-proven; live leg green via the contract-v0 peer** | `crates/kian-dsh/tests/driver_bridge.rs` + `crates/kian-superagent/tests/dsh_conformance.rs` (every mapping row, replay byte parity) + `crates/kian-cli/tests/dsh_bridge.rs` (mounted e2e, kill-9 takeover, child crash → `interrupted`); the live leg (env-gated on `KIAN_DSH_BIN`) ran green on 2026-11-02 with `contrib/dsh-v0-peer/dsh-v0-peer.mjs` and real `deepseek-chat` — full mapped chain, honest `Settled`; details in [runbook-dsh.md](runbook-dsh.md) |
+| Audit export / replay: a byte-identical replayable package | **demonstrated** — default-green | `kian session export` / re-import round-trips byte-identically (`crates/kian-cli/tests/ops_commands.rs`), and `superagent_delegation_audit_export_replays` replays both streams of a delegation |
+| Multi-replica takeover: two replicas over one postgres, `kill -9` the drain owner mid-drain | **demonstrated** — env-gated (`KIAN_PG_URL`) | `crates/kian-cli/tests/postgres_multi_replica.rs::multi_replica_two_replicas_kill9_takeover_no_split_brain`: real `kian serve` children, real `kill -9`, the survivor completes, exactly one end write, and a stale-epoch probe write from the dead replica is rejected |
 
-**Default-green vs env-gated.** Everything except the S6/S8 live legs runs with zero credentials and
-zero external services. `KIAN_PG_URL` (postgres — exercised in CI on every push since 2026-11-02),
-`KIAN_DSH_BIN` (a real dsh install — exercised live 2026-11-02 via the contract-v0 peer) and the channel
-smokes (`KIAN_API_KEY`, `KIAN_LARK_*`, `KIAN_GITHUB_*`) gate the rest: absent, those suites **skip
-with a log line and never fail**; present, they run and must pass. The README's environment-contract
-table lists every variable.
+**Default-green vs env-gated.** Everything except the live harness and multi-replica legs runs with
+zero credentials and zero external services. `KIAN_PG_URL` (postgres — exercised in CI on every push
+since 2026-11-02), `KIAN_DSH_BIN` (a real dsh install — exercised live 2026-11-02 via the
+contract-v0 peer) and the channel smokes (`KIAN_API_KEY`, `KIAN_LARK_*`, `KIAN_GITHUB_*`) gate the
+rest: absent, those suites **skip with a log line and never fail**; present, they run and must pass.
+The README's environment-contract table lists every variable.
 
 ## 6. Where the design inputs went
 
@@ -180,7 +179,7 @@ identifiable in the code:
 | Input | What it contributed | Where it lives in Kian |
 |-------|--------------------|------------------------|
 | **DeepSeek "Super-agent Design Exploration" article** | The four super-agent traits as *composition patterns*: two-layer Router/Worker with Thread delegation, event-driven triggers with two-level admission filtering, subscription passthrough (many-to-many fan-out), Inline/Spill context shaping + Chain of Recall, speculative execution, async `start()`/`stop()` tools, channel-matched output, the watchdog session, and the §7.1 ablation methodology | `kian-superagent` (bundle, not core): Router/Worker profiles, `channels`, `subscriptions`, `classes`, `shaping`, `recall`, `speculation`, `watchdog`, `async_tools`; the ablation benchmark is `crates/kian-superagent/tests/ablation_passthrough.rs` |
-| **deepseek-harness (dsh)** | The harness/kernel split: a harness owns interaction and capability; the substrate owns durability. dsh's append-only `SessionEvent` log, its turn/step vocabulary and its "model-visible means logged" rule shaped Kian's event schema and context derivation | `kian-core` event schema + `derive_model_context`; the S6 bridge `kian-dsh` (ADR-010) maps dsh session events onto **existing** kian kinds — zero new kinds |
+| **deepseek-harness (dsh)** | The harness/kernel split: a harness owns interaction and capability; the substrate owns durability. dsh's append-only `SessionEvent` log, its turn/step vocabulary and its "model-visible means logged" rule shaped Kian's event schema and context derivation | `kian-core` event schema + `derive_model_context`; the dsh bridge `kian-dsh` (ADR-010) maps dsh session events onto **existing** kian kinds — zero new kinds |
 | **Cordis** | Plugin mechanics: context as a service container (`ctx.<key>`), `inject`-declared dependencies, typed events, and registrations as reversible effects with disposers | `kian-plugin`: `Ctx` registry, `Plugin` trait, five-mode dispatch, `Disposer`; new capability grows config-first → plugin → seam (ADR-004) |
 | **Feishu "Kian" design doc + an internal design review** | The durable-execution core itself: Session as the sole first-class entity, event stream as sole truth, drain as the execution hold interval, the P1–P8 problems, the A1–A10 axioms, the six Admit → Wake → Drain → Promote invariants, the epoch-fencing/lease split, and the three-layer recovery model | `kian-core` (state machine, invariants), `kian-store` (CAS + fencing), `kian-orchestrator` (engine + recovery), and the ADR series ([ADR-001](../design/decisions/ADR-001-rust-foundation.md) … [ADR-011](../design/decisions/ADR-011-inbound-webhook-plane.md)) |
 

@@ -1,4 +1,4 @@
-//! Real-TCP pairing tests for the KiandProto server half (card C19
+//! Real-TCP pairing tests for the KiandProto server half (
 //! acceptance).
 //!
 //! Every test pairs `kian_exec::ConnectionManager` against the real
@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, watch};
 
-/// Local e2e discipline (round-2 plan §1 rule 6): raw TCP ignores proxies,
+/// Local e2e discipline (plan §1 rule 6): raw TCP ignores proxies,
 /// but the rule is cheap to honor and keeps every e2e suite uniform.
 fn no_proxy() {
     static ONCE: OnceLock<()> = OnceLock::new();

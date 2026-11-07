@@ -1,4 +1,4 @@
-//! Typed surface v1 (card C46) — one typed method per frozen C13/C14
+//! Typed surface v1 — one typed method per frozen
 //! wire method, mirroring the server's dispatch exactly:
 //!
 //! - control plane (`POST /rpc`): `create_session`, `submit`, `steer`,
@@ -8,7 +8,7 @@
 //!
 //! The SSE `events` helper lives in [`crate::sse`]. Every method here
 //! round-trips against a scripted server with golden request bytes in
-//! `tests/fixtures/` — the C8 serialization-freeze discipline applied
+//! `tests/fixtures/` — the serialization-freeze discipline applied
 //! to the client.
 
 use serde::Deserialize;
@@ -61,8 +61,8 @@ pub struct ResetReceipt {
     pub ts: u64,
 }
 
-/// `mock_channel_send` → `{"event_id", "channel", "topic"}` (C27 demo /
-/// S4 injection).
+/// `mock_channel_send` → `{"event_id", "channel", "topic"}` (demo /
+/// injection).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MockSendReceipt {
     pub event_id: String,
@@ -128,7 +128,7 @@ impl KianClient {
     }
 
     /// Control plane: request an interrupt; the outcome string is the
-    /// server's worded receipt. The intent is durable (C68/ADR-014):
+    /// server's worded receipt. The intent is durable (ADR-014):
     /// whenever work may still be in flight the server also admits a
     /// control-envelope inbox row that the owning drain consumes into a
     /// `control/interrupt` event — the interrupt survives a drain crash
@@ -177,7 +177,7 @@ impl KianClient {
     }
 
     /// Ops plane: inject one demo event onto a configured mock channel
-    /// (C27); the subscription engine routes it per the configured
+    /// the subscription engine routes it per the configured
     /// rules.
     pub async fn mock_channel_send(
         &self,
@@ -198,14 +198,14 @@ impl KianClient {
             .map_err(|e| ClientError::Malformed(format!("result shape: {e}")))
     }
 
-    /// Derived event id (C69) — pure, no I/O: the deterministic id kian
+    /// Derived event id — pure, no I/O: the deterministic id kian
     /// assigns to a session event. Rule (mirroring
     /// `kian_core::events::event_id` byte-for-byte, see the crate's
     /// `derived` module):
     ///
     /// ```text
     /// event_id = "evt_" + uuid5(namespace = <session uuid>,
-    ///                           name    = "kian:event:<seq>")
+    ///                           name = "kian:event:<seq>")
     /// ```
     ///
     /// RFC 4122 v5 (SHA-1 over `namespace || name`, version/variant
@@ -224,7 +224,7 @@ impl KianClient {
 mod tests {
     use super::KianClient;
 
-    /// C69 golden vectors: the SDK's dependency-free uuid-v5 mirror must
+    /// golden vectors: the SDK's dependency-free uuid-v5 mirror must
     /// equal the core rule's literals (generated independently of the
     /// Rust `uuid` crate — Python `uuid.uuid5`), pinning the two
     /// implementations to the same bytes.

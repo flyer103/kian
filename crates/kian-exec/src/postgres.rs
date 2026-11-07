@@ -1,7 +1,7 @@
-//! The postgres backend (C51): mirrors the sqlite statements with `$N`
+//! The postgres backend: mirrors the sqlite statements with `$N`
 //! placeholders and explicit casts (pg parameter-type inference is
 //! context-driven; a bare `$N` can infer `integer` and reject an int8
-//! bind — the C50 lesson). Semantics are the sqlite store's semantics,
+//! bind — the lesson). Semantics are the sqlite store's semantics,
 //! transported: ADR-007's enqueue-first / at-least-once / command-id
 //! correlation / honest timeout is unchanged, only the dialect is.
 
@@ -108,7 +108,7 @@ pub(crate) async fn drivable(
     .await
 }
 
-// -- C52: queue-row leases (pg twins of the sqlite statements) ---------------
+// -- queue-row leases (pg twins of the sqlite statements) ---------------
 
 pub(crate) async fn claim_queue_row(
     pool: &PgPool,

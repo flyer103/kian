@@ -1,4 +1,4 @@
-//! S2 acceptance e2e (card C16): steer/interrupt semantics + honesty,
+//! acceptance e2e: steer/interrupt semantics + honesty,
 //! over the REAL assembled server (engine + ReAct loop + openai-compat
 //! provider + local `exec` tool) with a long-running mock task.
 //!
@@ -62,7 +62,7 @@ async fn rpc(
     resp.json().await.expect("rpc json")
 }
 
-/// The C14 operator plane (POST /ops/rpc) — used for `wake_now`.
+/// The operator plane (POST /ops/rpc) — used for `wake_now`.
 async fn ops_rpc(
     client: &reqwest::Client,
     base: &str,
@@ -99,7 +99,7 @@ async fn spawn_server(config_path: &Path) -> (String, Arc<Server>) {
     (format!("http://{addr}"), server)
 }
 
-/// One S2 fixture: mock provider + config + live server + a read-only
+/// One fixture: mock provider + config + live server + a read-only
 /// store handle for event-stream assertions.
 struct Fixture {
     base: String,
@@ -112,7 +112,7 @@ struct Fixture {
 
 /// Long tool hold: the scripted `exec sleep <secs>` keeps the drain
 /// strictly between `tool/call` and `tool/result` — the deterministic
-/// mid-tool window S2 steers/interrupts/queues into.
+/// mid-tool window steers/interrupts/queues into.
 fn sleep_tool(secs: u64) -> ScriptedResponse {
     ScriptedResponse::ToolCall {
         id: "s2-sleep".into(),
@@ -284,7 +284,7 @@ fn end_reasons(events: &[Event]) -> Vec<EndReason> {
         .collect()
 }
 
-/// **The S2 ordering proof**: no `input/admitted` event may appear
+/// **The ordering proof**: no `input/admitted` event may appear
 /// inside a provider-turn bracket (between a `turn/start` and its
 /// matching `turn/end`). This is the event-level view of "steer never
 /// lands inside an in-flight provider turn" — asserted over every
@@ -349,7 +349,7 @@ fn sid_of(s: &str) -> SessionId {
 }
 
 // -----------------------------------------------------------------------
-// S2.1 — steer lands at the next safe boundary, synthetic + strippable
+// .1 — steer lands at the next safe boundary, synthetic + strippable
 // -----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -486,7 +486,7 @@ async fn steer_lands_at_next_safe_boundary_with_strippable_synthetic_marker() {
 }
 
 // -----------------------------------------------------------------------
-// S2.2 — interrupt mid-tool: settle-on-abort, honesty, resume
+// .2 — interrupt mid-tool: settle-on-abort, honesty, resume
 // -----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -640,7 +640,7 @@ async fn interrupt_mid_tool_settles_on_abort_and_resumes_honestly() {
 }
 
 // -----------------------------------------------------------------------
-// S2.3 — interrupt of an idle / completed session is a no-op
+// .3 — interrupt of an idle / completed session is a no-op
 // -----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -695,7 +695,7 @@ async fn interrupt_of_idle_and_completed_sessions_is_a_noop() {
 }
 
 // -----------------------------------------------------------------------
-// S2.4 — queue(msg) is consumed within the same drain sweep
+// .4 — queue(msg) is consumed within the same drain sweep
 // -----------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

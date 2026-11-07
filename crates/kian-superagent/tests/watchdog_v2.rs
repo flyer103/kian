@@ -1,4 +1,4 @@
-//! Integration tests (card C40): Watchdog Session v2 — the
+//! Integration tests: Watchdog Session v2 — the
 //! model-in-the-loop progress judge over a real sqlite `EventStore`
 //! and a real `Engine`. ScriptedProvider on all three sides (Router,
 //! Worker, Watchdog), `TimerChannel` driven by a `ManualTurnClock` as
@@ -157,7 +157,7 @@ fn tool_call_chunk(
 /// The first thread id found in any prior tool result of the request
 /// body (`threads[0].thread_id` from `list_threads`, `thread_id` from
 /// `read_progress`) — the watchdog's dynamic turns read the
-/// runtime-minted thread id this way. Dialect v2 (kian-61): a
+/// runtime-minted thread id this way. Dialect v2: a
 /// `role:"tool"` message's content is the serialized tool output
 /// itself; the legacy v1 shape wrapped it as `{"call_id","output"}` —
 /// both accepted here.
@@ -329,7 +329,7 @@ fn port_for_ctx() -> PortFor<DrainCtx> {
 struct StoreRecallPort {
     store: EventStore,
     /// Constructed for shape parity with the kian-cli recall port; this
-    /// suite never reads the index (pre-existing at C47: clippy 1.98
+    /// suite never reads the index (pre-existing at: clippy 1.98
     /// `dead_code`, fixed lint-only).
     #[expect(dead_code)]
     spill: Mutex<SpillIndex>,
@@ -419,7 +419,7 @@ struct Harness {
     router: SessionId,
     watchdog: SessionId,
     /// Kept for debug symmetry with worker/watchdog scripts; no test in
-    /// this suite reads it (pre-existing at C47: clippy 1.98 `dead_code`,
+    /// this suite reads it (pre-existing at: clippy 1.98 `dead_code`,
     /// fixed lint-only).
     #[expect(dead_code)]
     router_script: Arc<ScriptedProvider>,
@@ -713,7 +713,7 @@ fn script_watchdog_noop(h: &Harness) {
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C40)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 /// The stuck-worker arc, end to end: a dispatched thread with no

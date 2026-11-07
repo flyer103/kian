@@ -1,4 +1,4 @@
-//! C34 acceptance: the `RecallPort` read port and the spill index.
+//! acceptance: the `RecallPort` read port and the spill index.
 //!
 //! The store-level tests exercise assembly's port directly over a real
 //! sqlite store (committed events for arbitrary sessions, honest-empty
@@ -6,7 +6,7 @@
 //! liveness test runs the full assembled server with a gated scripted
 //! provider so a Router drain is parked mid-provider-turn, then proves
 //! a concurrent range read completes — the read never blocks the drain
-//! and the drain never blocks the read (the C11 pattern).
+//! and the drain never blocks the read (the pattern).
 //!
 //! All tests run with `NO_PROXY=127.0.0.1,localhost` (AGENTS.md
 //! gotcha), zero credentials, no network egress.
@@ -465,7 +465,7 @@ recovery:
 /// A Router drain parked mid-provider-turn (the gated scripted
 /// provider) stays concurrent with range reads: the read completes
 /// while the drain is in flight, and the drain completes after the
-/// concurrent read — neither blocks the other (the C11 pattern).
+/// concurrent read — neither blocks the other (the pattern).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_of_a_range_never_blocks_a_concurrent_drain() {
     force_no_proxy();

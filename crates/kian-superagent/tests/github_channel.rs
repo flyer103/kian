@@ -1,4 +1,4 @@
-//! C48 github-channel integration tests: webhook-body fixtures mapped
+//! github-channel integration tests: webhook-body fixtures mapped
 //! through the adapter, and send proven against a scripted in-process
 //! HTTP mock of the GitHub REST API — zero credentials, zero network.
 //! The live smoke test at the bottom is env-gated
@@ -39,12 +39,12 @@ type CapturedCall = (String, String, String, String, Value);
 struct GitHubMock {
     calls: Mutex<Vec<CapturedCall>>,
     /// The `User-Agent` of every captured call, in call order (the
-    /// kian-74 regression surface: api.github.com 403s UA-less
+    /// regression surface: api.github.com 403s UA-less
     /// requests, and reqwest sends none by default).
     user_agents: Mutex<Vec<String>>,
     /// The (status, json) the API answers with, when scripted.
     respond: Mutex<Option<(u16, Value)>>,
-    /// C64: path-keyed list pages (exact path match wins over
+    /// path-keyed list pages (exact path match wins over
     /// `respond`) — the scripted github the poll tests read from.
     pages: Mutex<std::collections::BTreeMap<String, Value>>,
 }
@@ -231,7 +231,7 @@ async fn within<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> Option<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Receive: fixture webhook body → ChannelEvent (via ingest, the C49
+// Receive: fixture webhook body → ChannelEvent (via ingest, the
 // receiver's hand-off point).
 // ---------------------------------------------------------------------------
 
@@ -488,7 +488,7 @@ async fn send_resolves_only_after_the_api_accepts() {
     ));
 }
 
-/// kian-74 regression (C65 live-run gap): api.github.com answers
+/// regression (live-run gap): api.github.com answers
 /// UA-less requests with 403 + HTML, which the adapter then fails to
 /// JSON-decode ("poll response unreadable") — the fixture suites never
 /// saw it because the scripted mock accepts anything. Every request
@@ -701,7 +701,7 @@ async fn github_event_flows_through_classes_rules_and_provenance_untrusted() {
             }]),
             Arc::clone(&inbox) as Arc<dyn InboxWriter>,
         )
-        // C43/C48: github is default-untrusted — assembly passes the
+        // github is default-untrusted — assembly passes the
         // channel name in; the wrapper gains the bit.
         .with_untrusted_channels(BTreeSet::from(["github".to_string()])),
     );
@@ -749,7 +749,7 @@ async fn github_event_flows_through_classes_rules_and_provenance_untrusted() {
     assert_eq!(key.as_deref(), Some("d-yes")); // delivery-id idempotency key
     assert_eq!(inbox.wakes.lock().unwrap().len(), 1);
 
-    // Provenance: the wrapper is the C33/C43 `{"kian":…}` channel-event
+    // Provenance: the wrapper is the `{"kian":…}` channel-event
     // wrapper with the untrusted bit set, and the verbatim github raw
     // (with the adapter-declared explicit flag) inside.
     let kian = &payload["kian"];
@@ -804,7 +804,7 @@ async fn github_live_smoke_env_gated() {
                 .send(ChannelDelivery {
                     channel: "github".into(),
                     target,
-                    content: json!("kian github live smoke (C48)"),
+                    content: json!("kian github live smoke"),
                 })
                 .await
                 .expect("live send accepted");
@@ -815,9 +815,9 @@ async fn github_live_smoke_env_gated() {
 }
 
 // ---------------------------------------------------------------------------
-// C64: poll-receive mode — scripted issue/comment list pages parsed
+// poll-receive mode — scripted issue/comment list pages parsed
 // into ChannelEvents, the since cursor honored, re-polls deduped by
-// event id, and bot/CI senders dropped by the C36 classes table.
+// event id, and bot/CI senders dropped by the classes table.
 // ---------------------------------------------------------------------------
 
 use kian_superagent::{POLL_SINCE_FIELD, PollConfig, PollKind};
@@ -858,7 +858,7 @@ fn comment_item(id: u64, issue: u64, updated: &str, body: &str) -> Value {
 
 /// Gate 1: scripted list pages parse into provenance-carrying
 /// `ChannelEvent`s — the delivery id is the deterministic poll id, the
-/// topic is the C61 thread-key derivation (`github:owner/repo#N`), a
+/// topic is the thread-key derivation (`github:owner/repo#N`), a
 /// human author's issue carries the adapter-declared explicit signal,
 /// and the cursor advances to the newest admitted `updated_at`.
 #[tokio::test]
@@ -1035,7 +1035,7 @@ async fn same_page_repolled_dedupes_by_event_id() {
     );
 }
 
-/// Gate 4 (config side): bot/CI senders are ignored by the C36
+/// Gate 4 (config side): bot/CI senders are ignored by the
 /// classes table while human comments stay candidates — the poll
 /// events flow the same pipeline a webhook event does.
 #[tokio::test]
@@ -1073,7 +1073,7 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
                     correlate_by: CorrelateBy::Topic,
                 },
             }]),
-            // The C36 classes table: the known bot senders are
+            // The classes table: the known bot senders are
             // `ignore`; everything else on the channel is a
             // candidate (human issues explicit by the adapter, human
             // comments candidate).
@@ -1129,7 +1129,7 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
 }
 
 // ---------------------------------------------------------------------------
-// C61: the REST `since` cursor helper (read-position derivation, fixture
+// the REST `since` cursor helper (read-position derivation, fixture
 // payloads only)
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-//! Integration tests (card C26): the resident Router profile over a
+//! Integration tests: the resident Router profile over a
 //! real sqlite `EventStore` and a real `Engine` — batching, channel
 //! output policies, subscription passthrough, and the structural
 //! toolset diff. ScriptedProvider both sides, MockChannel as the IM
@@ -185,7 +185,7 @@ impl RecoveryPolicySource for NoopPolicy {
 // Assembly surface: InboxWriter + StreamPort over the real engine
 // ---------------------------------------------------------------------------
 
-/// The cycle breaker (C25 pattern): admits are durable store writes;
+/// The cycle breaker (pattern): admits are durable store writes;
 /// wakes reach the engine through a late-bound slot.
 struct LateEngineInbox {
     store: EventStore,
@@ -228,7 +228,7 @@ impl InboxWriter for LateEngineInbox {
     }
 }
 
-/// Assembly's `StreamPort` over the execution-hold handle (C25 shape).
+/// Assembly's `StreamPort` over the execution-hold handle (shape).
 struct CtxPort(DrainCtx);
 
 impl StreamPort for CtxPort {
@@ -389,7 +389,7 @@ async fn build_harness(
     }
 }
 
-/// One channel-event input payload (the C23 provenance wrapper).
+/// One channel-event input payload (the provenance wrapper).
 fn channel_event_input(event_id: &str, text: &str) -> Value {
     channel_input_payload(&ChannelEvent {
         channel: "mock-im".into(),
@@ -404,7 +404,7 @@ fn channel_event_input(event_id: &str, text: &str) -> Value {
 
 /// Admits `n` channel events together as ONE residency signal (the
 /// whole cohort commits before the Router's admit counter moves — a
-/// parked Router can never observe a torn cohort; kian-63), no wakes,
+/// parked Router can never observe a torn cohort;), no wakes,
 /// then wakes the Router once — exactly "N channel events admitted
 /// together".
 async fn admit_batch_together(h: &Harness, ids: &[&str]) {
@@ -425,7 +425,7 @@ async fn admit_batch_together(h: &Harness, ids: &[&str]) {
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C26)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 /// Engine-native batching (article §7.2 for free): N channel events
@@ -443,7 +443,7 @@ async fn batch_admits_consumed_in_one_sweep_single_judge_turn() {
     )
     .await;
 
-    // Bootstrap via the C23 admit path (durable row, then one wake).
+    // Bootstrap via the admit path (durable row, then one wake).
     let profile = RouterProfile::new(h.router, router_template("mock", "mock-router"));
     profile
         .bootstrap(h.router_inbox.clone().as_ref())
@@ -580,7 +580,7 @@ async fn over_limit_reply_delivered_truncated_with_channel_delivered() {
     assert!(delivered.ends_with('…'));
     assert!(!delivered.contains("w120"));
 
-    // channel/delivered after the send, C18 schema, honest truncation.
+    // channel/delivered after the send, schema, honest truncation.
     let events = h.store.rebuild(h.router).await.unwrap();
     let delivered_ev = events
         .iter()
@@ -703,7 +703,7 @@ async fn structured_payload_missing_section_rejected_no_delivery_no_event() {
 
 /// The structured happy path: a complete payload is delivered and
 /// `channel/delivered{policy:"structured"}` lands after the send
-/// (no word count — the C18 §2 `words?` schema).
+/// (no word count — the §2 `words?` schema).
 #[tokio::test]
 async fn structured_delivery_happy_path_appends_channel_delivered() {
     let payload = json!({
@@ -841,7 +841,7 @@ async fn passthrough_event_reaches_worker_inbox_zero_router_events() {
     assert_eq!(h.router_script.request_count(), 0);
 }
 
-/// C33: the admission wrapper spills exactly once. The committed pair
+/// the admission wrapper spills exactly once. The committed pair
 /// carries only the Inline view into context and the verbatim raw into
 /// its non-context-bearing sibling; a duplicate event id adds no row.
 #[tokio::test]

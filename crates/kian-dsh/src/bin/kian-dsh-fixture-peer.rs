@@ -1,4 +1,4 @@
-//! `dsh-fixture-peer` (kian-dsh's copy, C54): the C53 scripted stdio
+//! `dsh-fixture-peer` (kian-dsh's copy): the scripted stdio
 //! peer — see [`kian_dsh::fixture_peer`]. Drives the bridge driver's
 //! own CI tests with zero Node/dsh present.
 

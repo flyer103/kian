@@ -1,7 +1,7 @@
-//! Crate-level iron-rule test (card C23, the C13 pattern): the bundle
+//! Crate-level iron-rule test (the pattern): the bundle
 //! never references an execution API. `kian-superagent` reaches the
 //! server exclusively through its ports — `InboxWriter` (write),
-//! `StreamPort` (per-hold, own-session) and `RecallPort` (C34,
+//! `StreamPort` (per-hold, own-session) and `RecallPort` (
 //! cross-session read-only) — the only permitted `kian-orchestrator`
 //! surface is the pure `WakeOutcome` type used in the port's signature
 //! (the "types only via a narrow port" rule). Enforced textually over
@@ -33,9 +33,9 @@ fn src_sources() -> Vec<(PathBuf, String)> {
 
 /// Symbols that would let the bundle touch execution: the orchestrator
 /// machinery, the store, the loop *as a client*, claims, wakes-as-execution.
-/// Same shape as the C13 table in kian-cli, adapted to this crate.
+/// Same shape as the table in kian-cli, adapted to this crate.
 ///
-/// C25 amendment: `LoopDriver` and `.drive(` are banned everywhere
+/// amendment: `LoopDriver` and `.drive(` are banned everywhere
 /// **except `src/worker.rs` and `src/router.rs`** — those modules
 /// legitimately *implement* the core `LoopDriver` seam (a kian-core
 /// type, not an orchestrator execution API) as the mandated
@@ -43,7 +43,7 @@ fn src_sources() -> Vec<(PathBuf, String)> {
 /// banned there from naming any engine/store/hold symbol, and every
 /// other module remains fully banned from the loop surface.
 ///
-/// C26 amendment: `src/router.rs` joins the decorator modules for the
+/// amendment: `src/router.rs` joins the decorator modules for the
 /// same reason (`RouterDriver` implements the seam).
 const FORBIDDEN: [&str; 11] = [
     "Engine",
@@ -59,7 +59,7 @@ const FORBIDDEN: [&str; 11] = [
     "take_eligible_inputs",
 ];
 
-/// Loop-seam tokens only the decorator module may use (see the C25
+/// Loop-seam tokens only the decorator module may use (see the
 /// amendment above). `lib.rs` is exempt *for re-exports only*: the
 /// crate root's job is `pub use` (the `WorkerLoopDriver` type name
 /// contains the seam trait's name); it implements and calls nothing.
@@ -124,7 +124,7 @@ fn channel_shaper_is_only_called_before_inbox_admission() {
         if !matches!(file, "provenance.rs" | "subscriptions.rs" | "lib.rs") {
             assert!(
                 !src.contains("shape_channel_input"),
-                "C33 shaper leaked into {}: shaping is admission-time only",
+                "shaper leaked into {}: shaping is admission-time only",
                 path.display()
             );
         }
@@ -134,7 +134,7 @@ fn channel_shaper_is_only_called_before_inbox_admission() {
         .iter()
         .find(|(path, _)| path.ends_with("subscriptions.rs"))
         .expect("subscription service source");
-    // C43 renamed the shaper entry point to carry the untrusted bit;
+    // renamed the shaper entry point to carry the untrusted bit;
     // the admission-time-only invariant this test guards is unchanged.
     let shape = subscriptions
         .find("shape_channel_input_marked(&event, &self.shaping, untrusted)")
@@ -180,7 +180,7 @@ fn inbox_writer_port_exposes_exactly_admit_and_wake() {
     }
 }
 
-/// C34: the read port is exactly a read port — cross-session reads and
+/// the read port is exactly a read port — cross-session reads and
 /// the spill-index lookup, nothing that writes, wakes or steers.
 #[test]
 fn recall_port_exposes_exactly_the_read_surface() {

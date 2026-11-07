@@ -1,6 +1,6 @@
-//! `GitHubChannel` — the second *real* [`ChannelAdapter`] (card C48,
+//! `GitHubChannel` — the second *real* [`ChannelAdapter`] (
 //! DESIGN §4.2 GitHub row): GitHub over webhook-shaped deliveries
-//! (receive) and the REST API (send) — the S4 "group-chat message +
+//! (receive) and the REST API (send) — the "group-chat message +
 //! CI events" family.
 //!
 //! Footprint-Ladder level 2, beside `lark.rs`: plugin-hosted code over
@@ -8,7 +8,7 @@
 //! exists.
 //!
 //! - **Receive** — push-shaped, not poll-shaped: GitHub POSTs a
-//!   webhook delivery, the receiver surface (C49) verifies it
+//!   webhook delivery, the receiver surface verifies it
 //!   (HMAC-SHA256 over the raw body — verification precedes any
 //!   parsing, the untrusted-by-default discipline), and hands the
 //!   *verified* triple (event type, delivery id, parsed body) to
@@ -28,17 +28,17 @@
 //!   [`ChannelError`].
 //! - **Credentials** — the token is a constructor input, never a
 //!   config-file field: assembly reads `KIAN_GITHUB_TOKEN` from the
-//!   environment (the C13/C44 secrets discipline). Receive needs no
+//!   environment (the secrets discipline). Receive needs no
 //!   token (webhook reads are unauthenticated; trust comes from the
 //!   receiver's HMAC check). `send: true` in the config without a
 //!   token refuses to start — fail-closed, never a degraded send.
 //! - **Untrusted by default** — `untrusted: true` is the config
-//!   default (C43): GitHub payloads are attacker-influible text (issue
+//!   default: GitHub payloads are attacker-influible text (issue
 //!   bodies, commit messages). The bit itself is applied by the
 //!   subscription service's channel list at admission time
 //!   (labeling, never filtering); [`GitHubChannel::untrusted`] exposes
 //!   the configured default for assembly.
-//! - **Provenance (C36)** — `repo.full_name` → `group`, the config
+//! - **Provenance ** — `repo.full_name` → `group`, the config
 //!   topic table → `topic` (`owner/repo` key, or an exact
 //!   `owner/repo#N` PR override when the payload is PR-scoped), the
 //!   verbatim `sender` object → `sender`, and an adapter-declared
@@ -79,14 +79,14 @@ pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 /// The REST API version pin (`X-GitHub-Api-Version`).
 pub const API_VERSION: &str = "2022-11-28";
 
-/// The `User-Agent` every request carries (kian-74): api.github.com
+/// The `User-Agent` every request carries: api.github.com
 /// answers UA-less requests with HTTP 403 + an HTML body, which the
 /// JSON decode then fails opaquely ("poll response unreadable").
 /// Applied once on the client so both the poll GETs and the send
 /// POST/PATCHs (and any future request path) carry it.
 pub const USER_AGENT: &str = concat!("kian/", env!("CARGO_PKG_VERSION"), " (+issue-watch)");
 
-/// The webhook event types this adapter maps (the S4 family). Any
+/// The webhook event types this adapter maps (the family). Any
 /// other `X-GitHub-Event` is an honest drop with an audit line —
 /// never a best-effort parse.
 pub const SUPPORTED_EVENT_TYPES: [&str; 6] = [
@@ -117,14 +117,14 @@ const KIND_PR_REVIEW: &str = "pr_review";
 const KIND_PR_DESCRIPTION: &str = "pr_description";
 const SEND_KINDS: [&str; 3] = [KIND_ISSUE_COMMENT, KIND_PR_REVIEW, KIND_PR_DESCRIPTION];
 
-/// The poll kind vocabulary (C64): which REST list endpoints the
+/// The poll kind vocabulary: which REST list endpoints the
 /// poll-receive mode drives. Serde names are the config spelling
 /// (`issues` | `issue_comments`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PollKind {
     /// `GET /repos/{o}/{r}/issues?since=…` — issues (and PRs, which
-    /// the endpoint folds in) updated since the cursor.
+    /// the endpoint folds ) updated since the cursor.
     Issues,
     /// `GET /repos/{o}/{r}/issues/comments?since=…` — repo-wide issue
     /// comments updated since the cursor.
@@ -132,7 +132,7 @@ pub enum PollKind {
 }
 
 impl PollKind {
-    /// The webhook event-type spelling the C48 mapper expects (the
+    /// The webhook event-type spelling the mapper expects (the
     /// poll items are normalized into webhook-shaped bodies, so the
     /// existing mapping — mention scan, provenance, PR detection —
     /// applies unchanged).
@@ -162,16 +162,16 @@ impl PollKind {
 /// silent default to a different field).
 pub const POLL_SINCE_FIELD: &str = "updated_at";
 
-/// The poll-receive configuration (C64): `poll: {repo, interval_ms,
+/// The poll-receive configuration: `poll: {repo, interval_ms,
 /// kinds, since_field, backfill_ms}` beside webhook receive. When
 /// present the adapter gains a poll driver (assembly spawns it after
 /// the subscription consumers): every `interval_ms` it reads the REST
 /// list endpoints with a `since` cursor, maps each updated item
-/// through the C48 mapping, and fans the events out — idempotent by
+/// through the mapping, and fans the events out — idempotent by
 /// the synthetic delivery id (`poll:<kind>:<repo>#<id>:<updated_at>`)
 /// and bounded by the cursor (nothing at or before it is emitted).
 ///
-/// Read position (C61/ADR-013): the cursor is seedable from the
+/// Read position (ADR-013): the cursor is seedable from the
 /// stream-derived resume position (`read_position` /
 /// `payload_since_cursor`) at boot; a first poll with no cursor is the
 /// bounded backfill window (`now - backfill_ms`). There is no
@@ -275,7 +275,7 @@ pub struct GitHubConfig {
     /// supported type surfaces; a non-empty set admits only those
     /// types (fail-closed on unknown entries).
     pub events: BTreeSet<String>,
-    /// C43 default `true`: GitHub payloads are attacker-influible
+    /// default `true`: GitHub payloads are attacker-influible
     /// text. Advisory to assembly (it builds the subscription
     /// service's untrusted channel list); the adapter itself never
     /// filters on it.
@@ -287,15 +287,15 @@ pub struct GitHubConfig {
     /// Env-only credential (`KIAN_GITHUB_TOKEN`, filled by assembly).
     /// Receive needs none.
     pub token: Option<String>,
-    /// The poll-receive mode (C64), beside webhook receive: when
+    /// The poll-receive mode, beside webhook receive: when
     /// present, assembly spawns the adapter's poll driver after the
     /// subscription consumers. `None` (the default) keeps the adapter
-    /// exactly the C48/C49 shape — webhook-fed only.
+    /// exactly the shape — webhook-fed only.
     pub poll: Option<PollConfig>,
 }
 
 impl GitHubConfig {
-    /// Fails closed on every degenerate field (the C13/C44/C48
+    /// Fails closed on every degenerate field (the
     /// discipline: an unusable github config is a startup error,
     /// never a default).
     pub fn validate(&self) -> Result<(), GitHubError> {
@@ -371,7 +371,7 @@ struct Inner {
     /// In-memory delivery-id dedupe (bounded); the durable guard is
     /// admission's `event_id` idempotency.
     seen: Mutex<DedupeRing>,
-    /// The poll-receive mode's resume cursor (C64): the `since`
+    /// The poll-receive mode's resume cursor: the `since`
     /// timestamp of the last poll (seeded at boot from the
     /// stream-derived read position; `None` until the first poll,
     /// which then bounds itself by the backfill window). In-memory
@@ -391,7 +391,7 @@ impl GitHubChannel {
         config.validate()?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            // kian-74: api.github.com 403s UA-less requests — the
+            // api.github.com 403s UA-less requests — the
             // client-level default covers poll, send, and every
             // future request path in one place.
             .user_agent(USER_AGENT)
@@ -423,7 +423,7 @@ impl GitHubChannel {
         &self.inner.config
     }
 
-    /// The configured C43 untrusted default (advisory to assembly:
+    /// The configured untrusted default (advisory to assembly:
     /// it builds the subscription service's untrusted channel list).
     pub fn untrusted(&self) -> bool {
         self.inner.config.untrusted
@@ -436,7 +436,7 @@ impl GitHubChannel {
     }
 
     // -----------------------------------------------------------------
-    // Poll-receive mode (C64) — beside webhook receive, never through
+    // Poll-receive mode — beside webhook receive, never through
     // it: the poll driver reads the REST list endpoints with a
     // `since` cursor and fans the mapped events out through the same
     // subscribe surface the webhook path feeds.
@@ -453,7 +453,7 @@ impl GitHubChannel {
             .clone()
     }
 
-    /// Seeds the resume cursor at boot (C61: the stream-derived read
+    /// Seeds the resume cursor at boot (the stream-derived read
     /// position from the last admitted event's payload — assembly
     /// calls this before spawning the poll driver). Keeps an existing
     /// cursor when one is already set (the max wins: a restart must
@@ -477,7 +477,7 @@ impl GitHubChannel {
     /// Runs one poll (the poll driver's body, public so tests and
     /// assembly drive it directly): reads every configured list
     /// endpoint with the current `since` cursor, maps the updated
-    /// items through the C48 mapping with the C61 thread-key topic,
+    /// items through the mapping with the thread-key topic,
     /// and fans each genuinely new event out. Returns how many events
     /// surfaced; the cursor advances to the newest `updated_at` seen
     /// (admitted or already-known — both bound the next poll).
@@ -563,7 +563,7 @@ impl GitHubChannel {
 
     /// Spawns the poll run loop (assembly mounts the handle for the
     /// server's lifetime; the loop is beside the webhook receiver —
-    /// the C49 surface is untouched). The first poll waits one
+    /// the surface is untouched). The first poll waits one
     /// interval (the TimerChannel discipline: assembly lands the
     /// Router bootstrap before the first event fires). A poll error
     /// is an audit line, never a crash: the next interval re-polls,
@@ -603,7 +603,7 @@ impl GitHubChannel {
         })
     }
 
-    /// Ingests one **verified** webhook delivery (the C49 receiver
+    /// Ingests one **verified** webhook delivery (the receiver
     /// surface calls this after its HMAC check — parse only what
     /// cryptographically authenticated). Maps the delivery to at most
     /// one `ChannelEvent` and fans it out to every live subscriber.
@@ -692,7 +692,7 @@ pub fn delivery_to_event(
         .filter(|r| !r.is_empty())?;
     let pr_number = payload_pr_number(event_type, body);
     let topic = config.topic_for(repo, pr_number)?;
-    // C36 provenance: the verbatim webhook `sender` object (login,
+    // provenance: the verbatim webhook `sender` object (login,
     // type, …) — machine events without one stay `None`.
     let sender = body.get("sender").filter(|s| s.is_object()).cloned();
     let group = repo.to_string();
@@ -713,7 +713,7 @@ pub fn delivery_to_event(
     })
 }
 
-/// The REST `since` cursor a mapped payload carries (C61 read
+/// The REST `since` cursor a mapped payload carries (read
 /// position): the `updated_at` timestamp of the issue or PR the
 /// payload belongs to — exactly the field the REST list endpoints
 /// filter on, so a restart's poll resumes at the last admitted
@@ -734,16 +734,16 @@ pub fn payload_since_cursor(payload: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// Poll-receive mapping (C64) — pure functions over the REST list
+// Poll-receive mapping — pure functions over the REST list
 // pages' items, normalized into webhook-shaped bodies so the existing
-// C48 mapping (mention scan, provenance, PR detection, allowlist)
+// mapping (mention scan, provenance, PR detection, allowlist)
 // applies unchanged. The delivery id is synthetic but deterministic:
 // `poll:<kind>:<repo>#<item id>:<updated_at>` — an unchanged item
 // re-polled derives the same id and dedupes; an updated item derives
 // a new one and surfaces.
 // ---------------------------------------------------------------------
 
-/// The poll-mode thread-key shape (C61/ADR-013): the canonical topic
+/// The poll-mode thread-key shape (ADR-013): the canonical topic
 /// is derived from `group` + `issue.number`, so every event of one
 /// issue — its opening, its comments, its edits — carries one routing
 /// topic (`<channel>:<owner/repo>#<number>`) and fans out to exactly
@@ -758,8 +758,8 @@ pub fn poll_thread_key_rule(channel: &str) -> crate::intake::ThreadKeyRule {
     }
 }
 
-/// Derives the outbox conversation keys a C61 thread-key topic covers
-/// (kian-76): a topic of the shape `<channel>:<owner/repo>#<number>`
+/// Derives the outbox conversation keys a thread-key topic covers
+/// a topic of the shape `<channel>:<owner/repo>#<number>`
 /// names exactly one GitHub conversation, and every send the Router
 /// makes for it targets `{kind, number, owner, repo}` for one of
 /// [`SEND_KINDS`] — the same `(channel, speak_key(target))` key the
@@ -810,7 +810,7 @@ pub fn poll_item_since(item: &Value) -> Option<&str> {
 
 /// Is this item's author a human (not a Bot, not a `[bot]`-suffixed
 /// app login)? The adapter-declared `explicit` signal on issue
-/// authorship (C64) — a human filing an issue is an explicit request
+/// authorship — a human filing an issue is an explicit request
 /// for the watch's attention.
 pub fn poll_author_is_human(item: &Value) -> bool {
     let Some(user) = item.get("user").and_then(Value::as_object) else {
@@ -825,11 +825,11 @@ pub fn poll_author_is_human(item: &Value) -> bool {
 }
 
 /// Normalizes one issues-list item into the webhook-shaped `issues`
-/// body the C48 mapper consumes. The action is honestly `poll` (a
+/// body the mapper consumes. The action is honestly `poll` (a
 /// list page cannot know opened/edited/closed — the topic thread key,
 /// not the action, carries the correlation). A human author's item
 /// carries the adapter-declared `explicit: true` (issue authorship is
-/// the explicit signal; bot/CI senders never get it — the C36 classes
+/// the explicit signal; bot/CI senders never get it — the classes
 /// table is the config-side filter).
 pub fn poll_issue_body(repo_full_name: &str, item: &Value) -> Value {
     let mut body = json_body(repo_full_name, item);
@@ -889,8 +889,8 @@ pub fn poll_event_id(kind: PollKind, repo: &str, item: &Value) -> Option<String>
     ))
 }
 
-/// Maps one REST list page's items to `ChannelEvent`s under the C48
-/// mapping with the C61 thread-key topic. Pure — the fixture-test
+/// Maps one REST list page's items to `ChannelEvent`s under the
+/// mapping with the thread-key topic. Pure — the fixture-test
 /// surface for the whole poll mapping contract:
 ///
 /// - items at or before the `since` cursor are **not** emitted
@@ -953,7 +953,7 @@ pub fn poll_items_to_events(
             // the webhook path takes.
             continue;
         };
-        // The topic IS the derived thread key (C61: keys are the
+        // The topic IS the derived thread key (keys are the
         // topics after derivation) — one canonical topic per issue
         // thread, regardless of what the static table maps the repo
         // to.
@@ -1072,7 +1072,7 @@ fn payload_pr_number(event_type: &str, body: &Value) -> Option<u64> {
 
 /// Does any human-authored text field of this payload carry an
 /// @-mention ('@' followed by at least one non-whitespace character —
-/// the C36 predicate shape)? Machine-only events (push metadata,
+/// the predicate shape)? Machine-only events (push metadata,
 /// check_run, status) never declare explicit.
 fn payload_has_mention(event_type: &str, body: &Value) -> bool {
     let mut texts: Vec<&str> = Vec::new();
@@ -1112,7 +1112,7 @@ fn payload_has_mention(event_type: &str, body: &Value) -> bool {
 }
 
 /// `@` followed by at least one non-whitespace character (the shared
-/// C36 predicate shape).
+/// predicate shape).
 fn text_has_at_mention(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     (0..chars.len())
@@ -1367,7 +1367,7 @@ mod tests {
             ))
         );
 
-        // The C48 fail-closed rule: send configured without a token
+        // The fail-closed rule: send configured without a token
         // refuses to start…
         let mut bad = cfg.clone();
         bad.send = true;
@@ -1389,7 +1389,7 @@ mod tests {
     fn constructor_reports_name_and_untrusted_default() {
         let channel = GitHubChannel::new("github", config()).expect("valid config");
         assert_eq!(channel.channel_name(), "github");
-        assert!(channel.untrusted(), "C43: github defaults to untrusted");
+        assert!(channel.untrusted(), "github defaults to untrusted");
         assert_eq!(channel.dropped_full(), 0);
     }
 
@@ -1564,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_event_types_are_the_s4_family() {
+    fn supported_event_types_are_the_bundle_family() {
         assert_eq!(
             SUPPORTED_EVENT_TYPES,
             [
@@ -1590,7 +1590,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C64: poll-receive mode — config validation, the pure mapping,
+    // poll-receive mode — config validation, the pure mapping,
     // and the RFC3339 cursor rendering.
     // -----------------------------------------------------------------
 
@@ -1677,7 +1677,7 @@ mod tests {
             events[1].event_id,
             "poll:issues:flyer103/kian#102:2026-11-04T10:30:00Z"
         );
-        // The topic is the derived thread key (C61): one canonical
+        // The topic is the derived thread key: one canonical
         // topic per issue thread, not the static table's repo topic.
         assert_eq!(events[0].topic.as_deref(), Some("github:flyer103/kian#101"));
         assert_eq!(events[1].topic.as_deref(), Some("github:flyer103/kian#102"));
@@ -1774,7 +1774,7 @@ mod tests {
 
     #[test]
     fn thread_key_topic_derives_the_conversation_keys_both_sides_share() {
-        // kian-76: a C61 thread-key topic `<channel>:<owner/repo>#<n>`
+        // a thread-key topic `<channel>:<owner/repo>#<n>`
         // names one GitHub conversation; every send the Router makes
         // for it targets `{kind, number, owner, repo}` for one of the
         // send kinds — the exact `conversation_key` the outbox intent

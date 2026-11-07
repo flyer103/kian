@@ -1,7 +1,7 @@
 //! `MockChannel` — the first-class in-memory [`ChannelAdapter`]
-//! (card C23, DESIGN §4.1): production code, not a `#[cfg(test)]` stub.
+//! (DESIGN §4.1): production code, not a `#[cfg(test)]` stub.
 //!
-//! It is the S4 IM stand-in and the framework's reference
+//! It is the IM stand-in and the framework's reference
 //! implementation:
 //!
 //! - **Inbound** — [`MockChannel::send_event`] (and the convenience
@@ -11,7 +11,7 @@
 //!   that subscriber's copy with an audit log line (bounded means
 //!   bounded — a slow consumer must never block the injector).
 //! - **Outbound** — [`ChannelAdapter::send`] captures the delivery with
-//!   its [`SendReceipt`] in a capture buffer, so tests (and S4) assert
+//!   its [`SendReceipt`] in a capture buffer, so tests () assert
 //!   exactly what a channel output policy delivered. An honest
 //!   `SendReceipt` is returned only after the delivery is captured.
 

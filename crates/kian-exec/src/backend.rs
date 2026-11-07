@@ -1,4 +1,4 @@
-//! `RemoteExecBackend` — the durable remote-execution seam impl (card C20,
+//! `RemoteExecBackend` — the durable remote-execution seam impl (
 //! DESIGN §4.3/§6.2, ADR-007).
 //!
 //! Enqueue-first: the queue row is durable in `kian.sqlite` **before** any
@@ -61,17 +61,17 @@ struct QueueCore {
     store: ExecStore,
     routes: HashMap<String, Arc<Route>>,
     config: RemoteExecConfig,
-    /// kian-77: the exec output redactor. Every `Ok` outcome passes it
+    /// the exec output redactor. Every `Ok` outcome passes it
     /// once, at settlement ([`QueueCore::complete`]) — the single choke
     /// point the durable row, every waiter, the sync tool result and
     /// the async-jobs completion all read from.
     redactor: SecretRedactor,
-    /// C52 row-lease identity: which replica's drivers own the rows
+    /// row-lease identity: which replica's drivers own the rows
     /// they drive. Defaults to a single-process holder; multi-replica
     /// assemblies (postgres mode) pass the config-validated unique
     /// `drain.holder` via [`RemoteExecBackend::with_row_leases`].
     row_lease_holder: String,
-    /// C52 row-lease TTL — how long a claimed row stays owned without a
+    /// row-lease TTL — how long a claimed row stays owned without a
     /// heartbeat before any replica may re-drive it.
     row_lease_ttl: Duration,
     waiters: Mutex<HashMap<CommandId, Vec<(u64, Waiter)>>>,
@@ -101,7 +101,7 @@ impl Default for RemoteExecConfig {
 }
 
 /// The server-side remote [`ExecBackend`] over a durable sqlite queue
-/// (card C20). Cloneable; share one per process.
+/// . Cloneable; share one per process.
 ///
 /// The endpoint managers must be started by the caller
 /// ([`ConnectionManager::start`]); this type only observes them.
@@ -130,7 +130,7 @@ impl RemoteExecBackend {
         default_endpoint: impl Into<String>,
         config: RemoteExecConfig,
     ) -> std::result::Result<Self, String> {
-        // C52 row-lease defaults: a single-process holder and the queue
+        // row-lease defaults: a single-process holder and the queue
         // timeout as the TTL (a row owed longer than that is re-drivable
         // — consistent with the honest-timeout bound). Single-process
         // behavior is unchanged: the same holder always re-claims.
@@ -144,7 +144,7 @@ impl RemoteExecBackend {
         )
     }
 
-    /// [`RemoteExecBackend::new`] with an explicit C52 row-lease
+    /// [`RemoteExecBackend::new`] with an explicit row-lease
     /// identity: `holder` names this replica (multi-replica postgres
     /// assemblies pass the config-validated unique `drain.holder`),
     /// `ttl` how long a claimed queue row stays owned without a
@@ -170,7 +170,7 @@ impl RemoteExecBackend {
         )
     }
 
-    /// kian-77: [`RemoteExecBackend::with_row_leases`] with the exec
+    /// [`RemoteExecBackend::with_row_leases`] with the exec
     /// output redactor. The redactor runs once per settled `Ok`
     /// outcome, before the durable row is written — the row, every
     /// waiter, `RemoteExecTool` results and async-job completions all
@@ -227,13 +227,13 @@ impl RemoteExecBackend {
         })
     }
 
-    /// The store behind the queue (registry reads for the C21 watchdog,
+    /// The store behind the queue (registry reads for the watchdog,
     /// row inspection for ops).
     pub fn store(&self) -> &ExecStore {
         &self.core.store
     }
 
-    /// The C52 row-lease identity this backend's drivers claim queue
+    /// The row-lease identity this backend's drivers claim queue
     /// rows under: `(holder, ttl)`.
     pub fn row_lease(&self) -> (&str, Duration) {
         (&self.core.row_lease_holder, self.core.row_lease_ttl)
@@ -268,16 +268,16 @@ impl RemoteExecBackend {
         {
             // Re-execution of a settled command id: answer from the row —
             // one row, one dispatch, ever (ADR-007 dedupe). Rows written
-            // by pre-kian-77 builds may carry raw output; redact the
+            // by legacy builds may carry raw output; redact the
             // read-back so a replayed tool call still emits scrubbed
             // bytes even against an old store.
             EnqueueOutcome::Existing(row) => match row.status {
                 QueueStatus::Done => {
                     return match row.outcome.expect("done rows always carry an outcome") {
-                        // The row was redacted at settlement (C69 report
+                        // The row was redacted at settlement (report
                         // rides the durable result); re-redacting is
                         // idempotent (scrubbed bytes yield an empty
-                        // report) and covers pre-kian-77 rows whose raw
+                        // report) and covers legacy rows whose raw
                         // output still scrubs — the stored report is
                         // kept and summed with anything newly redacted.
                         CommandOutcome::Ok { result } => {
@@ -402,10 +402,10 @@ impl QueueCore {
     /// Record a settled outcome durably, then wake every caller attached to
     /// this command id. Called only from a dispatch task.
     async fn complete(&self, command_id: CommandId, outcome: CommandOutcome) {
-        // kian-77: the one redaction point on the remote path — before
+        // the one redaction point on the remote path — before
         // the row is written, so the durable copy (and everything that
         // reads it: waiters, tool results, async completions, replays)
-        // only ever holds scrubbed bytes. C69: the same pass emits its
+        // only ever holds scrubbed bytes. The same pass emits its
         // provenance report, which rides the durable row so deduped
         // read-backs still answer with the report.
         let outcome = match outcome {
@@ -471,7 +471,7 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
             break;
         }
         let st = route.manager.status();
-        // Registry projection (C21 reads it): disposable, rebuilt from live
+        // Registry projection (reads it): disposable, rebuilt from live
         // status on every loop turn — heartbeats refresh it while idle.
         if let Err(e) = core
             .store
@@ -602,7 +602,7 @@ async fn drive_row_inner(
             .await
             .map_err(|_| "route cap closed".to_string())?
     };
-    // C52 row lease: single-statement ownership of this row for the
+    // row lease: single-statement ownership of this row for the
     // dispatch's duration — claimed BEFORE any mutation of the row. A
     // fresh lease held by *another* replica means its driver owns the
     // row: skip honestly and leave the row parked untouched (the lease
@@ -682,7 +682,7 @@ fn duration_ms_i64(d: Duration) -> i64 {
 }
 
 /// Extends one queue row's lease every `ttl/3` until `stop` fires —
-/// the owner's drive-loop heartbeat (C52). Losing the lease (another
+/// the owner's drive-loop heartbeat. Losing the lease (another
 /// replica reclaimed after expiry) logs and ends the loop; the
 /// in-flight dispatch itself is unaffected (the lease is liveness
 /// only, never a write permission).

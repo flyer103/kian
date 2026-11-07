@@ -1,4 +1,4 @@
-//! `kian` binary entry point (cards C13–C14, C17).
+//! `kian` binary entry point.
 //!
 //! - `kian` / `kian --version` — print the version.
 //! - `kian serve [--config <path>]` — run the single-machine server
@@ -6,21 +6,21 @@
 //!   `./kian.yaml`. Loading is fail-closed: a malformed config refuses
 //!   to start with a clear error and a non-zero exit code.
 //! - `kian cache-stats [--config <path>] [--session <uuid>] [--json]`
-//!   — S3 cache-byte stability report (C17): prefix hit-rate and
+//!   — cache-byte stability report: prefix hit-rate and
 //!   invalidation-cause counters derived from the event stream.
 //! - `kian usage-stats [--config <path>] [--session <uuid>] [--json]`
-//!   — C67 provider token-usage report: per-store token totals derived
+//!   — provider token-usage report: per-store token totals derived
 //!   from `turn/end` usage payloads (verbatim, no pricing).
-//! - `kian session inspect <uuid>` — projection + counters (C14;
+//! - `kian session inspect <uuid>` — projection + counters (
 //!   embedded read-only).
 //! - `kian session replay <uuid> [--url <base>]` — re-derive everything
 //!   from events, verify A2 byte-identity, optionally diff against the
 //!   live server projection.
 //! - `kian session export <uuid> [--since S] [--until U] [--out F]
 //!   [--with-event-ids]` — event interval → JSONL audit package
-//!   (`--with-event-ids` adds the C69 derived event id per line).
+//!   (`--with-event-ids` adds the derived event id per line).
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
-//!   `kian recovery budget reset <uuid>` — operator actions (C14).
+//!   `kian recovery budget reset <uuid>` — operator actions.
 //!
 //! Read-only commands open the sqlite file in-process (read-only);
 //! mutating commands talk to a running `serve` via `POST /ops/rpc`.
@@ -31,27 +31,27 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   kian serve [--config <path>]          run the kian server (default config: ./kian.yaml)
   kian cache-stats [--config <path>] [--session <uuid>] [--json]
-                                         S3 cache-byte stability report (C17)
+                                         cache-byte stability report
   kian usage-stats [--config <path>] [--session <uuid>] [--json]
-                                         provider token-usage report (C67)
+                                         provider token-usage report
   kian session inspect <uuid> [--db <sqlite>] [--config <path>] [--json]
-                                         projection + counters (C14)
+                                         projection + counters
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
-                                         re-derive everything from events (C14)
+                                         re-derive everything from events
   kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--db <sqlite>] [--config <path>]
-                                         event interval → JSONL audit package (C14; --with-event-ids adds the C69 derived id)
+                                         event interval → JSONL audit package (--with-event-ids adds the derived event id)
   kian wake-now <uuid> [--url <base>] [--config <path>] [--json]
-                                         operator wake via the running server (C14)
+                                         operator wake via the running server
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
-                                         epoch/TTL/holder of every lease (C14)
+                                         epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
                                          Ticket stage board: every worker session's
-                                         'what is it waiting for' stage (C56)
+                                         'what is it waiting for' stage
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
-                                         explicit recovery/budget-reset event (C14)
+                                         explicit recovery/budget-reset event
   kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
                                   [--url <base>] [--config <path>] [--json]
-                                         demo/S4 channel injection via ops (C27)
+                                         demo channel injection via ops
   kian --version                        print the version
 ";
 
@@ -83,10 +83,10 @@ fn main() -> ExitCode {
 }
 
 fn serve(args: &[String]) -> ExitCode {
-    // kian-62: `serve` is a long-lived resident — without a subscriber
+    // `serve` is a long-lived resident — without a subscriber
     // its tracing lines (including the resident re-arm succession note)
     // go nowhere and operators have no boot evidence. Default to warn;
-    // RUST_LOG overrides (the kian-62 demo runs with RUST_LOG=info to
+    // RUST_LOG overrides (the demo runs with RUST_LOG=info to
     // capture the re-arm line in serve.log).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
@@ -153,7 +153,7 @@ fn serve(args: &[String]) -> ExitCode {
 }
 
 /// `kian cache-stats [--config <path>] [--session <uuid>] [--json]` —
-/// the C17 S3 report from the configured store.
+/// the report from the configured store.
 fn cache_stats(args: &[String]) -> ExitCode {
     let mut config_path = std::path::PathBuf::from("kian.yaml");
     let mut session: Option<kian_core::model::SessionId> = None;
@@ -216,7 +216,7 @@ fn cache_stats(args: &[String]) -> ExitCode {
 }
 
 /// `kian usage-stats [--config <path>] [--session <uuid>] [--json]` —
-/// the C67 provider token-usage report from the configured store
+/// the provider token-usage report from the configured store
 /// (mirrors `cache-stats`).
 fn usage_stats(args: &[String]) -> ExitCode {
     let mut config_path = std::path::PathBuf::from("kian.yaml");
@@ -280,10 +280,10 @@ fn usage_stats(args: &[String]) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// C14 session commands
+// session commands
 // ---------------------------------------------------------------------------
 
-/// Shared flag set for the C14 commands (each uses the subset it needs).
+/// Shared flag set for the commands (each uses the subset it needs).
 struct SessionArgs {
     config: std::path::PathBuf,
     db: Option<std::path::PathBuf>,
@@ -294,7 +294,7 @@ struct SessionArgs {
     out: Option<std::path::PathBuf>,
     reason: Option<String>,
     json: bool,
-    /// C69: `session export --with-event-ids` — adds the derived event
+    /// `session export --with-event-ids` — adds the derived event
     /// id to each exported line (export path only; other subcommands
     /// ignore the flag).
     with_event_ids: bool,
@@ -317,7 +317,7 @@ impl Default for SessionArgs {
     }
 }
 
-/// Parses the shared C14 flag set; `usage_for` names the subcommand in
+/// Parses the shared flag set; `usage_for` names the subcommand in
 /// errors. Positional <uuid> sets `session`.
 fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, String> {
     let mut out = SessionArgs::default();
@@ -499,7 +499,7 @@ fn wake_now(args: &[String]) -> ExitCode {
 }
 
 /// `kian mock-channel-send <channel> [--text S | --payload JSON]
-/// [--topic T] [--url <base>] [--json]` (C27 demo injection).
+/// [--topic T] [--url <base>] [--json]` (demo injection).
 fn mock_channel_send(args: &[String]) -> ExitCode {
     let mut channel: Option<String> = None;
     let mut text: Option<String> = None;
@@ -612,7 +612,7 @@ fn lease(args: &[String]) -> ExitCode {
     )
 }
 
-/// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the C56
+/// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the
 /// Ticket stage board (read-only embedded).
 fn tickets(args: &[String]) -> ExitCode {
     let mut config = std::path::PathBuf::from("kian.yaml");

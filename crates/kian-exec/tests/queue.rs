@@ -1,4 +1,4 @@
-//! Durable command queue acceptance tests (card C20).
+//! Durable command queue acceptance tests.
 //!
 //! Every test pairs the real queue + `RemoteExecBackend` against the real
 //! endpoint-side crate over an ephemeral-port TCP listener and a real
@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-/// Local e2e discipline (round-2 plan §1 rule 6).
+/// Local e2e discipline (plan §1 rule 6).
 fn no_proxy() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -153,7 +153,7 @@ impl ExecBackend for CountingExecutor {
     }
 }
 
-/// **S5 core semantic**: enqueue while the endpoint is offline parks
+/// ** core semantic**: enqueue while the endpoint is offline parks
 /// durably (`pending` row in sqlite, registry `offline`); when the endpoint
 /// connects later, the caller's future resolves with the *real* result.
 #[tokio::test]
@@ -281,7 +281,7 @@ async fn queue_timeout_is_honest_and_marks_abandoned() {
     assert_eq!(again, ExecError::Timeout);
 
     backend.shutdown().await;
-    // NOTE (C19 limitation, flagged to the orchestrator): a manager parked
+    // NOTE (limitation, flagged to the orchestrator): a manager parked
     // in the handshake (endpoint bound but never serving) cannot be shut
     // down — the hello-wait has no shutdown branch, so `shutdown().await`
     // would deadlock. Tests that never connect drop the manager instead;
@@ -328,7 +328,7 @@ async fn server_restart_redrives_pending_rows() {
             QueueStatus::Pending
         );
         backend.shutdown().await;
-        // Never-connected manager (C19 handshake-park limitation, see the
+        // Never-connected manager (handshake-park limitation, see the
         // queue-timeout test note): dropping beats deadlocking on
         // `shutdown().await` here; the runtime reclaims the supervisor.
         drop(manager);
@@ -502,7 +502,7 @@ async fn per_endpoint_inflight_cap_respected() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// C11 liveness pattern, on a **single-threaded** runtime: while a slow
+/// liveness pattern, on a **single-threaded** runtime: while a slow
 /// remote command executes through the durable queue, the runtime's other
 /// tasks keep ticking — sqlite rides the async sqlx pool and nothing
 /// blocks the worker.
@@ -561,7 +561,7 @@ async fn slow_remote_command_never_blocks_the_runtime() {
 }
 
 /// Store-level contract: enqueue dedupe, monotone status transitions, and
-/// committed `done` rows are immutable (the runtime half of the C5 review
+/// committed `done` rows are immutable (the runtime half of the review
 /// assertion).
 #[tokio::test]
 async fn store_enqueue_dedupe_and_status_transitions() {
@@ -649,7 +649,7 @@ async fn store_reopen_is_idempotent_and_rows_survive() {
     let _ = std::fs::remove_file(&db);
 }
 
-// -- C52: queue-row leases ---------------------------------------------------
+// -- queue-row leases ---------------------------------------------------
 
 /// The single-statement row lease over sqlite (the same code path
 /// postgres rides): claim → fresh-foreign refusal → heartbeat

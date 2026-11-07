@@ -1,10 +1,10 @@
 //! TCP transport for KiandProto v0: newline-delimited JSON frames over a
-//! TCP stream (card C12, DESIGN §4.3).
+//! TCP stream (DESIGN §4.3).
 //!
 //! `attach` wires a `TcpStream` to the framed channel ends that
 //! [`Endpoint::run_connection`] consumes; `connect` builds the server-side
 //! peer over TCP. The concrete framing (JSON lines) is provisional and
-//! expected to churn when Phase 2 lands the real `kian-exec` pair.
+//! expected to churn when bundle lands the real `kian-exec` pair.
 
 use std::net::SocketAddr;
 
@@ -60,7 +60,7 @@ async fn read_pump(reader: OwnedReadHalf, inbound_tx: mpsc::Sender<ServerFrame>)
 }
 
 /// Connect to an endpoint over TCP and return the server-side peer.
-/// This is the reference client the Phase-2 `kian-exec` crate will grow
+/// This is the reference client the bundle `kian-exec` crate will grow
 /// out of.
 pub async fn connect(addr: SocketAddr) -> std::io::Result<ServerPeer> {
     let stream = TcpStream::connect(addr).await?;

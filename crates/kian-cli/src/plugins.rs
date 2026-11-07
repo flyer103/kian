@@ -1,23 +1,23 @@
-//! Built-in static plugins for `kian serve` (card C13, ADR-004).
+//! Built-in static plugins for `kian serve` (ADR-004).
 //!
 //! Five plugins assemble the seam implementations into the plugin
-//! [`Ctx`] (kian-plugin C7):
+//! [`Ctx`] (kian-plugin):
 //!
-//! | plugin         | registers                                                |
+//! | plugin | registers |
 //! |----------------|----------------------------------------------------------|
-//! | `openai-compat`| [`ProviderRegistry`] of openai-compatible providers       |
-//! | `local-tools`  | `Arc<dyn ToolProvider>` (built-in fs/exec, kian-loop C11) |
-//! | `react-loop`   | [`ReActLoop`] (`Arc<dyn LoopDriver>` built-in, C11)       |
-//! | `superagent`   | [`SuperAgentServices`] (C27: the bundle mounted on the    |
-//! |                | Router/Worker/plain three-way driver + subscription       |
-//! |                | engine + mock channels + watchdog wiring)                |
-//! | `remote-exec`  | [`RemoteExecServices`] (C27: the C20 durable queue +      |
-//! |                | per-endpoint `RemoteExecTool` for worker agents)         |
+//! | `openai-compat`| [`ProviderRegistry`] of openai-compatible providers |
+//! | `local-tools` | `Arc<dyn ToolProvider>` (built-in fs/exec, kian-loop) |
+//! | `react-loop` | [`ReActLoop`] (`Arc<dyn LoopDriver>` built-) |
+//! | `superagent` | [`SuperAgentServices`] (the bundle mounted on the |
+//! | | Router/Worker/plain three-way driver + subscription |
+//! | | engine + mock channels + watchdog wiring) |
+//! | `remote-exec` | [`RemoteExecServices`] (the durable queue + |
+//! | | per-endpoint `RemoteExecTool` for worker agents) |
 //!
 //! The `react-loop` plugin declares the first two as dependencies, so
-//! activation is deterministically topological (C7) and the server
+//! activation is deterministically topological and the server
 //! assembly simply resolves the loop out of the activated `Ctx`. The
-//! C27 plugins are presence-locked to their config sections
+//! plugins are presence-locked to their config sections
 //! (fail-closed both directions, see `config.rs`).
 //!
 //! Secrets discipline: provider API keys are read from the environment
@@ -99,7 +99,7 @@ impl Plugin for OpenAiCompatPlugin {
 /// The assembly-time [`PersistSink`] for provider requests.
 ///
 /// A2 persist-what-you-send is enforced twice: the drain-level
-/// `step/request` audit event (kian-loop C11) persists the exact primary
+/// `step/request` audit event (kian-loop) persists the exact primary
 /// request body *before* the turn starts, and the provider hands its
 /// bytes to this sink before dialing. This sink records at `debug` (it
 /// has no session context — it is built once, at assembly); the durable
@@ -128,16 +128,16 @@ impl PersistSink for AuditPersistSink {
 // local-tools
 // ---------------------------------------------------------------------------
 
-/// Registers the built-in local fs/exec [`ToolProvider`] (kian-loop C11).
+/// Registers the built-in local fs/exec [`ToolProvider`] (kian-loop).
 pub struct LocalToolsPlugin {
     /// Filesystem root the fs tools are confined to.
     pub root: std::path::PathBuf,
     /// Default exec timeout, milliseconds.
     pub exec_timeout_ms: u64,
-    /// kian-77: the exec child environment policy
+    /// the exec child environment policy
     /// (`tools.exec_env`, default inherit).
     pub env_policy: kian_core::secrets::ExecEnvPolicy,
-    /// kian-77: the exec output redactor (`tools.exec_redact`, default
+    /// the exec output redactor (`tools.exec_redact`, default
     /// on; built at assembly from every secret name kian.yaml names).
     pub redactor: kian_core::secrets::SecretRedactor,
 }
@@ -171,8 +171,8 @@ pub struct ReActPlugin {
     pub agent: AgentDef,
     pub policy: Arc<PolicyTable>,
     pub config: ReActConfig,
-    /// The default agent's evidence gate (C24, wired by C27). The
-    /// default (disabled) keeps Phase-1 behavior identical.
+    /// The default agent's evidence gate (wired ). The
+    /// default (disabled) keeps built-in behavior identical.
     pub gate: EvidenceGateConfig,
 }
 
@@ -192,7 +192,7 @@ impl Plugin for ReActPlugin {
         let tools = ctx
             .resolve::<dyn ToolProvider>()
             .ok_or_else(|| apply_error("react-loop: ToolProvider not registered"))?;
-        // kian-61: the agent's `tools:` list is the mounted surface —
+        // the agent's `tools:` list is the mounted surface —
         // fail-closed against the registered provider, then enforced at
         // the tool edge (unlisted schemas never ride the request).
         let unmatched = unmatched_tool_names(&self.agent.tools, &tools.schemas());
@@ -216,7 +216,7 @@ impl Plugin for ReActPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// remote-exec (C27): the C20 durable queue + per-endpoint tools
+// remote-exec: the durable queue + per-endpoint tools
 // ---------------------------------------------------------------------------
 
 /// The running remote-exec services (built by [`RemoteExecPlugin`]):
@@ -233,7 +233,7 @@ pub struct RemoteExecServices {
 
 impl RemoteExecServices {
     /// One [`RemoteExecTool`] per configured endpoint — the worker
-    /// agents' exec surface (same schema as the local built-in).
+    /// agents' exec surface (same schema as the local built-).
     pub fn tools(&self) -> Vec<Arc<RemoteExecTool>> {
         self.endpoints
             .iter()
@@ -255,13 +255,13 @@ pub struct RemoteExecPlugin {
     pub store: ExecStore,
     /// The configured endpoints.
     pub endpoints: Vec<crate::config::EndpointConfig>,
-    /// C52 row-lease identity: this replica's `drain.holder`. Under
+    /// row-lease identity: this replica's `drain.holder`. Under
     /// postgres the config validates it explicit-unique before we get
     /// here; sqlite passes the (defaulted) holder too — the lease is
     /// backend-portable and same-holder claims always land, so
     /// single-process behavior is unchanged.
     pub holder: String,
-    /// kian-77: the exec output redactor — runs once per settled
+    /// the exec output redactor — runs once per settled
     /// outcome, before the durable queue row is written.
     pub redactor: kian_core::secrets::SecretRedactor,
 }
@@ -326,7 +326,7 @@ impl Plugin for RemoteExecPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// superagent (C27): the bundle mounted on the three-way driver
+// superagent: the bundle mounted on the three-way driver
 // ---------------------------------------------------------------------------
 
 /// Registers [`SuperAgentServices`]: the Router/Worker/plain three-way
@@ -343,51 +343,51 @@ pub struct SuperAgentPlugin {
     pub worker_agent: AgentDef,
     /// The default agent's compiled definition (plain sessions).
     pub default_agent: AgentDef,
-    /// C70: the worker template's per-call tool permission table
+    /// the worker template's per-call tool permission table
     /// (`agents.<superagent.worker.agent>.permissions`), evaluated on
     /// the worker loop before every `tool/call`.
     pub worker_permissions: BTreeMap<String, Permission>,
-    /// C70: the default agent's permission table, evaluated on the
+    /// the default agent's permission table, evaluated on the
     /// plain-session loop.
     pub default_permissions: BTreeMap<String, Permission>,
-    /// The configured resident Router session id — already the kian-62
+    /// The configured resident Router session id — already the
     /// re-arm walk's *live* session: the pinned id itself when its
     /// stream is non-terminal (or never created), else the deterministic
     /// successor at the end of the chain.
     pub router_session: SessionId,
-    /// kian-62: the ended, frozen predecessors of `router_session`
+    /// the ended, frozen predecessors of `router_session`
     /// (empty = generation 0). Flows into the Router profile's re-arm
     /// bootstrap (per-generation key + cause-carrying prompt).
     pub router_rearm: Vec<kian_superagent::rearm::EndedResident>,
     /// The Router's slot name.
     pub router_slot: String,
-    /// The Router profile's speculation budget (C39): `None` disables
+    /// The Router profile's speculation budget: `None` disables
     /// speculation (speculative spawns refused honestly at the tool).
     pub speculation: Option<kian_superagent::SpeculationPolicy>,
-    /// The output-side speak-rules (C58): the whether-to-send gate on
+    /// The output-side speak-rules: the whether-to-send gate on
     /// `reply`/`deliver_structured`. Empty = ungated (today's
     /// behavior).
     pub speak: kian_superagent::SpeakPolicy,
-    /// C59 follow-up ownership (`superagent.followup_ownership`,
-    /// default on): live-only fan-out + release-to-fresh-Eval on
+    /// follow-up ownership (`superagent.followup_ownership`,
+    /// default ): live-only fan-out + release-to-fresh-Eval on
     /// all-ended topics, and the `spawn_worker` topic-ownership
-    /// refusal at the tool surface. `false` restores the pre-C59
+    /// refusal at the tool surface. `false` restores the legacy
     /// behavior.
     pub followup_ownership: bool,
-    /// C63: the configured policy version
+    /// the configured policy version
     /// (`superagent.policy.version`), rendered into the resident
     /// profiles' bootstrap prompts as a `[policy <label>]` header.
     /// `None` = today's bytes, byte-identical.
     pub policy_version: Option<kian_superagent::PolicyVersion>,
-    /// C63: `superagent.policy.notify_live` (default false) — deliver
+    /// `superagent.policy.notify_live` (default false) — deliver
     /// one synthetic policy-changed marker input to each drifted live
     /// resident session at boot (idempotent by a stable event id).
     pub policy_notify_live: bool,
-    /// C60 (ADR-012): the mandate issuance policy
+    /// (ADR-012): the mandate issuance policy
     /// (`superagent.mandate`), per-worker-template scope texts.
     /// `None` = no mandate issued (byte-identical legacy wrappers).
     pub mandate: Option<kian_superagent::MandatePolicy>,
-    /// C62: the outbox bounded-retry configuration
+    /// the outbox bounded-retry configuration
     /// (`superagent.outbox`). `None` = the legacy single-attempt send
     /// path, byte-identical.
     pub outbox: Option<kian_superagent::OutboxConfig>,
@@ -397,30 +397,30 @@ pub struct SuperAgentPlugin {
     pub policy: Arc<PolicyTable>,
     /// The converted subscription rule set (config, fail-closed).
     pub rules: kian_superagent::SubscriptionRuleSet,
-    /// The converted admission-class table (C36 config, fail-closed;
+    /// The converted admission-class table (config, fail-closed;
     /// empty = today's behavior).
     pub classes: kian_superagent::AdmissionClassTable,
-    /// C61/ADR-013: the converted thread-key derivations
+    /// /ADR-013: the converted thread-key derivations
     /// (`superagent.intake.thread_keys`). The derived key surfaces in
     /// spilled events' Inline `neighbors` block as recall context —
     /// correlation is context only, never a routing input. Empty =
     /// no derivation, byte-identical wrappers.
     pub thread_keys: kian_superagent::ThreadKeySet,
-    /// C33 admission-time shaping (infinite cap = legacy behavior).
+    /// admission-time shaping (infinite cap = legacy behavior).
     pub shaping: kian_superagent::ShapingConfig,
-    /// C43 untrusted-channel set (prompt-injection hygiene): events
+    /// untrusted-channel set (prompt-injection hygiene): events
     /// from these channels admit with the untrusted bit inside the
     /// provenance wrapper. Empty = every channel trusted.
     pub untrusted_channels: std::collections::BTreeSet<String>,
     /// Mock channels by configured name (v1's only adapter type).
     pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
-    /// Lark channels by configured name (C44): built by the server
+    /// Lark channels by configured name: built by the server
     /// from env-gated credentials, registered into the channel
     /// registry and the subscription consumers exactly like mocks.
     pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
-    /// GitHub channels by configured name (C48/C49): webhook-fed
+    /// GitHub channels by configured name: webhook-fed
     /// adapters built by the server (token env-only, fail-closed when
-    /// send is configured), registered alongside the others. The C49
+    /// send is configured), registered alongside the others. The
     /// receiver hands verified deliveries to the single channel
     /// through the `WebhookPlane` implementation in `server.rs`.
     pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
@@ -432,25 +432,25 @@ pub struct SuperAgentPlugin {
     pub inbox: Arc<crate::superagent::EngineInbox>,
     /// Whether endpoints are configured (dependency on `remote-exec`).
     pub has_remote: bool,
-    /// Mount the async `start()`/`stop()` pair (C37, ADR-008) on the
+    /// Mount the async `start()`/`stop()` pair (ADR-008) on the
     /// Router and Worker loops. Requires `has_remote` (fail-closed in
     /// config). Default off.
     pub async_tools: bool,
-    /// The recall toolpack gates and caps (C35): `router` default on,
+    /// The recall toolpack gates and caps: `router` default on,
     /// `worker` default off. The toolpack reads through the same
     /// `StoreRecall` port the runtime exposes (the shared instance is
     /// built once, below).
     pub recall: crate::config::RecallConfig,
-    /// C54: the resolved S6 dsh bridge config
+    /// the resolved dsh bridge config
     /// (`superagent.harness.dsh`, default off). When present the
     /// worker template's inner loop is the `DshDriver`.
     pub dsh_harness: Option<kian_dsh::DshDriverConfig>,
-    /// The timer input sources (C40), built by the server over the
+    /// The timer input sources, built by the server over the
     /// system clock; registered into the channel registry and the
     /// consumer spawn exactly like mocks. Their run tasks start in
     /// `start_services`, after the consumers exist.
     pub timer_channels: Vec<Arc<kian_superagent::TimerChannel>>,
-    /// The resident watchdog profile (C40), when configured. The loop
+    /// The resident watchdog profile, when configured. The loop
     /// and driver are built below; the bootstrap happens in
     /// `start_services`.
     pub watchdog: Option<kian_superagent::WatchdogProfile>,
@@ -489,8 +489,8 @@ impl Plugin for SuperAgentPlugin {
             None
         };
 
-        // C37: the async `start()`/`stop()` pair, config-gated (default
-        // off). The engine shares the C20 backend (no second dispatch
+        // the async `start()`/`stop()` pair, config-gated (default
+        // off). The engine shares the backend (no second dispatch
         // system); the completion bridge admits through the same
         // late-bound inbox port the bundle uses, and resolves invoking
         // sessions from committed `tool/call` events.
@@ -533,25 +533,25 @@ impl Plugin for SuperAgentPlugin {
             self.worker_agent.clone(),
         )
         .map_err(|e| apply_error(format!("superagent profile: {e}")))?;
-        // C39: the Router profile carries the configured speculation
+        // the Router profile carries the configured speculation
         // budget (None = disabled, speculative spawns refused honestly).
         let mut profile = RouterProfile::new(self.router_session, profile.router);
         profile.speculation = self.speculation.clone();
         profile.speak = self.speak.clone();
-        // C59: the follow-up-ownership gate rides the profile into the
+        // the follow-up-ownership gate rides the profile into the
         // tool surface.
         profile.followup_ownership = self.followup_ownership;
-        // C63: the policy version rides the profile into the bootstrap
+        // the policy version rides the profile into the bootstrap
         // render (header over the rendered prompt).
         profile.policy_version = self.policy_version.clone();
-        // C60 (ADR-012): the mandate issuance policy rides the profile
+        // (ADR-012): the mandate issuance policy rides the profile
         // into the spawn tool (the single issuance point).
         profile.mandate = self.mandate.clone();
-        // C62: the outbox bounded-retry config rides the profile (an
+        // the outbox bounded-retry config rides the profile (an
         // explicitly-built driver below overrides the auto-built one,
         // sharing one handle with the boot re-drive).
         profile.outbox = self.outbox;
-        // kian-62: the re-arm chain — empty for generation 0.
+        // the re-arm chain — empty for generation 0.
         profile.re_arm = self.router_rearm;
 
         // The mounted inbox: admits counted for Router residency.
@@ -577,14 +577,14 @@ impl Plugin for SuperAgentPlugin {
             channels.register(name.clone(), Arc::clone(mock) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(mock) as Arc<dyn ChannelAdapter>);
         }
-        // C44: real lark adapters ride the same registry + consumer
+        // real lark adapters ride the same registry + consumer
         // spawn (the adapter is a plugin over the seam — nothing in
         // the subscription engine knows Feishu exists).
         for (name, lark) in &self.lark_channels {
             channels.register(name.clone(), Arc::clone(lark) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(lark) as Arc<dyn ChannelAdapter>);
         }
-        // C48/C49: the github adapter rides the same registry +
+        // the github adapter rides the same registry +
         // consumer spawn; its receive half is fed exclusively by the
         // webhook receiver's verified hand-off (nothing here knows
         // HTTP delivery exists).
@@ -592,7 +592,7 @@ impl Plugin for SuperAgentPlugin {
             channels.register(name.clone(), Arc::clone(github) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(github) as Arc<dyn ChannelAdapter>);
         }
-        // C40: the timers ride the same registry + consumer spawn (a
+        // the timers ride the same registry + consumer spawn (a
         // timer is a channel — nothing here knows a watchdog exists).
         for timer in &self.timer_channels {
             let name = timer.channel_name().to_string();
@@ -600,14 +600,14 @@ impl Plugin for SuperAgentPlugin {
             adapters.push(Arc::clone(timer) as Arc<dyn ChannelAdapter>);
         }
         let hold = kian_superagent::RouterHold::shared();
-        // C59: one shared registry projection for the tool surface and
+        // one shared registry projection for the tool surface and
         // the subscription service — the spawn-time ownership check and
         // the fan-out resolution read the same map (still disposable:
         // `start_services` rebuilds its contents from streams at boot).
         let followup_registry = Arc::new(std::sync::RwLock::new(
             kian_superagent::PassthroughRegistry::new(),
         ));
-        // C62: one outbox driver shared by the tool surface (retry +
+        // one outbox driver shared by the tool surface (retry +
         // ordering + park) and the boot re-drive (`start_services`
         // rebuilds pending intents from the Router's stream and
         // re-drives them through this handle).
@@ -624,7 +624,7 @@ impl Plugin for SuperAgentPlugin {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }
         let router_tools = Arc::new(router_tools);
-        // C35: the recall toolpack reads through the one `StoreRecall`
+        // the recall toolpack reads through the one `StoreRecall`
         // port the runtime also exposes (the spill index it holds is
         // rebuilt by `start_services`). Config-gated: default on for
         // the Router, opt-in per worker template.
@@ -635,8 +635,8 @@ impl Plugin for SuperAgentPlugin {
             self.shaping.clone(),
             self.recall.to_runtime(),
         );
-        // C37 + C35: the Router's combined provider — async pair (when
-        // on), dispatch/channel tools, then recall. All names are
+        // +: the Router's combined provider — async pair (when
+        // ), dispatch/channel tools, then recall. All names are
         // unique, so the first-wins union shadows nothing; the request
         // prefix order is the loop's name sort (stable either way).
         let mut router_providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
@@ -665,7 +665,7 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName(self.router_slot.clone()),
                 max_iterations: self.max_iterations,
-                // C70: the Router judge loop does not evaluate
+                // the Router judge loop does not evaluate
                 // permissions (a table on its agent refuses boot at
                 // config validation — ADR-015).
                 permissions: BTreeMap::new(),
@@ -675,7 +675,7 @@ impl Plugin for SuperAgentPlugin {
         // Worker loop: strong main slot, local tools shadowed by the
         // per-endpoint remote exec tools when configured, ungated here
         // (the worker wrapper owns the gate).
-        // kian-61: the worker template's `tools:` list filters the local
+        // the worker template's `tools:` list filters the local
         // built-in surface (the remote/async/recall surfaces are already
         // config-gated) and is validated fail-closed against the loop's
         // combined mounted surface — a typo'd name refuses boot.
@@ -706,11 +706,11 @@ impl Plugin for SuperAgentPlugin {
                 worker_tools.push(provider);
             }
         }
-        // C37: the worker template mounts the pair when gated on.
+        // the worker template mounts the pair when gated on.
         if let Some(pair) = &async_pair {
             worker_tools.push(Arc::clone(pair));
         }
-        // C35: the worker template mounts the recall toolpack when
+        // the worker template mounts the recall toolpack when
         // opted in (config-gated, default off — after the async pair,
         // before the local tools; stable order, unique names).
         if self.recall.worker {
@@ -728,14 +728,14 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
-                // C70: the worker template's permission table rides the
+                // the worker template's permission table rides the
                 // inner ReAct loop (the dsh harness path does not
                 // evaluate it — ADR-015 records the boundary).
                 permissions: self.worker_permissions.clone(),
             },
         ));
-        // C54: the worker template's inner loop is config-gated — the
-        // S6 dsh bridge replaces the built-in ReAct loop when
+        // the worker template's inner loop is config-gated — the
+        // dsh bridge replaces the built-in ReAct loop when
         // `superagent.harness.dsh` is on (default off; the decorator,
         // evidence gate and completion report above it are unchanged).
         // The config is resolved fail-closed by the server assembly
@@ -749,7 +749,7 @@ impl Plugin for SuperAgentPlugin {
         };
 
         // Plain-session loop: the default agent, with its own gate. The
-        // agent's `tools:` list filters the local surface (kian-61,
+        // agent's `tools:` list filters the local surface (
         // fail-closed like the worker's).
         let default_agent = self.default_agent;
         let unmatched = unmatched_tool_names(&default_agent.tools, &local_tools.schemas());
@@ -768,7 +768,7 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
-                // C70: the default agent's permission table (the
+                // the default agent's permission table (the
                 // plain-session loop is the built-in loop of the
                 // bundle assembly).
                 permissions: self.default_permissions.clone(),
@@ -776,13 +776,13 @@ impl Plugin for SuperAgentPlugin {
             self.default_gate,
         ));
 
-        // C40: the resident watchdog loop (when configured) — a
+        // the resident watchdog loop (when configured) — a
         // worker-template agent whose tools are exactly the
         // read/intervene surface, over the same recall port, the
         // engine inbox, the shared channel registry (escalation) and
         // its own hold. Driven by the Router's residency shape: one
         // judge turn per admitted tick, parked between ticks.
-        // C63: its mounted inbox is hoisted for the services (the
+        // its mounted inbox is hoisted for the services (the
         // drift notice admits through it).
         let mut mounted_watchdog_inbox: Option<Arc<RouterInbox>> = None;
         let watchdog_side = self.watchdog.as_ref().map(|profile| {
@@ -802,7 +802,7 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
                 profile.session,
             );
-            // C63: the mounted inbox rides the services so the boot-time
+            // the mounted inbox rides the services so the boot-time
             // policy drift notice admits through the residency counter
             // a parked resident polls (a raw-engine admit would strand
             // behind the park).
@@ -815,7 +815,7 @@ impl Plugin for SuperAgentPlugin {
                 ReActConfig {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
-                    // C70: the Watchdog judge loop does not evaluate
+                    // the Watchdog judge loop does not evaluate
                     // permissions (a table on its agent refuses boot at
                     // config validation — ADR-015).
                     permissions: BTreeMap::new(),
@@ -830,7 +830,7 @@ impl Plugin for SuperAgentPlugin {
         });
 
         // The three-way driver. The Router side mounts judge-turn
-        // metrics (C41): batch size + wall duration per judge turn,
+        // metrics: batch size + wall duration per judge turn,
         // bundle-owned counters the /metrics route snapshots.
         let router_metrics = kian_superagent::RouterMetrics::shared();
         let router_side = kian_superagent::RouterDriver::with_metrics(
@@ -878,15 +878,15 @@ impl Plugin for SuperAgentPlugin {
             )
             .with_shaping(self.shaping)
             .with_untrusted_channels(self.untrusted_channels)
-            // C61/ADR-013: the derived thread key joins spilled
+            // /ADR-013: the derived thread key joins spilled
             // events' Inline neighbors as recall context (context
             // only — routing stays topic-keyed).
             .with_thread_keys(self.thread_keys.clone())
-            // C59: the fan-out and the spawn tool share one registry
+            // the fan-out and the spawn tool share one registry
             // projection, and the ownership gate rides the same flag.
             .with_shared_registry(Arc::clone(&followup_registry))
             .with_followup_ownership(self.followup_ownership)
-            // C60 (ADR-012): the fan-out's mandate revalidation compares
+            // (ADR-012): the fan-out's mandate revalidation compares
             // against the same current pointer the bootstrap renders and
             // the spawn tool stamps — one configured version everywhere.
             .with_policy_pointer(
@@ -910,12 +910,12 @@ impl Plugin for SuperAgentPlugin {
             worker_gate: self.worker_gate,
             subscription_metrics,
             router_metrics,
-            // C63: boot-time policy drift marking (audit + counter +
+            // boot-time policy drift marking (audit + counter +
             // the config-gated marker notice).
             policy: self.policy_version.clone(),
             policy_notify_live: self.policy_notify_live,
             policy_drift: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            // C62: the outbox driver + the Router hold (the boot
+            // the outbox driver + the Router hold (the boot
             // re-drive waits for the hold's first port, then re-sends
             // the rebuilt pending intents through this handle).
             outbox: outbox_driver,

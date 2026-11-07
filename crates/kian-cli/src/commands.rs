@@ -1,6 +1,6 @@
-//! The C14 operational session commands: `inspect` / `replay` /
+//! The operational session commands: `inspect` / `replay` /
 //! `export` / `wake-now` / `lease inspect` / `recovery budget reset`
-//! (SPEC §3.2), plus `tickets` — the C56 Ticket stage board.
+//! (SPEC §3.2), plus `tickets` — the Ticket stage board.
 //!
 //! Two access modes, by card design:
 //!
@@ -45,20 +45,20 @@
 //!   "session": "<uuid>",
 //!   "event_count": 12,
 //!   "derived_state": "completed",
-//!   "live_state": "completed",           // null without --url
-//!   "state_matches_live": true,          // null without --url
+//!   "live_state": "completed", // null without --url
+//!   "state_matches_live": true, // null without --url
 //!   "invariants_ok": true,
 //!   "violations": [],
-//!   "model_context": {                   // the A2 byte-identity check
+//!   "model_context": { // the A2 byte-identity check
 //!     "requests_checked": 2, "byte_identical": 2,
-//!     "mismatches": [] }                 // [{ "seq", "derived", "recorded" }]
+//!     "mismatches": [] } // [{ "seq", "derived", "recorded" }]
 //! }
 //! ```
 //!
 //! **`session export <id> [--since S] [--until U] [--with-event-ids]`** —
 //! JSONL, one frozen v0 event envelope per line (the exact stored
 //! bytes), `since <= seq <= until` (inclusive; defaults: whole stream).
-//! `--with-event-ids` (C69, opt-in) adds the derived `event_id` to each
+//! `--with-event-ids` (opt-) adds the derived `event_id` to each
 //! line — presentation only, the envelope bytes and the default export
 //! are unchanged, and import ignores the extra key. Import = one
 //! [`kian_store::EventStore::append`] per line under each event's own
@@ -74,7 +74,7 @@
 //! }
 //! ```
 //!
-//! **`tickets`** (C56) — one row per worker session, uuid-ascending
+//! **`tickets`** — one row per worker session, uuid-ascending
 //! ```json
 //! {
 //!   "now_ms": 1761900000000,
@@ -139,7 +139,7 @@ pub fn resolve_db(db: Option<&Path>, config_path: &Path) -> CmdResult<PathBuf> {
             config_path.display()
         )
     })?;
-    // C51: postgres-mode configs carry no sqlite path (validation
+    // postgres-mode configs carry no sqlite path (validation
     // refuses the mix) — these audit commands read sqlite files, so a
     // postgres config needs an explicit --db export.
     if config.storage.sqlite.trim().is_empty() {
@@ -209,7 +209,7 @@ pub struct InspectReport {
     pub epoch: u64,
     pub last_event_ts: u64,
     pub counters: Value,
-    /// C67: usage totals, present only when the stream carries
+    /// usage totals, present only when the stream carries
     /// usage-bearing `turn/end` events (absent → no key, no text lines).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::usage_metrics::SessionUsageReport>,
@@ -235,7 +235,7 @@ fn counters(events: &[Event], pending: usize, pending_control: usize) -> Value {
     count("compactions", kind_count(&EventKind::Compact));
     count("budget_resets", kind_count(&EventKind::RecoveryBudgetReset));
     count("pending_eligible_inputs", pending as u64);
-    // C68: unconsumed reserved control-envelope rows (durable interrupt
+    // unconsumed reserved control-envelope rows (durable interrupt
     // intents) — the "pending control" operator line.
     count("pending_control_inputs", pending_control as u64);
     json!(c)
@@ -257,7 +257,7 @@ pub async fn run_inspect(
         .await
         .map_err(|e| format!("inbox read: {e}"))?;
     let pending = pending_rows.len();
-    // C68: how many of the pending rows are durable interrupt intents.
+    // how many of the pending rows are durable interrupt intents.
     let pending_control = pending_rows
         .iter()
         .filter(|r| kian_core::control::InterruptIntent::is_control_envelope(&r.payload))
@@ -265,7 +265,7 @@ pub async fn run_inspect(
     store.close().await;
 
     let last = events.last().expect("non-empty by construction");
-    // C67: usage lines only when observed (a pure projection over the
+    // usage lines only when observed (a pure projection over the
     // same events already read — no extra store round trip).
     let usage = {
         let report = crate::usage_metrics::session_usage_report(session, &events);
@@ -307,12 +307,12 @@ pub async fn run_inspect(
         c["budget_resets"],
         c["pending_eligible_inputs"],
     );
-    // C68: pending durable interrupt intents (read-only inbox view) —
+    // pending durable interrupt intents (read-only inbox view) —
     // rendered only when one exists.
     if pending_control > 0 {
         out.push_str(&format!("pending control     {pending_control}\n"));
     }
-    // C67: usage lines render only when the stream observed usage.
+    // usage lines render only when the stream observed usage.
     if let Some(u) = &report.usage {
         out.push_str(&format!(
             "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
@@ -374,12 +374,12 @@ pub fn check_model_context(events: &[Event]) -> ModelContextCheck {
         };
         let derived = match derive_model_context(&events[..bracket]) {
             Ok(msgs) => {
-                // Dialect v2 (kian-61): tool transcripts map to the strict
+                // Dialect v2: tool transcripts map to the strict
                 // wire shape; the per-call duplicates drop out.
                 let chat: Vec<_> = msgs.iter().filter_map(to_chat_message).collect();
                 // Canonical form only: the recorded body round-tripped
                 // through `serde_json::Value` (lexicographic keys — the
-                // frozen C8 serialization), so both sides are compared
+                // frozen serialization), so both sides are compared
                 // in that same canonical byte form.
                 serde_json::to_value(&chat)
                     .and_then(|v| serde_json::to_string(&v))
@@ -408,7 +408,7 @@ pub fn check_model_context(events: &[Event]) -> ModelContextCheck {
     out
 }
 
-/// Runs the C3 invariant predicates that are stream-shaped (the ones
+/// Runs the invariant predicates that are stream-shaped (the ones
 /// taking a single event slice); violations are collected as strings.
 fn invariant_report(events: &[Event]) -> (bool, Vec<String>) {
     let mut violations = Vec::new();
@@ -543,7 +543,7 @@ pub async fn run_replay(
 /// exact stored bytes, re-serialized identically from the envelope
 /// column). `since`/`until` are inclusive seq bounds.
 ///
-/// `--with-event-ids` (C69, opt-in) adds the derived `event_id`
+/// `--with-event-ids` (opt-) adds the derived `event_id`
 /// ([`kian_core::events::event_id`]) to each line — a presentation key
 /// for tooling, never part of the envelope. The default export's bytes
 /// are unchanged; the flag only ever adds a key, and `import_jsonl`
@@ -581,10 +581,10 @@ pub async fn run_export(
     for e in &selected {
         // The envelope column holds serde_json::to_string(event); a
         // canonical re-serialization of the same Event is byte-identical
-        // (C5 persist-what-you-send), so round-trips are lossless.
-        // C69: --with-event-ids re-serializes through a Value to add the
+        // (persist-what-you-send), so round-trips are lossless.
+        // --with-event-ids re-serializes through a Value to add the
         // derived id next to the envelope fields — the default path
-        // (the same bytes as before C69) is untouched.
+        // (the same bytes as before) is untouched.
         let line = if with_event_ids {
             let mut v = serde_json::to_value(e).map_err(|e| format!("serialize event: {e}"))?;
             v["event_id"] =
@@ -711,7 +711,7 @@ pub async fn run_lease_inspect(
 }
 
 // ---------------------------------------------------------------------------
-// tickets — the Ticket stage board (C56)
+// tickets — the Ticket stage board
 // ---------------------------------------------------------------------------
 
 /// One row of the `kian tickets` board: a worker session (one Ticket
@@ -734,14 +734,14 @@ pub struct TicketRow {
     pub age_ms: u64,
     /// Event count of the worker stream.
     pub events: usize,
-    /// C62: the parked outbox deliveries named for this ticket
+    /// the parked outbox deliveries named for this ticket
     /// (`<conversation> (parked after N attempts)` lines; empty when
     /// the outbox holds nothing for it).
     pub parked: Vec<String>,
 }
 
 /// `kian tickets [--db <sqlite>] [--json]` — the Ticket stage board
-/// (C56): every worker session discovered by scanning `thread/started`
+/// every worker session discovered by scanning `thread/started`
 /// across streams (the [`kian_superagent::worker_sessions`] derivation),
 /// each with its stage, topic, thread status, and age. Read-only
 /// (`open_read_only`); the stage is a pure projection of the stream +
@@ -768,7 +768,7 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
     // names them too). BTreeSet ⇒ deterministic uuid order.
     let workers = kian_superagent::worker_sessions(&all_events);
     // Topic binding: the same disposable registry projection the
-    // runtime rebuilds (C38), inverted to worker → topics.
+    // runtime rebuilds, inverted to worker → topics.
     let registry = kian_superagent::PassthroughRegistry::rebuild(&all_events);
     let mut worker_topics: std::collections::BTreeMap<SessionId, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -779,11 +779,11 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
     }
 
     let now = now_ms();
-    // C62: the real outbox view — the delivery-retry stage arm's input
-    // (kian-64's stub exemption: this construction replaces `NoOutbox`).
+    // the real outbox view — the delivery-retry stage arm's input
+    // ('s stub exemption: this construction replaces `NoOutbox`).
     // Ticket aliases per thread: the thread's own id string plus the
     // topics its worker owns (a delivery's `correlation` names either).
-    // kian-76 adds the conversation attribution: a live intent's ticket
+    // adds the conversation attribution: a live intent's ticket
     // key is the freeform correlation the model passed (the triggering
     // event id) and matches no alias — but the target conversation is
     // derivable from the worker's own stream (its admitted wrappers)
@@ -816,7 +816,7 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             .collect();
         // The worker's own stream is the registry-independent source:
         // every admitted wrapper names its topic on the durable log
-        // (the live C65 run had no registry binding at all — kian-75).
+        // (the live run had no registry binding at all —).
         conversations.extend(kian_superagent::worker_conversation_keys(events));
         conversations.sort();
         conversations.dedup();
@@ -832,7 +832,7 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
                 .extend(conversations);
         }
     }
-    // Workers the registry never bound (the kian-75 live shape) still
+    // Workers the registry never bound (the live shape) still
     // get their conversations from their own streams.
     for worker in &workers {
         let entry = worker_conversations.entry(*worker).or_default();
@@ -880,9 +880,9 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             .and_then(|e| e.bytes.get("thread_id"))
             .and_then(Value::as_str)
             .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-        // The parked message named on the board (C62): a worker whose
+        // The parked message named on the board: a worker whose
         // ticket has a pending/parked delivery shows its parked lines.
-        // Attribution is alias-or-conversation (kian-76): an alias hit
+        // Attribution is alias-or-conversation: an alias hit
         // keeps the historical all-lines shape; otherwise the lines
         // are the parked deliveries of the conversations the worker's
         // own stream names — the live path, where the freeform
@@ -947,9 +947,9 @@ pub async fn run_tickets(config_path: &Path, db: Option<&Path>, json: bool) -> C
             format_age(row.age_ms),
         ));
     }
-    // C62: the parked message named on the board — appended lines only
+    // the parked message named on the board — appended lines only
     // when something is parked (empty board output stays byte-identical
-    // to the pre-C62 shape).
+    // to the legacy shape).
     for row in rows.iter().filter(|row| !row.parked.is_empty()) {
         out.push_str(&format!(
             "parked: {} {} → {}\n",
@@ -1022,7 +1022,7 @@ pub async fn run_wake_now(
 }
 
 /// `kian mock-channel-send <channel> [--text S | --payload JSON]
-/// [--topic T] [--url <base>] [--json]`: the C27 demo/S4 injection —
+/// [--topic T] [--url <base>] [--json]`: the demo/ injection —
 /// one event onto a configured mock channel via `POST /ops/rpc`; the
 /// running server's subscription engine routes it per the configured
 /// rules.
@@ -1234,7 +1234,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// C69: the default export is byte-identical to the pre-C69 format
+    /// the default export is byte-identical to the legacy format
     /// (one canonical `serde_json::to_string(event)` per line — no
     /// derived-id key anywhere).
     #[tokio::test]
@@ -1283,10 +1283,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// C69: `--with-event-ids` adds the stable derived id to every line,
+    /// `--with-event-ids` adds the stable derived id to every line,
     /// deterministically, without touching any envelope field — and the
     /// augmented lines re-import into a fresh store whose default export
-    /// is byte-identical to the original one (S7 discipline; the field
+    /// is byte-identical to the original one (discipline; the field
     /// is round-trip-safe, not export-only).
     #[tokio::test]
     async fn with_event_ids_export_adds_stable_ids_and_round_trips() {

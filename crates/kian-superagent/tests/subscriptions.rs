@@ -1,6 +1,6 @@
-//! Integration tests (card C23): the subscription framework against a
+//! Integration tests: the subscription framework against a
 //! real sqlite `EventStore` and a real `Engine` — through the
-//! `InboxWriter` port only, exactly the way assembly (C27) will wire
+//! `InboxWriter` port only, exactly the way assembly will wire
 //! it. No credentials, no network; everything local.
 
 use std::collections::{BTreeSet, HashMap};
@@ -65,7 +65,7 @@ async fn wait_for_events(
 #[derive(Clone)]
 enum Behavior {
     /// Append a `thread/started` delegating to `worker` with a spawning
-    /// topic inside the task's content (what C25's spawner will do),
+    /// topic inside the task's content (what 's spawner will do),
     /// then settle.
     Dispatch {
         worker: SessionId,
@@ -122,7 +122,7 @@ impl LoopDriver for TestDriver {
 }
 
 /// The assembly-style `InboxWriter` over a real engine (what kian-cli
-/// builds in C27). Lives in tests: the bundle crate never names the
+/// builds ). Lives in tests: the bundle crate never names the
 /// engine (tests/iron_rule.rs).
 struct EngineInbox<D>(Arc<Engine<D>>)
 where
@@ -396,7 +396,7 @@ async fn passthrough_routes_to_the_worker_not_the_router() {
     let router_events = store.rebuild(router).await.unwrap();
     let worker_events = store.rebuild(worker).await.unwrap();
     let registry = PassthroughRegistry::rebuild(router_events.iter().chain(worker_events.iter()));
-    // C38: resolve returns the subscriber set (singleton here).
+    // resolve returns the subscriber set (singleton here).
     assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
 
     let service = SubscriptionService::new(
@@ -426,7 +426,7 @@ async fn passthrough_routes_to_the_worker_not_the_router() {
         }
     );
 
-    // The worker's stream bootstraps via the C9 first-drain path and
+    // The worker's stream bootstraps via the first-drain path and
     // consumes the wrapper; the router stream never sees this event.
     wait_for_events(
         &store,
@@ -635,17 +635,17 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
     );
     let worker_events = store.rebuild(worker).await.unwrap();
     let rebuilt = PassthroughRegistry::rebuild(router_events.iter().chain(worker_events.iter()));
-    // C38: resolve returns the subscriber set (singleton here) — the
+    // resolve returns the subscriber set (singleton here) — the
     // historical record keeps the binding forever.
     assert_eq!(rebuilt.resolve("pr-9"), BTreeSet::from([worker]));
     assert_eq!(rebuilt.topics(), vec!["pr-9".to_string()]);
-    // C59 (kian-68): the worker's session settled (its scripted driver
+    // the worker's session settled (its scripted driver
     // returned a terminal outcome, so its stream carries `session/ended`)
     // — the liveness projection reads it as `ended`, and a follow-up on
     // the topic releases to the Router as a fresh evaluation instead of
-    // admitting onto the terminal session. (Pre-C59 this fixture relied
+    // admitting onto the terminal session. (Previously this fixture relied
     // on ended-subscriber admission; rewritten to the new fallback and
-    // named — plan C59's sanctioned-edit clause.)
+    // named — plan 's sanctioned-edit clause.)
     assert_eq!(
         rebuilt.status(&worker),
         kian_superagent::WorkerStatus::Ended
@@ -686,7 +686,7 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
 }
 
 /// The resident Router session is bootstrapped by admitting to a
-/// configured *not-yet-existing* session id — the C9 first-drain
+/// configured *not-yet-existing* session id — the first-drain
 /// `session/created` path. No orchestrator change is involved: the
 /// full pipeline (MockChannel → spawned consumer → rule match →
 /// durable admit → wake → first drain) creates the session.
@@ -793,11 +793,11 @@ async fn mock_channel_round_trip_through_the_subscription_pipeline() {
 }
 
 // ---------------------------------------------------------------------------
-// C38: many-to-many passthrough fan-out
+// many-to-many passthrough fan-out
 // ---------------------------------------------------------------------------
 
-/// C38-only driver: appends both delegations on the Router's drain and
-/// settles every worker drain. The Phase-2 `TestDriver` stays untouched.
+/// -only driver: appends both delegations on the Router's drain and
+/// settles every worker drain. The bundle `TestDriver` stays untouched.
 struct FanoutDriver {
     router: SessionId,
     workers: Vec<(SessionId, Uuid)>,
@@ -876,7 +876,7 @@ where
     }
 }
 
-/// C38 acceptance: one topic, two registered workers — one channel
+/// acceptance: one topic, two registered workers — one channel
 /// event yields one durable row per subscriber, each row carrying its
 /// own provenance wrapper; the rebuild (and a drop-and-replay after
 /// consumption) re-derives the same set from streams alone; the Router
@@ -1023,7 +1023,7 @@ async fn fanout_one_topic_two_workers_both_get_durable_rows() {
     );
 }
 
-/// C38 retry semantics against the real store: one subscriber's admit
+/// retry semantics against the real store: one subscriber's admit
 /// fails mid-set — the other's row is durable and consumed anyway; the
 /// idempotent retry fills only the gap (failed subscriber gets its
 /// row, the successful one deduplicates); each stream ends with

@@ -1,6 +1,6 @@
-//! Control-plane API (DESIGN §5 "Control-plane protocol", card C13).
+//! Control-plane API (DESIGN §5 "Control-plane protocol").
 //!
-//! axum JSON-RPC-over-HTTP + SSE exposing the Phase-1 set:
+//! axum JSON-RPC-over-HTTP + SSE exposing the built-in set:
 //! `create_session`, `submit`, `steer`, `interrupt`, `queue`, `events`
 //! (SSE interval polling of the event store), `projection` read.
 //!
@@ -91,7 +91,7 @@ struct AppState {
     sse_poll_ms: u64,
 }
 
-/// Builds the Phase-1 control-plane router.
+/// Builds the built-in control-plane router.
 pub fn router(plane: Arc<dyn ControlPlane>, sse_poll_ms: u64) -> Router {
     let state = AppState { plane, sse_poll_ms };
     Router::new()
@@ -193,7 +193,7 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         other => Err((
             CODE_METHOD_NOT_FOUND,
             format!(
-                "unknown method `{other}` (Phase-1 set: create_session, submit, steer, interrupt, queue, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
+                "unknown method `{other}` (baseline set: create_session, submit, steer, interrupt, queue, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
             ),
         )),
     }

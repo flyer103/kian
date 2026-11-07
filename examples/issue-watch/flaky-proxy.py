@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""flaky-proxy.py — a fault-injecting pass-through for the kian-62 demo.
+"""flaky-proxy.py — a fault-injecting pass-through for the re-arm demo.
 
 Forwards openai-compat chat-completions traffic to a real upstream
 (default https://api.deepseek.com) and, on the Nth *router judge*
@@ -9,15 +9,15 @@ content-type, a promised content-length larger than what will ever be
 sent, a few bytes of real SSE — then the connection closes. The kian
 provider surfaces an honest mid-turn stream error; the loop records
 `turn/end{outcome:"soft_failure"}` and the session ends `failed`.
-That is exactly the transient provider-stream failure the C60/C61
+That is exactly the transient provider-stream failure the earlier
 issue-watch runs observed in the wild.
 
-A second, independent fault mode (kian-74) targets the *delivery
+A second, independent fault mode targets the *delivery
 leg*: when FAIL_PATH is set, the first FAIL_N requests whose method
 matches FAIL_METHOD and whose path contains FAIL_PATH are answered
 with an injected HTTP 502 + a JSON `message` body (the shape the
 github adapter surfaces in its honest send error) instead of being
-forwarded — the C65 RUNLOG §7.1 scenario-6 evidence (bounded retry,
+forwarded — the RUNLOG §7.1 validation evidence (bounded retry,
 then park) becomes reproducible with the shipped tooling instead of a
 scratch shim. Set FAIL_N high (e.g. 99) to fail the whole bounded
 schedule (the park arm).
@@ -78,7 +78,7 @@ class Proxy(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep the demo output clean
         pass
 
-    # The delivery-leg fault (kian-74): True when this request is one
+    # The delivery-leg fault: True when this request is one
     # of the first FAIL_N method+path matches and must be answered
     # with an injected 502 instead of forwarded.
     def _claim_path_fault(self, method: str) -> bool:

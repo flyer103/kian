@@ -4,7 +4,7 @@
 //!
 //! Each predicate checks the invariant's **event-stream-visible**
 //! consequence; the store- and orchestrator-owned halves (CAS fencing,
-//! inbox rebuild, lease TTL) are verified in their own crates (C5/C6/C9).
+//! inbox rebuild, lease TTL) are verified in their own crates.
 //! Predicates are linear scans — safe to keep resident as debug_asserts.
 
 use crate::events::{EndReason, Event, EventKind};
@@ -136,7 +136,7 @@ pub fn durable_before_execute(events: &[Event]) -> Result<(), InvariantViolation
 /// Invariant 2 (**wake is advisory / NoLostWork**), event-stream side:
 /// history is append-only, so a restart snapshot (`after`) must extend
 /// the pre-crash snapshot (`before`) as a prefix. The inbox-rebuild half
-/// is owned by the store/orchestrator (C6/C9).
+/// is owned by the store/orchestrator.
 pub fn no_lost_work(before: &[Event], after: &[Event]) -> Result<(), InvariantViolation> {
     for (at, (b, a)) in before.iter().zip(after.iter()).enumerate() {
         if b != a {

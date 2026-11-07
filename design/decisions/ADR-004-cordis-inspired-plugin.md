@@ -11,7 +11,7 @@
   object type); ③ dependencies resolved topologically at construction time (equivalent to
   inject); ④ the five event-dispatch modes (emit/waterfall/parallel/serial/bail) as a `dispatch`
   API. The plugin set is known at compile time; the `kian_plugins![...]` macro registers plugins
-  into the binary. Dynamic loading (wasm/dylib) is left to Phase 3.
+  into the binary. Dynamic loading (wasm/dylib) is left to.
 - **Alternatives considered**:
   1. dylib dynamic loading — the Rust ABI is unstable (abi3 does not yet cover general cases);
      high risk of safety and version hell.

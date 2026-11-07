@@ -1,4 +1,4 @@
-//! The drain-context port the bridge drives against (C54).
+//! The drain-context port the bridge drives against.
 //!
 //! [`DshCtx`] mirrors exactly the surface `DrainCtx` offers a
 //! [`LoopDriver`](kian_core::seams::LoopDriver) — minus everything the

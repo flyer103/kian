@@ -1,6 +1,6 @@
-//! The C53 scripted stdio peer as a library function (C54): the same
+//! The scripted stdio peer as a library function: the same
 //! fixture-script interpreter the `dsh-fixture-peer` bins run, so the
-//! driver's CI tests (kian-dsh) and the C53 conformance suite
+//! driver's CI tests (kian-dsh) and the conformance suite
 //! (kian-superagent, unchanged) execute one implementation.
 //!
 //! Script operations (one JSON object per line):
@@ -11,7 +11,7 @@
 //!   diagnostic on stderr and exit code 1 — the peer never best-efforts
 //!   past an unexpected control frame);
 //! - `{"op":"exit","code":N}` — stop immediately with exit code N
-//!   (C54: the honest child-crash shape — mid-script, no cleanup);
+//!   (the honest child-crash shape — mid-script, no cleanup);
 //! - `{"op":"eof"}` — stop and exit 0.
 
 use std::error::Error;

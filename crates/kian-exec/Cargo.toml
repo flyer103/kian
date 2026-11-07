@@ -12,9 +12,9 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
-# Not in the card's dep list but unavoidable: frame (de)serialization is
+# Not in the dep list but unavoidable: frame (de)serialization is
 # serde_json line-based (same as kian-endpoint's codec); the durable queue
-# (C20) is sqlite over the shared sqlx pool discipline (C5/C6).
+# is sqlite over the shared sqlx pool discipline.
 serde_json.workspace = true
 sqlx.workspace = true
 

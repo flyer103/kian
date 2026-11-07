@@ -1,10 +1,10 @@
-//! The C54 S6 bridge e2e (mounted): a `kian serve` whose worker
-//! template runs the `DshDriver` against the C53 scripted fixture
-//! peer — zero Node/dsh present. Proves the card's mounted evidence:
+//! The bridge e2e (mounted): a `kian serve` whose worker
+//! template runs the `DshDriver` against the scripted fixture
+//! peer — zero Node/dsh present. Proves the mounted evidence:
 //! spawn/steer/complete through the full worker template, replay
 //! byte-parity of the finished stream, honest failure on child crash
 //! (`interrupted`, never `completed`), and kill -9 takeover with the
-//! takeover drain continuing the same dsh interaction (S1 semantics
+//! takeover drain continuing the same dsh interaction (semantics
 //! through the bridge). The live run against a real dsh install is
 //! env-gated (`KIAN_DSH_BIN`, kian-dsh's live smoke) and recorded in
 //! the README run log.
@@ -48,7 +48,7 @@ fn delegation_task() -> serde_json::Value {
     json!({"thread_id": THREAD_ID, "task": "deploy the service"})
 }
 
-/// The S6-mounted `kian.yaml`: super-agent assembly (the worker
+/// The -mounted `kian.yaml`: super-agent assembly (the worker
 /// template is where the bridge mounts) with
 /// `superagent.harness.dsh` pointing at the fixture peer.
 fn write_dsh_config(
@@ -149,7 +149,7 @@ fn spawn_serve(config: &Path) -> Child {
         // this one covers every early-return path. Without it, a
         // failed run leaks a spinning `kian serve` per test, which on
         // this shared machine has starved sibling e2e deadlines (the
-        // round-4 async_tools_e2e timeout traced back to exactly that).
+        // async_tools_e2e timeout traced back to exactly that).
         .kill_on_drop(true)
         .spawn()
         .expect("spawn kian serve")
@@ -355,7 +355,7 @@ async fn dsh_child_crash_settles_interrupted_never_completed() {
         .iter()
         .find(|e| matches!(e.kind, EventKind::SessionEnded { .. }))
         .unwrap();
-    // Never completed: the crash trace is the C53 honest shape — an
+    // Never completed: the crash trace is the honest shape — an
     // attempt with no assistant message after it (constraint 7).
     assert!(
         !matches!(
@@ -386,7 +386,7 @@ async fn dsh_kill9_takeover_continues_the_same_interaction() {
 
     // Boot #1: phase-1 script stalls mid-step (the drain is inside a
     // provider turn when the server dies).
-    let mut booted = boot_with_task(&dir, &sqlite, &provider_base, "e2e_phase1.jsonl").await;
+    let mut booted = boot_with_task(&dir, &sqlite, &provider_base, "e2e_initial.jsonl").await;
     let store = EventStore::open(&sqlite).await.expect("open store");
     let mid_step = wait_events(&store, booted.session, 20_000, |events| {
         events.iter().any(|e| e.kind == EventKind::StepRequest)
@@ -409,7 +409,7 @@ async fn dsh_kill9_takeover_continues_the_same_interaction() {
         &sqlite,
         &provider_base,
         &format!("127.0.0.1:{port}"),
-        "e2e_phase2.jsonl",
+        "e2e_bundle.jsonl",
     );
     let mut child2 = spawn_serve(&config);
     assert!(

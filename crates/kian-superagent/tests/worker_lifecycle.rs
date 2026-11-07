@@ -1,10 +1,10 @@
-//! Integration tests (card C25): Thread delegation over a real sqlite
+//! Integration tests: Thread delegation over a real sqlite
 //! `EventStore` and a real `Engine`, with **ScriptedProvider on both
 //! sides** (Router and Worker) — no credentials, no network egress at
 //! all (in-process engines + mock providers), so there is nothing for a
 //! system proxy to intercept.
 //!
-//! The assembly surface is exactly what C27 will build: the
+//! The assembly surface is exactly what will build: the
 //! `InboxWriter` port over the engine, the `StreamPort` over the
 //! execution-hold handle, one engine whose driver routes the resident
 //! Router session to the router loop and every other session to the
@@ -75,7 +75,7 @@ async fn wait_for_events(
 }
 
 // ---------------------------------------------------------------------------
-// ScriptedProvider (both sides — the S4 stand-in, no credentials)
+// ScriptedProvider (both sides — the stand-in, no credentials)
 // ---------------------------------------------------------------------------
 
 type ScriptedChunks = Vec<Result<ModelChunk, kian_core::seams::ProviderError>>;
@@ -246,7 +246,7 @@ impl InboxWriter for LateEngineInbox {
 /// Assembly's `StreamPort` over the execution-hold handle: every emit
 /// carries the hold's fencing epoch (the handle guarantees that); the
 /// stream read is the committed truth. A local newtype — the orphan
-/// rule keeps a direct impl in assembly's crate (exactly how C27 will
+/// rule keeps a direct impl in assembly's crate (exactly how will
 /// build it).
 struct CtxPort(DrainCtx);
 
@@ -289,7 +289,7 @@ fn port_for_ctx() -> PortFor<DrainCtx> {
 /// the moment the Router is woken, the just-admitted report row is
 /// already durable (an eligible row with a `thread-report:` key
 /// exists). The probe runs on its own thread with a small runtime (a
-/// sync trait method cannot await on this thread's runtime) — the C23
+/// sync trait method cannot await on this thread's runtime) — the
 /// `OrderingInbox` pattern.
 struct DurabilityProbeInbox {
     inner: Arc<dyn InboxWriter>,
@@ -342,13 +342,13 @@ impl InboxWriter for DurabilityProbeInbox {
 }
 
 // ---------------------------------------------------------------------------
-// The Router-side dispatch driver (the C26 spawn_worker stand-in)
+// The Router-side dispatch driver (the spawn_worker stand-)
 // ---------------------------------------------------------------------------
 
 /// The Router's loop: on first drive (per *stream*, idempotent — a
 /// restarted engine must not re-spawn) it dispatches one worker via
 /// [`WorkerSpawner`], appends `thread/started` to the Router's own
-/// stream at dispatch (what C26's `spawn_worker` tool will do from
+/// stream at dispatch (what 's `spawn_worker` tool will do from
 /// inside the Router's hold), then delegates to the inner ReAct loop so
 /// the Router's own scripted model turn runs through the real loop
 /// machinery.
@@ -401,7 +401,7 @@ impl LoopDriver for RouterDispatchDriver {
 /// One engine, one driver: the resident Router session routes to the
 /// router wrapper (which passes it through — no lineage), every other
 /// session routes to the worker wrapper. Both wrappers share the same
-/// inbox port and config, exactly how C27 assembles it.
+/// inbox port and config, exactly how assembles it.
 struct SuperAgentDriver {
     router: SessionId,
     router_side: WorkerLoopDriver<RouterDispatchDriver>,
@@ -648,7 +648,7 @@ fn hold_router_turn_until_worker_settles(h: &Harness) {
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C25)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 /// Full lifecycle: Router dispatch → the `thread/started` pair on both
@@ -738,7 +738,7 @@ async fn full_lifecycle_delegation_verdict_completion_report_consumed() {
     );
 
     // The evidence verdict passed and precedes thread/completed, which
-    // precedes the end write (the C24 ordering contract).
+    // precedes the end write (the ordering contract).
     let verdict_pos = position_of(&worker_events, |e| e.kind == EventKind::EvidenceVerdict)
         .expect("evidence/verdict");
     let completed_pos = position_of(&worker_events, |e| e.kind == EventKind::ThreadCompleted)
@@ -828,7 +828,7 @@ async fn takeover_midtask_no_duplicate_thread_started_task_completes() {
 
     // Engine A on its own runtime: the worker finishes its tool turn,
     // then hangs in the second provider turn until the crash flag drops
-    // the runtime (the C15 zombie pattern).
+    // the runtime (the zombie pattern).
     let spawned_a = Arc::clone(&spawned_slot);
     let clock_a: Arc<ManualClock> = Arc::clone(&clock);
     let store_a = store.clone();
@@ -1162,7 +1162,7 @@ async fn worker_toolset_contains_no_channel_tools() {
 #[tokio::test]
 async fn delegation_pair_discoverable_by_scanning_both_streams() {
     // Gate disabled (default-off): the worker completes ungated, no
-    // verdict events — Phase-1 inner behavior unchanged.
+    // verdict events — built-in inner behavior unchanged.
     let h = default_harness(
         vec![vec![text_chunk("done without a gate")]],
         vec![vec![text_chunk("dispatched")], vec![text_chunk("noted")]],

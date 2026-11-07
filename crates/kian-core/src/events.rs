@@ -3,7 +3,7 @@
 //!
 //! The append-only `Event` envelope carries a schema `version` (v0, DESIGN
 //! §3.3) and the durable `EventKind` set. Provider payloads stay opaque
-//! `bytes` — no provider-specific field names inside `EventKind`. After C2
+//! `bytes` — no provider-specific field names inside `EventKind`. After
 //! merges, event kinds are additions-only (constraint 3, cache-byte
 //! stability).
 
@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::model::{Epoch, SessionId};
 
-/// Current event-schema version (DESIGN §3.3). v0 is frozen by C2; later
+/// Current event-schema version (DESIGN §3.3). v0 is frozen by; later
 /// versions arrive exclusively as adjacent migrations — committed
 /// generations are never renamed, replaced or deleted.
 pub const SCHEMA_VERSION: u32 = 0;
@@ -22,7 +22,7 @@ pub const SCHEMA_VERSION: u32 = 0;
 ///
 /// The exact serialized JSON form is frozen (golden-tested): field order and
 /// byte shape are stable content, because envelopes feed replay and audit
-/// exports (C14).
+/// exports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// Monotone per-session sequence number (CAS fence input, ADR-005).
@@ -55,7 +55,7 @@ impl Event {
     }
 }
 
-/// The derived event id (C69): `"evt_" + uuid5(session, "kian:event:<seq>")`
+/// The derived event id: `"evt_" + uuid5(session, "kian:event:<seq>")`
 /// — RFC 4122 v5 with the session uuid as the namespace and the literal
 /// `kian:event:<seq>` as the name.
 ///
@@ -91,9 +91,9 @@ pub enum EndReason {
 /// terminal state transition must be projectable without parsing opaque
 /// bytes (NoHalfTerminated, constraint 4). Every other kind's payload lives
 /// in [`Event::bytes`] under a payload schema owned by the emitting
-/// subsystem (e.g. `compact`'s `[a,b)` range + summary: C4).
+/// subsystem (e.g. `compact`'s `[a,b)` range + summary:).
 ///
-/// **Additions-only after C2** (constraint 3): no renames, no reformats.
+/// **Additions-only after ** (constraint 3): no renames, no reformats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum EventKind {
@@ -135,7 +135,7 @@ pub enum EventKind {
 
     /// Compression — the only deliberate prefix-invalidation point (A3).
     /// Carries the pre-compression range `[a,b)` and the post-compression
-    /// summary in its payload (schema owned by C4).
+    /// summary in its payload (schema owned ).
     #[serde(rename = "compact")]
     Compact,
 
@@ -143,7 +143,7 @@ pub enum EventKind {
     #[serde(rename = "slot/binding")]
     SlotBinding,
 
-    /// One fallback-chain switch within a bound slot (C8).
+    /// One fallback-chain switch within a bound slot.
     #[serde(rename = "slot/fallback")]
     SlotFallback,
 
@@ -152,10 +152,10 @@ pub enum EventKind {
     #[serde(rename = "slot/migration")]
     SlotMigration,
 
-    /// Operator reset of a session's recovery budget (card C14). The
+    /// Operator reset of a session's recovery budget. The
     /// reset is itself an appended event — there is no silent counter
     /// wipe (constraint 1: every observable change is an append). The
-    /// payload (schema owned by C14: `{"reason": string}`) records why.
+    /// payload (schema owned by: `{"reason": string}`) records why.
     /// Neutral by design: the state machine maps it to no transition
     /// and the model-context projection skips it, so replay derives
     /// fresh budgets from config while the event remains the audit
@@ -163,9 +163,9 @@ pub enum EventKind {
     #[serde(rename = "recovery/budget-reset")]
     RecoveryBudgetReset,
 
-    /// Thread lineage start (C18, Phase 2): a Router's drain dispatched
+    /// Thread lineage start (bundle): a Router's drain dispatched
     /// work to a worker session, or the worker's stream records that it
-    /// was spawned by delegation. Payload schema (owned by C18):
+    /// was spawned by delegation. Payload schema (owned ):
     /// `{"thread_id": uuid, "parent": session-uuid, "worker":
     /// session-uuid, "pinned_version": u64, "task": <message payload>}`.
     /// State-preserving in `idle`/`running`/`recoverable` (same row as
@@ -173,33 +173,33 @@ pub enum EventKind {
     #[serde(rename = "thread/started")]
     ThreadStarted,
 
-    /// Thread lineage completion (C18, Phase 2): the worker's own drain
+    /// Thread lineage completion (bundle): the worker's own drain
     /// appended its outcome before the end write. Payload schema (owned
-    /// by C18): `{"thread_id": uuid, "status": "completed"|"failed"|
+    /// ): `{"thread_id": uuid, "status": "completed"|"failed"|
     /// "interrupted", "summary": <message payload>}`. Drain activity
     /// (default mapping); not context-bearing.
     #[serde(rename = "thread/completed")]
     ThreadCompleted,
 
-    /// Evidence-gate verdict (C18, Phase 2): the bounded, declarative
-    /// stop-gate recorded its decision. Payload schema (owned by C18):
+    /// Evidence-gate verdict (bundle): the bounded, declarative
+    /// stop-gate recorded its decision. Payload schema (owned ):
     /// `{"gate": str, "passed": bool, "checks": [{"name": str,
     /// "passed": bool, "detail"?: str}], "attempt": u64}`. Drain activity
     /// (default mapping); not context-bearing.
     #[serde(rename = "evidence/verdict")]
     EvidenceVerdict,
 
-    /// Channel delivery receipt (C18, Phase 2): a channel output policy
+    /// Channel delivery receipt (bundle): a channel output policy
     /// delivered a message and recorded the honest receipt. Payload
-    /// schema (owned by C18): `{"channel": str, "target": <value>,
+    /// schema (owned ): `{"channel": str, "target": <value>,
     /// "policy": str, "words"?: u64, "truncated": bool}`. Drain activity
     /// (default mapping); not context-bearing.
     #[serde(rename = "channel/delivered")]
     ChannelDelivered,
 
-    /// Spilled raw channel payload (C31, Phase 3): the verbatim channel
+    /// Spilled raw channel payload (ecosystem): the verbatim channel
     /// payload kept in-stream but out of context. Payload schema (owned
-    /// by C31): `{"event_id": str, "channel": str, "topic": str|null,
+    /// ): `{"event_id": str, "channel": str, "topic": str|null,
     /// "raw": <verbatim channel payload>}`. Appended by the drain's
     /// consumption write in the same fenced batch as its sibling
     /// `input/admitted` (the Inline form is what the model sees; this
@@ -210,9 +210,9 @@ pub enum EventKind {
     #[serde(rename = "input/spilled")]
     InputSpilled,
 
-    /// Durable interrupt intent (C68, ADR-014): the control plane's
+    /// Durable interrupt intent (ADR-014): the control plane's
     /// interrupt request, consumed and appended by the owning drain at a
-    /// safe boundary. Payload schema (owned by C68):
+    /// safe boundary. Payload schema (owned ):
     /// `{"action": "interrupt", "reason": string|null,
     /// "requested_by": string|null, "requested_at_ms": u64,
     /// "target_epoch": u64|null, "stale"?: true}` — `stale` is present
@@ -288,9 +288,9 @@ mod tests {
             .unwrap()
     }
 
-    /// Every EventKind has an exact golden JSON form and round-trips (C2
+    /// Every EventKind has an exact golden JSON form and round-trips (
     /// acceptance). The `as_str` name must stay in sync with the serde tag.
-    /// After C2 merges this set is additions-only.
+    /// After merges this set is additions-only.
     #[test]
     fn event_kind_golden_json_round_trip() {
         let cases = [
@@ -340,22 +340,22 @@ mod tests {
             assert_eq!(kind.as_str(), tag_of(golden));
         }
         // The durable set is exactly the twenty-one kinds above (the
-        // fourteen frozen by C2 + the additive C14
-        // `recovery/budget-reset` + the four additive C18 Phase-2 kinds
-        // + the additive C31 `input/spilled` + the additive C68
+        // fourteen frozen by + the additive
+        // `recovery/budget-reset` + the four additive bundle kinds
+        // + the additive `input/spilled` + the additive
         // `control/interrupt`; additions-only, no renames).
         assert_eq!(cases.len(), 21);
     }
 
-    /// Additions-only regression (C18): every pre-existing kind's golden
-    /// bytes are byte-identical to the Phase-1 frozen forms. This list is
+    /// Additions-only regression: every pre-existing kind's golden
+    /// bytes are byte-identical to the built-in frozen forms. This list is
     /// deliberately independent of the growing `cases` array above — it
-    /// is the frozen Phase-1 contract, copied verbatim, so a future edit
+    /// is the frozen built-in contract, copied verbatim, so a future edit
     /// to an existing kind's serialization fails here even if `cases`
     /// was updated alongside it.
     #[test]
-    fn additions_only_regression_phase1_kind_bytes_are_frozen() {
-        let frozen_phase1: [(EventKind, &str); 15] = [
+    fn additions_only_regression_initial_kind_bytes_are_frozen() {
+        let frozen_initial: [(EventKind, &str); 15] = [
             (EventKind::SessionCreated, r#"{"kind":"session/created"}"#),
             (EventKind::InputAdmitted, r#"{"kind":"input/admitted"}"#),
             (EventKind::DrainClaimed, r#"{"kind":"drain/claimed"}"#),
@@ -383,7 +383,7 @@ mod tests {
                 r#"{"kind":"session/ended","reason":"failed"}"#,
             ),
         ];
-        for (kind, golden) in &frozen_phase1 {
+        for (kind, golden) in &frozen_initial {
             assert_eq!(
                 &serde_json::to_string(kind).unwrap(),
                 golden,
@@ -395,14 +395,14 @@ mod tests {
         }
     }
 
-    /// Additions-only regression (C31): the four C18 Phase-2 kinds' golden
-    /// bytes are frozen exactly as they landed in Phase 2. Together with
-    /// the Phase-1 frozen set above this pins every one of the nineteen
-    /// pre-C31 kinds, independently of the growing `cases` array, so the
-    /// C31 addition cannot disturb a single existing serialization byte.
+    /// Additions-only regression: the four bundle kinds' golden
+    /// bytes are frozen exactly as they landed in bundle. Together with
+    /// the built-in frozen set above this pins every one of the nineteen
+    /// legacy kinds, independently of the growing `cases` array, so the
+    /// addition cannot disturb a single existing serialization byte.
     #[test]
-    fn additions_only_regression_phase2_kind_bytes_are_frozen() {
-        let frozen_phase2: [(EventKind, &str); 4] = [
+    fn additions_only_regression_bundle_kind_bytes_are_frozen() {
+        let frozen_bundle: [(EventKind, &str); 4] = [
             (EventKind::ThreadStarted, r#"{"kind":"thread/started"}"#),
             (EventKind::ThreadCompleted, r#"{"kind":"thread/completed"}"#),
             (EventKind::EvidenceVerdict, r#"{"kind":"evidence/verdict"}"#),
@@ -411,7 +411,7 @@ mod tests {
                 r#"{"kind":"channel/delivered"}"#,
             ),
         ];
-        for (kind, golden) in &frozen_phase2 {
+        for (kind, golden) in &frozen_bundle {
             assert_eq!(
                 &serde_json::to_string(kind).unwrap(),
                 golden,
@@ -423,15 +423,15 @@ mod tests {
         }
     }
 
-    /// Additions-only regression (C68): all twenty pre-C68 kinds' golden
-    /// bytes are frozen exactly as they stood at the end of round 6.
-    /// Like the Phase-1/Phase-2 frozen lists above, this is
+    /// Additions-only regression: all twenty legacy kinds' golden
+    /// bytes are frozen exactly as they stood at the end of.
+    /// Like the built-in/bundle frozen lists above, this is
     /// deliberately independent of the growing `cases` array, so the
-    /// C68 `control/interrupt` addition cannot disturb a single
+    /// `control/interrupt` addition cannot disturb a single
     /// existing serialization byte.
     #[test]
-    fn additions_only_regression_round6_all_twenty_kind_bytes_are_frozen() {
-        let frozen_round6: [(EventKind, &str); 20] = [
+    fn additions_only_regression_all_kind_bytes_are_frozen() {
+        let frozen_all: [(EventKind, &str); 20] = [
             (EventKind::SessionCreated, r#"{"kind":"session/created"}"#),
             (EventKind::InputAdmitted, r#"{"kind":"input/admitted"}"#),
             (EventKind::DrainClaimed, r#"{"kind":"drain/claimed"}"#),
@@ -467,7 +467,7 @@ mod tests {
                 r#"{"kind":"session/ended","reason":"failed"}"#,
             ),
         ];
-        for (kind, golden) in &frozen_round6 {
+        for (kind, golden) in &frozen_all {
             assert_eq!(
                 &serde_json::to_string(kind).unwrap(),
                 golden,
@@ -477,10 +477,10 @@ mod tests {
             let back: EventKind = serde_json::from_str(golden).unwrap();
             assert_eq!(&back, kind);
         }
-        assert_eq!(frozen_round6.len(), 20);
+        assert_eq!(frozen_all.len(), 20);
     }
 
-    /// The C68 `control/interrupt` kind round-trips through the full
+    /// The `control/interrupt` kind round-trips through the full
     /// envelope with its tabled payload riding opaquely in `bytes`,
     /// including the audit-only `stale` marker variant.
     #[test]
@@ -524,9 +524,9 @@ mod tests {
         }
     }
 
-    /// The C31 `input/spilled` kind round-trips through the full envelope
-    /// with a payload of its tabled schema (§2 of the round-3 plan) riding
-    /// opaquely in `bytes` (JSONL-export shape, the C14 replay path).
+    /// The `input/spilled` kind round-trips through the full envelope
+    /// with a payload of its tabled schema (§2 of the plan) riding
+    /// opaquely in `bytes` (JSONL-export shape, the replay path).
     #[test]
     fn input_spilled_envelope_round_trips_with_tabled_payload() {
         let payload = json!({
@@ -553,11 +553,11 @@ mod tests {
         assert_eq!(back.bytes, payload);
     }
 
-    /// Each C18 Phase-2 kind round-trips through the full envelope with
+    /// Each bundle kind round-trips through the full envelope with
     /// a payload of its tabled schema riding opaquely in `bytes`
-    /// (JSONL-export shape, the C14 replay path).
+    /// (JSONL-export shape, the replay path).
     #[test]
-    fn phase2_kind_envelopes_round_trip_with_tabled_payloads() {
+    fn bundle_kind_envelopes_round_trip_with_tabled_payloads() {
         let payloads = [
             (
                 EventKind::ThreadStarted,
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(back, ev);
     }
 
-    // -- C69: derived event id -------------------------------------------------
+    // -- derived event id -------------------------------------------------
 
     /// Golden vectors for the derived event id rule: `evt_` + RFC 4122
     /// v5(session uuid, "kian:event:<seq>"). The literals are generated

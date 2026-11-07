@@ -1,9 +1,9 @@
 # ADR-015: Per-call tool permission provenance — allow/deny, fail-closed
 
-- **Status**: draft (C70 / kian-82; append-only — ADR-001…014 immutable)
+- **Status**: draft (; append-only — ADR-001…014 immutable)
 - **Date**: 2026-11-07
-- **Context**: Round-7 plan §2.4/§3 card C70. Until now the only tool-surface control was the
-  agent's `tools:` list (kian-61): an unlisted tool never rides the request schema — a coarse,
+- **Context**: plan §2.4/§3. Until now the only tool-surface control was the
+  agent's `tools:` list: an unlisted tool never rides the request schema — a coarse,
   *compile-time* filter of what the model can *see*. There was no per-call decision recorded when
   a listed tool was *invoked*, and no way to deny one without hiding it (hiding changes tool-schema
   bytes and therefore the request prefix). Borrowed shape: CMA's `evaluated_permission` +
@@ -34,9 +34,9 @@
    honest error next turn and reacts. A denied call is a *tool failure*, never a loop abort —
    the loop continues and the session can still complete honestly (constraint 7's spirit: the
    truth of what happened is recorded, not laundered into a crash).
-4. **No new event kind.** The `tool/call` event (log-before-execute, C11) already carries the
-   call as an action record; permission is *provenance on that action*, the same pattern C69 set
-   for redaction reports and C67 for usage — an additive payload key on a frozen wrapper, never
+4. **No new event kind.** The `tool/call` event (log-before-execute) already carries the
+   call as an action record; permission is *provenance on that action*, the same pattern set
+   for redaction reports and for usage — an additive payload key on a frozen wrapper, never
    a new kind (additions-only event discipline, plan rule 4). The synthetic denied `tool/result`
    reuses the existing kind because it *is* a tool result the model must see — inventing a
    `tool/denied` kind would make the model-visible round trip a special case for no gain.
@@ -44,19 +44,19 @@
    `content`**; `derive_model_context` reads `role`/`content` only, so the projected message —
    and therefore the request bytes and the provider prefix cache — is identical with and without
    the key (golden-tested). Furthermore, with **no table configured the key is omitted
-   entirely**: the `tool/call` payload is byte-identical to the pre-C70 literal, so an unchanged
-   config produces an unchanged stream. (This reconciles the card's "absent config =
+   entirely**: the `tool/call` payload is byte-identical to the legacy literal, so an unchanged
+   config produces an unchanged stream. (This reconciles the design's "absent config =
    byte-identical today" with "provenance on allow": provenance rides only when a table exists;
    `"policy":"default"` is the *fall-through* arm of a configured table, not the no-table case.)
-6. **Where it evaluates.** The built-in loop (`react-loop` plugin / Phase-1 assembly), the
+6. **Where it evaluates.** The built-in loop (`react-loop` plugin / assembly), the
    superagent plain-session (default agent) loop, and the superagent worker-template loop map
    their agent's table into `ReActConfig.permissions`. The Router and Watchdog judge loops do
-   **not** evaluate permissions this round — rather than silently ignore a table on their agents,
-   config validation **refuses boot** for one. The S6 dsh harness replaces the worker's inner
+   **not** evaluate permissions — rather than silently ignore a table on their agents,
+   config validation **refuses boot** for one. The dsh harness replaces the worker's inner
    loop and does not evaluate the table (recorded boundary; the config still validates).
 7. **`ask` is out of scope, by design.** The vocabulary is closed at `allow|deny` so a later
    confirmation plane can add `ask` additively — both to the config enum and to the payload's
-   `evaluated` field. `ask` requires machinery this round deliberately does not build: a durable
+   `evaluated` field. `ask` requires machinery that is deliberately not built: a durable
    pending-confirmation state, a human/PLane response path into the inbox, and a hold semantics
    for a drain paused mid-turn — each its own design question (an `ask` that crashes the
    confirmation channel must not wedge sessions). Deferred, not forgotten.
@@ -69,7 +69,7 @@
   this changes request bytes for sessions where a deny actually fires — inherent to the feature
   and gated on config, never on the default path.
 - `AgentDef.tools` enforcement semantics are untouched: the schema filter (what the model sees)
-  stays exactly as kian-61 built it; permissions decide what *runs*. Two layers, one honest
+  stays exactly as built it; permissions decide what *runs*. Two layers, one honest
   boundary: schema-hidden tools are never called; schema-visible tools may be denied per call.
 - Tool-schema order/serialization, `derive_model_context`, request bytes and the evidence gate
   are untouched (asserted by tests).

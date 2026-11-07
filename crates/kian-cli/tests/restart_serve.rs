@@ -1,4 +1,4 @@
-//! S1 preview at API level (card C13): kill -9 `kian serve` mid-session
+//! preview at API level: kill -9 `kian serve` mid-session
 //! (mid provider turn, with a queued-but-unconsumed input), restart it,
 //! and prove the startup inbox rebuild lets the drain continue to an
 //! honest `completed` — zero lost work.

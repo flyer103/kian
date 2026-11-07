@@ -1,6 +1,6 @@
 # dsh-v0-peer — the contract-v0 peer for `dsh --profile sdk`
 
-The ecosystem half of the kian S6 bridge (card C59). `dsh-v0-peer.mjs` is a
+The ecosystem half of the kian dsh bridge. `dsh-v0-peer.mjs` is a
 Node ESM script (node: builtins only, no npm dependencies, executable) that
 adapts the stock `dsh --profile sdk` JSON-RPC 2.0 server onto kian's frozen
 bridge contract v0 (ADR-010). The kian side (`crates/kian-dsh`) is the frozen
@@ -64,7 +64,7 @@ a log line.
 ## Divergences from ADR-010's assumed vocabulary (reported, not patched)
 
 The ADR is frozen; these are the exact observed deltas, recorded here and in
-card C59's completion:
+the peer's completion:
 
 1. **The kind vocabulary itself matches** — every `session.event` type seen
    (`turn/start`, `step/start`, `system/message`, `user/message`,

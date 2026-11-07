@@ -1,4 +1,4 @@
-//! The postgres backend (C50): mirrors the sqlite statements with `$N`
+//! The postgres backend: mirrors the sqlite statements with `$N`
 //! placeholders and pg dialect, sharing the typed error surface
 //! ([`StoreError`]/[`InboxError`]) and the HEAD-query CAS classification
 //! path. pg ≥ 14 assumed.
@@ -213,7 +213,7 @@ const EVENT_EXISTS_SQL: &str =
 const CONSUMED_STATE_SQL: &str =
     "SELECT consumed_by_seq FROM inputs WHERE session = $1::text AND id = $2::text";
 
-/// Same conditional admission as sqlite's CLAIM (C47/ADR-009), with
+/// Same conditional admission as sqlite's CLAIM (ADR-009), with
 /// `GREATEST` for the scalar floor max and `$N` placeholders (one bind
 /// per distinct parameter). The DO UPDATE predicate qualifies its
 /// columns with the table name: unlike sqlite, postgres resolves

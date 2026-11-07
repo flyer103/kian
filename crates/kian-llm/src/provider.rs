@@ -1,4 +1,4 @@
-//! openai-compatible `ModelProvider` implementation (card C8).
+//! openai-compatible `ModelProvider` implementation.
 //!
 //! HTTP via reqwest with SSE streaming parsed into model chunks; request
 //! bytes are serialized and handed to persistence before the request
@@ -76,7 +76,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// One assistant tool call in the strict openai wire shape
-/// (`messages[n].tool_calls[m]`, card kian-61 / dialect v2).
+/// (`messages[n].tool_calls[m]`, card / dialect v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireFunctionCall {
     pub name: String,
@@ -95,7 +95,7 @@ pub struct WireToolCall {
 
 /// One chat message in the openai-compat request body.
 ///
-/// Dialect v2 (kian-61): plain messages stay exactly `{"content", "role"}`
+/// Dialect v2: plain messages stay exactly `{"content", "role"}`
 /// — byte-identical to dialect v1 — while tool round trips use the strict
 /// openai wire shape: an assistant tool-call turn carries `tool_calls`
 /// (and `content: null` when the turn had no text), and a `role:"tool"`
@@ -136,7 +136,7 @@ impl ChatMessage {
 /// every session and is a constraint-3 event: it requires a DESIGN note
 /// and an observable invalidation-cause record.
 ///
-/// v2 (kian-61): strict openai tool wire shape — assistant `tool_calls`,
+/// v2: strict openai tool wire shape — assistant `tool_calls`,
 /// `role:"tool"` results with `tool_call_id`, dotless tool names. The v1
 /// body (`4a1dad31…d7ce`) was rejected by strict OpenAI-compatible
 /// endpoints (HTTP 400 dotted names / 422 missing `tool_call_id`) after
@@ -157,7 +157,7 @@ pub const FROZEN_CHAT_BODY_SHA256: &str =
 ///   logical body always serializes to identical bytes.
 /// - Top-level fields: exactly `messages`, `model`, `stream` (always
 ///   `true`) and — only when at least one tool is supplied — `tools`.
-/// - Message objects (dialect v2, kian-61): `content` and `role` always;
+/// - Message objects (dialect v2): `content` and `role` always;
 ///   `tool_calls` only on assistant tool-call turns; `tool_call_id` only
 ///   on `role:"tool"` results. Plain messages are byte-identical to the
 ///   v1 shape.
@@ -413,7 +413,7 @@ fn response_stream(
 
 /// Decode one SSE `data:` payload into zero or more stream items.
 ///
-/// C67: a frame carrying a `usage` object emits a chunk with
+/// a frame carrying a `usage` object emits a chunk with
 /// `delta: null` and the usage object **verbatim** (multiple frames all
 /// surface; the consumer applies last-wins). A usage frame never flips
 /// the saw-chunk liveness flag — a stream whose only frames are usage
@@ -438,7 +438,7 @@ fn decode_data(data: &str, flags: &StreamFlags) -> Vec<Result<ModelChunk, Provid
             flags.0.store(true, Ordering::SeqCst);
             items.push(Ok(ModelChunk::new(delta.clone())));
         }
-        // Empty deltas (e.g. the trailing finish_reason marker) and
+        // Empty deltas (e.g. The trailing finish_reason marker) and
         // keepalive frames carry no content for the loop.
         _ => {}
     }
@@ -831,7 +831,7 @@ mod tests {
         );
     }
 
-    /// HTTP status → ProviderError classes used by the C10 classifier.
+    /// HTTP status → ProviderError classes used by the classifier.
     #[tokio::test]
     async fn error_statuses_map_to_provider_error_classes() {
         ensure_no_proxy();
@@ -933,7 +933,7 @@ mod tests {
     /// those bytes match the golden hash. Changing the constant below is a
     /// constraint-3 event (prefix-cache invalidation for every session).
     ///
-    /// Dialect v2 (kian-61): the golden body now carries one full tool
+    /// Dialect v2: the golden body now carries one full tool
     /// round trip in the strict openai wire shape — an assistant
     /// `tool_calls` turn (with `content: null`) followed by a
     /// `role:"tool"` result with `tool_call_id` — and dotless tool names
@@ -988,7 +988,7 @@ mod tests {
         );
     }
 
-    /// Dialect v2 (kian-61): the wire shape of a tool round trip is
+    /// Dialect v2: the wire shape of a tool round trip is
     /// exactly the strict openai form — `tool_calls` with string
     /// `function.arguments` and a `tool_call_id` on the result — and
     /// plain messages stay byte-identical to the v1 shape (no extra
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // C67: provider usage frames
+    // provider usage frames
     // ------------------------------------------------------------------
 
     /// A final usage frame after content deltas emits a usage-only chunk

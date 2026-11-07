@@ -1,4 +1,4 @@
-//! C57 (kian-65): closed decision-reason vocabularies + judge decision
+//! closed decision-reason vocabularies + judge decision
 //! tags. Four claims, all in this one binary (own process, so the
 //! process-global tracing capture here owns the global subscriber slot
 //! — the `tests/fanout_audit.rs` discipline):
@@ -15,7 +15,7 @@
 //!    (router / passthrough / deduplicated).
 //! 4. **The judge template change is golden.** The new default carries
 //!    exactly one decision-tag sentence; persisted (custom) prompts
-//!    render byte-identically — the C43 note pattern.
+//!    render byte-identically — the note pattern.
 
 use std::sync::{Arc, Mutex, Once};
 
@@ -199,7 +199,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
         vec![IntakeReason::AdmittedRouter]
     );
 
-    // Fixed session route (C40 watchdog ticks) → admitted_passthrough
+    // Fixed session route (watchdog ticks) → admitted_passthrough
     // (a direct admit, no Router judgment; the closed set has no
     // per-route variant — documented in `reasons.rs`).
     let outcome = service
@@ -222,7 +222,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
         vec![IntakeReason::AdmittedPassthrough]
     );
 
-    // Fan-out (C38): one code per admission.
+    // Fan-out: one code per admission.
     service.register_topic("pr-9", worker_b);
     let outcome = service
         .handle_event(event("ci", "evt-fan", Some("pr-9")))
@@ -270,7 +270,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
         vec![IntakeReason::NoRule]
     );
 
-    // C36 ignore class → class_ignored (decided before the rule set).
+    // ignore class → class_ignored (decided before the rule set).
     let ignored = SubscriptionService::with_classes(
         router,
         rules(watchdog),
@@ -292,7 +292,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
         vec![IntakeReason::ClassIgnored]
     );
 
-    // C36 explicit-only without a signal → not_explicit.
+    // explicit-only without a signal → not_explicit.
     let explicit_only = SubscriptionService::with_classes(
         router,
         rules(watchdog),
@@ -606,7 +606,7 @@ async fn audit_lines_carry_reason_codes_for_every_drop_and_admit_path() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The judge template change is golden (the C43 note pattern)
+// 4. The judge template change is golden (the note pattern)
 // ---------------------------------------------------------------------------
 
 /// The new default template, byte-golden. The decision-tag sentence is
@@ -625,7 +625,7 @@ batch, tag your decision in your reply text as exactly one of decision:accept, d
 decision:ignore, or decision:unavailable. Pending inputs in this batch: {inputs}";
 
     assert_eq!(JUDGE_PROMPT_TEMPLATE, golden);
-    // The template artifact lives in `templates.rs` (kian-65); the
+    // The template artifact lives in `templates.rs`; the
     // historical path re-exports the same item.
     assert_eq!(
         kian_superagent::templates::JUDGE_PROMPT_TEMPLATE,
@@ -649,7 +649,7 @@ decision:ignore, or decision:unavailable. Pending inputs in this batch: {inputs}
     assert_eq!(rendered.matches("decision:").count(), 4);
     assert!(rendered.ends_with("Pending inputs in this batch: 7"));
 
-    // Persisted prompts replay byte-identically (the C43 note
+    // Persisted prompts replay byte-identically (the note
     // pattern): a session bootstrapped under an older template keeps
     // rendering it, untouched by the new default.
     let persisted = "legacy judge prompt with {inputs} inputs";

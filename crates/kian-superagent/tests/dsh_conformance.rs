@@ -1,7 +1,7 @@
-//! The C53 dsh conformance suite (ADR-010, DESIGN §16): CI proves both
+//! The dsh conformance suite (ADR-010, DESIGN §16): CI proves both
 //! directions of the mapping, the steer/interrupt translation and the
 //! pre-flight ordering rule against the scripted stdio fixture peer —
-//! zero Node/dsh dependency (the live `KIAN_DSH_BIN` run is C54's
+//! zero Node/dsh dependency (the live `KIAN_DSH_BIN` run is 's
 //! env-gated smoke, never a default-CI requirement).
 //!
 //! The fixture peer is `src/bin/dsh-fixture-peer.rs`; scripts live in
@@ -55,7 +55,7 @@ fn seeded_stream() -> Vec<Event> {
 }
 
 /// The scripted stdio peer (a real child process speaking the bridge
-/// contract over pipes — the same shape C54's driver will speak with a
+/// contract over pipes — the same shape 's driver will speak with a
 /// `dsh --profile sdk` child).
 struct Peer {
     child: Child,
@@ -237,7 +237,7 @@ fn fixture_turn_replays_byte_identically_after_reimport() {
     let (events, mut peer) = run_script("basic_turn.jsonl", &controls);
     peer.finish();
 
-    // Export to JSONL (the C14 replay/export shape).
+    // Export to JSONL (the replay/export shape).
     let exported: Vec<String> = events
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
@@ -256,7 +256,7 @@ fn fixture_turn_replays_byte_identically_after_reimport() {
     );
 
     // Re-import: parse every line back and require byte-identical
-    // re-serialization plus an identical projected context (S7 shape).
+    // re-serialization plus an identical projected context (shape).
     let mut reimported = Vec::new();
     for line in &exported {
         let ev: Event = serde_json::from_str(line).expect("re-import line");

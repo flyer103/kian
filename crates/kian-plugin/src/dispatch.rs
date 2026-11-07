@@ -1,4 +1,4 @@
-//! Five-mode typed-event dispatch (card C7, DESIGN §6.1; mode semantics from
+//! Five-mode typed-event dispatch (DESIGN §6.1; mode semantics from
 //! the Cordis digest, `the design notes` §3).
 //!
 //! Like Cordis, the mode is a property of the *dispatch call*:

@@ -1,4 +1,4 @@
-//! S1 crash-recovery chaos suite (card C15): scripted `kill -9` fault
+//! crash-recovery chaos suite: scripted `kill -9` fault
 //! injection over the REAL assembled `kian serve` process at every
 //! drain stage — after admit, after claim, mid-provider-turn,
 //! mid-tool, before the end write, after the end write — then restart
@@ -38,7 +38,7 @@
 //! attempts, never silently accepted. Seeds identify runs (temp-dir
 //! tags, panic context) for reproducibility.
 //!
-//! ## Timing constants (relationship documented, per the card)
+//! ## Timing constants (relationship documented, per the design)
 //!
 //! `lease_ttl_ms = 2000`, `heartbeat_interval_ms = 400`, and the serve
 //! recovery-sweep tick equals the heartbeat interval (see
@@ -76,7 +76,7 @@ const DETECTION_BOUND_MS: u128 = LEASE_TTL_MS as u128 + 2 * HEARTBEAT_MS as u128
 const AFTER_CLAIM_INPUTS: usize = 64;
 /// Attempts for the race-y poll-catch boundary (fresh session each).
 /// The claim→first-turn window is scheduler-timing-dependent (its width
-/// is the first take-sweep, sub-millisecond; kian-61's binary-layout
+/// is the first take-sweep, sub-millisecond; 's binary-layout
 /// shift alone moved wake timing enough to miss it at 20×3ms polling),
 /// so: poll fast and retry generously — a miss is cheap, a false
 /// catch is impossible (the stage predicate is exact).
@@ -741,9 +741,9 @@ async fn verify_killed_stage(h: &Harness, point: KillPoint, sid: SessionId, even
 // Shared recovery assertions
 // ---------------------------------------------------------------------------
 
-/// The S1 recovery contract, checked on the final stream:
+/// The recovery contract, checked on the final stream:
 /// - zero lost work: every submitted input consumed (at-least-once —
-///   a kill between the `input/admitted` append and the C6
+///   a kill between the `input/admitted` append and the
 ///   `mark_consumed` binding re-admits that one input into the
 ///   context on recovery; the designed event-driven-consumption
 ///   semantics, never a loss);
@@ -1018,9 +1018,9 @@ async fn run_kill_point(point: KillPoint, seed: u64) {
 // The tests
 // ---------------------------------------------------------------------------
 
-/// S1 acceptance: all six kill points × repeated runs, all green.
+/// acceptance: all six kill points × repeated runs, all green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn chaos_s1_six_kill_points_repeated_runs_all_green() {
+async fn chaos_recovery_six_kill_points_repeated_runs_all_green() {
     force_no_proxy();
     const REPEATS: u64 = 2;
     for point in POINTS {
@@ -1039,7 +1039,7 @@ async fn chaos_s1_six_kill_points_repeated_runs_all_green() {
 /// is byte-identical to the takeover's completion, exactly one end
 /// write exists, and no event below the takeover epoch lands after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn chaos_s1_zombie_old_epoch_writes_all_rejected_across_kill_window() {
+async fn chaos_recovery_zombie_epoch_writes_rejected_across_kill_window() {
     force_no_proxy();
     let point = KillPoint::MidProviderTurn;
     let seed = SEED_BASE + 0xF00;

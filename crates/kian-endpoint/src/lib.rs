@@ -1,5 +1,5 @@
 //! `kian-endpoint` — endpoint SDK library: KiandProto's endpoint-side
-//! implementation, embeddable in any process (DESIGN §4.3, card C12).
+//! implementation, embeddable in any process (DESIGN §4.3).
 //!
 //! Two access forms share one protocol:
 //! - [`Endpoint::serve`] — accept commands over a stream transport (TCP),
@@ -10,12 +10,12 @@
 //!
 //! Brain–hand separation: the endpoint keeps **zero session state** — it
 //! executes commands and returns results; session logs live in Kian's
-//! EventStore. The server-side pair (`kian-exec`, Phase 2) is deliberately
+//! EventStore. The server-side pair (`kian-exec`, bundle) is deliberately
 //! absent; tests run against an in-process mock of that half ([`ServerPeer`]
 //! doubles as the reference client). Wire format v0 is provisional — churn
-//! is expected when Phase 2 lands the real pair.
+//! is expected when bundle lands the real pair.
 //!
-//! Security boundary (DESIGN §4.4) is a Phase-3 stake: no auth, no
+//! Security boundary (DESIGN §4.4) is a future stake: no auth, no
 //! data-egress tiering, no credential-less use here yet.
 pub mod endpoint;
 pub mod executor;

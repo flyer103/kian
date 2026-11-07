@@ -1,4 +1,4 @@
-//! KiandProto v0 wire types (card C12, DESIGN §4.3).
+//! KiandProto v0 wire types (DESIGN §4.3).
 //!
 //! Two frame directions over one bidirectional stream:
 //! - [`ServerFrame`] — server → endpoint (welcome, command, ping, bye);
@@ -6,7 +6,7 @@
 //!
 //! Every message is serde-serialized JSON; each frame carries the protocol
 //! `v` it was written for (or a handshake that pins it). v0 is provisional:
-//! wire-format churn is expected when Phase 2 lands `kian-exec`.
+//! wire-format churn is expected when bundle lands `kian-exec`.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -204,7 +204,7 @@ mod tests {
     }
 
     /// Golden JSON shapes for every frame variant — the wire contract of
-    /// KiandProto v0. Churn is expected for Phase 2; until then these are
+    /// KiandProto v0. Churn is expected for bundle; until then these are
     /// frozen so the in-process mock and this crate cannot drift apart
     /// silently.
     #[test]

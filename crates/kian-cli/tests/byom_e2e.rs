@@ -1,8 +1,8 @@
-//! S5 BYOM acceptance e2e (card C29): the **real `kiand` binary** as a
+//! BYOM acceptance e2e: the **real `kiand` binary** as a
 //! child process, paired with the full `kian serve` super-agent assembly.
 //!
 //! One remote endpoint is configured; a scripted worker issues an `exec`
-//! tool call → durable `exec_queue` row → C19 dial → kiand executes →
+//! tool call → durable `exec_queue` row → dial → kiand executes →
 //! `tool/result` event → worker completes. The offline leg kills the
 //! daemon with -9 while a command is queued: the watchdog detects the
 //! offline transition within its `offline_after_ms + poll` bound, a
@@ -10,7 +10,7 @@
 //! a restart drains the queue (result flows, completion) or the queue
 //! timeout resolves honestly (`Timeout`, row `abandoned`).
 //!
-//! Timing discipline (C15, plan §7 risk 5): every bound is seeded and
+//! Timing discipline (plan §7 risk 5): every bound is seeded and
 //! generous. `heartbeat_ms = 50`, `offline_after_ms = 600` (watchdog
 //! poll = 600/4 = 150 ms, bridge tick 250 ms); detection is asserted
 //! under `offline_after + poll + tick + slack`. Kill -9 is a real
@@ -37,7 +37,7 @@ use tokio::time::timeout;
 
 const ROUTER_SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-// Seeded timing (C15 discipline): heartbeat cadence, offline bound, and
+// Seeded timing (discipline): heartbeat cadence, offline bound, and
 // the derived watchdog poll (assembly: offline_after/4 clamped to
 // [50, 1000] ms) plus the watchdog-bridge sweep tick.
 const HEARTBEAT_MS: u64 = 50;
@@ -159,7 +159,7 @@ fn reserve_port() -> u16 {
 }
 
 // ---------------------------------------------------------------------------
-// The S5 serve fixture: super-agent assembly + one real kiand endpoint
+// The serve fixture: super-agent assembly + one real kiand endpoint
 // ---------------------------------------------------------------------------
 
 struct Fixture {
@@ -196,9 +196,9 @@ fn worker_script(exec: serde_json::Value) -> Vec<ScriptedResponse> {
     ]
 }
 
-/// The full super-agent `kian.yaml` (C27 shape) with one **live** endpoint
-/// (`ep1`) at `addr` and the S5 timing seeds.
-fn write_s5_config(
+/// The full super-agent `kian.yaml` (shape) with one **live** endpoint
+/// (`ep1`) at `addr` and the timing seeds.
+fn write_byom_config(
     dir: &std::path::Path,
     router_provider: &str,
     worker_provider: &str,
@@ -289,7 +289,7 @@ recovery:
     path
 }
 
-/// Spawns the assembled server on an ephemeral HTTP port (C27 harness
+/// Spawns the assembled server on an ephemeral HTTP port (harness
 /// shape) and opens the read-only observation surfaces.
 async fn spawn_server(config_path: &std::path::Path, dir: &std::path::Path) -> Fixture {
     let server = Arc::new(
@@ -328,7 +328,7 @@ async fn spawn_server(config_path: &std::path::Path, dir: &std::path::Path) -> F
     }
 }
 
-/// Boots the whole S5 pairing: mock providers, real kiand on a reserved
+/// Boots the whole pairing: mock providers, real kiand on a reserved
 /// port, assembled serve. Returns the fixture + the daemon.
 async fn boot(
     tag: &str,
@@ -347,7 +347,7 @@ async fn boot(
     let addr = daemon.wait_listening().await;
     assert_eq!(addr.port(), port, "kiand binds the reserved port");
 
-    let config = write_s5_config(
+    let config = write_byom_config(
         &dir,
         &router_base,
         &worker_base,
@@ -463,7 +463,7 @@ async fn wait_online(fx: &Fixture) {
 }
 
 /// Polls until the exec queue row is `inflight` — the command is durably
-/// queued *and* dispatched on the live endpoint (the kill point the S5
+/// queued *and* dispatched on the live endpoint (the kill point the
 /// scenario names: a command queued while the daemon runs).
 async fn wait_row_inflight(fx: &Fixture) {
     for _ in 0..800 {
@@ -538,11 +538,11 @@ fn ended_index(events: &[kian_core::events::Event]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// S5 round trip: exec on the real kiand → tool/result → completion
+// round trip: exec on the real kiand → tool/result → completion
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s5_exec_on_kiand_round_trip() {
+async fn byom_exec_on_kiand_round_trip() {
     let (fx, mut daemon, _port) = boot(
         "c29-roundtrip",
         serde_json::json!({"argv": ["echo", "s5-round-trip"]}),
@@ -627,12 +627,12 @@ async fn s5_exec_on_kiand_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// S5 offline leg, part 1: kill -9 while the command is queued → the row
+// offline leg, part 1: kill -9 while the command is queued → the row
 // parks durably pending (no dispatch, no fake result)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s5_offline_queue_parks_durable() {
+async fn byom_offline_queue_parks_durable() {
     let (fx, mut daemon, _port) = boot(
         "c29-park",
         serde_json::json!({"argv": ["echo", "s5-parked"]}),
@@ -691,12 +691,12 @@ async fn s5_offline_queue_parks_durable() {
 }
 
 // ---------------------------------------------------------------------------
-// S5 offline leg, part 2: the watchdog detects the offline transition
+// offline leg, part 2: the watchdog detects the offline transition
 // within offline_after_ms + poll and admits a durable health input
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s5_watchdog_detects_offline_within_bound() {
+async fn byom_watchdog_detects_offline_within_bound() {
     let (fx, mut daemon, _port) = boot(
         "c29-watchdog",
         // A long-running command: at the kill point the row is durable
@@ -821,12 +821,12 @@ async fn s5_watchdog_detects_offline_within_bound() {
 }
 
 // ---------------------------------------------------------------------------
-// S5 offline leg, part 3: restart kiand → reconnect drains the queue →
+// offline leg, part 3: restart kiand → reconnect drains the queue →
 // the real result flows → the worker completes
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s5_reconnect_drains_queue() {
+async fn byom_reconnect_drains_queue() {
     let (fx, mut daemon, port) = boot(
         "c29-reconnect",
         // A command long enough to still be in flight at the kill point,
@@ -917,13 +917,13 @@ async fn s5_reconnect_drains_queue() {
 }
 
 // ---------------------------------------------------------------------------
-// S5 honesty across the offline window: queue timeout first → honest
+// honesty across the offline window: queue timeout first → honest
 // Timeout tool result, row abandoned, completion only after the honest
 // error — never a fake success, never completed-before-result
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s5_honesty_across_offline_window() {
+async fn byom_honesty_across_offline_window() {
     // queue_timeout (1200ms) fires well before any restart: the honest
     // bound resolves the parked caller.
     let (fx, mut daemon, _port) = boot(

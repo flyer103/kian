@@ -1,4 +1,4 @@
-//! `TimerChannel` — the timer input source (card C40, DESIGN §4.3).
+//! `TimerChannel` — the timer input source (DESIGN §4.3).
 //!
 //! The v2 watchdog needs periodic ticks, and kian's one admission path
 //! is the channel pipeline — so the timer is **a channel like any
@@ -54,7 +54,7 @@ pub const DEFAULT_TIMER_TOPIC: &str = "watchdog";
 /// Default per-subscriber queue bound.
 pub const TIMER_QUEUE_CAPACITY: usize = 64;
 
-/// The timer's cadence (card C40). `interval_ms` must be > 0
+/// The timer's cadence. `interval_ms` must be > 0
 /// (validated by the config layer, fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimerConfig {
@@ -264,7 +264,7 @@ mod tests {
 
     /// The cadence under a manual clock: tick 1 lands exactly at
     /// `start + interval` (not before), tick 2 at `+ 2*interval` —
-    /// and the event shape is the card's exact form.
+    /// and the event shape is the exact form.
     #[tokio::test]
     async fn timer_emits_on_cadence_under_a_manual_clock() {
         let clock = Arc::new(ManualTurnClock::new(10_000));

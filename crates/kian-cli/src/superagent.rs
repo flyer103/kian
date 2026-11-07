@@ -1,18 +1,18 @@
-//! Super-agent assembly (card C27): the wiring that mounts the
+//! Super-agent assembly: the wiring that mounts the
 //! `kian-superagent` bundle and `kian-exec` server half onto the real
-//! engine, behind the same fail-closed discipline as the Phase-1
+//! engine, behind the same fail-closed discipline as the built-in
 //! assembly.
 //!
 //! This module is assembly-layer code — the peer of [`crate::server`],
 //! not of the HTTP handler modules. It names the engine, the store and
-//! the drivers on purpose (that is what assembly is for); the layered
+//! the drivers on purpose (that is what assembly is ); the layered
 //! iron rule still holds at its edges: HTTP handlers reach any of this
 //! only through the [`crate::api::ControlPlane`] / [`crate::ops::OpsPlane`]
 //! traits, and the bundle reaches the server only through its
-//! [`InboxWriter`] port (implemented here over the engine — the C23
+//! [`InboxWriter`] port (implemented here over the engine — the
 //! cycle breaker is a late-bound engine slot).
 //!
-//! Composition (one engine, one driver — the C26 pattern):
+//! Composition (one engine, one driver — the pattern):
 //!
 //! - the configured resident Router session runs under
 //!   [`RouterDriver`] (port install + residency parking over a ReAct
@@ -21,10 +21,10 @@
 //!   delegation wrapper, or an existing `thread/started`) run under
 //!   [`WorkerLoopDriver`] (lineage + evidence gate + completion
 //!   report);
-//! - every other session is a plain Phase-1 session and runs the
+//! - every other session is a plain built-in session and runs the
 //!   default agent's loop unchanged.
 //!
-//! Startup order is load-bearing (the card's acceptance): inbox
+//! Startup order is load-bearing (the acceptance): inbox
 //! rebuild → watchdog/subscription start → listener accepts traffic.
 //! [`startup_order_log`] records the sequence so the integration test
 //! can assert it.
@@ -58,7 +58,7 @@ use kian_superagent::{
 use crate::config::EndpointConfig;
 
 // ---------------------------------------------------------------------------
-// Startup order log (per-assembly; the C27 acceptance assertion)
+// Startup order log (per-assembly; the acceptance assertion)
 // ---------------------------------------------------------------------------
 
 /// The recorded startup sequence of one assembly. Purely observable
@@ -82,7 +82,7 @@ pub fn record_rebuild_done(order: &StartupOrder) {
 }
 
 // ---------------------------------------------------------------------------
-// The InboxWriter port over the real engine (the C23 cycle breaker)
+// The InboxWriter port over the real engine (the cycle breaker)
 // ---------------------------------------------------------------------------
 
 /// [`InboxWriter`] implemented over the engine's own admit + wake: the
@@ -155,7 +155,7 @@ impl InboxWriter for EngineInbox {
 }
 
 // ---------------------------------------------------------------------------
-// The per-hold StreamPort over DrainCtx (the C25/C26 shape)
+// The per-hold StreamPort over DrainCtx (the shape)
 // ---------------------------------------------------------------------------
 
 /// Assembly's [`StreamPort`]: one per execution hold, built from the
@@ -199,7 +199,7 @@ pub fn port_for_ctx() -> PortFor<DrainCtx> {
 }
 
 // ---------------------------------------------------------------------------
-// The RecallPort over the store's public scan (the C34 read surface)
+// The RecallPort over the store's public scan (the read surface)
 // ---------------------------------------------------------------------------
 
 /// Assembly's [`kian_superagent::RecallPort`]: cross-session reads
@@ -229,7 +229,7 @@ impl StoreRecall {
     /// Idempotent and disposable: drop the index and run it again over
     /// the same log and the same map comes back.
     ///
-    /// v1 boundary (C34): the scanned sessions are the bundle's whole
+    /// v1 boundary: the scanned sessions are the bundle's whole
     /// channel-fed universe. `input/spilled` events are written only by
     /// the drain's consumption of a spill envelope row, and those rows
     /// are admitted only by the subscription service — to the Router
@@ -237,7 +237,7 @@ impl StoreRecall {
     /// the Router stream therefore cannot exist today; if a future
     /// route widens admission, this scan list widens with it.
     ///
-    /// kian-62: `chain` is the re-arm chain — ended frozen predecessors
+    /// `chain` is the re-arm chain — ended frozen predecessors
     /// first, then the live resident session (see
     /// [`RouterProfile::re_arm`]); predecessor streams still carry
     /// spill envelopes the index must serve.
@@ -324,18 +324,18 @@ impl kian_superagent::RecallPort for StoreRecall {
 // The assembled driver
 // ---------------------------------------------------------------------------
 
-/// The driver every assembled engine runs: the Phase-1 plain loop, or
-/// the super-agent three-way router (Phase-1 behavior with the bundle
+/// The driver every assembled engine runs: the built-in plain loop, or
+/// the super-agent three-way router (built-in behavior with the bundle
 /// mounted). Both variants share `Ctx = DrainCtx`.
 pub enum ServeLoopDriver {
-    /// Phase-1: one loop, the default agent (unchanged behavior).
+    /// built-in: one loop, the default agent (unchanged behavior).
     Plain(Arc<ReActLoop>),
     /// Super-agent: resident Router / spawned workers / plain sessions.
     SuperAgent(Arc<SuperAgentDriver>),
 }
 
 // ---------------------------------------------------------------------------
-// C54: the S6 dsh bridge mount — the DshCtx port over the real DrainCtx
+// the dsh bridge mount — the DshCtx port over the real DrainCtx
 // ---------------------------------------------------------------------------
 
 /// Assembly's [`kian_dsh::DshCtx`] over the engine's `DrainCtx`: the
@@ -430,8 +430,8 @@ impl kian_dsh::DshCtx for DrainDshCtx {
     // exercised by the kian-dsh driver suite.
 }
 
-/// The worker template's inner loop, config-gated (C54): the built-in
-/// ReAct loop (default), or the S6 dsh bridge when
+/// The worker template's inner loop, config-gated: the built-in
+/// ReAct loop (default), or the dsh bridge when
 /// `superagent.harness.dsh` is on. The decorator (`WorkerLoopDriver`)
 /// and the plain/router sides are unchanged either way.
 pub enum WorkerInnerDriver {
@@ -468,7 +468,7 @@ impl LoopDriver for ServeLoopDriver {
 /// - the configured Router session → [`RouterDriver`] (residency);
 /// - a session with Thread lineage → [`WorkerLoopDriver`] (lineage,
 ///   evidence gate, completion report);
-/// - anything else → the default agent's loop (Phase-1 semantics for
+/// - anything else → the default agent's loop (built-in semantics for
 ///   plain sessions).
 ///
 /// Worker lineage is decided from the stream itself (constraint 1: no
@@ -480,7 +480,7 @@ pub struct SuperAgentDriver {
     router_side: RouterDriver<ReActLoop>,
     worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
     default_side: Arc<ReActLoop>,
-    /// The resident watchdog session (C40), when configured: routed to
+    /// The resident watchdog session, when configured: routed to
     /// its own driver (the same residency shape as the Router's) so
     /// each admitted tick is one judge turn.
     watchdog: Option<SessionId>,
@@ -507,8 +507,8 @@ impl SuperAgentDriver {
         }
     }
 
-    /// Attaches the resident watchdog session and its driver (C40).
-    /// Additive: unconfigured (the default) keeps the pre-C40 routing
+    /// Attaches the resident watchdog session and its driver.
+    /// Additive: unconfigured (the default) keeps the legacy routing
     /// exactly.
     #[must_use]
     pub fn with_watchdog(mut self, session: SessionId, side: RouterDriver<ReActLoop>) -> Self {
@@ -560,7 +560,7 @@ impl LoopDriver for SuperAgentDriver {
 ///
 /// Assembly uses the ordering `[remote-exec…, local-tools]` for worker
 /// agents, so the remote `exec` tool (same schema as the local built-in,
-/// C20) shadows the local one when endpoints are configured — one
+/// ) shadows the local one when endpoints are configured — one
 /// uniform `exec` surface for the model either way.
 pub struct CombinedTools {
     providers: Vec<Arc<dyn ToolProvider>>,
@@ -618,15 +618,15 @@ pub struct SubscriptionMetrics {
     routed: std::sync::atomic::AtomicU64,
     routed_deduplicated: std::sync::atomic::AtomicU64,
     dropped_no_rule: std::sync::atomic::AtomicU64,
-    /// C36 admission-class `ignore` drops (the DroppedNoRule shape).
+    /// admission-class `ignore` drops (the DroppedNoRule shape).
     dropped_ignored: std::sync::atomic::AtomicU64,
-    /// C36 `explicit-only` drops without an explicit-request signal.
+    /// `explicit-only` drops without an explicit-request signal.
     dropped_not_explicit: std::sync::atomic::AtomicU64,
     failures: std::sync::atomic::AtomicU64,
-    /// C57: per-code intake-reason counters — one tick per decision,
+    /// per-code intake-reason counters — one tick per decision,
     /// keyed by the closed [`kian_superagent::IntakeReason`] set's
     /// stable code. Every code is materialized in the snapshot, so
-    /// the series shape is fixed (the C41 histogram discipline).
+    /// the series shape is fixed (the histogram discipline).
     by_reason: ReasonCounters,
 }
 
@@ -676,7 +676,7 @@ impl SubscriptionMetrics {
     }
 
     /// Records one handled event's outcome: the legacy shape counters
-    /// plus exactly one per-code tick per decision (C57 — the codes
+    /// plus exactly one per-code tick per decision (— the codes
     /// come from the same mapping the audit lines stamp, so the two
     /// surfaces cannot drift).
     pub fn record_outcome(
@@ -691,7 +691,7 @@ impl SubscriptionMetrics {
                     Self::bump(&self.routed_deduplicated);
                 }
             }
-            // C38 fan-out: one routed counter tick per admitted
+            // fan-out: one routed counter tick per admitted
             // subscriber, dedup per row.
             kian_superagent::RoutingOutcome::FannedOut { admitted } => {
                 for admission in admitted {
@@ -704,7 +704,7 @@ impl SubscriptionMetrics {
             kian_superagent::RoutingOutcome::DroppedNoRule => {
                 Self::bump(&self.dropped_no_rule);
             }
-            // C36 fast-path drops: audit line by the service, counter
+            // fast-path drops: audit line by the service, counter
             // here (the DroppedNoRule shape).
             kian_superagent::RoutingOutcome::DroppedIgnored => {
                 Self::bump(&self.dropped_ignored);
@@ -750,7 +750,7 @@ pub fn spawn_subscription_consumers(
                 while let Some(event) = stream.next().await {
                     match service.handle_event(event).await {
                         Ok(outcome) => {
-                            // Legacy shape counters plus the C57
+                            // Legacy shape counters plus the
                             // per-code ticks (once per decision, the
                             // audit lines' own mapping).
                             metrics.record_outcome(&outcome, service.router_session());
@@ -773,7 +773,7 @@ pub fn spawn_subscription_consumers(
 /// queued commands on the endpoint that went offline. A normal message
 /// payload whose content embeds a `kian.endpoint_health` marker — the
 /// same content-embedding discipline as channel provenance (the frozen
-/// C4 payload contract is untouched).
+/// payload contract is untouched).
 pub fn endpoint_health_payload(
     endpoint_id: &str,
     status: &str,
@@ -806,7 +806,7 @@ async fn sessions_for_tool_calls(
 ) -> Result<BTreeSet<SessionId>, String> {
     let mut sessions = BTreeSet::new();
     for call_id in tool_call_refs {
-        // C51: same lookup, per dialect (sqlite json_extract vs pg
+        // same lookup, per dialect (sqlite json_extract vs pg
         // jsonb path) — derived purely from the event log either way.
         let rows: Vec<(String,)> = match store {
             EventStore::Sqlite(pool) => sqlx::query_as(
@@ -850,7 +850,7 @@ async fn sessions_for_tool_calls(
 /// it. The re-examination is idempotent per offline episode: the admit
 /// key embeds the episode's `ts_ms`, so repeated sweeps deduplicate at
 /// the inbox row. Online edges drop the endpoint from the sweep set
-/// (reconnects re-drive the queue on their own, C20 semantics).
+/// (reconnects re-drive the queue on their own, semantics).
 pub fn spawn_watchdog_bridge(
     watchdog: Arc<HeartbeatWatchdog>,
     exec_store: ExecStore,
@@ -967,7 +967,7 @@ async fn sweep_offline_endpoint(
 
 /// Registers the configured endpoints in the durable registry so a
 /// never-connected endpoint is observable (registered-but-stale is an
-/// actionable offline edge — C21 semantics).
+/// actionable offline edge — semantics).
 async fn seed_endpoint_registry(
     exec_store: &ExecStore,
     endpoints: &[EndpointConfig],
@@ -1001,7 +1001,7 @@ pub async fn endpoint_registry(exec_store: &ExecStore) -> Result<Vec<EndpointReg
 pub struct SuperAgentRuntime {
     /// The configured resident Router session.
     pub router: SessionId,
-    /// Channel name → mock adapter (the S4 injection surface; v1 only
+    /// Channel name → mock adapter (the injection surface; v1 only
     /// mock channels exist).
     pub channels: BTreeMap<String, Arc<MockChannel>>,
     /// The worker's evidence gate (shared counters = the verdict
@@ -1009,26 +1009,26 @@ pub struct SuperAgentRuntime {
     pub worker_gate: EvidenceGateConfig,
     /// Subscription outcome counters.
     pub subscription_metrics: Arc<SubscriptionMetrics>,
-    /// Router judge-turn batching metrics (C41: batch size, wall
+    /// Router judge-turn batching metrics (batch size, wall
     /// duration and amortized per-decision latency — recorded by
     /// `RouterDriver`, read-only here).
     pub router_metrics: Arc<RouterMetrics>,
-    /// The `superagent.policy_drift` counter (C63): one tick per
+    /// The `superagent.policy_drift` counter: one tick per
     /// drift marked at boot.
     pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
     /// The heartbeat watchdog (when endpoints are configured).
     pub watchdog: Option<Arc<HeartbeatWatchdog>>,
     /// The remote-exec services (when endpoints are configured).
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
-    /// The completion bridge's counters (C37; present when the async
+    /// The completion bridge's counters (present when the async
     /// pair is mounted).
     pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
-    /// The cross-session read port (C34): `read_events` /
+    /// The cross-session read port: `read_events` /
     /// `list_threads` / `spill_location` over the store's public scan,
     /// with the startup-rebuilt spill index. Read-only by
-    /// construction; the recall toolpack (C35) mounts on it.
+    /// construction; the recall toolpack mounts on it.
     pub recall: Arc<StoreRecall>,
-    /// GitHub channels by configured name (C48/C49): the webhook-fed
+    /// GitHub channels by configured name: the webhook-fed
     /// adapters (at most one — the config validation enforces it).
     /// The `WebhookPlane` hand-off in `server.rs` reads this map.
     pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
@@ -1045,7 +1045,7 @@ impl SuperAgentRuntime {
     /// The `/metrics` superagent fragment: evidence-verdict,
     /// subscription, channel-policy (a pure projection of the Router
     /// stream — workers never deliver; policies are Router-side),
-    /// router batching (C41: the §7.2 series the resident Router's
+    /// router batching (the §7.2 series the resident Router's
     /// driver records) and watchdog counters.
     pub async fn metrics_report(&self, store: &EventStore) -> serde_json::Value {
         let verdicts = self.worker_gate.counters.snapshot();
@@ -1123,11 +1123,11 @@ pub struct SuperAgentServices {
     pub subscriptions: Arc<SubscriptionService>,
     /// Mock channels by configured name (injection surface).
     pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
-    /// Lark channels by configured name (C44) — the real Feishu
+    /// Lark channels by configured name — the real Feishu
     /// adapters, registered alongside the mocks.
     pub lark_channels: BTreeMap<String, Arc<kian_superagent::LarkChannel>>,
-    /// GitHub channels by configured name (C48/C49) — the webhook-fed
-    /// adapters. The C49 receiver plane (server.rs) hands verified
+    /// GitHub channels by configured name — the webhook-fed
+    /// adapters. The receiver plane (server.rs) hands verified
     /// deliveries to the single channel through this map.
     pub github_channels: BTreeMap<String, Arc<kian_superagent::GitHubChannel>>,
     /// Adapters in config order (consumer spawn order).
@@ -1136,15 +1136,15 @@ pub struct SuperAgentServices {
     pub worker_gate: EvidenceGateConfig,
     /// Subscription outcome counters.
     pub subscription_metrics: Arc<SubscriptionMetrics>,
-    /// Router judge-turn batching metrics (C41) — the handle the
+    /// Router judge-turn batching metrics — the handle the
     /// driver records into and `/metrics` snapshots.
     pub router_metrics: Arc<RouterMetrics>,
-    /// C63: the configured policy version
+    /// the configured policy version
     /// (`superagent.policy.version`), rendered into the resident
     /// profiles' bootstrap prompts as a `[policy <label>]` header.
     /// `None` = today's bytes, byte-identical.
     pub policy: Option<kian_superagent::PolicyVersion>,
-    /// C63: `superagent.policy.notify_live` (default false) — deliver
+    /// `superagent.policy.notify_live` (default false) — deliver
     /// one synthetic policy-changed marker input to each drifted live
     /// resident session at boot (idempotent by a stable event id).
     pub policy_notify_live: bool,
@@ -1152,41 +1152,41 @@ pub struct SuperAgentServices {
     /// marked at boot (live sessions are never rewritten — the counter
     /// is the audit surface's numeric twin).
     pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
-    /// C62: the outbox bounded-retry driver, when
+    /// the outbox bounded-retry driver, when
     /// `superagent.outbox` is configured — the same handle the Router
     /// tools deliver through; the boot re-drive uses it after the
     /// stream rebuild.
     pub outbox: Option<Arc<kian_superagent::OutboxDriver>>,
-    /// The Router's shared hold slot (C62: the boot re-drive waits
+    /// The Router's shared hold slot (the boot re-drive waits
     /// for its first per-hold stream port before writing re-drive
     /// receipts).
     pub router_hold: Arc<kian_superagent::RouterHold>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
-    /// The async-jobs engine (C37), present when `superagent.async_tools`
+    /// The async-jobs engine, present when `superagent.async_tools`
     /// is on. The startup sweep re-drives and redelivers after the
     /// inbox rebuild.
     pub async_jobs: Option<Arc<kian_exec::AsyncJobs>>,
-    /// The completion bridge's counters (C37), for `/metrics`.
+    /// The completion bridge's counters, for `/metrics`.
     pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
-    /// The cross-session read port (C34): reads over the store's
+    /// The cross-session read port: reads over the store's
     /// public scan plus the disposable spill index, rebuilt by
     /// `start_services` after the inbox rebuild.
     pub recall: Arc<StoreRecall>,
-    /// The timer input sources (C40): their run tasks spawn in
+    /// The timer input sources: their run tasks spawn in
     /// `start_services` after the subscription consumers (a timer with
     /// no consumer would emit ticks into the void).
     pub timers: Vec<Arc<kian_superagent::TimerChannel>>,
-    /// The resident watchdog profile (C40), when configured: bootstrapped
+    /// The resident watchdog profile, when configured: bootstrapped
     /// (idempotent prompt admit + wake) in `start_services`.
     pub watchdog: Option<kian_superagent::WatchdogProfile>,
-    /// C63: the watchdog's mounted inbox (residency-counted), when
+    /// the watchdog's mounted inbox (residency-counted), when
     /// configured — the drift notice admits through the mounted inbox
     /// a parked resident polls.
     pub watchdog_inbox: Option<Arc<RouterInbox>>,
 }
 
-/// Post-`startup_rebuild` services start (the card's load-bearing
+/// Post-`startup_rebuild` services start (the load-bearing
 /// order): registry rebuild → subscription consumers → watchdog +
 /// bridge → Router bootstrap. Called by [`crate::server::Server::from_config`]
 /// **after** the inbox rebuild returned; every step lands in `order`.
@@ -1200,7 +1200,7 @@ pub async fn start_services(
 
     // 1. Rebuild the passthrough registry from event streams (the
     //    NoLostWork analog for subscriptions; nothing authoritative
-    //    survives only in memory). kian-62: the scan covers the whole
+    //    survives only in memory). The scan covers the whole
     //    re-arm chain — ended predecessors still carry thread/started
     //    lineage and worker references the registry must serve.
     let resident_chain: Vec<SessionId> = services
@@ -1233,7 +1233,7 @@ pub async fn start_services(
     );
     services.subscriptions.install_registry(registry);
 
-    // 1b. Rebuild the disposable spill index (C34) over the same
+    // 1b. Rebuild the disposable spill index over the same
     //     scanned universe — a pure location projection, reads only.
     services
         .recall
@@ -1242,7 +1242,7 @@ pub async fn start_services(
         .map_err(|e| format!("spill index rebuild: {e}"))?;
     record(&order, "spill_index_rebuilt");
 
-    // 1c. C63: boot-time policy drift marking over the LIVE resident
+    // 1c. boot-time policy drift marking over the LIVE resident
     //     sessions (the Router and, when configured, the watchdog).
     //     The persisted bootstrap prompts are read-only here — a
     //     drifted session keeps its prompt byte-identically; only the
@@ -1272,7 +1272,7 @@ pub async fn start_services(
         |session| {
             // Each resident's marker admits through ITS OWN mounted
             // inbox — the residency counter a parked resident polls
-            // (kian-63). The Router's and the watchdog's mounted
+            // . The Router's and the watchdog's mounted
             // inboxes; anything else falls back to the raw engine
             // inbox.
             if session == router {
@@ -1303,7 +1303,7 @@ pub async fn start_services(
         record(&order, "policy_drift_marked");
     }
 
-    // 1d. C62: the outbox boot re-drive — pending (in-flight,
+    // 1d. The outbox boot re-drive — pending (in-flight,
     //     result-less) delivery intents rebuilt from the Router's
     //     stream are re-sent through the adapter (at-least-once; under
     //     per-key ordering the receipt lands once). Parked entries are
@@ -1332,11 +1332,11 @@ pub async fn start_services(
             parked = pending.len() - redriven,
             "outbox audit: boot rebuild from the Router stream"
         );
-        // kian-76: each parked delivery rebuilt from the stream is
+        // each parked delivery rebuilt from the stream is
         // surfaced at boot with its identity — the park is durable
         // (the intent + park-shaped tool/result on the stream), so the
         // rebooted process re-states it instead of silently forgetting
-        // (the C65 run2 negative: parked=0 while two sat parked). Not
+        // (the run2 negative: parked=0 while two sat parked). Not
         // re-driven: a parked delivery waits for a person (003).
         for entry in pending
             .iter()
@@ -1399,7 +1399,7 @@ pub async fn start_services(
     );
     record(&order, "subscriptions_started");
 
-    // 2b. C40: the timers' run tasks spawn in step 4b below —
+    // 2b. The timers' run tasks spawn in step 4b below —
     //     strictly after the consumers exist (a tick emitted before
     //     any subscriber is a tick nobody hears).
 
@@ -1433,12 +1433,12 @@ pub async fn start_services(
         record(&order, "watchdog_started");
     }
 
-    // 3b. C37: the async bridge's startup sweep, strictly after the
+    // 3b. The async bridge's startup sweep, strictly after the
     //     inbox rebuild (admitted completions must never race an empty
     //     wake registry): re-offer settled rows (a crash between settle
     //     and deliver loses nothing — the admit key dedupes), then
     //     re-drive pending/inflight jobs (observers re-attach through
-    //     the C20 queue; one row, one dispatch, ever).
+    //     the queue; one row, one dispatch, ever).
     if let Some(jobs) = &services.async_jobs {
         jobs.redeliver_settled().await;
         jobs.redrive_pending().await;
@@ -1457,7 +1457,7 @@ pub async fn start_services(
 
     let mut tasks = consumers;
 
-    // 4b. C40: bootstrap the resident watchdog session (idempotent
+    // 4b. bootstrap the resident watchdog session (idempotent
     //     prompt admit + wake; the first hold appends
     //     `session/created`), then start the timers' run tasks —
     //     after this point every emitted tick reaches a live consumer
@@ -1478,11 +1478,11 @@ pub async fn start_services(
         record(&order, "timers_started");
     }
 
-    // 4c. C64: the github poll drivers — strictly after the consumers
+    // 4c. The github poll drivers — strictly after the consumers
     //     (a polled event emitted before any subscriber is an event
     //     nobody hears) and after the Router bootstrap (the first poll
     //     waits one interval besides). Each poll-mode channel resumes
-    //     from the stream-derived read position (C61): the universe
+    //     from the stream-derived read position: the universe
     //     scan above covers the Router chain and every worker stream,
     //     so the newest admitted github event's `updated_at` cursor
     //     seeds the adapter and a restart never replays what a previous
@@ -1663,7 +1663,7 @@ mod tests {
         assert!(result.is_err(), "admit before install must panic");
     }
 
-    /// C36: the consumer loop counts admission-class drops in the
+    /// the consumer loop counts admission-class drops in the
     /// `DroppedNoRule` shape — `ignore` bumps `dropped_ignored`,
     /// `explicit-only` without a signal bumps `dropped_not_explicit`,
     /// and nothing is routed.
@@ -1768,7 +1768,7 @@ mod tests {
         }
     }
 
-    /// C57: per-code counters increment exactly once per decision,
+    /// per-code counters increment exactly once per decision,
     /// keyed by the closed `IntakeReason` set, and the snapshot
     /// materializes every code (stable series shape). The legacy
     /// shape counters keep their semantics beside them.
@@ -1824,7 +1824,7 @@ mod tests {
         assert_eq!(by_reason["no_rule"], serde_json::json!(1));
         assert_eq!(by_reason["class_ignored"], serde_json::json!(1));
         assert_eq!(by_reason["not_explicit"], serde_json::json!(1));
-        // Reserved for C59: defined and materialized, never produced.
+        // Reserved for: defined and materialized, never produced.
         assert_eq!(by_reason["released_to_eval"], serde_json::json!(0));
         // Every code of the closed set is materialized — the snapshot
         // shape is fixed regardless of what has happened.

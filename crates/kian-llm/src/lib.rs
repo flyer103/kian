@@ -11,7 +11,7 @@
 //! frozen stable content (constraint 3): changing it invalidates provider
 //! prefix cache for every session.
 //!
-//! Modules (card C8):
+//! Modules:
 //! - [`provider`] — openai-compat ModelProvider over reqwest/SSE
 //! - [`slots`] — slot resolution and fallback chains (ADR-006)
 //! - [`turn`] — one provider turn: failover traversal driven by slots

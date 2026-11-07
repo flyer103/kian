@@ -1,5 +1,5 @@
 //! The `InboxWriter` port — the only thing the bundle may ask of the
-//! server (card C23; layered iron rule, AGENTS.md constraint 9).
+//! server (layered iron rule, AGENTS.md constraint 9).
 //!
 //! The port has exactly two capabilities, both control-plane-shaped:
 //!
@@ -10,7 +10,7 @@
 //!   race; the startup inbox rebuild re-derives them, so no work is lost
 //!   when a wake disappears.
 //!
-//! Assembly (kian-cli, card C27) implements this trait over the real
+//! Assembly (kian-cli) implements this trait over the real
 //! engine. The bundle crate itself holds no execution symbols —
 //! `tests/iron_rule.rs` enforces that textually. The single type this
 //! file takes from `kian-orchestrator` is `WakeOutcome`, a pure data

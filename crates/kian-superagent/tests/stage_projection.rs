@@ -1,4 +1,4 @@
-//! Ticket stage projection acceptance (card C56).
+//! Ticket stage projection acceptance.
 //!
 //! One scripted stream per arm of the first-match stage table (7 arms;
 //! the `delivery-retry` arm via an injected fake `OutboxView`), the
@@ -133,7 +133,7 @@ impl OutboxView for PendingFor {
 
 /// Arm 1 — `delivery-retry`: only the outbox view can produce it, and
 /// only for the ticket's own thread. With the stub view the arm is
-/// unreachable (the honest v1 state until C62 wires a real view).
+/// unreachable (the honest v1 state until wires a real view).
 #[test]
 fn arm1_delivery_retry_comes_from_the_outbox_view_only() {
     let worker = sid(1);
@@ -262,7 +262,7 @@ fn arm6_idle_on_success_and_terminal_completion() {
     assert_eq!(stage(&events), TicketStage::Idle);
 
     // Terminal-completed (the freeze) with the thread still
-    // outstanding (e.g. the session settled without a completion —
+    // outstanding (e.g. The session settled without a completion —
     // interrupted workers end this way; terminal beats outstanding).
     let worker = sid(8);
     let events = {
@@ -736,11 +736,11 @@ async fn run_tickets_over_an_empty_store_is_an_honest_empty_board() {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
-/// kian-76 (C65 run2, G3): the live board negative, replayed as a
+/// (run2): the live board negative, replayed as a
 /// fixture — a parked `deliver_structured` whose ticket key is the
 /// freeform correlation the model passed (the triggering event id, no
 /// thread alias match), spawned through the string-form wrapper (no
-/// registry binding — the kian-75 live gap), with the park error
+/// registry binding — the live gap), with the park error
 /// wrapped in `ToolError::Execution`'s Display. The board must still
 /// surface the parked line and the `delivery-retry` stage, attributed
 /// by the conversation both sides derive from the worker's own stream.
@@ -753,7 +753,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
     let thread = tid(0xa05);
 
     // The live wrapper shape: the channel-event wrapper serialized as
-    // a STRING (what the model passes as `task`), topic = the C61
+    // a STRING (what the model passes as `task`), topic = the
     // thread key, correlation = the freeform event id.
     let wrapper_string = channel_input_payload(&ChannelEvent {
         channel: "issue-github".into(),

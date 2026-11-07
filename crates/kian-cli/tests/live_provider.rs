@@ -1,13 +1,13 @@
-//! Live-provider e2e (card C17) — env-gated, ignored by default.
+//! Live-provider e2e — env-gated, ignored by default.
 //!
-//! Phase 1 asserts byte-stability as the controllable proxy; the live
+//! built-in asserts byte-stability as the controllable proxy; the live
 //! run is a *manual* pass against a real openai-compat endpoint, not
 //! CI. Run it once with:
 //!
 //! ```text
 //! KIAN_API_KEY=sk-... \
-//! KIAN_BASE_URL=https://api.openai.com/v1 \   # optional
-//! KIAN_MODEL=gpt-4o-mini \                    # optional
+//! KIAN_BASE_URL=https://api.openai.com/v1 \ # optional
+//! KIAN_MODEL=gpt-4o-mini \ # optional
 //! cargo test -p kian-cli --test live_provider -- --ignored --nocapture
 //! ```
 //!
@@ -142,7 +142,7 @@ recovery:
     println!("live run: session {session} -> {state}");
     assert_eq!(state, "completed", "session must complete honestly");
 
-    // S3 proxy against the real request bytes: whatever consecutive
+    // proxy against the real request bytes: whatever consecutive
     // requests happened, none may break the prefix without a compact.
     let out = kian_cli::cache_metrics::run_cache_stats(&config_path, None, true)
         .await

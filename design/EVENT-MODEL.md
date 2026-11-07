@@ -103,11 +103,11 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}` | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). |
 | `drain/claimed` | — | Claimed | `{"holder":<str>,"epoch":<u64>}` | orchestrator | Claim audit. Epoch is the fencing token; claim admission is conditional (ADR-009). |
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |
-| `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<C10 class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only (C67). |
+| `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
 | `step/request` | — | DrainActivity | `{"slot":<str>,"provider":<str>,"model":<str>,"iteration":<u64>,"body":<exact request bytes>}` | loop / provider persist hook | **A2**: persisted before the request flies; replay is byte-identical. |
 | `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...]}}` | loop | The sent bytes are the truth; never rewritten. |
-| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (C70, ADR-015). |
-| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]` | loop / exec | Redaction provenance never carries secret values (C69). |
+| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). |
+| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]` | loop / exec | Redaction provenance never carries secret values. |
 | `compact` | c | DrainActivity | `{"from_seq":<u64>,"to_seq":<u64>,"summary":{"role":<str>,"content":<json>}}` | recovery reactor | The only deliberate prefix-invalidation point; ranges pairwise-disjoint, `a < b <= seq`. |
 | `slot/binding` | — | DrainActivity | `{"slot":<str>,"spec":{"provider","model","fallback":[...]}}` | loop at first use | Slot → provider/model fixed for the session's lifetime (ADR-006). |
 | `slot/fallback` | — | DrainActivity | `{"slot":<str>,"from":{"provider","model"},"to":{"provider","model"}}` | provider turn | One fallback-chain switch, persisted before the fallback call. |
@@ -118,12 +118,12 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `evidence/verdict` | — | DrainActivity | `{"gate":<str>,"passed":<bool>,"checks":[{"name":<str>,"passed":<bool>,"detail"?<str>}],"attempt":<u64>}` | loop (evidence gate) | Bounded, declarative stop gate (A6); no model call. |
 | `channel/delivered` | — | DrainActivity | `{"channel":<str>,"target":<json>,"policy":<str>,"words"?<u64>,"truncated":<bool>}`; additive: `"attempt"`,`"first_attempt_ms"` | superagent/channel | Honest delivery receipt; no receipt means no delivery. |
 | `input/spilled` | — | DrainActivity | `{"event_id":<str>,"channel":<str>,"topic":<str\|null>,"raw":<verbatim channel payload>}` | orchestrator (consumption) | Non-context sibling of the Inline `input/admitted`; recall reads the raw from here. |
-| `control/interrupt` | — | DrainActivity | `{"action":"interrupt","reason":<str\|null>,"requested_by":<str\|null>,"requested_at_ms":<u64>,"target_epoch":<u64\|null>,"stale"?:true}` | orchestrator (consumption) | Durable interrupt intent audit (C68, ADR-014). Never a message, never context. |
+| `control/interrupt` | — | DrainActivity | `{"action":"interrupt","reason":<str\|null>,"requested_by":<str\|null>,"requested_at_ms":<u64>,"target_epoch":<u64\|null>,"stale"?:true}` | orchestrator (consumption) | Durable interrupt intent audit (ADR-014). Never a message, never context. |
 | `session/ended` | — | Ended | envelope-level `"reason":"completed"\|"cancelled"\|"interrupted"\|"failed"`; `bytes: {}` | orchestrator | **One atomic append** with the transition (`NoHalfTerminated`). `interrupted`/`failed` return the session to `idle` (resumable); only `completed`/`cancelled` are terminal. |
 
 ## 4. Cross-cutting payload contracts
 
-### 4.1 Message payload (C4)
+### 4.1 Message payload 
 
 `input/admitted`, `assistant/message`, `tool/call`, `tool/result` carry a message payload:
 `{"role": <non-empty string>, "content": <any JSON>, "synthetic"?: true}`. `content` passes through
@@ -135,9 +135,9 @@ this contract). `synthetic: true` marks steer-injected context and is strippable
 These keys ride the payload **outside `content`**, are audit-only, and are omitted when unset:
 
 - `turn/end`: `"usage"` (provider `usage` object verbatim; no normalization/pricing in core),
-  `"error": {"class","action"}` (C67).
-- `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (C70, ADR-015).
-- `tool/result`: `"redactions": [{"kind","name","count"}]` (C69).
+  `"error": {"class","action"}`.
+- `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (ADR-015).
+- `tool/result`: `"redactions": [{"kind","name","count"}]`.
 
 Rule: an additive key must leave legacy event bytes byte-identical and must not change
 `derive_model_context` output or model request bytes. If a proposed field is model-visible, it is
@@ -156,7 +156,7 @@ only `compact` may invalidate the prefix (`unexpected_prefix_change` must stay z
 - Channel admission is idempotent per `(session, event_id)`; inbox admission is idempotent per
   `(session, idempotency_key)`; `control/interrupt` is idempotent per
   `interrupt:<session>:<target_epoch>`.
-- **Derived event id** (C69, never stored): `evt_` + `uuid5(session.0, "kian:event:<seq>")`.
+- **Derived event id** (never stored): `evt_` + `uuid5(session.0, "kian:event:<seq>")`.
   Mirrored in `kian-sdk`; exposed by `session export --with-event-ids`; not an envelope field.
 
 ### 4.5 Reserved inbox-row envelopes (pre-event, NOT event kinds)
@@ -196,7 +196,7 @@ row-payload shapes must not be confused with event payloads:
 3. If the change is semantic (new kind, envelope shape, state effect, context effect, version),
    write an ADR (append-only; supersede by linking, never edit).
 4. Implement in `kian-core` (+ owner crate) and update the golden tests.
-5. Update the docs map and every count/claim (`README` status table, `CHANGELOG`, SPEC phase record);
+5. Update the docs map and every count/claim (`README` status table, `CHANGELOG`, SPEC capability record);
    `docs_map` must stay green.
 6. Run the full four gates.
 

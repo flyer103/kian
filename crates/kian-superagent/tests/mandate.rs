@@ -1,4 +1,4 @@
-//! Delegation mandate (card C60 / kian-70, ADR-012, DESIGN §4.7): the
+//! Delegation mandate (ADR-012, DESIGN §4.7): the
 //! authority object on the frozen delegation wrapper. Four gates:
 //!
 //! 1. **Wrapper form** — the mandated wrapper is exactly
@@ -8,19 +8,19 @@
 //! 2. **Issuance** — `spawn_worker` (the single issuance point) stamps
 //!    `strength` from the triggering input's provenance signal:
 //!    `explicit` for the adapter-declared `explicit: true` payload
-//!    field, `inferred` otherwise (the C43 discipline — the raw's text
+//!    field, `inferred` otherwise (the discipline — the raw's text
 //!    is never parsed for consent).
 //! 3. **Durable + model-visible** — the mandate appears verbatim in
 //!    the worker's first message (the admitted wrapper) and inside the
 //!    `thread/started` task payload, on both sides of the delegation
 //!    pair (the `delegation_pairs` audit helper).
-//! 4. **Revalidation** (with C59's live routing) — a follow-up on a
+//! 4. **Revalidation** (with 's live routing) — a follow-up on a
 //!    live worker's topic reaches the worker when the mandate is
 //!    `explicit` (even under a changed policy version) or `inferred`
 //!    under the current version; `inferred` under a *changed* version
 //!    releases to the Router as fresh evaluation, audited
 //!    `released_to_eval`. Speculative delegations carry mandates too
-//!    (the C39/C60 markers compose).
+//!    (the markers compose).
 //!
 //! No credentials, no network egress. Log capture follows the
 //! `tests/followup_ownership.rs` process-global discipline (own test
@@ -244,7 +244,7 @@ fn mandate_policy() -> MandatePolicy {
 }
 
 /// The `spawn_worker` tool surface with mandate issuance on and the
-/// C59 shared registry installed.
+/// shared registry installed.
 fn mandate_tools(
     policy: Option<MandatePolicy>,
     registry: Arc<std::sync::RwLock<PassthroughRegistry>>,
@@ -358,7 +358,7 @@ fn legacy_wrappers_parse_with_none() {
 /// `spawn_worker` on a wrapper whose raw carries the adapter-declared
 /// `explicit: true` stamps `strength: explicit`; the same wrapper
 /// without the signal stamps `inferred` (the raw's commanding text
-/// never upgrades it — the C43 discipline).
+/// never upgrades it — the discipline).
 #[tokio::test]
 async fn spawn_worker_stamps_strength_from_the_provenance_signal() {
     let _ = logs();
@@ -437,13 +437,13 @@ async fn spawn_worker_stamps_strength_from_the_provenance_signal() {
 }
 
 // ---------------------------------------------------------------------------
-// kian-75 — the LIVE spawn spelling (RUNLOG §7.2 gap G2)
+// — the LIVE spawn spelling (gap)
 // ---------------------------------------------------------------------------
 
 /// `spawn_worker` exactly as the live model calls it: the schema types
 /// `task` as a STRING, so the channel wrapper rides as serialized JSON
 /// text and `correlation` is a bare topic-token string. The spawn must
-/// bind the topic (C59 registration — the gap that left every live
+/// bind the topic (registration — the gap that left every live
 /// ticket `topic:null`), stamp the mandate strength from the
 /// adapter-declared `explicit` signal (not `inferred`), attribute the
 /// mandate source to the triggering channel/topic (not `router`/null),
@@ -585,7 +585,7 @@ async fn mandate_is_verbatim_in_first_message_and_thread_started() {
 }
 
 // ---------------------------------------------------------------------------
-// Gate 4 — revalidation on follow-up routing (with C59 live routing)
+// Gate 4 — revalidation on follow-up routing (with live routing)
 // ---------------------------------------------------------------------------
 
 /// The passthrough rules of the routing tests: `github` events
@@ -743,7 +743,7 @@ async fn inferred_under_changed_version_releases_to_the_router() {
 }
 
 /// An inferred mandate under its *current* version passes; a legacy
-/// worker (no mandate) always passes — pre-C60 authority is never
+/// worker (no mandate) always passes — legacy authority is never
 /// retroactively narrowed.
 #[tokio::test]
 async fn inferred_under_current_version_and_legacy_workers_pass() {
@@ -799,7 +799,7 @@ async fn inferred_under_current_version_and_legacy_workers_pass() {
 }
 
 // ---------------------------------------------------------------------------
-// Gate 4b — speculative delegations carry mandates too (C39 compose)
+// Gate 4b — speculative delegations carry mandates too (compose)
 // ---------------------------------------------------------------------------
 
 /// A speculative spawn under mandate config composes both additive

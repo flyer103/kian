@@ -18,7 +18,7 @@ use axum::routing::post;
 pub enum ScriptedResponse {
     /// Plain assistant text (a final answer).
     Text(String),
-    /// A tool call the loop must dispatch (e.g. the long `exec` the
+    /// A tool call the loop must dispatch (e.g. The long `exec` the
     /// chaos suite kills mid-tool). Not every test binary constructs
     /// this variant, hence the allow.
     #[allow(dead_code)]
@@ -27,7 +27,7 @@ pub enum ScriptedResponse {
         name: String,
         arguments: serde_json::Value,
     },
-    /// A stream that dies mid-flight (kian-62): HTTP 200, SSE
+    /// A stream that dies mid-flight: HTTP 200, SSE
     /// content-type, one partial content frame — then the connection
     /// ends before the promised content-length is satisfied. The
     /// provider surfaces a mid-turn stream error (the honest soft
@@ -50,7 +50,7 @@ pub struct MockProvider {
     pub script: Vec<ScriptedResponse>,
     /// Requests with number <= `gated` hold until `released`.
     pub gated: usize,
-    /// C37: additionally hold exactly this request number until
+    /// additionally hold exactly this request number until
     /// `released` (0 = off). Lets a test park a drain mid-provider-turn
     /// while an async job settles, then release on durable evidence —
     /// deterministic, no sleeps. Existing `gated` semantics unchanged.
@@ -153,7 +153,7 @@ pub async fn spawn_scripted_provider(
 }
 
 /// [`spawn_scripted_provider`] with an additional single-request gate
-/// (`gate_at`, 0 = off) — the C37 async-completion tests park one
+/// (`gate_at`, 0 = off) — the async-completion tests park one
 /// provider turn until the completion input is durable.
 #[allow(dead_code)] // each integration test compiles this module separately
 pub async fn spawn_scripted_provider_gated_at(
@@ -221,7 +221,7 @@ impl Default for ConfigTuning {
     }
 }
 
-/// [`write_config`] with explicit drain/lease/tool tuning (C15 chaos:
+/// [`write_config`] with explicit drain/lease/tool tuning (chaos:
 /// short lease TTL + heartbeat so recovery detection is observable)
 /// and an explicit file name (boot #1 / boot #2 configs coexist).
 pub fn write_config_with(

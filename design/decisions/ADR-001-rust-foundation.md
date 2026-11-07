@@ -18,7 +18,7 @@
 - **Consequences**: Development speed is lower than Go/TS; in exchange: no-GC tail latency,
   strongly-typed invariant encoding, and kiand cross-compiled as a single binary. dsh integration
   goes through a protocol, not in-process.
-- **Rollback Trigger**: If Rust development efficiency becomes a milestone bottleneck (Phase 1
+- **Rollback Trigger**: If Rust development efficiency becomes a milestone bottleneck (
   exceeding 2× the estimate) while core semantics are already stable, evaluate keeping the core
   in Rust with the super-agent bundle integrating via API in another language.
 - **Cost Impact**: Zero license cost; sqlite has zero infrastructure cost.

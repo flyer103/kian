@@ -1,4 +1,4 @@
-//! Inbox, claim/lease records, replay source, startup scan (card C6).
+//! Inbox, claim/lease records, replay source, startup scan.
 //!
 //! Inputs are durable rows before any wake fires (AGENTS.md constraint 6);
 //! admit is idempotent by key; claims issue monotonic epochs with
@@ -11,7 +11,7 @@
 //! eligibility away while destroying the row — the inbox row itself is
 //! durable and audit-visible forever.
 //!
-//! C50: the inbox surface dispatches over the same
+//! the inbox surface dispatches over the same
 //! [`EventStore`](crate::event_store::EventStore) enum as the event
 //! store — identical method names and signatures, per-backend SQL in
 //! [`crate::sqlite`] and [`crate::postgres`], shared decode and typed
@@ -19,7 +19,7 @@
 //!
 //! The store keeps zero background tasks: every time-sensitive query
 //! takes `now_ms` from the caller (clocks, timers and wake registries
-//! belong to the orchestrator, cards C9+).
+//! belong to the orchestrator, +).
 
 use kian_core::events::Event;
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
@@ -44,7 +44,7 @@ pub struct SessionInbox {
     pub eligible: Vec<InputRow>,
 }
 
-/// Typed inbox/lease failures (mirrors the C5 discipline: a rejected
+/// Typed inbox/lease failures (mirrors the discipline: a rejected
 /// operation is a matchable fact, not an opaque string).
 #[derive(Debug, thiserror::Error)]
 pub enum InboxError {
@@ -80,7 +80,7 @@ pub enum InboxError {
         session: SessionId,
         source: kian_core::state::ProjectionError,
     },
-    /// Conditional claim admission (C47/ADR-009): the claims row holds a
+    /// Conditional claim admission (ADR-009): the claims row holds a
     /// *fresh* lease owned by a *different* holder. Nothing was written —
     /// the store's epoch floor is unchanged — and the live holder's sweep
     /// or wake transport will service the input. A typed fact for the
@@ -195,20 +195,20 @@ impl EventStore {
     /// lease. The issued epoch is `max(claims.epoch, events epoch
     /// floor) + 1`, so epochs strictly increase per session across
     /// process restarts (the claims row is a durable high-water mark)
-    /// and across the claim-issued-but-not-yet-appended window C5
+    /// and across the claim-issued-but-not-yet-appended window
     /// flagged. One statement — concurrent claims serialize and get
     /// consecutive epochs. Liveness only (ADR-005).
     ///
-    /// C47 (ADR-009) — conditional admission: the claim lands only when
+    /// (ADR-009) — conditional admission: the claim lands only when
     /// (a) no claims row exists, (b) the row's lease is expired
     /// (`now - ttl > last_heartbeat`), or (c) `holder` already owns the
     /// row (same process re-claiming for its next drain episode — every
     /// single-replica behavior, including back-to-back drains, is
-    /// byte-identical to pre-C47). A fresh lease held by a different
+    /// byte-identical to legacy). A fresh lease held by a different
     /// holder is refused with the typed [`InboxError::ClaimRejected`]
     /// carrying the live holder; nothing is written, so the store's
     /// epoch floor is unchanged. This conditions *claiming* only —
-    /// write acceptance never consults lease state (ADR-005, round-4
+    /// write acceptance never consults lease state (ADR-005,
     /// rule 10).
     pub async fn claim(
         &self,
@@ -255,7 +255,7 @@ impl EventStore {
         Ok(self.scan(session, 0..i64::MAX as u64).await?)
     }
 
-    /// Every claims row, ordered by epoch (card C14: the read-only data
+    /// Every claims row, ordered by epoch (the read-only data
     /// source behind `kian lease inspect` — epoch/TTL/holder visibility).
     /// Unlike [`EventStore::expired_leases`] this applies no liveness
     /// filtering: an operational reader sees the lease table as it is,
@@ -410,7 +410,7 @@ mod tests {
 
     /// Admit idempotency: the same (session, idempotency key) yields
     /// exactly one durable row; the duplicate call returns the original
-    /// row — first write wins (card C6 acceptance).
+    /// row — first write wins (acceptance).
     #[tokio::test]
     async fn admit_is_idempotent_by_key() {
         let (store, path) = test_store().await;
@@ -502,7 +502,7 @@ mod tests {
 
     /// Taking eligibility never destroys the row before its consumption
     /// event exists: marking against a seq that is not committed is a
-    /// typed error and the input stays eligible (card C6 acceptance).
+    /// typed error and the input stays eligible (acceptance).
     #[tokio::test]
     async fn mark_consumed_requires_committed_consumption_event() {
         let (store, path) = test_store().await;
@@ -588,8 +588,8 @@ mod tests {
 
     /// Epochs strictly increase per session, including across a
     /// simulated process restart (close + reopen the DB file) — the
-    /// claims row is a durable high-water mark (card C6 acceptance).
-    /// C47 note: successive claims use *different* holders, so each must
+    /// claims row is a durable high-water mark (acceptance).
+    /// note: successive claims use *different* holders, so each must
     /// arrive past the previous lease's TTL (expired admission) — the
     /// takeover path — which is exactly how distinct replicas or a
     /// restarted successor take over.
@@ -641,7 +641,7 @@ mod tests {
 
     /// The epoch floor includes committed events: claiming a session
     /// whose stream already carries epoch 7 issues 8 — this closes the
-    /// claim-issued-but-not-yet-appended window C5 flagged.
+    /// claim-issued-but-not-yet-appended window flagged.
     #[tokio::test]
     async fn claim_epoch_floor_includes_committed_events() {
         let (store, path) = test_store().await;
@@ -659,7 +659,7 @@ mod tests {
     }
 
     /// Two concurrent claims serialize: both succeed with consecutive,
-    /// distinct epochs — exactly one holder can be current. C47 note:
+    /// distinct epochs — exactly one holder can be current. note:
     /// both claims carry the *same* holder (a single process's racing
     /// drain episodes — condition (c)); a cross-holder claim against a
     /// fresh lease is `ClaimRejected` by the conditional admission tests
@@ -686,7 +686,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C47: conditional claim admission (ADR-009) --------------------------
+    // -- conditional claim admission (ADR-009) --------------------------
 
     /// Admission condition (a): no claims row exists — the claim lands
     /// and issues epoch 1 (or the events-floor epoch when the stream
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(lease.holder, "first");
 
         // No claims row, but events committed at epoch 7: the events
-        // floor holds (issuance arithmetic unchanged, C6).
+        // floor holds (issuance arithmetic unchanged).
         let other = SessionId::new();
         append_ok(&store, other, 1, Epoch(7), EventKind::SessionCreated).await;
         let lease = store.claim(other, "first", 1_000, T0).await.unwrap();
@@ -710,8 +710,8 @@ mod tests {
     }
 
     /// Admission condition (b): an expired lease admits a *different*
-    /// holder with the next epoch — the S1 takeover path, unchanged
-    /// from pre-C47 (the sweep's semantics rest on it).
+    /// holder with the next epoch — the takeover path, unchanged
+    /// from legacy (the sweep's semantics rest on it).
     #[tokio::test]
     async fn claim_takeover_of_expired_lease_by_different_holder_issues_next_epoch() {
         let (store, path) = test_store().await;
@@ -790,7 +790,7 @@ mod tests {
 
     /// Admission condition (c): the *same* holder re-claiming a fresh
     /// lease succeeds and still bumps the epoch — the single-replica
-    /// back-to-back-drain behavior, byte-identical to pre-C47.
+    /// back-to-back-drain behavior, byte-identical to legacy.
     #[tokio::test]
     async fn claim_by_same_holder_on_fresh_lease_succeeds_and_bumps_epoch() {
         let (store, path) = test_store().await;
@@ -818,7 +818,7 @@ mod tests {
     /// The expired-lease query returns only leases past TTL whose
     /// session projects to `running` — terminal, idle and freshly
     /// heartbeated sessions never surface. Liveness input only
-    /// (ADR-005, card C6 acceptance).
+    /// (ADR-005, acceptance).
     #[tokio::test]
     async fn expired_leases_return_only_running_sessions_past_ttl() {
         let (store, path) = test_store().await;
@@ -928,7 +928,7 @@ mod tests {
     // -- startup scan -----------------------------------------------------------
 
     /// FIFO inside one `eligible_at` millisecond follows admission
-    /// order, never the random-uuid tie-break. C57 live-run finding:
+    /// order, never the random-uuid tie-break. live-run finding:
     /// the inbox ordered same-ms rows by `id` (a random uuid), so a
     /// task/steer pair admitted in the same millisecond could consume
     /// the steer first — and the worker-template classification (which
@@ -986,7 +986,7 @@ mod tests {
     /// The startup inbox scan finds every session with
     /// eligible-but-unconsumed inputs in a DB seeded with half-consumed
     /// sessions, and skips future-eligible and fully-consumed ones
-    /// (card C6 acceptance; the data source for NoLostWork).
+    /// (acceptance; the data source for NoLostWork).
     #[tokio::test]
     async fn startup_scan_finds_all_eligible_unconsumed_inputs() {
         let (store, path) = test_store().await;
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     /// `leases()` surfaces every claims row with epoch/TTL/holder, no
-    /// liveness filtering — the `kian lease inspect` data source (C14).
+    /// liveness filtering — the `kian lease inspect` data source.
     /// Rows survive the writer closing: the claims table is the durable
     /// epoch high-water mark.
     #[tokio::test]
@@ -1121,7 +1121,7 @@ mod tests {
             last_heartbeat: T0,
         }));
 
-        // A takeover claim rewrites the row with the next epoch. C47
+        // A takeover claim rewrites the row with the next epoch.
         // note: holder-a2 differs from holder-a, so the claim arrives
         // past the 30 s TTL — the expired-lease takeover path.
         let takeover = store
@@ -1138,7 +1138,7 @@ mod tests {
     }
 
     /// A read-only reopen sees the same events and leases a writer left
-    /// behind (C14's embedded audit reader), and refuses writes.
+    /// behind ('s embedded audit reader), and refuses writes.
     #[tokio::test]
     async fn read_only_reopen_reads_stream_and_refuses_writes() {
         let (store, path) = test_store().await;
@@ -1181,7 +1181,7 @@ mod tests {
     }
 }
 
-/// Review assertions (card C6): the store owns zero background tasks —
+/// Review assertions: the store owns zero background tasks —
 /// no task spaw*ning, no timers, no sleeps. Everything time-dependent
 /// takes `now_ms` from the caller.
 #[cfg(test)]
@@ -1190,7 +1190,7 @@ mod review {
     use std::path::PathBuf;
 
     /// This module's source must not create tasks, timers or sleeping
-    /// constructs: the store is a passive query surface (card C6
+    /// constructs: the store is a passive query surface (
     /// "never touch" list). The forbidden fragments are assembled from
     /// split pieces so this file cannot contain them literally.
     #[test]

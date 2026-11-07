@@ -1,8 +1,8 @@
-//! C27 integration tests: the super-agent assembly in `kian serve`.
+//! integration tests: the super-agent assembly in `kian serve`.
 //!
 //! All tests run with `NO_PROXY=127.0.0.1,localhost` (AGENTS.md
 //! gotcha), against the real openai-compat provider pointed at
-//! in-process mock providers (the C13 `common` fixtures — no
+//! in-process mock providers (the `common` fixtures — no
 //! credentials, no network egress), the real sqlite event store and
 //! the real engine. Observations read the committed streams through a
 //! read-only store handle, never the server's internals.
@@ -303,7 +303,7 @@ async fn serve_smoke_mock_channel_send_observes_router_drain() {
         2
     );
 
-    // /metrics carries the C27 counters.
+    // /metrics carries the counters.
     let metrics: serde_json::Value = client
         .get(format!("{base}/metrics"))
         .send()
@@ -326,7 +326,7 @@ async fn serve_smoke_mock_channel_send_observes_router_drain() {
 }
 
 // ---------------------------------------------------------------------------
-// /metrics exposes the C41 router-batching series (article §7.2 shape)
+// /metrics exposes the router-batching series (article §7.2 shape)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -426,7 +426,7 @@ async fn metrics_route_exposes_the_router_batching_series() {
 
 // ---------------------------------------------------------------------------
 // Watchdog: offline endpoint → health input admitted to the affected
-// worker session (the durable-row acceptance of C27)
+// worker session (the durable-row acceptance )
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -522,7 +522,7 @@ async fn watchdog_offline_admits_health_input_to_affected_worker_session() {
     );
 
     // The watchdog's offline edge reaches the worker as a durable
-    // health input row (the C27 acceptance).
+    // health input row (the acceptance).
     let worker_events = wait_for_session(
         &read_only,
         worker_session,
@@ -678,13 +678,13 @@ async fn startup_order_subscriptions_and_watchdog_start_after_rebuild() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase-1 compatibility: no `superagent:` section boots identically
+// built-in compatibility: no `superagent:` section boots identically
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn phase1_config_boots_identically_without_superagent() {
+async fn baseline_config_boots_identically_without_superagent() {
     force_no_proxy();
-    let dir = temp_dir("c27-phase1");
+    let dir = temp_dir("baseline-config");
     let (provider_base, _mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("All done.".into())], 0).await;
     let config = common::write_config(
@@ -697,7 +697,7 @@ async fn phase1_config_boots_identically_without_superagent() {
     let (base, _server) = spawn_server(&config).await;
     let client = reqwest::Client::new();
 
-    // The Phase-1 control plane still works end to end.
+    // The built-in control plane still works end to end.
     let out = client
         .post(format!("{base}/rpc"))
         .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "create_session", "params": {}}))
@@ -718,7 +718,7 @@ async fn phase1_config_boots_identically_without_superagent() {
         .await
         .expect("submit");
 
-    // /metrics keeps its Phase-1 shape (superagent: null).
+    // /metrics keeps its built-in shape (superagent: null).
     let metrics: serde_json::Value = client
         .get(format!("{base}/metrics"))
         .send()

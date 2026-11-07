@@ -1,4 +1,4 @@
-//! Iron-rule test (card C13): no control-plane handler references any
+//! Iron-rule test: no control-plane handler references any
 //! execution API. Enforced textually over the handler module — `api.rs`
 //! must be HTTP-only, with the `ControlPlane` trait as its sole server
 //! surface (inbox writes + projection/event reads).
@@ -71,7 +71,7 @@ fn control_plane_trait_exposes_only_inbox_and_reads() {
 }
 
 #[test]
-fn handlers_dispatch_only_the_phase1_method_set() {
+fn handlers_dispatch_only_the_baseline_method_set() {
     let src = api_src();
     for method in [
         "\"create_session\"",
@@ -83,17 +83,17 @@ fn handlers_dispatch_only_the_phase1_method_set() {
     ] {
         assert!(src.contains(method), "rpc dispatch missing {method}");
     }
-    // No Phase-2+ endpoints smuggled in.
+    // No bundle+ endpoints smuggled in.
     for banned in ["confirm", "auth", "tenant", "channel", "router"] {
         assert!(
             !src.contains(&format!("\"{banned}\"")),
-            "api.rs dispatches a non-Phase-1 method `{banned}`"
+            "api.rs dispatches a non-baseline method `{banned}`"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// C14: the operational plane obeys the same structural discipline —
+// the operational plane obeys the same structural discipline —
 // ops handlers speak only the OpsPlane trait, never execution APIs.
 // ---------------------------------------------------------------------------
 
@@ -148,12 +148,12 @@ fn ops_plane_exposes_only_the_operator_actions() {
 }
 
 // ---------------------------------------------------------------------------
-// C27: the iron rule, both directions.
+// the iron rule, both directions.
 //
 // - Handler modules (api.rs, ops.rs) stay free of execution symbols
 //   (the table above) — extended to a table so new handler modules are
 //   added to the list, not copy-pasted.
-// - Assembly modules (the C27 `superagent.rs` wiring, like server.rs)
+// - Assembly modules (the `superagent.rs` wiring, like server.rs)
 //   are the engine's peers and may name execution APIs — but they must
 //   never grow HTTP handlers of their own: no axum/reqwest/router
 //   surface lives outside api.rs/ops.rs/server.rs's metrics merge.
@@ -220,7 +220,7 @@ fn assembly_modules_hold_no_http_surface() {
 }
 
 // ---------------------------------------------------------------------------
-// C49: the webhook receiver plane — the fourth server surface, the
+// the webhook receiver plane — the fourth server surface, the
 // same structural discipline (the module greps with the table above
 // via HANDLER_MODULES; these tests pin the trait and the route set).
 // ---------------------------------------------------------------------------

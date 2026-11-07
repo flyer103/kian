@@ -1,4 +1,4 @@
-//! C32 acceptance: the C14 `session replay` A2 re-derivation passes over
+//! acceptance: the `session replay` A2 re-derivation passes over
 //! streams containing the spill pair (`input/admitted` + `input/spilled`
 //! consumed from one `{"content","spill"}` envelope row).
 //!
@@ -85,7 +85,7 @@ async fn session_replay_rederives_streams_containing_the_spill_pair() {
         .await
         .unwrap();
 
-    // The C32 envelope row: the Inline excerpt as content, the full raw
+    // The envelope row: the Inline excerpt as content, the full raw
     // as the opaque sidecar.
     let sidecar = json!({
         "event_id": "evt-1",

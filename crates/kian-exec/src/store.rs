@@ -1,5 +1,5 @@
-//! Durable command queue + endpoint registry (card C20, DESIGN §4.3/§7;
-//! dual-backend since C51).
+//! Durable command queue + endpoint registry (DESIGN §4.3/§7;
+//! dual-backend since).
 //!
 //! Queue rows are **pre-event durable state**, exactly like inbox rows: the
 //! row exists in the server's database before any dispatch flies
@@ -7,11 +7,11 @@
 //! the normal `tool/call`/`tool/result` loop path — never by writing the
 //! events table from here.
 //!
-//! One server, one database (C51): when the event store is postgres,
+//! One server, one database: when the event store is postgres,
 //! `endpoint_registry`/`exec_queue`/`async_jobs` live in the same postgres
 //! database. The public [`ExecStore`] is a small dispatching enum —
 //! `Sqlite(..) | Postgres(..)` — with the same method names and signatures
-//! on both backends (the C50 pattern: dispatch, not generics — sqlx cannot
+//! on both backends (the pattern: dispatch, not generics — sqlx cannot
 //! usefully genericize over the two dialects). Per-backend SQL lives in
 //! [`crate::sqlite`] and [`crate::postgres`]; `open`/`from_pool` stay
 //! sqlite construction, `from_pg_pool`/`open_postgres` are the postgres
@@ -21,15 +21,15 @@
 //!
 //! ```text
 //! pending ──▶ inflight ──▶ done
-//!    │           │
-//!    └───────────┴──▶ abandoned   (queue timeout; terminal)
+//!    │ │
+//!    └───────────┴──▶ abandoned (queue timeout; terminal)
 //! ```
 //!
 //! `done` and `abandoned` are terminal: every transition statement carries a
 //! status guard (`WHERE status IN (...)`) so a committed `done` row is never
 //! updated again and no row is ever deleted (asserted by
 //! `no_delete_and_done_rows_are_never_mutated` and
-//! `backend_modules_keep_guards_and_never_delete` — the C5 review pattern).
+//! `backend_modules_keep_guards_and_never_delete` — the review pattern).
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -160,7 +160,7 @@ pub struct QueuedCommand {
     pub updated_at: i64,
 }
 
-/// One `endpoint_registry` row (the C21 watchdog reads this projection).
+/// One `endpoint_registry` row (the watchdog reads this projection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointRegistryRow {
     pub endpoint_id: String,
@@ -193,19 +193,19 @@ pub struct Migration {
     pub up: &'static str,
 }
 
-/// v0 — the endpoint registry and the durable command queue (card C20).
+/// v0 — the endpoint registry and the durable command queue.
 /// Frozen golden: committed generations are never rewritten.
 ///
 /// `exec_queue.result` stores the correlated outcome JSON once a row
 /// settles, so command-id dedupe can answer re-executions from the row
-/// across a restart (additive over the card's column list; see ADR-007).
+/// across a restart (additive over the column list; see ADR-007).
 const V0_REGISTRY_QUEUE: Migration = Migration {
     version: 0,
     name: "v0_endpoint_registry_exec_queue",
     up: "CREATE TABLE IF NOT EXISTS endpoint_registry (\n    endpoint_id TEXT PRIMARY KEY,\n    addr TEXT NOT NULL,\n    last_heartbeat_ms INTEGER NOT NULL,\n    state TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS exec_queue (\n    command_id TEXT PRIMARY KEY,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_exec_queue_drive ON exec_queue (endpoint_id, status, created_at)",
 };
 
-/// v1 — the async job table (card C37, ADR-008). Frozen golden once
+/// v1 — the async job table (ADR-008). Frozen golden once
 /// committed: the same append-only discipline as v0. Rows are
 /// pre-event durable state per ADR-007's pattern — the row exists
 /// before any dispatch, the completion reaches a session only as an
@@ -216,8 +216,8 @@ const V1_ASYNC_JOBS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS async_jobs (\n    job_id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
 };
 
-/// v2 — queue-row lease columns (C51, the designed chain extension C52
-/// builds its row leases on): every queue table grows `claimed_by` /
+/// v2 — queue-row lease columns (the designed chain extension
+/// builds its row leases ): every queue table grows `claimed_by` /
 /// `claimed_until_ms` so a single replica can *own* a row while it drives
 /// it, and any replica can honestly re-drive after expiry (ADR-009: the
 /// lease is liveness only — the command-id correlation stays the safety
@@ -236,7 +236,7 @@ pub fn chain() -> &'static [Migration] {
     &[V0_REGISTRY_QUEUE, V1_ASYNC_JOBS, V2_QUEUE_ROW_LEASES]
 }
 
-/// v0 (postgres chain, C51) — same version and name as the sqlite
+/// v0 (postgres chain) — same version and name as the sqlite
 /// generation, pg DDL (TEXT/BIGINT; DESIGN §3.3's per-backend typing).
 const PG_V0_REGISTRY_QUEUE: Migration = Migration {
     version: 0,
@@ -244,14 +244,14 @@ const PG_V0_REGISTRY_QUEUE: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS endpoint_registry (\n    endpoint_id TEXT PRIMARY KEY,\n    addr TEXT NOT NULL,\n    last_heartbeat_ms BIGINT NOT NULL,\n    state TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS exec_queue (\n    command_id TEXT PRIMARY KEY,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_exec_queue_drive ON exec_queue (endpoint_id, status, created_at)",
 };
 
-/// v1 (postgres chain, C51) — the async job table, pg DDL.
+/// v1 (postgres chain) — the async job table, pg DDL.
 const PG_V1_ASYNC_JOBS: Migration = Migration {
     version: 1,
     name: "v1_async_jobs",
     up: "CREATE TABLE IF NOT EXISTS async_jobs (\n    job_id TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    endpoint_id TEXT NOT NULL,\n    cmd TEXT NOT NULL,\n    status TEXT NOT NULL,\n    tool_call_ref TEXT,\n    result TEXT,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_async_jobs_drive ON async_jobs (status, created_at)",
 };
 
-/// v2 (postgres chain, C51) — the queue-row lease columns, pg DDL. Same
+/// v2 (postgres chain) — the queue-row lease columns, pg DDL. Same
 /// version and name as the sqlite v2: the two chains track each other
 /// generation for generation.
 const PG_V2_QUEUE_ROW_LEASES: Migration = Migration {
@@ -303,7 +303,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), QueueStoreError> {
 }
 
 /// Applies every unapplied pg generation in order — the same runner logic
-/// as [`migrate`], dispatched per backend (the C50 pattern).
+/// as [`migrate`], dispatched per backend (the pattern).
 pub async fn migrate_pg(pool: &PgPool) -> Result<(), QueueStoreError> {
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS _kian_exec_migrations (\n    version BIGINT PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at BIGINT NOT NULL\n)",
@@ -338,9 +338,9 @@ pub async fn migrate_pg(pool: &PgPool) -> Result<(), QueueStoreError> {
 // ExecStore
 // ---------------------------------------------------------------------------
 
-/// Durable queue + registry access (dual-backend since C51): a small
+/// Durable queue + registry access (dual-backend since): a small
 /// dispatching enum over the sqlite and postgres backends. Every method
-/// carries the same name and signature the pre-C51 sqlite store had, so
+/// carries the same name and signature the legacy sqlite store had, so
 /// callers and tests are unchanged; construction picks the backend
 /// (`open`/`from_pool` = sqlite, `open_postgres`/`from_pg_pool` =
 /// postgres). All access goes through a sqlx pool — never blocks a tokio
@@ -381,8 +381,8 @@ impl ExecStore {
 
     /// Opens a postgres database by URL, applies the pg exec migration
     /// chain, and returns a pooled store. The URL is env-sourced by the
-    /// caller (the C51 assembly); it may carry a password, but never
-    /// lands in a config value (the C13 secrets rule).
+    /// caller (the assembly); it may carry a password, but never
+    /// lands in a config value (the secrets rule).
     pub async fn open_postgres(url: &str) -> Result<Self, QueueStoreError> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         let store = Self::Postgres(pool);
@@ -417,13 +417,13 @@ impl ExecStore {
     /// The underlying sqlite pool (the shared-pool adoption path and the
     /// sqlite test suite). The sqlite-only accessor: a postgres-backed
     /// store carries no sqlite pool by construction, so calling it there
-    /// is a programming error and panics with this message (the C50
+    /// is a programming error and panics with this message (the
     /// `EventStore::pool` pattern).
     pub fn pool(&self) -> &SqlitePool {
         match self {
             ExecStore::Sqlite(pool) => pool,
             ExecStore::Postgres(_) => panic!(
-                "ExecStore::pool() is the sqlite-only pool accessor; this store is postgres-backed (C51)"
+                "ExecStore::pool() is the sqlite-only pool accessor; this store is postgres-backed"
             ),
         }
     }
@@ -553,7 +553,7 @@ impl ExecStore {
         rows.into_iter().map(parse_row).collect()
     }
 
-    // -- C52: queue-row leases (ADR-009 decision 5) -------------------------
+    // -- queue-row leases (ADR-009 decision 5) -------------------------
 
     /// Claims one `exec_queue` row with a single-statement lease
     /// (`claimed_by`/`claimed_until_ms`, v2 columns). The claim lands
@@ -673,7 +673,7 @@ impl ExecStore {
         Ok(())
     }
 
-    /// All registry rows (the C21 watchdog's read API).
+    /// All registry rows (the watchdog's read API).
     pub async fn endpoints(&self) -> Result<Vec<EndpointRegistryRow>, QueueStoreError> {
         match self {
             Self::Sqlite(pool) => crate::sqlite::endpoints(pool).await,
@@ -738,7 +738,7 @@ mod tests {
 
     /// v0 is a committed generation: pinned byte-for-byte so any rewrite of
     /// history trips this test instead of diverging from every
-    /// already-created database (C5 frozen-golden pattern).
+    /// already-created database (frozen-golden pattern).
     #[test]
     fn v0_generation_sql_is_frozen() {
         let v0: &Migration = &chain()[0];
@@ -767,7 +767,7 @@ mod tests {
     }
 
     /// v2 is committed the moment this chain ships: pinned byte-for-byte
-    /// (additive `ALTER TABLE`s only — the C52 queue-lease columns, the
+    /// (additive `ALTER TABLE`s only — the queue-lease columns, the
     /// designed chain extension).
     #[test]
     fn v2_generation_sql_is_frozen_and_additive() {
@@ -795,7 +795,7 @@ mod tests {
     }
 
     /// The pg chain tracks the sqlite chain generation for generation:
-    /// same versions, same names, same order (C51; DESIGN §3.3).
+    /// same versions, same names, same order (DESIGN §3.3).
     #[test]
     fn pg_chain_mirrors_sqlite_chain_versions_and_names() {
         let sqlite = chain();
@@ -904,7 +904,7 @@ mod tests {
         );
     }
 
-    /// Review assertion (C5 pattern): the store never deletes queue rows,
+    /// Review assertion (pattern): the store never deletes queue rows,
     /// and every queue mutation carries a status guard so committed `done`
     /// rows are immutable.
     #[test]
@@ -928,7 +928,7 @@ mod tests {
     }
 
     /// The same review assertion over the backend modules, where the SQL
-    /// lives since C51: no deletes anywhere, and every `exec_queue` /
+    /// lives since: no deletes anywhere, and every `exec_queue` /
     /// `async_jobs` mutation carries a status guard.
     #[test]
     fn backend_modules_keep_guards_and_never_delete() {

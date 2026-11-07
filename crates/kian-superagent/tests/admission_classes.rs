@@ -1,4 +1,4 @@
-//! Integration tests (card C36): the admission-class Fast Path — the
+//! Integration tests: the admission-class Fast Path — the
 //! provenance-keyed filter evaluated **before** the rule set and before
 //! any model call — against a real sqlite `EventStore` and a real
 //! `Engine`, through the `InboxWriter` port exactly the way assembly
@@ -340,7 +340,7 @@ async fn candidate_rule_set_path_is_byte_identical_to_classless_config() {
 // model request on every judge turn.
 // ---------------------------------------------------------------------------
 
-/// A `ModelProvider` that records every request (the S4 ScriptedProvider
+/// A `ModelProvider` that records every request (the ScriptedProvider
 /// stand-in, both sides — no credentials).
 struct ScriptedProvider {
     call_count: std::sync::atomic::AtomicUsize,

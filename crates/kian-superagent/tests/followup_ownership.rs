@@ -1,13 +1,13 @@
-//! Follow-up ownership routing (card C59 / kian-68, DESIGN §4.1 + §4.7):
+//! Follow-up ownership routing (DESIGN §4.1 + §4.7):
 //! a person's follow-up belongs to the **live** Ticket's Executor
-//! (reference 002) — the mechanical half is C38's fan-out, and this
+//! (reference 002) — the mechanical half is 's fan-out, and this
 //! card closes its two gaps:
 //!
 //! 1. a follow-up on a topic with one live subscriber admits to that
 //!    worker and spends **zero Router judge turns** on it (the Router
 //!    session never receives the event's row, so no drain/turn can
 //!    include it);
-//! 2. the same topic after the worker's `thread/completed` releases to
+//! 2. The same topic after the worker's `thread/completed` releases to
 //!    the Router — the *release to fresh evaluation* (002's Ticket-end
 //!    rule), audited with the closed `released_to_eval` reason code
 //!    and naming the released topic;
@@ -16,7 +16,7 @@
 //!    owner session — and spawns nothing (no inbox row, no
 //!    `thread/started`); once the owner ended, the same spawn succeeds
 //!    and the new worker takes the topic;
-//! 4. the registry rebuild from a mixed live/ended stream equals the
+//! 4. The registry rebuild from a mixed live/ended stream equals the
 //!    runtime map (the projection is disposable by construction).
 //!
 //! No credentials, no network egress. Log capture follows the
@@ -221,7 +221,7 @@ impl StreamPort for RecordingPort {
     }
 }
 
-/// The `spawn_worker` tool surface with the C59 shared registry
+/// The `spawn_worker` tool surface with the shared registry
 /// installed (the assembly wiring: `with_followup_registry` over the
 /// same Arc the subscription service would hold).
 fn ownership_tools(
@@ -277,7 +277,7 @@ fn event(session: SessionId, seq: u64, kind: EventKind, bytes: Value) -> Event {
 }
 
 /// A Router-side `thread/started` delegating to `worker` with a task
-/// content that is the channel-event wrapper of `topic` (the C38
+/// content that is the channel-event wrapper of `topic` (the
 /// rebuild source-1 shape).
 fn thread_started(router: SessionId, worker: SessionId, topic: &str) -> Event {
     event(
@@ -294,7 +294,7 @@ fn thread_started(router: SessionId, worker: SessionId, topic: &str) -> Event {
     )
 }
 
-/// A worker-side `thread/completed` (the C18 §2 payload shape).
+/// A worker-side `thread/completed` (the §2 payload shape).
 fn thread_completed(worker: SessionId) -> Event {
     event(
         worker,
@@ -563,7 +563,7 @@ fn rebuild_from_mixed_stream_equals_the_runtime_map() {
 // ---------------------------------------------------------------------------
 
 /// `superagent.followup_ownership: false`: an ended subscriber still
-/// admits (the pre-C59 behavior) and a duplicate-topic spawn goes
+/// admits (the legacy behavior) and a duplicate-topic spawn goes
 /// through ungated.
 #[tokio::test]
 async fn ownership_off_restores_the_pre_c59_behavior() {

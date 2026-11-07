@@ -1,8 +1,8 @@
 //! Seam trait definitions (DESIGN §6.2 "Seam three roles").
 //!
-//! The Phase-1 seam traits — `ModelProvider`, `LoopDriver`, `ToolProvider`,
-//! `ExecBackend`, `RecoveryPolicySource` — plus the Phase-2 additions
-//! `ChannelAdapter` and `WatchdogSource` (C18) — are *definitions only*:
+//! The built-in seam traits — `ModelProvider`, `LoopDriver`, `ToolProvider`,
+//! `ExecBackend`, `RecoveryPolicySource` — plus the bundle additions
+//! `ChannelAdapter` and `WatchdogSource` — are *definitions only*:
 //! no impls here; implementation crates (kian-llm, kian-loop,
 //! kian-superagent, kian-exec, …) implement and re-export them. Living in
 //! `kian-core` keeps the orchestrator dependency tree clean (constraint
@@ -24,7 +24,7 @@ use crate::secrets::Redaction;
 
 /// A model request: slot + opaque provider-shaped body. The body is built
 /// and serialized by the provider implementation (its serialization format
-/// is frozen stable content, C8); the core stays provider-agnostic.
+/// is frozen stable content); the core stays provider-agnostic.
 ///
 /// Persist-what-you-send (A2): the *caller* persists the request bytes as a
 /// `step/request` event before invoking [`ModelProvider::complete`] — the
@@ -38,7 +38,7 @@ pub struct ModelRequest {
 /// One streamed response chunk; the delta shape is provider-defined and
 /// opaque to the core.
 ///
-/// C67: a chunk may instead (or additionally) carry the provider's
+/// a chunk may instead (or additionally) carry the provider's
 /// `usage` object **verbatim** — a usage-only frame has `delta: null`
 /// and `usage: Some(…)`; consumers must skip null deltas when
 /// assembling content. The field is additive (serde default, omitted
@@ -69,7 +69,7 @@ impl ModelChunk {
 }
 
 /// Provider-side failures. Variants pre-align with the pure error
-/// classifier (C10) so classification never needs to parse error strings.
+/// classifier so classification never needs to parse error strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum ProviderError {
     #[error("rate limited")]
@@ -90,7 +90,7 @@ pub enum ProviderError {
 }
 
 /// Seam (DESIGN §6.2): model completion as a stream of chunks. Built-in
-/// provider: openai-compat (kian-llm, C8); any third-party may replace it.
+/// provider: openai-compat (kian-llm); any third-party may replace it.
 pub trait ModelProvider: Send + Sync {
     fn complete(&self, req: ModelRequest) -> BoxStream<'static, Result<ModelChunk, ProviderError>>;
 }
@@ -125,7 +125,7 @@ pub struct ToolResult {
     /// Distinguishes tool-level errors from successful outputs honestly
     /// (constraint 7).
     pub is_error: bool,
-    /// C69 redaction provenance: what the exec redactor scrubbed from
+    /// redaction provenance: what the exec redactor scrubbed from
     /// this result (aggregate counts, never secret values). Additive
     /// seam field — legacy JSON parses with an empty vec, an empty vec
     /// serializes without the key, and the report never enters the
@@ -145,7 +145,7 @@ pub enum ToolError {
 }
 
 /// Seam (DESIGN §6.2): model-visible tools. Built-ins: fs/exec/kiand
-/// (kian-loop, C11). Side-effecting invocations must be *logged before
+/// (kian-loop). Side-effecting invocations must be *logged before
 /// execution* (invariant 1) — the caller appends the `tool/call` event
 /// before `invoke` runs.
 pub trait ToolProvider: Send + Sync {
@@ -173,7 +173,7 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
-    /// C69 redaction provenance, produced by the redaction pass that
+    /// redaction provenance, produced by the redaction pass that
     /// scrubbed `stdout`/`stderr` (the report travels with the result so
     /// tool layers can attach it to the `tool/result` event payload).
     /// Additive: legacy JSON parses with an empty vec; empty serializes
@@ -193,7 +193,7 @@ pub enum ExecError {
 }
 
 /// Seam (DESIGN §6.2): environment command execution. Built-ins: local
-/// (Phase 1) and remote endpoint via KiandProto (Phase 2).
+/// (built-) and remote endpoint via KiandProto (bundle).
 pub trait ExecBackend: Send + Sync {
     fn exec(&self, cmd: ExecCommand) -> BoxFuture<'static, Result<ExecResult, ExecError>>;
 }
@@ -219,7 +219,7 @@ pub enum LoopOutcome {
 }
 
 /// Seam (DESIGN §6.2): the agent loop as control flow inside a drain.
-/// Built-in: the async ReAct loop (kian-loop, C11). The context type is
+/// Built-in: the async ReAct loop (kian-loop). The context type is
 /// left abstract on purpose — it is the drain handle surface (inbox take,
 /// event append, …) that the orchestrator provides; the core does not model
 /// execution internals (layered iron rule).
@@ -233,7 +233,7 @@ pub trait LoopDriver: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// One declarative policy rule (A4): a classifier class name → action.
-/// `class` strings follow the pure classifier's names (C10:
+/// `class` strings follow the pure classifier's names (
 /// `provider_down`, `rate_limited`, `context_overflow`, …).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyRule {
@@ -253,20 +253,20 @@ pub enum RecoveryAction {
 }
 
 /// Seam (DESIGN §6.2): supplies the declarative recovery table. Built-in:
-/// config file (`kian.yaml`, C10/C13). Disposition stays owned by the
+/// config file (`kian.yaml`). Disposition stays owned by the
 /// caller — this source is pure data.
 pub trait RecoveryPolicySource: Send + Sync {
     fn table(&self) -> Vec<PolicyRule>;
 }
 
 // ---------------------------------------------------------------------------
-// ChannelAdapter (C18, Phase 2 — definition only; impls live in the
+// ChannelAdapter (bundle — definition only; impls live in the
 // super-agent bundle, never in core)
 // ---------------------------------------------------------------------------
 
 /// One inbound channel event, surfaced by a [`ChannelAdapter`]. The
 /// payload is verbatim channel JSON (it rides inside the admitted input's
-/// `content`, so the frozen C4 message-payload contract is untouched).
+/// `content`, so the frozen message-payload contract is untouched).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelEvent {
     /// Channel name (e.g. `mock-im`, `lark`, `github`).
@@ -278,13 +278,13 @@ pub struct ChannelEvent {
     pub topic: Option<String>,
     /// Optional sender provenance (adapter-defined identity — the id,
     /// name, or object the channel reports). Opaque to the core; the
-    /// bundle's admission-class vocabulary keys on it (C36).
+    /// bundle's admission-class vocabulary keys on it.
     /// `#[serde(default)]`: old JSON parses unchanged with `None`.
     #[serde(default)]
     pub sender: Option<Value>,
     /// Optional group/chat provenance (adapter-defined — the chat or
     /// group the event arrived in, when distinct from the routing
-    /// topic). Opaque to the core (C36).
+    /// topic). Opaque to the core.
     /// `#[serde(default)]`: old JSON parses unchanged with `None`.
     #[serde(default)]
     pub group: Option<String>,
@@ -329,10 +329,10 @@ pub enum ChannelError {
     Timeout,
 }
 
-/// Seam (DESIGN §6.2, Phase 2): an inbound/outbound channel (IM, issue
+/// Seam (DESIGN §6.2, bundle): an inbound/outbound channel (IM, issue
 /// tracker, …). Definition only in core — the first impl is the
-/// production-quality in-memory mock channel (kian-superagent, C23); real
-/// lark/GitHub adapters are Phase 3. Subscribe streams must be
+/// production-quality in-memory mock channel (kian-superagent); real
+/// lark/GitHub adapters are ecosystem. Subscribe streams must be
 /// independently cloneable consumers of the adapter's own choosing.
 pub trait ChannelAdapter: Send + Sync {
     /// Inbound events. Each event must be surfaced exactly once per
@@ -344,7 +344,7 @@ pub trait ChannelAdapter: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// WatchdogSource (C18, Phase 2 — definition only)
+// WatchdogSource (bundle — definition only)
 // ---------------------------------------------------------------------------
 
 /// Endpoint health as the watchdog observes it. Edge-triggered: a source
@@ -367,9 +367,9 @@ pub struct HealthEvent {
     pub detail: Option<String>,
 }
 
-/// Seam (DESIGN §6.2, Phase 2): an edge-triggered health monitor.
+/// Seam (DESIGN §6.2, bundle): an edge-triggered health monitor.
 /// Definition only in core — the v1 impl is the server-side heartbeat
-/// watchdog over the endpoint registry (kian-exec, C21). The stream
+/// watchdog over the endpoint registry (kian-exec). The stream
 /// carries state changes only (no flapping, no periodic noise); health
 /// events reach sessions exclusively via Admit — the watchdog never
 /// writes session streams itself (layered iron rule).
@@ -387,7 +387,7 @@ mod tests {
     };
     use crate::model::SlotName;
 
-    /// All Phase-1 seams are object-safe so the orchestrator can hold
+    /// All built-in seams are object-safe so the orchestrator can hold
     /// plugin-registered `Arc<dyn _>` impls (DESIGN §6.2, §7).
     #[test]
     fn seam_traits_are_object_safe() {
@@ -402,19 +402,19 @@ mod tests {
         let _ = assert_object_safe;
     }
 
-    /// The C18 Phase-2 seams are object-safe for the same reason the
-    /// Phase-1 seams are: assembly holds `Arc<dyn ChannelAdapter>` /
+    /// The bundle seams are object-safe for the same reason the
+    /// built-in seams are: assembly holds `Arc<dyn ChannelAdapter>` /
     /// `Arc<dyn WatchdogSource>` registered by plugins.
     #[test]
-    fn phase2_seam_traits_are_object_safe() {
+    fn bundle_seam_traits_are_object_safe() {
         fn assert_object_safe(_: &dyn super::ChannelAdapter, _: &dyn super::WatchdogSource) {}
         let _ = assert_object_safe;
     }
 
-    /// The Phase-2 seam support types round-trip through JSON; the
+    /// The bundle seam support types round-trip through JSON; the
     /// health status serializes as the lowercase tabled form.
     #[test]
-    fn phase2_seam_support_types_round_trip() {
+    fn bundle_seam_support_types_round_trip() {
         use super::{
             ChannelDelivery, ChannelError, ChannelEvent, EndpointHealth, HealthEvent, SendReceipt,
         };
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(ChannelError::Timeout.to_string(), "delivery timed out");
     }
 
-    /// Old `ChannelEvent` JSON (pre-C36, no `sender`/`group`) parses
+    /// Old `ChannelEvent` JSON (legacy, no `sender`/`group`) parses
     /// unchanged with `None` defaults for the new fields, and the new
     /// fields serialize as explicit nulls — additive, never breaking.
     #[test]
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(back, event);
     }
 
-    /// C67: `ModelChunk.usage` is additive — legacy JSON (no `usage`
+    /// `ModelChunk.usage` is additive — legacy JSON (no `usage`
     /// key) parses with `None`, `None` serializes without the key, and
     /// a usage-carrying chunk round-trips with `delta: null`.
     #[test]
@@ -522,7 +522,7 @@ mod tests {
     }
 
     /// The seam support types round-trip through JSON; policy rules come
-    /// from declarative config (C10) and must be serde-shaped.
+    /// from declarative config and must be serde-shaped.
     #[test]
     fn seam_support_types_round_trip() {
         let req = ModelRequest {

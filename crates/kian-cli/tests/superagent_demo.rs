@@ -1,4 +1,4 @@
-//! C28 integration tests: the S4 acceptance scenario, CI-safe.
+//! integration tests: the acceptance scenario, CI-safe.
 //!
 //! mock-IM work request → Router judges (scripted router model:
 //! dispatch) → Worker spawns via Thread delegation → worker model
@@ -7,10 +7,10 @@
 //! the mock channel: an IM reply ≤100 words **and** a structured
 //! delivery (background/changes/verification).
 //!
-//! Everything runs against the real assembled server (C27): the real
+//! Everything runs against the real assembled server: the real
 //! sqlite event store, the real engine, the real subscription engine,
 //! the real Router/Worker drivers — with the two providers mocked at
-//! the openai-compat wire level (the C13 `common` fixtures — no
+//! the openai-compat wire level (the `common` fixtures — no
 //! credentials, no network egress) and the mock-IM channel injected
 //! through the ops plane (`mock_channel_send`, the README demo path).
 //! `NO_PROXY=127.0.0.1,localhost` is forced in every test (AGENTS.md
@@ -52,11 +52,11 @@ fn count_kind(events: &[Event], kind: EventKind) -> usize {
     events.iter().filter(|e| e.kind == kind).count()
 }
 
-/// The S4 super-agent `kian.yaml`: two mock providers (router/worker
+/// The super-agent `kian.yaml`: two mock providers (router/worker
 /// scripts stay independent), mock-IM channel routed to the Router,
 /// and a configurable worker evidence gate. No endpoints, no
 /// credentials beyond the shared dummy env var.
-fn write_s4_config(
+fn write_superagent_config(
     dir: &std::path::Path,
     router_provider: &str,
     worker_provider: &str,
@@ -132,16 +132,16 @@ recovery:
         worker_gate = worker_gate,
     );
     let path = dir.join("kian.yaml");
-    std::fs::write(&path, yaml).expect("write s4 config");
+    std::fs::write(&path, yaml).expect("write superagent config");
     path
 }
 
-/// Spawns the assembled server on an ephemeral port (the C27 pattern).
+/// Spawns the assembled server on an ephemeral port (the pattern).
 async fn spawn_server(config_path: &std::path::Path) -> (String, Arc<Server>) {
     let server = Arc::new(
         Server::from_config_file(config_path)
             .await
-            .expect("assemble s4 server")
+            .expect("assemble superagent server")
             .0,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -172,7 +172,7 @@ async fn ops_rpc(
 }
 
 /// Polls a session's committed stream until `pred` holds (generous:
-/// the full S4 flow is ~7 provider turns over the real wire).
+/// the full flow is ~7 provider turns over the real wire).
 async fn wait_for_session(
     store: &EventStore,
     session: SessionId,
@@ -198,7 +198,7 @@ fn thread_id_of(started: &Event) -> uuid::Uuid {
     uuid::Uuid::parse_str(started.bytes["thread_id"].as_str().unwrap()).unwrap()
 }
 
-/// Everything the named S4 assertions need after one full flow.
+/// Everything the named assertions need after one full flow.
 struct S4Run {
     dir: PathBuf,
     config: PathBuf,
@@ -209,12 +209,12 @@ struct S4Run {
     injected_event_id: String,
 }
 
-/// Runs the full S4 scenario: inject → judge → dispatch → worker tool
+/// Runs the full scenario: inject → judge → dispatch → worker tool
 /// calls → gate → completion → report → IM reply + structured
 /// delivery. Waits until both `channel/delivered` events are committed
 /// and the worker's `thread/completed` is in, then snapshots both
 /// streams.
-async fn run_s4_flow(
+async fn run_superagent_flow(
     tag: &str,
     router_script: Vec<ScriptedResponse>,
     worker_script: Vec<ScriptedResponse>,
@@ -223,7 +223,7 @@ async fn run_s4_flow(
     let dir = temp_dir(&format!("c28-{tag}"));
     let (router_base, _router_mock) = spawn_scripted_provider(router_script, 0).await;
     let (worker_base, _worker_mock) = spawn_scripted_provider(worker_script, 0).await;
-    let config = write_s4_config(&dir, &router_base, &worker_base, worker_gate);
+    let config = write_superagent_config(&dir, &router_base, &worker_base, worker_gate);
     let (base, server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await
@@ -307,7 +307,7 @@ async fn run_s4_flow(
     }
 }
 
-/// The standard S4 scripts: judge dispatches, worker acts, router
+/// The standard scripts: judge dispatches, worker acts, router
 /// replies over-limit (120 words — the cap must hold) and delivers the
 /// structured report.
 fn standard_scripts() -> (Vec<ScriptedResponse>, Vec<ScriptedResponse>) {
@@ -346,7 +346,7 @@ fn standard_scripts() -> (Vec<ScriptedResponse>, Vec<ScriptedResponse>) {
         ScriptedResponse::ToolCall {
             id: "call-exec-1".into(),
             name: "exec".into(),
-            arguments: serde_json::json!({"argv": ["echo", "s4-ready"]}),
+            arguments: serde_json::json!({"argv": ["echo", "superagent-ready"]}),
         },
         ScriptedResponse::Text("Done: changelog summarized and build verified.".into()),
     ];
@@ -358,14 +358,14 @@ fn standard_scripts() -> (Vec<ScriptedResponse>, Vec<ScriptedResponse>) {
 const PASSING_GATE: &str = "    evidence_gate:\n      enabled: true\n      checks:\n        - type: final_message_present\n        - type: tool_result_since_last_user_input\n      max_retries: 1\n";
 
 // ---------------------------------------------------------------------------
-// S4: the Router judges the mock-IM request and dispatches a worker
+// the Router judges the mock-IM request and dispatches a worker
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_router_judges_and_dispatches() {
+async fn superagent_router_judges_and_dispatches() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_s4_flow("judge", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow("judge", router, worker, PASSING_GATE).await;
 
     // The channel event was admitted to the Router with the injected
     // event id verbatim (routing provenance rides inside content).
@@ -459,14 +459,14 @@ async fn s4_router_judges_and_dispatches() {
 }
 
 // ---------------------------------------------------------------------------
-// S4: the worker completes with evidence
+// the worker completes with evidence
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_worker_completes_with_evidence() {
+async fn superagent_worker_completes_with_evidence() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_s4_flow("evidence", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow("evidence", router, worker, PASSING_GATE).await;
 
     // The worker acted: one exec tool call and a non-error result.
     assert!(
@@ -548,14 +548,14 @@ async fn s4_worker_completes_with_evidence() {
 }
 
 // ---------------------------------------------------------------------------
-// S4: the IM reply respects the ≤100-word limit
+// the IM reply respects the ≤100-word limit
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_reply_within_word_limit() {
+async fn superagent_reply_within_word_limit() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_s4_flow("wordlimit", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow("wordlimit", router, worker, PASSING_GATE).await;
 
     // The scripted reply was 120 words; the §4.2 cap held on the
     // assembled path: the audit event says 100 words, truncated.
@@ -595,14 +595,14 @@ async fn s4_reply_within_word_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// S4: the structured delivery carries background/changes/verification
+// the structured delivery carries background/changes/verification
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_structured_delivery() {
+async fn superagent_structured_delivery() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_s4_flow("structured", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow("structured", router, worker, PASSING_GATE).await;
 
     // Both deliveries landed: one im, one structured — with word
     // counts on the im event.
@@ -650,16 +650,16 @@ async fn s4_structured_delivery() {
 }
 
 // ---------------------------------------------------------------------------
-// S4: export → re-import replays; the delegation pair stays linked
+// export → re-import replays; the delegation pair stays linked
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_delegation_audit_export_replays() {
+async fn superagent_delegation_audit_export_replays() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_s4_flow("export", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow("export", router, worker, PASSING_GATE).await;
 
-    // Export both sessions through the C14 JSONL path.
+    // Export both sessions through the JSONL path.
     let router_out = run.dir.join("router-audit.jsonl");
     let worker_out = run.dir.join("worker-audit.jsonl");
     run_export(
@@ -742,11 +742,11 @@ async fn s4_delegation_audit_export_replays() {
 }
 
 // ---------------------------------------------------------------------------
-// S4: the README demo path — the real `kian` CLI driving a running serve
+// the README demo path — the real `kian` CLI driving a running serve
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_readme_demo_cli_mock_channel_send_against_serve() {
+async fn superagent_readme_demo_cli_mock_channel_send_against_serve() {
     force_no_proxy();
     let dir = temp_dir("c28-cli-demo");
 
@@ -763,7 +763,7 @@ async fn s4_readme_demo_cli_mock_channel_send_against_serve() {
     .await;
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
-    let config = write_s4_config(&dir, &router_base, &worker_base, "");
+    let config = write_superagent_config(&dir, &router_base, &worker_base, "");
     let (base, _server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await
@@ -825,9 +825,9 @@ async fn s4_readme_demo_cli_mock_channel_send_against_serve() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// C33: the YAML knob reaches the real assembled subscription service.
+/// the YAML knob reaches the real assembled subscription service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_shaping_config_spills_over_cap_channel_event_on_assembled_server() {
+async fn superagent_shaping_config_spills_over_cap_channel_event_on_assembled_server() {
     force_no_proxy();
     let dir = temp_dir("c33-assembled-shaping");
     let (router_base, _router_mock) = spawn_scripted_provider(
@@ -840,7 +840,7 @@ async fn s4_shaping_config_spills_over_cap_channel_event_on_assembled_server() {
     .await;
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
-    let config = write_s4_config(&dir, &router_base, &worker_base, "");
+    let config = write_superagent_config(&dir, &router_base, &worker_base, "");
     let yaml = std::fs::read_to_string(&config)
         .unwrap()
         .replacen(
@@ -910,12 +910,12 @@ async fn s4_shaping_config_spills_over_cap_channel_event_on_assembled_server() {
 }
 
 // ---------------------------------------------------------------------------
-// S4 negative path: a gate-failed worker never reaches a delivered
+// negative path: a gate-failed worker never reaches a delivered
 // "done" reply (honesty mapping)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s4_gate_failed_worker_never_reaches_delivered_done_reply() {
+async fn superagent_gate_failed_worker_never_reaches_delivered_done_reply() {
     force_no_proxy();
     let dir = temp_dir("c28-negative");
 
@@ -946,7 +946,7 @@ async fn s4_gate_failed_worker_never_reaches_delivered_done_reply() {
     // A gate the scripted worker can never satisfy.
     let gate = "    evidence_gate:\n      enabled: true\n      checks:\n        - type: min_tool_results\n          n: 1\n      max_retries: 2\n";
 
-    let config = write_s4_config(&dir, &router_base, &worker_base, gate);
+    let config = write_superagent_config(&dir, &router_base, &worker_base, gate);
     let (base, server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await

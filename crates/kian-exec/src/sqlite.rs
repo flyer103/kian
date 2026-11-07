@@ -1,7 +1,7 @@
-//! The sqlite backend (C51): the statements `ExecStore` shipped in
-//! C20/C37, extracted verbatim from the dispatching enum so the
+//! The sqlite backend: the statements `ExecStore` shipped in
+//! , extracted verbatim from the dispatching enum so the
 //! dialect lives here and only here. No statement changes semantics —
-//! sqlite behavior is byte-identical to the pre-C51 store (the zero
+//! sqlite behavior is byte-identical to the legacy store (the zero
 //! sanctioned-edit goal).
 
 use sqlx::sqlite::SqlitePool;
@@ -134,13 +134,13 @@ pub(crate) async fn drivable(
     .await
 }
 
-// -- C52: queue-row leases ---------------------------------------------------
+// -- queue-row leases ---------------------------------------------------
 
-/// Single-statement row lease (C52, ADR-009 decision 5): the claimant
+/// Single-statement row lease (ADR-009 decision 5): the claimant
 /// takes ownership iff the row is live (`pending`/`inflight` — terminal
 /// rows freeze) and the row is unclaimed, expired, or already this
 /// holder's (same-holder re-drive keeps single-replica behavior
-/// unchanged, the C47 condition-(c) discipline). `RETURNING` yields
+/// unchanged, the condition-(c) discipline). `RETURNING` yields
 /// the row exactly when ownership landed. The lease is *liveness*
 /// only — it bounds duplicate dispatch across replicas; the command-id
 /// correlation (ADR-007) remains the safety net.

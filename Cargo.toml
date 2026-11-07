@@ -20,7 +20,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 
-# Shared dependencies, pinned once (card C1). Crates opt in with
+# Shared dependencies, pinned once. Crates opt in with
 # `foo.workspace = true`; version bumps happen only here.
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -33,7 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
     "rustls-tls",
 ] }
-# v5 (C20): remote-exec command ids are derived deterministically from the
+# v5: remote-exec command ids are derived deterministically from the
 # calling tool-call id so session recovery + re-execution dedupes at the
 # queue-row level (ADR-007).
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
@@ -43,7 +43,7 @@ futures = "0.3"
 dashmap = "6"
 wiremock = "0.6"
 sha2 = "0.10"
-# C49: HMAC-SHA256 verification of GitHub webhook deliveries
+# HMAC-SHA256 verification of GitHub webhook deliveries
 # (RustCrypto, beside the existing sha2 — pinned to the 0.12 line so
 # the digest traits line up with sha2 0.10). Receiver-surface code in
 # kian-cli only — never in a core crate.
@@ -66,7 +66,7 @@ kian-plugin = { path = "crates/kian-plugin" }
 kian-superagent = { path = "crates/kian-superagent" }
 # Wire-only SDK: own version (0.1.0), never a kian dependency inside.
 kian-sdk = { path = "crates/kian-sdk" }
-# C54: the S6 dsh bridge — depends on kian-core only (narrow waist).
+# the dsh bridge — depends on kian-core only (narrow waist).
 kian-dsh = { path = "crates/kian-dsh" }
 kian-cli = { path = "crates/kian-cli" }
 kiand = { path = "crates/kiand" }

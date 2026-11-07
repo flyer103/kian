@@ -1,4 +1,4 @@
-//! Integration tests (card C35): the recall toolpack over a real
+//! Integration tests: the recall toolpack over a real
 //! sqlite `EventStore` and a real `Engine` — the Chain of Recall.
 //! ScriptedProvider on both sides, MockChannel as the IM stand-in: no
 //! credentials, no network egress (nothing for a system proxy to
@@ -158,7 +158,7 @@ fn tool_call_chunk(
 }
 
 /// Extracts the `output.thread_id` of a prior tool result from the
-/// request body. Dialect v2 (kian-61): a `role:"tool"` message's content
+/// request body. Dialect v2: a `role:"tool"` message's content
 /// is the serialized tool output itself (with the wire `tool_call_id`
 /// beside it), so the thread id sits at `/thread_id`; the legacy v1
 /// shape wrapped it as `{"call_id","output"}` — both accepted here.
@@ -442,7 +442,7 @@ struct Harness {
     recall: Arc<StoreRecallPort>,
 }
 
-/// The C33 shaping used by the spill tests: a tiny admission cap so
+/// The shaping used by the spill tests: a tiny admission cap so
 /// every fixture raw is over-cap (Inline view + spilled verbatim raw).
 fn spill_shaping() -> ShapingConfig {
     ShapingConfig {
@@ -566,7 +566,7 @@ async fn build_harness(
     }
 }
 
-/// One over-cap channel event shaped at admission (the C32 envelope:
+/// One over-cap channel event shaped at admission (the envelope:
 /// Inline view in `content`, verbatim raw in the `spill` sidecar).
 fn over_cap_event(event_id: &str, topic: Option<&str>, raw: Value) -> ChannelEvent {
     ChannelEvent {
@@ -595,13 +595,13 @@ fn event_bytes(events: &[Event]) -> Vec<(u64, EventKind, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C35)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 /// Over-cap event + `recall_event` round-trip: the verbatim raw comes
 /// back as an ordinary `tool/result` appended at the tail, after the
 /// admitted/spilled pair — and the prior stream is byte-identical
-/// (prefix-bytes assertion, S3 discipline).
+/// (prefix-bytes assertion, discipline).
 #[tokio::test]
 async fn over_cap_event_recall_event_round_trip_returns_verbatim_raw_as_a_tail_tool_result() {
     let raw = json!({
@@ -611,7 +611,7 @@ async fn over_cap_event_recall_event_round_trip_returns_verbatim_raw_as_a_tail_t
     let event = over_cap_event("evt-over-cap", Some("room-9"), raw.clone());
     let envelope = shape_channel_input(&event, &spill_shaping());
 
-    // Phase 1: admit the envelope (no wake yet), then one judge turn —
+    // built-in: admit the envelope (no wake yet), then one judge turn —
     // the drain consumes the pair and the Router parks.
     let h = build_harness(
         vec![
@@ -642,7 +642,7 @@ async fn over_cap_event_recall_event_round_trip_returns_verbatim_raw_as_a_tail_t
     let before_bytes = event_bytes(&before);
 
     // The committed pair: Inline view in context, verbatim raw out of
-    // context (the C33 shape — re-verified here because the round trip
+    // context (the shape — re-verified here because the round trip
     // below must return exactly these raw bytes).
     let spilled = before
         .iter()
@@ -655,7 +655,7 @@ async fn over_cap_event_recall_event_round_trip_returns_verbatim_raw_as_a_tail_t
         .expect("input/admitted");
     assert!(admitted.bytes["content"]["kian"].get("raw").is_none());
 
-    // Phase 2: a follow-up input drives the recall turn. The spill
+    // bundle: a follow-up input drives the recall turn. The spill
     // index is deliberately EMPTY (fresh spills are not in it — the
     // startup rebuild predates them): the tool finds the raw through
     // the scan fallback over the stream, the sole truth. The admit
@@ -1079,7 +1079,7 @@ async fn recall_neighbors_returns_the_same_topic_locality_view() {
 
 /// Tool schemas are stable-ordered prompt-prefix content (constraint
 /// 3's gate): the serialization is a golden that does not change
-/// across this card, and repeated calls yield identical bytes.
+/// across this change, and repeated calls yield identical bytes.
 #[test]
 fn recall_tool_schemas_are_stable_ordered_golden() {
     let tools = RecallTools::new(

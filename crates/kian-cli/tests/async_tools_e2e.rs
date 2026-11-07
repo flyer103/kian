@@ -1,4 +1,4 @@
-//! Async `start()`/`stop()` assembled-server e2e (card C37, ADR-008):
+//! Async `start()`/`stop()` assembled-server e2e (ADR-008):
 //! the full `kian serve` super-agent assembly (real engine, real
 //! store, real completion bridge) paired with the **real `kiand`
 //! binary** as a child process, over scripted mock providers — no
@@ -9,7 +9,7 @@
 //! 1. `start_returns_fast_steer_interleaves_and_completion_lands` —
 //!    the worker's `start` resolves as an honest `tool/result` while
 //!    the command runs for seconds; the session answers a **steer**
-//!    during the job (the S2 path interleaved — loop-responsiveness);
+//!    during the job (the path interleaved — loop-responsiveness);
 //!    when the command settles, the completion lands as a durable
 //!    inbox input row (`async-result:{job_id}`) and is consumed at the
 //!    next drain as a visible `async_result` message.
@@ -18,7 +18,7 @@
 //!    result is honest, and the cancelled completion still lands,
 //!    labeled `cancelled`.
 //!
-//! Timing discipline (C15, plan §7 risk 5): seeded, generous bounds;
+//! Timing discipline (plan §7 risk 5): seeded, generous bounds;
 //! the "fast" assertion is measured against a 3-second command with a
 //! bound well under it, never against the command's own completion.
 
@@ -50,7 +50,7 @@ fn router_session() -> SessionId {
 }
 
 // ---------------------------------------------------------------------------
-// The real kiand child process (same harness discipline as s5_byom_e2e)
+// The real kiand child process (same harness discipline as byom_e2e)
 // ---------------------------------------------------------------------------
 
 struct Daemon {
@@ -147,7 +147,7 @@ fn router_script() -> Vec<ScriptedResponse> {
     ]
 }
 
-/// The C27 config shape plus `superagent.async_tools: true` (the C37
+/// The config shape plus `superagent.async_tools: true` (the
 /// gate) and one live endpoint.
 fn write_async_config(
     dir: &std::path::Path,
@@ -493,7 +493,7 @@ async fn start_returns_fast_steer_interleaves_and_completion_lands() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // The S2 path interleaved: a steer is queued **during the job**
+    // The path interleaved: a steer is queued **during the job**
     // (the command is still running; the drain is alive).
     rpc(
         &client,

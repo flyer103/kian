@@ -1,4 +1,4 @@
-//! Thread/Correlation intake projection (card C61, ADR-013 draft).
+//! Thread/Correlation intake projection (ADR-013 draft).
 //!
 //! Kian's intake already has channel-admit idempotency
 //! (`(session, event_id)`, one row per event, never two) and
@@ -29,7 +29,7 @@
 //!   table is explicitly rejected (ADR-013: pre-event durable state
 //!   needing its own ADR; `intake/positioned` as a kind likewise).
 //! - **Correlation is context only** — the derived key surfaces in the
-//!   C33 Inline `neighbors` block ([`neighbors_with_thread_key`]) so
+//!   Inline `neighbors` block ([`neighbors_with_thread_key`]) so
 //!   the Router and workers reach sibling threads through the existing
 //!   recall toolpack. Correlation never routes (001's
 //!   rejected-concepts row, kept): subscription routing stays
@@ -39,7 +39,7 @@
 //! **fan-out grants no authority.** A fanned-out message reaches live
 //! subscribed tickets as *context* bounded by their Mandates
 //! (ADR-012); no admission check runs on it. One trigger fanning out
-//! to many tickets is the existing C38 fan-out mechanics restated
+//! to many tickets is the existing fan-out mechanics restated
 //! under the authority rule — nothing here re-derives it.
 //!
 //! Bundle fence: this module is pure derivation over
@@ -57,7 +57,7 @@ use crate::lark;
 use crate::provenance::parse_channel_marker;
 
 /// The neighbors-block key the derived thread key surfaces under (the
-/// C33 vocabulary: an association id, context for recall hops — never
+/// vocabulary: an association id, context for recall hops — never
 /// a routing input).
 pub const THREAD_KEY_FIELD: &str = "thread_key";
 
@@ -244,13 +244,13 @@ fn encode_component(component: &str) -> String {
 // Neighbors block (correlation is context only)
 // ---------------------------------------------------------------------
 
-/// The C33 Inline `neighbors` block with the derived thread key
+/// The Inline `neighbors` block with the derived thread key
 /// surfaced as context: canonical `topic`/`event_id`, the configured
 /// top-level scalar neighbor fields (the provenance.rs rule — payload
 /// values never override the canonical names, non-scalars never ride),
 /// and `thread_key` when the set derives one.
 ///
-/// Context only: this block feeds recall hops (the C35 toolpack), not
+/// Context only: this block feeds recall hops (the toolpack), not
 /// the subscription rule matcher — correlation never routes.
 pub fn neighbors_with_thread_key(
     event: &ChannelEvent,
@@ -286,7 +286,7 @@ pub fn neighbors_with_thread_key(
 // Source read position
 // ---------------------------------------------------------------------
 
-/// The cursor vocabulary a source kind exposes (C61): how the resume
+/// The cursor vocabulary a source kind exposes: how the resume
 /// cursor is derived from the last admitted event's payload. Serde
 /// names are the config spelling (`lark-message-id | github-since`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-//! E2E API tests (card C13): create → submit → SSE shows
+//! E2E API tests: create → submit → SSE shows
 //! `input/admitted` / `drain/claimed` / turn events → projection reaches
 //! `completed` against a mock provider, over the REAL openai-compat
 //! provider + built-in ReAct loop + local tools assembled by

@@ -1,6 +1,6 @@
-//! Dependency-free derived-event-id mirror (C69).
+//! Dependency-free derived-event-id mirror.
 //!
-//! The SDK is wire-only (C46): its `[dependencies]` allowlist admits no
+//! The SDK is wire-only: its `[dependencies]` allowlist admits no
 //! `uuid` crate, so the derived event id rule is mirrored here in pure
 //! Rust — RFC 4122 v5 is just SHA-1 over `namespace || name` with the
 //! version/variant bits forced in. The golden test in `typed.rs` pins

@@ -24,21 +24,21 @@ tracing.workspace = true
 futures.workspace = true
 serde_yaml.workspace = true
 kian-superagent.workspace = true
-# C54: the S6 dsh bridge mount (worker template, config-gated).
+# the dsh bridge mount (worker template, config-gated).
 kian-dsh.workspace = true
 kian-exec.workspace = true
 kian-sdk.workspace = true
-# C49 webhook receiver: HMAC-SHA256 over the raw body (sha2 already
+# webhook receiver: HMAC-SHA256 over the raw body (sha2 already
 # pinned in the workspace).
 sha2.workspace = true
 hmac.workspace = true
-# kian-62: the serve binary installs a tracing subscriber (RUST_LOG,
+# the serve binary installs a tracing subscriber (RUST_LOG,
 # default warn) so the resident re-arm succession note has an audience.
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
-# C49: the rate-limit rejection's audit line is asserted by capturing
+# the rate-limit rejection's audit line is asserted by capturing
 # the tracing output in-process (no log file, no flaky greps).
 tracing-subscriber.workspace = true
 

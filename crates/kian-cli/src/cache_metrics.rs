@@ -1,4 +1,4 @@
-//! S3 cache-byte stability metrics (card C17).
+//! cache-byte stability metrics.
 //!
 //! The provider-independent proxy for a prefix-cache hit: within one
 //! session, consecutive model requests (`step/request` audit copies, the
@@ -12,7 +12,7 @@
 //! live counter from a drain task; the report is *derived* from the
 //! event stream on read, so it survives restarts and never lives
 //! outside the log. Observability belongs to this crate (kian-cli) and
-//! the orchestrator — never the core crates (C17 "never touch").
+//! the orchestrator — never the core crates ("never touch").
 //!
 //! Comparison granularity: one canonical byte string per message
 //! (`serde_json::to_vec` of the request-body message object — compact,
@@ -199,7 +199,7 @@ pub fn session_cache_report(session: SessionId, events: &[Event]) -> SessionCach
 
 /// Every session with events, ascending — a listing query over the
 /// events table (not metrics code in a core crate), backend-dispatched
-/// since C51 (the same statement on both dialects; only the executor
+/// since (the same statement on both dialects; only the executor
 /// differs).
 pub async fn sessions_with_events(
     store: &kian_store::EventStore,
@@ -251,7 +251,7 @@ pub async fn cache_stats_report(
 }
 
 /// Runs `kian cache-stats`: loads the config (fail-closed), opens the
-/// configured sqlite store read-only-in-intent, derives the S3 report
+/// configured sqlite store read-only-in-intent, derives the report
 /// and renders it (human-readable, or JSON with `json = true`).
 /// Returns the printed output so callers (tests) can assert on it.
 pub async fn run_cache_stats(
@@ -261,7 +261,7 @@ pub async fn run_cache_stats(
 ) -> Result<String, String> {
     let config =
         crate::config::ServeConfig::load(config_path).map_err(|e| format!("config: {e}"))?;
-    // C51: the store follows the config's backend. sqlite opens the
+    // the store follows the config's backend. sqlite opens the
     // configured file (read intent — no mutations happen here); postgres
     // resolves the env-only URL and opens without migrating (the report
     // is a pure projection).
@@ -404,7 +404,7 @@ mod tests {
         assert!(!is_prefix_stable(&a, &d), "shrunk history breaks it");
     }
 
-    /// S3 happy path: consecutive requests with unchanged (only
+    /// happy path: consecutive requests with unchanged (only
     /// extended) history share the byte prefix; nothing counts as an
     /// invalidation.
     #[test]

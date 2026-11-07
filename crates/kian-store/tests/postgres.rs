@@ -1,16 +1,16 @@
-//! Env-gated postgres suite (card C50).
+//! Env-gated postgres suite.
 //!
 //! `KIAN_PG_URL` absent → every test in this file SKIPS with a log line
-//! and never fails (the C44 pattern): default CI needs no postgres.
-//! With the env var set (pointing at a throwaway database — e.g. the
-//! docker recipe C55 documents), each test creates its own private
+//! and never fails (the pattern): default CI needs no postgres.
+//! With the env var set (pointing at a throwaway database — e.g. The
+//! docker recipe documents), each test creates its own private
 //! database `kian_store_test_<uuid>` off the URL so parallel runs never
 //! collide and nothing outside those databases is touched.
 //!
 //! Coverage is the store's core semantics on postgres: CAS fences, batch
 //! atomicity, the single-statement end write (constraint 4), conditional
-//! claim admission (C47), inbox consume + startup scan, the
-//! concurrent-append PK-race classification (C50 §3), export parity
+//! claim admission, inbox consume + startup scan, the
+//! concurrent-append PK-race classification (§3), export parity
 //! against a sqlite store seeded with the same stream, and the
 //! read-only role refusing migrations.
 
@@ -29,7 +29,7 @@ fn gated() -> bool {
     match std::env::var("KIAN_PG_URL") {
         Ok(url) if !url.is_empty() => true,
         _ => {
-            eprintln!("SKIP: KIAN_PG_URL is not set — postgres suite disabled (C50 env gate)");
+            eprintln!("SKIP: KIAN_PG_URL is not set — postgres suite disabled (env gate)");
             false
         }
     }
@@ -317,7 +317,7 @@ async fn pg_end_write_lands_once_and_rejects_the_competing_end() {
 // -- batch atomicity ----------------------------------------------------------
 
 /// A batch commits whole under a passing fence; a stale-epoch or
-/// seq-mismatched batch commits NOTHING (all-or-nothing, C32 semantics
+/// seq-mismatched batch commits NOTHING (all-or-nothing, semantics
 /// via one CTE statement).
 #[tokio::test]
 async fn pg_append_batch_is_all_or_nothing() {
@@ -398,7 +398,7 @@ async fn pg_append_batch_is_all_or_nothing() {
     pg.finish().await;
 }
 
-// -- the PK race (C50 §3) -----------------------------------------------------
+// -- the PK race (§3) -----------------------------------------------------
 
 /// Concurrent same-session appends for one seq: exactly one lands and
 /// every loser gets a *typed* CAS error — the pg PK race (WHERE snapshot
@@ -459,9 +459,9 @@ async fn pg_concurrent_append_pk_race_is_classified_never_leaked() {
     pg.finish().await;
 }
 
-// -- conditional claim admission (C47 on pg) -----------------------------------
+// -- conditional claim admission (on pg) -----------------------------------
 
-/// The C47 conditions hold on postgres with identical observables: no
+/// The conditions hold on postgres with identical observables: no
 /// row → epoch 1; fresh + different holder → `ClaimRejected` carrying
 /// the live holder and expiry; same holder → bumps; expired → takeover.
 #[tokio::test]
@@ -587,7 +587,7 @@ async fn pg_inbox_consume_and_startup_scan() {
 // -- export parity (the compat golden) -----------------------------------------
 
 /// The same stream seeded into sqlite and postgres exports
-/// byte-identically: both the stored envelope column (the S7 export
+/// byte-identically: both the stored envelope column (the export
 /// source) and the scanned/round-tripped events.
 #[tokio::test]
 async fn pg_export_parity_with_sqlite() {
@@ -780,9 +780,9 @@ async fn pg_read_only_role_refuses_migrations() {
     pg.finish().await;
 }
 
-// -- C52: wake transport (LISTEN/NOTIFY) -------------------------------------
+// -- wake transport (LISTEN/NOTIFY) -------------------------------------
 
-/// Notify-after-commit ordering (the C52 named test): a wake
+/// Notify-after-commit ordering (the named test): a wake
 /// notification is observable **only after** the input row it announces
 /// is durable and visible. The listener receives the notification and
 /// — on the same connection turn — the input row is already readable;
@@ -882,7 +882,7 @@ async fn pg_wake_notify_without_a_listener_still_commits_the_input() {
     pg.finish().await;
 }
 
-// -- inbox admission order (v2, C57) -------------------------------------------
+// -- inbox admission order (v2) -------------------------------------------
 
 /// FIFO inside one `eligible_at` millisecond follows admission order on
 /// postgres too: the identity column (`admitted_seq`, v2) breaks the
@@ -950,7 +950,7 @@ async fn pg_v2_upgrade_backfills_legacy_inbox_rows() {
     // DB by checking the applied chain includes v2 and that rows
     // admitted before this test's knowledge of v2 still order by their
     // identity ordinals. The real legacy path is: v1 DB + ALTER —
-    // verified live during C57 against PG 17 (identity backfill).
+    // verified live during against PG 17 (identity backfill).
     let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
         .await
         .expect("applied versions");

@@ -1,4 +1,4 @@
-//! The C54 driver suite: the bridge driven end-to-end against the C53
+//! The driver suite: the bridge driven end-to-end against the
 //! scripted fixture peer through an in-memory `DshCtx` — zero Node/dsh
 //! present. Covers spawn/steer/complete, the replay de-duplication
 //! that makes takeover continuation safe, honest failure on child
@@ -259,7 +259,7 @@ fn deploy() -> Value {
     json!({"text": "deploy the service"})
 }
 
-/// C57 live-run finding (the hang): a steer admitted *after* the drain
+/// live-run finding (the hang): a steer admitted *after* the drain
 /// already reached the safe boundary and went idle must still be
 /// delivered — the driver may not depend on a wake to make progress
 /// (constraint 6: wakes may fold, be lost, or race). The steer row
@@ -391,9 +391,9 @@ async fn takeover_replay_appends_only_new_events() {
     // so "phase 2" is what the log plus continuation produces.
     let script =
         std::env::temp_dir().join(format!("kian-dsh-takeover-{}.jsonl", uuid::Uuid::new_v4()));
-    let phase1 = std::fs::read_to_string(format!("{FIXTURE_DIR}/replay_phase1.jsonl")).unwrap();
-    let phase2 = std::fs::read_to_string(format!("{FIXTURE_DIR}/replay_phase2.jsonl")).unwrap();
-    std::fs::write(&script, &phase1).unwrap();
+    let initial = std::fs::read_to_string(format!("{FIXTURE_DIR}/replay_initial.jsonl")).unwrap();
+    let bundle = std::fs::read_to_string(format!("{FIXTURE_DIR}/replay_bundle.jsonl")).unwrap();
+    std::fs::write(&script, &initial).unwrap();
 
     fn driver_at(script: &std::path::Path) -> DshDriver {
         DshDriver::new(DshDriverConfig {
@@ -409,7 +409,7 @@ async fn takeover_replay_appends_only_new_events() {
         })
     }
 
-    // Phase 1: the drain dies mid-step after the first step completed
+    // built-in: the drain dies mid-step after the first step completed
     // (stream dropped = kill -9 semantics; the stalled child dies with
     // the dropped driver).
     let ctx = FakeCtx::seeded(deploy());
@@ -424,18 +424,18 @@ async fn takeover_replay_appends_only_new_events() {
             None => panic!("phase 1 stream ended before a turn completed"),
         }
     }
-    let after_phase1 = ctx.events_snapshot();
-    let step_requests_1 = after_phase1
+    let after_initial = ctx.events_snapshot();
+    let step_requests_1 = after_initial
         .iter()
         .filter(|ev| ev.kind == EventKind::StepRequest)
         .count();
     assert_eq!(step_requests_1, 1);
 
-    // Phase 2: the takeover drain — a NEW driver (new process) claims
+    // bundle: the takeover drain — a NEW driver (new process) claims
     // (the engine's shape) and spawns a fresh child that REPLAYS its
     // durable log (the same events again) and then continues.
     ctx.claim();
-    std::fs::write(&script, &phase2).unwrap();
+    std::fs::write(&script, &bundle).unwrap();
     let outcomes = drive_to_end(&driver_at(&script), ctx.clone()).await;
     assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
 
@@ -475,7 +475,7 @@ async fn child_crash_mid_step_is_interrupted_never_completed() {
         other => panic!("a child crash must be a soft failure, got {other:?}"),
     }
 
-    // The honest failure trace (C53): an attempt with NO assistant
+    // The honest failure trace: an attempt with NO assistant
     // message after it, and nothing that could read as completion.
     let events = ctx.events_snapshot();
     let attempt_idx = events

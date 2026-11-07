@@ -1,10 +1,10 @@
-//! `DshDriver` — the S6 bridge [`LoopDriver`](kian_core::seams::LoopDriver)
-//! (card C54, DESIGN §6.2 "dsh loop (being-integrated)" row).
+//! `DshDriver` — the bridge [`LoopDriver`](kian_core::seams::LoopDriver)
+//! (DESIGN §6.2 "dsh loop (being-integrated)" row).
 //!
 //! One `dsh --profile sdk` child process per drain episode, spoken to
-//! over stdio JSON-lines with the C53 contract (ready handshake,
+//! over stdio JSON-lines with the contract (ready handshake,
 //! logical session events out, input/steer/interrupt control frames
-//! in). The child owns its interaction; kian owns durability: every
+//! ). The child owns its interaction; kian owns durability: every
 //! mapped event is appended through the [`DshCtx`] fenced path, and
 //! nothing else is ever written.
 //!
@@ -14,7 +14,7 @@
 //! spawns a fresh child. Continuation *is* the replay: dsh's own
 //! durable session log is the child's truth, so a takeover drain (or a
 //! folded-wake episode) spawns a new child that replays its log and
-//! continues — exactly the S1 takeover shape through the bridge. All
+//! continues — exactly the takeover shape through the bridge. All
 //! per-episode state lives inside the outcome stream; dropping the
 //! stream (interrupt, fenced-out drain, settle) drops the child handle
 //! and the pump kills the process — a dropped drain never leaks a dsh
@@ -31,7 +31,7 @@
 //! promoted but died before delivering), and again at absorbed episode
 //! boundaries (`turn/start`/`turn/end`).
 //!
-//! # Replay de-duplication (S1/S6 takeover)
+//! # Replay de-duplication (takeover)
 //!
 //! A fresh child replays its own durable session log from the start.
 //! Every mapped event is first matched against a multiset of the
@@ -45,7 +45,7 @@
 //! # Honesty
 //!
 //! - a contract error or a child crash mid-step yields `SoftFailed` —
-//!   the engine settles `failed`, and the stream keeps C53's honest
+//!   the engine settles `failed`, and the stream keeps 's honest
 //!   failure trace (an attempt with no `assistant/message`);
 //! - a child crash is never reported as completion (constraint 7);
 //! - the step budget yields `Stopped` exactly like the built-in loop's
@@ -82,7 +82,7 @@ pub const DEFAULT_MAX_STEPS: u64 = 32;
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often an idle drain re-checks the inbox while waiting for the
-/// peer's next line (C57). Constraint 6: wakes may fold, be lost, or
+/// peer's next line. Constraint 6: wakes may fold, be lost, or
 /// race — the drain never depends on one to make progress. A step-open
 /// wait is unbounded (the provider call is in flight, exactly like the
 /// built-in loop's); an idle safe-boundary wait is bounded by this
@@ -92,7 +92,7 @@ pub const IDLE_INPUT_RECHECK: Duration = Duration::from_millis(50);
 /// Driver configuration (assembly-owned; `superagent.harness.dsh`).
 #[derive(Debug, Clone)]
 pub struct DshDriverConfig {
-    /// The dsh binary (a real install, or the C54 fixture peer in CI).
+    /// The dsh binary (a real install, or the fixture peer in CI).
     pub command: String,
     /// Child argv. Default [`DEFAULT_DSH_ARGS`].
     pub args: Vec<String>,
@@ -283,7 +283,7 @@ fn is_bridge_kind(kind: EventKind) -> bool {
     )
 }
 
-/// One live bridge session: the child handle plus the C53 mapper
+/// One live bridge session: the child handle plus the mapper
 /// state. Owned by the outcome stream while an episode runs; a stream
 /// that ends between outcomes parks the session in the driver's table
 /// so a later drive of the same hold continues the same child.
@@ -323,7 +323,7 @@ impl SessionTable {
     }
 }
 
-/// The S6 bridge LoopDriver. Cheap to clone; per-session child state
+/// The bridge LoopDriver. Cheap to clone; per-session child state
 /// lives behind the driver-wide table.
 #[derive(Clone, Default)]
 pub struct DshDriver {
@@ -482,7 +482,7 @@ impl DshDriver {
         // the engine promoted before `drive`. Inputs from earlier
         // drains are NOT re-delivered (the child learned them or the
         // drain died in the promote-before-deliver window — the
-        // documented S6 boundary; kian's stream keeps their durable
+        // documented boundary; kian's stream keeps their durable
         // record either way).
         let fresh = fresh_promotions(&events);
         for payload in fresh {
@@ -682,7 +682,7 @@ impl DshDriver {
                 Some(PeerMsg::Exit(code)) => {
                     let mid_step = sess.mapper.step_open();
                     if mid_step {
-                        // C53's honest failure trace: an attempt with no
+                        // 's honest failure trace: an attempt with no
                         // assistant/message — `interrupted`, never
                         // `completed` (constraint 7).
                         return (
@@ -789,7 +789,7 @@ fn consumption_payload(row_payload: &Value) -> Value {
 }
 
 /// Delivers one admitted user message: plain rows ride `input`,
-/// synthetic rows ride `steer` (C53's translation of the engine's
+/// synthetic rows ride `steer` ('s translation of the engine's
 /// inbox conventions).
 async fn deliver_admitted(
     peer: &mut PeerHandle,

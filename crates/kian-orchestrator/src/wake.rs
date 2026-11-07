@@ -1,4 +1,4 @@
-//! The wake registry (DESIGN §2.3, card C9).
+//! The wake registry (DESIGN §2.3).
 //!
 //! Wakes are *advisory* (invariant 2): pendingWake entries are
 //! - **foldable** — any number of wakes for one session collapse into a

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo-restart.sh — the S1 story on a real workload (kian examples/issue-watch v2).
+# demo-restart.sh — the story on a real workload (kian examples/issue-watch v2).
 #
 # Boots the issue-watch, lets at least one poll flow, kill -9's the
 # server mid-watch, reboots it on the SAME sqlite event store, and
@@ -10,7 +10,7 @@
 # boot-derived since cursor means the source is not re-delivered).
 #
 # Options (env):
-#   KEEP_STATE=1   do not wipe .state first (default: fresh demo)
+#   KEEP_STATE=1 do not wipe.state first (default: fresh demo)
 #   CREATE_ISSUE=1 also create a throwaway issue on flyer103/kian before
 #                  the kill, so the post-restart poll sees real new work
 #                  (closes the issue afterwards)

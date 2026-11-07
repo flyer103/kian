@@ -1,4 +1,4 @@
-//! `kian-superagent` — the super-agent bundle (ADR-003, card C23 slice 1:
+//! `kian-superagent` — the super-agent bundle (ADR-003, slice 1:
 //! subscription rules, channel framework, first-class MockChannel).
 //!
 //! DESIGN §7 assigns this crate: "super-agent bundle: Router/Worker
@@ -12,27 +12,27 @@
 //! the server is the [`InboxWriter`] port — write the inbox, then wake.
 //! Assembly (kian-cli) implements the port over the real engine; this
 //! crate never names an execution API. `tests/iron_rule.rs` enforces
-//! that textually (the C13 pattern).
+//! that textually (the pattern).
 //!
 //! Modules:
 //! - [`inbox`] — the `InboxWriter` port (the bundle's whole server surface)
 //! - [`rules`] — declarative `SubscriptionRule` set (config, DESIGN §4.1)
-//! - [`reasons`] — the closed decision-reason vocabularies (C57):
+//! - [`reasons`] — the closed decision-reason vocabularies:
 //!   `IntakeReason` audit/counter codes for every intake decision, and
 //!   the `DecisionKind` judge-side decision-tag convention
 //! - [`provenance`] — the channel-event wrapper riding inside the input
-//!   payload's `content` (the frozen C4 payload contract stays untouched)
-//! - [`registry`] — the passthrough worker registry (C38: topic →
+//!   payload's `content` (the frozen payload contract stays untouched)
+//! - [`registry`] — the passthrough worker registry (topic →
 //!   *set* of worker sessions, the many-to-many fan-out projection):
 //!   disposable, rebuilt from event streams (constraint 1)
-//! - [`stage`] — the Ticket stage projection (C56): "what is it
+//! - [`stage`] — the Ticket stage projection: "what is it
 //!   waiting for" — a pure first-match table over the worker's own
 //!   stream plus two read-side inputs (pending inbox rows, an outbox
 //!   view); a disposable projection, never persisted
 //! - [`subscriptions`] — the subscription service consuming
 //!   `ChannelAdapter` streams, matching rules, admitting + waking —
-//!   one durable row per passthrough subscriber (C38)
-//! - [`intake`] — the Thread/Correlation intake projection (C61,
+//!   one durable row per passthrough subscriber
+//! - [`intake`] — the Thread/Correlation intake projection (
 //!   ADR-013 draft): config-owned canonical thread keys derived from
 //!   provenance/payload fields (`<channel>:<group>#<key>` — after
 //!   derivation the key *is* a topic; the rule matcher is unchanged),
@@ -43,58 +43,58 @@
 //!   routes, and fan-out grants no authority (bounded by Mandate,
 //!   ADR-012)
 //! - [`mock`] — `MockChannel`: the production-quality in-memory channel
-//!   (the S4 IM stand-in and the framework's reference implementation)
-//! - [`lark`] — `LarkChannel`: the first *real* channel adapter (C44),
+//!   (the IM stand-in and the framework's reference implementation)
+//! - [`lark`] — `LarkChannel`: the first *real* channel adapter,
 //!   over the Feishu/Lark open APIs — chat-history poll receive (the
 //!   adapter-side, webhook-free ingestion), IM send, env-gated
 //!   credentials filled by assembly
 //! - [`github`] — `GitHubChannel`: the second *real* channel adapter
-//!   (C48), the S4 "group-chat message + CI events" family —
+//!   , the "group-chat message + CI events" family —
 //!   webhook-shaped receive (delivery id = the idempotency key;
-//!   verification lives in the C49 receiver surface, the adapter maps
+//!   verification lives in the receiver surface, the adapter maps
 //!   only verified deliveries), REST-API send (PR review comment /
 //!   issue comment / PR description, resolving only on acceptance),
 //!   token env-only (`KIAN_GITHUB_TOKEN`; receive needs none),
-//!   untrusted by default (C43)
-//! - [`dsh`] — the S6 dsh mapping contract (C53, ADR-010, DESIGN §16):
+//!   untrusted by default
+//! - [`dsh`] — the dsh mapping contract (ADR-010, DESIGN §16):
 //!   dsh durable session events → the existing Kian durable-event subset
 //!   (bundle-level; no `kian-core` kind changes), the generation rule
 //!   (decode-before-map; foreign generations refused), the pre-flight
 //!   persist-what-you-send rule across the process boundary (request
 //!   bytes before the response is offered, or the bridge stops at an
 //!   honest negative result), and the steer/interrupt control
-//!   translation — the contract C54's bridge implements and any
+//!   translation — the contract 's bridge implements and any
 //!   dsh-side plugin must satisfy
-//! - [`worker`] — Thread delegation (C25): `WorkerSpawner`,
+//! - [`worker`] — Thread delegation: `WorkerSpawner`,
 //!   `WorkerLoopDriver` (a `LoopDriver` decorator adding thread lineage
 //!   and the evidence-gated completion report), the delegation wrapper,
 //!   and the delegation-pair audit helper
 //! - [`templates`] — the Router/Worker `AgentDef` templates and the
-//!   structural profile rules (C25; workers never hold channel tools)
-//! - [`policy`] — the DESIGN §4.2 channel output policies (C26):
+//!   structural profile rules (workers never hold channel tools)
+//! - [`policy`] — the DESIGN §4.2 channel output policies:
 //!   `ImPolicy` (≤100-word rule) and `StructuredPolicy` (section
 //!   contract, honest rejection) — bundle-only placement
-//! - [`router`] — the resident Router profile (C26): judge prompt +
+//! - [`router`] — the resident Router profile: judge prompt +
 //!   bootstrap, `RouterTools` (spawn_worker / reply /
 //!   deliver_structured), the `RouterDriver` residency decorator, and
 //!   the channel registry
-//! - [`metrics`] — `RouterMetrics` (C41): the article-§7.2 batching
+//! - [`metrics`] — `RouterMetrics`: the article-§7.2 batching
 //!   observability over the Router drain — per judge turn, batch size,
 //!   wall duration and amortized per-decision latency; counters + a
 //!   bounded batch histogram, `RouterDriver`-recorded, assembly-snapshotted
-//! - [`recall`] — the `RecallPort` read port (C34): cross-session
+//! - [`recall`] — the `RecallPort` read port: cross-session
 //!   reads (`read_events`, `list_threads`) plus the disposable spill
 //!   index — assembly-implemented over the store's public scan; reads
 //!   only, the bundle names no store
-//! - [`toolpack`] — the recall toolpack (C35): `recall_event` /
+//! - [`toolpack`] — the recall toolpack: `recall_event` /
 //!   `recall_neighbors` / `recall_thread` as one read-only
 //!   `ToolProvider` over `RecallPort`; every output Inline/Spill-shaped
 //!   under its own caps so multi-hop recall composes (the Chain of
 //!   Recall)
-//! - [`timer`] — `TimerChannel` (C40): the timer input source as a
+//! - [`timer`] — `TimerChannel`: the timer input source as a
 //!   production channel adapter — numbered ticks on a configurable
 //!   cadence (clock-injected, `ManualTurnClock`-testable), inbound-only
-//! - [`watchdog`] — Watchdog Session v2 (C40): the model-in-the-loop
+//! - [`watchdog`] — Watchdog Session v2: the model-in-the-loop
 //!   progress judge — a resident worker-template agent whose tools are
 //!   exactly the read/intervene surface (`list_threads`,
 //!   `read_progress` over `RecallPort`; `intervene` as a steer row via

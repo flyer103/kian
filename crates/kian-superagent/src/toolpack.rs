@@ -1,7 +1,7 @@
-//! The recall toolpack (card C35) — the Chain of Recall.
+//! The recall toolpack — the Chain of Recall.
 //!
 //! Three read-only [`ToolProvider`] tools mounted on the Router and
-//! (opt-in) worker templates:
+//! (opt-) worker templates:
 //!
 //! - `recall_event(event_id)` — surfaces a spilled channel raw: the
 //!   Inline/Spill-shaped view plus next-hop ids;
@@ -12,7 +12,7 @@
 //!   the worker's `thread/completed`) and the final summary, with the
 //!   worker session as the next hop.
 //!
-//! Every output is itself Inline/Spill-shaped with the C33 shaping
+//! Every output is itself Inline/Spill-shaped with the shaping
 //! vocabulary (`first_chars` excerpts, `neighbor_fields` association
 //! ids) so multi-hop recall composes: each hop returns summaries and
 //! ids, never an unbounded raw — the verbatim-in-one-output bound is
@@ -28,7 +28,7 @@
 //! this module names no store, no hold, no session machinery (the
 //! crate iron rule holds).
 //!
-//! Untrusted hygiene (C43): a surfaced raw re-wraps through
+//! Untrusted hygiene: a surfaced raw re-wraps through
 //! [`raw_view`](crate::provenance::raw_view) keyed off the sibling
 //! admitted content's bit, so the untrusted marker survives every hop
 //! of a recall chain.
@@ -75,8 +75,8 @@ pub const DEFAULT_OUTPUT_CAP_BYTES: usize = 8_192;
 /// on either side of the anchor are considered neighbors.
 pub const DEFAULT_NEIGHBOR_WINDOW: u64 = 3;
 
-/// The toolpack's caps (C35). The excerpts and association ids reuse
-/// the C33 [`ShapingConfig`]; the verbatim bound is this config's own.
+/// The toolpack's caps. The excerpts and association ids reuse
+/// the [`ShapingConfig`]; the verbatim bound is this config's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecallToolConfig {
     /// Maximum serialized bytes of a single value surfaced verbatim in
@@ -98,7 +98,7 @@ impl Default for RecallToolConfig {
 }
 
 /// The recall toolpack as one [`ToolProvider`]: reads through the
-/// shared [`RecallPort`], shapes every output with the C33 vocabulary
+/// shared [`RecallPort`], shapes every output with the vocabulary
 /// under its own caps, and mutates nothing. Clone shares the port.
 pub struct RecallTools {
     port: Arc<dyn RecallPort>,
@@ -110,7 +110,7 @@ pub struct RecallTools {
 impl RecallTools {
     /// A toolpack over `port` (assembly-implemented), anchored at the
     /// resident Router `router` (threads list off its stream), with the
-    /// C33 shaping vocabulary and the toolpack caps.
+    /// shaping vocabulary and the toolpack caps.
     #[must_use]
     pub fn new(
         port: Arc<dyn RecallPort>,
@@ -187,7 +187,7 @@ impl RecallTools {
     }
 
     /// The untrusted bit of the admitted content sibling of a spilled
-    /// raw (C43): `event_id` is the join key, the sibling sits at most
+    /// raw: `event_id` is the join key, the sibling sits at most
     /// one seq earlier in the same fenced consumption batch.
     async fn sibling_untrusted(
         &self,
@@ -564,7 +564,7 @@ fn serialized_len(value: &Value) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// A strictly-shorter excerpt of the serialized value (the C33 rule:
+/// A strictly-shorter excerpt of the serialized value (the rule:
 /// shaping must never smuggle the complete over-cap payload back into
 /// a view, even for a tiny cap or a large `first_chars`).
 fn excerpt_of(value: &Value, first_chars: usize) -> String {
@@ -579,7 +579,7 @@ fn excerpt_of(value: &Value, first_chars: usize) -> String {
 
 /// The association ids of a payload: canonical `topic`/`event_id` plus
 /// any configured neighbor fields that carry scalar values — the same
-/// rule the C33 shaper applies (v1: payload-field-driven only).
+/// rule the shaper applies (v1: payload-field-driven only).
 fn association_ids(
     payload: &Value,
     topic: Option<&str>,
@@ -604,7 +604,7 @@ fn association_ids(
     Value::Object(neighbors)
 }
 
-/// One surfaced value, Inline/Spill-shaped with the C33 vocabulary
+/// One surfaced value, Inline/Spill-shaped with the vocabulary
 /// under the toolpack's own verbatim bound: verbatim at or below the
 /// cap; above it the Inline view (excerpt + continuation handle), so
 /// every hop of a recall chain stays bounded and composable.

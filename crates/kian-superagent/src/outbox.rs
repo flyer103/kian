@@ -1,11 +1,11 @@
-//! Outbox bounded retry (card C62, DESIGN §4.2 + §4.7): stored work
+//! Outbox bounded retry (DESIGN §4.2 + §4.7): stored work
 //! for the **write side** — reference 003's rule ("outgoing messages
 //! are stored and sent as stored work, retried with backoff … a
 //! message waits while an earlier one of the same Ticket to the same
 //! conversation has not gone out, until that one has failed three
 //! times in a row and shows as a problem").
 //!
-//! ## Delivery-kind reuse audit (the card's Step-1 gate)
+//! ## Delivery-kind reuse audit (the Step-1 gate)
 //!
 //! Three retry surfaces already exist; none is reusable here:
 //!
@@ -36,22 +36,22 @@
 //!
 //! ## Rebuild classification (why `tool/result` is load-bearing)
 //!
-//! A bare intent + error result is ambiguous between a C58
+//! A bare intent + error result is ambiguous between a
 //! speak-suppression (never sent, never outbox work) and a parked
 //! delivery. The park tool error carries the stable prefix
-//! [`PARK_ERROR_PREFIX`] (the C57 stable-vocabulary precedent), so a
+//! [`PARK_ERROR_PREFIX`] (the stable-vocabulary precedent), so a
 //! rebuild classifies each intent exactly:
 //!
 //! | `tool/result` for the intent | State | Re-driven at boot? |
 //! |---|---|---|
 //! | none yet | [`OutboxState::Pending`] (in-flight; kill -9 mid-retry) | **yes** (at-least-once) |
-//! | error carrying `outbox park:` — bare, or behind the stable `ToolError::Execution` Display wrapper `"tool execution failed: "` that the live loop writes (kian-76) | [`OutboxState::Parked`] | no — visible at boot, on the stage arm and the board; a person releases |
+//! | error carrying `outbox park:` — bare, or behind the stable `ToolError::Execution` Display wrapper `"tool execution failed: "` that the live loop writes | [`OutboxState::Parked`] | no — visible at boot, on the stage arm and the board; a person releases |
 //! | error, other text | suppressed / invalid args / legacy single failure | no (re-driving would duplicate suppressed sends) |
 //! | ok | delivered (its `channel/delivered` exists) | no |
 //!
 //! ## Ordering and identity
 //!
-//! - **Conversation** = `(channel, speak_key(target))` — the C58
+//! - **Conversation** = `(channel, speak_key(target))` — the
 //!   canonicalization reused verbatim.
 //! - **Ticket** = the intent's `correlation` tool argument (optional,
 //!   additive — the same vocabulary `spawn_worker` documents), the
@@ -67,7 +67,7 @@
 //!
 //! New deliveries under an enabled outbox stamp additive `attempt`
 //! and `first_attempt_ms` keys on the `channel/delivered` payload
-//! (the C39 additive-marker precedent; the C4/C18 schemas stay frozen
+//! (the additive-marker precedent; the schemas stay frozen
 //! — legacy receipts parse unchanged, and with the outbox off the
 //! payload bytes are identical to today's).
 
@@ -106,11 +106,11 @@ pub const DEFAULT_BACKOFF_CAP_MS: u64 = 60_000;
 pub const PARK_ERROR_PREFIX: &str = "outbox park:";
 
 /// Reads the attempt count out of a park-shaped tool error, if it is
-/// one (kian-76). The live `tool/result` path never carries the bare
+/// one. The live `tool/result` path never carries the bare
 /// [`PARK_ERROR_PREFIX`]: the Router maps a park to
 /// `ToolError::Execution(msg)` and the loop renders that enum's
 /// Display — `"tool execution failed: {msg}"` — into
-/// `content.output.error`. The C65 run2 proved the divergence: a
+/// `content.output.error`. The run2 proved the divergence: a
 /// bare-prefix-only match classified every live park as an ordinary
 /// error and the boot rebuild reported `parked=0` while two
 /// deliveries sat parked. Both shapes parse; the wrapper prefix is
@@ -130,7 +130,7 @@ fn park_attempts(error_text: &str) -> Option<u32> {
 
 /// The outbox retry configuration (`superagent.outbox`). An **absent**
 /// section is a disabled outbox — the send path is byte-identical to
-/// the pre-C62 behavior (one attempt, the model may retry in-turn).
+/// the legacy behavior (one attempt, the model may retry in-turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxConfig {
     /// Total attempts per delivery before parking (≥ 1).
@@ -178,7 +178,7 @@ impl OutboxConfig {
     }
 }
 
-/// Clock + sleeper for the retry driver — the C41 `TurnClock`
+/// Clock + sleeper for the retry driver — the `TurnClock`
 /// discipline applied to waiting: assembly injects the system clock,
 /// tests a manual one that **records** every sleep instead of
 /// sleeping, so the backoff schedule is asserted exactly (the
@@ -254,7 +254,7 @@ impl RetryClock for ManualRetryClock {
 }
 
 /// The canonical conversation key: `(channel, speak_key(target))` —
-/// the same canonicalization the C58 ack-once memory keys on, reused
+/// the same canonicalization the ack-once memory keys on, reused
 /// so the two projections can never disagree about identity.
 #[must_use]
 pub fn conversation_key(channel: &str, target: &Value) -> String {
@@ -336,7 +336,7 @@ fn is_delivery_tool(name: &str) -> bool {
 /// accepted: a *different* ticket's receipt on the same conversation
 /// can satisfy a result-less intent — under concurrent tickets that
 /// trades one bounded duplicate send (at-least-once, the documented
-/// C62 semantics) against unbounded re-drives.
+/// semantics) against unbounded re-drives.
 #[must_use]
 pub fn outbox_pending(events: &[Event]) -> Vec<OutboxEntry> {
     // call_id → position in `intents` (results may follow any later
@@ -442,7 +442,7 @@ pub fn outbox_pending(events: &[Event]) -> Vec<OutboxEntry> {
         .collect()
 }
 
-/// The rebuild snapshot answering the read side: the C56 stage arm
+/// The rebuild snapshot answering the read side: the stage arm
 /// and the `kian tickets` board.
 #[derive(Debug, Clone, Default)]
 pub struct OutboxStatus {
@@ -472,7 +472,7 @@ impl OutboxStatus {
     }
 
     /// Whether any delivery is pending or parked for `conversation` —
-    /// the attribution both sides can derive (kian-76): a live
+    /// the attribution both sides can derive: a live
     /// intent's ticket key is the freeform `correlation` the model
     /// passed and matches no thread alias, but the target
     /// conversation is computable from the worker's own stream
@@ -518,16 +518,16 @@ impl OutboxStatus {
     }
 }
 
-/// The real [`OutboxView`] (C56's arm 1, wired by this card): a
+/// The real [`OutboxView`] ('s arm 1, wired by this change): a
 /// pending/parked delivery lights the `delivery-retry` stage for the
 /// ticket it belongs to. Two attribution inputs, either sufficing
-/// (kian-76):
+///
 ///
 /// - `aliases` — the thread's own id string plus the topics its
 ///   worker owns in the registry projection (a `correlation` may
 ///   name either);
 /// - `conversations` — the target conversation keys the worker's own
-///   stream implies ([`worker_conversation_keys`]). The live C65 run
+///   stream implies ([`worker_conversation_keys`]). The live run
 ///   proved alias-only attribution blind: the model passes a
 ///   freeform correlation (the triggering event id) that matches no
 ///   alias, while the conversation is derivable on both sides.
@@ -580,18 +580,18 @@ impl OutboxView for ThreadOutboxView {
 }
 
 /// The outbox conversation keys a worker's own stream implies
-/// (kian-76): every channel-event wrapper the stream carries — an
+/// every channel-event wrapper the stream carries — an
 /// `input/admitted` content, a `thread/started` task, or that task's
 /// `content` (the shapes `spawn_topic` reads, plus the **string**
-/// forms the live C65 run proved the model passes: the wrapper
+/// forms the live run proved the model passes: the wrapper
 /// serialized inside `task`, and a `correlation` naming the topic —
-/// the kian-75 gap shapes) — contributes its marker topic, and each
+/// the gap shapes) — contributes its marker topic, and each
 /// topic derives the conversation keys of the conversations it names
 /// (for the GitHub thread-key topics,
 /// [`crate::github::topic_conversation_keys`]).
 ///
-/// Registry-independent on purpose: the live C65 run had no topic
-/// binding at all (the kian-75 gap) yet every wrapper rode the
+/// Registry-independent on purpose: the live run had no topic
+/// binding at all (the gap) yet every wrapper rode the
 /// worker's stream — the durable log is the attribution source that
 /// cannot be skipped. Pure over events; sorted and deduped.
 #[must_use]
@@ -630,7 +630,7 @@ fn candidate_topics(value: &Value) -> Vec<String> {
             topics.push(topic);
         }
     }
-    // The wrapper serialized as a string under `task` (kian-75's live
+    // The wrapper serialized as a string under `task` ('s live
     // gap shape: the model stringifies the wrapper the spawner then
     // admits verbatim).
     if let Some(task) = obj.get("task").and_then(Value::as_str)
@@ -650,7 +650,7 @@ fn candidate_topics(value: &Value) -> Vec<String> {
     topics
 }
 
-/// Counters for the retry driver (the C58 `SpeakMetrics` pattern —
+/// Counters for the retry driver (the `SpeakMetrics` pattern —
 /// plain atomics, audit-visible, snapshot-stable).
 #[derive(Debug, Default)]
 pub struct OutboxMetrics {
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn rebuild_parses_the_live_tool_error_wrapped_park() {
-        // kian-76 (C65 run2, G3a): the live `tool/result` shape wraps
+        // (run2, G3a): the live `tool/result` shape wraps
         // the park message in `ToolError::Execution`, whose Display
         // adds "tool execution failed: " before PARK_ERROR_PREFIX —
         // the bare-prefix match classified every live park as an
@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn conversation_attribution_matches_what_both_sides_derive() {
-        // kian-76 (C65 run2, G3b): a live intent's ticket key is the
+        // (run2, G3b): a live intent's ticket key is the
         // freeform correlation the model passed — no thread alias ever
         // matches it. The target conversation is derivable on both
         // sides regardless: the intent carries it verbatim, and a
@@ -1324,7 +1324,7 @@ mod tests {
         // The worker's own stream admitted the live shape (run1
         // worker3 export, verbatim structure): the wrapper serialized
         // as a STRING under `task`, plus a correlation naming the
-        // thread-key topic — no registry binding needed (the kian-75
+        // thread-key topic — no registry binding needed (the
         // live gap).
         let wrapper_string = json!({
             "kian": {

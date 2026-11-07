@@ -2,7 +2,7 @@
 
 - **Status**: proposed
 - **Date**: 2026-11-01
-- **Context**: S5 requires a cloud loop to keep working while its execution endpoint
+- **Context**: requires a cloud loop to keep working while its execution endpoint
   (`kiand`) is offline, and to recover cleanly across a server crash: a command issued while
   the endpoint is down must not vanish, and a crash mid-flight must not produce a phantom
   result or a lost one. The event stream is the sole truth for *sessions*, but a queued
@@ -16,7 +16,7 @@
   2. **At-least-once**: on reconnect — and after a server restart — `pending` *and*
      `inflight` rows are re-driven (`inflight` is presumed lost). A command re-delivered
      across a crash window may therefore execute twice on the endpoint. This is documented
-     and caller-tolerated in v1; endpoint-side dedupe is an explicit Phase-3 hook.
+     and caller-tolerated in v1; endpoint-side dedupe is an explicit hook.
   3. **Command-id correlation**: the durable `command_id` is derived deterministically from
      the calling tool-call id (UUIDv5), so session recovery and re-execution collapse onto
      the same row — one row, one dispatch, ever; a settled row answers duplicates from its
@@ -29,8 +29,8 @@
 - **Alternatives considered**:
   1. Exactly-once via endpoint-side idempotency keys — requires durable state on the
      endpoint, which the endpoint deliberately does not keep (brain–hand separation);
-     deferred to Phase 3.
-  2. Fail-fast while offline (no queue) — fails S5's core semantic (offline enqueue parks
+     deferred to.
+  2. Fail-fast while offline (no queue) — fails 's core semantic (offline enqueue parks
      durable, resolves when the endpoint returns).
   3. Queue as session events — violates the event contract: a queued command is not a
      session fact until its result enters the loop's `tool/call`/`tool/result` path.

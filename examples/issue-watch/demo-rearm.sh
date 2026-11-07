@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# demo-rearm.sh — the kian-62 acceptance run (examples/issue-watch).
+# demo-rearm.sh — the acceptance run (examples/issue-watch).
 #
 # Two acts, both against the real DeepSeek endpoint, real gh (dry-run),
 # and the real sqlite event store:
@@ -12,20 +12,20 @@
 #   store: the NEXT timer tick re-opens the SAME pinned session (a
 #   failed end projects idle) and judging resumes there. No successor.
 #
-#   ACT B — the real terminal death. We boot on a copy of the C61 live
+#   ACT B — the real terminal death. We boot on a copy of the live
 #   run's event store (.state/kian.db), whose pinned router session
 #   ...c060 ended session/ended{completed} at seq 211 (the lifetime
 #   iteration budget exhausted: iteration 32 hit the cap after tick 15)
-#   — the exact frozen state kian-62 exists for. On boot the re-arm
+#   — the exact frozen state exists for. On boot the re-arm
 #   walk arms the deterministic successor uuid5(c060,
 #   "kian:resident:re-arm"); the successor's first input is the
 #   [re-arm] cause prompt; ticks 1..15 dedupe against the frozen
 #   stream's committed rows and tick 16 is judged on the successor.
 #   No operator action.
 #
-# Options (env): DRY_RUN (default 1), KEEP_STATE=1 keep .state-rearm-*.
+# Options (env): DRY_RUN (default 1), KEEP_STATE=1 keep.state-rearm-*.
 #
-# Run from anywhere; artifacts land in .state-rearm-{a,b}/.
+# Run from anywhere; artifacts land in.state-rearm-{a,b}/.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -64,7 +64,7 @@ cfg = re.sub(r'session_id: "[^"]+"', f'session_id: "{pinned}"', cfg)
 cfg = re.sub(r'interval_ms: \d+', f'interval_ms: {interval}', cfg)
 cfg = re.sub(r'base_url: "[^"]+"', f'base_url: "{base}"', cfg)
 # The demo's residents must outlive the stock lifetime budget (32) —
-# that budget is exactly what froze the C61 router (§RUNLOG 2) and it
+# that budget is exactly what froze the router (§) and it
 # would end the re-armed successor mid-demo too.
 cfg = re.sub(r'max_iterations: \d+', 'max_iterations: 500', cfg)
 open(out, "w").write(cfg)
@@ -163,7 +163,7 @@ stop_serve
 
 echo
 echo "==================================================================="
-echo "ACT B — the real C61 frozen store: successor re-arm without operator action"
+echo "ACT B — the real frozen store: successor re-arm without operator action"
 echo "==================================================================="
 
 rm -rf .state-rearm-b
@@ -173,7 +173,7 @@ if [[ -f .state/kian.db ]]; then
   [[ -f .state/kian.db-wal ]] && cp .state/kian.db-wal .state-rearm-b/kian.db-wal
   [[ -f .state/kian.db-shm ]] && cp .state/kian.db-shm .state-rearm-b/kian.db-shm
 else
-  echo "C61 store .state/kian.db not found — ACT B needs it" >&2; exit 1
+  echo "frozen store .state/kian.db not found — ACT B needs it" >&2; exit 1
 fi
 DB_B=.state-rearm-b/kian.db
 PINNED_TAIL="$(SQL "$DB_B" "select count(*) from events where session='$PINNED_B'")"

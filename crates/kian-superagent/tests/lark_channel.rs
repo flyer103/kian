@@ -1,4 +1,4 @@
-//! C44 lark-channel integration tests: a scripted in-process HTTP mock
+//! lark-channel integration tests: a scripted in-process HTTP mock
 //! serving canned Feishu open-API responses (token, chat history, send)
 //! — zero credentials, zero network. The live smoke test at the bottom
 //! is env-gated (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`), `#[ignore]`d
@@ -42,7 +42,7 @@ struct FeishuMock {
     token_reject: Mutex<Option<(i64, String)>>,
     token_calls: Mutex<u64>,
     /// The `User-Agent` of every request the token/history/send
-    /// endpoints saw (the kian-74 check applied to lark too).
+    /// endpoints saw (the check applied to lark too).
     user_agents: Mutex<Vec<String>>,
 }
 
@@ -393,7 +393,7 @@ async fn poll_failures_are_honest_but_not_fatal() {
 // Send (honest receipts only).
 // ---------------------------------------------------------------------------
 
-/// kian-74 (the lark half of the check): every request the adapter
+/// (the lark half of the check): every request the adapter
 /// puts on the wire (tenant-token POST, history GET, send POST)
 /// carries a `kian/…` User-Agent — Feishu tolerates a missing one
 /// today, but the adapter must not depend on that.
@@ -615,7 +615,7 @@ async fn lark_event_flows_through_classes_rules_and_provenance_untrusted() {
             }]),
             Arc::clone(&inbox) as Arc<dyn InboxWriter>,
         )
-        // C43/C44: lark is default-untrusted — assembly passes the
+        // lark is default-untrusted — assembly passes the
         // channel name in; the wrapper gains the bit.
         .with_untrusted_channels(BTreeSet::from(["lark".to_string()])),
     );
@@ -648,7 +648,7 @@ async fn lark_event_flows_through_classes_rules_and_provenance_untrusted() {
     assert_eq!(key.as_deref(), Some("om_1")); // event_id idempotency key
     assert_eq!(inbox.wakes.lock().unwrap().len(), 1);
 
-    // Provenance: the wrapper is the C33/C43 `{"kian":…}` channel-event
+    // Provenance: the wrapper is the `{"kian":…}` channel-event
     // wrapper with the untrusted bit set, and the verbatim lark raw
     // (with the adapter-declared explicit flag) inside.
     let kian = &payload["kian"];
@@ -714,7 +714,7 @@ async fn lark_live_smoke_env_gated() {
             .send(ChannelDelivery {
                 channel: "lark".into(),
                 target: json!({"chat_id": chat}),
-                content: json!({"text": "kian lark live smoke (C44)"}),
+                content: json!({"text": "kian lark live smoke"}),
             })
             .await
             .expect("live send accepted");
@@ -739,7 +739,7 @@ async fn lark_live_smoke_env_gated() {
 }
 
 // ---------------------------------------------------------------------------
-// C61: the chat-history cursor helper (read-position derivation, fixture
+// the chat-history cursor helper (read-position derivation, fixture
 // payloads only)
 // ---------------------------------------------------------------------------
 

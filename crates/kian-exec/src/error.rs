@@ -1,4 +1,4 @@
-//! Server-side connection failures (card C19).
+//! Server-side connection failures.
 //!
 //! Transport loss is *expected* (intermittent endpoint presence is the norm,
 //! DESIGN §4.3): it fails the in-flight command futures honestly and triggers

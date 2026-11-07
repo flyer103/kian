@@ -1,7 +1,7 @@
-//! Watchdog Session v2 (card C40, DESIGN §4.3) — the model-in-the-loop
+//! Watchdog Session v2 (DESIGN §4.3) — the model-in-the-loop
 //! progress judge.
 //!
-//! The v1 [`HeartbeatWatchdog`](kian_exec::HeartbeatWatchdog) (C21)
+//! The v1 [`HeartbeatWatchdog`](kian_exec::HeartbeatWatchdog)
 //! watches *endpoint health* — heartbeat freshness over the endpoint
 //! registry. The v2 watchdog watches *worker progress*: a resident
 //! worker-template agent (own `main` slot) whose every input is a
@@ -30,7 +30,7 @@
 //! never happened (the stream shows no check ran).
 //!
 //! [`WatchdogProfile::bootstrap`] admits the judge prompt once
-//! (idempotent per [`WATCHDOG_BOOTSTRAP_KEY`]) — the same C23 shape
+//! (idempotent per [`WATCHDOG_BOOTSTRAP_KEY`]) — the same shape
 //! the resident Router uses.
 
 use std::sync::Arc;
@@ -110,7 +110,7 @@ impl WatchdogPrompt {
         self.template.clone()
     }
 
-    /// Renders the bootstrap prompt of a re-armed successor (kian-62):
+    /// Renders the bootstrap prompt of a re-armed successor:
     /// the observable cause prefix (frozen predecessors + reasons)
     /// followed by the plain watchdog prompt. Rendered once at
     /// bootstrap and persisted — replays are byte-identical.
@@ -138,10 +138,10 @@ pub struct WatchdogProfile {
     /// `main` slot; tools exactly [`WATCHDOG_TOOLS`]).
     pub agent: AgentDef,
     pub prompt: WatchdogPrompt,
-    /// kian-62 re-arm: the ended, frozen predecessors of `session`
+    /// re-arm: the ended, frozen predecessors of `session`
     /// (empty = generation 0, the configured pinned session itself).
     pub re_arm: Vec<crate::rearm::EndedResident>,
-    /// C63: the policy version whose label rides the bootstrap prompt
+    /// the policy version whose label rides the bootstrap prompt
     /// as a `[policy <label>]` header (rendered once at bootstrap,
     /// wrapped around the *rendered* prompt — the template text is
     /// untouched). `None` (absent `superagent.policy.version`) renders
@@ -164,18 +164,18 @@ impl WatchdogProfile {
         }
     }
 
-    /// Bootstraps the resident session via the C23 admit path: one
+    /// Bootstraps the resident session via the admit path: one
     /// durable judge-prompt input to the configured session id — the
     /// first hold appends `session/created`. Idempotent per
     /// [`WATCHDOG_BOOTSTRAP_KEY`], so assembly may call it at every
     /// startup.
     ///
-    /// kian-62: for a re-armed successor (`re_arm` non-empty) the key
+    /// for a re-armed successor (`re_arm` non-empty) the key
     /// becomes the per-generation
     /// [`watchdog:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
     /// and the payload carries the observable re-arm cause.
     ///
-    /// C63: the configured policy version's label wraps the rendered
+    /// the configured policy version's label wraps the rendered
     /// prompt as a `[policy <label>]` header — added at render, so the
     /// template text and every legacy persisted prompt stay
     /// byte-identical; a live session's persisted prompt is never
@@ -202,7 +202,7 @@ impl WatchdogProfile {
     }
 }
 
-/// The watchdog agent template (C40): worker-template shape — one
+/// The watchdog agent template: worker-template shape — one
 /// strong `main` slot, generous budgets — with the toolset exactly
 /// the read/intervene surface ([`WATCHDOG_TOOLS`]). Workers act; the
 /// watchdog reads and intervenes.
@@ -419,7 +419,7 @@ impl WatchdogTools {
             )));
         };
         // Durable first (the admit future resolves only on commit),
-        // then the advisory wake — the C23 ordering, never reversed.
+        // then the advisory wake — the ordering, never reversed.
         let receipt = self
             .inbox
             .admit(
@@ -447,7 +447,7 @@ impl WatchdogTools {
     /// the ≤100-word rule shapes the text BEFORE the send, the
     /// delivery goes through the channel adapter, and
     /// `channel/delivered` lands on the watchdog's own stream only
-    /// after the send succeeded (the Router `reply` discipline, C26).
+    /// after the send succeeded (the Router `reply` discipline).
     async fn escalate(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let port = self.hold.port().ok_or_else(|| {
             ToolError::Execution("watchdog stream port not installed for this hold".into())

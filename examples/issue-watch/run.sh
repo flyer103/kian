@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# run.sh — boot the issue-watch agent (kian examples/issue-watch, card C60).
+# run.sh — boot the issue-watch agent (kian examples/issue-watch).
 #
 # What it does:
 #   1. exports NO_PROXY (localhost e2e gotcha) and DRY_RUN (default 1:
 #      drafts only; DRY_RUN=0 is the only way a real comment is posted)
 #   2. sources ~/.hermes/.env for DEEPSEEK_API_KEY (presence-checked,
 #      never printed)
-#   3. boots `kian serve` on 127.0.0.1:7460 with ./config.yaml
+#   3. boots `kian serve` on 127.0.0.1:7460 with./config.yaml
 #   4. submits the charter (triage-prompt.md) to the fixed Router session,
 #      idempotently — safe to re-run after any restart
 #   5. prints how to inspect the durable audit streams

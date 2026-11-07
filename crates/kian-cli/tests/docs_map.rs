@@ -1,4 +1,4 @@
-//! Docs-map consistency check (card C17 closeout): every relative
+//! Docs-map consistency check (closeout): every relative
 //! link in the authored docs (README, AGENTS, SPEC, DESIGN, ADRs, the
 //! materials digest) resolves to a file that exists. Frozen reference
 //! snapshots in `a vendored archive/` are archived source material, not
@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 /// Authored markdown surfaces of the docs map (AGENTS.md §Docs map).
 /// `design/EVENT-MODEL.md` is the normative event contract, so its
 /// outbound links are part of the enforced set too.
-const AUTHORED: [&str; 6] = [
+const AUTHORED: [&str; 7] = [
     "README.md",
     "AGENTS.md",
     "docs/SPEC.md",
     "design/DESIGN.md",
     "design/EVENT-MODEL.md",
+    "design/API-CONTRACT.md",
     "the design notes",
 ];
 
@@ -118,11 +119,11 @@ fn adr_series_is_contiguous_from_001() {
     }
 }
 
-/// Every workspace crate is mapped in the docs (Phase-2 closeout): the
-/// crate map in DESIGN §7 and the README must each name all of
-/// `crates/*` — Phase 2 added `kian-exec`, `kian-superagent` and
-/// `kiand`, and a future crate that forgets the docs map fails here
-/// rather than silently disappearing from the documentation.
+/// Every workspace crate is mapped in the docs: the crate map in
+/// DESIGN §7 and the README must each name all of `crates/*` — the
+/// workspace includes `kian-exec`, `kian-superagent` and `kiand`, and a
+/// future crate that forgets the docs map fails here rather than
+/// silently disappearing from the documentation.
 #[test]
 fn every_workspace_crate_is_mapped_in_the_docs() {
     let root = repo_root();
@@ -144,7 +145,7 @@ fn every_workspace_crate_is_mapped_in_the_docs() {
 
     assert!(
         crates.len() >= 11,
-        "expected the 11-member Phase-2 workspace, found {crates:?}"
+        "expected the workspace crates, found {crates:?}"
     );
     let mut failures = Vec::new();
     for name in &crates {
@@ -164,32 +165,35 @@ fn every_workspace_crate_is_mapped_in_the_docs() {
     );
 }
 
-/// Phase-3 closeout (C45): the SPEC §5 Phase-3 table must name every
-/// capability the round landed, and the Phase-4 deferral table must
-/// carry the moved items. The SPEC is the contract — a capability
-/// that ships without a row here has silently left the contract, and
-/// a deferred item that stays in the Phase-3 table misstates scope.
+/// The SPEC §5 capability table must name every landed capability, and
+/// the deferral table must carry the moved items. The SPEC is the
+/// contract — a capability that ships without a row here has silently
+/// left the contract, and a deferred item that stays in a capability
+/// table misstates scope.
 #[test]
-fn spec_phase3_table_names_each_landed_capability() {
+fn spec_capability_table_names_each_landed_capability() {
     let root = repo_root();
     let spec = std::fs::read_to_string(root.join("docs/SPEC.md")).expect("SPEC.md");
 
-    // The §5 Phase-3 section: from its heading to the next heading of
-    // any level (Phase 4 / Deferred are separate sections).
-    let start = spec.find("### Phase 3").expect("SPEC §5 Phase-3 heading");
+    // The §5 recall/channels capability section: from its heading to the
+    // next heading of any level (the hosted set and Deferred are separate
+    // sections).
+    let start = spec
+        .find("### Recall, admission economics, channels")
+        .expect("SPEC §5 recall/channels heading");
     let end = spec[start..]
         .find("\n#")
         .map(|i| start + i)
         .unwrap_or(spec.len());
     let section = &spec[start..end];
 
-    // One keyword per landed round-3 card (C31–C44) plus the S7
-    // record; each must appear in the Phase-3 section's text.
+    // One keyword per landed capability plus the audit-export record;
+    // each must appear in the section text.
     let landed = [
         "Inline/Spill",
         "Recall toolpack",
         "Two-level",
-        "`start()`/`stop()`",
+        "`start`/`stop`",
         "fan-out",
         "Speculative",
         "Watchdog Session v2",
@@ -197,7 +201,7 @@ fn spec_phase3_table_names_each_landed_capability() {
         "Ablation",
         "Untrusted-input marking",
         "lark channel adapter",
-        "(S7)",
+        "Audit export/replay tooling",
     ];
     let missing: Vec<&str> = landed
         .iter()
@@ -206,21 +210,23 @@ fn spec_phase3_table_names_each_landed_capability() {
         .collect();
     assert!(
         missing.is_empty(),
-        "SPEC §5 Phase-3 table is missing landed capabilities: {missing:?}"
+        "SPEC §5 capability table is missing landed capabilities: {missing:?}"
     );
     assert!(
-        section.contains("**demonstrated**"),
-        "S7 must be recorded as demonstrated in the Phase-3 table"
+        section.contains("**Demonstrated**"),
+        "audit export/replay must be recorded as demonstrated"
     );
 
-    // The Phase-4 deferral table carries the moved items with their
-    // justifications (round-3 plan §3).
-    let phase4_start = spec.find("### Phase 4").expect("SPEC Phase-4 heading");
-    let phase4 = &spec[phase4_start..];
+    // The hosted-set table carries the moved items with their
+    // justifications.
+    let hosted_start = spec
+        .find("### Hosted foundation, SDK freeze, ecosystem surfaces")
+        .expect("SPEC hosted-set heading");
+    let hosted = &spec[hosted_start..];
     for item in ["Postgres", "dsh", "kian-sdk", "GitHub adapter", "A2A"] {
         assert!(
-            phase4.contains(item),
-            "SPEC Phase-4 deferral table is missing `{item}`"
+            hosted.contains(item),
+            "SPEC hosted-set table is missing `{item}`"
         );
     }
 }
@@ -302,4 +308,93 @@ fn event_model_catalog_matches_core_kinds() {
         model.contains("## 6. Change protocol"),
         "EVENT-MODEL must keep the change-protocol section"
     );
+}
+
+/// The control/ops method catalog in `design/API-CONTRACT.md` is the
+/// normative wire contract; the JSON-RPC dispatch arms in `kian-cli`
+/// are its executable form. This test fails on drift in either
+/// direction: adding, removing or renaming a method therefore requires
+/// updating the contract in the same change.
+#[test]
+fn api_contract_method_catalog_matches_dispatch() {
+    let root = repo_root();
+    let contract = std::fs::read_to_string(root.join("design/API-CONTRACT.md"))
+        .expect("design/API-CONTRACT.md is the normative API contract");
+
+    let mut documented = catalog_methods(&contract, "### 3.1 Method catalog");
+    documented.extend(catalog_methods(&contract, "### 4.1 Method catalog"));
+
+    let mut coded: BTreeSet<String> = BTreeSet::new();
+    for file in ["crates/kian-cli/src/api.rs", "crates/kian-cli/src/ops.rs"] {
+        let src =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        coded.extend(dispatch_methods(&src));
+    }
+
+    assert_eq!(
+        coded.len(),
+        9,
+        "expected 9 JSON-RPC methods (6 control + 3 ops), got {coded:?}"
+    );
+    assert_eq!(
+        documented,
+        coded,
+        "API-CONTRACT catalog and dispatch drift: missing={:?} extra={:?}",
+        coded.difference(&documented).collect::<Vec<_>>(),
+        documented.difference(&coded).collect::<Vec<_>>()
+    );
+
+    // The change protocol must stay discoverable from the contract.
+    assert!(
+        contract.contains("## 10. Change protocol"),
+        "API-CONTRACT must keep the change-protocol section"
+    );
+}
+
+/// Method rows of one `### ... Method catalog` table: the first cell is
+/// backticked (`| \`method\` | ...`) and the section ends at the next
+/// `###` heading.
+fn catalog_methods(contract: &str, heading: &str) -> BTreeSet<String> {
+    let start = contract
+        .find(heading)
+        .unwrap_or_else(|| panic!("missing `{heading}` in design/API-CONTRACT.md"));
+    let end = contract[start..]
+        .find("\n### ")
+        .map(|i| start + i)
+        .unwrap_or(contract.len());
+    let mut methods = BTreeSet::new();
+    for line in contract[start..end].lines() {
+        let Some(rest) = line.trim_start().strip_prefix("| `") else {
+            continue;
+        };
+        let Some(close) = rest.find('`') else {
+            continue;
+        };
+        methods.insert(rest[..close].to_string());
+    }
+    methods
+}
+
+/// The `"method" =>` arms of the handler module's `match method {`.
+fn dispatch_methods(src: &str) -> BTreeSet<String> {
+    let start = src
+        .find("match method {")
+        .expect("dispatch must match on `method`");
+    let mut methods = BTreeSet::new();
+    for line in src[start..].lines().skip(1) {
+        let line = line.trim();
+        if line.starts_with("other =>") {
+            break;
+        }
+        let Some(rest) = line.strip_prefix('"') else {
+            continue;
+        };
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        if rest[close + 1..].trim_start().starts_with("=>") {
+            methods.insert(rest[..close].to_string());
+        }
+    }
+    methods
 }

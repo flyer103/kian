@@ -1,4 +1,4 @@
-//! `kiand` — the endpoint daemon (card C22, DESIGN §4.3/§9):
+//! `kiand` — the endpoint daemon (DESIGN §4.3/§9):
 //! `kian-endpoint`'s [`kian_endpoint::Endpoint`] over the built-in
 //! [`kian_endpoint::LocalExecutor`], behind a thin, fail-closed main.
 //!

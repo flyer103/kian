@@ -1,12 +1,12 @@
-# kian serve config — examples/issue-watch (card C60, TIMER REGRESSION DEMO)
+# kian serve config — examples/issue-watch (TIMER REGRESSION DEMO)
 #
 # The issue-watch dogfood: a TimerChannel ticks the resident Router; the
 # Router delegates polling and triage drafting to fresh worker sessions;
-# everything lands in durable event streams under .state/kian.db.
+# everything lands in durable event streams under.state/kian.db.
 #
 # Credentials are env-only (never in this file):
-#   DEEPSEEK_API_KEY  — the model slot's key (sourced by run.sh)
-#   DRY_RUN           — "0" is the ONLY value that lets a worker post a
+#   DEEPSEEK_API_KEY — the model slot's key (sourced by run.sh)
+#   DRY_RUN — "0" is the ONLY value that lets a worker post a
 #                       real GitHub comment; anything else = dry-run
 # gh authentication comes from the invoking user's keyring.
 
@@ -22,7 +22,7 @@ storage:
 
 # The default (plain-session) agent — always required by the schema.
 # This example never creates plain sessions; it is intentionally minimal.
-# (Tool names are dotless since kian-61: strict OpenAI-compatible
+# (Tool names are dotless since: strict OpenAI-compatible
 # endpoints reject names outside ^[a-zA-Z0-9_-]+$.)
 agent:
   id: default
@@ -45,7 +45,7 @@ agents:
     tools: ["spawn_worker", "reply", "deliver_structured"]
   # The worker template every thread pins: exec toolset (argv-direct,
   # no shell, under tools.exec_timeout_ms). The agent `tools:` list is
-  # the mounted surface since kian-61 — the fs tools not listed here
+  # the mounted surface since — the fs tools not listed here
   # never ride the worker's requests (config-filtered, fail-closed).
   triager:
     id: triager
@@ -85,11 +85,11 @@ superagent:
     worker: false
 
 # DeepSeek's OpenAI-compatible endpoint, reached DIRECTLY (no adapter).
-# Since kian-61 (wire dialect v2) kian's request serialization is the
+# Since (wire dialect v2) kian's request serialization is the
 # strict openai shape — dotless built-in tool names, assistant
 # `tool_calls` with string arguments, tool results carrying
 # `tool_call_id` — which strict endpoints accept. The example-scoped
-# wire adapter the C60 run needed is gone; see RUNLOG.md.
+# wire adapter the run needed is gone; see md.
 providers:
   deepseek:
     base_url: "https://api.deepseek.com"
@@ -105,7 +105,7 @@ tools:
 drain:
   max_iterations: 32
 
-# Required, no silent defaults (the C10 rule). Network hiccups on the
+# Required, no silent defaults (the rule). Network hiccups on the
 # model side back off once; anything unrecognized fails honestly.
 recovery:
   rules:

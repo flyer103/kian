@@ -1,4 +1,4 @@
-//! `kian-dsh` — the S6 bridge (card C54, ADR-010 / DESIGN §6.2's
+//! `kian-dsh` — the bridge (ADR-010 / DESIGN §6.2's
 //! "dsh loop (being-integrated)" row, §16).
 //!
 //! `DshDriver` implements the [`LoopDriver`](kian_core::seams::LoopDriver)
@@ -11,7 +11,7 @@
 //!   rule; the bridge never touches a store);
 //! - steers arrive as inbox rows promoted at safe boundaries exactly
 //!   like any input and ride to the child as `steer` control frames;
-//! - the C53 mapping ([`mapping`]) is the only translation — zero new
+//! - the mapping ([`mapping`]) is the only translation — zero new
 //!   event kinds, mapped events ride the existing payloads verbatim.
 //!
 //! # Narrow waist
@@ -26,22 +26,22 @@
 //!
 //! # Crash honesty (constraint 7)
 //!
-//! A child that dies mid-step leaves the honest failure trace C53
+//! A child that dies mid-step leaves the honest failure trace
 //! fixed: `step/request` with no following `assistant/message`. The
 //! driver reports a soft failure (`Failed`, never `completed`); a
 //! server-side kill mid-drain leaves the stream `running` for the
 //! takeover drain, which spawns a fresh child that replays its own
 //! durable session log — the driver de-duplicates the replay against
 //! the persisted stream ([`driver::Dedup`]) so only genuinely new
-//! events are appended (S1/S6 semantics through the bridge).
+//! events are appended (semantics through the bridge).
 //!
 //! # Fixture peer
 //!
-//! [`fixture_peer`] is the C53 scripted stdio peer as a library
+//! [`fixture_peer`] is the scripted stdio peer as a library
 //! function plus a thin `dsh-fixture-peer` bin, so CI proves the
 //! driver with zero Node/dsh present. The live run (`KIAN_DSH_BIN`
 //! pointing at a real dsh install) is env-gated, CI-excluded, and
-//! recorded in the README run log (C44 pattern).
+//! recorded in the README run log (pattern).
 
 pub mod ctx;
 pub mod driver;

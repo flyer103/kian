@@ -1,4 +1,4 @@
-//! Built-in ReAct loop (card C11).
+//! Built-in ReAct loop.
 //!
 //! Per iteration: assemble context via `derive_model_context`, call the
 //! resolved model slot, persist request/response events before they fly,
@@ -10,20 +10,20 @@
 //! The loop is a **passenger inside the drain** (layered iron rule): it
 //! only ever appends events through [`DrainCtx`] and reads projections;
 //! admission, claims, interrupts, the end write and episode supervision
-//! belong to the engine (C9).
+//! belong to the engine.
 //!
 //! ## Event payload conventions (frozen, additions-only discipline)
 //!
-//! - `turn/start` / `turn/end`: `{"iteration": <n>, ...}` — the iteration
+//! - `turn/start` / `turn/end`: `{"iteration": <n>,...}` — the iteration
 //!   counter, derived from the stream (number of prior `turn/start`s),
 //!   never from resident state.
 //! - `step/request`: `{"slot", "provider", "model", "iteration", "body"}`
 //!   — the A2 audit copy of the request, appended **before** the provider
-//!   is called (the provider-level `PersistSink`, C8, additionally covers
+//!   is called (the provider-level `PersistSink`, additionally covers
 //!   fallback-request bytes at the HTTP edge).
 //! - `assistant/message`: content `{"text": str, "tool_calls"?: [...]}`.
 //! - `tool/call` (logged before execution): content
-//!   `{"id", "name", "arguments"}` with role `assistant` (C4 fixture
+//!   `{"id", "name", "arguments"}` with role `assistant` (fixture
 //!   convention).
 //! - `tool/result`: content `{"call_id", "output", "is_error"}` with role
 //!   `tool`.
@@ -35,9 +35,9 @@
 //! [`CLASS_EMPTY_RESPONSE`] and reports [`LoopOutcome::SoftFailed`] — the
 //! engine settles it as `failed`, never `completed`. The loop itself never
 //! retries (constraint 8: recovery disposition is one-shot-guarded and
-//! owned by the caller, C10).
+//! owned by the caller).
 //!
-//! ## Evidence gate on the stop path (C24)
+//! ## Evidence gate on the stop path
 //!
 //! When mounted via [`ReActLoop::with_evidence_gate`], every terminal stop
 //! flow (`Settled` — the final-answer "done" claim — and `Stopped`) passes
@@ -46,7 +46,7 @@
 //! the failed verdict, buys at most `max_retries` extra provider turns,
 //! then reports a soft failure the engine settles as `failed` — never
 //! `completed` with a failed gate. The gate makes no provider call and
-//! never mutates context. Default-off (Phase-1 behavior unchanged).
+//! never mutates context. Default-off (built-in behavior unchanged).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -88,9 +88,9 @@ pub struct ReActConfig {
     /// Maximum provider turns per session (counted from the event stream,
     /// so the budget survives episodes and restarts).
     pub max_iterations: usize,
-    /// Per-call tool permission table (C70 / ADR-015): tool name →
+    /// Per-call tool permission table (ADR-015): tool name →
     /// `allow`/`deny`. **Absent = empty = allow-all**, and with an empty
-    /// table the `tool/call` payload stays byte-identical to the pre-C70
+    /// table the `tool/call` payload stays byte-identical to the legacy
     /// shape (no provenance key at all). A non-empty table decides every
     /// call — provenance rides the payload on allow, not only on deny.
     pub permissions: BTreeMap<String, Permission>,
@@ -112,8 +112,8 @@ struct Inner {
     policy: Arc<dyn RecoveryPolicySource>,
     agent: AgentDef,
     config: ReActConfig,
-    /// C24 evidence gate on the stop path; default (disabled) leaves
-    /// Phase-1 behavior untouched.
+    /// evidence gate on the stop path; default (disabled) leaves
+    /// built-in behavior untouched.
     gate: EvidenceGateConfig,
 }
 
@@ -135,7 +135,7 @@ impl ReActLoop {
     }
 
     /// [`ReActLoop::new`] with explicit loop tuning. The evidence gate is
-    /// disabled (Phase-1 behavior).
+    /// disabled (built-in behavior).
     pub fn with_config(
         agent: AgentDef,
         registry: Arc<ProviderRegistry>,
@@ -153,7 +153,7 @@ impl ReActLoop {
         )
     }
 
-    /// [`ReActLoop::with_config`] with an evidence gate (C24) mounted on
+    /// [`ReActLoop::with_config`] with an evidence gate mounted on
     /// the stop path. A disabled [`EvidenceGateConfig`] behaves exactly
     /// like [`ReActLoop::with_config`].
     pub fn with_evidence_gate(
@@ -179,9 +179,9 @@ impl ReActLoop {
         &self.0.config
     }
 
-    /// The mounted evidence-gate config (C24). The shared verdict counters
+    /// The mounted evidence-gate config. The shared verdict counters
     /// inside are the metrics surface for `GET /metrics` (wired by the
-    /// C27 assembly).
+    /// assembly).
     #[must_use]
     pub fn evidence_gate(&self) -> &EvidenceGateConfig {
         &self.0.gate
@@ -245,7 +245,7 @@ enum TurnOutcome {
 }
 
 /// One provider turn's terminal state plus the audit facts the
-/// `turn/end` payload needs (C67): the last non-null provider usage
+/// `turn/end` payload needs: the last non-null provider usage
 /// observed across the whole turn — including an attempt that emitted
 /// usage before failing — travels with every outcome variant.
 struct TurnResult {
@@ -256,10 +256,10 @@ struct TurnResult {
 enum TurnError {
     /// Soft failure — reported to the engine as `LoopOutcome::SoftFailed`.
     /// Carries the structured recovery audit for `turn/end`
-    /// (`{"class", "action"}`, C67).
+    /// (`{"class", "action"}`).
     Soft { reason: String, audit: Value },
     /// Hard error (store/append failure): honest `failed`, never retried
-    /// by the loop. Also carries the C67 recovery audit.
+    /// by the loop. Also carries the recovery audit.
     Fatal { error: LoopError, audit: Value },
 }
 
@@ -283,7 +283,7 @@ impl Inner {
             Ok(flow) => flow,
             Err(e) => return Flow::Soft(format!("loop error: {e}")),
         };
-        // C24: terminal stop flows pass through the evidence gate before
+        // terminal stop flows pass through the evidence gate before
         // they are reported (a disabled gate is a no-op pass-through).
         match flow {
             Flow::Settled | Flow::Stopped(_) => self.apply_evidence_gate(ctx, flow).await,
@@ -291,7 +291,7 @@ impl Inner {
         }
     }
 
-    /// The evidence gate on the loop's stop path (C24). Evaluates the
+    /// The evidence gate on the loop's stop path. Evaluates the
     /// configured checks as pure predicates over the session's own event
     /// stream — never a provider call, never a context mutation — and
     /// appends one `evidence/verdict` event:
@@ -440,10 +440,10 @@ impl Inner {
     }
 
     /// Runs one provider turn: persist the A2 audit copy, call the slot
-    /// (with C8 fallback traversal), assemble the streamed response, then
+    /// (with fallback traversal), assemble the streamed response, then
     /// either dispatch tool calls (log-before-execute) or return a final
     /// answer. The returned [`TurnResult`] carries the last non-null
-    /// provider usage observed across the turn (C67), on every path.
+    /// provider usage observed across the turn, on every path.
     async fn provider_turn(
         &self,
         ctx: &DrainCtx,
@@ -454,7 +454,7 @@ impl Inner {
         let target = binding.target.clone();
 
         // Deterministic tool order (the request body freezes the tools
-        // array order — C8 serialization contract).
+        // array order — serialization contract).
         let mut schemas = self.tools.schemas();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
         let chat: Vec<ChatMessage> = messages.iter().filter_map(to_chat_message).collect();
@@ -498,7 +498,7 @@ impl Inner {
             Arc::new(CtxSlotSink { ctx: ctx.clone() }),
         );
 
-        // Assemble the streamed deltas. Usage-only chunks (C67) carry a
+        // Assemble the streamed deltas. Usage-only chunks carry a
         // Null delta — they never assemble content, but the last
         // non-null usage is captured across the whole turn, including an
         // attempt that emitted usage before failing.
@@ -585,12 +585,12 @@ impl Inner {
 
         let n = tool_calls.len();
         // Log-before-execute (invariant 1): each `tool/call` event is
-        // durable before `invoke` runs — for BOTH C70 arms. The deny arm
+        // durable before `invoke` runs — for BOTH arms. The deny arm
         // logs the call (with its deny provenance) and then never
         // invokes; the honest audit record of the attempted call exists
         // either way.
         for call in tool_calls {
-            // C70 (ADR-015): evaluate the per-call permission once,
+            // (ADR-015): evaluate the per-call permission once,
             // before the `tool/call` append. `None` = no table
             // configured → the legacy byte-identical payload, invoke
             // as today.
@@ -641,7 +641,7 @@ impl Inner {
                     }
                 }
             };
-            // C69: redaction provenance rides the payload OUTSIDE
+            // redaction provenance rides the payload OUTSIDE
             // `content` — the model-visible wire shape (and therefore
             // request bytes and prefix cache) never sees it; the key is
             // omitted entirely when nothing was redacted.
@@ -667,7 +667,7 @@ impl Inner {
 // ---------------------------------------------------------------------------
 
 impl TurnError {
-    /// A hard (store/append) failure with its C67 recovery audit. The
+    /// A hard (store/append) failure with its recovery audit. The
     /// class follows the existing pure classifier's vocabulary
     /// (`Engine` → `store_failure`; context/slot errors are outside it
     /// and classify as `unknown`), the action comes from the table.
@@ -693,7 +693,7 @@ fn loop_error_class(e: &LoopError) -> kian_orchestrator::recovery::ErrorClass {
 }
 
 /// The class of a provider error via the existing pure classifier
-/// (C10): `classify(RecoveryError::Provider(e))`.
+/// `classify(RecoveryError::Provider(e))`.
 fn provider_error_class(e: &ProviderError) -> kian_orchestrator::recovery::ErrorClass {
     kian_orchestrator::recovery::classify(
         &kian_orchestrator::recovery::RecoveryError::Provider(e.clone()),
@@ -701,7 +701,7 @@ fn provider_error_class(e: &ProviderError) -> kian_orchestrator::recovery::Error
     )
 }
 
-/// The C67 `turn/end` `error` audit object: the pure classifier's class
+/// The `turn/end` `error` audit object: the pure classifier's class
 /// name plus the declarative policy's disposition name — `"none"` when
 /// no rule covers the class (the honest no-rule spelling).
 fn recovery_audit(
@@ -730,7 +730,7 @@ fn action_name(action: Option<&RecoveryAction>) -> &'static str {
 
 /// Persists `slot/fallback` payloads through the drain ctx (one durable
 /// event per fallback switch, before the fallback provider is called —
-/// C8 ordering).
+/// ordering).
 struct CtxSlotSink {
     ctx: DrainCtx,
 }
@@ -797,10 +797,10 @@ fn assemble_delta(delta: &Value, text: &mut String, calls: &mut BTreeMap<u64, Ca
 }
 
 /// Converts a projected [`Message`] into the request-body chat shape
-/// (dialect v2, kian-61). Plain string content passes through unchanged
+/// (dialect v2). Plain string content passes through unchanged
 /// (byte-identical to dialect v1); structured content is translated to
 /// the strict openai wire shape — anything else is serialized compactly,
-/// deterministic under the frozen C8 serialization (lexicographic keys).
+/// deterministic under the frozen serialization (lexicographic keys).
 ///
 /// - `role:"tool"` `{call_id, output, is_error}` → `{role:"tool",
 ///   tool_call_id, content: <output as a JSON string>}` (the `is_error`
@@ -814,7 +814,7 @@ fn assemble_delta(delta: &Value, text: &mut String, calls: &mut BTreeMap<u64, Ca
 ///   `tool_calls` already carries the same call id, and strict endpoints
 ///   reject the duplicate. Returns `None`.
 ///
-/// Public (card C14): `kian session replay` re-derives the model context
+/// Public: `kian session replay` re-derives the model context
 /// from the event stream and must rebuild the *exact* chat shape the
 /// loop sent, so the A2 byte-identity check compares like with like.
 /// This conversion is part of the frozen request-serialization contract
@@ -828,7 +828,7 @@ pub fn to_chat_message(m: &Message) -> Option<ChatMessage> {
     }
 }
 
-/// The C70 permission decision for one tool call (ADR-015). Evaluated
+/// The permission decision for one tool call (ADR-015). Evaluated
 /// once per call, before the `tool/call` append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionDecision {
@@ -843,10 +843,10 @@ pub(crate) enum PermissionDecision {
 /// The deny `reason` string on the provenance object (closed).
 const PERMISSION_DENY_REASON: &str = "tool_denied_by_policy";
 
-/// Evaluates the per-call permission table (C70 / ADR-015):
+/// Evaluates the per-call permission table (ADR-015):
 ///
 /// - empty table → `None`: no table is configured, the `tool/call`
-///   payload stays byte-identical to the pre-C70 shape (constraint 3 —
+///   payload stays byte-identical to the legacy shape (constraint 3 —
 ///   cache-byte stability) and the call invokes as today;
 /// - non-empty table → every call gets a decision: an explicit entry is
 ///   `configured` (allow or deny), an unnamed tool falls through to the
@@ -867,7 +867,7 @@ fn evaluate_permission(
 }
 
 /// The `tool/call` event payload: the frozen `{role, content}` shape
-/// plus, only when a permission table is configured (C70), the additive
+/// plus, only when a permission table is configured, the additive
 /// top-level `permission` provenance key **outside `content`** — the
 /// projection reads `role`/`content` only, so request bytes are
 /// identical with and without it.
@@ -896,7 +896,7 @@ fn tool_call_payload(call: &ToolCall, decision: Option<PermissionDecision>) -> V
 }
 
 /// The `tool/result` event payload: `{role, content}` plus, only when
-/// the exec redactor scrubbed something (C69), the provenance report as
+/// the exec redactor scrubbed something, the provenance report as
 /// an additive top-level `redactions` key **outside `content`** — the
 /// model-visible wire shape (`to_chat_message` reads `content` only) is
 /// byte-identical either way, so request bytes and the provider prefix
@@ -1013,7 +1013,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
     Some(string_or_compact("assistant", content))
 }
 
-/// Maps a provider error onto the classifier's class names (C10
+/// Maps a provider error onto the classifier's class names (
 /// vocabulary) for the policy lookup.
 fn error_class(e: &ProviderError) -> &'static str {
     match e {
@@ -1067,10 +1067,10 @@ mod tests {
         }
     }
 
-    /// C69: the `tool/result` payload carries the redaction report as
+    /// the `tool/result` payload carries the redaction report as
     /// an additive top-level key OUTSIDE `content`, and omits it when
     /// nothing was redacted — the un-redacted payload is byte-identical
-    /// to the pre-C69 literal.
+    /// to the legacy literal.
     #[test]
     fn tool_result_payload_carries_redactions_outside_content() {
         let plain = ToolResult {
@@ -1114,7 +1114,7 @@ mod tests {
         assert_eq!(payload["content"]["call_id"], json!("call-2"));
     }
 
-    /// C69 (constraint 3): the additive `redactions` payload key never
+    /// (constraint 3): the additive `redactions` payload key never
     /// reaches the model context — the projection reads `role`/`content`
     /// only, so request bytes are identical with and without the key.
     #[test]
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(chat.content.as_deref(), Some("{\"content\":\"scrubbed\"}"));
     }
 
-    /// Dialect v2 (kian-61): a projected tool round trip maps to the
+    /// Dialect v2: a projected tool round trip maps to the
     /// strict openai wire shape, and the per-call `tool/call` transcript
     /// duplicate is dropped (the assistant turn's tool_calls already
     /// carries the id).
@@ -1244,9 +1244,9 @@ mod tests {
 
     // -- pure-unit sections ---------------------------------------------------
 
-    /// C70 (ADR-015): with no permissions table configured, evaluation
+    /// (ADR-015): with no permissions table configured, evaluation
     /// returns `None` — the `tool/call` payload stays byte-identical to
-    /// the pre-C70 shape (cache-byte stability). A non-empty table
+    /// the legacy shape (cache-byte stability). A non-empty table
     /// decides every call: an explicit entry is `configured`, an absent
     /// entry falls through to the default allow.
     #[test]
@@ -1277,7 +1277,7 @@ mod tests {
         );
     }
 
-    /// C70: the allow/deny provenance shapes on `tool/call` — additive
+    /// the allow/deny provenance shapes on `tool/call` — additive
     /// top-level `permission` key outside `content`, `content` exactly
     /// the legacy `{id, name, arguments}` triple.
     #[test]
@@ -1328,7 +1328,7 @@ mod tests {
         assert_eq!(denied["content"], legacy["content"]);
     }
 
-    /// C70 (constraint 3): the additive `permission` payload key never
+    /// (constraint 3): the additive `permission` payload key never
     /// reaches the model context — the projection reads `role`/`content`
     /// only, so the projected message (and therefore request bytes) is
     /// identical with and without the key.
@@ -1462,7 +1462,7 @@ mod tests {
 
     // -- engine integration sections live in integration_tests.rs -------------
 
-    /// C67: the recovery audit carries the pure classifier's class name
+    /// the recovery audit carries the pure classifier's class name
     /// plus the policy disposition name, `"none"` when no rule covers
     /// the class; provider classes flow through the existing pure
     /// classifier and loop-level hard errors map onto its vocabulary.
@@ -1492,7 +1492,7 @@ mod tests {
             "no covering rule → the honest none spelling"
         );
 
-        // Provider classes route through the pure classifier (C10).
+        // Provider classes route through the pure classifier.
         assert_eq!(
             super::provider_error_class(&kian_core::seams::ProviderError::RateLimited),
             ErrorClass::RateLimited

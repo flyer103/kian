@@ -1,6 +1,6 @@
-//! Outbox bounded retry (card C62 / kian-71, DESIGN §4.2 + §4.7):
+//! Outbox bounded retry (DESIGN §4.2 + §4.7):
 //! stored work for the write side — the four acceptance gates,
-//! mirrored from the card:
+//! mirrored from the design:
 //!
 //! 1. **flaky → success**: a send failing twice then succeeding
 //!    delivers exactly once with `attempt: 3` on `channel/delivered`,
@@ -318,7 +318,7 @@ async fn fail_twice_then_success_delivers_once_with_attempt_3_and_backoff_schedu
     assert_eq!(payload["target"], target);
     assert_eq!(payload["attempt"], 3, "{payload}");
     assert_eq!(payload["first_attempt_ms"], 10_000);
-    // The legacy keys are unchanged (C4/C18 shape, additive keys only).
+    // The legacy keys are unchanged (shape, additive keys only).
     for key in ["channel", "target", "policy", "words", "truncated"] {
         assert!(
             payload.get(key).is_some(),
@@ -345,7 +345,7 @@ async fn fail_twice_then_success_delivers_once_with_attempt_3_and_backoff_schedu
     assert_eq!(result.output["message_id"], "flk-3");
     assert!(!result.is_error);
 
-    // The receipt still parses for the C58 projection (legacy
+    // The receipt still parses for the projection (legacy
     // `channel/delivered` consumers are unaffected by the additive
     // keys).
     let tracker = SpeakTracker::from_events(&port.events());
@@ -389,7 +389,7 @@ async fn structured_delivery_stamps_the_same_attempt_keys() {
 // ---------------------------------------------------------------------------
 
 /// A gated send: counts on first poll, then waits on the shared gate
-/// before answering (the "in-flight" stand-in).
+/// before answering (the "in-flight" stand-).
 async fn gated_send(
     gate: Arc<tokio::sync::Mutex<()>>,
     counter: Arc<std::sync::atomic::AtomicU64>,
@@ -580,7 +580,7 @@ async fn max_attempts_parks_with_stage_audit_counter_and_no_re_ask() {
         TicketStage::DeliveryRetry
     );
     // Without the outbox input the same stream is `working` — the arm
-    // is the view's alone (the C56 shape).
+    // is the view's alone (the shape).
     assert_eq!(
         project_stage(&worker_stream, 0, &NoOutbox),
         TicketStage::Working
@@ -617,10 +617,10 @@ fn scripted_router_stream_with_park(
             2,
             EventKind::ToolResult,
             json!({"role": "tool", "content": {"call_id": "call-1", "is_error": true,
-                // kian-76: the live shape — react.rs renders the park
+                // the live shape — react.rs renders the park
                 // as `ToolError::Execution(msg)`, whose Display wraps
                 // "tool execution failed: " around the park message.
-                // The C65 run2 stream carried exactly this; the bare
+                // The run2 stream carried exactly this; the bare
                 // prefix is the never-live shape.
                 "output": {"error": ToolError::Execution(format!(
                     "outbox park: delivery to mock-im:{target} parked after {attempts} attempts: \
@@ -749,7 +749,7 @@ async fn killed_mid_retry_intent_re_drives_from_the_stream_rebuild() {
 async fn absent_config_is_the_legacy_single_attempt_path_byte_identical() {
     let (tools, _hold, flaky, port) = make_tools(None);
 
-    // Success: the receipt payload is exactly the pre-C62 bytes (no
+    // Success: the receipt payload is exactly the legacy bytes (no
     // attempt keys).
     let target = json!({"chat_id": 3});
     invoke(&tools, reply_call(target.clone(), None))

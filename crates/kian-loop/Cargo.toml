@@ -8,7 +8,7 @@ edition.workspace = true
 kian-core.workspace = true
 # DESIGN §7 crate map: kian-loop --> kian-orchestrator (the loop is a
 # passenger inside the drain and drives against its DrainCtx surface)
-# and consumes the C8 provider/slot machinery from kian-llm.
+# and consumes the provider/slot machinery from kian-llm.
 kian-llm.workspace = true
 kian-orchestrator.workspace = true
 tokio.workspace = true

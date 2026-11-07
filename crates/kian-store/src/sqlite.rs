@@ -1,4 +1,4 @@
-//! The sqlite backend (C50): the pre-C50 statements and statement logic,
+//! The sqlite backend: the legacy statements and statement logic,
 //! extracted verbatim from the single-backend store so the dispatching
 //! [`EventStore`](crate::event_store::EventStore) can expose the same
 //! surface on postgres. Dialect SQL lives here and only here.
@@ -42,7 +42,7 @@ const HEAD_SQL: &str =
 const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? AND seq >= ? AND seq < ? ORDER BY seq ASC";
 
 /// The CAS refused the write: re-read the head and classify which fence
-/// tripped — the same classification both backends share (C50 §3: pg's
+/// tripped — the same classification both backends share (§3: pg's
 /// PK-race zero-row outcome flows through here too).
 async fn classify(
     pool: &SqlitePool,
@@ -74,7 +74,7 @@ pub(crate) async fn append(
         .bind(i64::from(event.version))
         .bind(envelope)
         // Fence inputs are bound again: sqlite parameters are positional
-        // per index, and repeating ?N inline reads worse than rebinding.
+        // per index, and repeating?N inline reads worse than rebinding.
         .bind(&session_key)
         .bind(se_i64(event.epoch.0, "epoch")?)
         .bind(&session_key)
@@ -208,14 +208,14 @@ const CONSUMED_STATE_SQL: &str =
 /// so concurrent claims execute this atomically in order). The floor is
 /// max(claims.epoch, events epoch floor); the conflict branch's
 /// `excluded.epoch` is strictly greater than the stored epoch, so epochs
-/// never repeat. C47 (ADR-009) — conditional claim admission: the conflict
+/// never repeat. (ADR-009) — conditional claim admission: the conflict
 /// branch lands only when the existing lease is expired or the claiming
 /// holder already owns the row; otherwise zero rows return and `claim`
 /// reports the typed `ClaimRejected`.
 const CLAIM_SQL: &str = "INSERT INTO claims (session, epoch, holder, ttl_ms, last_heartbeat)\nVALUES (?1,\n        MAX(COALESCE((SELECT MAX(epoch) FROM claims WHERE session = ?2), 0),\n             COALESCE((SELECT MAX(epoch) FROM events WHERE session = ?3), 0)) + 1,\n        ?4, ?5, ?6)\nON CONFLICT(session) DO UPDATE SET\n    epoch = excluded.epoch,\n    holder = excluded.holder,\n    ttl_ms = excluded.ttl_ms,\n    last_heartbeat = excluded.last_heartbeat\nWHERE (?7 - ttl_ms) > last_heartbeat\n   OR holder = ?4\nRETURNING epoch";
 
 /// Reads the live claims row after a refused claim, to report *who* holds
-/// the fresh lease (C47 `ClaimRejected` diagnostics).
+/// the fresh lease (`ClaimRejected` diagnostics).
 const CLAIM_ROW_SQL: &str =
     "SELECT epoch, holder, ttl_ms, last_heartbeat FROM claims WHERE session = ?1";
 
@@ -225,7 +225,7 @@ const HEARTBEAT_SQL: &str = "UPDATE claims SET last_heartbeat = ?2 WHERE session
 /// neither side of the comparison can overflow i64.
 const EXPIRED_SQL: &str = "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims WHERE (?1 - ttl_ms) > last_heartbeat ORDER BY session ASC";
 
-/// Every claims row (C14 `lease inspect`): no filtering, epoch order.
+/// Every claims row (`lease inspect`): no filtering, epoch order.
 const ALL_LEASES_SQL: &str =
     "SELECT session, epoch, holder, ttl_ms, last_heartbeat FROM claims ORDER BY epoch ASC";
 

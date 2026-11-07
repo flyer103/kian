@@ -1,10 +1,10 @@
-//! Built-in local executor (card C12, DESIGN §4.3).
+//! Built-in local executor (DESIGN §4.3).
 //!
 //! Executes [`ExecCommand`]s as local child processes: argv[0] is the
 //! program (never a shell string), the child inherits this process's
 //! environment plus the command's overrides, and `timeout_ms` kills the
 //! child when it elapses. Data-egress tiering and credential-less
-//! execution are Phase-3 stakes (DESIGN §4.4) — deliberately not built.
+//! execution are future stakes (DESIGN §4.4) — deliberately not built.
 
 use std::process::Stdio;
 use std::time::Duration;

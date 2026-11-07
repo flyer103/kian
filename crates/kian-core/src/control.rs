@@ -1,10 +1,10 @@
-//! The reserved control-envelope convention (C68, ADR-014).
+//! The reserved control-envelope convention (ADR-014).
 //!
 //! Interrupt intent is *durable*: the control plane admits a reserved
 //! inbox row instead of only flipping an in-memory flag, so the intent
 //! survives a crash of the draining replica and crosses replicas as
 //! data. The row's payload is exactly `{"kian": {...}}` — a row-level
-//! convention like the steer wrapper and the C32 spill envelope before
+//! convention like the steer wrapper and the spill envelope before
 //! it: a plain payload of that precise single-key shape is read as an
 //! envelope, never as message content.
 //!
@@ -18,7 +18,7 @@
 //! through the takeover path (recovery sweep / startup inbox scan).
 //!
 //! Epoch targeting: the envelope carries `target_epoch` — the epoch of
-//! the last event in the stream at admit time, i.e. the episode the
+//! the last event in the stream at admit time, i.e. The episode the
 //! interrupt intends to stop (best-effort; `null` when unreadable).
 //! Consumption compares it against the stream to decide staleness (see
 //! ADR-014): a row whose target episode already *settled* (the stream
@@ -58,7 +58,7 @@ pub struct InterruptIntent {
 
 impl InterruptIntent {
     /// Whether `payload` is the reserved control envelope (a single
-    /// `{"kian": {"type": "control", "action": "interrupt", ...}}` key).
+    /// `{"kian": {"type": "control", "action": "interrupt",...}}` key).
     /// Like the steer wrapper and the spill envelope, the exact shape is
     /// reserved: any other payload — including a `kian` object that is
     /// not an interrupt control — is plain content.

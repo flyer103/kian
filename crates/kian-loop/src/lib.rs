@@ -10,11 +10,11 @@
 //! is a soft failure routed to the recovery policy, never `completed`.
 //!
 //! Modules:
-//! - [`react`] — the built-in ReAct LoopDriver (card C11)
+//! - [`react`] — the built-in ReAct LoopDriver
 //! - [`tools`] — the built-in local fs/exec `ToolProvider` + `ExecBackend`
-//!   (card C11); local exec runs via `spawn_blocking` so a sleeping tool
+//!   local exec runs via `spawn_blocking` so a sleeping tool
 //!   cannot stall concurrent drains
-//! - [`evidence`] — the evidence gate v1 (card C24): bounded, declarative,
+//! - [`evidence`] — the evidence gate v1: bounded, declarative,
 //!   pure predicates over the event stream; wired into [`react`]'s stop
 //!   path, default-off
 

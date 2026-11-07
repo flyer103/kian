@@ -1,9 +1,9 @@
 //! Async job rows — the durable bookkeeping behind the async
-//! `start()`/`stop()` tool pair (card C37, ADR-008).
+//! `start()`/`stop()` tool pair (ADR-008).
 //!
 //! An async job is a queued remote command **plus** the session that
 //! must be told when it settles. The dispatch itself is owned by the
-//! existing C20 machinery unchanged: the command rides the same
+//! existing machinery unchanged: the command rides the same
 //! `exec_queue` through the same per-endpoint drivers, correlated by
 //! the same command id (the job id **is** the command id, derived from
 //! the calling tool-call id — dedupe across recovery comes free). This
@@ -12,7 +12,7 @@
 //! Rows are pre-event durable state per ADR-007's pattern: the job row
 //! is committed before any dispatch flies (admit-before-execute), and
 //! the completion reaches the session only as an **admitted input**
-//! (the C23 admit→wake path, driven by the kian-cli completion
+//! (the admit→wake path, driven by the kian-cli completion
 //! bridge) — never by writing session events from here.
 //!
 //! Statuses form the same monotone little state machine as
@@ -20,9 +20,9 @@
 //!
 //! ```text
 //! pending ──▶ inflight ──▶ done
-//!    │           │
-//!    │           ├──▶ cancelled   (stop(); terminal)
-//!    └───────────┴──▶ abandoned   (queue timeout; terminal)
+//!    │ │
+//!    │ ├──▶ cancelled (stop(); terminal)
+//!    └───────────┴──▶ abandoned (queue timeout; terminal)
 //! ```
 //!
 //! `done`, `cancelled` and `abandoned` are terminal: every transition
@@ -30,9 +30,9 @@
 //! terminal row is ever mutated (asserted by
 //! [`self::tests::async_rows_are_guarded_and_never_deleted`] and
 //! `crate::store::tests::backend_modules_keep_guards_and_never_delete`,
-//! the C5 review pattern applied to this table).
+//! the review pattern applied to this table).
 //!
-//! C51: every method dispatches over the [`ExecStore`] backend enum —
+//! every method dispatches over the [`ExecStore`] backend enum —
 //! same signatures, sqlite or postgres.
 
 use kian_core::model::SessionId;
@@ -326,7 +326,7 @@ mod tests {
     }
 
     /// v1 is a committed generation: pinned byte-for-byte so any
-    /// rewrite of history trips this test (C5 frozen-golden pattern).
+    /// rewrite of history trips this test (frozen-golden pattern).
     #[test]
     fn v1_generation_sql_is_frozen() {
         let v1: &Migration = &chain()[1];
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(v1.up, golden);
     }
 
-    /// Review assertion (C5 pattern, applied to this table): no
+    /// Review assertion (pattern, applied to this table): no
     /// deletes, and every mutation carries a status guard so committed
     /// terminal rows are immutable.
     #[test]

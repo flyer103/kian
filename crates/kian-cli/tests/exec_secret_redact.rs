@@ -1,4 +1,4 @@
-//! kian-77 serve-level acceptance: the G4 live leak, replayed end to
+//! serve-level acceptance: the live leak, replayed end to
 //! end against the real assembly. A session's agent runs `env` through
 //! the built-in exec tool; the provider's API key (a configured secret
 //! the assembly auto-collects from `api_key_env`) must appear **nowhere**
@@ -44,7 +44,7 @@ const SECRET_VALUE: &str = "sk-kian77-e2e-secret-value-42";
 async fn env_dumping_session_persists_no_configured_secret() {
     force_no_proxy();
     // The secret exists in the server environment (assembly requires
-    // it) — exactly the G4 precondition.
+    // it) — exactly the precondition.
     // SAFETY: set once before the server (or any child) spawns; the
     // name is the shared e2e fixture key every test uses with the same
     // constant value.

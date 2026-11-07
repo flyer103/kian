@@ -1,8 +1,8 @@
 # ADR-013: Thread/Correlation intake — derived read positions and thread keys, context-only correlation
 
-- **Status**: draft (C61 / kian-67; append-only — ADR-001…011 immutable, ADR-010 contract v0 stays frozen)
+- **Status**: draft (; append-only — ADR-001…011 immutable, ADR-010 contract v0 stays frozen)
 - **Date**: 2026-11-03
-- **Context**: Round-6 Wave B, plan §3 card C61. Kian's intake has channel-admit idempotency
+- **Context**:, plan §3. Kian's intake has channel-admit idempotency
   (`(session, event_id)` — one durable row per event, never two) and adapter-chosen topics. The
   prototype's domain layer (reference 001, the Source/Thread/Correlation/Trigger rows; digest §5
   "what kian lacks" gap row 2) adds three things kian does not name: a **Source read position**
@@ -31,7 +31,7 @@
      contract**: thread identity belongs to the deployment's config, recorded here, not to the
      event store.
    - After derivation the key **is** a topic: routing stays the existing topic-keyed subscription
-     rule matcher, unchanged (C61 never touches it — the matcher gains no correlation concept).
+     rule matcher, unchanged ( never touches it — the matcher gains no correlation concept).
    - Underivable is an honest `None` (missing field, non-scalar field, missing group, channel
      without a rule): the adapter's own topic stands; never a fallback guess.
 2. **Source read position — derived from the stream, or honestly re-polled.** The resume cursor is
@@ -46,16 +46,16 @@
      under `event_id` dedupe**: a restart re-polls at most once per underivable source, and the
      pipeline's existing `(session, event_id)` idempotency absorbs the replay — `deduplicated`
      admissions, zero duplicate rows. **No durable position table** (that would be pre-event
-     durable state outside the event log, needing its own ADR — explicitly rejected this round).
-3. **Correlation adds context, never routes.** The derived key surfaces in the C33 Inline
+     durable state outside the event log, needing its own ADR — explicitly rejected).
+3. **Correlation adds context, never routes.** The derived key surfaces in the Inline
    `neighbors` block (`thread_key` beside the canonical `topic`/`event_id` association ids) so the
-   Router and workers reach sibling threads through the existing C35 recall toolpack — a recall
+   Router and workers reach sibling threads through the existing recall toolpack — a recall
    hop, never a routing input. 001's rejected-concepts row, kept verbatim: *Subscriptions route;
    Correlation only adds context.*
 4. **Fan-out grants no authority; bounded by Mandate (ADR-012).** A fanned-out message reaches live
    subscribed tickets as **context** bounded by their Mandates; **no admission check runs on it**
    (001's rejected-concepts row "Admission checks on Subscriptions", kept). One trigger fanning out
-   to many tickets is the existing C38 fan-out mechanics (one durable row per subscriber,
+   to many tickets is the existing fan-out mechanics (one durable row per subscriber,
    idempotent per `(session, event_id)`) restated under the authority rule — nothing in this ADR
    re-derives or re-gates it. This is the normative statement of DESIGN §4.1.
 
@@ -67,7 +67,7 @@
 - `ChannelEvent`'s shape is untouched (the derivation *reads* it); admission idempotency is
   untouched (the re-poll bound *is* it); the subscription rule matcher is untouched (keys are
   topics after derivation — no correlation concept enters routing).
-- Zero new event kinds (§2 of the round-6 plan): the durable trace of an intake stays the existing
+- Zero new event kinds (§2 of the plan): the durable trace of an intake stays the existing
   admitted/spilled pair; the key and the cursor ride payload bytes that already exist.
 
 ## Consequences
@@ -77,8 +77,8 @@
   same event derive two keys, and both stay stable under their own config forever.
 - `intake.rs` is bundle-only: pure derivation over `ChannelEvent`s and admitted stream events
   against `kian-core` seams; no store, no inbox, no wake — assembly and adapters call it
-  (enforced by the resident iron-rule grep and the C61 acceptance test).
-- Correlation hops compose with the C33/C35 Inline/Spill vocabulary: the key is one more
+  (enforced by the resident iron-rule grep and the acceptance test).
+- Correlation hops compose with the Inline/Spill vocabulary: the key is one more
   association id in a bounded view, so multi-hop recall stays bounded.
 - The adapter cursor helpers (`github::payload_since_cursor`, `lark::payload_message_cursor`) are
   pure functions over payloads — fixture-testable, no network, no client.

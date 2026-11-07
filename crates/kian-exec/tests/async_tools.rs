@@ -1,4 +1,4 @@
-//! Async `start()`/`stop()` tool acceptance tests (card C37, ADR-008).
+//! Async `start()`/`stop()` tool acceptance tests (ADR-008).
 //!
 //! Every test pairs the real durable queue + `RemoteExecBackend` +
 //! `AsyncJobs` engine against the real endpoint-side crate over an
@@ -401,7 +401,7 @@ async fn stop_mid_run_cancels_and_completion_lands_labelled_cancelled() {
     shutdown(rig).await;
 }
 
-/// Regression (C56): `stop` racing the observer's row-lease claim.
+/// Regression: `stop` racing the observer's row-lease claim.
 /// A worker can issue `start` → `stop` in consecutive turns (the
 /// kian-cli e2e does, milliseconds apart). If the cancel CAS lands
 /// between the observer's first row read and its `claim_async_row`,

@@ -1,5 +1,5 @@
 //! KiandProto v0 wire types — the **server half's independent declaration** of
-//! the wire contract (card C19, DESIGN §4.3).
+//! the wire contract (DESIGN §4.3).
 //!
 //! This is a deliberate mirror of the endpoint-side crate's `proto`
 //! module, not a shared dependency: the two halves of the protocol are two

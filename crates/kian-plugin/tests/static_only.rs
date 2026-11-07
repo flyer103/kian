@@ -1,7 +1,7 @@
-//! Static-only check (card C7, ADR-004): the kian-plugin dependency tree
+//! Static-only check (ADR-004): the kian-plugin dependency tree
 //! must not pull any dynamic-loading crate (`libloading` / dylib / wasm).
-//! Phase-1 plugins are compile-time registered via `kian_plugins![...]`;
-//! dynamic loading is Phase 3.
+//! built-in plugins are compile-time registered via `kian_plugins![...]`;
+//! dynamic loading is deferred.
 //!
 //! Uses `cargo tree` (a metadata-only command — it does not take the cargo
 //! build lock, so nesting it inside `cargo test` is safe). A raw Cargo.lock

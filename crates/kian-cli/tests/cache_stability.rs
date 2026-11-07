@@ -1,4 +1,4 @@
-//! S3 cache-byte stability smoke (card C17, acceptance scenario S3).
+//! cache-byte stability smoke (acceptance scenario).
 //!
 //! Within one session driven end-to-end through the real server
 //! (scripted mock provider over the openai-compat wire format):
@@ -196,7 +196,7 @@ where
 /// Drives one full session over HTTP and asserts the prefix identity
 /// of consecutive requests, the metrics endpoint and the CLI binary.
 #[tokio::test]
-async fn s3_consecutive_requests_share_prefix_and_metrics_expose_it() {
+async fn cache_stability_consecutive_requests_share_prefix_and_metrics_expose_it() {
     force_no_proxy();
     let dir = temp_dir("s3");
     let sqlite = dir.join("s3.db");
@@ -270,7 +270,7 @@ async fn s3_consecutive_requests_share_prefix_and_metrics_expose_it() {
     assert!(completed, "session never completed");
     assert!(mock.requests.load(Ordering::SeqCst) >= 3);
 
-    // -- 2. S3: every consecutive request pair shares the byte prefix,
+    // -- 2. every consecutive request pair shares the byte prefix,
     //       and nothing but a compact counts as an invalidation.
     let report = kian_cli::cache_metrics::run_cache_stats(&config_path, None, true)
         .await
@@ -341,7 +341,7 @@ async fn s3_consecutive_requests_share_prefix_and_metrics_expose_it() {
         "engine counters present: {metrics}"
     );
 
-    // -- 4. the real binary reports the same numbers.
+    // -- 4. The real binary reports the same numbers.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_kian"))
         .arg("cache-stats")
         .arg("--config")
@@ -361,9 +361,9 @@ async fn s3_consecutive_requests_share_prefix_and_metrics_expose_it() {
 /// invalidation under the `compact` cause — and the queued-input
 /// session above proves nothing else fires. Crafted directly against
 /// the store (a compact is a recovery-path event, not API-drivable in
-/// Phase 1) and surfaced through the same CLI path.
+/// built-) and surfaced through the same CLI path.
 #[tokio::test]
-async fn s3_compact_event_bumps_the_invalidation_cause_counter() {
+async fn cache_stability_compact_event_bumps_the_invalidation_cause_counter() {
     force_no_proxy();
     let dir = temp_dir("s3-compact");
     let sqlite = dir.join("s3-compact.db");

@@ -1,8 +1,8 @@
-//! Admit → Wake → Drain → Promote (DESIGN §2.3, card C9).
+//! Admit → Wake → Drain → Promote (DESIGN §2.3).
 //!
 //! Admit before wake (constraint 6): the input row is durable before any
 //! wake fires. Wakes are advisory: foldable, losable, fully rebuilt from
-//! the C6 startup inbox scan (NoLostWork). Claim issues a monotonic
+//! the startup inbox scan (NoLostWork). Claim issues a monotonic
 //! epoch via the store; every drain write carries it (ADR-005 fencing);
 //! the lease TTL + heartbeat task is *liveness only*. Drains are
 //! per-session serial (one `DashMap<SessionId, DrainHandle>` entry per
@@ -13,7 +13,7 @@
 //! events — every state is re-derived from the event projection; the
 //! control-plane surface (`admit`/`steer`) only writes the inbox.
 //!
-//! Input-consumption convention (C6 consumption is event-driven): the
+//! Input-consumption convention (consumption is event-driven): the
 //! drain is the only writer of `input/admitted` *events*. It appends one
 //! — carrying the message payload contract from DESIGN §3.2
 //! (`{"role","content","synthetic"?}`) — at a safe boundary when it
@@ -21,7 +21,7 @@
 //! `mark_consumed`. Payload convention: a plain input row's payload IS
 //! the message content; a steer row wraps it as
 //! `{"synthetic": true, "content": <content>}` so the synthetic
-//! (strippable) marker survives the inbox round-trip. The C32 spill
+//! (strippable) marker survives the inbox round-trip. The spill
 //! envelope extends this row-level convention: a row payload of exactly
 //! `{"content": <message content>, "spill": <sidecar value>}` consumes
 //! as TWO events in one fenced write batch — `input/admitted` carrying
@@ -32,7 +32,7 @@
 //! never enters model context (`input/spilled` is non-context-bearing),
 //! and rows without the envelope consume byte-identically to before.
 //!
-//! C68 extends the same row-level convention with the reserved control
+//! extends the same row-level convention with the reserved control
 //! envelope `{"kian": {"type": "control", "action": "interrupt", …}}`
 //! (exactly that single key): the control plane admits it as the
 //! durable interrupt intent, and the drain consumes it to a
@@ -61,7 +61,7 @@ use crate::metrics::Metrics;
 use crate::wake::WakeRegistry;
 
 /// Wall-clock source. Injectable so tests (lease TTL, heartbeats) run
-/// deterministically; the store itself never owns a clock (C6).
+/// deterministically; the store itself never owns a clock.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
@@ -214,7 +214,7 @@ struct DrainCtxCore {
     seq: AtomicU64,
     /// True while a provider turn is in flight (promote boundary gate).
     in_turn: AtomicBool,
-    /// The drain's interrupt flag (C68). Shared with the engine's
+    /// The drain's interrupt flag. Shared with the engine's
     /// `DrainHandle` when the ctx is built by `drain_episode`, so a
     /// consumed current-epoch control row and an `interrupt` RPC flip
     /// the *same* flag and `supervise` honors both identically. A ctx
@@ -307,7 +307,7 @@ impl DrainCtxCore {
         })
     }
 
-    /// The C32 spill consumption write: `input/admitted` immediately
+    /// The spill consumption write: `input/admitted` immediately
     /// followed by `input/spilled` as ONE fenced write batch (the
     /// store's `append_batch`), so the pair either lands whole or not at
     /// all — a stale-epoch rejection writes neither event. Retry
@@ -388,7 +388,7 @@ impl DrainCtx {
 
     /// [`DrainCtx::new`] sharing `interrupt` — the engine's
     /// `drain_episode` passes the `DrainHandle` flag so a consumed
-    /// control row interrupts the live drain (C68).
+    /// control row interrupts the live drain.
     pub async fn with_interrupt(
         store: EventStore,
         session: SessionId,
@@ -424,7 +424,7 @@ impl DrainCtx {
 
     /// Whether an interrupt has been requested for this drain — via the
     /// `interrupt` RPC flag or a consumed current-epoch control row
-    /// (C68); both flip the same flag.
+    /// both flip the same flag.
     #[must_use]
     pub fn interrupt_requested(&self) -> bool {
         self.core.interrupt.load(Ordering::Acquire)
@@ -448,7 +448,7 @@ impl DrainCtx {
         self.begin_turn_with(json!({})).await
     }
 
-    /// [`DrainCtx::begin_turn`] with an audit payload (e.g. the loop's
+    /// [`DrainCtx::begin_turn`] with an audit payload (e.g. The loop's
     /// iteration counter). The payload rides the `turn/start` event's
     /// `bytes`; boundary semantics are identical.
     pub async fn begin_turn_with(&self, bytes: Value) -> Result<Event, EngineError> {
@@ -482,13 +482,13 @@ impl DrainCtx {
 
     /// Takes every eligible input at this safe boundary: appends the
     /// consumption event(s) per row (the `input/admitted` message event,
-    /// plus — for the C32 spill envelope — its `input/spilled` sibling in
+    /// plus — for the spill envelope — its `input/spilled` sibling in
     /// the same fenced write batch) and binds the row to the admitted
     /// event's seq via `mark_consumed`. Refused while a provider turn is
     /// in flight (invariant 3) — steer inputs land only at turn
     /// boundaries.
     ///
-    /// C68: reserved control-envelope rows are consumed here too — they
+    /// reserved control-envelope rows are consumed here too — they
     /// append a `control/interrupt` event (the audit record) instead of
     /// a message, and a current-epoch row sets the drain's interrupt
     /// flag. Control rows are never returned: they are never wrapped
@@ -497,7 +497,7 @@ impl DrainCtx {
         Ok(self.consume_inputs(false).await?.messages)
     }
 
-    /// The C68 final take before the end write: consumes ONLY pending
+    /// The final take before the end write: consumes ONLY pending
     /// control rows (regular inputs stay eligible for the resumer) and
     /// returns whether a current-epoch control row fired the interrupt.
     pub async fn take_control_inputs(&self) -> Result<bool, EngineError> {
@@ -540,7 +540,7 @@ impl DrainCtx {
                         );
                     } else {
                         // A row for the current episode always
-                        // interrupts (C68/ADR-014): flip the shared
+                        // interrupts (ADR-014): flip the shared
                         // drain flag — `supervise` and `drain_episode`
                         // settle at the next safe boundary.
                         report.control_interrupt = true;
@@ -603,7 +603,7 @@ impl DrainCtx {
         }
     }
 
-    /// The C68 stale rule (ADR-014): a control row is *stale* when the
+    /// The stale rule (ADR-014): a control row is *stale* when the
     /// episode it targeted has already settled — the stream carries a
     /// `session/ended` at the row's `target_epoch`. A row for this
     /// drain's own claiming epoch can never be stale (no end write
@@ -808,7 +808,7 @@ where
         // Constraint 6: the row is durable BEFORE the wake fires. On
         // any store failure we return without touching the registry.
         let outcome = self.store.admit(input).await?;
-        // C52 wake transport (ADR-009 decision 4): publish the advisory
+        // wake transport (ADR-009 decision 4): publish the advisory
         // cross-replica hint. The admit INSERT above is a single
         // statement, so it has *committed* by the time we get here —
         // the notify can never be observed before its row is visible
@@ -881,7 +881,7 @@ where
     /// next safe boundary; the drain then settles on abort). Interrupt
     /// of an idle or missing session is a no-op (invariant 5).
     ///
-    /// C68 (ADR-014): the intent is *durable*. Whenever work may still
+    /// (ADR-014): the intent is *durable*. Whenever work may still
     /// be in flight — a local drain handle exists, or the projection is
     /// `running`/`recoverable` (the owner is another replica or dead) —
     /// the control plane admits a reserved control-envelope inbox row
@@ -946,7 +946,7 @@ where
         Ok(InterruptOutcome::Requested)
     }
 
-    /// Admits the durable interrupt-intent row (C68). Durable-first
+    /// Admits the durable interrupt-intent row. Durable-first
     /// (constraint 6): the row exists before this returns; no wake —
     /// see [`Engine::interrupt`].
     async fn admit_interrupt_row(
@@ -984,7 +984,7 @@ where
     }
 
     /// Startup NoLostWork rebuild: registers a pending wake for every
-    /// session the C6 inbox scan reports with eligible-but-unconsumed
+    /// session the inbox scan reports with eligible-but-unconsumed
     /// input, then drains them. Returns the number of sessions found.
     pub async fn startup_rebuild(&self) -> Result<usize, EngineError> {
         let inboxes = self.store.startup_scan(self.clock.now_ms()).await?;
@@ -999,7 +999,7 @@ where
         Ok(count)
     }
 
-    /// Lease-expiry recovery sweep (S1 recovery detection, DESIGN §2.4
+    /// Lease-expiry recovery sweep (recovery detection, DESIGN §2.4
     /// R4 and the §13 availability target "recoverable detection ≤ lease
     /// TTL + heartbeat interval"): wakes every session whose lease is
     /// past its TTL *and* whose stream projects `running` — the previous
@@ -1025,7 +1025,7 @@ where
     /// write → release, repeating while folded wakes remain. On
     /// interrupt, ownership is released with pendingWake deliberately
     /// left registered (settle-on-abort, invariant 6). A rejected claim
-    /// (fresh lease held by another holder, C47/ADR-009) is an honest
+    /// (fresh lease held by another holder, /ADR-009) is an honest
     /// no-op exit: nothing was appended and the folded wake is left for
     /// the live holder's sweep — never a retry loop (constraint 8).
     async fn drain_task(self: Arc<Self>, session: SessionId, interrupt: Arc<AtomicBool>) {
@@ -1042,7 +1042,7 @@ where
                         &e,
                         EngineError::Inbox(kian_store::InboxError::ClaimRejected { .. })
                     ) {
-                        // C47 (ADR-009): another holder owns a fresh
+                        // (ADR-009): another holder owns a fresh
                         // lease. Honest no-op exit — the claim failed
                         // before any append, so this drain wrote
                         // nothing, and the live holder's sweep or wake
@@ -1131,7 +1131,7 @@ where
         lease: LeaseRecord,
         interrupt: &Arc<AtomicBool>,
     ) -> Result<DrainOutcome, EngineError> {
-        // C68: the ctx shares the drain's interrupt flag — an
+        // the ctx shares the drain's interrupt flag — an
         // `interrupt` RPC and a consumed current-epoch control row flip
         // the same switch.
         let ctx = DrainCtx::with_interrupt(
@@ -1144,7 +1144,7 @@ where
         )
         .await?;
         let mut claimed = false;
-        // S1 takeover (DESIGN §2.4 R4/R5, C15): a stream that already
+        // takeover (DESIGN §2.4 R4/R5): a stream that already
         // projects `running` when we claim belongs to a drain that died
         // mid-episode (process death; its lease expired or it lost
         // liveness). The takeover claim re-owns the session and re-drives
@@ -1187,7 +1187,7 @@ where
                 }
             }
             let taken = ctx.take_eligible_inputs().await?;
-            // C68: a current-epoch control row consumed by that take
+            // a current-epoch control row consumed by that take
             // flips the shared flag — honor it now, before the
             // empty-inbox branch below can settle `completed` past it.
             if ctx.interrupt_requested() && claimed {
@@ -1229,7 +1229,7 @@ where
                     break 'episodes;
                 }
                 Supervised::SoftFailed { reason } => {
-                    // Honest failure (constraint 7); C10's policy table
+                    // Honest failure (constraint 7); 's policy table
                     // will intercept this before the end write.
                     tracing::warn!(session = %session.0, reason, "soft failure");
                     end_reason = EndReason::Failed;
@@ -1247,7 +1247,7 @@ where
         if ctx.has_eligible_inputs().await? {
             self.wakes.register(session);
         }
-        // C68 final take: one last control-only pass before the end
+        // final take: one last control-only pass before the end
         // write — a current-epoch control row that raced the settle is
         // consumed here and flips the end write to `interrupted` (the
         // honest "stop before done"; DESIGN §2.4 records the race). A
@@ -1340,7 +1340,7 @@ async fn heartbeat_loop(
     }
 }
 
-/// What one consumption pass took (C68). Message rows are returned to
+/// What one consumption pass took. Message rows are returned to
 /// the caller; control rows are consumed for audit and — when current
 /// — flip the drain's interrupt flag instead.
 #[derive(Default)]
@@ -1352,7 +1352,7 @@ struct TakeReport {
 /// The engine's input-row convention: what one row consumes to. A plain
 /// row's payload IS the message content; a steer row wraps it as
 /// `{"synthetic": true, "content": X}` so the strippable marker survives
-/// the inbox round-trip (DESIGN §3.2 payload contract); the C32 spill
+/// the inbox round-trip (DESIGN §3.2 payload contract); the spill
 /// envelope `{"content": X, "spill": Y}` (exactly those two keys)
 /// consumes to the admitted message plus its non-context-bearing sidecar
 /// in one fenced write batch. The envelope is a row-level convention
@@ -1360,12 +1360,12 @@ struct TakeReport {
 /// steer wrapper before it, the exact two-key shape is reserved: a plain
 /// payload of that precise shape is read as an envelope, not content.
 enum Consumption {
-    /// One `input/admitted` event (the entire pre-C32 surface).
+    /// One `input/admitted` event (the entire legacy surface).
     Single(Value),
-    /// The C32 pair: `input/admitted` then `input/spilled`, appended
+    /// The pair: `input/admitted` then `input/spilled`, appended
     /// atomically under one CAS (`append_batch`).
     SpillPair { admitted: Value, spill: Value },
-    /// The C68 reserved control envelope: a `control/interrupt` audit
+    /// The reserved control envelope: a `control/interrupt` audit
     /// event, never a message. The row is bound to the event's seq like
     /// any other consumption.
     Control(kian_core::control::InterruptIntent),
@@ -1776,7 +1776,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C32: the spill sidecar consumption-write convention ---------------
+    // -- the spill sidecar consumption-write convention ---------------
 
     /// Bootstraps `sid` (session/created + drain/claimed) and returns a
     /// drain context under `epoch` — the safe-boundary surface the spill
@@ -1873,7 +1873,7 @@ mod tests {
         // spilled sibling's.
         assert!(store.startup_scan(T0).await.unwrap().is_empty());
         assert!(store.eligible_inputs(sid, T0).await.unwrap().is_empty());
-        // The pair projects legally (C31 drain-activity default) and the
+        // The pair projects legally (drain-activity default) and the
         // sidecar never enters model context.
         let projected = project(&events).expect("pair projects");
         assert_eq!(projected, SessionState::Running);
@@ -2037,7 +2037,7 @@ mod tests {
 
     /// Compat: the envelope is exactly two keys. Content objects that
     /// merely carry a `content` key (or extra keys alongside `spill`)
-    /// remain plain payloads — byte-identical to the pre-C32 surface.
+    /// remain plain payloads — byte-identical to the legacy surface.
     #[tokio::test]
     async fn content_objects_with_extra_keys_are_not_treated_as_spill_envelopes() {
         let (store, path) = open_store().await;
@@ -2196,9 +2196,9 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- S1 recovery: lease-expiry sweep + takeover re-drive -----------------
+    // -- recovery: lease-expiry sweep + takeover re-drive -----------------
 
-    /// S1 (C15): a drain killed mid-provider-turn with its input already
+    /// a drain killed mid-provider-turn with its input already
     /// consumed leaves an EMPTY inbox — the startup scan sees nothing.
     /// The recovery sweep must detect the expired lease on the
     /// `running` stream, take over with a higher epoch, and re-drive the
@@ -2254,7 +2254,7 @@ mod tests {
             "A reached the provider turn"
         );
         // The killed drain's input is already consumed: the inbox is empty
-        // and the stream projects `running` — the pure S1 shape.
+        // and the stream projects `running` — the pure shape.
         assert!(
             reader
                 .eligible_inputs(sid, clock.now_ms())
@@ -2336,7 +2336,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C68: durable interrupt intent (ADR-014) -----------------------------
+    // -- durable interrupt intent (ADR-014) -----------------------------
 
     /// Unit: a reserved control-envelope row consumes to a
     /// `control/interrupt` audit event — never a message row — and a
@@ -2485,7 +2485,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// C68 crash leg: the interrupt RPC on a replica whose projection is
+    /// crash leg: the interrupt RPC on a replica whose projection is
     /// `running` (owner elsewhere/dead) records the durable intent; the
     /// row outlives the crashed owner; the takeover drain consumes it
     /// and settles `interrupted` — the audit event in the stream.
@@ -2722,7 +2722,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// The C68 stop-before-done semantics: a current-epoch control row
+    /// The stop-before-done semantics: a current-epoch control row
     /// that becomes eligible while the loop is finishing its work is
     /// honored — the session settles `interrupted`, never `completed`
     /// (the completed-interrupt race, DESIGN §2.4). Deterministic: the
@@ -2789,7 +2789,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// C68 + invariant 5: interrupt of an idle, terminal or missing
+    /// + invariant 5: interrupt of an idle, terminal or missing
     /// session changes nothing — no events AND no durable intent row.
     #[tokio::test]
     async fn interrupt_of_idle_or_terminal_session_admits_no_control_row() {
@@ -2838,7 +2838,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C47: conditional claim admission at the engine (ADR-009) -----------
+    // -- conditional claim admission at the engine (ADR-009) -----------
 
     /// A second engine with a *different* holder waking a session whose
     /// fresh lease is held by a live drain (mid-provider-turn, frozen
@@ -3393,7 +3393,7 @@ mod tests {
 
     // -- metrics ------------------------------------------------------------
 
-    /// The C9 counters move: state transitions, drain depth/duration,
+    /// The counters move: state transitions, drain depth/duration,
     /// end writes, wake traffic.
     #[tokio::test]
     async fn metrics_counters_track_transitions_depth_duration_and_wakes() {
@@ -3456,16 +3456,16 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C52: wake transport (postgres, env-gated) --------------------------
+    // -- wake transport (postgres, env-gated) --------------------------
 
-    /// True when the env-gated postgres tests run (the C44/C50 pattern:
+    /// True when the env-gated postgres tests run (the pattern:
     /// `KIAN_PG_URL` absent → SKIP with a log line, never fail).
     fn pg_gated() -> bool {
         match std::env::var("KIAN_PG_URL") {
             Ok(url) if !url.is_empty() => true,
             _ => {
                 eprintln!(
-                    "SKIP: KIAN_PG_URL is not set — postgres wake-transport tests disabled (C52 env gate)"
+                    "SKIP: KIAN_PG_URL is not set — postgres wake-transport tests disabled (env gate)"
                 );
                 false
             }
@@ -3552,7 +3552,7 @@ mod tests {
     /// A notify the listener never saw (a simulated listener gap —
     /// reconnect window, or the recipient replica was down) is still
     /// serviced within one sweep period: the recovery sweep wakes the
-    /// expired-lease session, the C47 conditional claim admits the
+    /// expired-lease session, the conditional claim admits the
     /// takeover, and the drain completes the work. Correctness never
     /// depends on the transport (invariant 6; ADR-009 decision 4) —
     /// this is the named listener-gap recovery test, on postgres, with
@@ -3592,7 +3592,7 @@ mod tests {
             .expect("replica A's claim");
 
         // A dies silently. One sweep period later (clock-past-TTL — the
-        // exact ManualClock lease control the card asks for) B sweeps.
+        // exact ManualClock lease control the design asks ) B sweeps.
         clock.advance(ttl + 1);
         let woken = eng.recovery_sweep().await.expect("sweep");
         assert_eq!(

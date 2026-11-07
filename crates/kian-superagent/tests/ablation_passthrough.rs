@@ -1,4 +1,4 @@
-//! Integration test (card C42): the §7.1 ablation benchmark, with and
+//! Integration test: the §7.1 ablation benchmark, with and
 //! without passthrough, on kian's own bundle.
 //!
 //! One scripted workload — a work request (mock-IM) plus a train of
@@ -15,7 +15,7 @@
 //! What §7.1 measured, in kian's native units: Router judge turns
 //! (`turn/start` count on the Router stream — the "Router decisions"
 //! axis) and the read-token proxy (summed `step/request` body bytes on
-//! the Router stream — the S3-style cache-read axis). The assertions
+//! the Router stream — the -style cache-read axis). The assertions
 //! are **directionality, not the article's numbers** (different
 //! workload, different model): with passthrough, turns ≤ without and
 //! bytes ≤ without, at equal task completion (both runs end with the
@@ -233,7 +233,7 @@ fn worker_turn(train_len: usize) -> DynamicTurn {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures (the C35 harness shape, ManualClock'd)
+// Fixtures (the harness shape, ManualClock'd)
 // ---------------------------------------------------------------------------
 
 /// The worker's tool surface (every call succeeds — the loop shape is
@@ -388,7 +388,7 @@ struct AblationRun {
     /// `turn/start` count on the Router stream (Router decisions).
     router_turns: usize,
     /// Summed `step/request` body bytes on the Router stream (the
-    /// S3-style cache-read proxy).
+    /// -style cache-read proxy).
     router_request_bytes: usize,
     /// `input/admitted` count on the Router stream (workload sanity).
     router_inputs: usize,
@@ -700,7 +700,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C42)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 const TRAIN_LEN: usize = 6;

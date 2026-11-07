@@ -1,4 +1,4 @@
-//! `LarkChannel` — the first *real* [`ChannelAdapter`] (card C44,
+//! `LarkChannel` — the first *real* [`ChannelAdapter`] (
 //! DESIGN §4.2): the Feishu/Lark open platform over HTTP.
 //!
 //! Footprint-Ladder level 2: plugin-hosted code over the core
@@ -23,12 +23,12 @@
 //! - **Credentials** — `app_id`/`app_secret` are constructor inputs,
 //!   never config-file fields: assembly (kian-cli) reads
 //!   `KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET` from the environment at
-//!   startup (the C13 secrets discipline; C44 fail-closed: absent
+//!   startup (the secrets discipline; fail-closed: absent
 //!   credentials refuse to start). The tenant access token is fetched,
 //!   cached until shortly before expiry, and refreshed once on an
 //!   invalid-token rejection.
 //! - **Untrusted by default** — the channel carries no policy of its
-//!   own; assembly adds lark-typed channels to the C43 untrusted set
+//!   own; assembly adds lark-typed channels to the untrusted set
 //!   (real IM input is attacker-controllable text by default).
 //!
 //! Output policy is adapter-agnostic by contract: the caller shapes
@@ -59,7 +59,7 @@ pub const DEFAULT_API_BASE: &str = "https://open.feishu.cn";
 /// `POST /open-apis/auth/v3/tenant_access_token/internal`.
 const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
 
-/// The `User-Agent` every request carries (kian-74, the lark half of
+/// The `User-Agent` every request carries (the lark half of
 /// the check): applied once on the client so the token POST, the
 /// history GET, and the send POST all carry it. Feishu tolerates a
 /// missing one today — the adapter must not depend on that.
@@ -131,7 +131,7 @@ pub struct LarkConfig {
 }
 
 impl LarkConfig {
-    /// Fails closed on every degenerate field (the C13/C44 discipline:
+    /// Fails closed on every degenerate field (the discipline:
     /// an unusable lark config is a startup error, never a default).
     pub fn validate(&self) -> Result<(), LarkError> {
         if self.app_id.trim().is_empty() {
@@ -190,7 +190,7 @@ impl LarkChannel {
         config.validate()?;
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
-            // kian-74: the client-level User-Agent covers the token
+            // the client-level User-Agent covers the token
             // POST, history GET, and send POST in one place.
             .user_agent(USER_AGENT)
             .build()
@@ -429,7 +429,7 @@ pub fn message_to_event(
     if message.get("deleted").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    // C36 provenance: chat id → group, sender id/name → sender (kept
+    // provenance: chat id → group, sender id/name → sender (kept
     // verbatim as the adapter-defined identity object).
     let group = message
         .get("chat_id")
@@ -445,7 +445,7 @@ pub fn message_to_event(
         .map(|secs| secs * 1000)
         .unwrap_or_else(now_ms);
     // The payload is the verbatim message item plus — exactly the
-    // C36-documented adapter-declared signal — a top-level
+    // -documented adapter-declared signal — a top-level
     // `explicit: true` when the raw message carries an @-mention
     // (Feishu's `mentions` array, or an @-token in the text content,
     // which arrives JSON-encoded as a string rather than as
@@ -469,7 +469,7 @@ pub fn message_to_event(
 
 /// Does the raw message carry an @-mention? Feishu populates the
 /// `mentions` array for real mentions; a bare `@word` inside the
-/// JSON-encoded text content counts too (the same shape the C36
+/// JSON-encoded text content counts too (the same shape the
 /// text predicate recognizes, decoded from the wire form).
 fn message_has_mention(message: &Value) -> bool {
     if message
@@ -496,7 +496,7 @@ fn message_has_mention(message: &Value) -> bool {
     })
 }
 
-/// The chat-history cursor a mapped message payload carries (C61 read
+/// The chat-history cursor a mapped message payload carries (read
 /// position): its top-level `message_id` — offset semantics, the next
 /// poll resumes after it (the history API pages by create time; the
 /// id is the durable marker of what admission already saw). Pure over
@@ -817,7 +817,7 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
 
-        // A lone '@' or '@ word' is not a mention (the C36 predicate
+        // A lone '@' or '@ word' is not a mention (the predicate
         // shape: '@' followed by a non-whitespace char).
         for text in ["\"@\"", "\"@ kian\"", "\"no mention here\""] {
             let plain = json!({

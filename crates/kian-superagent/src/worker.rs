@@ -1,4 +1,4 @@
-//! Thread delegation (card C25): `WorkerSpawner` + `WorkerLoopDriver`.
+//! Thread delegation: `WorkerSpawner` + `WorkerLoopDriver`.
 //!
 //! The Router/Worker composition mechanics over existing primitives
 //! (DESIGN §4, ADR-003): a `Thread` pins a parent (Router) session and a
@@ -17,7 +17,7 @@
 //! rewritten afterward (constraint 3 — rewriting it would destroy
 //! provider prefix cache).
 //!
-//! The `"speculative": true` marker (C39) is additive and optional:
+//! The `"speculative": true` marker is additive and optional:
 //! [`delegation_content`] never emits it (legacy bytes are unchanged,
 //! golden-tested) and [`speculative_delegation_content`] adds exactly
 //! one key. The marker is model-visible by design — the worker's first
@@ -27,18 +27,18 @@
 //! worker-side `thread/started` payloads embed the task message, and
 //! the worker's `input/admitted` carries the wrapper itself).
 //!
-//! ## Lineage events (the C18 additions-only kinds)
+//! ## Lineage events (the additions-only kinds)
 //!
 //! - Router side: the Router's own execution hold appends
 //!   `thread/started` at dispatch, built by [`thread_started_payload`]
-//!   (the C26 `spawn_worker` tool does this in assembly; tests and the
+//!   (the `spawn_worker` tool does this in assembly; tests and the
 //!   audit helper consume the same bytes).
 //! - Worker side: [`WorkerLoopDriver`] appends `thread/started` at its
 //!   first drive when the stream lacks one and the initial input
 //!   carries the wrapper — **idempotent by stream scan**, so a takeover
 //!   after a killed hold never duplicates lineage (constraint 1).
 //! - Completion: on the inner loop's terminal outcome the wrapper runs
-//!   the C24 evidence gate (pure predicates, no model call), appends
+//!   the evidence gate (pure predicates, no model call), appends
 //!   `evidence/verdict` + `thread/completed{status, summary}`, admits
 //!   the completion report to the Router's inbox via [`InboxWriter`]
 //!   (a durable row — no cross-stream claim, fencing untouched), then
@@ -122,7 +122,7 @@ pub fn delegation_content(thread_id: Uuid, correlation: Option<Value>, task: Val
     wrapper
 }
 
-/// The speculative marker key (C39): present (and `true`) iff the
+/// The speculative marker key: present (and `true`) iff the
 /// delegation was spawned on a weak signal. An additive optional field
 /// inside the wrapper `content` — the frozen fields
 /// (`thread_id`/`correlation`/`task`) and every legacy wrapper byte are
@@ -148,7 +148,7 @@ pub fn parse_delegation(content: &Value) -> Option<Delegation> {
     })
 }
 
-/// True iff `content` is a delegation wrapper carrying the C39
+/// True iff `content` is a delegation wrapper carrying the
 /// speculative marker (`"speculative": true`). The companion of
 /// [`parse_delegation`] for the one additive wrapper field: the
 /// [`Delegation`] struct itself stays exactly its frozen shape, so
@@ -160,7 +160,7 @@ pub fn delegation_is_speculative(content: &Value) -> bool {
         .is_some_and(|obj| obj.get(SPECULATIVE_MARKER) == Some(&Value::Bool(true)))
 }
 
-/// The speculative delegation wrapper (C39): exactly
+/// The speculative delegation wrapper: exactly
 /// [`delegation_content`] plus `"speculative": true` — the marker that
 /// tells the worker (model-visible, in its first message) that it was
 /// spawned on a weak signal and may be discarded without delivery.
@@ -176,19 +176,19 @@ pub fn speculative_delegation_content(
 }
 
 // ---------------------------------------------------------------------------
-// The mandate object (C60 / ADR-012)
+// The mandate object (ADR-012)
 // ---------------------------------------------------------------------------
 
-/// The mandate key (C60, ADR-012): present iff the delegation carries
+/// The mandate key (ADR-012): present iff the delegation carries
 /// an authority object. An additive optional field inside the wrapper
 /// `content` — the frozen fields (`thread_id`/`correlation`/`task`),
-/// the C39 marker, and every legacy wrapper byte are unchanged. The
+/// the marker, and every legacy wrapper byte are unchanged. The
 /// markers compose: a speculative delegation may carry a mandate too
 /// (both are additive wrapper keys).
 pub const MANDATE_KEY: &str = "mandate";
 
-/// The mandate delegation wrapper (C60, ADR-012): exactly
-/// [`delegation_content`] plus `"mandate"` — the C39 marker mechanism
+/// The mandate delegation wrapper (ADR-012): exactly
+/// [`delegation_content`] plus `"mandate"` — the marker mechanism
 /// applied to an object. The mandate is the authority the Router
 /// granted: `{strength, scope, granted_by, source{channel,topic},
 /// policy_version, matched_rules?}` (schema owned by ADR-012). It is
@@ -220,18 +220,18 @@ pub fn delegation_mandate(content: &Value) -> Option<&Value> {
 
 /// The result of revalidating a live worker's mandate before a
 /// follow-up routes to it (ADR-012's revalidation rule, composed with
-/// the C59 live-routing path).
+/// the live-routing path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MandateRevalidation {
     /// The mandate authorizes the follow-up: `strength: explicit`
     /// always passes; `inferred` passes while its `policy_version` is
     /// still the current pointer. Legacy delegations (no mandate
-    /// object) pass — pre-C60 authority is never retroactively
+    /// object) pass — legacy authority is never retroactively
     /// narrowed.
     Pass,
     /// `strength: inferred` under a `policy_version` that is no longer
     /// the current pointer: the follow-up releases to fresh
-    /// evaluation (the C59 `released_to_eval` path) — honestly
+    /// evaluation (the `released_to_eval` path) — honestly
     /// audited, never a silent drop. `policy_version` is the mandate's
     /// persisted label, for the audit line.
     Release { policy_version: String },
@@ -239,7 +239,7 @@ pub enum MandateRevalidation {
 
 /// Pure mandate revalidation (ADR-012): `strength: explicit` passes;
 /// `inferred` passes iff its `policy_version` equals the current
-/// policy pointer (the C63 label; `None` on either side reads as the
+/// policy pointer (the label; `None` on either side reads as the
 /// honest `none` label, so an unversioned deployment never releases).
 /// A missing `strength` is treated as `inferred` (the safe reading:
 /// only an explicit statement is explicit).
@@ -273,7 +273,7 @@ pub fn revalidate_mandate(
 // Lineage payload builders (golden forms, frozen like all event bytes)
 // ---------------------------------------------------------------------------
 
-/// The `thread/started` payload (C18 §2 schema):
+/// The `thread/started` payload (§2 schema):
 /// `{"thread_id", "parent", "worker", "pinned_version", "task"}`.
 /// `task` is the *message payload* (`{"role","content":<wrapper>}`) the
 /// worker consumed — identical bytes on both sides' events.
@@ -288,7 +288,7 @@ pub fn thread_started_payload(thread: &Thread, worker: SessionId, task_message: 
     })
 }
 
-/// The `thread/completed` payload (C18 §2 schema):
+/// The `thread/completed` payload (§2 schema):
 /// `{"thread_id", "status": "completed"|"failed"|"interrupted",
 /// "summary": <message payload>}`.
 #[must_use]
@@ -311,7 +311,7 @@ pub fn thread_report_content(thread_id: Uuid, status: &str, summary: Value) -> V
     })
 }
 
-/// The structured report state (C56): the closed vocabulary the stage
+/// The structured report state: the closed vocabulary the stage
 /// projection reads (the prototype 001's Report row: progress ·
 /// waiting · ready · blocked · failed · dropped). Carried by the
 /// **additive** `"state"` key on stated completion reports
@@ -360,12 +360,12 @@ impl ReportState {
     }
 }
 
-/// The additive state key on stated completion reports (C56). Omitted
+/// The additive state key on stated completion reports. Omitted
 /// entirely by [`thread_report_content`] (legacy bytes unchanged, the
-/// C39 marker precedent).
+/// marker precedent).
 pub const REPORT_STATE_KEY: &str = "state";
 
-/// The stated completion-report content (C56): exactly
+/// The stated completion-report content: exactly
 /// [`thread_report_content`] plus the additive `"state"` key — the
 /// structured fact the Ticket stage projection reads (arm 2 `waiting`,
 /// arm 3 `ready`). The key is present (never `null`) precisely because
@@ -388,7 +388,7 @@ pub struct ThreadReport {
     pub thread_id: Uuid,
     pub status: String,
     pub summary: Value,
-    /// The additive structured state (C56): `None` on legacy reports
+    /// The additive structured state: `None` on legacy reports
     /// (the key is absent) and on unknown future values — the report
     /// still parses, the state is never guessed.
     pub state: Option<ReportState>,
@@ -426,7 +426,7 @@ pub struct StreamPortError(pub String);
 /// The decorator's only request surface toward the running hold:
 /// append one event (carrying the hold's fencing epoch — assembly
 /// guarantees that), read the session's committed stream, and name the
-/// session. Assembly (kian-cli, C27) builds one `Arc<dyn StreamPort>`
+/// session. Assembly (kian-cli) builds one `Arc<dyn StreamPort>`
 /// per execution hold from the hold handle (the handle is foreign to
 /// this crate, so the impl lives with assembly — the same shape as the
 /// `InboxWriter` port impl); the bundle never names that type.
@@ -472,7 +472,7 @@ pub struct SpawnedWorker {
 pub enum SpawnError {
     #[error("worker spawn: inbox admit failed: {0}")]
     Inbox(#[from] InboxWriteError),
-    /// The Router-profile speculation budget is exhausted (C39): the
+    /// The Router-profile speculation budget is exhausted: the
     /// honest refusal the Router model sees and reacts to — never a
     /// silent drop. The outstanding count behind it is stream-derived
     /// (unmatched `thread/started`), so the decision survives Router
@@ -497,7 +497,7 @@ pub enum SpawnError {
 pub struct WorkerSpawner {
     router: SessionId,
     pinned_version: u64,
-    /// The worker template's id (C60): the key the Router's mandate
+    /// The worker template's id: the key the Router's mandate
     /// policy resolves per-template scope text against.
     worker_template_id: String,
     inbox: Arc<dyn InboxWriter>,
@@ -514,7 +514,7 @@ impl WorkerSpawner {
         }
     }
 
-    /// The worker template's id — the mandate scope key (C60,
+    /// The worker template's id — the mandate scope key (
     /// `superagent.mandate.scopes`).
     #[must_use]
     pub fn worker_template_id(&self) -> &str {
@@ -533,7 +533,7 @@ impl WorkerSpawner {
         self.spawn_inner(task, correlation, false, None).await
     }
 
-    /// [`WorkerSpawner::spawn`] plus the authority object (C60,
+    /// [`WorkerSpawner::spawn`] plus the authority object (
     /// ADR-012): the wrapper is exactly the legacy bytes plus the
     /// additive `"mandate"` key, carried verbatim into the worker's
     /// first message and both streams' `thread/started` payloads.
@@ -547,7 +547,7 @@ impl WorkerSpawner {
             .await
     }
 
-    /// Spawns one worker **speculatively** (C39): identical mechanics
+    /// Spawns one worker **speculatively**: identical mechanics
     /// to [`WorkerSpawner::spawn`], except the delegation wrapper
     /// carries `"speculative": true` — the model-visible, audit-forever
     /// marker that this thread was minted on a weak signal and may be
@@ -565,7 +565,7 @@ impl WorkerSpawner {
     }
 
     /// [`WorkerSpawner::spawn_speculative`] plus the authority object
-    /// (C60): the C39 and C60 markers compose — the wrapper carries
+    /// the and markers compose — the wrapper carries
     /// both additive keys, so even a speculatively spawned worker runs
     /// under a recorded mandate (weak signal, bounded authority).
     pub async fn spawn_speculative_with_mandate(
@@ -591,10 +591,10 @@ impl WorkerSpawner {
             pinned_version: self.pinned_version,
         };
         let worker_session = SessionId::new();
-        // The C60 wrapper composes the public builders: the mandate
+        // The wrapper composes the public builders: the mandate
         // key lands through mandate_delegation_content (exactly
         // delegation_content plus one key), the speculative marker
-        // through the C39 spelling — both additive, both optional, and
+        // through the spelling — both additive, both optional, and
         // absent together the bytes are the frozen legacy form.
         let mut wrapper = match &mandate {
             Some(mandate) => mandate_delegation_content(thread.id, correlation, task, mandate),
@@ -776,14 +776,14 @@ pub struct WorkerLoopConfig {
     /// The worker template's pinned `AgentDef` version (ADR-006) —
     /// stamped into the worker-side `thread/started`.
     pub worker_version: u64,
-    /// The C24 evidence gate evaluated at the terminal outcome.
+    /// The evidence gate evaluated at the terminal outcome.
     /// Default (disabled) appends no verdict and completes ungated —
-    /// Phase-1 inner behavior unchanged.
+    /// built-in inner behavior unchanged.
     pub gate: EvidenceGateConfig,
 }
 
 /// A decorator over any inner [`LoopDriver`] that adds Thread lineage
-/// (C25): `thread/started` at first drive (idempotent by stream scan —
+/// `thread/started` at first drive (idempotent by stream scan —
 /// safe across takeover), the evidence gate + `evidence/verdict` +
 /// `thread/completed` at the terminal outcome, and the completion
 /// report admitted to the Router's inbox before the outcome propagates.
@@ -811,7 +811,7 @@ impl<D: LoopDriver> Clone for WorkerLoopDriver<D> {
 
 impl<D: LoopDriver> WorkerLoopDriver<D> {
     /// Wraps `driver`. `inbox` is used only for the completion report
-    /// (admit, then wake — both via the C23 port); `port_for` builds
+    /// (admit, then wake — both via the port); `port_for` builds
     /// the [`StreamPort`] for each execution hold from its context
     /// (assembly's job — see [`PortFor`]).
     pub fn new(
@@ -951,7 +951,7 @@ where
     }
 }
 
-/// Phase 1: classify the stream and, for a fresh worker, append the
+/// built-in: classify the stream and, for a fresh worker, append the
 /// `thread/started` lineage event. Pure decision via [`lineage_plan`].
 async fn begin_lineage<D>(
     core: &DriverCore<D>,
@@ -984,7 +984,7 @@ where
     }
 }
 
-/// Phase 3: the terminal outcome. Gate → verdict → `thread/completed`
+/// ecosystem: the terminal outcome. Gate → verdict → `thread/completed`
 /// → report (durable row, then wake) → propagate. Gate failures with
 /// retry budget left re-drive the inner loop (yielding `TurnDone` as
 /// the continue signal); everything else yields a terminal outcome.
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Speculative delegation wrapper (C39)
+    // Speculative delegation wrapper
     // ------------------------------------------------------------------
 
     #[test]
@@ -1217,7 +1217,7 @@ mod tests {
     #[test]
     fn legacy_wrapper_bytes_are_unchanged_additive_golden() {
         // The legacy builder emits no marker key at all (absent, never
-        // false/null) and its serialized bytes are exactly the C25
+        // false/null) and its serialized bytes are exactly the
         // golden — the addition is purely additive.
         let content = delegation_content(tid(0x5b), Some(json!("evt-9")), json!("do the thing"));
         assert!(content.get(SPECULATIVE_MARKER).is_none());
@@ -1339,7 +1339,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The mandate wrapper (C60 / ADR-012)
+    // The mandate wrapper (ADR-012)
     // ------------------------------------------------------------------
 
     fn mandate() -> serde_json::Value {
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn speculative_and_mandate_markers_compose() {
-        // C39 + C60 compose: one wrapper carries both additive keys, so
+        // + compose: one wrapper carries both additive keys, so
         // even a weak-signal spawn runs under recorded authority.
         let router = sid(10);
         let inbox = CapturingInbox::shared();
@@ -1469,7 +1469,7 @@ mod tests {
             revalidate_mandate(Some(&explicit), Some("v9")),
             MandateRevalidation::Pass
         );
-        // Legacy delegations (no object) pass; pre-C60 authority is
+        // Legacy delegations (no object) pass; legacy authority is
         // never retroactively narrowed.
         assert_eq!(
             revalidate_mandate(None, Some("v9")),
@@ -1504,7 +1504,7 @@ mod tests {
             }
         );
         // A versioned mandate under an unversioned deployment drifts
-        // too (the pointer moved — unset is a drift, C63's rule).
+        // too (the pointer moved — unset is a drift, 's rule).
         assert_eq!(
             revalidate_mandate(Some(&inferred), None),
             MandateRevalidation::Release {
@@ -1570,7 +1570,7 @@ mod tests {
 
     #[test]
     fn stated_report_is_exactly_legacy_plus_the_state_key() {
-        // The C56 additive key (the C39 marker precedent): the legacy
+        // The additive key (the marker precedent): the legacy
         // builder emits no key at all, the stated builder adds exactly
         // one, and legacy bytes are unchanged.
         let legacy = thread_report_content(tid(0xe1), "completed", json!({"text": "done"}));

@@ -1,12 +1,12 @@
-//! `HeartbeatWatchdog` — the v1 [`WatchdogSource`] impl (card C21,
-//! DESIGN §4.3): an edge-triggered health monitor over the C20 endpoint
+//! `HeartbeatWatchdog` — the v1 [`WatchdogSource`] impl (
+//! DESIGN §4.3): an edge-triggered health monitor over the endpoint
 //! registry projection.
 //!
 //! v1 is deliberately **server-side**: a dead daemon cannot report its own
 //! death, so the authoritative view is the server's heartbeat-absence
 //! observation — `now - last_heartbeat > offline_after` marks an endpoint
-//! offline, a fresh heartbeat marks it online again (DESIGN §4.3; S5).
-//! Endpoint-side self-checks (anomaly self-healing) remain Phase 3.
+//! offline, a fresh heartbeat marks it online again (DESIGN §4.3;).
+//! Endpoint-side self-checks (anomaly self-healing) remain deferred.
 //!
 //! Semantics:
 //!
@@ -21,7 +21,7 @@
 //!   that is already stale *does* emit offline — the registry's previous
 //!   word was online, and the change is real and actionable.
 //! - **Observes only.** The watchdog never writes sessions or events;
-//!   health events reach sessions exclusively via Admit (wired in C27) —
+//!   health events reach sessions exclusively via Admit (wired ) —
 //!   the layered iron rule.
 //!
 //! Exposure: a `tokio::sync::watch` channel carries the live state map
@@ -31,9 +31,9 @@
 //! detection latency.
 //!
 //! Freshness compares the server clock against the endpoint-*reported*
-//! heartbeat timestamp (the v0 registry semantics — C19/C20 own that write
-//! path and this card does not touch it); clock-skew hardening
-//! (server-receive timestamps) is Phase 3.
+//! heartbeat timestamp (the v0 registry semantics — own that write
+//! path and this change does not touch it); clock-skew hardening
+//! (server-receive timestamps) is deferred.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,7 +135,7 @@ impl Default for WatchdogConfig {
     }
 }
 
-/// Watchdog counters for the metrics surface (C27 wires them into
+/// Watchdog counters for the metrics surface (wires them into
 /// `/metrics`). All fields are plain atomics; read them cheaply.
 #[derive(Debug, Default)]
 pub struct WatchdogMetrics {
@@ -199,7 +199,7 @@ struct Inner {
 }
 
 /// The v1 server-side [`WatchdogSource`]: an edge-triggered heartbeat
-/// monitor over the C20 endpoint registry (DESIGN §4.3). Build with
+/// monitor over the endpoint registry (DESIGN §4.3). Build with
 /// [`HeartbeatWatchdog::start`]; share one per process.
 pub struct HeartbeatWatchdog {
     inner: Arc<Inner>,

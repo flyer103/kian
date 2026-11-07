@@ -1,5 +1,5 @@
 //! Typed client errors (moved verbatim from `kian-cli/src/client.rs`,
-//! card C14) plus the frozen error-code table.
+//! ) plus the frozen error-code table.
 //!
 //! Errors are honest and structured: transport failures stay
 //! [`ClientError::Http`]; a JSON-RPC error object becomes
@@ -18,7 +18,7 @@ pub enum ClientError {
 }
 
 // ---------------------------------------------------------------------------
-// The frozen C13/C14 error-code table (matchable, never string-parsed)
+// The frozen error-code table (matchable, never string-parsed)
 // ---------------------------------------------------------------------------
 
 /// JSON-RPC error code for server-side failures (-32000).
@@ -77,7 +77,7 @@ mod tests {
         CODE_UNKNOWN_SESSION, ClientError,
     };
 
-    /// The frozen code table is exactly the C13/C14 table.
+    /// The frozen code table is exactly the table.
     #[test]
     fn the_error_code_table_is_frozen() {
         assert_eq!(CODE_INTERNAL, -32000);

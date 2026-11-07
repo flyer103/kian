@@ -1,10 +1,10 @@
-//! The Router profile (card C26): the resident Router session, its
+//! The Router profile: the resident Router session, its
 //! judge prompt, dispatch tools, and the residency hold.
 //!
 //! ## Resident Router session
 //!
 //! The Router is a *resident* session: a configured [`SessionId`]
-//! bootstrapped through the C23 admit path (the first execution hold
+//! bootstrapped through the admit path (the first execution hold
 //! appends `session/created` — no server API is widened for it). It
 //! runs the built-in driver wrapped by [`RouterDriver`], which owns
 //! two residency rules:
@@ -15,7 +15,7 @@
 //!    spent re-asking an unchanged context) and resumes exactly when a
 //!    new input row lands in the Router's inbox (the worker's
 //!    completion report, admitted durably before its wake — invariant
-//!    1). This is the design point C25 routed here: a terminal Router
+//!    1). This is the design point routed here: a terminal Router
 //!    session freezes, so the hold is kept alive while workers run.
 //! 2. **Never settle on an idle final answer.** A `Settled` outcome
 //!    with the inbox drained is swallowed and the driver parks for the
@@ -31,7 +31,7 @@
 //! ## Dispatch tools
 //!
 //! [`RouterTools`] is the Router's whole model-visible toolset:
-//! `spawn_worker` (C25 mechanics + the Router-side `thread/started`),
+//! `spawn_worker` (mechanics + the Router-side `thread/started`),
 //! `reply` (ImPolicy-shaped) and `deliver_structured`
 //! (StructuredPolicy-checked). Workers never hold these
 //! ([`crate::templates`] enforces the structural diff); the Router
@@ -93,9 +93,9 @@ pub const DELIVER_STRUCTURED_TOOL: &str = "deliver_structured";
 /// Idempotency key of the Router's one bootstrap input.
 pub const ROUTER_BOOTSTRAP_KEY: &str = "router:bootstrap";
 
-/// Default judge-prompt template (C57 decision-tag sentence included).
+/// Default judge-prompt template (decision-tag sentence included).
 /// The constant lives in [`crate::templates`] beside the other
-/// template artifacts (kian-65); re-exported here so the historical
+/// template artifacts; re-exported here so the historical
 /// `router::JUDGE_PROMPT_TEMPLATE` path keeps resolving.
 pub use crate::templates::JUDGE_PROMPT_TEMPLATE;
 
@@ -129,7 +129,7 @@ impl JudgePrompt {
         self.template.replace("{inputs}", &pending.to_string())
     }
 
-    /// Renders the bootstrap prompt of a re-armed successor (kian-62):
+    /// Renders the bootstrap prompt of a re-armed successor:
     /// an observable, derivable cause prefix — naming every frozen
     /// predecessor and its end reason — followed by the plain judge
     /// prompt, so the watch's charter rides along unchanged. The prefix
@@ -163,31 +163,31 @@ pub struct RouterProfile {
     pub judge: JudgePrompt,
     pub im: ImPolicy,
     pub structured: StructuredPolicy,
-    /// The speculation budget (C39). `None` (the default) disables
+    /// The speculation budget. `None` (the default) disables
     /// speculation: a `spawn_worker` call with `speculative: true` is
     /// refused with an honest tool error naming the missing config —
     /// never a silent refusal, never an uncapped spawn.
     pub speculation: Option<SpeculationPolicy>,
-    /// The output-side speak-rules (C58, `superagent.speak_rules`):
+    /// The output-side speak-rules (`superagent.speak_rules`):
     /// the *whether-to-send* gate on `reply`/`deliver_structured`,
     /// composed **before** the §4.2 shaping policies. Empty (the
     /// default, and what an absent config section produces) admits
-    /// every send — byte-identical to the pre-C58 behavior.
+    /// every send — byte-identical to the legacy behavior.
     pub speak: SpeakPolicy,
-    /// C59 follow-up ownership (`superagent.followup_ownership`,
+    /// follow-up ownership (`superagent.followup_ownership`,
     /// default **on**): while a live Executor owns a topic, the Router
     /// may only stop it — `spawn_worker` with that topic correlation is
     /// refused at the tool with an honest error naming the owner
     /// session, and the spawned worker is registered as the topic's
-    /// live owner. `false` restores the pre-C59 behavior (no refusal,
+    /// live owner. `false` restores the legacy behavior (no refusal,
     /// no registration).
     pub followup_ownership: bool,
-    /// kian-62 re-arm: the ended, frozen predecessors of `session`
+    /// re-arm: the ended, frozen predecessors of `session`
     /// (empty = generation 0, the configured pinned session itself).
     /// Assembly fills it from the boot-time chain walk; the bootstrap
     /// keys and prompt above branch on it.
     pub re_arm: Vec<crate::rearm::EndedResident>,
-    /// C63: the policy version whose label rides the bootstrap prompt
+    /// the policy version whose label rides the bootstrap prompt
     /// as a `[policy <label>]` header (rendered once at bootstrap,
     /// wrapped around the *rendered* prompt — the template text is
     /// untouched). `None` (the default, and what an absent
@@ -196,7 +196,7 @@ pub struct RouterProfile {
     /// is marked at boot, the new header lands only on the *next*
     /// bootstrap (cache-byte stability, constraint 3).
     pub policy_version: Option<PolicyVersion>,
-    /// C60 (ADR-012): the mandate issuance policy
+    /// (ADR-012): the mandate issuance policy
     /// (`superagent.mandate`). `None` (the default) issues no
     /// mandate — every delegation wrapper stays byte-identical legacy.
     /// When set, `spawn_worker` (the single issuance point) builds the
@@ -204,11 +204,11 @@ pub struct RouterProfile {
     /// per-worker-template scope texts here, stamping the current
     /// policy-version pointer.
     pub mandate: Option<MandatePolicy>,
-    /// C62: the outbox bounded-retry configuration
+    /// the outbox bounded-retry configuration
     /// (`superagent.outbox`). `None` (the default, and what an absent
     /// config section produces) sends exactly once and reports the
     /// honest adapter error to the model — byte-identical to the
-    /// pre-C62 behavior. When set, `reply`/`deliver_structured`
+    /// legacy behavior. When set, `reply`/`deliver_structured`
     /// deliver through the [`OutboxDriver`] (bounded backoff, per-
     /// `(ticket, conversation)` ordering, park with a visible stage).
     pub outbox: Option<OutboxConfig>,
@@ -235,19 +235,19 @@ impl RouterProfile {
         }
     }
 
-    /// Bootstraps the resident session via the C23 admit path: one
+    /// Bootstraps the resident session via the admit path: one
     /// durable judge-prompt input to the configured (possibly
     /// not-yet-existing) session id — the first execution hold appends
     /// `session/created`. Idempotent per [`ROUTER_BOOTSTRAP_KEY`], so
     /// assembly may call it at every startup.
     ///
-    /// kian-62: for a re-armed successor (`re_arm` non-empty) the key
+    /// for a re-armed successor (`re_arm` non-empty) the key
     /// becomes the per-generation
     /// [`router:bootstrap:re-arm:<uuid>`](crate::rearm::re_arm_bootstrap_key)
     /// and the payload carries the observable re-arm cause — the frozen
     /// predecessors and their reasons — before the judge prompt.
     ///
-    /// C63: the configured policy version's label wraps the rendered
+    /// the configured policy version's label wraps the rendered
     /// prompt as a `[policy <label>]` header (added at render, so the
     /// template text and every legacy persisted prompt stay
     /// byte-identical). The header is idempotent with the bootstrap
@@ -279,7 +279,7 @@ impl RouterProfile {
 // ---------------------------------------------------------------------------
 
 /// Name → adapter lookup for the Router's channel-facing tools.
-/// Assembly builds it from config (C27); the tools send through it and
+/// Assembly builds it from config; the tools send through it and
 /// never construct adapters themselves.
 #[derive(Clone, Default)]
 pub struct ChannelRegistry {
@@ -329,10 +329,10 @@ impl std::fmt::Debug for ChannelRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Speculation policy (C39)
+// Speculation policy
 // ---------------------------------------------------------------------------
 
-/// The default **silent-repro prompt template** (C39 item 3): the
+/// The default **silent-repro prompt template** (item 3): the
 /// article's "don't cry wolf" delivery policy, shipped as a *config
 /// artifact* on the Router profile — prose the operator edits without
 /// code. It constrains when a speculative finding is delivered at all:
@@ -341,7 +341,7 @@ pub const SILENT_REPRO_TEMPLATE: &str = "Silent-repro policy for speculative fin
 report only after the bug is confirmed AND a simple fix is found; otherwise stay quiet — record \
 what you confirmed in the thread summary and deliver nothing on any channel.";
 
-/// The Router profile's speculation budget (C39 item 2):
+/// The Router profile's speculation budget (item 2):
 /// `speculation: { max_outstanding: n, label: … }`. The cap bounds how
 /// many threads the Router may keep outstanding via speculative spawns;
 /// enforcement is honest (an error the Router model sees and reacts to)
@@ -374,7 +374,7 @@ impl SpeculationPolicy {
 }
 
 /// Enforces [`SpeculationPolicy`] against the Router's committed event
-/// stream (C39): a speculative spawn is admitted only while the
+/// stream: a speculative spawn is admitted only while the
 /// stream-derived outstanding count (`thread/started` without a
 /// completion report — [`outstanding_threads`]) is below the cap. A
 /// refusal is the honest [`SpawnError::SpeculationCap`] the Router
@@ -397,14 +397,14 @@ pub fn enforce_speculation_cap(
 }
 
 // ---------------------------------------------------------------------------
-// Mandate issuance (C60, ADR-012)
+// Mandate issuance (ADR-012)
 // ---------------------------------------------------------------------------
 
-/// The mandate issuance policy (C60, ADR-012 —
+/// The mandate issuance policy (ADR-012 —
 /// `superagent.mandate`): per-worker-template scope texts. The Router
 /// profile carries it; `spawn_worker` is the single issuance point.
 /// Absent config issues no mandate — every wrapper stays byte-identical
-/// legacy (the default-off discipline of C37/C39).
+/// legacy (the default-off discipline ).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MandatePolicy {
     /// Worker template id (`agents.<id>`) → the natural-language scope
@@ -436,8 +436,8 @@ impl MandatePolicy {
 ///
 /// - `strength` — `explicit` iff the triggering wrapper's raw carries
 ///   the **adapter-declared** `"explicit": true` payload field (the
-///   C36 signal the github/lark adapters stamp on @-mentions); every
-///   other trigger — including any text-derived reading, which the C43
+///   signal the github/lark adapters stamp on @-mentions); every
+///   other trigger — including any text-derived reading, which the
 ///   untrusted discipline refuses to trust — is `inferred`;
 /// - `granted_by` — the raw's sender provenance **verbatim** when the
 ///   wrapper records one; `null` for a channel event whose sender is
@@ -445,7 +445,7 @@ impl MandatePolicy {
 ///   session id for a non-channel spawn (the Router itself triggered);
 /// - `source` — the wrapper's `{channel, topic}`, or
 ///   `{channel: "router", topic: null}` when no channel wrapper exists;
-/// - `policy_version` — the current pointer (the C63 label; `none`
+/// - `policy_version` — the current pointer (the label; `none`
 ///   when unversioned);
 /// - `matched_rules` — omitted in v1: the spawn surface has no named
 ///   rule source to cite (the ADR leaves the key optional for exactly
@@ -461,7 +461,7 @@ pub fn build_mandate(
     policy_label: Option<&str>,
 ) -> Option<Value> {
     let scope = policy.scope_for(worker_template)?.to_string();
-    // kian-75: the task may arrive as a JSON object or as the live
+    // the task may arrive as a JSON object or as the live
     // spelling — a string carrying the serialized wrapper (the tool
     // schema types `task` as a string). The lenient parse reads both;
     // the mandate provenance/strength follow the marker either way.
@@ -478,7 +478,7 @@ pub fn build_mandate(
         // delegation — the honest source is the Router itself.
         None => (json!({"channel": "router", "topic": null}), Value::Null),
     };
-    // C43 discipline: only the adapter-declared signal makes authority
+    // discipline: only the adapter-declared signal makes authority
     // explicit — the raw's text is never parsed for consent.
     let strength = if raw.get("explicit") == Some(&Value::Bool(true)) {
         "explicit"
@@ -554,32 +554,32 @@ pub struct RouterTools {
     im: ImPolicy,
     structured: StructuredPolicy,
     speculation: Option<SpeculationPolicy>,
-    /// C58: the output-side speak-rule table (empty = ungated).
+    /// the output-side speak-rule table (empty = ungated).
     speak: SpeakPolicy,
-    /// C58: the ack-once memory — a disposable projection seeded lazily
+    /// the ack-once memory — a disposable projection seeded lazily
     /// from the Router's own stream at the first gated send (the boot
     /// rebuild) and then kept in step by [`Self::speak_record`].
     speak_tracker: Arc<Mutex<Option<SpeakTracker>>>,
-    /// C58: suppression counters (audit-visible, snapshot-stable).
+    /// suppression counters (audit-visible, snapshot-stable).
     speak_metrics: Arc<SpeakMetrics>,
-    /// C59: the follow-up-ownership gate (`superagent.followup_ownership`,
+    /// the follow-up-ownership gate (`superagent.followup_ownership`,
     /// default on — mirrored from the profile).
     followup_ownership: bool,
-    /// C59: the shared passthrough registry — the same projection the
+    /// the shared passthrough registry — the same projection the
     /// subscription service fans out through. `None` (tests, or
     /// assembly without the wiring) means no ownership check and no
     /// registration: `spawn_worker` behaves exactly as before.
     followup_registry: Option<Arc<std::sync::RwLock<PassthroughRegistry>>>,
-    /// The resident Router session (C60): the mandate's `granted_by`
+    /// The resident Router session: the mandate's `granted_by`
     /// fallback for non-channel spawns — the Router itself triggered.
     router: SessionId,
-    /// C60 (ADR-012): the mandate issuance policy. `None` issues no
+    /// (ADR-012): the mandate issuance policy. `None` issues no
     /// mandate (byte-identical legacy wrappers).
     mandate: Option<MandatePolicy>,
-    /// C60: the current policy-version pointer (the C63 label) the
+    /// the current policy-version pointer (the label) the
     /// mandate stamps — the same label the bootstrap renders.
     policy_label: Option<String>,
-    /// C62: the outbox bounded-retry driver. `None` (the default) is
+    /// the outbox bounded-retry driver. `None` (the default) is
     /// the legacy single-attempt send path, byte-identical. When
     /// present, `reply`/`deliver_structured` deliver through it.
     outbox: Option<Arc<OutboxDriver>>,
@@ -594,7 +594,7 @@ impl RouterTools {
         profile: &RouterProfile,
         hold: Arc<RouterHold>,
     ) -> Self {
-        // C62: the outbox driver is built before the literal moves
+        // the outbox driver is built before the literal moves
         // `channels` (it owns a clone for the boot re-drive).
         let outbox = profile.outbox.map(|config| {
             Arc::new(OutboxDriver::new(
@@ -625,7 +625,7 @@ impl RouterTools {
         }
     }
 
-    /// Shares the passthrough registry with the tool surface (C59
+    /// Shares the passthrough registry with the tool surface (
     /// assembly wiring): the `spawn_worker` ownership check and the
     /// fan-out path then read one projection — the same handle the
     /// subscription service holds.
@@ -638,7 +638,7 @@ impl RouterTools {
         self
     }
 
-    /// C62 assembly/test wiring: installs an explicitly-built outbox
+    /// assembly/test wiring: installs an explicitly-built outbox
     /// driver (clock-injected for tests; the boot re-drive uses the
     /// same handle). Overrides any driver the profile's config built.
     #[must_use]
@@ -647,7 +647,7 @@ impl RouterTools {
         self
     }
 
-    /// C62: the installed outbox driver, if any (the boot re-drive
+    /// the installed outbox driver, if any (the boot re-drive
     /// surface — `start_services` rebuilds pending intents from the
     /// Router's stream and re-drives them through this handle).
     #[must_use]
@@ -655,17 +655,17 @@ impl RouterTools {
         self.outbox.as_ref().map(Arc::clone)
     }
 
-    /// The speak-gate's suppression counters (C58) — the assembly's
+    /// The speak-gate's suppression counters — the assembly's
     /// observability surface.
     #[must_use]
     pub fn speak_metrics(&self) -> Arc<SpeakMetrics> {
         Arc::clone(&self.speak_metrics)
     }
 
-    /// A copy of the runtime ack-once memory (C58). The tracker is a
+    /// A copy of the runtime ack-once memory. The tracker is a
     /// disposable projection: this snapshot must always equal
     /// [`SpeakTracker::from_events`] over the Router's committed
-    /// stream — the equality the C58 tests pin.
+    /// stream — the equality the tests pin.
     #[must_use]
     pub fn speak_tracker_snapshot(&self) -> SpeakTracker {
         self.speak_tracker
@@ -675,13 +675,13 @@ impl RouterTools {
             .unwrap_or_default()
     }
 
-    /// The C58 output gate: evaluates the channel's speak rule *before*
+    /// The output gate: evaluates the channel's speak rule *before*
     /// the send, before the shaping policies. An ungated channel
     /// returns `Ok(())` without touching the stream (byte-identical to
-    /// the pre-C58 path). A suppression is an **honest tool error**
+    /// the legacy path). A suppression is an **honest tool error**
     /// naming the rule and condition — the model sees it and reacts —
     /// plus an audit line and a counter tick; nothing is sent and no
-    /// `channel/delivered` is appended (the C39 deliver-or-discard
+    /// `channel/delivered` is appended (the deliver-or-discard
     /// discipline).
     async fn speak_gate(
         &self,
@@ -746,7 +746,7 @@ impl RouterTools {
         }
     }
 
-    /// The C58 gate's success half: after a send (and its
+    /// The gate's success half: after a send (and its
     /// `channel/delivered`) committed on a *gated* channel, the
     /// ack-once memory records the conversation — keeping the runtime
     /// tracker equal to a stream rebuild.
@@ -792,12 +792,12 @@ impl RouterTools {
             .get("speculative")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // C59: follow-up ownership — the topic correlation of this
+        // follow-up ownership — the topic correlation of this
         // spawn, derived exactly the way the registry rebuild derives
         // topic bindings (the channel-event wrapper the Router judged),
         // or an explicit `{"topic": …}` correlation object. `None`
         // (the common non-channel spawn) skips the check with no
-        // registry read — byte-identical to the pre-C59 path.
+        // registry read — byte-identical to the legacy path.
         let ownership_topic = if self.followup_ownership {
             spawn_topic(&task, correlation.as_ref())
         } else {
@@ -829,14 +829,14 @@ impl RouterTools {
                 owner.0
             )));
         }
-        // C39: speculative spawns are budgeted by the Router profile.
+        // speculative spawns are budgeted by the Router profile.
         // The cap check happens strictly before the admit — no thread
         // id is minted, no row lands — and every refusal is an honest
         // error the Router model sees and reacts to (never silence).
         // The legacy path (no `speculative` arg) is byte-identical to
-        // C26: no policy lookup, no stream read.
+        // no policy lookup, no stream read.
         //
-        // C60 (ADR-012): the mandate is issued here — the single
+        // (ADR-012): the mandate is issued here — the single
         // issuance point — built from the triggering input's provenance
         // wrapper and the per-worker-template scope config, stamping
         // the current policy-version pointer. `None` (no
@@ -888,7 +888,7 @@ impl RouterTools {
         // worker-side event (the delegation pair is discoverable by
         // scanning both streams). For a speculative spawn the embedded
         // task message carries the marker — the audit-visible half of
-        // C39 (the worker's own first input is the other half).
+        // (the worker's own first input is the other half).
         port.emit(
             EventKind::ThreadStarted,
             thread_started_payload(
@@ -908,7 +908,7 @@ impl RouterTools {
             output["speculative"] = json!(true);
             debug_assert!(delegation_is_speculative(&spawned.task_message["content"]));
         }
-        // C59: the spawned worker is now the topic's live Executor.
+        // the spawned worker is now the topic's live Executor.
         // Registration strictly after the durable lineage (`thread/started`)
         // — the projection never runs ahead of the log — and it is the
         // runtime half of the ownership the next duplicate spawn (or a
@@ -921,7 +921,7 @@ impl RouterTools {
                 .expect("followup registry lock")
                 .register(topic.clone(), spawned.worker_session);
         }
-        // C60: the mandate projection rides the same
+        // the mandate projection rides the same
         // strictly-after-lineage ordering — the fan-out's revalidation
         // reads it (a rebuild re-derives it from the `thread/started`
         // task payload). Registered for every mandated spawn, topic or
@@ -934,7 +934,7 @@ impl RouterTools {
                 .expect("followup registry lock")
                 .register_mandate(spawned.worker_session, mandate.clone());
         }
-        // C60: the issuance audit line — the durable record is the
+        // the issuance audit line — the durable record is the
         // mandate object inside the wrapper (both streams' task
         // payloads); this line is the operator's console trace.
         if let Some(mandate) = &mandate {
@@ -963,7 +963,7 @@ impl RouterTools {
         })
     }
 
-    /// C62: the shared send path of `reply`/`deliver_structured`.
+    /// the shared send path of `reply`/`deliver_structured`.
     /// Without a driver (the default) this is the legacy single
     /// attempt — byte-identical behavior. With one, the send runs
     /// through [`OutboxDriver::deliver_with_retry`]: bounded backoff,
@@ -1014,7 +1014,7 @@ impl RouterTools {
             .get(channel)
             .ok_or_else(|| ToolError::InvalidCall(format!("unknown channel `{channel}`")))?;
 
-        // C58 speak gate: the *whether-to-send* decision, before the
+        // speak gate: the *whether-to-send* decision, before the
         // §4.2 shaping (a suppressed send is never shaped, never sent,
         // and leaves no channel/delivered).
         self.speak_gate(&port, channel, SpeakKind::Decision, &target)
@@ -1032,7 +1032,7 @@ impl RouterTools {
             .send_with_outbox(args, channel, &target, &adapter, delivery)
             .await?;
         // channel/delivered lands only after the send succeeded; under
-        // an enabled outbox (C62) the receipt carries the additive
+        // an enabled outbox the receipt carries the additive
         // `attempt`/`first_attempt_ms` keys (legacy payloads stay
         // byte-identical).
         let payload = im_delivered_payload(channel, &target, &enforced);
@@ -1073,7 +1073,7 @@ impl RouterTools {
             .get(channel)
             .ok_or_else(|| ToolError::InvalidCall(format!("unknown channel `{channel}`")))?;
 
-        // C58 speak gate, before the §4.2 section contract: a result
+        // speak gate, before the §4.2 section contract: a result
         // the rule refuses is never validated-then-sent — it is
         // refused honestly with nothing sent and no channel/delivered.
         self.speak_gate(&port, channel, SpeakKind::Result, &target)
@@ -1384,7 +1384,7 @@ fn event_thread_id(ev: &Event) -> Option<Uuid> {
 ///   inner loop);
 /// - propagates `Stopped` (intentional stop) and `SoftFailed` (honest
 ///   failure) unchanged;
-/// - with a [`RouterTurnRecorder`] mounted (C41), times each judge
+/// - with a [`RouterTurnRecorder`] mounted, times each judge
 ///   turn — the decision segment from an inner-loop start (or a parked
 ///   resume) to the parking/terminal transition — and records its
 ///   batch (inputs consumed, a pure stream projection) and wall
@@ -1401,16 +1401,16 @@ struct DriverCore<D: LoopDriver> {
     port_for: PortFor<D::Ctx>,
     inbox: Arc<RouterInbox>,
     park_tick: Duration,
-    /// Judge-turn recording (C41); `None` = metrics off, the exact
-    /// pre-C41 behavior.
+    /// Judge-turn recording; `None` = metrics off, the exact
+    /// legacy behavior.
     metrics: Option<RouterTurnRecorder>,
     /// The admitted-count baseline carried from the last judge turn's
-    /// end (C41), persistent across this driver's holds — the engine
+    /// end, persistent across this driver's holds — the engine
     /// consumes a batch *before* `drive()` starts, so only a baseline
     /// from before that consumption yields the true batch diff.
     mark: Mutex<Option<u64>>,
     /// The inbox counter snapshot at the last judge turn's close
-    /// (kian-63), persistent across holds. `Phase::First` compares it
+    /// , persistent across holds. `Phase::First` compares it
     /// against the live counter to tell a re-drive with fresh durable
     /// rows from one on unchanged context: the counter only advances
     /// after a row commits, so `admit_count() <= admit_mark` means
@@ -1461,7 +1461,7 @@ impl<D: LoopDriver> RouterDriver<D> {
         Self::with_park_tick_and_metrics(driver, hold, port_for, inbox, park_tick, None)
     }
 
-    /// [`RouterDriver::new`] plus judge-turn metrics (C41): every judge
+    /// [`RouterDriver::new`] plus judge-turn metrics: every judge
     /// turn's batch size and wall duration land in `recorder`'s
     /// counters. Pure observability — identical control flow, identical
     /// provider behavior.
@@ -1511,14 +1511,14 @@ impl<D: LoopDriver> RouterDriver<D> {
 /// The decorator's phases. `First` installs the port and starts the
 /// inner loop whenever the hold has work — a fresh hold must consume
 /// whatever is already eligible (takeover included). The one exception
-/// (kian-63): a re-drive of a session this process already parked,
+/// a re-drive of a session this process already parked,
 /// with no durable row admitted since that judge turn's close, has no
 /// work — it parks before opening a turn, spending no provider call on
 /// unchanged context. `Inner` delegates; `Park` waits for the next
 /// durable Router admit, ticking out `TurnDone`s so supervision
 /// observes interrupts.
 ///
-/// `turn` carries the open judge turn's timing (C41); the batch
+/// `turn` carries the open judge turn's timing; the batch
 /// baseline lives in `DriverCore` (it must survive across holds — see
 /// `start_turn`).
 enum Phase<Ctx> {
@@ -1528,7 +1528,7 @@ enum Phase<Ctx> {
         stream: BoxStream<'static, LoopOutcome>,
         /// Inbox counter at the moment the inner loop last (re)started.
         seen: u64,
-        /// The judge turn being timed (metrics on), if any.
+        /// The judge turn being timed (metrics ), if any.
         turn: Option<TurnTiming>,
     },
     Park {
@@ -1538,7 +1538,7 @@ enum Phase<Ctx> {
     Done,
 }
 
-/// The open judge turn's timing state (C41).
+/// The open judge turn's timing state.
 struct TurnTiming {
     t0_ms: u64,
     admitted_before: u64,
@@ -1571,7 +1571,7 @@ where
                             // already eligible (a report admitted while
                             // the Router was idle, takeover included) —
                             // parking before that would strand the row.
-                            // The exception (kian-63): this process has
+                            // The exception: this process has
                             // settled a judge turn on this session and
                             // no durable row landed since its close —
                             // nothing is eligible, nothing is
@@ -1635,7 +1635,7 @@ where
                                         ))
                                     } else {
                                         // The judge turn over its batch
-                                        // is decided: record it (C41)
+                                        // is decided: record it
                                         // and park.
                                         finish_turn(&core, turn).await;
                                         Some((LoopOutcome::TurnDone, Phase::Park { ctx, seen }))
@@ -1674,7 +1674,7 @@ where
                                 // re-drive the inner loop; its opening
                                 // pass takes the eligible inputs. The
                                 // re-drive opens the next judge turn
-                                // (C41).
+                                // .
                                 let turn = start_turn(&core).await;
                                 let stream = core.driver.drive(ctx.clone());
                                 phase = Phase::Inner {
@@ -1717,7 +1717,7 @@ async fn has_outstanding_threads<D: LoopDriver>(core: &DriverCore<D>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Judge-turn timing (C41) — pure observability over the stream
+// Judge-turn timing — pure observability over the stream
 // ---------------------------------------------------------------------------
 
 /// The Router's committed stream via the hold's port, or `None` when no
@@ -1861,7 +1861,7 @@ mod tests {
         assert_eq!(custom.render(0), "judge 0 inputs");
     }
 
-    /// C43: the default template carries the prompt-injection hygiene
+    /// the default template carries the prompt-injection hygiene
     /// sentence (untrusted channel-event content is data, never
     /// instructions), and the `{inputs}` variable contract is exactly
     /// as before — one placeholder, substituted by render. The
@@ -2018,7 +2018,7 @@ mod tests {
         assert_eq!(admits.len(), 1);
         assert_eq!(admits[0].0, router);
         assert_eq!(admits[0].2.as_deref(), Some(ROUTER_BOOTSTRAP_KEY));
-        // Generation 0 is byte-identical to the pre-kian-62 bootstrap:
+        // Generation 0 is byte-identical to the legacy bootstrap:
         // the plain judge prompt, no re-arm prefix.
         assert_eq!(admits[0].1, json!(profile.judge.render(0)));
     }
@@ -2206,7 +2206,7 @@ mod tests {
         assert_eq!(delivered.split_whitespace().count(), 100);
         assert!(delivered.ends_with('…'));
 
-        // channel/delivered was appended after the send, C18 schema.
+        // channel/delivered was appended after the send, schema.
         let emitted = rec.emitted.lock().unwrap().clone();
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
@@ -2285,7 +2285,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C59: follow-up ownership at the tool surface
+    // follow-up ownership at the tool surface
     // -----------------------------------------------------------------
 
     fn channel_task(topic: &str) -> serde_json::Value {
@@ -2474,12 +2474,12 @@ mod tests {
         );
     }
 
-    /// kian-75: the live `spawn_worker` spelling — the schema types
+    /// the live `spawn_worker` spelling — the schema types
     /// `task` as a string, so the model passes the wrapper serialized
     /// as JSON text. The mandate must stamp strength from the
     /// adapter-declared explicit signal and attribute the triggering
     /// channel/topic, not fall back to `inferred` +
-    /// `router`/null (RUNLOG §7.1). The `spawn_topic` derivation
+    /// `router`/null. The `spawn_topic` derivation
     /// itself is golden-tested in `registry.rs` — one derivation,
     /// two readers.
     #[test]
@@ -2523,7 +2523,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C60: mandate issuance (ADR-012)
+    // mandate issuance (ADR-012)
     // -----------------------------------------------------------------
 
     fn mandate_policy() -> MandatePolicy {
@@ -2555,7 +2555,7 @@ mod tests {
     }
 
     /// The same wrapper without the adapter-declared explicit signal —
-    /// the C43 discipline: no text-derived reading ever upgrades the
+    /// the discipline: no text-derived reading ever upgrades the
     /// strength, however commanding the words look.
     fn inferred_channel_task() -> serde_json::Value {
         crate::provenance::wrap_channel_event(&kian_core::seams::ChannelEvent {
@@ -2607,7 +2607,7 @@ mod tests {
         );
 
         // Inferred: same shape, no adapter-declared signal — the raw's
-        // commanding text never upgrades the strength (C43).
+        // commanding text never upgrades the strength.
         let inferred = build_mandate(
             &policy,
             "kian-worker",
@@ -2785,7 +2785,7 @@ mod tests {
 
     #[test]
     fn toolset_diff_router_holds_channel_tools_worker_none() {
-        // The structural diff asserted by the card: the Router's
+        // The structural diff asserted by the design: the Router's
         // toolset is exactly the dispatch surface; the worker template
         // holds none of it and the profile rejects a smuggle attempt.
         let (tools, _hold, _mock, _inbox) = tools_for_test();
@@ -2815,7 +2815,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Speculation profile (C39)
+    // Speculation profile
     // ------------------------------------------------------------------
 
     /// A port whose committed stream is scriptable (the Router stream
@@ -2967,7 +2967,7 @@ mod tests {
 
     #[test]
     fn speculation_policy_defaults_and_silent_repro_template() {
-        // Default profile: speculation disabled (None) — the C26
+        // Default profile: speculation disabled (None) — the
         // profile stays byte-identical until configured.
         let profile = RouterProfile::new(sid(1), router_template("mock", "mock-router"));
         assert_eq!(profile.speculation, None);
@@ -2977,7 +2977,7 @@ mod tests {
         assert_eq!(policy.label, "weak-signal");
         // The silent-repro policy is a prompt template (a config
         // artifact), shipped with a non-empty default the operator may
-        // override — the card's item (3).
+        // override — the item (3).
         assert_eq!(policy.silent_repro, SILENT_REPRO_TEMPLATE);
         assert!(policy.silent_repro.contains("confirmed"));
         assert!(policy.silent_repro.contains("simple fix"));
@@ -3114,7 +3114,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_spawn_path_is_unchanged_by_the_speculation_addition() {
-        // No `speculative` argument: the legacy C26 path — no policy
+        // No `speculative` argument: the legacy path — no policy
         // needed, no cap check, wrapper without the marker, output
         // without the speculative field.
         let (tools, _hold, port, inbox, _mock) =
@@ -3140,8 +3140,8 @@ mod tests {
     #[test]
     fn spawn_worker_schema_grows_additively_with_stable_ordering() {
         // Tool schemas are part of the prompt prefix (constraint 3):
-        // the C39 addition appends exactly one property, leaving the
-        // C26 bytes and their order untouched.
+        // the addition appends exactly one property, leaving the
+        // bytes and their order untouched.
         let (tools, _hold, _port, _inbox, _mock) = speculative_tools(None);
         let schema = tools
             .schemas()
@@ -3311,7 +3311,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Residency re-drive gating (kian-63)
+    // Residency re-drive gating
     // ------------------------------------------------------------------
 
     /// A fake inner loop that counts drives and settles immediately:
@@ -3335,7 +3335,7 @@ mod tests {
     }
 
     /// A parked Router re-driven with nothing new admitted spends ZERO
-    /// provider calls (kian-63): the fresh hold parks before opening a
+    /// provider calls: the fresh hold parks before opening a
     /// turn — structurally, from the re-drive gate, not from timing.
     /// Liveness is preserved: the next durable admit re-drives.
     #[tokio::test]

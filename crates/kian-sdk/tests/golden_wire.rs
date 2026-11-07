@@ -1,14 +1,14 @@
-//! Golden wire tests (card C46): every typed SDK method round-trips
+//! Golden wire tests: every typed SDK method round-trips
 //! against a **scripted raw-TCP HTTP server** — no axum, no kian
 //! crates — so the assertions are on the exact bytes that fly:
 //!
-//! - the request line and path match the frozen C13/C14 routes;
+//! - the request line and path match the frozen routes;
 //! - the request body is byte-identical to `tests/fixtures/*.request.json`
-//!   (the C8 serialization-freeze discipline applied to the client);
+//!   (the serialization-freeze discipline applied to the client);
 //! - the canned response bytes (`*.response.json`) parse into the
 //!   typed result structs.
 //!
-//! The SSE helper test pins the `kian`/`done`/`error` framing per C13,
+//! The SSE helper test pins the `kian`/`done`/`error` framing per,
 //! and the error test proves the −32001/−32002/−32003/−32000 mapping
 //! is matchable by code, never string-parsed.
 
@@ -86,10 +86,7 @@ async fn serve(listener: TcpListener, exchanges: Vec<Exchange>) -> tokio::task::
         for ex in exchanges {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let (line, content_type, body) = read_request(&mut sock).await;
-            assert_eq!(
-                line, ex.request_line,
-                "golden route mismatch (C13/C14 wire freeze)"
-            );
+            assert_eq!(line, ex.request_line, "golden route mismatch (wire freeze)");
             assert!(
                 content_type.starts_with("application/json"),
                 "expected application/json, got {content_type}"
@@ -377,7 +374,7 @@ fn remove_json_field(body: &mut Vec<u8>, field: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// SSE helper: kian / done / error framing per C13
+// SSE helper: kian / done / error framing per
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

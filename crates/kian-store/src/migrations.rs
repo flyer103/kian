@@ -2,7 +2,7 @@
 //!
 //! vN→vN+1 is one [`Migration`] entry; committed generations are never
 //! renamed, replaced or deleted — a new generation is published
-//! exclusively by appending to the chain. v0 is current in Phase 1 and
+//! exclusively by appending to the chain. v0 is current in built-in and
 //! the chain is extensible, so an old DB with a v0 stream reopens
 //! cleanly (each unapplied generation runs in order, exactly once).
 
@@ -22,7 +22,7 @@ pub struct Migration {
     pub up: &'static str,
 }
 
-/// v0 — the append-only events table (card C5). Frozen golden: committed
+/// v0 — the append-only events table. Frozen golden: committed
 /// generations are never rewritten (see `v0_generation_sql_is_frozen`).
 ///
 /// The `envelope` column stores the exact serialized v0 event envelope so
@@ -34,7 +34,7 @@ const V0_EVENTS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS events (\n    session TEXT NOT NULL,\n    seq INTEGER NOT NULL,\n    epoch INTEGER NOT NULL,\n    ts INTEGER NOT NULL,\n    kind TEXT NOT NULL,\n    version INTEGER NOT NULL,\n    envelope TEXT NOT NULL,\n    PRIMARY KEY (session, seq)\n)",
 };
 
-/// v1 — the inbox and claim/lease tables (card C6). Frozen golden like
+/// v1 — the inbox and claim/lease tables. Frozen golden like
 /// v0: committed generations are never rewritten.
 ///
 /// `inputs` rows are the durable inbox (constraint 6: inputs are durable
@@ -48,7 +48,7 @@ const V0_EVENTS: Migration = Migration {
 /// epoch high-water mark: issuance always takes
 /// max(claims.epoch, events epoch floor) + 1, so epochs strictly increase
 /// per session across process restarts and across claims whose
-/// `drain/claimed` event has not been appended yet (the window C5
+/// `drain/claimed` event has not been appended yet (the window
 /// flagged). Leases are liveness only (ADR-005) — expiry never grants
 /// permission to accept stale writes.
 const V1_INBOX_CLAIMS: Migration = Migration {
@@ -63,7 +63,7 @@ pub fn chain() -> &'static [Migration] {
     &[V0_EVENTS, V1_INBOX_CLAIMS, V2_INBOX_ADMIT_ORDER]
 }
 
-/// v2 — the inbox admission ordinal (card C57). The take queries
+/// v2 — the inbox admission ordinal. The take queries
 /// ordered eligible rows by `(eligible_at, id)`, and `id` is a random
 /// uuid: two inputs admitted in the same millisecond consumed in a
 /// random order, which misrouted worker sessions whose classification
@@ -82,17 +82,17 @@ const V2_INBOX_ADMIT_ORDER: Migration = Migration {
     up: "ALTER TABLE inputs ADD COLUMN admitted_seq INTEGER NOT NULL DEFAULT 0;\nUPDATE inputs SET admitted_seq = rowid;\nCREATE INDEX IF NOT EXISTS idx_inputs_admit_order ON inputs (session, eligible_at, admitted_seq) WHERE consumed_by_seq IS NULL;",
 };
 
-/// v0 (postgres chain, C50) — same version and name as the sqlite
+/// v0 (postgres chain) — same version and name as the sqlite
 /// generation, pg DDL (TEXT/BIGINT; DESIGN §3.3). Envelope stays verbatim
 /// TEXT so the same event stream exported from either backend is
-/// byte-identical (the C50 export-parity golden).
+/// byte-identical (the export-parity golden).
 const PG_V0_EVENTS: Migration = Migration {
     version: 0,
     name: "v0_events",
     up: "CREATE TABLE IF NOT EXISTS events (\n    session TEXT NOT NULL,\n    seq BIGINT NOT NULL,\n    epoch BIGINT NOT NULL,\n    ts BIGINT NOT NULL,\n    kind TEXT NOT NULL,\n    version BIGINT NOT NULL,\n    envelope TEXT NOT NULL,\n    PRIMARY KEY (session, seq)\n)",
 };
 
-/// v1 (postgres chain, C50) — the inbox and claim/lease tables, pg DDL.
+/// v1 (postgres chain) — the inbox and claim/lease tables, pg DDL.
 /// The same partial index and the same UNIQUE (session, idempotency_key)
 /// semantics: pg unique indexes treat NULLs as distinct, exactly like
 /// sqlite, so keyless admits never deduplicate on either backend.
@@ -167,7 +167,7 @@ pub async fn applied_versions(pool: &SqlitePool) -> Result<Vec<u32>, StoreError>
 }
 
 /// Applies every unapplied pg generation in order — the same runner
-/// logic as [`migrate`], dispatched per backend (C50). Read-only roles
+/// logic as [`migrate`], dispatched per backend. Read-only roles
 /// are refused here by the server itself: a migration is a write, and
 /// `open_postgres_read_only` never calls this.
 pub async fn migrate_pg(pool: &PgPool) -> Result<(), StoreError> {
@@ -236,7 +236,7 @@ mod tests {
 
     /// Every entry carries a name and DDL — a malformed registration is
     /// caught here, not at open time on a user's database. (Relaxed in
-    /// C6: the chain is designed to grow beyond the events generation;
+    /// the chain is designed to grow beyond the events generation;
     /// a generation is well-formed when it names a store table it
     /// creates.)
     #[test]
@@ -327,7 +327,7 @@ mod tests {
     }
 
     /// The pg chain tracks the sqlite chain generation for generation:
-    /// same versions, same names, same order (C50; DESIGN §3.3). A
+    /// same versions, same names, same order (DESIGN §3.3). A
     /// divergence means one backend's schema drifted from the other's —
     /// caught here, not on a user's database.
     #[test]

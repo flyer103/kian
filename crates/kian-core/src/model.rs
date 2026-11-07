@@ -1,6 +1,6 @@
 //! Concept model (DESIGN §2.1 "Concept model and Rust type skeletons").
 //!
-//! Pure types only — no I/O, no runtime state (C2 acceptance). The event
+//! Pure types only — no I/O, no runtime state (acceptance). The event
 //! stream is the sole truth: these types are the vocabulary the projections
 //! and the store are built from, and none of them hide authoritative state
 //! outside the event log.
@@ -81,7 +81,7 @@ pub struct InputRow {
     pub admitted_at: u64,
     /// Becomes eligible for a drain to take at, unix epoch milliseconds.
     pub eligible_at: u64,
-    /// Deduplication key for idempotent admit (C6).
+    /// Deduplication key for idempotent admit.
     pub idempotency_key: Option<String>,
 }
 
@@ -103,7 +103,7 @@ pub struct SlotSpec {
     pub provider: String,
     pub model: String,
     /// Fallback chain, tried in order; each switch emits a durable
-    /// `slot/fallback` event (C8).
+    /// `slot/fallback` event.
     pub fallback: Vec<SlotTarget>,
 }
 
@@ -115,7 +115,7 @@ pub struct Budgets {
     pub wall_clock_ms: Option<u64>,
 }
 
-/// Per-call tool permission (C70 / ADR-015): a **closed** vocabulary —
+/// Per-call tool permission (ADR-015): a **closed** vocabulary —
 /// `allow` or `deny`, nothing else parses (fail-closed: an unknown value
 /// refuses boot). `ask` is deliberately absent this round; the closed
 /// shape lets a later confirmation plane add it additively.
@@ -141,7 +141,7 @@ pub struct AgentDef {
 /// Environment spec, unversioned config (DESIGN §2.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSpec {
-    /// Sandbox selection (Phase 1: `"none"` = local).
+    /// Sandbox selection (built-in: `"none"` = local).
     pub sandbox: String,
     pub network_allowlist: Vec<String>,
     pub deps: Vec<String>,
@@ -170,7 +170,7 @@ mod tests {
         SlotName, SlotSpec, SlotTarget, Thread,
     };
 
-    /// C70: `Permission` is a closed vocabulary — `allow`/`deny` parse
+    /// `Permission` is a closed vocabulary — `allow`/`deny` parse
     /// and serialize lowercase, and any other value (notably `ask`,
     /// deferred to a later round) refuses to parse (fail-closed).
     #[test]

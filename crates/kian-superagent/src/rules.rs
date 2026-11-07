@@ -1,4 +1,4 @@
-//! Declarative subscription rules (DESIGN §4.1, card C23; Footprint
+//! Declarative subscription rules (DESIGN §4.1,; Footprint
 //! Ladder level 1 — pure config, no code).
 //!
 //! A rule names a channel, a match condition on inbound
@@ -6,7 +6,7 @@
 //! passthrough correlated by topic (CI-style events of a worker's own
 //! topic flow straight into that worker's inbox without Router
 //! judgment — the DESIGN §4.1 load-reduction device). The passthrough
-//! `topic → set of worker sessions` mapping (C38: many-to-many
+//! `topic → set of worker sessions` mapping (many-to-many
 //! fan-out) lives in [`crate::registry::PassthroughRegistry`], a
 //! disposable projection.
 
@@ -15,7 +15,7 @@ use kian_core::seams::ChannelEvent;
 use serde::{Deserialize, Serialize};
 
 /// Match condition on an inbound channel event. Serde form (externally
-/// tagged, the card's `match: always|mentions(str)|topic(str)`):
+/// tagged, the `match: always|mentions(str)|topic(str)`):
 /// `"always"`, `{"mentions": "@kian"}`, `{"topic": "ci"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleMatcher {
@@ -51,14 +51,14 @@ impl RuleMatcher {
 
 /// How a matched event's target session is chosen. Serde form:
 /// `"router"`, `{"passthrough": {"correlate_by": "topic"}}`, or —
-/// C40, additive — `{"session": "<uuid>"}`.
+/// , additive — `{"session": "<uuid>"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Route {
     #[serde(rename = "router")]
     Router,
     #[serde(rename = "passthrough")]
     Passthrough { correlate_by: CorrelateBy },
-    /// A config-addressed fixed session (C40): the timer's ticks (and
+    /// A config-addressed fixed session: the timer's ticks (and
     /// any other event an operator wants pinned to one resident
     /// session) route here — generic vocabulary, nothing
     /// watchdog-specific. The target is admitted like any other
@@ -133,13 +133,13 @@ impl SubscriptionRuleSet {
 }
 
 // ---------------------------------------------------------------------------
-// Admission classes (C36 — the article §3.1 Fast Path): an admission
+// Admission classes (— the article §3.1 Fast Path): an admission
 // taxonomy over provenance, evaluated BEFORE the rule set and before
 // any model call. Additive config layer; absent classes = today's
 // behavior, unchanged.
 // ---------------------------------------------------------------------------
 
-/// The admission class one provenance key resolves to (C36). The
+/// The admission class one provenance key resolves to. The
 /// serde form is the config spelling: `candidate` | `explicit-only` |
 /// `ignore`.
 ///
@@ -199,7 +199,7 @@ impl AdmissionClassRule {
     }
 }
 
-/// The validated class table (C36). Resolution is **most-specific-wins**:
+/// The validated class table. Resolution is **most-specific-wins**:
 /// among all entries whose key matches the event, the one with the most
 /// pinned key components (topic, sender) decides; a tie resolves to the
 /// earliest declared entry — deterministic by construction. No matching
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn rule_serde_golden_forms() {
-        // The card's config shape: match: always|mentions(str)|topic(str),
+        // The design's config shape: match: always|mentions(str)|topic(str),
         // route: router | passthrough(correlate_by: topic).
         let always_router: SubscriptionRule = serde_json::from_value(
             json!({"channel": "mock-im", "match": "always", "route": "router"}),
@@ -394,7 +394,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C36: admission classes
+    // admission classes
     // -----------------------------------------------------------------
 
     use super::{
@@ -587,13 +587,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C40: Route::Session — additive serde golden
+    // Route::Session — additive serde golden
     // -----------------------------------------------------------------
 
-    /// The C40 `Route::Session` variant is strictly additive: the two
+    /// The `Route::Session` variant is strictly additive: the two
     /// pre-existing route forms parse and serialize byte-identically,
     /// and the new `{"session": "<uuid>"}` form round-trips. Old
-    /// route JSON (a config file from before C40) parses unchanged.
+    /// route JSON (a config file from before) parses unchanged.
     #[test]
     fn route_session_serde_is_additive_and_old_forms_are_unchanged() {
         use kian_core::model::SessionId;
@@ -601,7 +601,7 @@ mod tests {
         let uuid = "0b6e1e02-7da4-4a76-b4b3-9a1f1fd64d01";
         let sid = SessionId(uuid::Uuid::parse_str(uuid).unwrap());
 
-        // The pre-C40 golden forms, byte-for-byte.
+        // The legacy golden forms, byte-for-byte.
         assert_eq!(
             serde_json::to_value(Route::Router).unwrap(),
             json!("router")

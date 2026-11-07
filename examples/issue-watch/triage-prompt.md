@@ -4,7 +4,7 @@ This file is submitted verbatim (once, idempotently) as the Router
 session's charter input by `run.sh`. It is standing policy for the whole
 watch: the Router keeps it in context for its lifetime.
 
-What changed in v2 (card C64): the Router no longer polls on timer
+What changed in v2: the Router no longer polls on timer
 ticks. A github poll channel delivers every issue-thread event under
 its own canonical topic (`issue-github:flyer103/kian#<N>`); the Router
 judges only the events that reach it — a NEW issue (its thread has no

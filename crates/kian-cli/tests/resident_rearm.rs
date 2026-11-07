@@ -1,4 +1,4 @@
-//! kian-62 integration tests: the resident re-arm path.
+//! integration tests: the resident re-arm path.
 //!
 //! Three claims, against the real assembly, the real sqlite event
 //! store, the real engine and in-process scripted providers (no
@@ -6,7 +6,7 @@
 //!
 //! 1. **Terminal pinned → successor.** A resident Router whose pinned
 //!    session ended `session/ended{completed}` (the frozen state the
-//!    C61 live run actually left behind — the loop's lifetime iteration
+//!    live run actually left behind — the loop's lifetime iteration
 //!    budget exhausting) re-arms on boot onto the deterministic
 //!    successor session, and the live watch (channel events → judge
 //!    turns) runs THERE, while the frozen stream stays untouched.

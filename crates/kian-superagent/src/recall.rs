@@ -1,4 +1,4 @@
-//! The `RecallPort` read port (card C34) — the bundle's cross-session
+//! The `RecallPort` read port — the bundle's cross-session
 //! read surface.
 //!
 //! The bundle's other two ports are scoped: [`crate::inbox::InboxWriter`]
@@ -10,7 +10,7 @@
 //! any hold, **reads only**.
 //!
 //! The trait is bundle-defined and **assembly-implemented** (kian-cli,
-//! C34): assembly serves it over the store's public scan API; the
+//! ): assembly serves it over the store's public scan API; the
 //! bundle crate itself never names a store (`tests/iron_rule.rs`
 //! enforces that textually, exactly as for the other ports).
 //!
@@ -38,11 +38,11 @@ pub enum RecallPortError {
     Read(String),
 }
 
-/// The bundle's cross-session read port (C34), implemented by assembly
+/// The bundle's cross-session read port, implemented by assembly
 /// over the store's public scan. Implementations must stay read-only:
 /// no execution surface, no writes, no projection mutated. The methods
 /// resolve concurrently with drains — a read never waits on a drain
-/// hold (the C11 liveness discipline).
+/// hold (the liveness discipline).
 pub trait RecallPort: Send + Sync {
     /// Reads one session's committed events in seq order over
     /// `[since_seq, until_seq)`. An unknown session or an empty window
@@ -75,7 +75,7 @@ pub trait RecallPort: Send + Sync {
     ) -> BoxFuture<'static, Result<Option<(SessionId, u64)>, RecallPortError>>;
 }
 
-/// The disposable spill index (C34): channel `event_id` →
+/// The disposable spill index: channel `event_id` →
 /// `(session, seq)` of its `input/spilled` event. Rebuilt at startup
 /// by scanning the streams; never authoritative — the events are. A
 /// pure projection over the log, safe to drop at any moment.

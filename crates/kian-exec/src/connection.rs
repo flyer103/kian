@@ -1,5 +1,5 @@
 //! `ConnectionManager` — the KiandProto server-side connection half
-//! (card C19, DESIGN §4.3).
+//! (DESIGN §4.3).
 //!
 //! Dials a configured endpoint address (the endpoint listens — matches
 //! `kian_endpoints`' `Endpoint::serve`), performs the hello/welcome
@@ -12,7 +12,7 @@
 //! This slice is deliberately **in-memory**: a transport loss fails the
 //! in-flight command futures with a transport error (never a fake result —
 //! honesty over completion rate). Durable offline queueing is the next
-//! slice (C20).
+//! slice.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -109,7 +109,7 @@ impl ConnectionConfig {
 
 /// Live view of the managed endpoint, projected from hello + heartbeats.
 /// Exposed via [`ConnectionManager::status`] and a watch channel for
-/// subscribers (the C21 watchdog consumes the same projection).
+/// subscribers (the watchdog consumes the same projection).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointStatus {
     /// Endpoint id announced in the hello (empty before the first
@@ -269,7 +269,7 @@ impl ConnectionManager {
     /// While no connection is live the future parks until a reconnect
     /// succeeds (or the manager stops). A transport loss under an
     /// in-flight command fails with [`ConnectionError::TransportClosed`] —
-    /// the caller decides whether to retry; durability is C20's slice.
+    /// the caller decides whether to retry; durability is 's slice.
     pub async fn dispatch(
         &self,
         cmd: ExecCommand,
@@ -279,10 +279,10 @@ impl ConnectionManager {
 
     /// [`ConnectionManager::dispatch`] with a caller-chosen command id.
     ///
-    /// The durable queue (C20) keys its rows by the command id derived
+    /// The durable queue keys its rows by the command id derived
     /// from the calling tool-call id, and re-drives rows after a restart
     /// with the *same* id — at-least-once delivery with command-id
-    /// correlation (ADR-007). Additive C20 API; the random-id behavior of
+    /// correlation (ADR-007). Additive API; the random-id behavior of
     /// `dispatch` is unchanged.
     pub async fn dispatch_with_id(
         &self,
@@ -592,7 +592,7 @@ mod tests {
         );
     }
 
-    /// The status projection is serde round-trippable (C20/C21 persist and
+    /// The status projection is serde round-trippable (persist and
     /// expose it).
     #[test]
     fn endpoint_status_round_trips() {

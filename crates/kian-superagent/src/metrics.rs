@@ -1,4 +1,4 @@
-//! Router batching metrics (card C41): the article's §7.2 observability
+//! Router batching metrics: the article's §7.2 observability
 //! shape over the Router drain — per judge turn, **inputs consumed**
 //! (batch size), **turn wall duration** (per-request) and
 //! **duration/inputs** (per-decision amortized latency).
@@ -194,14 +194,14 @@ fn bucket_index(batch: u64) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Speak-rule metrics (C58) — the suppression side of the output gate
+// Speak-rule metrics — the suppression side of the output gate
 // ---------------------------------------------------------------------------
 
-/// Counters for the output-side speak gate (C58, DESIGN §4.2): one
+/// Counters for the output-side speak gate (DESIGN §4.2): one
 /// `suppressed` tick per honest refusal, plus per-condition counters
 /// over the closed [`crate::policy::SpeakCondition`] set — every
 /// condition materialized zero-initialized, so the series shape is
-/// fixed (the C41 histogram discipline). Plain atomics, monotone;
+/// fixed (the histogram discipline). Plain atomics, monotone;
 /// recording never emits an event and never changes a decision.
 #[derive(Debug)]
 pub struct SpeakMetrics {

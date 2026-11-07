@@ -1,4 +1,4 @@
-//! Integration tests (card C41): §7.2-shaped batching metrics over the
+//! Integration tests: §7.2-shaped batching metrics over the
 //! Router drain — per judge turn, inputs consumed (batch size), turn
 //! wall duration (per-request) and duration/inputs (per-decision
 //! amortized latency). Recorded by `RouterDriver` through the
@@ -196,7 +196,7 @@ impl RecoveryPolicySource for NoopPolicy {
 // Assembly surface: InboxWriter + StreamPort over the real engine
 // ---------------------------------------------------------------------------
 
-/// The C25 cycle breaker: admits are durable store writes; wakes reach
+/// The cycle breaker: admits are durable store writes; wakes reach
 /// the engine through a late-bound slot.
 struct LateEngineInbox {
     store: EventStore,
@@ -239,7 +239,7 @@ impl InboxWriter for LateEngineInbox {
     }
 }
 
-/// Assembly's `StreamPort` over the execution-hold handle (C25 shape).
+/// Assembly's `StreamPort` over the execution-hold handle (shape).
 struct CtxPort(DrainCtx);
 
 impl StreamPort for CtxPort {
@@ -470,7 +470,7 @@ async fn wait_for_turns(metrics: &RouterMetrics, n: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Named acceptance tests (card C41)
+// Named acceptance tests
 // ---------------------------------------------------------------------------
 
 /// N events admitted together → ONE judge turn records batch=N with
@@ -548,7 +548,7 @@ async fn n_events_admitted_together_one_judge_turn_batch_n_amortized_determinist
     assert_eq!(snap["batch_histogram"]["2"], json!(0));
 
     // Exactly two provider requests: bootstrap judge + batch judge —
-    // recording did not add provider behavior. Structural (kian-63):
+    // recording did not add provider behavior. Structural:
     // the cohort admit advances the Router's residency counter in one
     // atomic jump after every row commits, so the parked Router cannot
     // observe a torn cohort and fold a second batch into the same
@@ -621,7 +621,7 @@ async fn metrics_on_and_off_produce_identical_provider_behavior() {
         ]
     }
 
-    // Metrics OFF: the exact pre-C41 wiring (plain with_park_tick).
+    // Metrics OFF: the exact legacy wiring (plain with_park_tick).
     let off = build_harness(turns(), false, usize::MAX, None, None).await;
     let profile = RouterProfile::new(off.router, router_template("mock", "mock-router"));
     profile

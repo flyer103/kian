@@ -1,7 +1,7 @@
-//! kian-62: the resident re-arm path.
+//! the resident re-arm path.
 //!
 //! A resident session (the Router, the watchdog) can end *terminally* —
-//! `session/ended{completed}` (e.g. the loop's lifetime iteration budget
+//! `session/ended{completed}` (e.g. The loop's lifetime iteration budget
 //! exhausting → `Flow::Stopped` → `EndReason::Completed`) freezes the
 //! stream: the engine's drain projects `Terminal`, every later input
 //! stays pending forever, and the (already consumed) idempotent
@@ -9,7 +9,7 @@
 //! `failed`, which projects back to `idle` — the *next* admitted input
 //! re-opens the same session, no re-arm needed.
 //!
-//! Re-arm semantics (DESIGN "Resident re-arm", kian-62): on boot, the
+//! Re-arm semantics (DESIGN "Resident re-arm"): on boot, the
 //! pinned session id from config is walked down a **deterministic
 //! successor chain**. A successor id is `uuid5(parent,
 //! "kian:resident:re-arm")` — derivable from persisted state alone, so
@@ -21,7 +21,7 @@
 //! pinned id used to go, and bootstraps it:
 //!
 //! - generation 0 (no ended predecessors): the legacy bootstrap key and
-//!   prompt, byte-identical to the pre-kian-62 behavior;
+//!   prompt, byte-identical to the legacy behavior;
 //! - generation ≥ 1: the key `"<prefix>:re-arm:<successor uuid>"`
 //!   (stable per generation, so reboots dedupe onto the same row) and a
 //!   judge prompt prefixed with an observable, derivable cause naming
@@ -46,7 +46,7 @@ pub const RE_ARM_CHAIN_BOUND: usize = 64;
 /// The frozen v5 name input of the successor derivation. This string is
 /// part of the derivable-chain contract: changing it changes every
 /// successor id and orphans every existing chain (additions-only spirit,
-/// constraint 3 — it never changes after kian-62).
+/// constraint 3 — it never changes after).
 pub const RE_ARM_V5_NAME: &[u8] = b"kian:resident:re-arm";
 
 /// The deterministic successor of an ended resident session:
@@ -367,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_soft_failed_pinned_session_stays_generation_zero() {
-        // The card's original framing: a soft-failed resident projects
+        // The design's original framing: a soft-failed resident projects
         // idle and re-opens on its next admitted input — same session,
         // no successor.
         let pinned = session(1);

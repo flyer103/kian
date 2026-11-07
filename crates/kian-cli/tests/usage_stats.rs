@@ -1,4 +1,4 @@
-//! E2E acceptance for the C67 usage surfaces: `kian session inspect`
+//! E2E acceptance for the usage surfaces: `kian session inspect`
 //! usage lines, `kian usage-stats` (text + JSON, deterministic) and the
 //! `GET /metrics` `"usage"` aggregate — all derived from the same
 //! seeded store carrying usage-bearing `turn/end` events.

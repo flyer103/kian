@@ -1,14 +1,14 @@
-//! Output-side speak-rules (card C58 / kian-66, DESIGN §4.2 + §4.7):
+//! Output-side speak-rules (DESIGN §4.2 + §4.7):
 //! the *whether-to-send* gate on the Router's `reply` and
 //! `deliver_structured` tool paths — attention economics (reference
 //! 000: "speak only when a person must act or can use a result;
 //! confirm once, stay quiet while working").
 //!
-//! Four gates, mirrored from the card's acceptance:
+//! Four gates, mirrored from the acceptance:
 //! 1. each `SpeakCondition` admits/suppresses correctly (pure policy);
 //! 2. a suppressed send is an **honest tool error** naming the rule and
 //!    condition — zero adapter sends, zero `channel/delivered`, an
-//!    audit line and a counter recorded (the C39 deliver-or-discard
+//!    audit line and a counter recorded (the deliver-or-discard
 //!    discipline: no send ⇒ no receipt event);
 //! 3. `ack-first-only` suppresses the second ack to the same topic and
 //!    admits one to a new topic, and the ack-once memory survives a
@@ -88,7 +88,7 @@ fn sid(n: u128) -> SessionId {
 
 /// A stream port whose `read_stream` returns everything ever emitted —
 /// the Router's committed stream as the tools see it, so the
-/// ack-once tracker rebuild (the C58 constraint-1 projection) is
+/// ack-once tracker rebuild (the constraint-1 projection) is
 /// exercised against real tool-written events.
 struct ScriptedPort {
     session: SessionId,
@@ -397,7 +397,7 @@ fn ack_first_only_is_topic_scoped_or_channel_scoped_by_config() {
 fn absent_rules_admit_everything_and_conditions_have_stable_codes() {
     let policy = SpeakPolicy::default();
     assert!(policy.rule_for("mock-im").is_none());
-    // The closed vocabulary is exactly the card's five conditions, with
+    // The closed vocabulary is exactly the five conditions, with
     // stable serde/audit codes.
     let codes: Vec<&str> = SpeakCondition::ALL.iter().map(|c| c.code()).collect();
     assert_eq!(
@@ -694,7 +694,7 @@ async fn absent_rules_every_send_passes_with_today_payloads() {
     assert_eq!(structured.output["sections_delivered"], json!(true));
 
     assert_eq!(mock.deliveries().len(), 2);
-    // The delivered payloads are exactly the C18 §2 schema (no speak
+    // The delivered payloads are exactly the §2 schema (no speak
     // keys, no new fields) — absent config is byte-identical.
     let events = port.events();
     let delivered: Vec<&Event> = events

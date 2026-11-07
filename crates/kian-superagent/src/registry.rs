@@ -1,5 +1,5 @@
 //! Passthrough worker registry: `topic → set of worker sessions`
-//! (card C38: many-to-many fan-out), with the C59 liveness
+//! (many-to-many fan-out), with the liveness
 //! projection layered on top.
 //!
 //! A **disposable projection** (constraint 1): nothing authoritative
@@ -14,7 +14,7 @@
 //! carry the channel-event wrapper with the topic they served. Drop the
 //! registry and replay the streams and you get the same map back.
 //!
-//! C59 (follow-up ownership): the registry also projects each worker's
+//! (follow-up ownership): the registry also projects each worker's
 //! **status** — `live` or `ended` — from the worker's own stream
 //! (`thread/completed` or `session/ended`). [`PassthroughRegistry::resolve`]
 //! keeps returning every subscriber (the historical record: a worker
@@ -33,7 +33,7 @@ use serde_json::Value;
 use crate::provenance::{correlation_topic, parse_channel_marker, parse_channel_marker_lenient};
 use crate::worker::delegation_mandate;
 
-/// A worker's liveness (C59): `Live` until its own stream carries
+/// A worker's liveness: `Live` until its own stream carries
 /// `thread/completed` or `session/ended`, then `Ended` — terminal for
 /// a kian Ticket v1 (one worker session's life; resumption is a fresh
 /// Eval, never a same-session resume). A pure projection of the
@@ -58,7 +58,7 @@ impl WorkerStatus {
 }
 
 /// The runtime projection: routing topic → the *set* of worker sessions
-/// subscribed to it (C38 fan-out), plus the C59 worker-status
+/// subscribed to it (fan-out), plus the worker-status
 /// projection. Guarded by a lock at the call site; cheap to rebuild and
 /// safe to discard.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,7 +69,7 @@ pub struct PassthroughRegistry {
     /// are the historical binding record; `ended` is the liveness view
     /// the fan-out filters with.
     ended: BTreeSet<SessionId>,
-    /// C60 (ADR-012): each worker's mandate — the verbatim authority
+    /// (ADR-012): each worker's mandate — the verbatim authority
     /// object carried by its delegation wrapper. A disposable
     /// projection like everything else here: registered at spawn time
     /// by the Router's tool surface and re-derived by
@@ -86,7 +86,7 @@ impl PassthroughRegistry {
     }
 
     /// Adds a subscriber to a topic's set. Called at runtime by the
-    /// worker spawner (C25); a second worker on the same topic joins
+    /// worker spawner; a second worker on the same topic joins
     /// the set — both then observe the topic's events. Restarts
     /// re-derive the same entries via [`PassthroughRegistry::rebuild`]
     /// instead. Registration asserts liveness: a session registered
@@ -97,7 +97,7 @@ impl PassthroughRegistry {
         self.topics.entry(topic.into()).or_default().insert(worker);
     }
 
-    /// Marks a worker's stream ended (C59). Idempotent; the topic sets
+    /// Marks a worker's stream ended. Idempotent; the topic sets
     /// are untouched — the worker stays a *historical* subscriber and
     /// [`PassthroughRegistry::resolve`] keeps naming it, but
     /// [`PassthroughRegistry::resolve_live`] stops returning it.
@@ -105,7 +105,7 @@ impl PassthroughRegistry {
         self.ended.insert(worker);
     }
 
-    /// Registers a worker's mandate (C60, ADR-012): the verbatim
+    /// Registers a worker's mandate (ADR-012): the verbatim
     /// authority object the Router's `spawn_worker` issued. Called
     /// strictly after the durable `thread/started` lineage write — the
     /// projection never runs ahead of the log — and re-derived by
@@ -117,7 +117,7 @@ impl PassthroughRegistry {
         self.mandates.insert(worker, mandate);
     }
 
-    /// The worker's mandate, verbatim (C60). `None` for pre-C60
+    /// The worker's mandate, verbatim. `None` for legacy
     /// workers and unregistered sessions — legacy authority, which the
     /// revalidation rule never narrows.
     #[must_use]
@@ -125,7 +125,7 @@ impl PassthroughRegistry {
         self.mandates.get(worker)
     }
 
-    /// The worker's projected status (C59). Unknown sessions are
+    /// The worker's projected status. Unknown sessions are
     /// `live` — the registry only ever records the ended ones.
     #[must_use]
     pub fn status(&self, worker: &SessionId) -> WorkerStatus {
@@ -144,7 +144,7 @@ impl PassthroughRegistry {
         self.topics.get(topic).cloned().unwrap_or_default()
     }
 
-    /// The set of **live** subscribers of `topic` (C59): the historical
+    /// The set of **live** subscribers of `topic`: the historical
     /// set minus the ended workers. This is the fan-out admission set —
     /// an event never admits onto a terminal session where it would
     /// strand forever.
@@ -159,7 +159,7 @@ impl PassthroughRegistry {
             .collect()
     }
 
-    /// The deterministic first live subscriber of `topic` (C59's owner
+    /// The deterministic first live subscriber of `topic` ('s owner
     /// for the tool-surface refusal): session ids sort, so the owner
     /// named in a refusal is stable. `None` when no live worker owns
     /// the topic (unbound, or all subscribers ended — the release to
@@ -207,7 +207,7 @@ impl PassthroughRegistry {
     /// served the topic is a subscriber (the fan-out semantics), and a
     /// topic bound by several workers rebuilds to exactly their set.
     ///
-    /// C59 status projection, derived in the same pass: a worker
+    /// status projection, derived in the same pass: a worker
     /// session whose own stream carries `thread/completed` or
     /// `session/ended` is `ended`. The terminal event must sit on the
     /// *worker's* stream — a Router-side `session/ended` (the re-arm
@@ -254,7 +254,7 @@ impl PassthroughRegistry {
             let Some(worker) = bytes_worker(&ev.bytes) else {
                 continue;
             };
-            // C60 (ADR-012): the same task content may carry the
+            // (ADR-012): the same task content may carry the
             // mandate object — derived here verbatim, so the
             // revalidation projection survives restarts (the mandate
             // itself is immutable; a wider scope is a new Ticket).
@@ -271,7 +271,7 @@ impl PassthroughRegistry {
             // carry the channel-event wrapper with the spawning topic,
             // or — the spawner's real shape — be the delegation
             // wrapper holding the spawn call's task/correlation
-            // verbatim (the kian-75 string spellings included).
+            // verbatim (the string spellings included).
             if let Some(topic) = ev
                 .bytes
                 .get("task")
@@ -287,7 +287,7 @@ impl PassthroughRegistry {
             }
             // The worker's own channel inputs carry the wrapper
             // directly; its *first* input is the delegation wrapper —
-            // both read with the same derivation (kian-75).
+            // both read with the same derivation.
             if let Some(topic) = ev.bytes.get("content").and_then(delegation_topic) {
                 topics.entry(topic).or_default().insert(ev.session);
             }
@@ -321,7 +321,7 @@ fn bytes_worker(bytes: &serde_json::Value) -> Option<SessionId> {
     Some(SessionId(uuid::Uuid::parse_str(raw).ok()?))
 }
 
-/// The topic correlation of a `spawn_worker` call (C59): the topic of
+/// The topic correlation of a `spawn_worker` call: the topic of
 /// the channel-event wrapper the Router judged — read off the task the
 /// same way the registry rebuild derives topic bindings from
 /// `thread/started` task content (one derivation, two readers) — or,
@@ -329,7 +329,7 @@ fn bytes_worker(bytes: &serde_json::Value) -> Option<SessionId> {
 /// every non-channel spawn (the common case): no ownership attaches.
 ///
 /// The task may *be* the wrapper (a JSON object, or — the live
-/// spelling the tool schema's string `task` type produces, kian-75 — a
+/// spelling the tool schema's string `task` type produces, — a
 /// **string** carrying the serialized wrapper) or a message payload
 /// whose `content` is. The correlation may be an explicit
 /// `{"topic": "…"}` object or a bare non-empty string token (the live
@@ -354,7 +354,7 @@ fn task_marker(task: &Value) -> Option<crate::provenance::ChannelEventMarker> {
 /// itself (the fabricated/legacy rebuild shape), or — the spawner's
 /// real shape — a delegation wrapper whose `task`/`correlation` fields
 /// carry the spawn call's arguments verbatim, read with the same
-/// [`spawn_topic`] derivation (kian-75: the string spellings included).
+/// [`spawn_topic`] derivation (the string spellings included).
 fn delegation_topic(content: &Value) -> Option<String> {
     if let Some(topic) = parse_channel_marker(content).and_then(|marker| marker.topic) {
         return Some(topic);
@@ -418,13 +418,13 @@ mod tests {
         });
         let task = json!({"role": "user", "content": marker});
         let registry = PassthroughRegistry::rebuild([&thread_started(router, worker, task)]);
-        // C38: a single binding rebuilds to the singleton set.
+        // a single binding rebuilds to the singleton set.
         assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
         assert_eq!(registry.len(), 1);
     }
 
     // -----------------------------------------------------------------
-    // kian-75: the live string spellings (one derivation, two readers)
+    // the live string spellings (one derivation, two readers)
     // -----------------------------------------------------------------
 
     fn marker(topic: &str) -> serde_json::Value {
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn spawn_topic_derivation_covers_the_live_string_spellings() {
-        // The live `spawn_worker` call (kian-75/RUNLOG §7.2 G2): the
+        // The live `spawn_worker` call: the
         // schema types `task` as a string, so the model passes the
         // wrapper serialized as JSON text plus the correlation as a
         // bare topic token string.
@@ -503,7 +503,7 @@ mod tests {
         // Source 1 over the spawner's real delegation-wrapper shape:
         // the `task` is the SERIALIZED channel wrapper (string) and
         // the `correlation` is a bare topic token — exactly what the
-        // live Router model passes (kian-75).
+        // live Router model passes.
         let router = sid(1);
         let worker = sid(2);
         let started = thread_started(
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn rebuild_derives_the_fanout_set_from_both_sources() {
-        // C38: two workers on one topic — one bound by its delegation
+        // two workers on one topic — one bound by its delegation
         // task's channel marker (source 1), the other by a channel
         // input on its own stream (source 2). Rebuild yields the set
         // of both: every worker that served the topic is a subscriber.
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn runtime_register_accumulates_workers_into_a_set() {
-        // C38: registering a second worker on a topic adds it to the
+        // registering a second worker on a topic adds it to the
         // set (no re-bind, no eviction) — both subscribers stay.
         let mut r = PassthroughRegistry::new();
         assert!(r.is_empty());
@@ -725,7 +725,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C59: the worker-status projection
+    // the worker-status projection
     // -----------------------------------------------------------------
 
     #[test]
@@ -842,13 +842,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // C60: the mandate projection
+    // the mandate projection
     // -----------------------------------------------------------------
 
     #[test]
     fn rebuild_derives_mandates_and_runtime_registration_equals_it() {
         // A Router-side thread/started whose task content is a
-        // mandated delegation wrapper (the C60 shape): the rebuild
+        // mandated delegation wrapper (the shape): the rebuild
         // derives the mandate verbatim; the runtime register_mandate
         // write equals it (the projection is disposable).
         let router = sid(1);

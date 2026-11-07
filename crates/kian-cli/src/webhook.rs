@@ -1,12 +1,12 @@
-//! Inbound webhook receiver plane (card C49, ADR-011) — the fourth
-//! server surface, beside the C13 control plane, the C14 ops plane
-//! and the C17 metrics route.
+//! Inbound webhook receiver plane (ADR-011) — the fourth
+//! server surface, beside the control plane, the ops plane
+//! and the metrics route.
 //!
 //! `POST /webhooks/github` is the only inbound HTTP surface: it speaks
 //! for the internet, not for an authenticated operator or client, so
 //! it is untrusted-by-default in the strongest sense — **nothing is
 //! parsed before its bytes are cryptographically authenticated** (the
-//! C43/C44 discipline). The module is trait-isolated exactly like
+//! discipline). The module is trait-isolated exactly like
 //! [`crate::api`] and [`crate::ops`]: handlers speak JSON and call
 //! **nothing but** the [`WebhookPlane`] trait, whose sole capability
 //! is "verify, then hand a verified delivery to the subscription
@@ -138,11 +138,11 @@ struct AppState {
     limits: WebhookLimits,
     /// Per-source token buckets (source = the connection's peer IP
     /// when the serve layer provides it, else one shared
-    /// "unattributed" bucket — the tests' in-process stand-in).
+    /// "unattributed" bucket — the tests' in-process stand-).
     buckets: Arc<Mutex<BTreeMap<String, Bucket>>>,
 }
 
-/// Builds the C49 webhook router (`POST /webhooks/github`). Mounted
+/// Builds the webhook router (`POST /webhooks/github`). Mounted
 /// by the serve assembly **only** when the route is configured (a
 /// `type: github` channel exists); otherwise the path 404s.
 pub fn router(plane: Arc<dyn WebhookPlane>, secret: String, limits: WebhookLimits) -> Router {

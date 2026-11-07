@@ -1,4 +1,4 @@
-//! Ticket stage projection (card C56): "what is it waiting for".
+//! Ticket stage projection: "what is it waiting for".
 //!
 //! A kian **Ticket v1 = one delegated worker session** (spawned by
 //! `spawn_worker`, named by that thread's `thread/started`). Its stage
@@ -6,15 +6,15 @@
 //! is it waiting for?* — and is a **pure derived projection** (the
 //! prototype's 003 first-match table mapped onto kian facts):
 //!
-//! | # | Stage            | Condition (first match wins)                                                                 |
+//! | # | Stage | Condition (first match wins) |
 //! |---|------------------|----------------------------------------------------------------------------------------------|
-//! | 1 | `delivery-retry` | the outbox view reports a pending/parked delivery for the thread (C62 wires the real view)   |
-//! | 2 | `awaiting-answer`| latest structured report state `waiting`, the thread still outstanding, no input since       |
-//! | 3 | `awaiting-review`| latest structured report state `ready` (result delivered, human review pending)              |
-//! | 4 | `blocked-failed` | `thread/completed{failed}` or `session/ended{failed}`, and no input admitted since           |
-//! | 5 | `queued`         | input admitted (pending inbox row, or no `drain/claimed` after the last input)               |
-//! | 6 | `idle`           | thread completed successfully / session terminal-completed                                   |
-//! | 7 | `working`        | everything else                                                                              |
+//! | 1 | `delivery-retry` | the outbox view reports a pending/parked delivery for the thread (wires the real view) |
+//! | 2 | `awaiting-answer`| latest structured report state `waiting`, the thread still outstanding, no input since |
+//! | 3 | `awaiting-review`| latest structured report state `ready` (result delivered, human review pending) |
+//! | 4 | `blocked-failed` | `thread/completed{failed}` or `session/ended{failed}`, and no input admitted since |
+//! | 5 | `queued` | input admitted (pending inbox row, or no `drain/claimed` after the last input) |
+//! | 6 | `idle` | thread completed successfully / session terminal-completed |
+//! | 7 | `working` | everything else |
 //!
 //! Structured facts only (001's rule: "waiting on a person" is never
 //! inferred from free text — the Executor asks through a structured
@@ -25,14 +25,14 @@
 //! A stage is a *disposable projection* (constraint 1):
 //! [`project_stage`] reads only the worker's own stream plus two
 //! read-side inputs (pending inbox rows, an outbox view). Persisting a
-//! stage would make it authoritative — rejected (§2 of the round-6
+//! stage would make it authoritative — rejected (§2 of the
 //! plan). Drop the projection and replay the stream and the same stage
 //! comes back (replay-stable by construction).
 //!
 //! v1 deviation, recorded honestly (DESIGN §4.7): an `idle` ticket is
 //! resumable only via fresh Eval (a new `thread/started`), not
 //! same-Mandate resume — the prototype's person-resume rule is future
-//! work (C59's release path).
+//! work ('s release path).
 //!
 //! "No input admitted since" (arms 2 and 4) is the release rule: the
 //! delegation wrapper is always the stream's *first* input, so every
@@ -52,7 +52,7 @@ use crate::worker::{ReportState, parse_delegation, parse_thread_report};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TicketStage {
     /// A channel delivery for this ticket is pending/parked behind the
-    /// outbox retry driver (person/delivery). Unreachable until C62
+    /// outbox retry driver (person/delivery). Unreachable until
     /// wires a real [`OutboxView`]; the stub is empty.
     #[serde(rename = "delivery-retry")]
     DeliveryRetry,
@@ -105,9 +105,9 @@ impl std::fmt::Display for TicketStage {
 }
 
 /// The outbox read-side input (arm 1): whether the delivery retry
-/// domain (C62) reports a pending/parked delivery for this ticket.
+/// domain reports a pending/parked delivery for this ticket.
 ///
-/// The default is the **stub**: no pending delivery. Until C62 wires a
+/// The default is the **stub**: no pending delivery. Until wires a
 /// real implementation over the `tool/call` ↔ `channel/delivered`
 /// projection, the `delivery-retry` arm is honestly unreachable — the
 /// enum is complete from day one, only the input is empty.
@@ -121,7 +121,7 @@ pub trait OutboxView {
 }
 
 /// The canonical empty [`OutboxView`] — the stub every caller passes
-/// until C62 lands.
+/// until lands.
 pub struct NoOutbox;
 
 impl OutboxView for NoOutbox {}
@@ -166,7 +166,7 @@ pub fn project_stage(
     }
 
     // Arm 4 — blocked-failed: a failure nobody has released yet (a
-    // message after the failure moves the ticket on).
+    // message after the failure moves the ticket ).
     if let Some(failed_seq) = facts.failed_terminal_seq
         && !facts.input_admitted_since(failed_seq)
     {

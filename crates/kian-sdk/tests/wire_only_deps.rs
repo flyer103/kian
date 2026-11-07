@@ -1,4 +1,4 @@
-//! The wire-only dependency contract (card C46): `cargo tree -p
+//! The wire-only dependency contract: `cargo tree -p
 //! kian-sdk` must show nothing beyond reqwest/serde/serde_json/futures/
 //! tokio/thiserror and never a kian crate — the SDK is embeddable
 //! anywhere. Enforced here at the manifest source so a stray
@@ -55,7 +55,7 @@ fn no_kian_crate_dependency_anywhere() {
 }
 
 /// The SDK carries its own version, decoupled from the workspace bump
-/// cadence (C46 versioning rule).
+/// cadence (versioning rule).
 #[test]
 fn sdk_carries_its_own_version() {
     let manifest = include_str!("../Cargo.toml");

@@ -1,4 +1,4 @@
-//! C49 webhook receiver e2e: the real assembled server (`kian serve`
+//! webhook receiver e2e: the real assembled server (`kian serve`
 //! shape) with a `type: github` channel, driven over the real HTTP
 //! route with HMAC-signed deliveries — and the honest fail-closed
 //! startup refusals. No credentials, no network (the provider is the
@@ -202,7 +202,7 @@ async fn await_admissions(sqlite: &std::path::Path, delivery_id: &str, expected:
     }
 }
 
-/// The full C49 acceptance path: a validly signed, known event
+/// The full acceptance path: a validly signed, known event
 /// admits exactly once through the whole stack; a delivery-id replay
 /// stays one admission; an invalid signature admits nothing.
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn configured_route_without_secret_refuses_to_start() {
 }
 
 /// Without a github channel the route is simply absent (404) — the
-/// Phase-1/C27 servers never expose the webhook surface.
+/// built-in/ servers never expose the webhook surface.
 #[tokio::test]
 async fn route_is_absent_without_a_github_channel() {
     let _guard = ENV_MUTEX.lock().await;

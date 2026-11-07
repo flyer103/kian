@@ -1,4 +1,4 @@
-//! Thread/Correlation intake projection acceptance (card C61, the
+//! Thread/Correlation intake projection acceptance (the
 //! ADR-013 draft's contract in code).
 //!
 //! - thread-key derivation goldens per configured source shape (the
@@ -13,7 +13,7 @@
 //! - a no-cursor source documents the re-poll bound: the replayed poll
 //!   produces `deduplicated` admissions and zero duplicate rows
 //!   (idempotent re-poll under `event_id` dedupe — no position table);
-//! - the derived key surfaces in the C33 Inline `neighbors` block as
+//! - the derived key surfaces in the Inline `neighbors` block as
 //!   context (correlation never routes);
 //! - `intake.rs` names no store type (bundle-only, `kian-core` seams
 //!   only).
@@ -57,7 +57,7 @@ fn event(seq: u64, kind: EventKind, bytes: Value) -> Event {
     }
 }
 
-/// A lark-shaped channel event (chat-history poll mapping, C44): the
+/// A lark-shaped channel event (chat-history poll mapping): the
 /// verbatim message item as payload, the chat id as group.
 fn lark_event(event_id: &str, chat: &str, message_id: &str) -> ChannelEvent {
     ChannelEvent {
@@ -78,7 +78,7 @@ fn lark_event(event_id: &str, chat: &str, message_id: &str) -> ChannelEvent {
     }
 }
 
-/// A github `issue_comment` webhook-shaped channel event (C48 mapping):
+/// A github `issue_comment` webhook-shaped channel event (mapping):
 /// the verbatim body as payload, `owner/repo` as group.
 fn github_issue_event(event_id: &str, number: u64, updated_at: &str) -> ChannelEvent {
     ChannelEvent {
@@ -102,7 +102,7 @@ fn github_issue_event(event_id: &str, number: u64, updated_at: &str) -> ChannelE
 }
 
 /// One admitted channel input as a stream event (the wrapper rides
-/// inside `content`, the C4-frozen payload contract).
+/// inside `content`, the -frozen payload contract).
 fn admitted(ev: &ChannelEvent, seq: u64) -> Event {
     event(
         seq,
@@ -111,7 +111,7 @@ fn admitted(ev: &ChannelEvent, seq: u64) -> Event {
     )
 }
 
-/// The C32 spill sidecar of an over-cap admitted input: the verbatim
+/// The spill sidecar of an over-cap admitted input: the verbatim
 /// raw plus the join key.
 fn spilled(ev: &ChannelEvent, seq: u64) -> Event {
     event(
@@ -377,11 +377,11 @@ fn thread_key_set_first_match_wins_in_declaration_order() {
 // Neighbors block (correlation is context only)
 // ---------------------------------------------------------------------
 
-/// The derived key surfaces in the C33 Inline `neighbors` block: the
+/// The derived key surfaces in the Inline `neighbors` block: the
 /// canonical `topic`/`event_id`, the configured scalar neighbor
 /// fields (payload-controlled values never override the canonical
 /// ones), and `thread_key` — context for recall hops, never a routing
-/// input (the subscription rule matcher is unchanged by C61).
+/// input (the subscription rule matcher is unchanged ).
 #[test]
 fn neighbors_block_carries_the_thread_key() {
     let set = ThreadKeySet::new(vec![
@@ -585,8 +585,8 @@ async fn no_cursor_source_repoll_produces_deduplicated_admissions_zero_duplicate
 
 /// `intake.rs` is bundle-only: it names no store, no orchestrator
 /// execution surface — the derivation reads `ChannelEvent`s and
-/// admitted stream events through `kian-core` seams only (the C61
-/// acceptance, in the C13 iron-rule textual pattern).
+/// admitted stream events through `kian-core` seams only (the
+/// acceptance, in the iron-rule textual pattern).
 #[test]
 fn intake_module_names_no_store_type() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

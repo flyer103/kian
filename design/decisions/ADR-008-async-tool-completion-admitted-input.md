@@ -1,4 +1,4 @@
-# ADR-008: Async tool completion is an admitted input; job rows are pre-event durable state; `stop()` is honest cancellation
+# ADR-008: Async tool completion is an admitted input; job rows are pre-event durable state; `stop` is honest cancellation
 
 - **Status**: proposed
 - **Date**: 2026-11-01
@@ -7,8 +7,8 @@
   session. In kian's native shape the input half *is* invariant 3 (inputs are durable rows
   promoted at provider-turn safe boundaries — already true), and the completion half *is* an
   admit→wake→promote round-trip. The only gap was the tool wrapper: the sync `exec` tool
-  (C20) parks the calling drain until the command settles. A blocked drain would break the
-  S2 steer path for the duration of the job; a detached fire-and-forget command without a
+   parks the calling drain until the command settles. A blocked drain would break the
+   steer path for the duration of the job; a detached fire-and-forget command without a
   durable completion path would break NoLostWork.
 - **Decision**:
   1. **Async completion is an admitted input, never a direct event write.** When a job
@@ -24,11 +24,11 @@
      updated_at`) lives in the shared `kian.sqlite` under `kian-exec`'s own append-only
      migration chain. The row is committed **before dispatch** (admit-before-execute). The
      job id *is* the command id, derived from the calling tool-call id (UUIDv5), so
-     recovery and replay dedupe onto the same row. Dispatch itself is entirely the C20
+     recovery and replay dedupe onto the same row. Dispatch itself is entirely the 
      durable queue's business — `async_jobs` adds only "who to notify", never a second
      dispatch system. Job statuses are monotone and terminal rows freeze; cancellation
      wins a settle race by guarded transition, exactly like the queue.
-  3. **`stop()` is honest cancellation, not erasure.** Cancelling marks the job `cancelled`
+  3. **`stop` is honest cancellation, not erasure.** Cancelling marks the job `cancelled`
      (terminal) and kills the in-flight command best-effort: the v0 wire has no kill frame,
      so a not-yet-dispatched queue row is abandoned (it never flies) and an already-running
      command is unkillable — its late result is discarded by the queue's terminal guard.
@@ -48,11 +48,11 @@
   1. Completion as a new event kind appended by the executor — violates the layered iron
      rule (execution appends events; an external completion is *input*, and inputs are
      durable inbox rows admitted then promoted, not events written out of band).
-  2. A separate async dispatch queue — duplicates C20's proven at-least-once machinery and
+  2. A separate async dispatch queue — duplicates 's proven at-least-once machinery and
      forks the correlation scheme; rejected in favor of one queue plus a notify row.
   3. Blocking the drain but streaming progress — still blocks steers for the job's lifetime;
-     the S2 path must interleave, so the tool resolves fast instead.
-  4. Kill-frame wire extension for `stop()` — a wire-protocol change is out of scope;
+     the path must interleave, so the tool resolves fast instead.
+  4. Kill-frame wire extension for `stop` — a wire-protocol change is out of scope;
      best-effort cancellation with an honest label is the v1 semantics.
 - **Consequences**: a completion may arrive while the session is mid-drain; it is promoted
   only at a provider-turn boundary (cache-byte stability is untouched). Duplicate

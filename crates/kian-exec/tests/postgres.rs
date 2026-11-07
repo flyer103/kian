@@ -1,14 +1,14 @@
-//! Env-gated postgres suite for the exec store (card C51).
+//! Env-gated postgres suite for the exec store.
 //!
 //! `KIAN_PG_URL` absent → every test in this file SKIPS with a log line
-//! and never fails (the C44/C50 pattern): default CI needs no postgres.
-//! With the env var set (a throwaway database — e.g. the docker recipe
-//! C55 documents), each test creates its own private database
+//! and never fails (the pattern): default CI needs no postgres.
+//! With the env var set (a throwaway database — e.g. The docker recipe
+//! documents), each test creates its own private database
 //! `kian_exec_test_<uuid>` off the URL so parallel runs never collide.
 //!
-//! Coverage is the C20 queue semantics — park / re-drive / restart,
+//! Coverage is the queue semantics — park / re-drive / restart,
 //! dedupe, guarded transitions, honest timeout, the registry projection,
-//! the C37 async-jobs lifecycle — transported to postgres, plus the v2
+//! the async-jobs lifecycle — transported to postgres, plus the v2
 //! queue-row lease columns existing and defaulting to unclaimed.
 
 use kian_core::model::SessionId;
@@ -26,7 +26,7 @@ fn gated() -> bool {
         Ok(url) if !url.is_empty() => true,
         _ => {
             eprintln!(
-                "SKIP: KIAN_PG_URL is not set — kian-exec postgres suite disabled (C51 env gate)"
+                "SKIP: KIAN_PG_URL is not set — kian-exec postgres suite disabled (env gate)"
             );
             false
         }
@@ -131,7 +131,7 @@ fn timeout_outcome() -> CommandOutcome {
     }
 }
 
-/// C20 semantics on pg: enqueue parks a durable pending row (nothing is
+/// semantics on pg: enqueue parks a durable pending row (nothing is
 /// driving), `drivable` returns it oldest-first, dedupe by command id
 /// collapses replays onto the existing row.
 #[tokio::test]
@@ -176,7 +176,7 @@ async fn pg_enqueue_parks_durable_and_dedupes_by_command_id() {
     pg.finish().await;
 }
 
-/// C20 semantics on pg: guarded transitions — done freezes the row
+/// semantics on pg: guarded transitions — done freezes the row
 /// (command-id dedupe answers re-executions from the row), abandoned is
 /// the honest timeout, and neither may be overwritten by the other.
 #[tokio::test]
@@ -218,7 +218,7 @@ async fn pg_transitions_are_guarded_and_terminal_rows_freeze() {
     pg.finish().await;
 }
 
-/// C20 semantics on pg: restart — closing the pool and reopening the
+/// semantics on pg: restart — closing the pool and reopening the
 /// same database redrives everything not settled (pending never sent,
 /// inflight presumed lost: at-least-once, ADR-007), and settled rows
 /// are answered from the row, not re-dispatched.
@@ -256,7 +256,7 @@ async fn pg_restart_reopens_and_redrives_unsettled_rows() {
     let mut ids: Vec<_> = rows.iter().map(|r| r.command_id).collect();
     ids.sort();
     // The expected set must be sorted the same way — the ids are random
-    // uuids, so a fixed literal order would flip ~50% of runs (C52
+    // uuids, so a fixed literal order would flip ~50% of runs (
     // flake fix; the assertion's meaning — exactly the two unsettled
     // rows redrive — is unchanged).
     let mut expected = vec![inflight, pending];
@@ -298,7 +298,7 @@ async fn pg_endpoint_registry_upsert_projects() {
     pg.finish().await;
 }
 
-/// C37 semantics on pg: the async-jobs lifecycle — admit-before-execute,
+/// semantics on pg: the async-jobs lifecycle — admit-before-execute,
 /// dedupe by job id, guarded transitions, terminal freeze, status
 /// sweeps.
 #[tokio::test]
@@ -374,7 +374,7 @@ async fn pg_async_jobs_lifecycle_and_terminal_freeze() {
 }
 
 /// The v2 queue-row lease columns exist on pg, are nullable, and default
-/// to unclaimed — C52's row leases build on them with zero further
+/// to unclaimed — 's row leases build on them with zero further
 /// migrations.
 #[tokio::test]
 async fn pg_v2_queue_row_lease_columns_exist_and_default_unclaimed() {
@@ -436,7 +436,7 @@ async fn pg_reopen_is_idempotent() {
     pg.finish().await;
 }
 
-// -- C52: queue-row leases on postgres ----------------------------------------
+// -- queue-row leases on postgres ----------------------------------------
 
 /// The single-statement row lease over postgres (the same code path the
 /// sqlite suite rides): claim → fresh-foreign refusal → heartbeat

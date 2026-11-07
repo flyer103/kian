@@ -8,7 +8,7 @@
 #   2. checks the local vadis gateway is up (the model provider) and sets
 #      KIAN_API_KEY to a fixed marker (vadis accepts any bearer; no real
 #      secret is used or read)
-#   3. boots `kian serve` on 127.0.0.1:7461 with ./config.yaml
+#   3. boots `kian serve` on 127.0.0.1:7461 with./config.yaml
 #   4. submits the charter (charter.md) to the fixed Router session,
 #      idempotently — safe to re-run after any restart
 #   5. prints how to inspect the durable audit streams

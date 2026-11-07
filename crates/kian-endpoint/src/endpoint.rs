@@ -1,5 +1,5 @@
 //! `Endpoint` — the KiandProto endpoint-side connection loop
-//! (card C12, DESIGN §4.3).
+//! (DESIGN §4.3).
 //!
 //! Accepts commands over a stream transport, executes them via a
 //! configurable [`ExecBackend`] under a concurrency cap, returns results
@@ -8,7 +8,7 @@
 //! command ids; when the connection ends, nothing about it survives —
 //! reconnects start from a clean handshake. Session logs live in Kian's
 //! EventStore; delivery retries across disconnects are **server-side**
-//! (Phase 2, `kian-exec`) — the endpoint drops undeliverable results with
+//! (bundle, `kian-exec`) — the endpoint drops undeliverable results with
 //! a warning.
 
 use std::sync::Arc;
@@ -54,7 +54,7 @@ pub struct HelloInfo {
 
 /// One heartbeat the endpoint successfully sent, as seen by an optional
 /// observer installed via [`Endpoint::with_heartbeat_tap`] (additive
-/// builder hook, card C22): a hosting daemon logs liveness at its own
+/// builder hook): a hosting daemon logs liveness at its own
 /// level without the library choosing one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatInfo {
@@ -115,7 +115,7 @@ impl Endpoint {
         self
     }
 
-    /// Install a heartbeat observer (additive builder hook, card C22).
+    /// Install a heartbeat observer (additive builder hook).
     /// Called for every heartbeat frame successfully sent — both the
     /// periodic emitter's beats and ping answers.
     pub fn with_heartbeat_tap(mut self, tap: HeartbeatTap) -> Self {
@@ -150,7 +150,7 @@ impl Endpoint {
     /// Embed: run one connection loop against an in-process peer and
     /// return the server-side handle. This is the "SDK embedded in any
     /// process" access form (the peer will be `kian-exec`'s client half
-    /// in Phase 2; today it doubles as the in-process mock for tests).
+    /// in bundle; today it doubles as the in-process mock for tests).
     pub fn embed(self: &Arc<Self>) -> ServerPeer {
         let (inbound_tx, inbound) = mpsc::channel(64);
         let (outbound, outbound_rx) = mpsc::channel(64);
@@ -298,7 +298,7 @@ impl Endpoint {
             if outbound.send(frame).await.is_err() {
                 tracing::warn!(
                     command_id = %id,
-                    "connection lost before result was delivered; delivery retries are server-side (Phase 2)"
+                    "connection lost before result was delivered; delivery retries are server-side"
                 );
             }
             drop(permit); // hold the permit through delivery
@@ -314,7 +314,7 @@ fn now_ms() -> u64 {
 }
 
 /// The server-side half of one connection: send [`ServerFrame`]s, receive
-/// [`EndpointFrame`]s. In-process mock of the Phase-2 `kian-exec` client;
+/// [`EndpointFrame`]s. In-process mock of the bundle `kian-exec` client;
 /// also the reference client for the TCP transport ([`crate::tcp::connect`]).
 #[derive(Debug)]
 pub struct ServerPeer {
@@ -659,7 +659,7 @@ mod tests {
         assert!(peer.next_frame().await.is_none(), "endpoint must close");
     }
 
-    /// The heartbeat tap (additive hook, C22) observes every beat the
+    /// The heartbeat tap (additive hook) observes every beat the
     /// emitter successfully sends — identity, timestamp, in-flight count.
     #[tokio::test]
     async fn heartbeat_tap_observes_periodic_beats() {

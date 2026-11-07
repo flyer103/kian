@@ -1,4 +1,4 @@
-//! C51 postgres assembly tests: fail-closed startup rules (always run —
+//! postgres assembly tests: fail-closed startup rules (always run —
 //! they need no postgres) and the env-gated serve-assembly smoke
 //! (`KIAN_PG_URL` absent → SKIP with a log line, never fail).
 
@@ -50,7 +50,7 @@ fn gated() -> bool {
         Ok(url) if !url.is_empty() => true,
         _ => {
             eprintln!(
-                "SKIP: KIAN_PG_URL is not set — postgres serve-assembly suite disabled (C51 env gate)"
+                "SKIP: KIAN_PG_URL is not set — postgres serve-assembly suite disabled (env gate)"
             );
             false
         }
@@ -98,7 +98,7 @@ async fn postgres_mode_with_missing_url_env_refuses_to_start() {
     );
 }
 
-/// The default drain.holder is refused under postgres (C47 condition
+/// The default drain.holder is refused under postgres (condition
 /// (c)): two replicas sharing a holder would defeat same-holder claim
 /// admission.
 #[test]

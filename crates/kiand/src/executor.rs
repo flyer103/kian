@@ -1,5 +1,5 @@
 //! The daemon's executor: [`LocalExecutor`] plus the three things a
-//! daemon needs on top of an embeddable SDK (card C22).
+//! daemon needs on top of an embeddable SDK.
 //!
 //! - applies `exec_timeout_ms` as the default bound for commands that
 //!   arrive without their own `timeout_ms` — the daemon never runs an

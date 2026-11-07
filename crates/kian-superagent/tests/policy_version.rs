@@ -1,12 +1,12 @@
-//! Integration tests (card C63): policy/prompt versioning + drift
+//! Integration tests: policy/prompt versioning + drift
 //! marking, over a real sqlite `EventStore` and a real `Engine` — the
 //! same fixture family as `router_profile.rs`. ScriptedProvider, no
 //! credentials, no network egress.
 //!
 //! The four named gates:
-//! 1. the `[policy <label>]` header is rendered at bootstrap and
+//! 1. The `[policy <label>]` header is rendered at bootstrap and
 //!    persisted (byte golden of a new-session bootstrap input);
-//! 2. the same session replayed after a config version change keeps
+//! 2. The same session replayed after a config version change keeps
 //!    its original header byte-identically (live sessions are never
 //!    rewritten — cache-byte stability);
 //! 3. drift detection marks exactly the affected sessions;
@@ -128,7 +128,7 @@ impl RecoveryPolicySource for NoopPolicy {
     }
 }
 
-/// The engine-backed inbox (the C25 cycle-breaker shape): admits are
+/// The engine-backed inbox (the cycle-breaker shape): admits are
 /// durable store writes with real `(session, idempotency_key)`
 /// dedupe; wakes reach the engine through a late-bound slot.
 struct LateEngineInbox {
@@ -172,7 +172,7 @@ impl InboxWriter for LateEngineInbox {
     }
 }
 
-/// Assembly's `StreamPort` over the execution-hold handle (C25 shape).
+/// Assembly's `StreamPort` over the execution-hold handle (shape).
 struct CtxPort(DrainCtx);
 
 impl kian_superagent::StreamPort for CtxPort {
@@ -610,7 +610,7 @@ async fn absent_config_bootstrap_bytes_are_identical_to_today() {
     let h = harness().await;
     let router = h.router;
     let events = bootstrap_and_wait(&h, router, None).await;
-    // Exactly what the pre-C63 tests asserted (and still assert,
+    // Exactly what the legacy tests asserted (and still assert,
     // unmodified): the plain judge render, nothing added.
     assert_eq!(
         bootstrap_prompt(&events),

@@ -1,6 +1,6 @@
 //! `kian-cli` — CLI and embedded SDK: serve/run/inspect/replay/export.
 //!
-//! DESIGN §7 assigns this crate (together with the Phase-2 `kian-sdk`) the
+//! DESIGN §7 assigns this crate (together with the bundle `kian-sdk`) the
 //! key interfaces `create_session`, `submit`, `steer`, `interrupt`,
 //! `events`. It is the assembly point: it depends on every other kian
 //! crate, builds the plugin `Ctx`, wires the seam implementations into the
@@ -13,30 +13,30 @@
 //!
 //! Modules:
 //! - [`api`] — axum JSON-RPC + SSE control plane (DESIGN §5)
-//! - [`cache_metrics`] — S3 cache-byte stability report (C17), exposed
+//! - [`cache_metrics`] — cache-byte stability report, exposed
 //!   at `GET /metrics` and `kian cache-stats`
-//! - [`usage_metrics`] — C67 provider token-usage report (pure
+//! - [`usage_metrics`] — provider token-usage report (pure
 //!   projection over `turn/end` payloads), exposed at `GET /metrics`,
 //!   `kian usage-stats` and the `session inspect` usage lines
 //! - [`client`] — thin JSON-RPC HTTP client the session commands use to
 //!   talk to a running `serve` (re-exported from the wire-only
-//!   `kian-sdk` crate, card C46)
-//! - [`commands`] — the C14 session commands (inspect / replay / export
+//!   `kian-sdk` crate)
+//! - [`commands`] — the session commands (inspect / replay / export
 //!   / wake-now / lease / recovery budget reset) with documented
 //!   `--json` schemas
 //! - [`config`] — `kian.yaml` loading, fail-closed on malformed config
-//! - [`ops`] — the C14 operational plane (`POST /ops/rpc`: `wake_now`,
-//!   `recovery_budget_reset`, and the C27 demo injection
+//! - [`ops`] — the operational plane (`POST /ops/rpc`: `wake_now`,
+//!   `recovery_budget_reset`, and the demo injection
 //!   `mock_channel_send`), trait-isolated like the control plane
 //! - [`plugins`] — built-in static plugins (openai-compat, local-tools,
-//!   react-loop; C27 adds superagent and remote-exec) registered via
+//!   react-loop; adds superagent and remote-exec) registered via
 //!   `kian_plugins![...]`
 //! - [`server`] — assembly (plugins → Ctx → engine → inbox rebuild) and
 //!   the `ControlPlane` / `OpsPlane` implementations
-//! - [`superagent`] — the C27 super-agent assembly: the three-way
+//! - [`superagent`] — the super-agent assembly: the three-way
 //!   Router/Worker/plain driver, the `InboxWriter` port over the
 //!   engine, subscription consumers, watchdog wiring and metrics
-//! - [`webhook`] — the C49 inbound webhook receiver plane
+//! - [`webhook`] — the inbound webhook receiver plane
 //!   (`POST /webhooks/github`: HMAC-verified GitHub deliveries handed
 //!   to the subscription pipeline), trait-isolated like the control
 //!   and ops planes (ADR-011)

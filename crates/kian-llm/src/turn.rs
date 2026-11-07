@@ -1,4 +1,4 @@
-//! One provider turn: failover traversal driven by slot bindings (C8).
+//! One provider turn: failover traversal driven by slot bindings.
 //!
 //! `complete_turn` runs the provider turn for one slot against a provider
 //! registry. When the primary target fails with a failover-class error
@@ -61,7 +61,7 @@ where
 /// Failover-class errors: the endpoint is unusable right now (provider
 /// down / rate limited / transport broken). `ContextOverflow` is
 /// deliberately *not* failover — it routes to `compress_then_retry` in the
-/// recovery policy (C10); `EmptyResponse` is a soft failure, not a switch.
+/// recovery policy; `EmptyResponse` is a soft failure, not a switch.
 fn is_failover_class(e: &ProviderError) -> bool {
     matches!(
         e,

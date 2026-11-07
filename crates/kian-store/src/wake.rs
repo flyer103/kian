@@ -1,4 +1,4 @@
-//! Wake transport — the postgres LISTEN/NOTIFY accelerator (C52, ADR-009).
+//! Wake transport — the postgres LISTEN/NOTIFY accelerator (ADR-009).
 //!
 //! Wakes stay **advisory** (AGENTS.md constraint 6, invariant 2): the
 //! in-process [`crate::inbox`]-adjacent `WakeRegistry` (owned by
@@ -6,7 +6,7 @@
 //! this module only adds a *cross-process* accelerator so a replica that
 //! admits an input can hint every other replica immediately.
 //!
-//! Ordering rule (the card's named guarantee): the notify fires
+//! Ordering rule (the named guarantee): the notify fires
 //! **after the input insert commits** — never inside the transaction. A
 //! notify observed before its row is visible would invert
 //! durable-before-wake. Because `EventStore::admit` is a single INSERT
@@ -95,7 +95,7 @@ mod tests {
 
     /// sqlite is single-process: `notify_wake` is a successful no-op —
     /// the in-process registry is the transport and nothing here ever
-    /// touches the database (C52: "sqlite behavior is unchanged").
+    /// touches the database ("sqlite behavior is unchanged").
     #[tokio::test]
     async fn sqlite_notify_wake_is_a_successful_noop() {
         let path = temp_db_path();

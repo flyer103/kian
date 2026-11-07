@@ -1,7 +1,7 @@
-//! End-to-end daemon tests (card C22 acceptance): spawn the **real
+//! End-to-end daemon tests (acceptance): spawn the **real
 //! `kiand` binary** (`CARGO_BIN_EXE_kiand`) on an ephemeral port and pair
-//! it with the C19 client (`kian_exec::ConnectionManager`) over real TCP.
-//! No credentials, `NO_PROXY` honored (round-2 plan §1 rule 6).
+//! it with the client (`kian_exec::ConnectionManager`) over real TCP.
+//! No credentials, `NO_PROXY` honored (plan §1 rule 6).
 
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -280,7 +280,7 @@ fn unknown_flag_is_a_usage_error() {
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// S5 preview: kill -9 (no drain, no bye), restart on the **same port**,
+/// preview: kill -9 (no drain, no bye), restart on the **same port**,
 /// and the manager's reconnect loop re-handshakes and executes again.
 #[tokio::test]
 async fn kill9_restart_same_port_reconnects() {

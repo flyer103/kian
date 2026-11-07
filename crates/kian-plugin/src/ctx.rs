@@ -1,10 +1,10 @@
 //! `Ctx` typed service registry, `Plugin`, activation, `Disposer`
-//! (card C7, DESIGN §6.1, ADR-004).
+//! (DESIGN §6.1, ADR-004).
 //!
 //! Mapping from Cordis (ADR-004):
 //! - **Stable service keys**: a service is registered *by trait-object type*
 //!   (`ctx.provide::<dyn ModelProvider>(impl)` / `ctx.resolve::<dyn
-//!   ModelProvider>()`); one implementation per key — a second registration
+//!   ModelProvider>`); one implementation per key — a second registration
 //!   is a named error.
 //! - **Reversible registration**: `trait Plugin { fn apply(self, ctx: &mut
 //!   Ctx) -> Result<Disposer, PluginError> }` — everything `apply` installs
@@ -16,7 +16,7 @@
 //!   `dispose()` or on drop.
 //!
 //! Static (compile-time) plugins only — [`crate::kian_plugins!`] assembles a
-//! [`PluginSet`]; dynamic loading (dylib/wasm) is Phase 3.
+//! [`PluginSet`]; dynamic loading (dylib/wasm) is deferred.
 
 use std::any::{Any, TypeId};
 use std::cmp::Reverse;
@@ -32,7 +32,7 @@ pub trait Service: Any + Send + Sync {}
 
 impl<T: ?Sized + Any + Send + Sync> Service for T {}
 
-/// Named errors for the plugin subsystem (card C7 acceptance criteria).
+/// Named errors for the plugin subsystem (acceptance criteria).
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     /// A second registration for an already-occupied stable service key.
@@ -168,7 +168,7 @@ impl Ctx {
         let key = TypeId::of::<S>();
         // The slot stores `Arc<S>` itself as the concrete type behind
         // `dyn Any` (trait-object-to-`dyn Any` coercion needs a sized
-        // value, and `Arc<S>` is sized even for `S: ?Sized`).
+        // value, and `Arc<S>` is sized even for `S:?Sized`).
         let slot_value: Arc<dyn Any + Send + Sync> = Arc::new(svc);
         {
             let mut services = self

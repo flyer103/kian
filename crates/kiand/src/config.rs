@@ -1,4 +1,4 @@
-//! kiand configuration (card C22): flags + environment + optional
+//! kiand configuration: flags + environment + optional
 //! `kiand.yaml`, resolved with the precedence **flags > environment >
 //! file > defaults**. Loading is fail-closed: a malformed value, an
 //! unknown key or an unparseable `listen` address refuses to start with a

@@ -144,7 +144,7 @@ pub fn text_chunk(text: &str) -> Result<ModelChunk, ProviderError> {
     Ok(ModelChunk::new(json!({"content": text})))
 }
 
-/// Convenience (C67): one usage-only chunk — a Null delta plus the
+/// Convenience: one usage-only chunk — a Null delta plus the
 /// provider's usage object verbatim.
 pub fn usage_chunk(usage: Value) -> Result<ModelChunk, ProviderError> {
     Ok(ModelChunk::with_usage(Value::Null, usage))

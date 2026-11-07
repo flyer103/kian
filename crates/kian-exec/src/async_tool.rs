@@ -1,4 +1,4 @@
-//! The async `start()`/`stop()` tool pair (card C37, ADR-008, DESIGN
+//! The async `start()`/`stop()` tool pair (ADR-008, DESIGN
 //! §4.3/§6.2) — the article's §4.1 per-session full-duplex in kian's
 //! native shape.
 //!
@@ -8,7 +8,7 @@
 //! gap was the tool wrapper, and that is all this module adds:
 //!
 //! - [`AsyncExecTool`] (`start`) enqueues the command through the
-//!   **unchanged** C20 durable queue and returns **immediately** with
+//!   **unchanged** durable queue and returns **immediately** with
 //!   `{"status":"started","job_id":…}` as an honest `tool/result` —
 //!   the session's drain is never blocked by the job (the built-in
 //!   loop in `kian-loop` is untouched; the tool simply resolves
@@ -146,7 +146,7 @@ impl AsyncJobs {
             // The ack is honest even on the dedupe path: the job IS
             // started (its row exists; an observer is attached).
             is_error: false,
-            // No exec output here — nothing was redacted (C69).
+            // No exec output here — nothing was redacted.
             redactions: Vec::new(),
         })
     }
@@ -255,7 +255,7 @@ impl AsyncJobs {
             self.finish(job_id);
             return;
         }
-        // C52 row lease: own the job row before observing. A fresh lease
+        // row lease: own the job row before observing. A fresh lease
         // held by another replica means *its* observer drives this job —
         // exit honestly (delivery is idempotent by the bridge's admit
         // key, and that replica's startup redeliver covers the handoff).
@@ -276,7 +276,7 @@ impl AsyncJobs {
                 // this claim (`stop` won the race) — the settled row
                 // must be delivered HERE: in-process only this
                 // observer would, and the startup redelivery sweep
-                // is a recovery path, not this turn's (C56: a
+                // is a recovery path, not this turn's (a
                 // cancelled completion used to be lost here until
                 // the next process restart).
                 match store.get_async_job(job_id).await {
@@ -381,7 +381,7 @@ impl AsyncJobs {
         // will fly — abandoned is terminal, the driver skips it); a
         // command already executing on the endpoint is unkillable and
         // its late result is discarded by the queue's terminal guard
-        // ("late result for a settled command discarded", C20).
+        // ("late result for a settled command discarded").
         match store.mark_abandoned(job_id).await {
             Ok(true) => tracing::info!(
                 job_id = %job_id,

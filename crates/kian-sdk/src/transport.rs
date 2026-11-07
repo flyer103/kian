@@ -1,14 +1,14 @@
-//! Thin JSON-RPC 2.0 HTTP transport (card C14; extracted from
-//! `kian-cli/src/client.rs` unchanged by card C46) — the transport the
+//! Thin JSON-RPC 2.0 HTTP transport (extracted from
+//! `kian-cli/src/client.rs` unchanged ) — the transport the
 //! typed surface rides on.
 //!
 //! Two endpoints:
-//! - `POST /rpc` — the C13 control plane (`projection`, …);
-//! - `POST /ops/rpc` — the C14 operational plane (`wake_now`,
+//! - `POST /rpc` — the control plane (`projection`, …);
+//! - `POST /ops/rpc` — the operational plane (`wake_now`,
 //!   `recovery_budget_reset`, `mock_channel_send`).
 //!
 //! The request envelope (`jsonrpc`/`id`/`method`/`params`) is byte-stable
-//! by the C8 serialization-freeze discipline; golden wire fixtures pin it.
+//! by the serialization-freeze discipline; golden wire fixtures pin it.
 
 use serde_json::{Value, json};
 

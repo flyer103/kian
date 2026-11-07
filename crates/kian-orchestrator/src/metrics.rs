@@ -1,6 +1,6 @@
-//! Orchestrator metrics counters (card C9).
+//! Orchestrator metrics counters.
 //!
-//! Observability lives at the orchestrator layer (round-1 plan C17:
+//! Observability lives at the orchestrator layer (plan:
 //! "metrics code inside core crates" is forbidden — this crate is where
 //! it belongs). The counters are plain atomics: cheap to bump from drain
 //! tasks, snapshottable for serve/CLI exposure later.
@@ -30,7 +30,7 @@ pub struct Metrics {
 }
 
 /// A point-in-time copy of [`Metrics`] for exposure (serde-shaped for
-/// the Phase-1 serve metrics endpoint, C17).
+/// the built-in serve metrics endpoint).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct MetricsSnapshot {
     pub state_transitions: u64,

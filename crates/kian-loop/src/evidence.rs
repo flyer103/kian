@@ -1,8 +1,8 @@
-//! Evidence gate v1 (card C24, SPEC P4/A6): a declarative, bounded,
+//! Evidence gate v1 (SPEC P4/A6): a declarative, bounded,
 //! **no-model-call** gate over the worker's own event stream.
 //!
 //! The gate is a pure predicate evaluation: it never calls the provider,
-//! never mutates context (verdicts are non-context-bearing by C18), and
+//! never mutates context (verdicts are non-context-bearing ), and
 //! only *reports* — recovery disposition stays owned by the engine
 //! (a failed gate surfaces as a soft failure; the engine settles it).
 //!
@@ -10,7 +10,7 @@
 //! [`crate::react::ReActLoop::with_evidence_gate`]):
 //!
 //! - On the loop's terminal stop — `Settled` (final answer, empty inbox:
-//!   the loop's "done" claim) or `Stopped` (intentional stop, e.g. the
+//!   the loop's "done" claim) or `Stopped` (intentional stop, e.g. The
 //!   iteration budget) — the gate evaluates every check as a pure
 //!   predicate over the session's event stream.
 //! - **Pass**: append `evidence/verdict{passed:true}` and let the stop
@@ -27,7 +27,7 @@
 //!   non-context-bearing, so a gate retry never invalidates the provider
 //!   prefix cache (constraint 3).
 //!
-//! Default-off: [`EvidenceGateConfig::default`] is disabled; Phase-1
+//! Default-off: [`EvidenceGateConfig::default`] is disabled; built-in
 //! behavior is unchanged until a caller explicitly mounts a gate.
 
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Gate name the built-in loop stamps on its verdicts. Custom wrappers
-/// (C25's worker driver) pass their own name so multiple gates can coexist
+/// ('s worker driver) pass their own name so multiple gates can coexist
 /// on one stream.
 pub const BUILTIN_GATE_NAME: &str = "builtin";
 
@@ -156,7 +156,7 @@ pub struct GateVerdict {
 
 /// Evaluates `checks` against `events`. Pure: same inputs, same verdict.
 ///
-/// Public and reusable — C25's worker-loop wrapper consumes this directly
+/// Public and reusable — 's worker-loop wrapper consumes this directly
 /// instead of reimplementing gate semantics.
 #[must_use]
 pub fn evaluate_evidence_gate(gate: &str, checks: &[CheckSpec], events: &[Event]) -> GateVerdict {
@@ -177,7 +177,7 @@ pub fn evaluate_evidence_gate(gate: &str, checks: &[CheckSpec], events: &[Event]
     }
 }
 
-/// Renders a verdict into the frozen C18 `evidence/verdict` payload:
+/// Renders a verdict into the frozen `evidence/verdict` payload:
 /// `{"gate": str, "passed": bool, "checks": [{"name": str, "passed": bool,
 /// "detail"?: str}], "attempt": u64}`. Field order in serialized form is
 /// lexicographic (frozen serialization discipline, constraint 3).
@@ -226,7 +226,7 @@ fn tool_results(events: &[Event]) -> Vec<&Event> {
 }
 
 /// A context-bearing assistant/message is a *final* message when its text
-/// is non-empty and it carries no tool calls (C4 payload convention).
+/// is non-empty and it carries no tool calls (payload convention).
 fn is_final_message(ev: &Event) -> bool {
     let Some(content) = ev.bytes.get("content") else {
         return false;
@@ -247,7 +247,7 @@ fn is_final_message(ev: &Event) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Verdict counters for the metrics surface (SPEC §3.1: evidence-gate
-/// verdicts). Mounted into `GET /metrics` by the C27 assembly; cheap to
+/// verdicts). Mounted into `GET /metrics` by the assembly; cheap to
 /// read at any time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerdictCounters {
@@ -281,7 +281,7 @@ impl EvidenceGateCounters {
     }
 }
 
-/// Evidence-gate tuning. Default is **disabled** — Phase-1 behavior is
+/// Evidence-gate tuning. Default is **disabled** — built-in behavior is
 /// unchanged until a caller mounts a gate explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

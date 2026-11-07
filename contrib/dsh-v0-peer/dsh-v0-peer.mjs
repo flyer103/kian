@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// dsh-v0-peer — the ecosystem half of the kian S6 bridge (card C59).
+// dsh-v0-peer — the ecosystem half of the kian bridge.
 //
 // Adapts the stock `dsh --profile sdk` JSON-RPC 2.0 server (newline-
 // delimited stdio) onto kian's frozen bridge contract v0 (ADR-010):
@@ -7,7 +7,7 @@
 //   stdout -> {"v":0,"type":"ready","logical_format":0} first, then one
 //             {"v":0,"type":"session-event","event":{kind,payload,ts}}
 //             line per adapted dsh session-log event;
-//   stdin  <- {"v":0,"type":"input"|"steer","content":...} and
+//   stdin <- {"v":0,"type":"input"|"steer","content":...} and
 //             {"v":0,"type":"interrupt"} control frames.
 //
 // The kian side (crates/kian-dsh/src/mapping.rs) is FROZEN: this peer
@@ -15,13 +15,13 @@
 // node: builtins only.
 //
 // Env knobs (all optional):
-//   DSH_BIN           dsh binary (default: `dsh` from PATH)
-//   DSH_PEER_CWD      cwd sent in `initialize` (default: process.cwd())
+//   DSH_BIN dsh binary (default: `dsh` from PATH)
+//   DSH_PEER_CWD cwd sent in `initialize` (default: process.cwd())
 //   DSH_PEER_PROVIDER provider route (default: "deepseek-official" — the
 //                     adapter the sdk profile registers; "deepseek" is NOT
 //                     registered and initialize rejects it)
-//   DSH_PEER_MODEL    model name (default: "deepseek-chat")
-//   DSH_PEER_SESSION  dsh session id (default: "kian-" + sha256(cwd)[0:16]
+//   DSH_PEER_MODEL model name (default: "deepseek-chat")
+//   DSH_PEER_SESSION dsh session id (default: "kian-" + sha256(cwd)[0:16]
 //                     — stable per working directory, so a restarted peer
 //                     continues the same dsh session and dsh's own durable
 //                     log is the replay)

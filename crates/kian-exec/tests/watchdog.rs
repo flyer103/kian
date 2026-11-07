@@ -1,5 +1,5 @@
-//! Watchdog acceptance tests (card C21): the v1 server-side
-//! [`WatchdogSource`] over the C20 registry's heartbeat freshness.
+//! Watchdog acceptance tests: the v1 server-side
+//! [`WatchdogSource`] over the registry's heartbeat freshness.
 //!
 //! Every test drives the real sqlite registry (rows written through the
 //! public `upsert_endpoint` projection API, exactly as the queue drivers
@@ -16,7 +16,7 @@ use kian_core::seams::{EndpointHealth, HealthEvent, WatchdogSource};
 use kian_exec::{Clock, ExecStore, HeartbeatWatchdog, ManualClock, WatchdogConfig};
 use uuid::Uuid;
 
-/// Local e2e discipline (round-2 plan §1 rule 6).
+/// Local e2e discipline (plan §1 rule 6).
 fn no_proxy() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {

@@ -46,7 +46,7 @@ jobs:
   # Postgres surfaces are env-gated (KIAN_PG_URL) and skip — never
   # fail — when the env is absent. This job supplies a real postgres
   # so the gated suites (kian-store, kian-exec, kian-cli postgres_serve
-  # and the S8 multi-replica e2e) actually run.
+  # and the multi-replica e2e) actually run.
   postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -74,9 +74,9 @@ jobs:
           export KIAN_PG_URL="postgres://kian@localhost:5432/kian_ci"
           export NO_PROXY=127.0.0.1,localhost
           for t in "kian-store --test postgres" "kian-exec --test postgres" \
-                   "kian-cli --test postgres_serve" "kian-cli --test postgres_s8"; do
+                   "kian-cli --test postgres_serve" "kian-cli --test postgres_multi_replica"; do
             echo "== cargo test -p $t =="
-            # shellcheck disable=SC2086  # $t is a word-split target list by design
+            # shellcheck disable=SC2086 # $t is a word-split target list by design
             cargo test --locked -p $t 2>&1 | tee /tmp/out.log
             grep -q "test result: ok" /tmp/out.log
             if grep -q "SKIP:" /tmp/out.log; then

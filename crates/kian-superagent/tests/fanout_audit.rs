@@ -1,7 +1,7 @@
-//! C38 fan-out audit-log tests. This file is deliberately its own test
+//! fan-out audit-log tests. This file is deliberately its own test
 //! binary: each `tests/*.rs` runs in its own process, so the global
 //! tracing subscriber installed here owns the process's single global
-//! slot — no race with the Phase-2 `install_log_capture` fixture in
+//! slot — no race with the bundle `install_log_capture` fixture in
 //! `tests/subscriptions.rs`, and no dependence on test order.
 //!
 //! Why a process-global install instead of thread-local
@@ -160,7 +160,7 @@ fn ci_event(event_id: &str, topic: &str) -> ChannelEvent {
     }
 }
 
-/// C38 audit acceptance, filter-independent by construction: the audit
+/// audit acceptance, filter-independent by construction: the audit
 /// log names **every** fan-out admission (one line per subscriber,
 /// naming the session and the event id), names the dropped subscriber
 /// on a mid-set write failure while the other's admission is still

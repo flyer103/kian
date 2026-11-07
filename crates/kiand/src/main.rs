@@ -1,4 +1,4 @@
-//! `kiand` binary entry point (card C22): the endpoint daemon —
+//! `kiand` binary entry point: the endpoint daemon —
 //! `kian-endpoint` + a thin main.
 //!
 //! - `kiand [flags]` — serve the endpoint over TCP + JSON lines. Config

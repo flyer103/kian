@@ -1,4 +1,4 @@
-//! `RemoteExecTool` acceptance tests (card C20): the model-visible remote
+//! `RemoteExecTool` acceptance tests: the model-visible remote
 //! exec tool — same schema shape as the local built-in, tool-call-id
 //! correlation, honest errors, command-id dedupe.
 

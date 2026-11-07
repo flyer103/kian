@@ -1,4 +1,4 @@
-//! Append-only events table (card C5) and its dual-backend dispatch (C50).
+//! Append-only events table and its dual-backend dispatch.
 //!
 //! `append(session, event, { epoch, expected_seq })` as a single atomic
 //! CAS write rejecting stale epochs and seq mismatches (ADR-005);
@@ -11,7 +11,7 @@
 //! atomic append: the terminal state transition is *projected* from that
 //! single row, never written separately (NoHalfTerminated, constraint 4).
 //!
-//! C50: the public [`EventStore`] is a small dispatching enum —
+//! the public [`EventStore`] is a small dispatching enum —
 //! `Sqlite(..) | Postgres(..)` — exposing the same method names and
 //! signatures on both backends (sqlx cannot usefully genericize over the
 //! two dialects; dispatch, not generics, is the plan of record). The
@@ -103,7 +103,7 @@ pub enum StoreError {
 /// tripped. Shared by both backends — on sqlite it explains zero rows
 /// from the WHERE fence; on postgres it additionally explains the
 /// PK-race outcomes (`ON CONFLICT DO NOTHING` zero rows / sqlstate
-/// 23505) that sqlite's writer serialization makes impossible (C50 §3).
+/// 23505) that sqlite's writer serialization makes impossible (§3).
 pub(crate) fn classify_cas_rejection(
     session: SessionId,
     guard: AppendGuard,
@@ -129,9 +129,9 @@ pub(crate) fn to_i64(v: u64, field: &'static str) -> Result<i64, StoreError> {
     i64::try_from(v).map_err(|_| StoreError::IntOverflow { field })
 }
 
-/// The dual-backend EventStore (C50): a small dispatching enum over the
+/// The dual-backend EventStore: a small dispatching enum over the
 /// sqlite and postgres implementations. Every method carries the same
-/// name and signature the pre-C50 sqlite store had, so callers and tests
+/// name and signature the legacy sqlite store had, so callers and tests
 /// are unchanged; construction picks the backend (`open` = sqlite,
 /// `open_postgres` = postgres).
 ///
@@ -156,7 +156,7 @@ impl EventStore {
             .synchronous(SqliteSynchronous::Normal)
             // Generous timeout: WAL serializes writers and concurrent
             // drains queue up — never tighten locking to force
-            // interleavings (round-1 plan, risk #7).
+            // interleavings (plan, risk #7).
             .busy_timeout(Duration::from_secs(30));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -169,8 +169,8 @@ impl EventStore {
     /// Opens a postgres database by URL, applies the pg migration chain
     /// (same versions and names as the sqlite chain, pg DDL — DESIGN
     /// §3.3), and returns a pooled store. The URL is env-sourced by the
-    /// caller (C51 assembly); it may carry a password, but never lands in
-    /// a config value (the C13 secrets rule).
+    /// caller (assembly); it may carry a password, but never lands in
+    /// a config value (the secrets rule).
     pub async fn open_postgres(url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         migrations::migrate_pg(&pool).await?;
@@ -179,14 +179,14 @@ impl EventStore {
 
     /// Adopts an already-open postgres pool and applies the pg migration
     /// chain — the counterpart of [`EventStore::from_pool`]-style
-    /// adoption, used by the C51 assembly so the event store and the
+    /// adoption, used by the assembly so the event store and the
     /// exec store share ONE pool (one server, one database).
     pub async fn from_pg_pool(pool: PgPool) -> Result<Self, StoreError> {
         migrations::migrate_pg(&pool).await?;
         Ok(Self::Postgres(pool))
     }
 
-    /// Opens an existing sqlite database file **read-only** (card C14: the
+    /// Opens an existing sqlite database file **read-only** (the
     /// audit reader behind `kian session inspect/replay/export` and
     /// `kian lease inspect`).
     ///
@@ -213,24 +213,24 @@ impl EventStore {
     /// property of the role behind the URL, not a client flag, on
     /// postgres: point this at a role without schema privileges and the
     /// store can read what it is granted and refuses every mutation
-    /// (including migrations — see the C50 pg suite).
+    /// (including migrations — see the pg suite).
     pub async fn open_postgres_read_only(url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new().max_connections(4).connect(url).await?;
         Ok(Self::Postgres(pool))
     }
 
-    /// The underlying sqlite pool (C6's inbox/lease tables share it).
+    /// The underlying sqlite pool ('s inbox/lease tables share it).
     ///
-    /// C50 note: this is the *sqlite-only* accessor. The postgres variant
+    /// note: this is the *sqlite-only* accessor. The postgres variant
     /// carries no sqlite pool by construction, so calling it there is a
     /// programming error and panics with this message. Production code
-    /// paths are backend-dispatched since C51; remaining callers are
+    /// paths are backend-dispatched since; remaining callers are
     /// sqlite-only by construction (tests and sqlite-file readers).
     pub fn pool(&self) -> &SqlitePool {
         match self {
             EventStore::Sqlite(pool) => pool,
             EventStore::Postgres(_) => panic!(
-                "EventStore::pool() is the sqlite-only pool accessor; this store is postgres-backed (C50; C51 migrates the remaining sqlite-only surfaces)"
+                "EventStore::pool() is the sqlite-only pool accessor; this store is postgres-backed"
             ),
         }
     }
@@ -263,8 +263,8 @@ impl EventStore {
     ) -> Result<(), StoreError> {
         Self::validate_append(&session, &event, guard)?;
         // Persist-what-you-send: the envelope column holds the exact
-        // serialized bytes (frozen v0 shape from C2), so replay and audit
-        // exports are byte-identical — on either backend (the C50 export
+        // serialized bytes (frozen v0 shape from), so replay and audit
+        // exports are byte-identical — on either backend (the export
         // parity golden).
         let envelope = serde_json::to_string(&event)?;
         match self {
@@ -311,7 +311,7 @@ impl EventStore {
     /// The end write: session end + state transition as exactly one
     /// atomic append (NoHalfTerminated, constraint 4). The terminal state
     /// is projected from this single row by callers — the store performs
-    /// no second write. `EndReason` first-write-wins lives in the C3
+    /// no second write. `EndReason` first-write-wins lives in the
     /// projection, so a resumed session's later end event appends
     /// normally under the same fences.
     pub async fn append_end(
@@ -329,14 +329,14 @@ impl EventStore {
     }
 
     /// Appends a contiguous batch of events as ONE atomic CAS write
-    /// (C32): the batch shares a single fence decision — the first event
+    /// the batch shares a single fence decision — the first event
     /// takes the CAS position and every event carries the guard's epoch —
     /// so a rejected write (stale epoch, seq mismatch) commits NOTHING.
     /// Used when two events are one logical fact (the spill sidecar's
     /// `input/admitted` + `input/spilled` pair): half a pair must never
     /// become durable (NoSplitBrainWrite over the whole batch).
     ///
-    /// C50: on sqlite the batch is a guarded first-row CAS + tail inserts
+    /// on sqlite the batch is a guarded first-row CAS + tail inserts
     /// in one transaction; on postgres it is a single CTE statement —
     /// all rows land or none on both backends.
     pub async fn append_batch(
@@ -479,7 +479,7 @@ mod tests {
     }
 
     /// The migration chain's head version, so reopen assertions track the
-    /// chain instead of hardcoding its Phase-1 length (C6 extended it to
+    /// chain instead of hardcoding its built-in length (extended it to
     /// v1; future generations extend it further).
     fn kian_store_chain_head() -> u32 {
         crate::migrations::chain()
@@ -549,7 +549,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- C32 batch append: one logical fact, one fenced write --------------
+    // -- batch append: one logical fact, one fenced write --------------
 
     /// A batch append commits every event contiguously, in order, under
     /// one CAS — the happy path of the spill pair.
@@ -1166,7 +1166,7 @@ mod tests {
     }
 }
 
-/// Review assertions (card C5): properties enforced by scanning the crate
+/// Review assertions: properties enforced by scanning the crate
 /// source itself, so a violation fails `cargo test` instead of waiting
 /// for human review.
 #[cfg(test)]

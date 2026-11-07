@@ -1,10 +1,10 @@
 # ADR-012: Delegation Mandate — the authority object on the frozen delegation wrapper
 
-- Status: landed (C60 / kian-70 implements it; landed on the round-6 shared tree, the
+- Status: landed (implements it; landed on the shared tree, the
   orchestrator records the implementation commit at gate time)
 - Date: 2026-11-03 (landed 2026-11-04)
-- Deciders: round-6 architect plan (`shared/round6-plan.md` §5), orchestrator-landed draft ahead of implementation card C60
-- Relates to: ADR-010 (frozen contract v0), the C18 delegation wrapper freeze, C39 speculative-marker precedent, ADR-013 (fan-out authority rule)
+- Deciders: architect plan (`shared/-plan.md` §5), orchestrator-landed draft ahead of implementation 
+- Relates to: ADR-010 (frozen contract v0), the delegation wrapper freeze, speculative-marker precedent, ADR-013 (fan-out authority rule)
 
 ## Context
 
@@ -17,7 +17,7 @@ half; this ADR owns the authority object).
 
 ## Decision
 
-The Mandate is an **additive `"mandate"` object on the C18-frozen delegation wrapper** (the C39
+The Mandate is an **additive `"mandate"` object on the -frozen delegation wrapper** (the 
 `speculative`-marker mechanism, applied to an object):
 
 ```json
@@ -35,12 +35,12 @@ The Mandate is an **additive `"mandate"` object on the C18-frozen delegation wra
   forever) and as the worker's first message (model-visible). A wider scope is a new Ticket (a new
   `thread/started`), never a mutation of an existing mandate.
 - **Issuance**: the Router's `spawn_worker` is the single issuance point; the mandate is built from
-  the triggering input's provenance wrapper (the C43 untrusted discipline: the mandate records *who
+  the triggering input's provenance wrapper (the untrusted discipline: the mandate records *who
   triggered*, it does not trust their text) plus `superagent.mandate` config (per-worker-template
   scope templates; strength `explicit` for adapter-declared explicit signals, else `inferred`).
-- **Revalidation** (with the follow-up-ownership routing card): on follow-up routing to a live
+- **Revalidation** (with the follow-up-ownership routing change): on follow-up routing to a live
   worker, `strength: explicit` passes; `inferred` + `policy_version` ≠ the current pointer (the
-  policy-versioning card) releases to fresh Eval. The revoke path releases to fresh Eval, honestly
+  policy-versioning change) releases to fresh Eval. The revoke path releases to fresh Eval, honestly
   audited.
 - `Delegation` stays frozen; a companion parser (`delegation_mandate`) reads the key; legacy
   wrappers parse unchanged. **Zero new event kinds.**
@@ -60,7 +60,7 @@ The Mandate is an **additive `"mandate"` object on the C18-frozen delegation wra
   `thread/started` payload — constraints 2–3 satisfied by construction).
 - The Router's spawn tool becomes the single issuance point; config changes to scope templates
   affect new Tickets only (persisted mandates are immutable — cache-byte stability holds).
-- Speculative delegations carry mandates too (the C39 markers compose; both are additive wrapper
+- Speculative delegations carry mandates too (the markers compose; both are additive wrapper
   keys).
 
 ## Rejected

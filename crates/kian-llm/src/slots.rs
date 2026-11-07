@@ -1,4 +1,4 @@
-//! Slot resolution (card C8, ADR-006).
+//! Slot resolution (ADR-006).
 //!
 //! `AgentDef` slots bind to provider/model/fallback once per session
 //! (`slot/binding` event at claim); runtime model swap is cache-hostile and

@@ -1,7 +1,7 @@
-//! E2E tests for the C14 session commands (card C14).
+//! E2E tests for the session commands.
 //!
 //! Everything runs against the REAL assembled server (fixtures from
-//! C13's e2e suite): the mock provider speaks the openai-compat wire
+//! 's e2e suite): the mock provider speaks the openai-compat wire
 //! format, so the streams under test are produced by the true
 //! engine + ReAct loop. The commands are exercised through the same
 //! `kian_cli::commands` entry points the binary calls, plus one
@@ -78,7 +78,7 @@ async fn spawn_server(config_path: &Path) -> (String, Arc<Server>) {
     (format!("http://{addr}"), server)
 }
 
-/// The full C14 acceptance path:
+/// The full acceptance path:
 /// 1. run a session to `completed` against the mock provider,
 /// 2. `replay` re-derives it: derived == live, invariants ok, and the
 ///    A2 check — every recorded `step/request` body is byte-identical

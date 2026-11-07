@@ -1,4 +1,4 @@
-//! Three-layer recovery (DESIGN §2.4, card C10) — A4/A5.
+//! Three-layer recovery (DESIGN §2.4) — A4/A5.
 //!
 //! Layer 1 (in-loop): a pure `classify` function mapping typed errors to
 //! [`ErrorClass`], a declarative policy table (`class → action`) parsed
@@ -124,7 +124,7 @@ pub struct ClassifyCtx {
 
 /// Classify one error (A4, layer 1). **Pure and total**: a synchronous
 /// function of its arguments only — any I/O inside `classify` is a
-/// defect (card C10 "never touch").
+/// defect ("never touch").
 #[must_use]
 pub fn classify(error: &RecoveryError, _ctx: &ClassifyCtx) -> ErrorClass {
     match error {
@@ -436,7 +436,7 @@ pub struct BudgetDenied {
 /// Token + wall-clock budget with refund semantics (A5): retries draw
 /// tokens down; unused tokens are refunded on demand and the unused
 /// remainder is *returned* on task completion (`settle`). Counters are
-/// observable for the C14 `recovery budget reset` command.
+/// observable for the `recovery budget reset` command.
 pub struct RecoveryBudget {
     limit_tokens: u64,
     deadline_ms: u64,
@@ -1105,7 +1105,7 @@ recovery:
     }
 
     /// The bare section (no `recovery:` wrapper) parses identically —
-    /// C13 may hand either shape.
+    /// may hand either shape.
     #[test]
     fn policy_section_parses_without_the_recovery_wrapper() {
         let bare = r#"
@@ -1177,7 +1177,7 @@ rules:
     }
 
     /// The compiled table IS the built-in `RecoveryPolicySource`
-    /// provider (DESIGN §6.2): usable as the seam trait object C13
+    /// provider (DESIGN §6.2): usable as the seam trait object
     /// wires into the plugin context.
     #[test]
     fn policy_table_is_a_recovery_policy_source() {
@@ -1483,7 +1483,7 @@ rules:
 
     /// `compress_then_retry` emits the observable `compact` event
     /// through the real event store BEFORE the prefix is invalidated
-    /// (constraint 3), and the C4 projection skips exactly `[a,b)`.
+    /// (constraint 3), and the projection skips exactly `[a,b)`.
     #[tokio::test]
     async fn compress_then_retry_emits_observable_compact_event_before_prefix_invalidation() {
         let path = temp_db_path();
@@ -1576,7 +1576,7 @@ rules:
             .expect("recovers");
         assert_eq!(result, "recovered");
 
-        // A3/C4: the projection skips exactly [1,4) — only the summary
+        // A3/: the projection skips exactly [1,4) — only the summary
         // message remains, from the compact event's payload.
         let events = store.rebuild(sid).await.expect("rebuild");
         assert_eq!(events[0].version, SCHEMA_VERSION);

@@ -1,4 +1,4 @@
-//! The env-gated live smoke (C54): `KIAN_DSH_BIN` absent → SKIP with
+//! The env-gated live smoke: `KIAN_DSH_BIN` absent → SKIP with
 //! a log line, never fail (rule 9 — default CI needs no dsh). Present
 //! → drive one real `dsh --profile sdk` child through the bridge; any
 //! outcome is asserted honest (a contract mismatch surfaces as the
@@ -128,11 +128,11 @@ fn smoke_ctx() -> Arc<SmokeCtx> {
 #[tokio::test]
 async fn live_dsh_smoke_env_gated() {
     let Ok(bin) = std::env::var("KIAN_DSH_BIN") else {
-        eprintln!("SKIP: KIAN_DSH_BIN not set — the live S6 run is env-gated (rule 9)");
+        eprintln!("SKIP: KIAN_DSH_BIN not set — the live dsh run is env-gated (rule 9)");
         return;
     };
     if bin.trim().is_empty() {
-        eprintln!("SKIP: KIAN_DSH_BIN empty — the live S6 run is env-gated (rule 9)");
+        eprintln!("SKIP: KIAN_DSH_BIN empty — the live dsh run is env-gated (rule 9)");
         return;
     }
     let _live = LIVE_LOCK.lock().unwrap();
@@ -170,7 +170,7 @@ async fn live_dsh_smoke_env_gated() {
     }
 }
 
-/// The S6 live positive (C59): `$KIAN_DSH_PEER` points at the contract-v0
+/// The live positive: `$KIAN_DSH_PEER` points at the contract-v0
 /// peer (`contrib/dsh-v0-peer/dsh-v0-peer.mjs`), the driver spawns it with
 /// the default `--profile sdk` args, and one real input rides kian → peer →
 /// dsh → the real DeepSeek model. The assertions are evidence-based, not
@@ -261,7 +261,7 @@ async fn live_dsh_peer_positive_env_gated() {
                 .find(|ev| ev.kind == EventKind::TurnEnd)
                 .map(|ev| ev.bytes.clone());
             if has(EventKind::AssistantMessage) {
-                // The full S6 live positive.
+                // The full live positive.
                 assert!(
                     has(EventKind::StepRequest),
                     "assistant/message arrived without the pre-flight step/request"

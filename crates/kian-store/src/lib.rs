@@ -4,7 +4,7 @@
 //! DESIGN §7 assigns this crate the key interfaces `append(carrying epoch,
 //! expected_seq)`, `scan`, `project`. It depends on [`kian_core`] only.
 //!
-//! Storage is dual-backend since C50: sqlite (WAL over a sqlx pool) and
+//! Storage is dual-backend since: sqlite (WAL over a sqlx pool) and
 //! postgres, dispatched by the [`event_store::EventStore`] enum with the
 //! same method names and signatures on both. sqlite access never blocks
 //! a tokio worker (AGENTS.md environment gotcha). Correctness lives in
@@ -19,7 +19,7 @@
 //! - [`inbox`] — durable input rows, claims/leases, replay source, startup
 //!   scan
 //! - [`wake`] — the postgres LISTEN/NOTIFY wake transport (advisory;
-//!   C52/ADR-009)
+//!   /ADR-009)
 //! - [`migrations`] — adjacent migration chains, one per backend (DESIGN
 //!   §3.3)
 

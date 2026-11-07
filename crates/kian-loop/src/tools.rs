@@ -1,6 +1,6 @@
-//! Built-in local `ToolProvider` + `ExecBackend` (card C11).
+//! Built-in local `ToolProvider` + `ExecBackend`.
 //!
-//! The Phase-1 built-in tool set is local fs + exec, confined to a root
+//! The built-in tool set is local fs + exec, confined to a root
 //! directory. Two disciplines are baked in:
 //!
 //! - **Log-before-execute** is enforced by the loop (it appends the
@@ -33,13 +33,13 @@ pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 const EXEC_POLL_MS: u64 = 5;
 
 // ---------------------------------------------------------------------------
-// LocalExecBackend (ExecBackend seam built-in, Phase 1 = local)
+// LocalExecBackend (ExecBackend seam built-in, local)
 // ---------------------------------------------------------------------------
 
 /// Local command execution via `spawn_blocking` (DESIGN §6.2 `ExecBackend`
-/// built-in). argv is executed directly — never a shell string.
+/// built-). argv is executed directly — never a shell string.
 ///
-/// kian-77 secret hygiene, applied at this (the only) local spawn site:
+/// secret hygiene, applied at this (the only) local spawn site:
 ///
 /// - **Environment**: [`ExecEnvPolicy`] bounds what the child inherits.
 ///   The default is today's full inheritance (the config-compat
@@ -75,7 +75,7 @@ impl LocalExecBackend {
         self
     }
 
-    /// Sets the child environment policy (kian-77). `Inherit` (the
+    /// Sets the child environment policy. `Inherit` (the
     /// default) keeps today's full-passthrough behavior.
     #[must_use]
     pub fn with_env_policy(mut self, policy: ExecEnvPolicy) -> Self {
@@ -83,7 +83,7 @@ impl LocalExecBackend {
         self
     }
 
-    /// Sets the output redactor (kian-77). The default is
+    /// Sets the output redactor. The default is
     /// patterns-only; assembly builds the full redactor from the
     /// configured secret env names.
     #[must_use]
@@ -137,7 +137,7 @@ fn run_blocking(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // kian-77: allowlist mode replaces the inherited environment with
+    // allowlist mode replaces the inherited environment with
     // the closed set (configured names + DRY_RUN); `None` (inherit)
     // leaves the spawn command's environment untouched.
     if let Some(child_env) = env_policy.resolve() {
@@ -174,9 +174,9 @@ fn run_blocking(
             }
         }
     }
-    // kian-77: the redaction pass runs before the result leaves the
+    // the redaction pass runs before the result leaves the
     // backend — every caller (tool/result event, transcript envelopes,
-    // retries) only ever sees scrubbed bytes. C69: the same pass now
+    // retries) only ever sees scrubbed bytes. The same pass now
     // emits its provenance report, merged across stdout/stderr and
     // carried on the result.
     let (stdout, stdout_report) = redactor.redact_with_report(&stdout_t.join());
@@ -233,7 +233,7 @@ impl ReaderThread {
 /// - `fs_read` — `{ "path": string }`
 /// - `fs_write` — `{ "path": string, "content": string }` (side-effecting)
 ///
-/// Tool names are dotless (kian-61): strict OpenAI-compatible endpoints
+/// Tool names are dotless: strict OpenAI-compatible endpoints
 /// validate `tools[n].function.name` against `^[a-zA-Z0-9_-]+$` and
 /// reject the pre-rename dotted spelling (`fs.list` et al.) with HTTP
 /// 400. The dotted legacy names are still ACCEPTED by [`ToolProvider::
@@ -241,7 +241,7 @@ impl ReaderThread {
 /// rename keep working when replayed.
 ///
 /// Tool schemas are exposed sorted by name — the request-body
-/// serialization freezes the `tools` array order (C8 contract), so the
+/// serialization freezes the `tools` array order (contract), so the
 /// built-in set must be deterministic.
 #[derive(Debug, Clone)]
 pub struct LocalTools {
@@ -268,7 +268,7 @@ impl LocalTools {
         self
     }
 
-    /// kian-77: sets the exec child environment policy (forwarded to
+    /// sets the exec child environment policy (forwarded to
     /// the inner [`LocalExecBackend`]).
     #[must_use]
     pub fn with_env_policy(mut self, policy: kian_core::secrets::ExecEnvPolicy) -> Self {
@@ -276,7 +276,7 @@ impl LocalTools {
         self
     }
 
-    /// kian-77: sets the exec output redactor (forwarded to the inner
+    /// sets the exec output redactor (forwarded to the inner
     /// [`LocalExecBackend`]).
     #[must_use]
     pub fn with_redactor(mut self, redactor: kian_core::secrets::SecretRedactor) -> Self {
@@ -373,7 +373,7 @@ impl ToolProvider for LocalTools {
         // only the I/O side goes to the blocking pool.
         let parsed: Result<ParsedCall, ToolError> = match call.name.as_str() {
             "exec" => parse_exec(&call.arguments).map(ParsedCall::Exec),
-            // Dotted legacy spellings (pre-kian-61 history) stay invocable
+            // Dotted legacy spellings (legacy history) stay invocable
             // but are never advertised in `schemas()`.
             "fs_list" | "fs.list" => parse_path_only(&call.arguments)
                 .and_then(confine)
@@ -390,7 +390,7 @@ impl ToolProvider for LocalTools {
         let root = self.root.clone();
         let exec = self.exec.clone();
         Box::pin(async move {
-            // C69: the exec arm carries the redaction provenance report
+            // the exec arm carries the redaction provenance report
             // from the backend onto the ToolResult (the loop copies it
             // into the `tool/result` payload); every other arm leaves
             // it empty (nothing was redacted).
@@ -467,10 +467,10 @@ enum ParsedCall {
 }
 
 // ---------------------------------------------------------------------------
-// FilteredTools (kian-61: config-filterable mounted surface)
+// FilteredTools (config-filterable mounted surface)
 // ---------------------------------------------------------------------------
 
-/// A config-driven allowlist over another [`ToolProvider`] (kian-61).
+/// A config-driven allowlist over another [`ToolProvider`].
 ///
 /// `AgentDef.tools` names the agent's mounted surface; this wrapper
 /// enforces it at the provider edge: schemas not in the list are hidden
@@ -479,7 +479,7 @@ enum ParsedCall {
 /// honest [`ToolError::InvalidCall`], never a silent passthrough.
 ///
 /// The wrapper is *narrow*: it only ever removes from the inner
-/// surface, so the caller-supplied schema order (the frozen C8 tools
+/// surface, so the caller-supplied schema order (the frozen tools
 /// array order) is preserved.
 #[derive(Clone)]
 pub struct FilteredTools {
@@ -655,7 +655,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// kian-61: pre-rename history carries the dotted spellings — they
+    /// pre-rename history carries the dotted spellings — they
     /// stay invocable (never advertised) so replayed sessions work.
     #[tokio::test]
     async fn dotted_legacy_tool_names_stay_invocable() {
@@ -781,7 +781,7 @@ mod tests {
         });
     }
 
-    /// kian-61 regression: strict OpenAI-compatible endpoints validate
+    /// regression: strict OpenAI-compatible endpoints validate
     /// `tools[n].function.name` against `^[a-zA-Z0-9_-]{1,64}$` and
     /// answer HTTP 400 otherwise (verified live against real DeepSeek).
     /// Every advertised built-in name must match.
@@ -824,9 +824,9 @@ mod tests {
         );
     }
 
-    // -- FilteredTools (kian-61) --------------------------------------------
+    // -- FilteredTools --------------------------------------------
 
-    // -- kian-77: exec secret hygiene (env allowlist + output redaction) --
+    // -- exec secret hygiene (env allowlist + output redaction) --
 
     /// SAFETY: each name is written by exactly one test with a constant
     /// value (idempotent re-writes); the names are unique to these
@@ -837,9 +837,9 @@ mod tests {
         }
     }
 
-    /// The G4 acceptance test: a worker that dumps its environment (or
+    /// The acceptance test: a worker that dumps its environment (or
     /// echoes a configured secret) must persist **no** configured secret
-    /// through the exec tool result — the exact live leak from the C65
+    /// through the exec tool result — the exact live leak from the
     /// run, now redacted at the tool edge before the result is emitted.
     #[tokio::test]
     async fn exec_env_dump_persists_no_configured_secret() {
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(res.stdout.trim(), "[REDACTED:token]");
     }
 
-    // -- C69: redaction provenance through the local exec path ---------
+    // -- redaction provenance through the local exec path ---------
 
     /// The local exec path carries the report on the ExecResult and on
     /// the ToolResult, while the model-visible `output` keeps exactly

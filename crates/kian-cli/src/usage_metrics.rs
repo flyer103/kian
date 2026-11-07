@@ -1,5 +1,5 @@
-//! Provider token-usage metrics (card C67) — a pure projection over
-//! `turn/end` events, patterned on `cache_metrics.rs` (C17).
+//! Provider token-usage metrics — a pure projection over
+//! `turn/end` events, patterned on `cache_metrics.rs`.
 //!
 //! The loop persists the provider's `usage` object **verbatim** on
 //! `turn/end` when observed (drain-activity, never context-bearing).
@@ -14,12 +14,12 @@
 //! openai-compat provider emits openai spellings; anthropic-style keys
 //! are accepted so future providers need no core change):
 //!
-//! | total                        | primary key                  | accepted alias                          |
+//! | total | primary key | accepted alias |
 //! |------------------------------|------------------------------|-----------------------------------------|
-//! | `input_tokens`               | `input_tokens`               | `prompt_tokens`                         |
-//! | `output_tokens`              | `output_tokens`              | `completion_tokens`                     |
-//! | `cache_read_input_tokens`    | `cache_read_input_tokens`    | `prompt_tokens_details.cached_tokens`   |
-//! | `cache_creation_input_tokens`| `cache_creation_input_tokens`| —                                       |
+//! | `input_tokens` | `input_tokens` | `prompt_tokens` |
+//! | `output_tokens` | `output_tokens` | `completion_tokens` |
+//! | `cache_read_input_tokens` | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
+//! | `cache_creation_input_tokens`| `cache_creation_input_tokens`| — |
 //!
 //! A `turn/end` whose usage object yields **none** of the four kinds is
 //! counted under `unknown_usage_requests` (still counted under
@@ -179,7 +179,7 @@ pub fn render_usage_stats(report: &UsageStatsReport) -> String {
 }
 
 /// Runs `kian usage-stats`: loads the config (fail-closed), opens the
-/// configured store read-only-in-intent, derives the C67 report and
+/// configured store read-only-in-intent, derives the report and
 /// renders it (human-readable, or JSON with `json = true`). Mirrors
 /// `run_cache_stats`. Returns the printed output so callers (tests)
 /// can assert on it.
@@ -190,7 +190,7 @@ pub async fn run_usage_stats(
 ) -> Result<String, String> {
     let config =
         crate::config::ServeConfig::load(config_path).map_err(|e| format!("config: {e}"))?;
-    // C51: the store follows the config's backend (read intent — no
+    // the store follows the config's backend (read intent — no
     // mutations happen here).
     let store = if config.storage.is_postgres() {
         let url_env = &config

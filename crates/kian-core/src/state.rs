@@ -6,7 +6,7 @@
 //! transition table [`transition`], and any stream the table rejects is a
 //! corruption, not a state.
 //!
-//! Trigger mapping and end-write semantics (C3 refinement, recorded in
+//! Trigger mapping and end-write semantics (refinement, recorded in
 //! DESIGN §2.2): `session/created` → create; `drain/claimed` → claim
 //! (also takeover: a second claim with no end write in between is the
 //! crash-recovery shape, and safety against true double-claims is the
@@ -15,7 +15,7 @@
 //! stream while `interrupted`/`failed` release ownership cleanly and
 //! return the session to `idle` (resumable via a new claim; the final end
 //! write records the final outcome); `input/admitted` and `thread/started`
-//! (C18) are state-preserving in `idle`/`running`/`recoverable`; every other
+//! are state-preserving in `idle`/`running`/`recoverable`; every other
 //! kind is drain activity, legal only while `running`. `recoverable` (lease
 //! expiry) and `archived` are transitions of the machine with no v0 event
 //! trigger.
@@ -72,7 +72,7 @@ pub enum TransitionTrigger {
     Archived,
     /// `input/admitted` — state-preserving.
     InputAdmitted,
-    /// `thread/started` (C18, Phase 2) — state-preserving in
+    /// `thread/started` (bundle) — state-preserving in
     /// `idle`/`running`/`recoverable`, mirroring `InputAdmitted`. The
     /// worker's stream records its delegation lineage after
     /// `session/created` but before the first `drain/claimed`; the
@@ -95,7 +95,7 @@ impl TransitionTrigger {
             EventKind::SessionEnded { reason } => Self::Ended(*reason),
             EventKind::InputAdmitted => Self::InputAdmitted,
             EventKind::ThreadStarted => Self::ThreadStarted,
-            // C68: the durable interrupt intent is drain activity — it
+            // the durable interrupt intent is drain activity — it
             // preserves `running` exactly like every other audit kind
             // the drain appends mid-episode.
             EventKind::ControlInterrupt => Self::DrainActivity,
@@ -156,7 +156,7 @@ pub enum ProjectionError {
 /// end write); running→idle (interrupted/failed end write: ownership
 /// released cleanly, session resumable); running→recoverable (lease
 /// expiry, non-event); idle/running→archived (ops action, non-event);
-/// `input/admitted` and `thread/started` (C18) preserve
+/// `input/admitted` and `thread/started` preserve
 /// idle/running/recoverable; drain activity preserves running only. Every
 /// other pair is [`IllegalTransition`].
 pub fn transition(
@@ -446,7 +446,7 @@ mod tests {
         Archived as Archive, Claimed, Created, DrainActivity, Ended, InputAdmitted, LeaseExpired,
     };
 
-    /// The additive C14 `recovery/budget-reset` kind is neutral: it maps
+    /// The additive `recovery/budget-reset` kind is neutral: it maps
     /// to no state transition and contributes no model-context message,
     /// so a stream containing it projects exactly like one without it
     /// (the event is the audit record, never a context mutation —
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(ctx_with.len(), 1, "exactly the one input message");
     }
 
-    /// The additive C68 `control/interrupt` kind is explicit drain
+    /// The additive `control/interrupt` kind is explicit drain
     /// activity: it maps to the state-preserving `DrainActivity`
     /// trigger (never a transition of its own — the *end write* is what
     /// settles an interrupt, constraint 4), and a stream containing it
@@ -588,7 +588,7 @@ mod tests {
 
     /// Exhaustive illegal-transition table: every pair outside the legal
     /// set is rejected with the named `IllegalTransition` error carrying
-    /// the offending from/on. Includes the card's examples: `idle→
+    /// the offending from/on. Includes the examples: `idle→
     /// completed`, `recoverable` entered from `idle`, `archived`/terminal
     /// states frozen, work events without a claim, events before create.
     #[test]
@@ -671,14 +671,14 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // C18 Phase-2 kinds: trigger mapping and projection behavior
+    // bundle kinds: trigger mapping and projection behavior
     // ------------------------------------------------------------------
 
     /// `thread/started` maps to its own state-preserving trigger; the
-    /// other three Phase-2 kinds map to drain activity via the
+    /// other three bundle kinds map to drain activity via the
     /// additions-only default.
     #[test]
-    fn trigger_mapping_for_phase2_kinds() {
+    fn trigger_mapping_for_bundle_kinds() {
         use super::TransitionTrigger as T;
         assert_eq!(
             TransitionTrigger::from_event_kind(&EventKind::ThreadStarted),
@@ -815,11 +815,11 @@ mod tests {
         );
     }
 
-    /// The other three Phase-2 kinds are drain activity by the
+    /// The other three bundle kinds are drain activity by the
     /// additions-only default: no ownership, no drain activity — they are
     /// rejected while `idle` (only legal mid-drain under a claim).
     #[test]
-    fn project_phase2_drain_activity_kinds_rejected_while_idle() {
+    fn project_bundle_drain_activity_kinds_rejected_while_idle() {
         for kind in [
             EventKind::ThreadCompleted,
             EventKind::EvidenceVerdict,
@@ -845,7 +845,7 @@ mod tests {
     /// worker-end shape completes: `thread/completed` is appended by the
     /// worker's own drain before its end write.
     #[test]
-    fn project_phase2_drain_activity_kinds_legal_mid_drain() {
+    fn project_bundle_drain_activity_kinds_legal_mid_drain() {
         let mut b = StreamBuilder::new(26);
         b.push(EventKind::SessionCreated)
             .claim()
@@ -860,7 +860,7 @@ mod tests {
         assert_eq!(project(&b.build()), Ok(Completed));
     }
 
-    /// C31: `input/spilled` maps to drain activity via the additions-only
+    /// `input/spilled` maps to drain activity via the additions-only
     /// default — it owns no trigger-table row (no state transition of its
     /// own; it rides the drain's consumption write).
     #[test]
@@ -872,7 +872,7 @@ mod tests {
         );
     }
 
-    /// The C31 spill shape: `input/spilled` is appended mid-drain by the
+    /// The spill shape: `input/spilled` is appended mid-drain by the
     /// consumption write right after its sibling `input/admitted` and
     /// the stream projects through to a terminal end.
     #[test]
@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(project(&b.build()), Ok(Completed));
     }
 
-    /// C16 semantics encoded early: an interrupted end is honest and
+    /// semantics encoded early: an interrupted end is honest and
     /// non-terminal; the session resumes via a new claim and the final
     /// end write records the final outcome.
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(project(&b.build()), Ok(Completed));
     }
 
-    /// A takeover claim with no end write in between is the S1
+    /// A takeover claim with no end write in between is the
     /// crash-recovery shape: the previous drain died mid-flight and a new
     /// drain re-claims. The store's epoch fence guarantees single
     /// ownership; the projection must not reject the recovered stream.
