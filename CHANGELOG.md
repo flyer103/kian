@@ -372,3 +372,38 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   Owner-gated next steps remain: making the repo public and executing the remaining gated
   surfaces with real credentials (live provider smoke, live lark channel). Tracked on the
   kanban board, not here.
+- **Read model P0 — versions, unchanged/delta reads, resumable SSE, drain context cache
+  (round 9, R9-02)** — default-green. The serving-form contract's first phase
+  (`design/READ-MODEL.md` §3/§4.1; API-CONTRACT §3.1/§3.2/§5 promoted from planned §5.3):
+  `projection` gains `version` (u64 = `head.next_seq - 1`) and the optional `since` —
+  `since == version` answers `{"version":V,"unchanged":true}` with no state and costs exactly
+  one seq-axis query (`EventStore::version`, a PK-index min/max lookup; `head`'s unindexed
+  `MAX(epoch)` aggregate would make it O(history)); `since > version` is `-32602`, never a
+  silent resync; the payload is always derived from one committed prefix (the scan's end bound
+  pins the version). SSE `kian` frames carry `id: <seq>`; a reconnect with `Last-Event-ID`
+  resumes after that seq without re-emitting the pre-resume prefix; ahead/non-numeric resume
+  ids are one `event: error` + close; a terminal stream resumed at head emits `done`
+  immediately; polling is tail-only (`kian_orchestrator::read::events_after`: one version
+  query + one bounded scan — never `rebuild()` per poll). `DrainCtx` keeps one committed-event
+  Vec per drain episode, tail-extended per iteration, with `compact` as the single
+  full-re-derivation point (R5); the returned Vec is byte-identical to `rebuild` (request
+  bytes untouched — cache-stability + golden-wire witnesses green, unchanged). SDK additive:
+  `projection_since`, `ProjectionVersioned`, optional `version` on `ProjectionResult`,
+  `SseFrame::KianWithId`, `events_from`; old fixtures still parse. Zero new event kinds;
+  migration chains untouched. Executed evidence: `version_unchanged_and_full_read_shapes`,
+  `ahead_and_empty_refusals`, `tail_delta_terminal_and_ahead` (kian-orchestrator read);
+  `drain_ctx_events_cache_equals_rebuild_across_self_and_foreign_appends`,
+  `compact_in_the_tail_forces_one_full_rederivation` (engine);
+  `version_reports_the_last_committed_seq` (kian-store);
+  `projection_version_unchanged_delta_and_ahead_e2e`,
+  `sse_ids_terminal_replay_and_resume_refusals_e2e`,
+  `sse_resume_across_reconnect_with_mid_session_append_e2e` (kian-cli e2e);
+  `projection_since_round_trips_golden_request_bytes`,
+  `sse_helper_carries_kian_ids_and_resumes_with_last_event_id`,
+  `parse_frame_carries_kian_ids_additively` (kian-sdk); chaos + cache-stability suites green.
+  Benchmark (`cargo bench -p kian-cli --bench read_path`, sqlite, criterion 0.5, M-series
+  laptop): unchanged read **17.2 µs flat** (1k events: 17.2 µs; 10k: 17.2 µs) vs changed read
+  870 µs → 8.7 ms (grows with history); SSE tail poll 36 µs idle / 40 µs with 5 new events —
+  flat across history — vs legacy full-rebuild poll 843 µs → 9.2 ms (≈250× the tail poll at
+  10k events). READ-MODEL §11 P0 `planned` → `landed`; DESIGN §3.2 pointer updated; docs-map
+  green.

@@ -20,6 +20,7 @@
 //! - [`recovery`] — three-layer recovery (DESIGN §2.4)
 pub mod engine;
 pub mod metrics;
+pub mod read;
 pub mod recovery;
 pub mod wake;
 
@@ -28,6 +29,7 @@ pub use engine::{
     SystemClock, WakeOutcome,
 };
 pub use metrics::{Metrics, MetricsSnapshot};
+pub use read::{EventTail, VersionedProjection};
 pub use recovery::{
     BudgetConfig, BudgetDenied, BudgetSnapshot, ClassifyCtx, CompactOutcome, ErrorClass,
     EscalationCause, GuardDecision, OneShotGuard, PolicyConfig, PolicyError, PolicyTable,

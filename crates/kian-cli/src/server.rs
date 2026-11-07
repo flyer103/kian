@@ -951,6 +951,70 @@ impl ControlPlane for Server {
             Ok(events)
         })
     }
+
+    fn projection_versioned(
+        &self,
+        session: SessionId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<crate::api::ProjectionRead, ControlError>> {
+        Box::pin(async move {
+            let read = self
+                .engine
+                .projection_versioned(session, since)
+                .await
+                .map_err(|e| match e {
+                    EngineError::SinceAhead {
+                        session,
+                        since,
+                        version,
+                    } => ControlError::SinceAhead {
+                        session,
+                        since,
+                        version,
+                    },
+                    EngineError::Projection(kian_core::state::ProjectionError::EmptyStream) => {
+                        ControlError::UnknownSession { session }
+                    }
+                    other => ControlError::Internal(format!("projection: {other}")),
+                })?;
+            Ok(crate::api::ProjectionRead {
+                version: read.version,
+                unchanged: read.unchanged,
+                state: read.state,
+            })
+        })
+    }
+
+    fn session_events_after(
+        &self,
+        session: SessionId,
+        after: u64,
+    ) -> BoxFuture<'_, Result<crate::api::EventTailRead, ControlError>> {
+        Box::pin(async move {
+            let tail = kian_orchestrator::read::events_after(&self.store, session, after)
+                .await
+                .map_err(|e| match e {
+                    EngineError::SinceAhead {
+                        session,
+                        since,
+                        version,
+                    } => ControlError::SinceAhead {
+                        session,
+                        since,
+                        version,
+                    },
+                    EngineError::Projection(kian_core::state::ProjectionError::EmptyStream) => {
+                        ControlError::UnknownSession { session }
+                    }
+                    other => ControlError::Internal(format!("events: {other}")),
+                })?;
+            Ok(crate::api::EventTailRead {
+                version: tail.version,
+                events: tail.events,
+                terminal: tail.terminal,
+            })
+        })
+    }
 }
 
 /// Maps engine/store failures onto `ControlError::Internal` with the

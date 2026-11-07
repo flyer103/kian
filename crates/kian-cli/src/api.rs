@@ -61,6 +61,48 @@ pub trait ControlPlane: Send + Sync {
     fn projection(&self, session: SessionId) -> BoxFuture<'_, Result<SessionState, ControlError>>;
     fn session_events(&self, session: SessionId)
     -> BoxFuture<'_, Result<Vec<Event>, ControlError>>;
+    /// READ-MODEL §3 (P0): the versioned projection read. `since` is
+    /// the caller's last version: equal to the current one answers
+    /// `unchanged` with no state and no scan beyond the head check.
+    fn projection_versioned(
+        &self,
+        session: SessionId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<ProjectionRead, ControlError>>;
+    /// READ-MODEL §4.1 (P0): the SSE tail read — events
+    /// `(after, head]` plus the head version and the terminal probe,
+    /// from one head query and one bounded scan (per-poll work is
+    /// O(new events), never O(history)).
+    fn session_events_after(
+        &self,
+        session: SessionId,
+        after: u64,
+    ) -> BoxFuture<'_, Result<EventTailRead, ControlError>>;
+}
+
+/// The versioned projection result (READ-MODEL §3). `unchanged`
+/// responses carry no state (R3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectionRead {
+    /// The committed prefix the payload was derived from
+    /// (`head.next_seq - 1`).
+    pub version: u64,
+    /// `since == version`: nothing changed, no state is carried.
+    pub unchanged: bool,
+    /// `Some(state)` iff `unchanged` is false.
+    pub state: Option<SessionState>,
+}
+
+/// One SSE tail read (READ-MODEL §4.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventTailRead {
+    /// The head version the read observed.
+    pub version: u64,
+    /// Exactly the events with `after < seq <= version`, seq order.
+    pub events: Vec<Event>,
+    /// The stream's last committed event is `session/ended` — the
+    /// SSE `done` condition.
+    pub terminal: bool,
 }
 
 /// Control-plane failures.
@@ -68,6 +110,14 @@ pub trait ControlPlane: Send + Sync {
 pub enum ControlError {
     #[error("unknown session {session:?}")]
     UnknownSession { session: SessionId },
+    /// READ-MODEL §3: `since` is ahead of the durable head — the
+    /// client is ahead or pointed at another store (`-32602`).
+    #[error("since {since} is ahead of session {session:?} version {version}")]
+    SinceAhead {
+        session: SessionId,
+        since: u64,
+        version: u64,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -142,6 +192,18 @@ fn control_err(e: ControlError) -> (i64, String) {
             CODE_UNKNOWN_SESSION,
             format!("unknown session {:?}", session.0),
         ),
+        ControlError::SinceAhead {
+            session,
+            since,
+            version,
+        } => (
+            CODE_INVALID_PARAMS,
+            format!(
+                "since {since} is ahead of session {:?} version {version} \
+                 (client ahead or another store)",
+                session.0
+            ),
+        ),
         ControlError::Internal(msg) => (CODE_INTERNAL, msg),
     }
 }
@@ -187,8 +249,21 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         }
         "projection" => {
             let session = session_params(params)?;
-            let state = state.plane.projection(session).await.map_err(control_err)?;
-            Ok(json!({"state": state}))
+            let since = since_param(params)?;
+            let read = state
+                .plane
+                .projection_versioned(session, since)
+                .await
+                .map_err(control_err)?;
+            if read.unchanged {
+                // READ-MODEL §3/R3: no state on the unchanged path.
+                Ok(json!({"version": read.version, "unchanged": true}))
+            } else {
+                Ok(json!({
+                    "version": read.version,
+                    "state": read.state.expect("a changed read carries state"),
+                }))
+            }
         }
         other => Err((
             CODE_METHOD_NOT_FOUND,
@@ -273,11 +348,41 @@ fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
     session_of(params)
 }
 
+/// The optional `projection.since` (READ-MODEL §3): absent → `None`;
+/// present it must be a u64 — anything else (including explicit
+/// `null`) is `-32602`, never silently treated as absent.
+fn since_param(params: &Value) -> Result<Option<u64>, (i64, String)> {
+    match params.get("since") {
+        None => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            (
+                CODE_INVALID_PARAMS,
+                "`since` must be a u64 (the caller's last version)".to_string(),
+            )
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SSE `events` (interval polling of the event stream)
 // ---------------------------------------------------------------------------
 
-async fn session_events_sse(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+/// One `event: error` frame then close (READ-MODEL §4.1: an invalid
+/// resume is an explicit error, never a silent restart).
+fn sse_error_stream(message: String) -> Response {
+    let stream = futures::stream::iter(vec![Ok::<_, Infallible>(
+        SseEvent::default().event("error").data(message),
+    )]);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn session_events_sse(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let Ok(uuid) = id.parse::<uuid::Uuid>() else {
         return (StatusCode::BAD_REQUEST, "session id must be a uuid").into_response();
     };
@@ -285,12 +390,30 @@ async fn session_events_sse(State(state): State<AppState>, Path(id): Path<String
     let plane = Arc::clone(&state.plane);
     let poll = Duration::from_millis(state.sse_poll_ms);
 
-    // Poll the event store every `poll` and emit events the client has
-    // not seen yet (seq strictly increases). The stream ends after the
-    // session/ended event — a terminal projection freezes the stream, so
-    // there is nothing more to observe.
+    // READ-MODEL §4.1: a reconnect with `Last-Event-ID: <seq>` resumes
+    // after that seq (frames before the resume point are never
+    // re-emitted). A non-numeric resume id is an explicit error frame
+    // followed by close.
+    let start = match headers.get("last-event-id").map(|v| v.to_str()) {
+        None => 0u64,
+        Some(Ok(raw)) => match raw.trim().parse::<u64>() {
+            Ok(seq) => seq,
+            Err(_) => {
+                return sse_error_stream(format!("Last-Event-ID `{raw}` is not a numeric seq"));
+            }
+        },
+        Some(Err(_)) => return sse_error_stream("Last-Event-ID is not valid UTF-8".into()),
+    };
+
+    // Poll the tail every `poll` and emit events the client has not
+    // seen yet (seq strictly increases; each frame carries `id: <seq>`
+    // so a reconnect can resume). The stream ends after the
+    // session/ended event — a terminal projection freezes the stream,
+    // so there is nothing more to observe. Per-poll work is the
+    // bounded tail read `(last, head]` (one head query + one scan) —
+    // never a full-stream rebuild.
     let stream = futures::stream::unfold(
-        (plane, session, 0u64, false),
+        (plane, session, start, false),
         move |(plane, session, mut last_seq, done)| {
             async move {
                 if done {
@@ -302,31 +425,35 @@ async fn session_events_sse(State(state): State<AppState>, Path(id): Path<String
                 let mut items: Vec<Result<SseEvent, Infallible>> = Vec::new();
                 let mut done_next = false;
                 loop {
-                    match plane.session_events(session).await {
+                    match plane.session_events_after(session, last_seq).await {
                         Err(e) => {
                             let (_, msg) = control_err(e);
                             items.push(Ok(SseEvent::default().event("error").data(msg)));
                             done_next = true;
                             break;
                         }
-                        Ok(events) => {
-                            let fresh: Vec<&Event> =
-                                events.iter().filter(|e| e.seq > last_seq).collect();
-                            if fresh.is_empty() {
+                        Ok(tail) => {
+                            if tail.events.is_empty() {
+                                if tail.terminal {
+                                    // At the head of a terminal stream
+                                    // (e.g. resumed at the end write):
+                                    // replayed, then done.
+                                    items.push(Ok(SseEvent::default().event("done").data("ended")));
+                                    done_next = true;
+                                    break;
+                                }
                                 // Nothing new: wait one interval, poll again.
                                 tokio::time::sleep(poll).await;
                                 continue;
                             }
-                            for e in fresh {
+                            for e in &tail.events {
                                 last_seq = e.seq;
                                 items.push(Ok(SseEvent::default()
                                     .event("kian")
+                                    .id(e.seq.to_string())
                                     .data(serde_json::to_string(e).unwrap_or_default())));
                             }
-                            let terminal = events.last().is_some_and(|e| {
-                                matches!(e.kind, kian_core::events::EventKind::SessionEnded { .. })
-                            });
-                            if terminal {
+                            if tail.terminal {
                                 items.push(Ok(SseEvent::default().event("done").data("ended")));
                                 done_next = true;
                             }

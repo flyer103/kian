@@ -41,8 +41,8 @@ struct Exchange {
 }
 
 /// Reads one full HTTP/1.1 request (headers + content-length body).
-/// Returns (request line, content-type, body).
-async fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+/// Returns (request line, content-type, body, full header block).
+async fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>, String) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -75,6 +75,7 @@ async fn read_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
         request_line,
         header("content-type"),
         buf[header_end..].to_vec(),
+        head,
     )
 }
 
@@ -85,7 +86,7 @@ async fn serve(listener: TcpListener, exchanges: Vec<Exchange>) -> tokio::task::
     tokio::spawn(async move {
         for ex in exchanges {
             let (mut sock, _) = listener.accept().await.expect("accept");
-            let (line, content_type, body) = read_request(&mut sock).await;
+            let (line, content_type, body, _head) = read_request(&mut sock).await;
             assert_eq!(line, ex.request_line, "golden route mismatch (wire freeze)");
             assert!(
                 content_type.starts_with("application/json"),
@@ -106,13 +107,42 @@ async fn serve(listener: TcpListener, exchanges: Vec<Exchange>) -> tokio::task::
     })
 }
 
-/// Serves one SSE stream: asserts the GET route, then writes raw frames
-/// and closes (close-delimited body).
+/// Serves one SSE stream: asserts the GET route (and, when given, the
+/// `Last-Event-ID` resume header), then writes raw frames and closes
+/// (close-delimited body).
 async fn serve_sse(listener: TcpListener, sid: &str, frames: String) {
+    serve_sse_resuming(listener, sid, frames, None).await
+}
+
+async fn serve_sse_resuming(
+    listener: TcpListener,
+    sid: &str,
+    frames: String,
+    expect_last_event_id: Option<&str>,
+) {
     let (mut sock, _) = listener.accept().await.expect("accept");
-    let (line, _ctype, body) = read_request(&mut sock).await;
+    let (line, _ctype, body, head) = read_request(&mut sock).await;
     assert_eq!(line, format!("GET /sessions/{sid}/events HTTP/1.1"));
     assert_eq!(body, Vec::<u8>::new(), "SSE GET carries no body");
+    let got_id = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("last-event-id")
+                .then(|| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    match expect_last_event_id {
+        Some(expected) => assert_eq!(
+            got_id, expected,
+            "the reconnect must send Last-Event-ID (READ-MODEL §4.1)"
+        ),
+        None => assert!(
+            got_id.is_empty(),
+            "a fresh `events()` connection must not send Last-Event-ID, got `{got_id}`"
+        ),
+    }
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
     sock.write_all(head.as_bytes()).await.unwrap();
     sock.write_all(frames.as_bytes()).await.unwrap();
@@ -238,6 +268,39 @@ async fn projection_round_trips_golden_request_bytes() {
     let out = KianClient::new(&base).projection(SID).await.expect("call");
     assert_eq!(out.state["phase"], "idle");
     assert_eq!(out.state["seq"], 7);
+    server.await.unwrap();
+}
+
+/// READ-MODEL §3 (P0): `projection_since` golden request bytes + the
+/// unchanged response shape (no state) and the changed shape.
+#[tokio::test]
+async fn projection_since_round_trips_golden_request_bytes() {
+    let (listener, base) = bind().await;
+    let server = serve(
+        listener,
+        vec![
+            Exchange {
+                request_line: "POST /rpc HTTP/1.1",
+                expect_body: fixture("projection_since_unchanged.request.json"),
+                respond_with: fixture("projection_since_unchanged.response.json"),
+            },
+            Exchange {
+                request_line: "POST /rpc HTTP/1.1",
+                expect_body: fixture("projection_since_changed.request.json"),
+                respond_with: fixture("projection_since_changed.response.json"),
+            },
+        ],
+    )
+    .await;
+    let client = KianClient::new(&base);
+    let unchanged = client.projection_since(SID, 7).await.expect("unchanged");
+    assert_eq!(unchanged.version, 7);
+    assert!(unchanged.unchanged);
+    assert_eq!(unchanged.state, None, "R3: no state on the unchanged path");
+    let changed = client.projection_since(SID, 4).await.expect("changed");
+    assert_eq!(changed.version, 7);
+    assert!(!changed.unchanged);
+    assert_eq!(changed.state.as_ref().unwrap()["seq"], 7);
     server.await.unwrap();
 }
 
@@ -426,6 +489,66 @@ async fn sse_helper_frames_kian_done_and_error_per_c13() {
         .expect("frame");
     server.await.unwrap();
     assert_eq!(item, SseFrame::Error("unknown session".into()));
+}
+
+/// READ-MODEL §4.1 (P0): `kian` frames carrying `id: <seq>` parse as
+/// `KianWithId`, and a reconnect via `events_from` sends
+/// `Last-Event-ID` on the wire (asserted byte-level server-side).
+#[tokio::test]
+async fn sse_helper_carries_kian_ids_and_resumes_with_last_event_id() {
+    // A stream whose kian frames carry ids.
+    let (listener, base) = bind().await;
+    let stream = format!(
+        "event: kian\nid: 1\ndata: {{\"seq\":1,\"kind\":\"session/created\",\"session\":\"{SID}\"}}\n\n\
+         event: kian\nid: 2\ndata: {{\"seq\":2,\"kind\":\"session/ended\",\"session\":\"{SID}\"}}\n\n\
+         event: done\ndata: ended\n\n"
+    );
+    let server = tokio::spawn(serve_sse(listener, SID, stream));
+    let client = KianClient::new(&base);
+    let mut frames = client.events(SID).await.expect("sse open");
+    let first = tokio::time::timeout(Duration::from_secs(5), frames.next())
+        .await
+        .expect("sse frame timeout")
+        .expect("stream ended early")
+        .expect("frame");
+    // Drain the rest so the scripted server completes.
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(5), frames.next())
+        .await
+        .expect("sse frame timeout")
+    {
+        if matches!(item.expect("frame"), SseFrame::Done) {
+            break;
+        }
+    }
+    server.await.unwrap();
+    match first {
+        SseFrame::KianWithId { id, data } => {
+            assert_eq!(id, 1);
+            assert_eq!(data["seq"], 1);
+        }
+        other => panic!("expected KianWithId, got {other:?}"),
+    }
+
+    // The reconnect: `events_from(2)` must send `Last-Event-ID: 2` and
+    // receive only events after seq 2 (here: the terminal done).
+    let (listener, base) = bind().await;
+    let server = tokio::spawn(serve_sse_resuming(
+        listener,
+        SID,
+        "event: done\ndata: ended\n\n".to_string(),
+        Some("2"),
+    ));
+    let mut frames = KianClient::new(&base)
+        .events_from(SID, 2)
+        .await
+        .expect("sse open");
+    let item = tokio::time::timeout(Duration::from_secs(5), frames.next())
+        .await
+        .expect("sse frame timeout")
+        .expect("stream ended before done")
+        .expect("frame");
+    server.await.unwrap();
+    assert_eq!(item, SseFrame::Done);
 }
 
 // ---------------------------------------------------------------------------

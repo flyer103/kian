@@ -147,6 +147,17 @@ pub enum EngineError {
     NotAtSafeBoundary { session: SessionId },
     #[error("append retry budget exhausted for {session:?}")]
     AppendRetryExhausted { session: SessionId },
+    /// READ-MODEL §3: the caller's `since` is ahead of the durable
+    /// head — the client is ahead or pointed at another store. An
+    /// explicit refusal, never a silent resync.
+    #[error(
+        "since {since} is ahead of session {session:?} version {version} (client ahead or another store)"
+    )]
+    SinceAhead {
+        session: SessionId,
+        since: u64,
+        version: u64,
+    },
 }
 
 /// What a [`Engine::wake`] call did.
@@ -222,6 +233,12 @@ struct DrainCtxCore {
     seq: AtomicU64,
     /// True while a provider turn is in flight (promote boundary gate).
     in_turn: AtomicBool,
+    /// The drain's committed-event cache (READ-MODEL §3, P0): the one
+    /// event Vec this episode derives from, tail-extended by
+    /// [`DrainCtx::events`]. Disposable by construction — every entry
+    /// is a committed stream event and a full re-derivation is always
+    /// one `rebuild` away (R1: the stream stays the truth).
+    events: tokio::sync::Mutex<Vec<Event>>,
     /// The drain's interrupt flag. Shared with the engine's
     /// `DrainHandle` when the ctx is built by `drain_episode`, so a
     /// consumed current-epoch control row and an `interrupt` RPC flip
@@ -413,6 +430,7 @@ impl DrainCtx {
                 epoch,
                 seq: AtomicU64::new(head.next_seq),
                 in_turn: AtomicBool::new(false),
+                events: tokio::sync::Mutex::new(Vec::new()),
                 interrupt,
                 clock,
                 metrics,
@@ -484,8 +502,53 @@ impl DrainCtx {
     /// derives its model context from (the event log is the sole truth,
     /// constraint 1; the loop is a passenger and never mutates
     /// projections).
+    ///
+    /// READ-MODEL §3 (P0): the drain keeps ONE committed-event Vec per
+    /// episode; each call extends it with only the events committed
+    /// since the last — a bounded tail scan, never a full `rebuild`
+    /// per loop iteration (per-poll work is O(new events)). A
+    /// `compact` event in the tail is the single deliberate
+    /// invalidation point (constraint 3 / R5): the cache is dropped
+    /// and re-derived from the stream once, in full. Event bytes are
+    /// never rewritten, reordered or reformatted here — the returned
+    /// Vec is byte-identical to a fresh `rebuild` (the cache-stability
+    /// witness suites pin the derived request bytes).
     pub async fn events(&self) -> Result<Vec<Event>, EngineError> {
-        Ok(self.core.store.rebuild(self.core.session).await?)
+        let mut cache = self.core.events.lock().await;
+        // The seq axis alone: this refresh must stay cheap at any
+        // history size (the epoch-floor aggregate of `head` is not
+        // needed for reads).
+        let version = self.core.store.version(self.core.session).await?;
+        match cache.last().map(|e| e.seq) {
+            // Up to date: one version query, no scan (R3's fast path).
+            Some(seq) if version == seq => {}
+            // The durable head behind the cache: the stream cannot
+            // legitimately shrink. Treat as skew and re-derive in full —
+            // honesty over cleverness (never serve a skew as truth).
+            Some(seq) if version < seq => {
+                *cache = self.core.store.rebuild(self.core.session).await?;
+            }
+            _ => {
+                let start = cache.last().map(|e| e.seq + 1).unwrap_or(0);
+                let fresh = self
+                    .core
+                    .store
+                    .scan(self.core.session, start..version + 1)
+                    .await?;
+                if fresh.iter().any(|e| matches!(e.kind, EventKind::Compact)) {
+                    // R5: compact is the ONLY deliberate invalidation
+                    // point — one full re-derivation from the stream.
+                    *cache = self.core.store.rebuild(self.core.session).await?;
+                } else if fresh.first().is_none_or(|e| e.seq == start) {
+                    cache.extend(fresh);
+                } else {
+                    // A non-contiguous tail (store bug or reset):
+                    // re-derive rather than append a gap.
+                    *cache = self.core.store.rebuild(self.core.session).await?;
+                }
+            }
+        }
+        Ok(cache.clone())
     }
 
     /// Takes every eligible input at this safe boundary: appends the
@@ -630,7 +693,7 @@ impl DrainCtx {
         if target == self.core.epoch.0 {
             return Ok(false); // targets this drain's own claim
         }
-        let events = self.core.store.rebuild(self.core.session).await?;
+        let events = self.events().await?;
         Ok(events
             .iter()
             .any(|e| matches!(e.kind, EventKind::SessionEnded { .. }) && e.epoch.0 == target))
@@ -787,13 +850,27 @@ where
     }
 
     /// Projects the session from its event stream (constraint 1: state
-    /// is only ever read here, never cached).
+    /// is only ever read here, never cached). Equivalent to
+    /// [`Engine::projection_versioned`] with no `since`.
     pub async fn projection(&self, session: SessionId) -> Result<SessionState, EngineError> {
-        let events = self.store.rebuild(session).await?;
-        if events.is_empty() {
-            return Err(kian_core::state::ProjectionError::EmptyStream.into());
-        }
-        Ok(project(&events)?)
+        let read = self.projection_versioned(session, None).await?;
+        Ok(read
+            .state
+            .expect("a changed versioned read always carries state"))
+    }
+
+    /// The versioned projection read (READ-MODEL §3, P0): `version`
+    /// is the last committed seq (`head.next_seq - 1`); `since ==
+    /// version` answers `unchanged` with no state and no scan beyond
+    /// the head check; `since > version` is
+    /// [`EngineError::SinceAhead`]. Delegates to
+    /// [`crate::read::versioned_projection`].
+    pub async fn projection_versioned(
+        &self,
+        session: SessionId,
+        since: Option<u64>,
+    ) -> Result<crate::read::VersionedProjection, EngineError> {
+        crate::read::versioned_projection(&self.store, session, since).await
     }
 
     /// Admits one input: **durable row first**, then wake (constraint
@@ -3774,5 +3851,128 @@ mod tests {
         store.close().await;
         pg_finish(&admin, &url).await;
         admin.close().await;
+    }
+
+    // -- READ-MODEL P0: the DrainCtx committed-event cache ---------------
+
+    /// Builds a raw event and appends it straight to the store (the
+    /// "foreign writer" path — same epoch, lawful CAS).
+    async fn raw_append(store: &EventStore, sid: SessionId, seq: u64, kind: EventKind) {
+        let event = Event {
+            seq,
+            session: sid,
+            epoch: Epoch(1),
+            ts: T0 + seq,
+            kind,
+            bytes: json!({ "n": seq }),
+            version: SCHEMA_VERSION,
+        };
+        store
+            .append(
+                sid,
+                event,
+                AppendGuard {
+                    epoch: Epoch(1),
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("raw append");
+    }
+
+    /// The cache is transparent: across self-appends, foreign appends
+    /// and repeated reads, `ctx.events()` equals a fresh full rebuild
+    /// byte-for-byte (the cache can never serve a skew).
+    #[tokio::test]
+    async fn drain_ctx_events_cache_equals_rebuild_across_self_and_foreign_appends() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        raw_append(&store, sid, 1, EventKind::SessionCreated).await;
+
+        let ctx = DrainCtx::new(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+
+        // First read: full (the cache starts empty) — and equals rebuild.
+        assert_eq!(
+            ctx.events().await.unwrap(),
+            store.rebuild(sid).await.unwrap()
+        );
+
+        // Self-appends land; the tail refresh picks them up.
+        ctx.append(EventKind::DrainClaimed, json!({}))
+            .await
+            .unwrap();
+        ctx.begin_turn().await.unwrap();
+        assert_eq!(
+            ctx.events().await.unwrap(),
+            store.rebuild(sid).await.unwrap()
+        );
+
+        // A foreign append (same epoch, straight to the store) is seen
+        // by the next tail scan — the cache tracks the stream, not just
+        // this ctx's own writes.
+        raw_append(&store, sid, 4, EventKind::AssistantMessage).await;
+        assert_eq!(
+            ctx.events().await.unwrap(),
+            store.rebuild(sid).await.unwrap()
+        );
+
+        // Repeated reads with nothing new are stable.
+        assert_eq!(
+            ctx.events().await.unwrap(),
+            store.rebuild(sid).await.unwrap()
+        );
+
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A `compact` event in the tail forces exactly one full
+    /// re-derivation (R5's single invalidation point): the cache is
+    /// rebuilt from the stream, still byte-identical to `rebuild`, and
+    /// reads after it return to tail-only work.
+    #[tokio::test]
+    async fn compact_in_the_tail_forces_one_full_rederivation() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        raw_append(&store, sid, 1, EventKind::SessionCreated).await;
+        let ctx = DrainCtx::new(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+        ctx.append(EventKind::DrainClaimed, json!({}))
+            .await
+            .unwrap();
+        // Warm the cache.
+        assert_eq!(ctx.events().await.unwrap().len(), 2);
+
+        // The compaction lands (as recovery would append it).
+        raw_append(&store, sid, 3, EventKind::Compact).await;
+        let events = ctx.events().await.unwrap();
+        assert_eq!(events, store.rebuild(sid).await.unwrap());
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[2].kind, EventKind::Compact));
+
+        // Post-compact reads are ordinary tail reads again.
+        raw_append(&store, sid, 4, EventKind::AssistantMessage).await;
+        assert_eq!(
+            ctx.events().await.unwrap(),
+            store.rebuild(sid).await.unwrap()
+        );
+
+        store.close().await;
+        cleanup(&path);
     }
 }

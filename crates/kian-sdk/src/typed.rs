@@ -38,10 +38,33 @@ pub struct InterruptResult {
 /// `projection` → `{"state": <projection JSON>}`. The state is the
 /// server's projection object; the SDK keeps it as parsed JSON because
 /// the projection shape belongs to the server's version, not the wire
-/// method.
+/// method. `version` is present on read-model servers (READ-MODEL
+/// §3) and absent on older ones — additive.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProjectionResult {
     pub state: Value,
+    /// Last committed seq the state was derived from (READ-MODEL §3;
+    /// `None` on pre-read-model servers).
+    #[serde(default)]
+    pub version: Option<u64>,
+}
+
+/// `projection` with `since` (READ-MODEL §3) → the versioned read:
+/// `since == version` answers `{"version":..,"unchanged":true}`
+/// with **no** state; any other (older) `since` answers the full
+/// `{"version":..,"state":..}`. `since > version` is an RPC error
+/// (`-32602`, the client is ahead or pointed at another store).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ProjectionVersioned {
+    /// The committed prefix the payload was derived from.
+    pub version: u64,
+    /// `true` iff nothing changed since the caller's `since` — no
+    /// state is carried then.
+    #[serde(default)]
+    pub unchanged: bool,
+    /// `Some(state)` iff `unchanged` is false.
+    #[serde(default)]
+    pub state: Option<Value>,
 }
 
 /// `wake_now` outcome: a drain was spawned, or the wake folded onto an
@@ -141,6 +164,20 @@ impl KianClient {
     /// Control plane: read the session's projection.
     pub async fn projection(&self, session: &str) -> Result<ProjectionResult, ClientError> {
         let result = self.rpc("projection", json!({"session": session})).await?;
+        Self::parse(result)
+    }
+
+    /// Control plane: the versioned projection read (READ-MODEL §3) —
+    /// presents the caller's last version; an unchanged answer costs
+    /// one version check and carries no state.
+    pub async fn projection_since(
+        &self,
+        session: &str,
+        since: u64,
+    ) -> Result<ProjectionVersioned, ClientError> {
+        let result = self
+            .rpc("projection", json!({"session": session, "since": since}))
+            .await?;
         Self::parse(result)
     }
 

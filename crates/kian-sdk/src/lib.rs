@@ -39,5 +39,5 @@ pub use sse::SseFrame;
 pub use transport::KianClient;
 pub use typed::{
     CreateSessionResult, InputAck, InterruptResult, MockSendReceipt, ProjectionResult,
-    ResetReceipt, WakeOutcome,
+    ProjectionVersioned, ResetReceipt, WakeOutcome,
 };

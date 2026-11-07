@@ -449,10 +449,15 @@ creation-time `input/admitted` with `synthetic:true`, appended before the first 
 a frozen renderer and hard caps — so the injected index joins the shared prefix instead of rewriting
 a live session's context. Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
 
-**Serving-form acceleration (READ-MODEL, proposed)**: projection reads, event streams and the
+**Serving-form acceleration (READ-MODEL, P0 landed)**: projection reads, event streams and the
 model context MAY be served from versioned caches, snapshots and materialized views. They are
 disposable, verified against the stream, and never an alternative truth; `compact` remains the
 only deliberate cache-invalidation point (constraint 3). Contract: `design/READ-MODEL.md`.
+Landed in P0: `projection` versioned/unchanged reads, SSE `id:` + `Last-Event-ID` resume with
+tail-only polls, and the per-drain committed-event cache in `DrainCtx` — one event Vec per drain
+episode, tail-extended per iteration, fully re-derived only on a `compact` event (the single
+invalidation point; the returned Vec is byte-identical to a fresh rebuild, so model request bytes
+are untouched).
 
 **The loop conventions (built-in ReAct loop, frozen after merge, additions-only)**: the built-in
 loop (kian-loop) is a passenger inside the drain — it interacts with the engine only through the

@@ -116,7 +116,7 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 | `steer` | same as `submit` | `{"deduplicated":<bool>}` |
 | `queue` | same as `submit` | `{"deduplicated":<bool>}` |
 | `interrupt` | `{"session":"<uuid>"}` | `{"outcome":"requested" \| "not_draining"}` |
-| `projection` | `{"session":"<uuid>"}` | `{"state":"<see §2.3>"}` |
+| `projection` | `{"session":"<uuid>","since":<u64>?}` | `{"version":<u64>,"state":"<see §2.3>"}` or `{"version":<u64>,"unchanged":true}` |
 
 ### 3.2 Semantics
 
@@ -134,8 +134,15 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   `control/interrupt` event, so the intent survives a drain crash and crosses replicas.
   `requested` = an abort may be settled; `not_draining` = nothing was in flight (an honest no-op).
   An interrupted result is never reported as `completed`.
-- `projection` reads the stream and returns the pure projection state. A session with no events is
-  `-32001`.
+- `projection` reads the stream and returns the pure projection state plus `version` — the last
+  committed seq (`head.next_seq - 1`, READ-MODEL §3). The optional `since` (u64) carries the
+  caller's last version: `since == version` returns `{"version":V,"unchanged":true}` with **no**
+  state (the read costs one version check, no stream scan); any older value returns the full
+  `{"version":V,"state":…}`. `since > version` is `-32602` (the client is ahead or pointed at
+  another store — an explicit refusal, never a silent resync); a non-u64 `since` (including
+  explicit `null`) is likewise `-32602`. A session with no events is `-32001` either way. The
+  payload is always derived from one committed prefix (READ-MODEL R2: a concurrent append may
+  make an answer stale, never mixed).
 
 ### 3.3 Errors
 
@@ -197,7 +204,7 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 ## 5. Event stream — `GET /sessions/{id}/events`
 
 Server-sent events over `text/event-stream`. This is a bounded audit/observability view of one
-session's durable stream, not a resumable subscription.
+session's durable stream, resumable per connection via `Last-Event-ID` (READ-MODEL §4.1).
 
 ### 5.1 Frames
 
@@ -207,8 +214,11 @@ session's durable stream, not a resumable subscription.
 | `event: done` | `ended` | The stream is closing; sent after the first `session/ended` event observed |
 | `event: error` | The error message (plain text) | The stream is closing due to a read failure or unknown session |
 
+- Every `event: kian` frame carries `id: <seq>` (READ-MODEL §4.1) — the value to send back as
+  `Last-Event-ID` on reconnect.
 - The stream is interval-polled server-side; the cadence is `sse.poll_interval_ms` (default 100 ms).
   Polling cadence is not part of the contract — clients must not derive ordering or timing from it.
+  Each poll is a tail-only read of the new events (O(new events), never a full-history rebuild).
 - Implementations may emit SSE comment keep-alives; clients must ignore comment lines.
 - The path `id` must be a UUID; a malformed id is an HTTP 400 with a plain-text body (not a JSON-RPC
   envelope).
@@ -218,20 +228,23 @@ session's durable stream, not a resumable subscription.
 The stream closes after the first `session/ended` event, whatever its reason. Terminal ends
 (`completed`, `cancelled`) freeze the projection. An `interrupted`/`failed` end is state-preserving
 (`running → idle`), so a resumed session appends later events; those are observed on a **new
-connection**. A client that needs to follow a resumable session must reconnect.
+connection**.
 
-### 5.3 Planned: read-model surface (READ-MODEL P0/P3)
+Resumption (READ-MODEL §4.1): a reconnect may send `Last-Event-ID: <seq>`; the server resumes at
+`seq + 1` and never re-emits frames at or before the resume point on that connection. A resume id
+that is ahead of the durable head, not a number, or inside an archived range is one explicit
+`event: error` frame followed by close — never a silent restart or truncation. A terminal stream
+replays its remaining events and closes with `done`; a connection resumed at the terminal head
+emits `done` immediately.
+
+### 5.3 Planned: read-model surface (READ-MODEL P2b/P3)
 
 > Planned additive surface. Each item lands with the READ-MODEL phase that implements it; until
 > then v0 behavior above is normative and nothing here is callable. Semantics are owned by
-> [READ-MODEL.md](READ-MODEL.md); this file only fixes wire shapes.
+> [READ-MODEL.md](READ-MODEL.md); this file only fixes wire shapes. The P0 items (projection
+> `version`/`since`/`unchanged`, SSE `id:` + `Last-Event-ID` resume) have landed and are normative
+> in §3.1/§3.2 and §5.1/§5.2 above.
 
-- `projection` result gains `version` (u64 = last committed seq). Optional request field `since`
-  (u64): `since == version` returns `{"version":<u64>,"unchanged":true}` with no `state`; any
-  other value returns `{"version":<u64>,"state":"<see §2.3>"}`. `since > version` is `-32602`.
-- `GET /sessions/{id}/events`: `event: kian` frames gain `id: <seq>`. A reconnect with
-  `Last-Event-ID: <seq>` resumes after that seq. A resume id ahead of head, non-numeric, or inside
-  an archived range is `event: error` + close. Terminal streams replay then close with `done`.
 - Planned fan-in (P3, OSS): `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`, tail-only (no
   resume), explicit allowlist of at most 64 sessions, `id: <uuid>:<seq>`, no wildcard, HTTP 400
   on malformed/over-cap; an unknown listed session emits one `event: error` naming it and the

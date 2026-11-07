@@ -18,8 +18,16 @@ use crate::transport::KianClient;
 /// One parsed frame of the SSE event stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SseFrame {
-    /// `event: kian` — one session event (`data` is its JSON).
+    /// `event: kian` — one session event (`data` is its JSON). Servers
+    /// that do not set the SSE `id` field (pre-read-model) yield this
+    /// variant.
     Kian(Value),
+    /// `event: kian` with `id: <seq>` (READ-MODEL §4.1): one session
+    /// event and its seq — the value to send back as `Last-Event-ID`
+    /// on reconnect. Additive: a server always emitting ids yields
+    /// only this variant; one never emitting ids yields only
+    /// [`SseFrame::Kian`].
+    KianWithId { id: u64, data: Value },
     /// `event: done` — the terminal event was observed; the stream is
     /// complete.
     Done,
@@ -29,9 +37,9 @@ pub enum SseFrame {
 }
 
 impl KianClient {
-    /// Opens the SSE event stream for a session and yields parsed
-    /// frames until the server closes the stream (after `done` or
-    /// `error`). Transport failures mid-stream surface as
+    /// Opens the SSE event stream for a session from the beginning and
+    /// yields parsed frames until the server closes the stream (after
+    /// `done` or `error`). Transport failures mid-stream surface as
     /// [`ClientError::Http`] items; a frame with an unknown event name
     /// or unparseable `kian` data is [`ClientError::Malformed`] — never
     /// a silent drop.
@@ -40,11 +48,35 @@ impl KianClient {
         session: &str,
     ) -> Result<impl Stream<Item = Result<SseFrame, ClientError>> + Send + 'static, ClientError>
     {
+        self.events_impl(session, None).await
+    }
+
+    /// [`KianClient::events`] resuming after `last_event_id` (READ-MODEL
+    /// §4.1): sends `Last-Event-ID: <seq>`; the server emits only
+    /// events with `seq > last_event_id` — frames before the resume
+    /// point are never re-delivered. A resume id ahead of the durable
+    /// head yields one [`SseFrame::Error`] and closes.
+    pub async fn events_from(
+        &self,
+        session: &str,
+        last_event_id: u64,
+    ) -> Result<impl Stream<Item = Result<SseFrame, ClientError>> + Send + 'static, ClientError>
+    {
+        self.events_impl(session, Some(last_event_id)).await
+    }
+
+    async fn events_impl(
+        &self,
+        session: &str,
+        last_event_id: Option<u64>,
+    ) -> Result<impl Stream<Item = Result<SseFrame, ClientError>> + Send + 'static, ClientError>
+    {
         let url = format!("{}/sessions/{session}/events", self.base);
-        let resp = self
-            .http
-            .get(&url)
-            .header("accept", "text/event-stream")
+        let mut request = self.http.get(&url).header("accept", "text/event-stream");
+        if let Some(id) = last_event_id {
+            request = request.header("last-event-id", id.to_string());
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| ClientError::Http(format!("{url}: {e}")))?;
@@ -123,11 +155,15 @@ fn frame_boundary(buf: &[u8]) -> Option<usize> {
 
 /// Parses one raw frame. `Ok(None)` = comment/keep-alive (no fields);
 /// `Err` = a named frame the contract does not know, or `kian` data
-/// that is not JSON.
+/// that is not JSON. A `kian` frame carrying `id: <seq>` (READ-MODEL
+/// §4.1) parses as [`SseFrame::KianWithId`]; a non-numeric `id` on a
+/// `kian` frame is [`ClientError::Malformed`] (the id is contract
+/// data, not decoration — never a silent drop).
 fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
     let text = String::from_utf8_lossy(raw);
     let mut event: Option<String> = None;
     let mut data = String::new();
+    let mut id: Option<String> = None;
     let mut saw_field = false;
     for line in text.split('\n') {
         let line = line.trim_end_matches('\r');
@@ -150,8 +186,14 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
                 data.push_str(value);
                 saw_field = true;
             }
-            // `id:` / `retry:` and any future field are not part of the
-            // contract; ignoring them is additive-safe.
+            // READ-MODEL §4.1: `id` on a `kian` frame is the seq
+            // (carried into `KianWithId`); on `done`/`error` it is
+            // not part of the contract and ignored. `retry:` and any
+            // future field stay additive-safe.
+            "id" => {
+                id = Some(value.to_owned());
+                saw_field = true;
+            }
             _ => {}
         }
     }
@@ -163,10 +205,21 @@ fn parse_frame(raw: &[u8]) -> Result<Option<SseFrame>, ClientError> {
         return Ok(None);
     };
     match event.as_str() {
-        "kian" => serde_json::from_str(&data)
-            .map(SseFrame::Kian)
-            .map(Some)
-            .map_err(|e| ClientError::Malformed(format!("kian frame data is not JSON: {e}"))),
+        "kian" => {
+            let data: Value = serde_json::from_str(&data)
+                .map_err(|e| ClientError::Malformed(format!("kian frame data is not JSON: {e}")))?;
+            match id {
+                None => Ok(Some(SseFrame::Kian(data))),
+                Some(raw) => {
+                    let id = raw.parse::<u64>().map_err(|_| {
+                        ClientError::Malformed(format!(
+                            "kian frame id `{raw}` is not a numeric seq"
+                        ))
+                    })?;
+                    Ok(Some(SseFrame::KianWithId { id, data }))
+                }
+            }
+        }
         "done" => Ok(Some(SseFrame::Done)),
         "error" => Ok(Some(SseFrame::Error(data))),
         other => Err(ClientError::Malformed(format!(
@@ -215,5 +268,41 @@ mod tests {
 
         // Data-only frame (default event) is not — skipped.
         assert_eq!(parse_frame(b"data: hello\n\n").ok(), Some(None));
+    }
+
+    /// READ-MODEL §4.1: a `kian` frame with `id: <seq>` parses as
+    /// `KianWithId` (id + data); the id-less spelling still parses as
+    /// `Kian` (old servers, old fixtures); a non-numeric id on a kian
+    /// frame is an honest Malformed error; `done` with an id stays
+    /// `Done`.
+    #[test]
+    fn parse_frame_carries_kian_ids_additively() {
+        assert_eq!(
+            parse_frame(b"event: kian\nid: 42\ndata: {\"seq\":42}\n\n").unwrap(),
+            Some(SseFrame::KianWithId {
+                id: 42,
+                data: serde_json::json!({"seq": 42})
+            })
+        );
+        // `id:42` without the space is legal SSE.
+        assert_eq!(
+            parse_frame(b"event: kian\nid:42\ndata: {\"seq\":42}\n\n").unwrap(),
+            Some(SseFrame::KianWithId {
+                id: 42,
+                data: serde_json::json!({"seq": 42})
+            })
+        );
+        // Old servers / old fixtures: no id line.
+        assert!(matches!(
+            parse_frame(b"event: kian\ndata: {\"seq\":1}\n\n").unwrap(),
+            Some(SseFrame::Kian(_))
+        ));
+        // A non-numeric id is contract data gone wrong — never silent.
+        assert!(parse_frame(b"event: kian\nid: abc\ndata: {\"seq\":1}\n\n").is_err());
+        // `done`/`error` ignore an id (not part of their contract).
+        assert_eq!(
+            parse_frame(b"id: 9\nevent: done\ndata: ended\n\n").ok(),
+            Some(Some(SseFrame::Done))
+        );
     }
 }

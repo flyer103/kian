@@ -39,6 +39,9 @@ const BATCH_TAIL_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind,
 const HEAD_SQL: &str =
     "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
 
+/// The seq axis only (the unchanged-read fast path — see `version`).
+const VERSION_SQL: &str = "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
+
 const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? AND seq >= ? AND seq < ? ORDER BY seq ASC";
 
 /// The CAS refused the write: re-read the head and classify which fence
@@ -175,6 +178,20 @@ pub(crate) async fn head(pool: &SqlitePool, session: SessionId) -> Result<Head, 
         next_seq: max_seq as u64 + 1,
         epoch: Epoch(epoch as u64),
     })
+}
+
+/// READ-MODEL §3 (P0): the session's version (`head.next_seq - 1`)
+/// alone. Unlike [`head`] this touches only the seq axis — the PK
+/// index's min/max lookup, no per-row epoch read — so the
+/// unchanged-read fast path stays one cheap query at any history
+/// size. (`MAX(epoch)` in [`HEAD_SQL`] has no index and would scan
+/// the session's rows every call.)
+pub(crate) async fn version(pool: &SqlitePool, session: SessionId) -> Result<u64, StoreError> {
+    let max_seq: i64 = sqlx::query_scalar(VERSION_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(pool)
+        .await?;
+    Ok(max_seq as u64)
 }
 
 // -- inbox ------------------------------------------------------------------

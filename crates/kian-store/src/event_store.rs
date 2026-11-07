@@ -406,6 +406,18 @@ impl EventStore {
             EventStore::Postgres(pool) => crate::postgres::head(pool, session).await,
         }
     }
+
+    /// The session's read version (READ-MODEL §3, P0):
+    /// `head.next_seq - 1`, `0` for a session with no events. This is
+    /// the unchanged-read fast path's only query — the seq axis alone
+    /// (an index min/max lookup), without [`EventStore::head`]'s
+    /// epoch-floor aggregate, so it stays cheap at any history size.
+    pub async fn version(&self, session: SessionId) -> Result<u64, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::version(pool, session).await,
+            EventStore::Postgres(pool) => crate::postgres::version(pool, session).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1043,6 +1055,25 @@ mod tests {
                 next_seq: 4,
                 epoch: Epoch(7)
             }
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// READ-MODEL §3 (P0): `version` is `head.next_seq - 1` (the last
+    /// committed seq), `0` for an event-less session — the unchanged
+    /// read's single cheap query.
+    #[tokio::test]
+    async fn version_reports_the_last_committed_seq() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        assert_eq!(store.version(sid).await.unwrap(), 0);
+        seed(&store, sid, 5, Epoch(7)).await;
+        assert_eq!(store.version(sid).await.unwrap(), 5);
+        // Agrees with the head's seq axis at every size.
+        assert_eq!(
+            store.version(sid).await.unwrap() + 1,
+            store.head(sid).await.unwrap().next_seq
         );
         store.close().await;
         cleanup(&path);

@@ -52,6 +52,9 @@ const BATCH_SQL: &str = "WITH guarded AS (\n    SELECT 1\n    WHERE (SELECT COAL
 const HEAD_SQL: &str =
     "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = $1::text";
 
+/// The seq axis only (the unchanged-read fast path — see `version`).
+const VERSION_SQL: &str = "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = $1::text";
+
 const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = $1::text AND seq >= $2::bigint AND seq < $3::bigint ORDER BY seq ASC";
 
 /// Postgres sqlstate for a unique-constraint violation — the observable
@@ -186,6 +189,17 @@ pub(crate) async fn head(pool: &PgPool, session: SessionId) -> Result<Head, Stor
         next_seq: max_seq as u64 + 1,
         epoch: Epoch(epoch as u64),
     })
+}
+
+/// READ-MODEL §3 (P0): the session's version (`head.next_seq - 1`)
+/// alone — the seq axis only, mirroring [`crate::sqlite::version`]
+/// (same names, same semantics on both backends).
+pub(crate) async fn version(pool: &PgPool, session: SessionId) -> Result<u64, StoreError> {
+    let max_seq: i64 = sqlx::query_scalar(VERSION_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(pool)
+        .await?;
+    Ok(max_seq as u64)
 }
 
 // -- inbox ------------------------------------------------------------------

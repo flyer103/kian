@@ -44,6 +44,13 @@ uuid.workspace = true
 # the rate-limit rejection's audit line is asserted by capturing
 # the tracing output in-process (no log file, no flaky greps).
 tracing-subscriber.workspace = true
+# the read-path benchmark (READ-MODEL P0): unchanged vs changed
+# projection reads and SSE tail polls vs full rebuilds.
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "read_path"
+harness = false
 
 [[bin]]
 name = "kian"
