@@ -1,4 +1,4 @@
-# Kian — WeChat iLink Channel (proposed)
+# Kian — WeChat iLink Channel (normative)
 
 > **This document is the normative channel contract for `type: wechat`.** It fixes how Tencent's
 > ClawBot iLink Bot API maps onto the existing `ChannelAdapter` seam: endpoints and wire fields,
@@ -6,10 +6,10 @@
 > config and CLI surfaces, the receive allowlist, dedupe, the cursor bound, and the degradation
 > table. It defines **no** new event kind, **no** new server surface and **no** core concept.
 >
-> Status: **proposed** (round 10, owner-approved route 2026-11-07). The adapter lands in
-> `kian-superagent` and the config/CLI half in `kian-cli`; this document is written before that
-> code and is the contract those cards implement. Rationale:
-> [ADR-018](decisions/ADR-018-wechat-ilink-channel.md).
+> Status: **normative** (round 10: contract landed with the adapter by ADR-018; owner-approved
+> route 2026-11-07, L1/L2 landed 2026-11-08 — review PASS after the R10-06a security fix). The
+> adapter lives in `kian-superagent`, the config/CLI half in `kian-cli`; both are held to this
+> contract. Rationale: [ADR-018](decisions/ADR-018-wechat-ilink-channel.md).
 >
 > **Best-effort by contract.** The protocol below is reverse-documented from Tencent's
 > MIT-licensed client (no public API contract exists). A protocol break must degrade **this

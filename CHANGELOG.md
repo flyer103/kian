@@ -714,23 +714,46 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   did not arrive in this run. `SseFrame #[non_exhaustive]` stays deferred to the SDK freeze
   (F5, recorded with its reason in the R9-08a entry).
 
-## 2026-11-08 — round-10 WeChat iLink channel: contract, decision, pointers (in progress, documentation only)
+## 2026-11-08 — round-10 WeChat iLink channel: adapter, config/CLI, login — default-green (L1/L2)
 
-- **`design/CHANNEL-WECHAT.md` (proposed)** — the normative `type: wechat` channel contract: the
-  frozen iLink protocol mapping (endpoints, headers, `WeixinMessage`, the `sendmessage` payload),
-  the `ChannelEvent`/`ChannelDelivery` mapping, the `context_token` rule, the `0600` credential-file
-  schema and lifecycle, the config/CLI contract (`kian wechat login`), the receive allowlist,
-  dedupe (`message_id` ring + `(session, event_id)` idempotency), the empty-cursor bound (no
-  position table), the failure/degradation table, phase-2 non-goals, L1/L2/L3 acceptance and the
-  full UNVERIFIED list.
+- **`design/CHANNEL-WECHAT.md` (normative)** — the `type: wechat` channel contract: the frozen
+  iLink protocol mapping (endpoints, headers, `WeixinMessage`, the `sendmessage` payload), the
+  `ChannelEvent`/`ChannelDelivery` mapping, the `context_token` rule, the `0600` credential-file
+  schema and lifecycle, the config/CLI contract (`kian wechat login`), the bidirectional receive
+  allowlist (§3 drop + §9 send gate), dedupe (`message_id` ring + `(session, event_id)`
+  idempotency), the empty-cursor bound (no position table), the failure/degradation table,
+  phase-2 non-goals, L1/L2/L3 acceptance and the full UNVERIFIED list.
 - **`design/decisions/ADR-018-wechat-ilink-channel.md`** — a native adapter in the bundle rather
   than the OpenClaw bridge, 公众号, 微信客服 or personal-account hooks; the QR-issued token as a
   deliberate deviation from the env-only static-secret rule; best-effort consequences (operator
   re-login on `-14`, reply-only so no proactive push, phase-2 media).
-- **Pointers**: DESIGN §4.2 channel row, §6.2 seam row, §7 bundle note; SPEC §3.2 operator verb,
-  §5 channel row (in progress) and the credential deviation; README features / docs map / Channels
-  config / environment-contract exception; `docs_map` `AUTHORED` + the SPEC §5 keyword.
-- **No code, no wire, no event kind** — `API-CONTRACT.md` and `EVENT-MODEL.md` show zero diff. The
-  adapter (`kian-superagent`) and the config/CLI half (`kian-cli`) land in the following cards; the
-  SPEC/DESIGN rows flip to `landed` at closeout. L3 (real QR scan + phone) is owner-run and stays
-  unverified until executed.
+- **`kian-superagent` adapter (commit `c066e7d`)** — `WechatChannel` over the `ChannelAdapter`
+  seam: one long-poll loop per channel, `message_id` → `event_id` (lossless decimal string),
+  ring + idempotency dedupe, topics allowlist, `context_token` send cache populated only for
+  admitted senders and a send gate refusing non-allowlisted targets before any wire traffic,
+  ordered >2000-char split, `-14` → 1 h pause + credential-mtime resume; `wechat/login.rs` QR
+  flow (a status long-poll timeout is `wait`, never fatal); the judge prompt gains the
+  channel-target sentence (new-session `policy_version` change only — old sessions replay
+  byte-identically). 22 adapter tests against a scripted axum mock iLink server.
+- **`kian-cli` config/assembly/login (commit `8153938`)** — `WechatChannelSection` fail-closed
+  validation (credentials required, non-empty topics, single wechat channel, forced untrusted),
+  `kian wechat login` (QR print, atomic `0600` write, ids never the token), assembly mounts the
+  channel (registry, consumers, poll-driver order), token redaction. 9 tests including the
+  real-`Server` + sqlite end-to-end: one inbound admitted exactly once across replay **and**
+  process restart; channel failure leaves session state untouched.
+- **R10-06a review fixes (folded into both commits)** — the four findings of the independent
+  review: the send-path allowlist hole (blocker: token cache moved admit-only + the §9 send
+  gate), the vacuous restart leg (baseline-before-respawn), login abort on a normal long-poll
+  timeout, and missing-`ret` minting a delivered receipt; plus minors (api_base doc/code match,
+  verify-code wording, dead stub removed, `0700` credential parent, `-14` observability note,
+  baseurl-vs-api_base UNVERIFIED item). Re-review verdict: **PASS**, each fix mutation-tested
+  red→green by the reviewer.
+- **No new surface, no wire, no event kind** — `API-CONTRACT.md` and `EVENT-MODEL.md` show zero
+  diff across the round; no `kian-core`/`kian-store`/`kian-orchestrator` change; no new HTTP
+  route. Independent QA: all §7 criteria L1/L2 pass, negative controls 1–10 pass, mutation
+  spot-checks red.
+- **Unverified (L3, owner-run, never faked)** — a real QR scan with a phone; empty-cursor replay
+  across downtime; `-14` lifetime and re-login behavior; `iLink-*`/`base_info` acceptance; the
+  real text-length limit and rate limits; baseurl-vs-`api_base` (CHANNEL-WECHAT §14 item 8).
+  The `AGENTS.md` docs-map bullets (CHANNEL-WECHAT, READ-MODEL) remain owner-pending — protected
+  file.

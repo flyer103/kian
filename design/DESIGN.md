@@ -1389,7 +1389,7 @@ caps) landed as the `kian-memory` bundle (row above); the `memory:` config secti
 `kian-cli`. Injection (P2) and representations (P3) remain designed. Placement and non-goals are
 fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
-**Channels (bundle, ADR-018 — round 10, in progress).** The real `ChannelAdapter` implementations
+**Channels (bundle, ADR-018 — round 10, landed).** The real `ChannelAdapter` implementations
 live in `kian-superagent` — `lark`, `github`, the round-10 `wechat`, and the mock channel; the seam
 definition stays in `kian-core::seams`. The WeChat channel is **best-effort by contract** and
 poll-shaped: one long-poll loop per configured channel, `message_id` → `event_id` (lossless decimal
