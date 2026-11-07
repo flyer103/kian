@@ -343,6 +343,23 @@ Scope: knowledge that survives a session boundary (P9). The normative contract i
 Non-goals recorded with the phases: no in-session memory tool (P1), no mid-session memory updates
 (P2), no representation as truth or unbounded build (P3), no cross-agent shared memory (open).
 
+### Read model and serving form (designed; not landed)
+
+Scope: versioned unchanged/delta reads, resumable per-session streams, verified snapshots,
+materialized views, opt-in export-only retention, and bounded-staleness reads. The normative
+contract is [design/READ-MODEL.md](../design/READ-MODEL.md); the decision record is
+[ADR-017](../design/decisions/ADR-017-read-model-and-snapshots.md). Nothing here is landed yet.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-store, kian-orchestrator, kian-cli | version + unchanged/delta reads, resumable SSE, drain context cache | designed |
+| P1 | kian-store, kian-core, kian-orchestrator | verified snapshots (state + model context), tail replay | designed |
+| P2a | kian-store, kian-cli | session directory, usage/stage views, kind index | designed |
+| P2b | kian-store, kian-cli | opt-in export-only archive, import, retention | designed |
+| P3 | kian-cli, kian-sdk | explicit-allowlist fan-in stream | designed |
+
+Non-goals: transparent cold-tier query, wildcard streams in OSS, multi-region active-active.
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|
@@ -361,3 +378,6 @@ Non-goals recorded with the phases: no in-session memory tool (P1), no mid-sessi
 | Honesty | interrupt ≠ failed; empty response is a soft failure; evidence gate (A6) |
 | Governance | permission/approval fail-closed; audit = event-stream export (P8/A1) |
 | Compatibility | Event schema versioning + adjacent migrations |
+| Read cost | Unchanged projection reads cost one version check; stream polling is O(new events); benchmarked |
+| Resume | A recoverable session resumes from the latest verified snapshot + tail (P1) |
+| Retention | Opt-in, terminal-only; the archive package reproduces the audit export byte-identically |

@@ -220,6 +220,27 @@ The stream closes after the first `session/ended` event, whatever its reason. Te
 (`running → idle`), so a resumed session appends later events; those are observed on a **new
 connection**. A client that needs to follow a resumable session must reconnect.
 
+### 5.3 Planned: read-model surface (READ-MODEL P0/P3)
+
+> Planned additive surface. Each item lands with the READ-MODEL phase that implements it; until
+> then v0 behavior above is normative and nothing here is callable. Semantics are owned by
+> [READ-MODEL.md](READ-MODEL.md); this file only fixes wire shapes.
+
+- `projection` result gains `version` (u64 = last committed seq). Optional request field `since`
+  (u64): `since == version` returns `{"version":<u64>,"unchanged":true}` with no `state`; any
+  other value returns `{"version":<u64>,"state":"<see §2.3>"}`. `since > version` is `-32602`.
+- `GET /sessions/{id}/events`: `event: kian` frames gain `id: <seq>`. A reconnect with
+  `Last-Event-ID: <seq>` resumes after that seq. A resume id ahead of head, non-numeric, or inside
+  an archived range is `event: error` + close. Terminal streams replay then close with `done`.
+- Planned fan-in (P3, OSS): `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]`, tail-only (no
+  resume), explicit allowlist of at most 64 sessions, `id: <uuid>:<seq>`, no wildcard, HTTP 400
+  on malformed/over-cap; an unknown listed session emits one `event: error` naming it and the
+  stream continues.
+- Planned error code (P2b, append-only registry): `-32005 archived` — the session's online range
+  has been archived; use the archive package / `session import`.
+- Planned metrics (additive): `read` object (`unchanged`, `delta_reads`, `resync`, `full_scans`)
+  and `event_stream` object (`subscribers`, `sessions_watched`, `events_sent`).
+
 ## 6. Metrics — `GET /metrics`
 
 Read-only JSON snapshot. HTTP 200, `application/json`.

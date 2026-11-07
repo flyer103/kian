@@ -447,6 +447,11 @@ creation-time `input/admitted` with `synthetic:true`, appended before the first 
 a frozen renderer and hard caps — so the injected index joins the shared prefix instead of rewriting
 a live session's context. Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
 
+**Serving-form acceleration (READ-MODEL, proposed)**: projection reads, event streams and the
+model context MAY be served from versioned caches, snapshots and materialized views. They are
+disposable, verified against the stream, and never an alternative truth; `compact` remains the
+only deliberate cache-invalidation point (constraint 3). Contract: `design/READ-MODEL.md`.
+
 **The loop conventions (built-in ReAct loop, frozen after merge, additions-only)**: the built-in
 loop (kian-loop) is a passenger inside the drain — it interacts with the engine only through the
 `DrainCtx` surface (append, begin/end turn with payload, take eligible inputs at safe boundaries,
@@ -1464,6 +1469,10 @@ sequenceDiagram
  dialable by any replica (v1: duplicate dialing is harmless under at-least-once
  + command-id dedupe; the registry's `last_heartbeat` is written by whichever
  replica holds the connection).
+- **Maintenance outside drains (READ-MODEL)**: snapshot builders, view rebuilders and the archive
+job run as maintenance tasks (same binary, configurable role, or a separate process) under a
+per-session/per-shard lease (liveness only) and store CAS/fencing (safety); every mutation is
+idempotent. No maintenance write ever changes event bytes.
 - A kiand connection = one TCP connection carrying JSON-lines KiandProto frames with pipelined
  commands; the endpoint-side execution concurrency cap is configurable. **v1 topology: the
  endpoint listens, the server dials.** quinn/quic and websocket-over-TLS remain the 
@@ -1511,6 +1520,9 @@ sequenceDiagram
  explicit unique `drain.holder` (the shared default refuses to start — same-holder claim
  admission, /ADR-009 condition (c), must not be defeat-able by two replicas sharing a name).
  sqlite mode keeps today's defaults byte-identically.
+- v1 read model (READ-MODEL): observability reads MAY be served by read replicas within the
+  declared bounded staleness of `design/READ-MODEL.md` §8; control decisions always read the
+  primary. Retention is opt-in and archive-only (§7).
 - Endpoint side: kiand single binary (systemd/launchd managed) + watchdog.
 - Hosted control plane (commercial layer, not in the open-source core): multi-replica hosting,
  audit console, evidence-gate reports — see the BP.
