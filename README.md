@@ -26,6 +26,7 @@ been demonstrated.
 | [docs/overview.md](docs/overview.md) | **Start here** | The problem, the execution model, architecture, crate map, S1–S8 proofs, design-input map |
 | [docs/SPEC.md](docs/SPEC.md) | Spec (WHAT) | Positioning, user interfaces, scope, milestones |
 | [design/DESIGN.md](design/DESIGN.md) | Design (HOW) | Execution model, session state machine, recovery, event schema, plugin system, crate map, super-agent bundle |
+| [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | **Event contract (normative)** | Envelope, the 21-kind catalog, payload schemas, invariants and the event-change protocol — the source of truth for any Event change |
 | [design/decisions/](design/decisions/) | Decisions (WHY) | ADR-001 … ADR-015 (append-only): each decision with its alternatives and trade-offs |
 | [the design notes](the design notes) | Research | Structured digest of the five design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Runbook | Operating the S6 dsh bridge: config, the live positive via the contract-v0 peer (`contrib/dsh-v0-peer/`), and the C57 stock-dsh contract survey |
@@ -35,7 +36,7 @@ been demonstrated.
 
 Docs-map consistency is enforced by the `docs_map` test in `crates/kian-cli/tests/docs_map.rs`: it
 checks that every relative link in `README.md`, `AGENTS.md`, `docs/SPEC.md`, `design/DESIGN.md`,
-`the design notes` and the ADRs resolves. The two runbooks, `docs/overview.md` and
+`design/EVENT-MODEL.md`, `the design notes` and the ADRs resolves. The two runbooks, `docs/overview.md` and
 `CHANGELOG.md` are not yet in that enforced set — their links are checked by hand for now (extending
 `AUTHORED` is tracked as a follow-up, not done here).
 

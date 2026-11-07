@@ -175,6 +175,9 @@ asset) / Environment (unversioned config) / Session (the one first-class durable
 derivation, an event slice) / Iteration (aggregate counters + events) / Event (append-only, never
 modified) / Thread (independent event stream + version pin; task-centric delegation).
 
+The event envelope, the complete kind catalog, payload contracts and the event-change protocol
+are normative in [design/EVENT-MODEL.md](../design/EVENT-MODEL.md).
+
 ## 5. Scope
 
 ### Phase 1 (MVP, ~6 weeks)

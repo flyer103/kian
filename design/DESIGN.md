@@ -345,6 +345,11 @@ Two races are settled explicitly:
 
 ### 3.1 Event classification (borrowing dsh's durable/live split)
 
+> **Normative event contract**: [EVENT-MODEL.md](EVENT-MODEL.md) is the source of truth for the
+> envelope, the complete kind catalog, payload schemas and the change protocol. This section
+> records the design rationale; if they disagree, EVENT-MODEL.md wins and both are corrected in
+> the same change.
+
 | Class | Examples | Persisted | Purpose |
 |-------|----------|-----------|---------|
 | Durable events | turn/start, step/request, assistant/message (sent bytes), tool/call, tool/result, input/admitted, drain/claimed, session/ended | ✅ append-only | Truth and replay |

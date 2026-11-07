@@ -8,11 +8,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Authored markdown surfaces of the docs map (AGENTS.md §Docs map).
-const AUTHORED: [&str; 5] = [
+/// `design/EVENT-MODEL.md` is the normative event contract, so its
+/// outbound links are part of the enforced set too.
+const AUTHORED: [&str; 6] = [
     "README.md",
     "AGENTS.md",
     "docs/SPEC.md",
     "design/DESIGN.md",
+    "design/EVENT-MODEL.md",
     "the design notes",
 ];
 
@@ -220,4 +223,83 @@ fn spec_phase3_table_names_each_landed_capability() {
             "SPEC Phase-4 deferral table is missing `{item}`"
         );
     }
+}
+
+/// The event catalog in `design/EVENT-MODEL.md` is the normative source
+/// of truth; `EventKind` is its executable form. This test fails on any
+/// drift: a kind in the enum but not the catalog, a kind in the catalog
+/// but not the enum, or a changed kind count. Adding/removing an event
+/// kind therefore requires updating the catalog in the same change.
+#[test]
+fn event_model_catalog_matches_core_kinds() {
+    let root = repo_root();
+    let model = std::fs::read_to_string(root.join("design/EVENT-MODEL.md"))
+        .expect("design/EVENT-MODEL.md is the normative event contract");
+    let events_rs = std::fs::read_to_string(root.join("crates/kian-core/src/events.rs"))
+        .expect("crates/kian-core/src/events.rs");
+
+    // Catalog rows live in the §3 kind table: `| \`kind\` | ...`.
+    let start = model
+        .find("## 3. Kind catalog")
+        .expect("EVENT-MODEL §3 kind catalog heading");
+    let end = model[start..]
+        .find("\n## 4.")
+        .map(|i| start + i)
+        .unwrap_or(model.len());
+    let catalog = &model[start..end];
+    let mut documented: BTreeSet<String> = BTreeSet::new();
+    for line in catalog.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("| `") else {
+            continue;
+        };
+        let Some(close) = rest.find('`') else {
+            continue;
+        };
+        let kind = &rest[..close];
+        documented.insert(kind.to_string());
+    }
+
+    // Executable form: the `#[serde(rename = "kind/name")]` tags on
+    // `EventKind` (the golden tests pin them to `as_str`).
+    let mut coded: BTreeSet<String> = BTreeSet::new();
+    for line in events_rs.lines() {
+        let Some(pos) = line.find("#[serde(rename = \"") else {
+            continue;
+        };
+        let rest = &line[pos + "#[serde(rename = \"".len()..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let kind = &rest[..close];
+        coded.insert(kind.to_string());
+    }
+
+    assert_eq!(
+        coded.len(),
+        21,
+        "expected 21 EventKind variants, got {coded:?}"
+    );
+    assert_eq!(
+        documented.len(),
+        coded.len(),
+        "EVENT-MODEL catalog has {} kinds but EventKind has {}; \
+         update design/EVENT-MODEL.md in the same change: missing={:?} extra={:?}",
+        documented.len(),
+        coded.len(),
+        coded.difference(&documented).collect::<Vec<_>>(),
+        documented.difference(&coded).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        documented,
+        coded,
+        "EVENT-MODEL catalog and EventKind drift: missing={:?} extra={:?}",
+        coded.difference(&documented).collect::<Vec<_>>(),
+        documented.difference(&coded).collect::<Vec<_>>()
+    );
+
+    // The change protocol must stay discoverable from the contract.
+    assert!(
+        model.contains("## 6. Change protocol"),
+        "EVENT-MODEL must keep the change-protocol section"
+    );
 }

@@ -109,6 +109,9 @@ when the owner asks. Negative results commit documentation only — never broken
 - `docs/SPEC.md` — the contract (WHAT). Changing scope means changing this file in the same change.
 - `design/DESIGN.md` — the blueprint (HOW). Any crate/seam/invariant change updates it in the same
   change.
+- `design/EVENT-MODEL.md` — the normative event contract (source of truth): envelope, the complete
+  21-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
+  and updates this file first; code/tests must be reconciled in the same change.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.
