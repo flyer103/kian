@@ -93,8 +93,7 @@ consistent: `cargo test -p kian-cli --test docs_map`.
 - `docs/SPEC.md` — WHAT: positioning, user/ops interfaces, scope.
 - `design/DESIGN.md` — HOW: execution model (Admit→Wake→Drain→Promote), session state machine,
   three-layer recovery, event schema versioning, plugin system, crate map, super-agent bundle.
-- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-018 WeChat iLink
-  channel.
+- `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-019 governed memory.
 - `the design notes` — structured synthesis of the design inputs.
 - `a vendored archive/` — frozen snapshots (WeChat super-agent article; dsh README/architecture;
   cordis README/primer; Feishu kian design rev 1425; Feishu an internal design review rev 47).
