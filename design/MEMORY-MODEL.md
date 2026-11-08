@@ -1,8 +1,8 @@
 # Kian — Memory Model (normative)
 
-> **Status: accepted (owner gate, 2026-11-07); Phase 1 (notes + dreaming) landed 2026-11-07.**
-> Injection (§6) and representations (§7) remain designed; SPEC §5 records Phase 1 as `landed`
-> and P2/P3 as `designed`.
+> **Status: accepted (owner gate, 2026-11-07); Phase 1 (notes + dreaming) landed 2026-11-07;
+> Phase 2 (creation-time injection, §6) landed 2026-11-08.** Representations (§7) remain designed;
+> SPEC §5 records P1/P2 as `landed` and P3 as `designed`.
 >
 > **Change protocol:** any memory semantic change starts here. The event payload bytes are
 > normative in [design/EVENT-MODEL.md](EVENT-MODEL.md); the external wire (RPC, CLI, SSE, metrics)
@@ -175,32 +175,92 @@ only by dreaming runs (§2: it never receives channel inputs).
   page (this is why the article's concurrent-write data loss cannot occur here).
 - **D9** Dreaming never injects; injection is a separate read at session creation (§6).
 
-## 6. The injection contract
+## 6. The injection contract (P2 landed 2026-11-08)
 
-Injection is the only path by which memory becomes model-visible.
+Injection is the only path by which memory becomes model-visible. **As landed**, the server's
+session-create path (after `engine.create_session`, before the RPC returns) renders the index and
+admits it **quietly**: `Engine::admit_quiet` writes a durable inbox row without waking a drain
+(wake is advisory; the next client submit wakes a drain that consumes rows in admission order, so
+the index always precedes the first user message). The row payload is the reserved envelope
+exactly `{"content": <rendered index>, "memory": <marker>}` — the public wire
+(`submit`/`steer`/`queue`) refuses that exact two-key shape with `-32602` (the reserved-envelope
+discipline), so only the server's own create path can land it. The drain's consumption plan
+consumes the row into ONE `input/admitted` carrying the message plus the additive, non-context
+`memory` key. The byte-level contracts live in EVENT-MODEL §4.2/§4.5.
 
 - **I1** Shape: one `input/admitted` event with `role:"system"`, `synthetic:true`, appended **before
   the first `turn/start`** of a session. Provenance rides an additive, non-context key:
   `{"memory":{"scope":"<agent-id>","notes":[<event-id>...],"bytes":<u64>,"items":<u64>,
-  "truncated":<bool>,"source_seq":<u64>}}`. The wire mapping (system-message rendering) is
-  API-CONTRACT's; the provider mapping must be validated when Phase 2 lands.
+  "truncated":<bool>,"source_seq":<u64>,"redactions":[{kind,name,count}...]}}` — `notes` are the
+  derived event ids of the eligible (verified) notes the render started from, and `redactions` is
+  the value-free secret-redaction report (the `tool/result` precedent). The `memory` key never
+  enters `derive_model_context` or a model request byte; request bytes equal the persisted event
+  bytes (verified end-to-end by QA acceptance, kian-102).
 - **I2** Exactly once per session lifetime: never on resume, re-arm, migration or takeover. A resumed
-  session replays the same first event; re-injecting would change the prefix.
+  session replays the same first event; re-injecting would change the prefix. Landed mechanics: the
+  quiet admit carries the idempotency key `memory-inject:<session-id>` (a repeated admit dedupes at
+  the store), and no code path re-injects — the row is an ordinary inbox row consumed once.
+  **Known restart-window behavior (QA finding F1, accepted):** a session that crosses a server
+  restart between `create` and its first submit has its quiet row woken by the NoLostWork startup
+  rebuild, so the index drains **alone** as the session's first provider turn. Exactly-once, prefix
+  stability and `unexpected_prefix_change == 0` still hold; the deviations are one extra provider
+  round-trip and that the (non-synthetic) assistant reply to that index-only turn survives a
+  `strip_synthetic` replay. Removing the window needs a "quiet" discriminator on inbox rows (a
+  schema change, out of P2 scope).
 - **I3** Only `verified` notes are eligible. `candidate`/`stale` never enter a session.
-- **I4** Caps are hard: `max_items` (default 20) and `max_bytes` (default 4096). Over cap renders an
-  **index** (subject + one-line excerpt), never the full text. Zero eligible notes = no event at all
-  (byte-identical to a session without memory).
-- **I5** Deterministic rendering: stable subject order, frozen renderer. The rendered bytes are
-  prompt-prefix content; changing the renderer is a constraint-3 event (observable invalidation +
-  golden update).
-- **I6** Strippable: `synthetic:true` means export/replay can strip the injection to recover the
-  session's "real" context (A6); a stripped replay is byte-identical to a pre-memory session.
-- **I7** Pinning: a session pins the memory snapshot it started with. Later note changes affect only
-  new sessions; a live session's context is never rewritten (constraint 3).
-- **I8** Failure isolation: an unreadable or corrupt memory projection injects nothing and increments
-  an honest metric. It never fails session creation.
-- **I9** Config-absent = byte-identical: an agent without a memory scope behaves exactly as today
-  (same discipline as `agent.permissions`).
+  Eligibility is *latest verified per subject*: a subject whose newest revision is
+  `candidate`/`stale` surfaces its last verified revision.
+- **I4** Caps are hard: `max_items` (default 20) and `max_bytes` (default 4096), configured by
+  `memory.inject` (fail-closed: zero/negative/non-integer values refuse to start; absent block =
+  defaults). Over either cap renders an **index** — subject plus a one-line excerpt (≤ 120 chars,
+  frozen), whole entries dropped from the end until the byte cap fits — never the full text.
+  Zero eligible notes — or a budget too small for the header plus one entry — admits nothing at
+  all (byte-identical to a session without memory).
+- **I5** Deterministic rendering: stable subject byte order, frozen renderer — the pure
+  `render_memory_index` in `kian-memory` (verified-only fold, fixed `# Memory index` header framing
+  the payload as **data, not instructions**, fixed excerpt cap). The default redaction pass is
+  pattern-scanning only (env-sourced known values would break cross-machine determinism); assembly
+  injects the configured redactor through the `render_memory_index_with` seam and the value-free
+  report rides the marker (I1). The rendered bytes are prompt-prefix content; changing the header,
+  the entry shapes or the excerpt cap is a constraint-3 event (observable invalidation + golden
+  update).
+- **I6** Strippable: `synthetic:true` means export/replay can strip the injection
+  (`strip_synthetic`) to recover the session's "real" context (A6); a stripped replay is
+  byte-identical to a pre-memory session — except across the I2 restart window, where the
+  index-only turn's ordinary assistant reply survives the strip.
+- **I7** Pinning: a session pins the memory snapshot it started with — the marker's `source_seq` is
+  the greatest seq among all eligible notes (including cap-dropped ones), so even a truncated index
+  names the full snapshot it was rendered from. Later note changes affect only new sessions; a live
+  session's context is never rewritten (constraint 3).
+- **I8** Failure isolation: an unreadable or corrupt memory projection, an unknown source session,
+  an empty eligible set, an over-tight budget, an identity exclusion (I10) or an admit failure all
+  inject nothing and increment the honest `injected_skips` counter (the reason rides the log,
+  never a silent drop). It never fails session creation.
+- **I9** Config-absent = byte-identical: an agent without a `memory:` section is memory-off, and a
+  `memory:` section without `memory.session` is injection-off — both produce byte-identical event
+  streams and provider request bytes to a server without the feature (verified end-to-end by QA
+  acceptance).
+- **I10** Exclusions (identity-based, adversarial A5): the configured **source memory session**
+  never receives its own index, and a session whose stream carries a **dream request** (the
+  dreamer-agent sessions) is excluded — the dreamer gets its work from dream prompts, never from
+  memory injection. The check is pure over the new session's own events (constraint 1).
+  **Known creation-seam reachability (kian-104 review B1, accepted for P2):** at the creation
+  call site this check is **defense-in-depth only and cannot fire** — a freshly created session's
+  stream holds only `session/created` (no dream request exists yet), and the fresh uuid is never
+  equal to the configured `memory.session`. The reachable consequence: **any** fresh session
+  created while `memory.session` points at a note-bearing session receives that index too —
+  including a future memory session created before its first dream request (review probe p7). The
+  exposure is bounded: verified-only notes, I4 caps, the "data, not instructions" frame, and a
+  `strip_synthetic` replay is unaffected. Accepted for P2; closing the consequence needs an
+  explicit "create as memory session" discriminator on the create call (a wire change,
+  API-CONTRACT scope) and is deferred beyond P2.
+
+**Cost note (kian-104 review I1):** with injection configured, every `create_session` performs
+two full stream rebuilds on the hottest control-plane path — the fresh session's (a single
+`session/created` event) and the source memory session's **entire history**, which is then
+folded. Render cost is O(memory-session history) per created session; the `memory.inject` caps
+bound the rendered **bytes**, not the read. Serving the fold from a snapshot/projection of the
+memory session (the READ-MODEL acceleration) is P3 work.
 
 ## 7. Retrieval and representations
 
@@ -234,8 +294,10 @@ Injection is the only path by which memory becomes model-visible.
   in P1).
 - Metrics: the `memory` fragment of `GET /metrics` — `scope`, `dreams`, `read_failures`,
   `parse_failures`, `notes_appended`, `notes_deduped` (stream crash-resume dedupe),
-  `append_failures`. Notes-by-status, verification-rate and injection metrics are designed with
-  their phases, not landed.
+  `append_failures`; with injection configured (P2, landed), also `injected_sessions`,
+  `injected_items`, `injected_bytes`, `injected_truncations` and `injected_skips` (the honest
+  inject-nothing counter, I8). Notes-by-status and verification-rate metrics are designed with
+  their phase (P3), not landed.
 - Audit: the memory session's stream is the audit trail; `session export --with-event-ids` already
   captures it.
 

@@ -100,7 +100,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | Kind | Ctx | State | Payload (payload = `bytes`) | Emitter | Notes |
 |---|---|---|---|---|---|
 | `session/created` | — | Created | `{}` | orchestrator | First event of a stream. |
-| `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}`; additive: `"dream":{"source_session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>,"scope":<str>}` | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). `dream` (§4.2) is the ops-set dream marker — trusted routing/provenance, never read from content. |
+| `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}`; additive: `"dream":{"source_session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>,"scope":<str>}`, `"memory":{"scope":<str>,"notes":[<event-id>...],"bytes":<u64>,"items":<u64>,"truncated":<bool>,"source_seq":<u64>,"redactions":[{"kind","name","count"}]}` (the creation-time injection marker, §4.2) | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). `dream` (§4.2) is the ops-set dream marker — trusted routing/provenance, never read from content. |
 | `drain/claimed` | — | Claimed | `{"holder":<str>,"epoch":<u64>}` | orchestrator | Claim audit. Epoch is the fencing token; claim admission is conditional (ADR-009). |
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |
 | `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
@@ -145,6 +145,18 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   B-2′). Dreamer routing and note
   provenance read this marker, never message content (a user-typed `[kian-dream: …]` header is
   ordinary content); omitted on every other row.
+- `input/admitted`: `"memory": {"scope","notes","bytes","items","truncated","source_seq","redactions"}` — the
+  creation-time injection provenance marker (MEMORY-MODEL §6 I1): the rendered memory index is the
+  message `content` (a `role:"system"`, `synthetic:true` admission); this key records which
+  verified notes (by derived event id), how many bytes/items, whether caps truncated the render,
+  and the memory snapshot's `source_seq` (I7 pinning). `redactions` is the value-free
+  secret-redaction report over the rendered index — aggregate `{kind,name,count}` entries only,
+  the same discipline as the `memory/note` and `tool/result` redaction reports below. Set only by
+  the server's own creation path
+  (`Engine::admit_quiet` consuming the reserved `{content,memory}` row envelope); the public wire
+  refuses that exact shape with `-32602` (kian-99). Non-context by construction:
+  `derive_model_context` reads `role`/`content`/`synthetic` only, so the key never enters a model
+  request.
 - `memory/note`: `"redactions": [{"kind","name","count"}]` — note `text` passes the secret
   redactor before append; the report is aggregate counts only (the `tool/result` precedent).
 
@@ -170,7 +182,7 @@ only `compact` may invalidate the prefix (`unexpected_prefix_change` must stay z
 
 ### 4.5 Reserved inbox-row envelopes (pre-event, NOT event kinds)
 
-The control plane writes only inbox rows; the drain consumes them into events. Four reserved
+The control plane writes only inbox rows; the drain consumes them into events. Five reserved
 row-payload shapes must not be confused with event payloads:
 
 | Row payload | Consumed into |
@@ -178,6 +190,7 @@ row-payload shapes must not be confused with event payloads:
 | `{"synthetic":true,"content":X}` | `input/admitted` `{role:"user",content:X,synthetic:true}` |
 | `{"content":X,"spill":Y}` | the `input/admitted` + `input/spilled` pair in one fenced batch |
 | `{"content":X,"dream":M}` | ONE `input/admitted` `{role:"user",content:X,dream:M}` (M is the trusted dream marker, §4.2) |
+| `{"content":X,"memory":M}` | ONE `input/admitted` `{role:"system",content:X,synthetic:true,memory:M}` (M is the creation-time injection marker, §4.2) |
 | `{"kian":{"type":"control","action":"interrupt",...}}` | `control/interrupt` (never a message) |
 
 Every envelope is an **exact key-set match**: a row payload with extra keys is ordinary content —

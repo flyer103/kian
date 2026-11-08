@@ -668,7 +668,35 @@ impl Server {
                 )?;
                 let caps = section.dreamer.caps();
                 let scope = section.scope.clone();
-                let assembly = Arc::new(MemoryAssembly::new(scope, caps, Arc::clone(&dream)));
+                // P2 (kian-101): `memory.session` configures
+                // creation-time injection. Absent = injection off (the
+                // plan is None, sessions byte-identical, I9). The uuid
+                // shape was validated; the parse here is the same
+                // fail-closed rule, never a silent skip.
+                let inject = match &section.session {
+                    Some(session) => {
+                        let source = kian_core::model::SessionId(
+                            uuid::Uuid::parse_str(session).map_err(|_| {
+                                ServeError::Assembly(format!(
+                                    "memory.session `{session}` is not a uuid \
+                                     (the source memory session)"
+                                ))
+                            })?,
+                        );
+                        let caps = section
+                            .inject
+                            .as_ref()
+                            .map_or_else(kian_memory::MemoryIndexConfig::default, |i| i.caps());
+                        Some(crate::memory::InjectPlan::new(
+                            source,
+                            caps,
+                            memory_redactor.clone(),
+                        ))
+                    }
+                    None => None,
+                };
+                let assembly =
+                    Arc::new(MemoryAssembly::new(scope, caps, Arc::clone(&dream), inject));
                 let router = Arc::new(MemoryLoopDriver::new(Arc::clone(plain), dream));
                 driver = Arc::new(ServeLoopDriver::Memory(router));
                 Some(assembly)
@@ -1020,13 +1048,115 @@ impl Server {
 // ControlPlane: the ONLY surface the HTTP layer may call (iron rule)
 // ---------------------------------------------------------------------------
 
+impl Server {
+    /// The creation-time memory injection (MEMORY-MODEL §6, kian-101):
+    /// rebuild the source memory session's stream, fold it, render the
+    /// bounded index and admit it as ONE quiet row — durable before
+    /// this returns, waking nothing (the next submit drains it first).
+    ///
+    /// Every failure is honest degradation (I8): inject nothing, count
+    /// a skip, log the reason — session creation NEVER fails here.
+    /// Exclusions are by identity (A5): the source session never
+    /// receives its own index, and a stream carrying a dream request
+    /// runs the dreamer (dream prompts, not memory injection).
+    async fn inject_memory_index(&self, session: SessionId) {
+        let Some(memory) = self.memory.as_ref() else {
+            return; // memory off — nothing to do
+        };
+        let Some(plan) = memory.inject() else {
+            return; // injection off (I9: byte-identical sessions)
+        };
+        let skip = |reason: &str| {
+            plan.counters().record_skip();
+            tracing::warn!(
+                session = %session.0,
+                reason,
+                "memory injection skipped (inject nothing, creation proceeds)"
+            );
+        };
+
+        // A5: classify the new session from its own stream (constraint
+        // 1). A freshly created stream carries only `session/created`,
+        // so in practice this is the source-identity check plus defense
+        // in depth against any future path that admits before us.
+        let new_events = match self.store.rebuild(session).await {
+            Ok(events) => events,
+            Err(e) => {
+                skip(&format!("new-session stream unreadable: {e}"));
+                return;
+            }
+        };
+        if crate::memory::injection_excluded(*plan.source(), session, &new_events) {
+            skip("excluded: the source session or a dreamer session never receives an index");
+            return;
+        }
+
+        // The source snapshot (I7): rendered from the stream alone.
+        let source_events = match self.store.rebuild(*plan.source()).await {
+            Ok(events) => events,
+            Err(e) => {
+                skip(&format!("source stream unreadable: {e}"));
+                return;
+            }
+        };
+        if source_events.is_empty() {
+            skip("unknown source memory session (no events)");
+            return;
+        }
+        let notes = kian_core::memory::project_notes(&source_events);
+        let eligible = kian_memory::eligible_notes(&notes);
+        let Some(rendered) =
+            kian_memory::render_memory_index_with(&notes, plan.caps(), plan.redactor())
+        else {
+            // I4: zero eligible notes (or a budget too tight to carry
+            // even one entry) admits nothing — byte-identical session.
+            skip("nothing renderable (no verified notes or budget too tight)");
+            return;
+        };
+        let payload = crate::memory::injection_admit_payload(
+            memory.scope(),
+            *plan.source(),
+            &rendered,
+            &eligible,
+        );
+        let key = crate::memory::memory_inject_key(&session);
+        match self.engine.admit_quiet(session, payload, Some(key)).await {
+            Ok(outcome) => {
+                plan.counters().record_injected(&rendered);
+                tracing::info!(
+                    session = %session.0,
+                    source = %plan.source().0,
+                    deduplicated = outcome.deduplicated,
+                    items = rendered.items,
+                    bytes = rendered.bytes,
+                    truncated = rendered.truncated,
+                    "memory index injected at session creation"
+                );
+            }
+            Err(e) => {
+                // A1: the session exists without memory — honest
+                // degradation, never a failed creation.
+                skip(&format!("quiet admit failed: {e}"));
+            }
+        }
+    }
+}
+
 impl ControlPlane for Server {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
         Box::pin(async move {
-            self.engine
+            let sid = self
+                .engine
                 .create_session()
                 .await
-                .map_err(internal("create_session"))
+                .map_err(internal("create_session"))?;
+            // P2 (kian-101): the creation-time memory injection
+            // (MEMORY-MODEL §6). Admitted BEFORE this RPC returns (A2:
+            // a client submit racing the response still lands after the
+            // index row) and never able to fail creation (I8: any
+            // failure injects nothing and counts an honest skip).
+            self.inject_memory_index(sid).await;
+            Ok(sid)
         })
     }
 

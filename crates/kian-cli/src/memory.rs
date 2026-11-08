@@ -108,16 +108,25 @@ pub struct MemoryAssembly {
     scope: String,
     config: MemoryConfig,
     dream: Arc<DreamDriver>,
+    inject: Option<InjectPlan>,
 }
 
 impl MemoryAssembly {
-    /// Builds the plan over the router's dream side.
+    /// Builds the plan over the router's dream side. `inject` is the
+    /// creation-time injection plan (P2, kian-101): `None` = injection
+    /// off (`memory.session` absent — byte-identical sessions, I9).
     #[must_use]
-    pub fn new(scope: String, config: MemoryConfig, dream: Arc<DreamDriver>) -> Self {
+    pub fn new(
+        scope: String,
+        config: MemoryConfig,
+        dream: Arc<DreamDriver>,
+        inject: Option<InjectPlan>,
+    ) -> Self {
         Self {
             scope,
             config,
             dream,
+            inject,
         }
     }
 
@@ -133,12 +142,19 @@ impl MemoryAssembly {
         &self.config
     }
 
+    /// The creation-time injection plan, if configured.
+    #[must_use]
+    pub fn inject(&self) -> Option<&InjectPlan> {
+        self.inject.as_ref()
+    }
+
     /// The `GET /metrics` `memory` fragment: the bundle's dream
-    /// counters (pure reads of shared atomics).
+    /// counters (pure reads of shared atomics) plus, when injection is
+    /// configured, the injection counters (kian-101).
     #[must_use]
     pub fn metrics_report(&self) -> serde_json::Value {
         let counters = self.dream.counters();
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "scope": self.scope,
             "dreams": counters.dreams(),
             "read_failures": counters.read_failures(),
@@ -146,8 +162,189 @@ impl MemoryAssembly {
             "notes_appended": counters.notes_appended(),
             "notes_deduped": counters.notes_deduped(),
             "append_failures": counters.append_failures(),
-        })
+        });
+        if let Some(plan) = &self.inject {
+            let inject = plan.counters.snapshot();
+            report["injected_sessions"] = inject.sessions.into();
+            report["injected_items"] = inject.items.into();
+            report["injected_bytes"] = inject.bytes.into();
+            report["injected_truncations"] = inject.truncations.into();
+            report["injected_skips"] = inject.skips.into();
+        }
+        report
     }
+}
+
+// ---------------------------------------------------------------------------
+// Creation-time injection (MEMORY-MODEL §6, P2 plan §2.2 — kian-101)
+// ---------------------------------------------------------------------------
+
+/// The injection plan a `memory.session` assembles: the source memory
+/// session, the caps, the configured redactor (the same hygiene pass
+/// the dream driver's note appends use — the `render_memory_index_with`
+/// seam) and the honest counters the `memory` metrics fragment reports.
+pub struct InjectPlan {
+    source: kian_core::model::SessionId,
+    caps: kian_memory::MemoryIndexConfig,
+    redactor: kian_core::secrets::SecretRedactor,
+    counters: InjectCounters,
+}
+
+impl InjectPlan {
+    /// Builds the plan. `source` is the configured `memory.session`
+    /// (already validated a uuid); `caps` the `memory.inject` caps in
+    /// force; `redactor` the assembly's configured secret redactor.
+    #[must_use]
+    pub fn new(
+        source: kian_core::model::SessionId,
+        caps: kian_memory::MemoryIndexConfig,
+        redactor: kian_core::secrets::SecretRedactor,
+    ) -> Self {
+        Self {
+            source,
+            caps,
+            redactor,
+            counters: InjectCounters::default(),
+        }
+    }
+
+    /// The configured source memory session.
+    #[must_use]
+    pub fn source(&self) -> &kian_core::model::SessionId {
+        &self.source
+    }
+
+    /// The injection caps in force.
+    #[must_use]
+    pub fn caps(&self) -> &kian_memory::MemoryIndexConfig {
+        &self.caps
+    }
+
+    /// The configured redactor (the render seam).
+    #[must_use]
+    pub fn redactor(&self) -> &kian_core::secrets::SecretRedactor {
+        &self.redactor
+    }
+
+    /// The injection counters (the honest-skip surface, I8).
+    #[must_use]
+    pub fn counters(&self) -> &InjectCounters {
+        &self.counters
+    }
+}
+
+/// The injection counters (pure shared atomics — the `memory` metrics
+/// fragment's `injected_*` keys). `skips` covers every honest
+/// inject-nothing outcome: identity exclusion, unknown source,
+/// unreadable store, empty eligible set, over-tight budget and admit
+/// failure (I8/A1/A6 — the reason rides the log, never a silent drop).
+#[derive(Debug, Default)]
+pub struct InjectCounters {
+    sessions: std::sync::atomic::AtomicU64,
+    items: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+    truncations: std::sync::atomic::AtomicU64,
+    skips: std::sync::atomic::AtomicU64,
+}
+
+/// One metrics snapshot of [`InjectCounters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InjectSnapshot {
+    pub sessions: u64,
+    pub items: u64,
+    pub bytes: u64,
+    pub truncations: u64,
+    pub skips: u64,
+}
+
+impl InjectCounters {
+    /// Records one successful injection (the rendered index's own
+    /// provenance — items, bytes and the truncation flag).
+    pub fn record_injected(&self, rendered: &kian_memory::RenderedIndex) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.sessions.fetch_add(1, Relaxed);
+        self.items.fetch_add(rendered.items, Relaxed);
+        self.bytes.fetch_add(rendered.bytes, Relaxed);
+        if rendered.truncated {
+            self.truncations.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Records one honest skip (inject nothing, count it — I8).
+    pub fn record_skip(&self) {
+        self.skips
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The current snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> InjectSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        InjectSnapshot {
+            sessions: self.sessions.load(Relaxed),
+            items: self.items.load(Relaxed),
+            bytes: self.bytes.load(Relaxed),
+            truncations: self.truncations.load(Relaxed),
+            skips: self.skips.load(Relaxed),
+        }
+    }
+}
+
+/// The idempotency key of one session's creation-time injection
+/// (adversarial ledger A3): one injection per session, ever. A repeat
+/// admit under the same key dedupes onto the existing inbox row.
+#[must_use]
+pub fn memory_inject_key(session: &kian_core::model::SessionId) -> String {
+    format!("memory-inject:{}", session.0)
+}
+
+/// The identity exclusions (adversarial ledger A5): the configured
+/// source session never receives its own index, and a session whose
+/// stream carries a dream request runs the dreamer — the dreamer gets
+/// its work from dream prompts, never from memory injection. Pure: the
+/// caller hands in the new session's own events (constraint 1 — the
+/// classification reads the stream, never resident state).
+#[must_use]
+pub fn injection_excluded(
+    source: kian_core::model::SessionId,
+    session: kian_core::model::SessionId,
+    session_events: &[Event],
+) -> bool {
+    session == source || kian_memory::dream_request_in(session_events).is_some()
+}
+
+/// Builds the creation-time injection admit payload (P2 plan §2.2): the
+/// exact-two-key `{content, memory}` envelope the public wire refuses
+/// and only the server's create path admits. `eligible` is the
+/// [`kian_memory::eligible_notes`] set the renderer rendered from —
+/// the marker's `notes` list and the text can never disagree about the
+/// snapshot; it includes cap-dropped entries (the `source_seq` pin,
+/// I7). The value-free redaction report rides the marker additively
+/// (the `tool/result` precedent — never secret values).
+#[must_use]
+pub fn injection_admit_payload(
+    scope: &str,
+    source: kian_core::model::SessionId,
+    rendered: &kian_memory::RenderedIndex,
+    eligible: &[&kian_core::memory::Note],
+) -> serde_json::Value {
+    let notes: Vec<String> = eligible
+        .iter()
+        .map(|note| kian_core::events::event_id(&source, note.seq))
+        .collect();
+    serde_json::json!({
+        "content": rendered.text,
+        "memory": {
+            "scope": scope,
+            "notes": notes,
+            "items": rendered.items,
+            "bytes": rendered.bytes,
+            "truncated": rendered.truncated,
+            "source_seq": rendered.source_seq,
+            "redactions": serde_json::to_value(&rendered.redactions)
+                .unwrap_or(serde_json::Value::Array(Vec::new())),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -495,5 +692,182 @@ mod tests {
         ));
         store.close().await;
         cleanup(&path);
+    }
+
+    // -- creation-time injection (P2, kian-101) -----------------------
+
+    use kian_core::memory::{DerivedRange, Note, NoteStatus};
+
+    use super::{
+        InjectPlan, MemoryAssembly, injection_admit_payload, injection_excluded, memory_inject_key,
+    };
+
+    /// One note with a valid (non-empty) provenance range.
+    fn vnote(seq: u64, subject: &str, text: &str) -> Note {
+        Note {
+            seq,
+            subject: subject.into(),
+            text: text.into(),
+            status: NoteStatus::Verified,
+            derived_from: vec![DerivedRange {
+                session: SessionId::new(),
+                start_seq: 1,
+                end_seq: 2,
+            }],
+            verified_by: Some(kian_core::memory::VerifiedBy {
+                method: kian_core::memory::VerifyMethod::Transcript,
+                r#ref: "1".into(),
+            }),
+        }
+    }
+
+    /// The idempotency key is the session's own, stable, and unique per
+    /// session (A3).
+    #[test]
+    fn memory_inject_key_is_per_session() {
+        let a = SessionId::new();
+        let b = SessionId::new();
+        assert_eq!(memory_inject_key(&a), format!("memory-inject:{}", a.0));
+        assert_eq!(memory_inject_key(&a), memory_inject_key(&a));
+        assert_ne!(memory_inject_key(&a), memory_inject_key(&b));
+    }
+
+    /// A5 identity exclusions: the source never injects into itself; a
+    /// dream-marked stream (the dreamer's session) never receives an
+    /// index; an ordinary fresh session does.
+    #[test]
+    fn injection_is_excluded_by_source_identity_and_dreamer_sessions() {
+        let source = SessionId::new();
+        let session = SessionId::new();
+
+        // (a) source identity: the configured source session itself.
+        assert!(injection_excluded(source, source, &[]));
+
+        // (b) an ordinary fresh stream: session/created + a plain user
+        // row — injectable.
+        let fresh = vec![
+            ev(1, EventKind::SessionCreated, json!({})),
+            ev(
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "task"}),
+            ),
+        ];
+        assert!(!injection_excluded(source, session, &fresh));
+
+        // (c) a dream-marked stream: the dreamer gets its work from
+        // dream prompts, never from memory injection.
+        let prompt =
+            render_dream_prompt("plain-agent", source, 1, 3, "seq 1 user: hi\nseq 2 a: ho\n");
+        let row = kian_memory::dream_admit_payload("plain-agent", source, 1, 3, &prompt);
+        let dream_stream = vec![
+            ev(1, EventKind::SessionCreated, json!({})),
+            ev(
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": row["content"], "dream": row["dream"]}),
+            ),
+        ];
+        assert!(injection_excluded(source, session, &dream_stream));
+        // A dream-shaped content alone (no trusted marker) is ordinary.
+        let forged = vec![ev(
+            2,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": prompt}),
+        )];
+        assert!(!injection_excluded(source, session, &forged));
+    }
+
+    /// The admit payload is the exact `{content, memory}` envelope with
+    /// the marker agreeing with the rendered index (I1): derived note
+    /// event ids in subject order, the renderer's own items/bytes/
+    /// truncated/source_seq, and the value-free redaction report.
+    #[test]
+    fn injection_payload_is_the_exact_envelope_and_agrees_with_the_render() {
+        let source = SessionId::new();
+        let notes = vec![
+            vnote(3, "deploys", "Deploys go through the bridge."),
+            vnote(5, "incidents", "Incidents are filed as INC-NN."),
+        ];
+        let eligible = kian_memory::eligible_notes(&notes);
+        let rendered =
+            kian_memory::render_memory_index(&notes, &kian_memory::MemoryIndexConfig::default())
+                .expect("renders");
+
+        let payload = injection_admit_payload("e2e-agent", source, &rendered, &eligible);
+
+        // The exact two-key reserved envelope (the wire refuses it; only
+        // the create path admits it).
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["content", "memory"], "exactly two keys: {payload}");
+        assert_eq!(payload["content"], json!(rendered.text));
+
+        let marker = &payload["memory"];
+        assert_eq!(marker["scope"], json!("e2e-agent"));
+        assert_eq!(
+            marker["notes"],
+            json!([
+                kian_core::events::event_id(&source, 3),
+                kian_core::events::event_id(&source, 5),
+            ]),
+            "subject-order derived event ids"
+        );
+        assert_eq!(marker["items"], json!(rendered.items));
+        assert_eq!(marker["bytes"], json!(rendered.bytes));
+        assert_eq!(marker["truncated"], json!(rendered.truncated));
+        assert_eq!(marker["source_seq"], json!(rendered.source_seq));
+        assert!(
+            marker["redactions"].as_array().is_some(),
+            "the value-free redaction report rides the marker"
+        );
+    }
+
+    /// The counters record injections and honest skips, and the metrics
+    /// fragment carries the `injected_*` keys iff injection is on.
+    #[tokio::test]
+    async fn inject_counters_surface_in_the_metrics_fragment() {
+        let model = Arc::new(RecordingModel {
+            seen: std::sync::Mutex::new(Vec::new()),
+            answer: "[]".into(),
+        });
+        let dream = Arc::new(kian_memory::DreamDriver::new(
+            (*react_loop("dreamer-agent", model)).clone(),
+            MemoryConfig::default(),
+        ));
+
+        // Injection off: no injected_* keys (byte-identical fragment).
+        let off = MemoryAssembly::new("a".into(), MemoryConfig::default(), dream.clone(), None);
+        assert!(off.metrics_report().get("injected_sessions").is_none());
+
+        // Injection on: keys start at zero, records bump them.
+        let plan = InjectPlan::new(
+            SessionId::new(),
+            kian_memory::MemoryIndexConfig::default(),
+            kian_core::secrets::SecretRedactor::patterns_only(),
+        );
+        let on = MemoryAssembly::new("a".into(), MemoryConfig::default(), dream, Some(plan));
+        let report = on.metrics_report();
+        assert_eq!(report["injected_sessions"], json!(0));
+        assert_eq!(report["injected_skips"], json!(0));
+
+        let notes = vec![vnote(2, "s", "claim text")];
+        let rendered =
+            kian_memory::render_memory_index(&notes, &kian_memory::MemoryIndexConfig::default())
+                .expect("renders");
+        let counters = on.inject().expect("plan").counters();
+        counters.record_injected(&rendered);
+        counters.record_injected(&rendered);
+        counters.record_skip();
+        let report = on.metrics_report();
+        assert_eq!(report["injected_sessions"], json!(2));
+        assert_eq!(report["injected_items"], json!(2 * rendered.items));
+        assert_eq!(report["injected_bytes"], json!(2 * rendered.bytes));
+        assert_eq!(report["injected_truncations"], json!(0));
+        assert_eq!(report["injected_skips"], json!(1));
     }
 }

@@ -269,6 +269,52 @@ pub struct MemorySection {
     pub scope: String,
     /// The dreamer assembly.
     pub dreamer: DreamerSection,
+    /// The source memory session (P2 plan §2.1): the session whose
+    /// `memory/note` stream is rendered into new sessions at creation
+    /// time (MEMORY-MODEL §6 injection). A uuid string; **absent =
+    /// injection off** — sessions are byte-identical to a memory-off
+    /// server (I9).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// The injection caps (MEMORY-MODEL §6 I4). Requires `session` (a
+    /// caps block without a source session is a configuration mistake
+    /// and refuses, never silently ignored).
+    #[serde(default)]
+    pub inject: Option<InjectSection>,
+}
+
+/// The `memory.inject` block (P2 plan §2.1): the injection caps.
+/// Absent keys default to the bundle defaults
+/// (`kian_memory::MemoryIndexConfig::default()`); present values must
+/// be positive (fail-closed in [`ServeConfig::validate`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InjectSection {
+    /// Maximum entries a rendered index carries (default 20); over cap
+    /// the renderer degrades to subject + one-line excerpt. Must be > 0.
+    #[serde(default)]
+    pub max_items: Option<u64>,
+    /// Hard byte ceiling of the rendered index text (default 4096).
+    /// Must be > 0.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl InjectSection {
+    /// The caps in force (explicit values or the bundle defaults).
+    /// The values were already validated positive; this only fills
+    /// defaults — the same discipline as [`DreamerSection::caps`].
+    #[must_use]
+    pub fn caps(&self) -> kian_memory::MemoryIndexConfig {
+        kian_memory::MemoryIndexConfig {
+            max_items: self
+                .max_items
+                .unwrap_or(kian_memory::DEFAULT_INJECT_MAX_ITEMS),
+            max_bytes: self
+                .max_bytes
+                .unwrap_or(kian_memory::DEFAULT_INJECT_MAX_BYTES),
+        }
+    }
 }
 
 /// The `memory.dreamer` block: which agent dreams, and the caps.
@@ -2351,6 +2397,31 @@ impl ServeConfig {
             }
             if memory.dreamer.max_notes == Some(0) {
                 return Err(invalid("memory.dreamer.max_notes must be > 0"));
+            }
+            // P2 (kian-101): the injection source and caps. `session`
+            // absent = injection off (nothing below runs); present must
+            // be a parseable uuid — a typo'd session id would otherwise
+            // silently degrade every creation into a skip.
+            if let Some(session) = &memory.session
+                && uuid::Uuid::parse_str(session).is_err()
+            {
+                return Err(invalid(
+                    "memory.session must be a uuid string (the source memory session)",
+                ));
+            }
+            if let Some(inject) = &memory.inject {
+                if memory.session.is_none() {
+                    return Err(invalid(
+                        "memory.inject requires memory.session — injection caps without a \
+                         source session are a configuration mistake, never silently ignored",
+                    ));
+                }
+                if inject.max_items == Some(0) {
+                    return Err(invalid("memory.inject.max_items must be > 0"));
+                }
+                if inject.max_bytes == Some(0) {
+                    return Err(invalid("memory.inject.max_bytes must be > 0"));
+                }
             }
         }
 
@@ -4928,6 +4999,117 @@ recovery:
             err.to_string().contains("superagent"),
             "the mix must refuse: {err}"
         );
+    }
+
+    // -- memory injection config (P2, kian-101) ----------------------
+
+    /// The injection source parses: `memory.session` rides through, the
+    /// caps default to the bundle defaults; absent `session` (and
+    /// absent `inject`) is injection off.
+    #[test]
+    fn memory_injection_config_parses_with_defaults() {
+        let cfg = ServeConfig::parse(&memory_yaml()).expect("valid config");
+        let memory = cfg.memory.as_ref().expect("memory on");
+        assert!(memory.session.is_none(), "absent session = injection off");
+        assert!(memory.inject.is_none());
+
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let yaml = valid_yaml().replace(
+            "drain:",
+            &format!("memory:\n  scope: default\n  session: {uuid}\n  dreamer:\n    agent: default\ndrain:"),
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("valid config");
+        let memory = cfg.memory.as_ref().expect("memory on");
+        assert_eq!(memory.session.as_deref(), Some(uuid.as_str()));
+        assert!(memory.inject.is_none(), "no inject block = default caps");
+    }
+
+    /// Explicit injection caps ride through to `MemoryIndexConfig`.
+    #[test]
+    fn memory_injection_explicit_caps_parse() {
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let yaml = valid_yaml().replace(
+            "drain:",
+            &format!(
+                "memory:\n  scope: default\n  session: {uuid}\n  inject:\n    max_items: 5\n    max_bytes: 1024\n  dreamer:\n    agent: default\ndrain:"
+            ),
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("valid config");
+        let inject = cfg
+            .memory
+            .as_ref()
+            .expect("memory on")
+            .inject
+            .as_ref()
+            .expect("inject block");
+        assert_eq!(inject.max_items, Some(5));
+        assert_eq!(inject.max_bytes, Some(1024));
+        assert_eq!(
+            inject.caps(),
+            kian_memory::MemoryIndexConfig {
+                max_items: 5,
+                max_bytes: 1024,
+            }
+        );
+        // The bundle defaults fill absent keys.
+        let partial = valid_yaml().replace(
+            "drain:",
+            &format!(
+                "memory:\n  scope: default\n  session: {uuid}\n  inject:\n    max_items: 3\n  dreamer:\n    agent: default\ndrain:"
+            ),
+        );
+        let cfg = ServeConfig::parse(&partial).expect("valid config");
+        let caps = cfg
+            .memory
+            .as_ref()
+            .expect("memory on")
+            .inject
+            .as_ref()
+            .expect("inject block")
+            .caps();
+        assert_eq!(caps.max_items, 3);
+        assert_eq!(caps.max_bytes, kian_memory::DEFAULT_INJECT_MAX_BYTES);
+    }
+
+    /// The fail-closed matrix for the injection block: a non-uuid
+    /// session, caps without a session, zero caps, unknown inject keys.
+    #[test]
+    fn memory_injection_validation_is_fail_closed() {
+        let cases = [
+            (
+                "session not a uuid",
+                "memory:\n  scope: default\n  session: not-a-uuid\n  dreamer:\n    agent: default\n",
+                "memory.session",
+            ),
+            (
+                "inject without session",
+                "memory:\n  scope: default\n  inject:\n    max_items: 5\n  dreamer:\n    agent: default\n",
+                "memory.inject requires memory.session",
+            ),
+            (
+                "zero max_items",
+                "memory:\n  scope: default\n  session: 00000000-0000-0000-0000-000000000000\n  inject:\n    max_items: 0\n  dreamer:\n    agent: default\n",
+                "memory.inject.max_items",
+            ),
+            (
+                "zero max_bytes",
+                "memory:\n  scope: default\n  session: 00000000-0000-0000-0000-000000000000\n  inject:\n    max_bytes: 0\n  dreamer:\n    agent: default\n",
+                "memory.inject.max_bytes",
+            ),
+            (
+                "unknown inject key",
+                "memory:\n  scope: default\n  session: 00000000-0000-0000-0000-000000000000\n  inject:\n    cadence: hourly\n  dreamer:\n    agent: default\n",
+                "unknown field",
+            ),
+        ];
+        for (label, block, needle) in cases {
+            let yaml = format!("{block}\n{}", valid_yaml());
+            let err = ServeConfig::parse(&yaml).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "{label} must refuse with `{needle}`: {err}"
+            );
+        }
     }
 
     // -- read_model.snapshots (READ-MODEL P1) ----------------------

@@ -366,24 +366,25 @@ fn session_of(params: &Value) -> Result<SessionId, (i64, String)> {
     Ok(SessionId(uuid))
 }
 
-/// Reserved row-envelope key sets (DESIGN §3.1, MEMORY-MODEL §5 D1):
-/// `{content, dream}` (the ops-plane dream admit), `{content, spill}`
-/// (the Inline/Spill shape) and `{synthetic, content}` (the strippable
-/// steer marker). Only the server's internal planes produce these
-/// shapes — and the drain (`consumption_plan`) consumes each envelope
-/// only at exactly two keys (kian-96, review N-1), so a superset that
-/// passes this guard lands as ordinary nested content, never as a
-/// client-minted marker. A public `submit`/`steer`/`queue` carrying an
-/// exact reserved shape would let client content forge a marker the
-/// server is documented to set itself (kian-94, review B-2′), so the
-/// wire refuses them (`-32602`).
+/// Reserved row-envelope key sets (DESIGN §3.1, MEMORY-MODEL §5 D1 and
+/// §6 I1): `{content, dream}` (the ops-plane dream admit),
+/// `{content, spill}` (the Inline/Spill shape), `{synthetic, content}`
+/// (the strippable steer marker) and `{content, memory}` (the
+/// creation-time memory injection). Only the server's internal planes
+/// produce these shapes — and the drain (`consumption_plan`) consumes
+/// each envelope only at exactly two keys (kian-96, review N-1), so a
+/// superset that passes this guard lands as ordinary nested content,
+/// never as a client-minted marker. A public `submit`/`steer`/`queue`
+/// carrying an exact reserved shape would let client content forge a
+/// marker the server is documented to set itself (kian-94, review
+/// B-2′; kian-99), so the wire refuses them (`-32602`).
 fn is_reserved_envelope(content: &Value) -> bool {
     let Some(obj) = content.as_object() else {
         return false;
     };
     obj.len() == 2
         && obj.contains_key("content")
-        && ["dream", "spill", "synthetic"]
+        && ["dream", "spill", "synthetic", "memory"]
             .iter()
             .any(|k| obj.contains_key(*k))
 }
@@ -398,7 +399,8 @@ fn input_params(params: &Value) -> Result<(SessionId, Value, Option<String>), (i
         return Err((
             CODE_INVALID_PARAMS,
             "`content` is a reserved row-envelope key set ({content,dream} / {content,spill} \
-             / {synthetic,content}); only the server's internal planes admit those rows"
+             / {synthetic,content} / {content,memory}); only the server's internal planes \
+             admit those rows"
                 .to_string(),
         ));
     }
@@ -966,6 +968,47 @@ mod tests {
             json!({"content": "x", "unrelated": {"dream": 1}}),
         ] {
             assert!(!is_reserved_envelope(&ordinary), "{ordinary}");
+        }
+    }
+
+    /// kian-99: the exact `{content, memory}` injection shape joins the
+    /// reserved set — refused; a superset (`memory` + extra keys) and
+    /// near-misses stay ordinary client content.
+    #[test]
+    fn reserved_memory_envelope_detection_is_exact() {
+        assert!(is_reserved_envelope(&json!({
+            "content": "rendered index",
+            "memory": {"scope": "a", "notes": [], "bytes": 1, "items": 1,
+                        "truncated": false, "source_seq": 1}
+        })));
+        for ordinary in [
+            json!({"content": "x", "memory": {"scope": "a"}, "extra": true}),
+            json!({"memory": {"scope": "a"}, "unrelated": 1}),
+            json!({"content": "x", "unrelated": {"memory": 1}}),
+        ] {
+            assert!(!is_reserved_envelope(&ordinary), "{ordinary}");
+        }
+    }
+
+    /// kian-99: a public `submit` whose `content` is the exact
+    /// `{content, memory}` envelope is refused at the wire (`-32602`)
+    /// — only the server's own creation path admits that shape.
+    #[test]
+    fn input_params_refuses_the_memory_envelope() {
+        let params = json!({
+            "session": "00000000-0000-0000-0000-000000000001",
+            "content": {
+                "content": "rendered index",
+                "memory": {"scope": "ghost", "notes": [], "bytes": 1, "items": 1,
+                            "truncated": false, "source_seq": 1}
+            },
+        });
+        match input_params(&params) {
+            Err((code, msg)) => {
+                assert_eq!(code, CODE_INVALID_PARAMS);
+                assert!(msg.contains("reserved"), "{msg}");
+            }
+            Ok(ok) => panic!("the memory envelope must be refused, got {ok:?}"),
         }
     }
 

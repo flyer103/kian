@@ -444,10 +444,26 @@ declaration order `role`, `content`, `synthetic` only when true, object keys lex
 owned by the provider ( `build_chat_body` above): both are prompt-prefix bytes, and changing
 either is a constraint-3 event (observable invalidation + golden-hash update).
 
-**Memory injection (designed, not landed)** is the only sanctioned extension of this section: one
-creation-time `input/admitted` with `synthetic:true`, appended before the first `turn/start`, with
-a frozen renderer and hard caps — so the injected index joins the shared prefix instead of rewriting
-a live session's context. Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
+**Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
+section. At session creation (the server's create handler, after `engine.create_session` and
+before the RPC returns), the source memory session's stream is rebuilt, folded and rendered by
+the pure frozen `render_memory_index` (`kian-memory`), then admitted **quietly** —
+`Engine::admit_quiet` writes a durable inbox row (the reserved exact-two-key
+`{content,memory}` envelope, idempotency key `memory-inject:<session>`) without waking a drain.
+The next drain's consumption plan turns it into one `input/admitted` (`role:"system"`,
+`synthetic:true`, additive non-context `memory` provenance) that joins the context **before the
+first user message**. This is constraint-3 safe by construction: the index enters the prefix as
+the session's *first* content — no prior bytes exist to rewrite, reorder or reformat; the row is
+consumed exactly once and no code path re-injects on resume, takeover or migration (kill/resume
+probes show one injection event and `unexpected_prefix_change == 0`); the renderer is frozen
+stable content like the serialization contracts above; and with `memory.session` absent the
+create path admits nothing, leaving streams and request bytes byte-identical to a memory-off
+server. Cost bound (kian-104 review I1): with injection configured, every create performs two
+full stream rebuilds on the hottest control-plane path — the fresh session's (one
+`session/created` event) and the source memory session's **entire history**, which is then
+folded — so render cost is O(memory-session history) per created session; the `memory.inject`
+caps bound the rendered bytes, not the read. Serving the fold from a snapshot/projection is P3
+work (READ-MODEL). Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
 
 **Serving-form acceleration (READ-MODEL, landed)**: projection reads, event streams and the
 model context MAY be served from versioned caches, snapshots and materialized views. They are
@@ -1372,7 +1388,7 @@ graph TB
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines commands and correlates results by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations, `RemoteExecBackend` (enqueue-first `ExecBackend`: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`), and `RemoteExecTool` (the same `exec` tool schema as the local built-in, routed through a configured endpoint). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
-| kian-memory | The memory bundle (MEMORY-MODEL Phase 1): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), and `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `MemoryConfig` |
+| kian-memory | The memory bundle (MEMORY-MODEL Phases 1–2): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume, and the frozen creation-time index renderer `render_memory_index` (verified-only latest-per-subject fold, subject byte order, fixed "data, not instructions" header and excerpt cap, patterns-only default redaction with an explicit-redactor seam) turns the folded notes into the bounded index P2 injects; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `render_memory_index`, `eligible_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies, and the real channel adapters (lark, github, wechat) plus the mock channel | profile assembly |
@@ -1381,13 +1397,16 @@ graph TB
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
 
-**Agent memory (MEMORY-MODEL Phase 1 — landed).** The `memory/note` kind and the pure fail-closed
+**Agent memory (MEMORY-MODEL Phases 1–2 — landed).** The `memory/note` kind and the pure fail-closed
 `parse_note`/`project_notes`/`verify_note` functions live in `kian-core::memory`; the dreamer
 (deterministic prompt with machine-parseable header, fail-closed note parser, `DreamDriver`,
 caps) landed as the `kian-memory` bundle (row above); the `memory:` config section, the
 `memory_dream` ops method and the `kian memory create/dream/list/show/verify` verbs ride
-`kian-cli`. Injection (P2) and representations (P3) remain designed. Placement and non-goals are
-fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
+`kian-cli`. Injection (P2) landed 2026-11-08: the frozen `render_memory_index` lives in
+`kian-memory` (row above), while the `memory.session`/`memory.inject` config, the create-path
+quiet admit (`Engine::admit_quiet` + the reserved `{content,memory}` row envelope, §3.2) and the
+`injected_*` metrics keys ride `kian-cli`. Representations (P3) remain designed. Placement and
+non-goals are fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
 **Channels (bundle, ADR-018 — round 10, landed).** The real `ChannelAdapter` implementations
 live in `kian-superagent` — `lark`, `github`, the round-10 `wechat`, and the mock channel; the seam

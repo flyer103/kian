@@ -1,0 +1,545 @@
+//! kian-101 acceptance: the creation-time memory injection (P2 plan
+//! §2.2 / MEMORY-MODEL §6), in-process against a real sqlite store and
+//! the scripted mock provider (no network beyond localhost; `NO_PROXY`
+//! forced).
+//!
+//! Covers the card's acceptance list:
+//! - creation admits exactly ONE quiet row before any submit, and no
+//!   wake fires on creation (idle stays idle),
+//! - the first submit drains `[system memory, user task]` in that
+//!   order (the injected index precedes the task),
+//! - injection-off configs (no `memory.session`) admit no row — the
+//!   stream is byte-identical to a memory-off server,
+//! - verified-only notes are injected (a candidate never enters),
+//! - the caps are honoured (over-cap renders the truncated index),
+//! - every NEW session gets its own fresh row while an existing
+//!   session never re-injects.
+
+mod common;
+
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::post;
+
+use kian_cli::api::ControlPlane;
+use kian_cli::ops::OpsPlane;
+use kian_cli::server::Server;
+use kian_core::events::EventKind;
+use kian_core::model::SessionId;
+
+/// Spawns a mock openai-compat provider whose every response is
+/// `answer` (JSON-escaped properly — the dream answers are JSON
+/// arrays full of quotes).
+async fn scripted_answer_provider(answer: &'static str) -> String {
+    let frame = serde_json::json!({
+        "choices": [{"delta": {"content": answer}}]
+    });
+    let tail = serde_json::json!({
+        "choices": [{"delta": {}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {frame}\n\ndata: {tail}\n\n");
+    let app = Router::new()
+        .route(
+            "/chat/completions",
+            post(move |State(body): State<String>| async move {
+                let mut response = (StatusCode::OK, body).into_response();
+                response.headers_mut().insert(
+                    "content-type",
+                    axum::http::HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        )
+        .with_state(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("mock serve");
+    });
+    format!("http://{addr}")
+}
+
+/// Polls `cond` every 25 ms until it holds or `timeout_ms` elapses.
+async fn wait_for_async<F, Fut>(timeout_ms: u64, mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if cond().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Writes a kian.yaml with the memory section; `session`/`inject` are
+/// spliced in as given (`""` = absent — injection off).
+fn inject_config(
+    dir: &std::path::Path,
+    sqlite: &std::path::Path,
+    provider_base: &str,
+    session: &str,
+    inject: &str,
+) -> std::path::PathBuf {
+    let yaml = format!(
+        r#"listen: "127.0.0.1:0"
+storage:
+  sqlite: "{sqlite}"
+agent:
+  id: e2e-agent
+  model_slots:
+    main:
+      provider: mock
+      model: mock-model
+agents:
+  dreamer:
+    id: dreamer
+    model_slots:
+      main:
+        provider: mock
+        model: mock-model
+providers:
+  mock:
+    base_url: "{provider_base}"
+    api_key_env: KIAN_E2E_API_KEY
+drain:
+  max_iterations: 8
+memory:
+  scope: e2e-agent{session}
+  dreamer:
+    agent: dreamer
+    max_bytes_read: 262144{inject}
+recovery:
+  budget:
+    tokens: 64
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+        sqlite = sqlite.display(),
+    );
+    let path = dir.join("kian.yaml");
+    std::fs::write(&path, yaml).expect("write kian.yaml");
+    path
+}
+
+/// The dream answer with ONE verified note (in-range transcript ref)
+/// and one candidate — only the verified note may ever be injected.
+const ONE_VERIFIED_ANSWER: &str = r#"[{"subject":"deploys via dsh bridge","text":"Deploys go through the dsh bridge.","status":"verified","verified_by":{"method":"transcript","ref":"2"}},{"subject":"incident process","text":"Incidents are filed as INC-NN."}]"#;
+
+/// The dream answer with TWO verified notes (for the cap test).
+const TWO_VERIFIED_ANSWER: &str = r#"[{"subject":"deploys via dsh bridge","text":"Deploys go through the dsh bridge.","status":"verified","verified_by":{"method":"transcript","ref":"2"}},{"subject":"incident process","text":"Incidents are filed as INC-NN.","status":"verified","verified_by":{"method":"transcript","ref":"3"}}]"#;
+
+/// Drives one ordinary session to a completed settle and returns its id.
+async fn settled_session(control: &Arc<dyn ControlPlane>, content: &str) -> SessionId {
+    let session = control.create_session().await.expect("session");
+    control
+        .submit(session, serde_json::json!(content), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    session
+}
+
+/// The phase-A fixture: a source transcript session and a memory
+/// session whose stream carries the dream's notes (one dream over the
+/// source's first turn, `answer` scripting the dreamer). Returns the
+/// memory session id — the injection source for phase B.
+async fn dream_fixture(tag: &str, answer: &'static str) -> (std::path::PathBuf, SessionId) {
+    let dir = common::temp_dir(tag);
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider(answer).await;
+    // Phase A: injection off (no `memory.session` yet).
+    let config_path = inject_config(&dir, &sqlite, &provider_base, "", "");
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config");
+    let server = Arc::new(Server::from_config(config).await.expect("server"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let ops: Arc<dyn OpsPlane> = server.clone();
+
+    let source = settled_session(
+        &control,
+        "the deploy pipeline broke on staging; deploys go through the dsh bridge from now on",
+    )
+    .await;
+    let memory = control.create_session().await.expect("memory session");
+    ops.memory_dream(memory, source, 2, 5).await.expect("dream");
+    assert!(
+        wait_for_async(10_000, || {
+            let events = control.session_events(memory);
+            async {
+                events
+                    .await
+                    .map(|events| {
+                        events
+                            .iter()
+                            .any(|ev| matches!(ev.kind, EventKind::MemoryNote))
+                    })
+                    .unwrap_or(false)
+            }
+        })
+        .await,
+        "the dream must land memory/note events"
+    );
+    (dir, memory)
+}
+
+/// Mounts the server's public router and returns the base url.
+async fn mount(server: &Arc<Server>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind rpc");
+    let addr = listener.local_addr().expect("rpc addr");
+    let app = server.router();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("rpc serve");
+    });
+    format!("http://{addr}")
+}
+
+/// `GET /metrics` off the server's own router.
+async fn metrics(base: &str) -> serde_json::Value {
+    reqwest::Client::new()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("get /metrics")
+        .json()
+        .await
+        .expect("metrics json")
+}
+
+/// Creation injects exactly one quiet row before any submit; the first
+/// submit drains `[system memory, user task]`; a candidate note never
+/// enters; every new session gets its own row while an existing
+/// session never re-injects.
+#[tokio::test]
+async fn creation_injects_one_quiet_row_then_first_submit_drains_memory_then_task() {
+    common::force_no_proxy();
+    let (dir, memory) = dream_fixture("inject-quiet", ONE_VERIFIED_ANSWER).await;
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider("plain answer").await;
+    // Phase B: the same store, injection configured (default caps).
+    let config_path = inject_config(
+        &dir,
+        &sqlite,
+        &provider_base,
+        &format!("\n  session: {}", memory.0),
+        "",
+    );
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config B");
+    let server = Arc::new(Server::from_config(config).await.expect("server B"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let base = mount(&server).await;
+
+    // (a) creation admits exactly ONE quiet row and wakes nothing: the
+    // session is still Idle and its stream carries no admitted event
+    // yet (the row lives in the inbox until a submit drains it).
+    let session = control.create_session().await.expect("session");
+    let report = metrics(&base).await;
+    assert_eq!(report["memory"]["injected_sessions"], 1, "{report}");
+    assert_eq!(report["memory"]["injected_skips"], 0, "{report}");
+    assert!(
+        matches!(
+            control.projection(session).await,
+            Ok(kian_core::state::SessionState::Idle)
+        ),
+        "no wake on creation — idle stays idle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+            .count(),
+        0,
+        "the quiet row is durable inbox state, not an event"
+    );
+
+    // (b) the first submit drains `[system memory, user task]` in that
+    // order (admission order), and only the VERIFIED note entered.
+    control
+        .submit(session, serde_json::json!("the task"), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    let admitted: Vec<&kian_core::events::Event> = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+        .collect();
+    assert_eq!(admitted.len(), 2, "exactly [memory, task]: {events:?}");
+
+    let injected = admitted[0];
+    assert_eq!(injected.bytes["role"], "system", "{}", injected.bytes);
+    assert_eq!(injected.bytes["synthetic"], true);
+    let content = injected.bytes["content"].as_str().expect("content");
+    assert!(
+        content.starts_with(kian_memory::INDEX_HEADER.lines().next().unwrap_or_default()),
+        "the frozen header leads the injected text: {content}"
+    );
+    assert!(content.contains("Deploys go through the dsh bridge."));
+    assert!(
+        !content.contains("INC-NN"),
+        "a candidate note never enters a session: {content}"
+    );
+    // The marker (I1): the derived event id of the verified note, the
+    // renderer's own provenance, and the value-free redaction report.
+    let marker = &injected.bytes["memory"];
+    let note_seq = {
+        let mem_events = control.session_events(memory).await.expect("memory events");
+        mem_events
+            .iter()
+            .find(|ev| {
+                matches!(ev.kind, EventKind::MemoryNote)
+                    && ev.bytes["subject"] == "deploys via dsh bridge"
+            })
+            .expect("the verified note")
+            .seq
+    };
+    assert_eq!(marker["scope"], "e2e-agent");
+    assert_eq!(
+        marker["notes"],
+        serde_json::json!([kian_core::events::event_id(&memory, note_seq)]),
+        "exactly the verified note's derived event id"
+    );
+    assert_eq!(marker["items"], 1);
+    assert_eq!(marker["truncated"], false);
+    assert_eq!(marker["source_seq"], note_seq);
+    assert!(marker["bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(marker["redactions"].as_array().is_some());
+
+    assert_eq!(
+        admitted[1].bytes,
+        serde_json::json!({"role": "user", "content": "the task"}),
+        "the user task follows the memory index"
+    );
+
+    // (c) a NEW session gets its own fresh row; the existing session
+    // never re-injects (still exactly one memory-marked admitted).
+    let second = control.create_session().await.expect("second session");
+    let report = metrics(&base).await;
+    assert_eq!(report["memory"]["injected_sessions"], 2, "{report}");
+    let events = control.session_events(session).await.expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted)
+                && ev.bytes.get("memory").is_some())
+            .count(),
+        1,
+        "an existing session never re-injects"
+    );
+    let second_events = control.session_events(second).await.expect("second events");
+    assert_eq!(second_events.len(), 1, "the fresh session is untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Injection off (`memory.session` absent, memory section present):
+/// no row, no `memory` marker anywhere, byte-identical stream — and no
+/// `injected_*` metrics keys at all.
+#[tokio::test]
+async fn injection_off_admits_no_row_and_is_byte_identical() {
+    common::force_no_proxy();
+    let dir = common::temp_dir("inject-off");
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider("plain answer").await;
+    // Memory section present, `session` absent: injection off.
+    let config_path = inject_config(&dir, &sqlite, &provider_base, "", "");
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config");
+    let server = Arc::new(Server::from_config(config).await.expect("server"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let base = mount(&server).await;
+
+    let session = control.create_session().await.expect("session");
+    let report = metrics(&base).await;
+    assert!(
+        report["memory"].get("injected_sessions").is_none(),
+        "no injection counters when injection is off: {report}"
+    );
+    control
+        .submit(session, serde_json::json!("the task"), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    let admitted: Vec<&kian_core::events::Event> = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+        .collect();
+    assert_eq!(admitted.len(), 1, "one ordinary input, nothing else");
+    assert_eq!(
+        admitted[0].bytes,
+        serde_json::json!({"role": "user", "content": "the task"}),
+        "byte-identical to a memory-off session"
+    );
+    assert!(
+        !events.iter().any(|ev| ev.bytes.get("memory").is_some()),
+        "no memory marker anywhere in the stream"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The caps are honoured: `max_items: 1` over two verified notes
+/// renders the truncated index form (excerpts only) and counts the
+/// truncation honestly.
+#[tokio::test]
+async fn caps_render_the_truncated_index_and_count_it() {
+    common::force_no_proxy();
+    let (dir, memory) = dream_fixture("inject-caps", TWO_VERIFIED_ANSWER).await;
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider("plain answer").await;
+    let config_path = inject_config(
+        &dir,
+        &sqlite,
+        &provider_base,
+        &format!("\n  session: {}", memory.0),
+        "\n  inject:\n    max_items: 1",
+    );
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config B");
+    let server = Arc::new(Server::from_config(config).await.expect("server B"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let base = mount(&server).await;
+
+    let session = control.create_session().await.expect("session");
+    let report = metrics(&base).await;
+    assert_eq!(report["memory"]["injected_sessions"], 1, "{report}");
+    assert_eq!(report["memory"]["injected_truncations"], 1, "{report}");
+
+    control
+        .submit(session, serde_json::json!("the task"), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    let injected = events
+        .iter()
+        .find(|ev| matches!(ev.kind, EventKind::InputAdmitted) && ev.bytes.get("memory").is_some())
+        .expect("the injected row");
+    let content = injected.bytes["content"].as_str().expect("content");
+    assert!(
+        content.contains("(index truncated: 1 of 2 entries, excerpts only)"),
+        "the index-form footer: {content}"
+    );
+    assert!(
+        !content.contains("## deploys via dsh bridge"),
+        "over cap the full-form entry never renders, only the index line"
+    );
+    assert!(
+        content.contains("- deploys via dsh bridge: Deploys go through the dsh bridge."),
+        "the index-form entry is subject + one-line excerpt: {content}"
+    );
+    assert_eq!(injected.bytes["memory"]["items"], 1);
+    assert_eq!(injected.bytes["memory"]["truncated"], true);
+    // Both eligible notes stay pinned in the snapshot (source_seq
+    // includes cap-dropped entries; the notes list names them).
+    assert_eq!(
+        injected.bytes["memory"]["notes"].as_array().map(Vec::len),
+        Some(2),
+        "the marker names the full eligible snapshot"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I8 (honest degradation): a configured source that does not exist
+/// (or is unreadable) injects nothing, counts a skip, and creation
+/// still succeeds with a byte-identical session.
+#[tokio::test]
+async fn unknown_source_skips_honestly_and_never_fails_creation() {
+    common::force_no_proxy();
+    let dir = common::temp_dir("inject-ghost");
+    let sqlite = dir.join("kian.sqlite");
+    let provider_base = scripted_answer_provider("plain answer").await;
+    let ghost = SessionId::new();
+    let config_path = inject_config(
+        &dir,
+        &sqlite,
+        &provider_base,
+        &format!("\n  session: {}", ghost.0),
+        "",
+    );
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config");
+    let server = Arc::new(Server::from_config(config).await.expect("server"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let base = mount(&server).await;
+
+    // Creation succeeds — never failed by the injection path.
+    let session = control
+        .create_session()
+        .await
+        .expect("creation must succeed despite the ghost source");
+    let report = metrics(&base).await;
+    assert_eq!(report["memory"]["injected_sessions"], 0, "{report}");
+    assert_eq!(report["memory"]["injected_skips"], 1, "{report}");
+
+    // The session is ordinary and byte-identical: it settles, one
+    // admitted row, no memory marker.
+    control
+        .submit(session, serde_json::json!("the task"), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|ev| ev.bytes.get("memory").is_some()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -38,7 +38,13 @@
 //! `{"role": "user", "content": <content>, "dream": <marker>}` — the
 //! marker is additive and non-context (dreamer routing and provenance
 //! read it, never message text; `derive_model_context` output is
-//! unchanged).
+//! unchanged). The memory envelope (kian-99, MEMORY-MODEL §6) is the
+//! same shape for the creation-time injection: a row payload of exactly
+//! `{"content": <rendered index>, "memory": <provenance marker>}`,
+//! admitted only by the server's own creation path via
+//! [`Engine::admit_quiet`], consumes as ONE `input/admitted` carrying
+//! `{"role": "system", "content": <content>, "synthetic": true,
+//! "memory": <marker>}` — additive and non-context the same way.
 //!
 //! extends the same row-level convention with the reserved control
 //! envelope `{"kian": {"type": "control", "action": "interrupt", …}}`
@@ -938,18 +944,7 @@ where
         content: Value,
         idempotency_key: Option<String>,
     ) -> Result<AdmitOutcome, EngineError> {
-        let now = self.clock.now_ms();
-        let input = InputRow {
-            id: Uuid::new_v4(),
-            session,
-            payload: content,
-            admitted_at: now,
-            eligible_at: now,
-            idempotency_key,
-        };
-        // Constraint 6: the row is durable BEFORE the wake fires. On
-        // any store failure we return without touching the registry.
-        let outcome = self.store.admit(input).await?;
+        let outcome = self.admit_row(session, content, idempotency_key).await?;
         // wake transport (ADR-009 decision 4): publish the advisory
         // cross-replica hint. The admit INSERT above is a single
         // statement, so it has *committed* by the time we get here —
@@ -969,6 +964,49 @@ where
         }
         self.wake(session);
         Ok(outcome)
+    }
+
+    /// Admits one input **quietly** (MEMORY-MODEL §6, P2 plan §2.2):
+    /// the durable row lands exactly like [`Engine::admit`] — same
+    /// idempotency semantics, constraint 6's durable-row-first
+    /// ordering — but **no wake fires and no cross-replica NOTIFY hint
+    /// is published**. Wakes are advisory (invariant 2): the next
+    /// `submit`'s wake discovers the row and drains it first (the
+    /// inbox scan orders by admission), and the startup scan / sweep
+    /// bound the miss across restarts. The creation-time memory
+    /// injection uses this so the injected index row is durable
+    /// before any client input without arming a drain on a session
+    /// that has nothing to run yet.
+    pub async fn admit_quiet(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<AdmitOutcome, EngineError> {
+        self.admit_row(session, content, idempotency_key).await
+    }
+
+    /// The shared durable-row write behind [`Engine::admit`] and
+    /// [`Engine::admit_quiet`]: build the row, persist it, stop there.
+    /// Any wake/notify is the caller's decision.
+    async fn admit_row(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<AdmitOutcome, EngineError> {
+        let now = self.clock.now_ms();
+        let input = InputRow {
+            id: Uuid::new_v4(),
+            session,
+            payload: content,
+            admitted_at: now,
+            eligible_at: now,
+            idempotency_key,
+        };
+        // Constraint 6: the row is durable BEFORE any wake may fire.
+        // On any store failure we return without touching the registry.
+        Ok(self.store.admit(input).await?)
     }
 
     /// Steers a running session: a synthetic (strippable) input that
@@ -1517,9 +1555,15 @@ struct TakeReport {
 /// in one fenced write batch; the dream envelope
 /// `{"content": X, "dream": M}` (exactly those two keys — kian-91,
 /// review B-2) consumes to ONE admitted message carrying the trusted,
-/// server-set `dream` marker alongside `role`/`content` (the marker is
+/// `dream` marker alongside `role`/`content` (the marker is
 /// additive and non-context: dreamer routing and provenance read it,
-/// never the message text). The envelopes are row-level conventions
+/// never the message text); the memory envelope
+/// `{"content": X, "memory": M}` (exactly those two keys — kian-99,
+/// MEMORY-MODEL §6 I1) consumes to ONE admitted **system** message
+/// carrying the creation-time injection provenance marker alongside
+/// `role`/`content`/`synthetic:true` (the marker is additive and
+/// non-context: `derive_model_context` reads role/content/synthetic
+/// only). The envelopes are row-level conventions
 /// only — the committed event payload contracts are unchanged (the
 /// marker rides EVENT-MODEL §4.2's additive provenance keys). Like the
 /// steer wrapper before it, each exact two-key shape is reserved: a
@@ -1573,6 +1617,19 @@ fn consumption_plan(row: &InputRow) -> Consumption {
             // only, so request bytes are unchanged).
             return Consumption::Single(
                 json!({"role": "user", "content": content, "dream": dream}),
+            );
+        }
+        if obj.len() == 2
+            && let (Some(content), Some(memory)) = (obj.get("content"), obj.get("memory"))
+        {
+            // kian-99 (MEMORY-MODEL §6 I1): the server's creation-time
+            // memory injection admit (`admit_quiet`). ONE admitted
+            // system message, strippable (`synthetic:true`), the
+            // marker riding verbatim — additive, non-context
+            // (derive_model_context reads role/content/synthetic
+            // only, so request bytes are unchanged).
+            return Consumption::Single(
+                json!({"role": "system", "content": content, "synthetic": true, "memory": memory}),
             );
         }
     }
@@ -1815,6 +1872,120 @@ mod tests {
         assert_eq!(scan[0].eligible.len(), 1);
         gate.notify_one();
 
+        cleanup(&path);
+    }
+
+    /// kian-99: `admit_quiet` lands a durable row but arms nothing —
+    /// no drain spawns and the wake registry stays empty (wake is
+    /// advisory; the next submit's wake discovers the row).
+    #[tokio::test]
+    async fn admit_quiet_does_not_wake() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = eng.create_session().await.expect("session");
+
+        let outcome = eng
+            .admit_quiet(
+                sid,
+                json!({"content": "index", "memory": {"scope": "a", "items": 0}}),
+                Some(format!("memory-inject:{}", sid.0)),
+            )
+            .await
+            .expect("quiet admit");
+        assert!(!outcome.deduplicated);
+
+        assert!(
+            !eng.is_draining(&sid),
+            "no drain may spawn from admit_quiet"
+        );
+        assert_eq!(eng.pending_wake_depth(), 0, "the wake registry stays empty");
+        // The row IS durable: the startup scan sees it (admit semantics
+        // unchanged — only the wake is suppressed).
+        let scan = store.startup_scan(T0).await.expect("scan");
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].eligible.len(), 1);
+        cleanup(&path);
+    }
+
+    /// kian-99 (P2 plan §2.2): a `submit` after a quiet admit drains
+    /// BOTH rows in one drain, in admission order — the injected index
+    /// event lands before the user's message event.
+    #[tokio::test]
+    async fn submit_after_admit_quiet_drains_both_rows_in_admission_order() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = eng.create_session().await.expect("session");
+
+        let marker = json!({"scope": "ops-agent", "notes": [], "bytes": 32, "items": 1,
+                            "truncated": false, "source_seq": 3});
+        eng.admit_quiet(
+            sid,
+            json!({"content": "rendered index", "memory": marker.clone()}),
+            Some(format!("memory-inject:{}", sid.0)),
+        )
+        .await
+        .expect("quiet admit");
+
+        // The quiet row sits dormant until this submit's wake drains.
+        eng.admit(
+            sid,
+            json!("what changed since yesterday?"),
+            Some("k2".into()),
+        )
+        .await
+        .expect("submit");
+
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the session settles through the one woken drain"
+        );
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 2, "both rows consumed: {events:#?}");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "system", "content": "rendered index", "synthetic": true,
+                   "memory": marker}),
+            "the injected index lands first"
+        );
+        assert_eq!(
+            admitted[1].bytes,
+            json!({"role": "user", "content": "what changed since yesterday?"}),
+            "the user's message lands second"
+        );
+        cleanup(&path);
+    }
+
+    /// kian-99: `admit_quiet` shares `admit`'s idempotency semantics —
+    /// a repeated key deduplicates (first write wins, one row).
+    #[tokio::test]
+    async fn admit_quiet_dedupes_on_a_repeated_key() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = eng.create_session().await.expect("session");
+        let key = format!("memory-inject:{}", sid.0);
+
+        let first = eng
+            .admit_quiet(sid, json!("index-a"), Some(key.clone()))
+            .await
+            .expect("first quiet admit");
+        assert!(!first.deduplicated);
+        let second = eng
+            .admit_quiet(sid, json!("index-b"), Some(key))
+            .await
+            .expect("repeated quiet admit");
+        assert!(second.deduplicated, "first write wins");
+
+        let scan = store.startup_scan(T0).await.expect("scan");
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].eligible.len(), 1, "exactly one durable row");
+        assert_eq!(scan[0].eligible[0].payload, json!("index-a"));
         cleanup(&path);
     }
 
@@ -2132,6 +2303,117 @@ mod tests {
             !with_marker.contains("source_session"),
             "the marker must never enter model context"
         );
+        cleanup(&path);
+    }
+
+    /// kian-99 (MEMORY-MODEL §6 I1): the memory envelope row — exactly
+    /// `{"content": X, "memory": M}` — consumes to ONE `input/admitted`
+    /// system message carrying `synthetic:true` + the marker verbatim
+    /// (no sibling event), and the additive marker leaves the projected
+    /// model context byte-identical to the same stream without it
+    /// (constraint 3).
+    #[tokio::test]
+    async fn memory_envelope_consumes_to_one_admitted_system_message() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let marker = json!({
+            "scope": "ops-agent",
+            "notes": [
+                "evt_00000000-0000-0000-0000-000000000001",
+                "evt_00000000-0000-0000-0000-000000000002"
+            ],
+            "bytes": 512,
+            "items": 2,
+            "truncated": false,
+            "source_seq": 41,
+        });
+        let index = "[kian-memory: scope=\"ops-agent\" items=2]\n\n- deploy: use pnpm\n- test: cargo nextest";
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": index, "memory": marker.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "exactly one input/admitted event");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "system", "content": index, "synthetic": true, "memory": marker}),
+            "the marker rides the admitted payload verbatim"
+        );
+        // Constraint-3 witness: the additive, non-context marker leaves
+        // derive_model_context byte-identical (the same stream without
+        // the key derives the same context).
+        let mut bare = events.clone();
+        for ev in &mut bare {
+            if ev.kind == EventKind::InputAdmitted {
+                ev.bytes.as_object_mut().unwrap().remove("memory");
+            }
+        }
+        let with_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&events).unwrap())
+                .unwrap();
+        let without_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&bare).unwrap())
+                .unwrap();
+        assert_eq!(with_marker, without_marker);
+        assert!(with_marker.contains("cargo nextest"));
+        assert!(
+            !with_marker.contains("source_seq"),
+            "the marker must never enter model context"
+        );
+        // The synthetic marker survives the projection, so export can
+        // strip the injection (I6).
+        assert!(
+            with_marker.contains("\"synthetic\":true"),
+            "the injected index is strippable: {with_marker}"
+        );
+        cleanup(&path);
+    }
+
+    /// A superset (`memory` + extra keys) is ordinary content, never an
+    /// envelope (kian-99, the kian-96 review N-1 discipline): the wire
+    /// guard refuses only exact key-set equality, so the consumption
+    /// plan must not mint a system injection from public content.
+    #[tokio::test]
+    async fn memory_superset_row_is_ordinary_content() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let forged = json!({
+            "content": "totally ordinary user text",
+            "memory": {"scope": "ghost", "items": 1, "bytes": 10, "truncated": false, "source_seq": 1},
+            "extra": true,
+        });
+        store.admit(row(sid, 7, forged.clone())).await.unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1);
+        // Ordinary user content: the whole payload rides as content,
+        // no top-level `memory`/`synthetic` key was minted.
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": forged}),
+            "a superset must consume as ordinary content"
+        );
+        assert!(admitted[0].bytes.get("memory").is_none());
+        assert!(admitted[0].bytes.get("synthetic").is_none());
         cleanup(&path);
     }
 

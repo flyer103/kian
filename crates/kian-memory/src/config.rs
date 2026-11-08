@@ -15,6 +15,12 @@ pub const DEFAULT_MAX_BYTES_READ: u64 = 262_144;
 /// Default per-answer note cap (matches the injection `max_items`
 /// discipline of MEMORY-MODEL §6 I4).
 pub const DEFAULT_MAX_NOTES: u64 = 20;
+/// Default injection item cap (MEMORY-MODEL §6 I4): at most 20 entries
+/// per rendered memory index.
+pub const DEFAULT_INJECT_MAX_ITEMS: u64 = 20;
+/// Default injection byte cap (MEMORY-MODEL §6 I4): a rendered memory
+/// index stays within 4096 bytes.
+pub const DEFAULT_INJECT_MAX_BYTES: u64 = 4096;
 
 /// Why a memory config block was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -73,6 +79,51 @@ fn positive(value: &Value, field: &'static str) -> Result<u64, MemoryConfigError
     match value.as_u64() {
         Some(n) if n > 0 => Ok(n),
         _ => Err(MemoryConfigError::Invalid(field.to_string())),
+    }
+}
+
+/// The injection caps (MEMORY-MODEL §6 I4, plan §2.1's `memory.inject`
+/// block). Config-first pure values: [`crate::render_memory_index`]
+/// enforces them; the config wiring lands with kian-101. An absent
+/// block is "injection off" at the caller, not a config error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryIndexConfig {
+    /// Maximum entries a rendered index carries; over cap the renderer
+    /// degrades to subject + one-line excerpt per item.
+    pub max_items: u64,
+    /// Hard byte ceiling of the rendered index text.
+    pub max_bytes: u64,
+}
+
+impl Default for MemoryIndexConfig {
+    fn default() -> Self {
+        Self {
+            max_items: DEFAULT_INJECT_MAX_ITEMS,
+            max_bytes: DEFAULT_INJECT_MAX_BYTES,
+        }
+    }
+}
+
+impl MemoryIndexConfig {
+    /// Fail-closed parse of the injection caps block: an object whose
+    /// keys are a subset of `{max_items, max_bytes}`, each a positive
+    /// integer. Anything else refuses (the same discipline as
+    /// [`MemoryConfig::from_value`]).
+    pub fn from_value(block: &Value) -> Result<Self, MemoryConfigError> {
+        let obj = block.as_object().ok_or(MemoryConfigError::NotAnObject)?;
+        let mut config = Self::default();
+        for (key, value) in obj {
+            match key.as_str() {
+                "max_items" => {
+                    config.max_items = positive(value, "max_items")?;
+                }
+                "max_bytes" => {
+                    config.max_bytes = positive(value, "max_bytes")?;
+                }
+                unknown => return Err(MemoryConfigError::UnknownKey(unknown.to_string())),
+            }
+        }
+        Ok(config)
     }
 }
 

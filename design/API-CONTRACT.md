@@ -316,7 +316,7 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}` |
 | `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
-| `memory` | object or `null` | Dream counters of the memory assembly (dreams, read/parse/append failures, notes appended/deduped); `null` when no `memory:` section assembled |
+| `memory` | object or `null` | Counters of the memory assembly: dream counters (dreams, read/parse/append failures, notes appended/deduped) and, when `memory.session` is configured (P2), the injection counters `injected_sessions`/`injected_items`/`injected_bytes`/`injected_truncations`/`injected_skips`; `null` when no `memory:` section assembled |
 | `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |
 
 The seven top-level keys are stable; nested counters are additive. Consumers must ignore unknown

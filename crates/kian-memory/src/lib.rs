@@ -28,7 +28,16 @@
 //!   path. A parse failure appends nothing (honest zero) and counts.
 //! - [`config`] — [`MemoryConfig`]: the `max_bytes_read` / `max_notes`
 //!   caps, parsed fail-closed (used by the caller that renders and
-//!   admits, kian-87).
+//!   admits, kian-87), plus [`MemoryIndexConfig`]: the injection caps
+//!   `max_items` / `max_bytes` (MEMORY-MODEL §6 I4).
+//! - [`index`] — [`render_memory_index`]: the deterministic
+//!   creation-time memory index renderer (MEMORY-MODEL §6, P2): verified
+//!   notes only, subject byte order, hard item/byte caps that degrade to
+//!   subject + one-line-excerpt entries, a fixed "data, not instructions"
+//!   header, and the [`kian_core::secrets`] redaction pass whose report
+//!   rides the provenance struct. Pure: no I/O, no state — the caller
+//!   (kian-101) admits the rendered row. The rendered bytes are frozen
+//!   content (constraint 3 / I5).
 //!
 //! The event stream is the sole truth (constraint 1): every note lands
 //! as one `memory/note` event (the kind landed by kian-84, payload
@@ -37,11 +46,19 @@
 
 pub mod config;
 pub mod driver;
+pub mod index;
 pub mod parse;
 pub mod prompt;
 
-pub use config::{DEFAULT_MAX_BYTES_READ, DEFAULT_MAX_NOTES, MemoryConfig, MemoryConfigError};
+pub use config::{
+    DEFAULT_INJECT_MAX_BYTES, DEFAULT_INJECT_MAX_ITEMS, DEFAULT_MAX_BYTES_READ, DEFAULT_MAX_NOTES,
+    MemoryConfig, MemoryConfigError, MemoryIndexConfig,
+};
 pub use driver::{DreamCounters, DreamDriver, dream_request_in};
+pub use index::{
+    EXCERPT_MAX_CHARS, INDEX_HEADER, RenderedIndex, eligible_notes, render_memory_index,
+    render_memory_index_with,
+};
 pub use kian_loop::{LoopDriver, LoopOutcome};
 pub use parse::{NoteDraft, ParseError, parse_notes};
 pub use prompt::{

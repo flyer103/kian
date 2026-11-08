@@ -757,3 +757,66 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   real text-length limit and rate limits; baseurl-vs-`api_base` (CHANNEL-WECHAT §14 item 8).
   The `AGENTS.md` docs-map bullets (CHANNEL-WECHAT, READ-MODEL) remain owner-pending — protected
   file.
+
+## 2026-11-08 — agent-memory P2: creation-time injection — default-green (L1/L2)
+
+- **Scope** — MEMORY-MODEL §6 landed exactly as designed: no new event kind (the injection is an
+  ordinary `input/admitted`), no new crate, no table/migration. Four additive deltas only:
+  `Engine::admit_quiet` + the `memory` row arm, the additive non-context `memory` provenance key,
+  the `memory.session`/`memory.inject` config block, and the pure renderer.
+- **Quiet admit + the `memory` row arm (kian-99)** — `Engine::admit_quiet` writes a durable inbox
+  row without waking (no NOTIFY, no drain; same idempotency semantics as `admit` via a shared
+  `admit_row` helper). The consumption plan gains one arm: a row payload of exactly
+  `{"content":X,"memory":M}` consumes to ONE `input/admitted`
+  `{role:"system",content:X,synthetic:true,memory:M}`; a superset shape is ordinary content. The
+  public wire (`submit`/`steer`/`queue`) refuses the exact two-key shape with `-32602` (the fifth
+  reserved envelope), so only the server's create path can land the marker.
+- **Deterministic index renderer (kian-100)** — `kian-memory` `index.rs`:
+  `render_memory_index(notes, cfg)` filters verified-only (latest verified per subject, subject
+  byte order), renders the full claims within both caps, degrades over either cap to the index
+  form (subject + one-line excerpt ≤ 120 chars, whole entries dropped until the byte cap fits,
+  `truncated:true`), and returns `None` for an empty eligible set or an unusable budget (admit
+  nothing). Frozen content (constraint 3): the `# Memory index` "data, not instructions" header
+  and the excerpt cap are named constants; the default redaction pass is pattern-scanning only
+  (env-sourced known values would break cross-machine determinism), with
+  `render_memory_index_with` as the assembly seam for the configured redactor; the value-free
+  report rides provenance.
+- **Config + creation-time injection (kian-101)** — `memory.session` (the source memory session
+  uuid; absent = injection off, byte-identical) and `memory.inject {max_items, max_bytes}`
+  (fail-closed; defaults 20 / 4096). The server's create path, after `engine.create_session` and
+  before the RPC returns, rebuilds the source stream, folds, renders, applies the identity
+  exclusions (the source session itself and dreamer-agent sessions), and quietly admits the index
+  under idempotency key `memory-inject:<session>`; every failure is honest degradation (inject
+  nothing + `injected_skips`, never a failed creation). New `GET /metrics` `memory` keys:
+  `injected_sessions/items/bytes/truncations/skips` (present only when injection is configured).
+- **Acceptance (kian-102, independent QA)** — 9 QA-authored probes over real sqlite + real drains
+  + scripted recording providers, run then removed: exactly-once across kill/resume (one
+  injection event, `unexpected_prefix_change == 0`, request bytes == persisted event bytes),
+  admission order `[system index, user task]`, injection-off byte-identity (streams **and** raw
+  provider bodies), caps → index form, empty verified set admits nothing, `strip_synthetic`
+  recovers the pre-memory context, adversarial note text stays inside the data frame, the
+  idempotency key dedupes repeated admits, exclusions are identity-based. All 8 acceptance
+  behaviours PASS. **Finding F1 (accepted, documented)**: a session that crosses a restart
+  between `create` and its first submit has its quiet row woken by the NoLostWork startup
+  rebuild — the index drains alone as the first provider turn. Exactly-once and prefix stability
+  hold; recorded as known behavior in MEMORY-MODEL §6 I2 (fix needs an inbox-row schema change,
+  out of scope).
+- **Closeout docs (kian-103)** — MEMORY-MODEL §6 reconciled with the landed behavior (status
+  P2 landed; I1–I9 updated; I10 exclusions added; the F1 restart window recorded; §9 metrics),
+  SPEC §5 P2 row → landed, DESIGN §3.2 creation-time path + constraint-3 argument, DESIGN §7
+  crate map, README feature bullet + advanced-usage example + docs/crate map rows, this entry.
+  EVENT-MODEL §3/§4.2/§4.5 were reconciled with the payload changes in the kian-99/101 changes.
+- **Unverified (named)** — no process-level `kill -9` variant (in-process drop + rebuild over
+  the same sqlite exercised the same `startup_rebuild` path); residual prompt-injection risk vs a
+  real model (no provider key — the frame is asserted structurally, A8 known limitation);
+  concurrent create/submit not stress-tested (guarded by construction: fresh uuid + per-session
+  key); the dreamer-agent exclusion is covered at the pure level only (structurally unreachable
+  at server create).
+- **Gates on the final tree** — build / `cargo test --workspace` (1263 passed / 0 failed /
+  5 ignored, 104 suites) / clippy `--workspace --all-targets -D warnings` / fmt `--all --check`
+  green; `docs_map` green. New tests: kian-99 (`admit_quiet_does_not_wake`,
+  `submit_after_admit_quiet_drains_both_rows_in_admission_order`,
+  `admit_quiet_dedupes_on_a_repeated_key`,
+  `memory_envelope_consumes_to_one_admitted_system_message` + wire-refusal/mutation guards in
+  `kian-cli`), kian-100 (`kian-memory` renderer suite), kian-101
+  (`crates/kian-cli/tests/memory_inject.rs` end-to-end suite).

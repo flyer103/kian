@@ -33,9 +33,11 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   heartbeat watchdog; offline work parks and resumes honestly.
 - **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
   the same `LoopDriver` seam and event kinds.
-- **Agent memory (notes + dreaming)** — the memory session's drain reads a bounded transcript
-  range and appends `memory/note` events (claims with provenance and verification state);
-  `kian memory create/dream/list/show/verify`. Injection is a later phase.
+- **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
+  a bounded transcript range and appends `memory/note` events (claims with provenance and
+  verification state); `kian memory create/dream/list/show/verify`. New sessions can open with a
+  bounded, verified-only memory index injected once at creation (`memory.session`, config-gated,
+  byte-identical when off).
 - **Read-model serving form** — versioned unchanged/delta projection reads, resumable SSE
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
@@ -73,7 +75,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/DESIGN.md](design/DESIGN.md) | The blueprint (HOW): execution model, recovery, plugin system, bundle |
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
-| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phase 1 landed; injection/representations designed) |
+| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phases 1–2 landed; representations designed) |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
@@ -477,6 +479,11 @@ change. Absent the `memory:` section, behavior is byte-identical (memory off).
 ```yaml
 memory:
   scope: my-agent            # the agent identity whose memory this is
+  session: 0f9c2a11-…        # the source memory session: new sessions open with its
+                             # verified notes as an injected index (absent = injection off)
+  inject:
+    max_items: 20            # default; over-cap renders subject + one-line excerpt only
+    max_bytes: 4096          # default; the rendered index never exceeds this
   dreamer:
     agent: my-agent          # a named agents: entry or the default agent: id
     max_bytes_read: 262144   # default 256 KiB; an over-budget dream is refused, not truncated
@@ -494,8 +501,15 @@ target/debug/kian memory verify --session "$MEM" --config kian.yaml   # re-check
 ```
 
 A dream is idempotent per `(source, range)` — repeating the same range is a no-op, and a drain
-crash resumes without duplicate notes (dedupe on `(subject, derived_from)`). Injection into new
-sessions is Phase 2 (designed, not landed).
+crash resumes without duplicate notes (dedupe on `(subject, derived_from)`).
+
+With `memory.session` set, every newly created session quietly admits one bounded index of the
+**verified** notes (frozen "data, not instructions" framing, secret-redacted, hard-capped) as its
+first system message — persisted as an event before any request flies, injected exactly once
+(never on resume or migration), strippable from replay, and byte-identical to a memory-off server
+when the key is absent. The `injected_*` keys in `curl -s localhost:7433/metrics | jq .memory`
+count sessions, items, bytes, truncations and honest skips.
+([design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) §6.)
 
 ### Read model (versions, snapshots, views, retention)
 
@@ -568,7 +582,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-orchestrator` | Admit → Wake → Drain → Promote engine and the bounded three-layer recovery subsystem |
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
-| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` |
+| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — plus the frozen creation-time index renderer |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
 | `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |

@@ -334,17 +334,18 @@ Out of scope (recorded, not silently dropped): the `ask` permission/confirmation
 conversion (usage persists verbatim; pricing is a projection-layer decision), CMA wire
 compatibility, and cross-replica interrupt latency beyond "next safe boundary" (ADR-014).
 
-### Agent memory (Phase 1 landed; P2/P3 designed)
+### Agent memory (Phases 1–2 landed; P3 designed)
 
 Scope: knowledge that survives a session boundary (P9). The normative contract is
 [design/MEMORY-MODEL.md](../design/MEMORY-MODEL.md); the rationale is
-[ADR-016](../design/decisions/ADR-016-memory-as-events.md). Phase 1 (notes + dreaming) is landed
-(notes and dreaming only); P2/P3 record the agreed later phases, not shipped status.
+[ADR-016](../design/decisions/ADR-016-memory-as-events.md). Phase 1 (notes + dreaming) landed
+2026-11-07 and Phase 2 (creation-time injection) landed 2026-11-08; P3 records the agreed later
+phase, not shipped status.
 
 | Phase | Module | Contents | Status |
 |--------|--------|----------|--------|
 | P1 | Notes + dreaming | `memory/note` as the 22nd durable kind (non-context, `DrainActivity`, additions-only, emitted only by a dreamer drain); the fail-closed `project_notes` fold + `verify_note` in `kian-core::memory`; the `kian-memory` bundle (deterministic dream prompt with a machine-parseable header, fail-closed parser, `DreamDriver`); one operator-created memory session per configured scope (`memory.scope`, no derived-id machinery); a dream request as one durable **marked** inbox row (the rendered prompt as `content` plus the trusted server-set `dream` marker, consumed to one `input/admitted` carrying the non-context `dream` key — routing and provenance read the marker, never message text; idempotency key `dream:<source>:<from>:<to>`) over a source range bounded by the source head and `max_bytes_read`; `kian memory create/dream/list/show/verify` + the `memory_dream` ops method; provenance (`derived_from`) and `status`/`verified_by` are payload fields; no injection, no cadence | landed |
-| P2 | Injection | One creation-time `input/admitted` with `synthetic:true`, verified notes only, hard caps (default 20 items / 4 KiB), index-only over cap, never on resume/migration; additive non-context provenance; renderer frozen | designed |
+| P2 | Injection | One creation-time `input/admitted` with `role:"system"`, `synthetic:true` and the additive non-context `memory` provenance key (scope, note event-ids, items/bytes/truncated, `source_seq` pin, redaction report); quiet admit at creation (`Engine::admit_quiet`, no wake; idempotency key `memory-inject:<session>`; the next submit drains the index before the first user message) over the exact-two-key `{content,memory}` row envelope, which the public wire refuses (`-32602`); config `memory.session` (absent = injection off, byte-identical) + `memory.inject` caps (fail-closed, default 20 items / 4 KiB); the deterministic frozen renderer in `kian-memory` (verified-only latest-per-subject, subject order, redacted, "data, not instructions" frame, index-only over cap); identity exclusions that are defense-in-depth only at the creation seam — at create time a fresh stream has no dream request and the fresh uuid never equals `memory.session`, so any fresh session created while `memory.session` points at a note-bearing session receives the index (accepted for P2; kian-104 review B1, recorded in MEMORY-MODEL §6 I10); honest-skip `injected_*` counters; never on resume/migration (one known restart-window drain-alone behavior recorded in MEMORY-MODEL §6 I2) | landed |
 | P3 | Representations | Disposable projections over notes (index/map) rebuilt on demand, recall integration, declarative dreaming cadence/budget | designed |
 
 Non-goals recorded with the phases: no in-session memory tool (P1), no mid-session memory updates
