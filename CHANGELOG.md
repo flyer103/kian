@@ -820,3 +820,35 @@ outcome (an honest negative, kept as the true record), the rest as explicitly no
   `memory_envelope_consumes_to_one_admitted_system_message` + wire-refusal/mutation guards in
   `kian-cli`), kian-100 (`kian-memory` renderer suite), kian-101
   (`crates/kian-cli/tests/memory_inject.rs` end-to-end suite).
+
+## Round-10 WeChat L3 live-run fixes (2026-11-08)
+
+The first real phone/QR run of the WeChat iLink channel surfaced five defects that the mocked
+suites could not; all are fixed, tested, and re-verified live (messages delivered in both
+directions).
+
+- **Official iLink client identity is required** (`kian-superagent`, `wechat/protocol.rs`) —
+  `iLink-App-Id: bot`, `iLink-App-ClientVersion: 0x0002040A` and `base_info.channel_version:
+  2.4.10`. The kian-branded values made WeChat's ClawBot login page fail with `Network error`
+  before the scan reached the server; the QR scan then confirmed and wrote the 0600 credential.
+- **Sender provenance reaches the model** (`wechat.rs`) — the event `raw` now carries
+  `from_user_id`; the Router prompt derives the reply target from `raw.from_user_id` instead of
+  guessing (it previously used the message id).
+- **Target spellings tolerated** (`wechat.rs`) — the model may pass `target` as a JSON object or
+  as a JSON-encoded string; both are parsed before the allowlist checks.
+- **Ret-less `sendmessage` success accepted** (`protocol.rs`) — the live success body omits `ret`;
+  an absent `ret` now reads as success (official-client parity), a non-object body is still
+  `Malformed`, and `ret != 0`/`errcode != 0` stay honest failures. The strict parse had caused a
+  retry storm whose sends the server had in fact accepted.
+- **Judge tags and channel formatting** (`templates.rs`, `policy.rs`) — the decision tag is
+  confined to the Router's assistant narration (it must not appear in `reply` text); channel text
+  is plain text (no markdown/emoji), summarized rather than relayed from a worker report; the IM
+  budget now counts **CJK characters as units** (a whitespace-only count let arbitrarily long
+  Chinese replies through the ≤100 rule), cuts over-budget text at the last complete sentence that
+  keeps at least half the budget, and the prompt asks for a complete summary plus
+  `回复「详情」看完整结果` instead of relying on truncation.
+- **L3 evidence recorded** — `design/CHANNEL-WECHAT.md` §13: QR login, admission/delivery event
+  ids, empty-cursor downtime replay (single observation), ret-less wire shape, target spelling,
+  tag leak, CJK budget; §14 item 4 resolved, item 3 updated.
+- **Unverified remains** — `-14` token lifetime / automatic re-login; real text-length and rate
+  limits; `baseurl` vs `api_base`; media/typing/group/multi-account/proactive push (phase 2).

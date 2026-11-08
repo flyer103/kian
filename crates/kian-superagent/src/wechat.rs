@@ -555,6 +555,7 @@ pub fn map_message(
             "text": text,
             "create_time_ms": create_time_ms,
             "item_types": item_types,
+            "from_user_id": from_user_id,
         }),
         ts_ms: create_time_ms,
     })
@@ -620,8 +621,17 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
                 .into(),
         ));
     }
-    let Some(user_id) = out
-        .target
+    // The channel-defined target may arrive as a JSON object or as a
+    // JSON-encoded string (tool-argument dialects differ); parse the
+    // string form before the allowlist checks so a well-formed target
+    // is never rejected over its wire spelling.
+    let target = match &out.target {
+        Value::String(raw) => {
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| out.target.clone())
+        }
+        other => other.clone(),
+    };
+    let Some(user_id) = target
         .get("user_id")
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
@@ -1016,6 +1026,7 @@ mod tests {
                 "text": "build broken",
                 "create_time_ms": 1730000000123u64,
                 "item_types": [1],
+                "from_user_id": "oUSER@im.wechat",
             })
         );
         assert_eq!(event.ts_ms, 1730000000123);
@@ -1103,6 +1114,7 @@ mod tests {
                 "text": "the caption",
                 "create_time_ms": 1730000000123u64,
                 "item_types": [2, 1],
+                "from_user_id": "oUSER@im.wechat",
             })
         );
     }

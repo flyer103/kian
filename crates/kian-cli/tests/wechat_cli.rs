@@ -980,10 +980,8 @@ async fn e2e_router_reply_produces_the_exact_sendmessage_payload() {
         "client_id generated per delivery: {msg}"
     );
     assert!(
-        body["base_info"]["channel_version"]
-            .as_str()
-            .is_some_and(|v| v.starts_with("kian/")),
-        "base_info.channel_version is kian/<version>: {}",
+        body["base_info"]["channel_version"].as_str() == Some("2.4.10"),
+        "base_info.channel_version is the official 2.4.10: {}",
         body["base_info"]
     );
     assert!(

@@ -57,8 +57,8 @@ pub const ELLIPSIS: &str = "…";
 /// The §4.2 IM output policy template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImPolicy {
-    /// Hard word limit. Word count = whitespace tokens of the
-    /// plain-text reply.
+    /// Hard unit limit. Unit count = whitespace tokens + one unit per
+    /// CJK character of the plain-text reply.
     pub max_words: u64,
 }
 
@@ -76,24 +76,53 @@ impl Default for ImPolicy {
 pub struct EnforcedReply {
     /// The text to deliver (truncated or verbatim).
     pub text: String,
-    /// Whitespace-token count of the delivered `text` (excluding the
-    /// truncation ellipsis).
+    /// Delivered-unit count of `text` (excluding the truncation
+    /// ellipsis): whitespace tokens + one unit per CJK character.
     pub words: u64,
     /// True iff the original reply exceeded the limit and was cut.
     pub truncated: bool,
 }
 
-/// Whitespace-token count of `text` (the word-count definition).
+/// Counts delivered-text units (the IM budget unit): one unit per
+/// whitespace token plus one unit per CJK character. CJK scripts have no
+/// inter-word spaces, so a whitespace-only count would let an
+/// arbitrarily long Chinese reply through the ≤100-unit budget.
 #[must_use]
 pub fn count_words(text: &str) -> u64 {
-    text.split_whitespace().count() as u64
+    let mut units = 0u64;
+    let mut in_token = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            in_token = false;
+            continue;
+        }
+        if !in_token {
+            units += 1;
+            in_token = true;
+        }
+        if is_cjk(ch) {
+            units += 1;
+        }
+    }
+    units
+}
+
+/// CJK scripts without inter-word spaces: Han (all blocks), kana, Hangul.
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3040..=0x30FF      // hiragana + katakana
+        | 0x3400..=0x4DBF    // CJK unified ideographs extension A
+        | 0x4E00..=0x9FFF    // CJK unified ideographs
+        | 0xAC00..=0xD7AF    // Hangul syllables
+        | 0xF900..=0xFAFF    // CJK compatibility ideographs
+    )
 }
 
 impl ImPolicy {
-    /// Shapes `text` for delivery. Over-limit replies keep their first
-    /// `max_words` whitespace tokens (joined by single spaces) plus a
-    /// trailing ellipsis; exact-limit and under-limit replies pass
-    /// verbatim with `truncated: false`.
+    /// Shapes `text` for delivery. Over-limit replies keep the longest
+    /// prefix whose unit count is within `max_words` (cutting inside a
+    /// CJK run when needed) plus a trailing ellipsis; exact-limit and
+    /// under-limit replies pass verbatim with `truncated: false`.
     #[must_use]
     pub fn enforce(&self, text: &str) -> EnforcedReply {
         let words = count_words(text);
@@ -104,13 +133,55 @@ impl ImPolicy {
                 truncated: false,
             };
         }
-        let kept: Vec<&str> = text
-            .split_whitespace()
-            .take(self.max_words as usize)
-            .collect();
+        let mut kept = String::new();
+        let mut units = 0u64;
+        let mut in_token = false;
+        // The last sentence boundary inside the budget; a clean cut there
+        // beats a mid-sentence cut when it keeps a healthy prefix.
+        let mut last_boundary: Option<usize> = None;
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                in_token = false;
+                kept.push(ch);
+                if ch == '\n' {
+                    last_boundary = Some(kept.len());
+                }
+                continue;
+            }
+            let mut cost = 0u64;
+            if !in_token {
+                cost += 1;
+                in_token = true;
+            }
+            if is_cjk(ch) {
+                cost += 1;
+            }
+            if units + cost > self.max_words {
+                break;
+            }
+            units += cost;
+            kept.push(ch);
+            if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
+                last_boundary = Some(kept.len());
+            }
+        }
+        if let Some(boundary) = last_boundary {
+            let prefix = &kept[..boundary];
+            let prefix_units = count_words(prefix);
+            // Only prefer the boundary when it keeps at least half the
+            // budget; otherwise the hard cut carries more of the answer.
+            if prefix_units * 2 >= self.max_words {
+                kept.truncate(boundary);
+                units = prefix_units;
+            }
+        }
+        while kept.ends_with(char::is_whitespace) {
+            kept.pop();
+        }
+        kept.push_str(ELLIPSIS);
         EnforcedReply {
-            text: format!("{}{ELLIPSIS}", kept.join(" ")),
-            words: self.max_words,
+            text: kept,
+            words: units,
             truncated: true,
         }
     }
@@ -497,6 +568,57 @@ mod tests {
         assert_eq!(count_words("one"), 1);
         assert_eq!(count_words("  two   words  "), 2);
         assert_eq!(count_words("a\tb\nc"), 3);
+    }
+
+    #[test]
+    fn cjk_characters_count_one_unit_each() {
+        // CJK has no inter-word spaces: the whitespace-token-only count
+        // would read a long Chinese reply as one or two "words".
+        assert_eq!(count_words("你好"), 3); // token start + 2 ideographs
+        assert_eq!(count_words("你好 世界"), 6); // 2 tokens + 4 ideographs
+        assert_eq!(count_words("共 171 个任务"), 7); // 3 tokens + 4 ideographs
+        assert_eq!(count_words("hi 你好"), 4); // 2 tokens + 2 ideographs
+    }
+
+    #[test]
+    fn cjk_over_limit_reply_is_cut_inside_the_run() {
+        let policy = ImPolicy { max_words: 5 };
+        let enforced = policy.enforce("你好世界你好");
+        assert!(enforced.truncated);
+        assert_eq!(enforced.words, 5);
+        assert_eq!(enforced.text, "你好世界…");
+        assert_eq!(count_words(&enforced.text), 5);
+        // A mixed reply keeps the ASCII token and cuts inside the CJK run.
+        let mixed = ImPolicy { max_words: 3 }.enforce("hi 你好世界");
+        assert_eq!(mixed.words, 3);
+        assert_eq!(mixed.text, "hi 你…");
+        assert_eq!(count_words(&mixed.text), 3);
+        // Under-limit CJK text passes verbatim.
+        let verbatim = ImPolicy { max_words: 100 }.enforce("你好，世界！");
+        assert!(!verbatim.truncated);
+        assert_eq!(verbatim.text, "你好，世界！");
+    }
+
+    #[test]
+    fn over_limit_reply_prefers_a_sentence_boundary_that_keeps_half_the_budget() {
+        // The Chinese report case: cut after a complete sentence instead
+        // of mid-sentence when the boundary keeps enough of the answer.
+        let policy = ImPolicy { max_words: 6 };
+        let enforced = policy.enforce("你好。世界你好世界");
+        assert!(enforced.truncated);
+        assert_eq!(enforced.text, "你好。…");
+        assert!(enforced.words * 2 >= policy.max_words);
+        assert_eq!(count_words(&enforced.text), enforced.words);
+        // A boundary that keeps less than half the budget is ignored in
+        // favor of the hard cut (more of the answer survives).
+        let hard = ImPolicy { max_words: 10 }.enforce("好。世界你好世界你好世界");
+        assert!(hard.truncated);
+        assert!(
+            !hard.text.starts_with("好。…"),
+            "hard cut carries more: {}",
+            hard.text
+        );
+        assert!(count_words(&hard.text) <= 10);
     }
 
     #[test]

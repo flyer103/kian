@@ -33,7 +33,7 @@ pub const QR_BOT_TYPE: u32 = 3;
 /// `base_info.channel_version` sent with every POST body: kian's own
 /// client version. Whether the server accepts an arbitrary value is
 /// UNVERIFIED (CHANNEL-WECHAT §14.4 — settle in L3).
-pub const CHANNEL_VERSION: &str = concat!("kian/", env!("CARGO_PKG_VERSION"));
+pub const CHANNEL_VERSION: &str = "2.4.10";
 
 /// `AuthorizationType` header value (the token kind the `Authorization`
 /// header carries).
@@ -42,11 +42,11 @@ pub const AUTHORIZATION_TYPE: &str = "ilink_bot_token";
 /// Observability `iLink-App-Id`. Whether the server requires the two
 /// `iLink-*` headers from a third-party client is UNVERIFIED (§14.4) —
 /// send them and verify in L3.
-pub const ILINK_APP_ID: &str = "kian";
+pub const ILINK_APP_ID: &str = "bot";
 
 /// Observability `iLink-App-ClientVersion`, a uint32 `0x00MMNNPP`.
 /// `0x00_00_01_00` spells 0.1.0 (major 0, minor 1, patch 0).
-pub const ILINK_APP_CLIENT_VERSION: u32 = 0x0000_0100;
+pub const ILINK_APP_CLIENT_VERSION: u32 = 0x0002_040A;
 
 /// UA-style `bot_agent` header (≤256 bytes; also the HTTP client's
 /// `User-Agent`).
@@ -177,10 +177,13 @@ impl IlinkClient {
     /// object (the adapter builds the exact §2.4 shape). `ret != 0` is
     /// returned as data ([`SendOutcome`]), not an error — only the
     /// adapter knows the receipt rule; `-14` is classified here because
-    /// it pauses the whole channel. A body WITHOUT an integer `ret` is
-    /// [`IlinkError::Malformed`] (a shape break is never a success),
-    /// and a non-`-14` non-zero `errcode` is [`IlinkError::Api`] —
-    /// symmetric with the receive path's `classify`.
+    /// it pauses the whole channel. The live wire's success body may
+    /// **omit `ret`** (the official client treats an absent ret as
+    /// success); an absent `ret` is therefore read as `0`. A non-object
+    /// body is [`IlinkError::Malformed`] (a shape break is never a
+    /// success), and a non-`-14` non-zero `errcode` is
+    /// [`IlinkError::Api`] — symmetric with the receive path's
+    /// `classify`.
     pub async fn send_message(
         &self,
         base_url: &str,
@@ -193,14 +196,18 @@ impl IlinkClient {
         let value = self
             .post_json(&url, token, &body, timeout, "sendmessage")
             .await?;
+        if !value.is_object() {
+            return Err(IlinkError::Malformed(
+                "sendmessage response is not a JSON object".into(),
+            ));
+        }
         if value.get("errcode").and_then(Value::as_i64) == Some(STALE_TOKEN_ERRCODE) {
             return Err(IlinkError::StaleToken);
         }
-        let ret = value.get("ret").and_then(Value::as_i64).ok_or_else(|| {
-            IlinkError::Malformed(
-                "sendmessage response carries no integer `ret` — nothing synthesized".into(),
-            )
-        })?;
+        // The real success body may omit `ret` (official client: an
+        // absent ret is success); read it as 0, never synthesize a
+        // field the server did not send.
+        let ret = value.get("ret").and_then(Value::as_i64).unwrap_or(0);
         let errcode = value.get("errcode").and_then(Value::as_i64).unwrap_or(0);
         if errcode != 0 {
             return Err(IlinkError::Api {

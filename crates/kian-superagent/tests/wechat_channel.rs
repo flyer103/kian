@@ -544,7 +544,7 @@ async fn receive_maps_a_text_message_to_exactly_one_channel_event() {
     assert_eq!(event.group, None);
     assert_eq!(
         event.payload,
-        json!({"text": "build broken", "create_time_ms": 1730000000123u64, "item_types": [1]})
+        json!({"text": "build broken", "create_time_ms": 1730000000123u64, "item_types": [1], "from_user_id": USER})
     );
     assert_eq!(event.ts_ms, 1730000000123);
 
@@ -790,10 +790,7 @@ async fn send_builds_the_exact_sendmessage_payload() {
         .and_then(Value::as_str)
         .unwrap();
     assert!(!client_id.is_empty(), "client_id is generated per delivery");
-    assert_eq!(
-        body["base_info"],
-        json!({"channel_version": format!("kian/{}", env!("CARGO_PKG_VERSION"))})
-    );
+    assert_eq!(body["base_info"], json!({"channel_version": "2.4.10"}));
     // Exactly the two top-level keys — no extra fields.
     let mut keys: Vec<&str> = body
         .as_object()
@@ -810,7 +807,7 @@ async fn send_builds_the_exact_sendmessage_payload() {
         assert_eq!(captured.authorization, "Bearer fake-bot-token-1");
         assert_eq!(captured.authorization_type, "ilink_bot_token");
         assert!(!captured.wechat_uin.is_empty(), "X-WECHAT-UIN present");
-        assert_eq!(captured.ilink_app_id, "kian");
+        assert_eq!(captured.ilink_app_id, "bot");
         assert!(
             captured.bot_agent.starts_with("kian/"),
             "bot_agent UA-style"
@@ -836,6 +833,35 @@ async fn send_builds_the_exact_sendmessage_payload() {
         "one fresh X-WECHAT-UIN per request: {uins:?} vs {} requests",
         all.len()
     );
+    std::fs::remove_file(cred).ok();
+}
+
+/// The model may emit the channel-defined target as a JSON-encoded
+/// string (one tool-argument dialect); the adapter parses the string
+/// form before the allowlist checks, so a well-formed target is never
+/// rejected over its wire spelling.
+#[tokio::test]
+async fn a_json_string_target_is_accepted_for_send() {
+    force_no_proxy();
+    let mock = IlinkMock::new();
+    let base = mock.clone().serve().await;
+    let cred = temp_credential_path("send-string-target");
+    write_credentials(&cred, "fake-bot-token-1");
+    let channel = channel_with_one_inbound(&mock, &base, &cred).await;
+
+    let receipt = channel
+        .send(ChannelDelivery {
+            channel: "wechat".into(),
+            target: json!(format!("{{\"user_id\": \"{USER}\"}}")),
+            content: json!("string-shaped target"),
+        })
+        .await
+        .expect("a JSON-encoded target string is accepted");
+    assert_eq!(receipt.message_id, "18446744073709551615");
+
+    let sends = mock.requests_for("/ilink/bot/sendmessage");
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].body.pointer("/msg/to_user_id"), Some(&json!(USER)));
     std::fs::remove_file(cred).ok();
 }
 
@@ -1149,9 +1175,10 @@ async fn send_error_mapping_is_honest_per_the_degradation_table() {
     std::fs::remove_file(cred).ok();
 }
 
-/// M4: a `sendmessage` response without `ret` (a shape break or a
-/// proxy's `{}` body) and one with `ret: 0` but a failing `errcode`
-/// must never mint a receipt — nothing synthesized (§11).
+/// M4 (settled by the live L3 wire): the real `sendmessage` success
+/// body omits `ret`, so an absent ret is success (official-client
+/// parity); a non-object body is still malformed, and `ret: 0` with a
+/// failing `errcode` is still a failure — nothing synthesized (§11).
 #[tokio::test]
 async fn a_missing_ret_or_a_failing_errcode_is_never_a_success() {
     force_no_proxy();
@@ -1161,20 +1188,32 @@ async fn a_missing_ret_or_a_failing_errcode_is_never_a_success() {
     write_credentials(&cred, "fake-bot-token-1");
     let channel = channel_with_one_inbound(&mock, &base, &cred).await;
 
-    // (a) `ret` absent: a shape break is an honest error, never a
-    // synthesized success.
+    // (a) `ret` absent is the live wire's success shape: a receipt is
+    // minted, falling back to our client_id when no message_id exists.
     mock.push_send(json!({"message_id": 1, "errmsg": "ok"}));
-    let error = channel
+    let receipt = channel
         .send(ChannelDelivery {
             channel: "wechat".into(),
             target: json!({"user_id": USER}),
             content: json!("probe missing ret"),
         })
         .await
-        .expect_err("a response without ret is never a success");
+        .expect("a ret-less success body is accepted");
+    assert_eq!(receipt.message_id, "1");
+
+    // (a2) a non-object body is malformed, never a success.
+    mock.push_send(json!([]));
+    let error = channel
+        .send(ChannelDelivery {
+            channel: "wechat".into(),
+            target: json!({"user_id": USER}),
+            content: json!("probe non-object"),
+        })
+        .await
+        .expect_err("a non-object body is never a success");
     assert!(
-        matches!(&error, ChannelError::Unavailable(why) if why.contains("ret")),
-        "the honest error names the missing field: {error}"
+        matches!(&error, ChannelError::Unavailable(why) if why.contains("malformed")),
+        "the honest error names the malformed body: {error}"
     );
 
     // (b) `ret: 0` with a non-zero, non--14 errcode is a failure too

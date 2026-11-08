@@ -87,11 +87,11 @@ Phase 2 only (not implemented in round 10): `GET /ilink/bot/getconfig` (`typing_
 | `AuthorizationType` | `ilink_bot_token` |
 | `X-WECHAT-UIN` | `base64(<random decimal uint32>)` — a **new** value per request |
 | `Authorization` | `Bearer <bot token>` from the credential file; never logged |
-| `iLink-App-Id`, `iLink-App-ClientVersion`, `bot_agent` | optional/observability: client version is a uint32 `0x00MMNNPP`, `bot_agent` is UA-style and ≤256 bytes. Whether the server requires the two `iLink-*` headers from a third-party client is **UNVERIFIED** — send them and settle it in L3 (§13) |
+| `iLink-App-Id`, `iLink-App-ClientVersion`, `bot_agent` | the login liteapp requires the **official client identity**: `iLink-App-Id: bot` (the official package's `ilink_appid`), `iLink-App-ClientVersion: 0x0002040A` (2.4.10), and `base_info.channel_version: 2.4.10`; kian-branded values made WeChat's ClawBot page fail with `Network error` before the scan ever reached the server (L3, 2026-11-08). `bot_agent` stays kian-branded (UA-style, ≤256 bytes, observability) |
 
 `base_info` is attached to every POST body as `{channel_version: "<value>"}`. The official client
-sends its own plugin version; kian sends `kian/<crate version>`. Whether an arbitrary value is
-accepted is **UNVERIFIED** (L3).
+sends its own plugin version; kian sends the official `2.4.10` because the login liteapp rejects a
+non-official value (settled by the L3 live run, 2026-11-08 — see §13).
 
 ### 2.3 Inbound message (`WeixinMessage`)
 
@@ -120,9 +120,14 @@ accepted is **UNVERIFIED** (L3).
     "context_token": "<the token from the inbound message being answered>",
     "item_list": [{"type": 1, "text_item": {"text": "<the reply text>"}}]
   },
-  "base_info": {"channel_version": "kian/<crate version>"}
+  "base_info": {"channel_version": "2.4.10"}
 }
 ```
+
+**Response**: the live success body may **omit `ret`** (the official client treats an absent `ret`
+as success). kian reads an absent `ret` as `0` and mints the receipt, falling back to its own
+`client_id` when `message_id` is absent. A non-object body is `Malformed`; `ret != 0` or a
+non-`-14` `errcode != 0` is an honest failure (settled by the L3 live run, 2026-11-08).
 
 ## 3. Receive: `ChannelEvent` mapping
 
@@ -137,7 +142,7 @@ without a server.
 | `topic` | `topics[from_user_id]` | the same table is the allowlist |
 | `sender` | `{"user_id": from_user_id}` | verbatim adapter-defined identity object |
 | `group` | `None` | direct chats only in phase 1 |
-| `payload` | `{"text": "<text_item.text>", "create_time_ms": <u64>, "item_types": [<u8>…]}` | derived, text-bearing, media-free; the raw item list is not persisted (media is phase 2) |
+| `payload` | `{"text": "<text_item.text>", "create_time_ms": <u64>, "item_types": [<u8>…], "from_user_id": "<the sender id>"}` | derived, text-bearing, media-free; the raw item list is not persisted (media is phase 2). `from_user_id` is the **only** place the model can read the reply target (the provenance wrapper exposes `raw`, not `sender`) |
 | `ts_ms` | `create_time_ms` | falls back to the adapter's receive time when the field is absent |
 
 Rules — each produces `None` plus an audit line, never a synthesized event:
@@ -160,7 +165,7 @@ change (§15).
 | `ChannelDelivery` field | Handling |
 |---|---|
 | `channel` | must be this channel's name |
-| `target` | `{"user_id": "<recipient>"}`; any other shape is an honest `DeliveryFailed` naming the expected shape |
+| `target` | `{"user_id": "<recipient>"}` — a JSON object, or its JSON-encoded string (tool-argument dialects differ; both accepted). The recipient is the inbound event's `raw.from_user_id`; any other shape is an honest `DeliveryFailed` naming the expected shape |
 | `content` | a JSON string, or an object with a `text` string; anything else is `DeliveryFailed` (policy shaping happens upstream, §4.2 of DESIGN) |
 
 - The adapter resolves the **latest** `context_token` it has seen for that `user_id` (§5) and
@@ -169,9 +174,9 @@ change (§15).
   (§9): a delivery naming any other user is an honest `DeliveryFailed` naming the allowlist —
   never a silent send, and never wire traffic. The reply target is model-controlled, so this
   check is a security boundary, not a convenience.
-- Resolve only on `ret == 0`: a receipt is minted from the response `message_id` (numeric ids
-  stringified losslessly); a `ret == 0` response without one falls back to the request `client_id`
-  we generated — never an invented server id.
+- Resolve only on `ret == 0` **or an absent `ret`** (the live success shape): a receipt is minted
+  from the response `message_id` (numeric ids stringified losslessly); a success response without
+  one falls back to the request `client_id` we generated — never an invented server id.
 - `ret != 0` → `DeliveryFailed` quoting `ret`/`errmsg`. A transport-level timeout →
   `ChannelError::Timeout`; any other transport failure → `Unavailable`. Errors are redacted: no
   token, no `Authorization` value, no full request headers.
@@ -180,6 +185,12 @@ change (§15).
   receipt. A failure after part *k* is a `DeliveryFailed` naming how many parts landed — the
   caller's outbox retry then re-drives the whole shaped delivery, which is at-least-once.
 - One inbound message may be answered once; nothing here sends to a user with no inbound (§5).
+- **Output shape**: the reply text is plain text (the client renders no markdown). The Router
+  prompt forbids markdown/emoji and asks for a complete answer inside the IM budget; the shared IM
+  policy enforces ≤100 **units**, where each CJK character counts one unit (CJK has no inter-word
+  spaces, so a whitespace-token count would never trigger). Over-budget text is cut at the last
+  complete sentence that keeps at least half the budget, with an honest `truncated` receipt; the
+  Router is told to summarize and offer `回复「详情」看完整结果` instead of relying on truncation.
 
 ## 5. The `context_token` rule
 
@@ -379,17 +390,40 @@ behavior, `iLink-*`/`base_info` acceptance, the real text-length limit and rate 
 manual steps and their outcomes belong in the round's QA record and CHANGELOG, stated as
 unverified until actually executed.
 
+**First live L3 run (2026-11-08, owner phone)** — results, recorded here as evidence:
+
+- QR login succeeded (bot `<bot-id>@im.bot`, user `<open-id>@im.wechat`)
+  only after the adapter sent the **official client identity** (`bot` / `0x0002040A` / `2.4.10`);
+  kian-branded identity values failed **client-side** (`Network error`) before the scan reached
+  the server (`scanned` count stayed 0).
+- End-to-end delivery proven: WeChat text → `input/admitted` (event id lossless) → `tool/call
+  reply` with target `raw.from_user_id` → `channel/delivered` → iLink `sendmessage` returned a
+  `message_id`; the operator received the messages. `hi` and `你是谁？` both round-tripped.
+- A message sent while no client was polling was delivered on the first empty-cursor poll
+  (single observation; see §14 item 3).
+- The real `sendmessage` success body **omits `ret`**; an earlier strict parse rejected it and
+  caused the repeated-retry storm (fixed).
+- The model emitted the channel target as a JSON-encoded **string**, and the ad-hoc `user_id`
+  came from the wrapper only after `from_user_id` was added to `raw`; both are fixed above.
+- The Router leaked the judge-side `decision:*` tag into channel text; the prompt now places the
+  tag in the assistant narration only.
+- The CJK budget was previously bypassed (whitespace-only count): a 160+ character Chinese report
+  counted as 25 "words" and would have been sent whole; it now truncates at the unit budget
+
 ## 14. UNVERIFIED (must stay visible)
 
 1. iLink has **no public API contract** — Tencent may change or terminate it; the channel is
    best-effort and must degrade alone.
 2. `-14` session lifetime and whether re-login ever happens automatically are unverified (the
    official client pauses 1 h and expects the operator to re-login).
-3. Whether `getupdates` with an empty `get_updates_buf` replays messages missed during downtime is
-   unverified — measure in L3; if it does not, the downtime gap is documented as an honest bound
-   and **no position table** is added.
-4. Whether `iLink-App-Id`, `iLink-App-ClientVersion` and an arbitrary `base_info.channel_version`
-   are required for a non-OpenClaw client is unverified — verify in L3.
+3. Whether `getupdates` with an empty `get_updates_buf` replays messages missed during downtime:
+   **observed once (2026-11-08)** — a message sent while no client was polling was delivered on
+   the first empty-cursor poll. Treated as an observation, not a guarantee; no position table is
+   added and the downtime gap remains a documented bound until repeated.
+4. **RESOLVED (2026-11-08)**: the login liteapp requires the official client identity —
+   `iLink-App-Id: bot`, `iLink-App-ClientVersion: 0x0002040A` (2.4.10), and
+   `base_info.channel_version: 2.4.10`; kian-branded values produced a WeChat-side `Network error`
+   before the scan reached the server. `bot_agent` remains kian-branded and accepted.
 5. The real text-length limit and the rate limits are unverified — defensive split at ~2000
    characters plus honest errors.
 6. macOS system proxy intercepts localhost: local end-to-end tests need
