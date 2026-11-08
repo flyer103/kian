@@ -113,7 +113,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `slot/fallback` | — | DrainActivity | `{"slot":<str>,"from":{"provider","model"},"to":{"provider","model"}}` | provider turn | One fallback-chain switch, persisted before the fallback call. |
 | `slot/migration` | — | DrainActivity | `{"slot":<str>,"from_spec":<spec>,"to_spec":<spec>,"reason":<str>}` | ops/control path | The only escape hatch from an immutable binding. |
 | `recovery/budget-reset` | — | DrainActivity | `{"reason":<str>}` | operator | Running-preserving only (the ops path refuses idle/terminal sessions); audit only — budget state re-derives from config, context skips it. |
-| `thread/started` | — | Thread | `{"thread_id":<uuid-str>,"parent":<session-uuid>,"worker":<session-uuid>,"pinned_version":<u64>,"task":<message payload>}` | superagent / worker | Thread lineage + delegation authority wrapper are durable here (ADR-012). |
+| `thread/started` | — | Thread | `{"thread_id":<uuid-str>,"parent":<session-uuid>,"worker":<session-uuid>,"pinned_version":<u64>,"task":<message payload>}`; additive: `"exec_worker":<str>` | superagent / worker | Thread lineage + delegation authority wrapper are durable here (ADR-012). `exec_worker` is the execution-worker id the session is bound to (ADR-020, §4.2). |
 | `thread/completed` | — | DrainActivity | `{"thread_id":<uuid-str>,"status":"completed"\|"failed"\|"interrupted","summary":<message payload>}` | worker | Worker outcome before the end write; never maps a failed gate onto `completed`. |
 | `evidence/verdict` | — | DrainActivity | `{"gate":<str>,"passed":<bool>,"checks":[{"name":<str>,"passed":<bool>,"detail"?<str>}],"attempt":<u64>}` | loop (evidence gate) | Bounded, declarative stop gate (A6); no model call. |
 | `channel/delivered` | — | DrainActivity | `{"channel":<str>,"target":<json>,"policy":<str>,"words"?<u64>,"truncated":<bool>}`; additive: `"attempt"`,`"first_attempt_ms"` | superagent/channel | Honest delivery receipt; no receipt means no delivery. |
@@ -159,6 +159,25 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   request.
 - `memory/note`: `"redactions": [{"kind","name","count"}]` — note `text` passes the secret
   redactor before append; the report is aggregate counts only (the `tool/result` precedent).
+- `thread/started` and the delegation wrapper (ADR-020): `"exec_worker"` — the **execution-worker
+  id** (a configured `endpoints[].id`) the delegated worker session is bound to. The same key and
+  the same value appear twice, in one payload each: as a top-level `thread/started` payload key
+  (audit echo, readable without parsing the task) and inside the task's delegation-wrapper
+  `content` (the worker's first message — the wrapper *is* the message, so the binding is recorded
+  in the same bytes the model consumed). `worker` in that payload keeps its own meaning (the worker
+  **session** uuid); `worker` and `exec_worker` are never conflated and `worker` is never
+  repurposed. Absent = legacy unbound (both places, byte-identical legacy bytes); a present but
+  malformed value (non-string / empty) is never guessed, never defaulted and never fallback-routed —
+  it is an honest refusal (ADR-020 I7). The two copies are derived from the same wrapper, so a
+  stream where they disagree is malformed history and is refused rather than reconciled.
+  Context effect, stated precisely: the top-level payload key is a pure additive audit key (it rides
+  outside `content`, so `derive_model_context` — which reads `role`/`content`/`synthetic` only —
+  never puts it in a request), and it is the key this section's rule governs. The wrapper copy is a
+  field of a message payload's `content`, which passes through verbatim (§4.1) — the same standing
+  as `speculative` and `mandate`: model-visible by design, because the worker is entitled to know
+  which machine it runs on, and legitimate because only **new** message bytes carry it. Legacy
+  wrapper bytes and every persisted `step/request.body` stay untouched, so history is not rewritten
+  and no live session's prefix changes as a result of the record itself.
 
 Rule: an additive key must leave legacy event bytes byte-identical and must not change
 `derive_model_context` output or model request bytes. If a proposed field is model-visible, it is
@@ -269,8 +288,9 @@ A new kind is the **last** resort (config → plugin → seam → core primitive
   durable, but not an event until consumed/appended.
 - **Derived projections**: session state, ticket stage, outbox view, usage/cache reports — pure
   projections over events; never authoritative state.
-- **Bundle-level provenance**: channel wrappers, untrusted markers, mandates (they ride message
-  payloads / `thread/started` task payloads, not new event kinds).
+- **Bundle-level provenance**: channel wrappers, untrusted markers, mandates, the speculative
+  marker and the execution-worker binding `exec_worker` (they ride message payloads /
+  `thread/started` task payloads as additive keys, not new event kinds).
 - **Envelope/audit metadata**: the derived event id is computed, never stored; export wrappers are
   not events.
 

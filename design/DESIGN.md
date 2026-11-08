@@ -609,6 +609,41 @@ graph TB
  projection). Config: `superagent.followup_ownership` (default **on**); `false` restores the
  legacy behavior on both surfaces. Runtime ended-transitions are honest-v1 bounded: the boot
  rebuild re-derives them from streams, and `mark_worker_ended` is the runtime seam.
+- **Execution-worker binding** (ADR-020; contract in `design/EVENT-MODEL.md` §3/§4.2): a delegated
+  worker session is bound to exactly one **execution worker** — a configured `endpoints[].id` (a
+  `kiand` daemon; the loop itself stays on the `kian serve` side). The catalog is config
+  (`endpoints[].id` + an optional human `description`); zero endpoints means the feature is off.
+  The binding is **durable and derived, never resident**: the delegation wrapper (the worker's first
+  message) carries the additive `"exec_worker"` key and the `thread/started` payload carries the
+  same additive top-level key on both sides, so the assignment is a projection of the session's own
+  stream and a restart reconstructs it by replay. `worker` in that payload keeps meaning the worker
+  *session* uuid; `exec_worker` is the worker *id* and the two names are never conflated. Routing is
+  a **per-drive selection** in this section's driver: assembly prebuilds one worker side per
+  configured worker (`WorkerLoopDriver` over that worker's single `exec` — `RemoteExecTool` for its
+  endpoint id — plus that worker's async pair, recall and local tools), and `SuperAgentDriver::drive`
+  picks the side from the stream's binding before the first provider turn. That fixes today's
+  multi-endpoint limitation (`CombinedTools` first-wins left only the first endpoint reachable)
+  without changing the worker tool surface: one `exec` tool, unchanged schema, no `kian-core` seam
+  change. **1:1 exclusivity** is checked at `spawn_worker` before any side effect: candidates are the
+  Router stream's `thread/started` events grouped by `exec_worker`, liveness is the existing worker
+  vocabulary (`thread/completed` + `session/ended` on the *worker's* stream — `completed`/`cancelled`
+  release, `failed`/`interrupted` are resumable and stay live), read through a bundle-owned
+  read-only port (the `RecallPort` precedent; no store symbol enters the bundle). To make the check
+  honest across a crash, the Router-side `thread/started` is written **before** the task row is
+  admitted: a spawn that dies in between leaves a reserved-but-never-started thread (refused to
+  others, audited, released after the configured `queue_timeout_ms`) instead of a live session the
+  scan cannot see. A refusal names the owning worker session and thread and creates no inbox row, no
+  thread and no provider call. **Legacy** (`superagent.followup_ownership`-style discipline): a
+  pre-change worker session with no binding, on a server that now has workers, keeps the first
+  endpoint plus a `legacy unbound` audit line — never rewritten, never rebound, never counted as
+  bound. Worker lifecycle is "same id, new incarnation": a daemon crash/restart/migration keeps the
+  binding and the durable queue re-drives on reconnect (ADR-007); a worker that never returns
+  produces the honest queue timeout, never a failover to another worker id, and **rebinding a live
+  session is deferred** (ADR-020 "Deferred"). Tests: L1 byte-identical legacy wrapper/payload/schema/
+  prompt, the spawn matrix (unknown/busy/missing/defaulted/feature-off) with no side effects on
+  refusal, routing as a pure function of (stream, catalog), and the release table; L2 two real
+  `kiand` daemons route independently, `kill -9` re-drives, a server restart re-derives the binding,
+  and the async pair's `async_jobs.endpoint_id` follows the bound worker.
 - **Two-level filtering** (article §3.1): the *Fast Path* is an admission taxonomy over
  provenance — a config-level `classes:` table keys `(channel, topic?, sender?)` to
  `candidate | explicit-only | ignore` with most-specific-wins resolution, evaluated in code
@@ -780,6 +815,20 @@ graph LR
  writes session streams.
 - Intermittent endpoint presence is the norm: commands queue in durable state and are consumed
  after the endpoint reconnects (BYOM's offline-tolerant semantics).
+- **Endpoint identity vs address** (ADR-020): an execution worker is its configured `endpoints[].id`
+  — never its `addr`. A session's worker binding is by id, so a daemon that dies, restarts or moves
+  (same id, reachable at its configured address — a stable tunnel, or an edited `addr` plus a server
+  restart) is the same worker to the binding, and the durable queue re-drives its outstanding rows on
+  reconnect (§4.1). The catalog is the `endpoints:` list itself (`id` + optional human `description`);
+  duplicate ids keep refusing to boot, and zero endpoints means the binding feature is off.
+  Consequences recorded here: the async `start`/`stop` pair is mounted **per worker side**, bound to
+  that worker's endpoint (`AsyncJobs` already persists `endpoint_id` per job row), so an async
+  execution cannot escape a bound session's worker — refusing `superagent.async_tools` outright would
+  break existing deployments to prevent a violation a per-side pair removes; and
+  `superagent.harness.dsh` **plus** a non-empty `endpoints:` list now refuses to boot, because the
+  dsh harness runs the loop inside the dsh child and never mounts the kian `exec` tool, so a recorded
+  binding could not route anything (a claimed-but-unenforceable binding is the exact dishonesty this
+  section's audit exists to prevent).
 - **The two axes of separation**: where execution runs (ExecBackend provider: local /
  remote-endpoint / sandbox / cloud machine) and who the loop is (LoopDriver seam, see §6.2) —
  independently pluggable.
@@ -1021,7 +1070,13 @@ gap fixes recorded in the closing bullets.
  (the residency counter a parked resident polls — a raw-engine admit would strand behind
  the park). The version is replayable: it lives in persisted bootstrap prompts and marker
  inputs — derivable from the stream, no `policy/version` kind (rejected: the persisted
- prompt is the record).
+ prompt is the record). ADR-020's worker catalog is prompt-prefix content of the same kind: the
+ `spawn_worker` schema gains the `exec_worker` argument and the render path appends the catalog
+ block (id + description + the choice rule) to the judge prompt **only when the catalog is
+ non-empty**, so a zero-endpoints deployment renders today's exact bytes. New sessions pin a new
+ label; persisted prompts are never rewritten and the drift machinery only reports the mismatch —
+ while a resident Router's first request after the upgrade pays one prefix invalidation (the same
+ recorded cost as the earlier `speculative` argument on that schema).
 - **Delegation mandate (ADR-012)** — the authority object separating *what to
  do* (task) from *with what authority* (Mandate; references 001/002) lands as an
  **additive `"mandate"` object on the -frozen delegation wrapper** (the 
