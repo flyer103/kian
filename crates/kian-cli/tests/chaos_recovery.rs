@@ -30,13 +30,31 @@
 //!   construction.
 //!
 //! The remaining race-y boundary (*after claim*, between the claim
-//! append and the completion of the input-take sweep) is widened by
-//! admitting 64 inputs in one concurrent batch; the harness polls the
-//! durable store, freezes the server with SIGSTOP, verifies the exact
-//! stream shape (a frozen process cannot advance) and kills — an
-//! overshoot is detected and re-run on a fresh session with bounded
-//! attempts, never silently accepted. Seeds identify runs (temp-dir
-//! tags, panic context) for reproducibility.
+//! append and the completion of the input-take sweep) is captured by
+//! observing the burst that creates it — with the deck stacked so the
+//! window is wide: the harness holds the sqlite WAL writer
+//! (`BEGIN IMMEDIATE`) while a concurrent batch of N submits flies,
+//! so every admit INSERT parks on the lock and the whole batch is
+//! "in the pipe" before any commit — and thus before any wake or
+//! claim. On release the batch's INSERTs commit together and the
+//! drain's claim append queues behind them, so the take sweep
+//! snapshot is the whole batch and the claim→sweep window spans
+//! ~2N serialized write transactions (each taken row is one
+//! `input/admitted` append plus one `mark_consumed` bind). The
+//! observer runs CONCURRENTLY with the burst — polling only after
+//! the last RPC returned let the whole window pass inside the
+//! burst's HTTP round-trips (the original flake) — probes the
+//! stream version cheaply and rebuilds only on change (event-paced:
+//! no sleep while the stream advances), SIGSTOP-freezes the server
+//! on the exact stage predicate, re-verifies the frozen stream (a
+//! frozen process cannot advance) and kills. A mid-burst kill may
+//! cancel submits that never became durable; the recovered-input
+//! set is derived from the durable state itself (consumed
+//! `input/admitted` events ∪ rows still eligible), so NoLostWork is
+//! asserted over exactly the admitted work. Overshoots are detected
+//! and re-run on a fresh session with bounded attempts, never
+//! silently accepted. Seeds identify runs (temp-dir tags, panic
+//! context) for reproducibility.
 //!
 //! ## Timing constants (relationship documented, per the design)
 //!
@@ -71,15 +89,20 @@ const HEARTBEAT_MS: u64 = 400;
 /// kill → takeover-claim bound: heartbeat skew + TTL + one sweep tick
 /// (see module docs) + restart/scheduling slack.
 const DETECTION_BOUND_MS: u128 = LEASE_TTL_MS as u128 + 2 * HEARTBEAT_MS as u128 + 6_000;
-/// The after-claim take-sweep width: this many inputs are admitted in
-/// one concurrent batch so the claim→take window spans tens of ms.
-const AFTER_CLAIM_INPUTS: usize = 64;
-/// Attempts for the race-y poll-catch boundary (fresh session each).
-/// The claim→first-turn window is scheduler-timing-dependent (its width
-/// is the first take-sweep, sub-millisecond; 's binary-layout
-/// shift alone moved wake timing enough to miss it at 20×3ms polling),
-/// so: poll fast and retry generously — a miss is cheap, a false
-/// catch is impossible (the stage predicate is exact).
+/// The after-claim burst width: this many inputs are submitted in one
+/// concurrent batch while the harness holds the WAL writer (see the
+/// module docs), so on release the batch commits together and the
+/// take sweep spans ~2N serialized write transactions (one
+/// `input/admitted` append + one `mark_consumed` bind per taken row).
+/// Kept moderate for ephemeral-port hygiene: each in-flight submit is
+/// one connection, and missed attempts (rare with the hold) would
+/// otherwise burn hundreds of ports each.
+const AFTER_CLAIM_INPUTS: usize = 128;
+/// Attempts for the race-y after-claim boundary (fresh session each).
+/// The observer runs alongside the submit burst (see the module docs),
+/// so a miss requires the ENTIRE claim→take-sweep window to fit
+/// between two probes; a miss is cheap and a false catch is impossible
+/// (the stage predicate is exact), so: poll fast and retry generously.
 const CATCH_ATTEMPTS: u32 = 60;
 const SEED_BASE: u64 = 0xC15;
 
@@ -582,15 +605,26 @@ async fn kill_at_stage(
             }
         }
 
-        // The race-y boundary: 64 inputs admitted in one concurrent
-        // batch widen the claim→take-sweep window to tens of ms;
-        // poll-catch, SIGSTOP-freeze, verify, kill. Overshoots retry
-        // on fresh sessions with bounded attempts.
+        // The race-y boundary, caught by observing the burst that
+        // creates it (see the module docs): N inputs submitted in one
+        // concurrent batch — every admit INSERT, the claim append and
+        // each take-sweep write serialize on the single sqlite WAL
+        // writer, so the claim→take-sweep window spans the
+        // interleaving. The observer runs CONCURRENTLY with the burst;
+        // on the exact stage predicate it SIGSTOP-freezes, re-verifies
+        // the frozen stream and kills. Overshoots and freeze races
+        // retry on fresh sessions with bounded attempts.
         KillPoint::AfterClaim => {
             let mut last_note = String::new();
             for attempt in 1..=CATCH_ATTEMPTS {
                 let sid = h.create_session(&h.base1).await;
-                let mut jobs = Vec::new();
+                // Hold the WAL writer while the burst flies: every
+                // admit INSERT parks on the lock, so the whole batch
+                // is "in the pipe" before any commit — and thus
+                // before any wake or claim. On release the batch
+                // commits together and the claim queues behind it.
+                let hold = WriteLock::acquire(&h.sqlite).await;
+                let mut jobs = Vec::with_capacity(AFTER_CLAIM_INPUTS);
                 for n in 0..AFTER_CLAIM_INPUTS as u32 {
                     let params = serde_json::json!({
                         "session": sid.0.to_string(),
@@ -599,53 +633,107 @@ async fn kill_at_stage(
                     });
                     jobs.push(h.rpc(&h.base1, "submit", params));
                 }
-                futures::future::join_all(jobs).await;
-
+                let burst = futures::future::join_all(jobs);
+                tokio::pin!(burst);
+                let mut burst_done = false;
+                // Drive the burst until every submit has reached its
+                // parked INSERT (bounded; localhost round-trips).
+                tokio::select! {
+                    _ = &mut burst => burst_done = true,
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                }
+                hold.release().await;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                let mut seen_version: Option<u64> = None;
+                let mut caught = false;
                 loop {
-                    let events = h.events(sid).await;
-                    match after_claim_status(&events) {
-                        Catch::NotYet => {}
-                        Catch::Got => {
-                            sigstop(server);
-                            tokio::time::sleep(Duration::from_millis(60)).await;
-                            let frozen = h.events(sid).await;
-                            if let Catch::Got = after_claim_status(&frozen) {
-                                let kill_wall = now_ms();
-                                kill9(server);
-                                eprintln!(
-                                    "c15: killed after-claim (seed {seed}, attempt {attempt}) \
-                                     with {} of {} inputs taken",
-                                    count(&frozen, EventKind::InputAdmitted),
-                                    AFTER_CLAIM_INPUTS
-                                );
-                                let contents: Vec<String> = (0..AFTER_CLAIM_INPUTS as u32)
-                                    .map(|n| format!("after-claim-input-{n}"))
-                                    .collect();
-                                return (sid, contents, kill_wall);
+                    // Cheap version probe; the full rebuild only when
+                    // the stream moved.
+                    let version = h.store.version(sid).await.expect("version");
+                    if Some(version) != seen_version {
+                        seen_version = Some(version);
+                        let events = h.events(sid).await;
+                        match after_claim_status(&events) {
+                            Catch::NotYet => {}
+                            Catch::Got => {
+                                sigstop(server);
+                                tokio::time::sleep(Duration::from_millis(60)).await;
+                                let frozen = h.events(sid).await;
+                                if let Catch::Got = after_claim_status(&frozen) {
+                                    caught = true;
+                                } else {
+                                    eprintln!(
+                                        "c15: after-claim freeze race: frozen has {} events ({:?})",
+                                        frozen.len(),
+                                        kinds_of(&frozen)
+                                    );
+                                }
+                                break;
                             }
-                            eprintln!(
-                                "c15: after-claim freeze race: frozen has {} events ({:?})",
-                                frozen.len(),
-                                kinds_of(&frozen)
-                            );
-                            sigcont(server);
-                            break;
+                            Catch::Overshot => {
+                                last_note =
+                                    format!("attempt {attempt} overshot: {:?}", kinds_of(&events));
+                                break;
+                            }
                         }
-                        Catch::Overshot => {
-                            last_note =
-                                format!("attempt {attempt} overshot: {:?}", kinds_of(&events));
-                            break;
+                        // The stream is advancing — probe again
+                        // immediately (event-paced, no tick sleep).
+                        tokio::task::yield_now().await;
+                    } else {
+                        // Idle: drive the burst / wait one tick.
+                        if !burst_done {
+                            tokio::select! {
+                                _ = &mut burst => burst_done = true,
+                                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        last_note = format!("attempt {attempt} timed out: {:?}", kinds_of(&events));
+                        last_note = format!("attempt {attempt} timed out");
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                // Stage not captured on this session: let it settle and
-                // retry on a fresh one.
+                if caught {
+                    // SIGKILL lands on the stopped process directly —
+                    // no SIGCONT first: a resumed server would advance
+                    // the sweep between the resume and the kill.
+                    let kill_wall = now_ms();
+                    kill9(server);
+                    // A mid-burst kill may cancel submits that never
+                    // became durable; the admitted-work set is derived
+                    // from the durable state itself — consumed events
+                    // ∪ rows still eligible — so NoLostWork is asserted
+                    // over exactly the admitted work.
+                    let frozen = h.events(sid).await;
+                    let mut contents: Vec<String> = frozen
+                        .iter()
+                        .filter(|e| e.kind == EventKind::InputAdmitted)
+                        .map(|e| e.bytes["content"].as_str().expect("content").to_owned())
+                        .collect();
+                    let eligible = h
+                        .store
+                        .eligible_inputs(sid, now_ms() as u64)
+                        .await
+                        .expect("eligible");
+                    contents.extend(
+                        eligible
+                            .iter()
+                            .map(|r| r.payload.as_str().expect("plain content").to_owned()),
+                    );
+                    contents.sort();
+                    contents.dedup();
+                    eprintln!(
+                        "c15: killed after-claim (seed {seed}, attempt {attempt}) \
+                         with {} of {} inputs taken",
+                        count(&frozen, EventKind::InputAdmitted),
+                        AFTER_CLAIM_INPUTS
+                    );
+                    return (sid, contents, kill_wall);
+                }
+                // Stage not captured on this session: resume, let it
+                // settle, and retry on a fresh one.
                 sigcont(server);
                 let _ = h
                     .rpc(
