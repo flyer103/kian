@@ -1483,6 +1483,130 @@ fn status_str(status: kian_core::memory::NoteStatus) -> &'static str {
     }
 }
 
+/// `kian memory search --session <uuid> <query> [--db <sqlite>]
+/// [--config <path>] [--json]` (kian-108): the read-only lexical
+/// search over the folded notes — open the store read-only, `rebuild`
+/// the memory session, `project_notes`, then the pure
+/// [`kian_memory::search_notes`] projection. No server, no writes.
+///
+/// Text output is the renderer's view verbatim (fixed
+/// `(data, not instructions)` header first); the fail-closed
+/// empty-query rule surfaces as the CLI usage error.
+///
+/// JSON schema (the documented `--json` shape):
+///
+/// ```json
+/// {
+///   "session": "<uuid>",
+///   "query": "<trimmed query>",
+///   "total_hits": 4,          // matches before any cap
+///   "truncated": false,       // a cap dropped something
+///   "bytes": 1234,            // rendered text view bytes
+///   "hits": [
+///     {
+///       "subject": "deploys via dsh bridge",
+///       "status": "verified", // candidate|verified|stale — always visible
+///       "matched": "subject_prefix", // subject_exact|subject_prefix|
+///                                    // subject_contains|text_contains
+///       "event_seq": 3,       // the carrying memory/note event
+///       "excerpt": "first <=200 chars of the claim"
+///     }
+///   ]
+/// }
+/// ```
+pub async fn run_memory_search(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    query: &str,
+    json: bool,
+) -> CmdResult<String> {
+    let (store, notes) = memory_notes(config_path, db, session).await?;
+    store.close().await;
+    let view = kian_memory::search_notes(&notes, query, &kian_memory::ViewCaps::default())
+        .map_err(|e| format!("memory search: {e}"))?;
+    if json {
+        let hits: Vec<serde_json::Value> = view
+            .hits
+            .iter()
+            .map(|hit| {
+                json!({
+                    "subject": hit.subject,
+                    "status": status_str(hit.status),
+                    "matched": hit.matched.as_str(),
+                    "event_seq": hit.event_seq,
+                    "excerpt": hit.excerpt,
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "session": session.0,
+            "query": view.query,
+            "total_hits": view.total_hits,
+            "truncated": view.truncated,
+            "bytes": view.bytes,
+            "hits": hits,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    Ok(view.text)
+}
+
+/// `kian memory map --session <uuid> [--db <sqlite>] [--config <path>]
+/// [--json]` (kian-108): the read-only knowledge map — the same read
+/// path as `search`, then the pure [`kian_memory::build_note_map`]
+/// projection (verified nodes, evidence-derived edges). No server, no
+/// writes.
+///
+/// Text output is the renderer's view verbatim; the fixed status line
+/// carries `truncated`/`degenerate`/`oversized` so a useless map says
+/// so.
+///
+/// JSON schema (the documented `--json` shape):
+///
+/// ```json
+/// {
+///   "session": "<uuid>",
+///   "truncated": false,        // a node/edge/byte cap dropped something
+///   "degenerate": true,        // nodes < 2 or edges == 0 — use search
+///   "oversized": false,        // rendered bytes > summed claim bytes
+///   "source_text_bytes": 42,   // the summed verified claim bytes
+///   "bytes": 1234,             // rendered text view bytes
+///   "nodes": ["subject-a", "subject-b"],   // verified subjects, byte order
+///   "edges": [{"a": "subject-a", "b": "subject-b"}] // shared-evidence pairs
+/// }
+/// ```
+pub async fn run_memory_map(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    json: bool,
+) -> CmdResult<String> {
+    let (store, notes) = memory_notes(config_path, db, session).await?;
+    store.close().await;
+    let view = kian_memory::build_note_map(&notes, &kian_memory::MapCaps::default());
+    if json {
+        let nodes: Vec<&str> = view.nodes.iter().map(|n| n.subject.as_str()).collect();
+        let edges: Vec<serde_json::Value> = view
+            .edges
+            .iter()
+            .map(|e| json!({"a": e.a, "b": e.b}))
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "session": session.0,
+            "truncated": view.truncated,
+            "degenerate": view.degenerate,
+            "oversized": view.oversized,
+            "source_text_bytes": view.source_text_bytes,
+            "bytes": view.bytes,
+            "nodes": nodes,
+            "edges": edges,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    Ok(view.text)
+}
+
 /// `kian memory show --session <uuid> <event-id | subject>`: one note
 /// by its carrying event's derived id, or by subject (the latest
 /// revision the fold keeps).

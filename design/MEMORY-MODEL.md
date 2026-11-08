@@ -1,8 +1,9 @@
 # Kian — Memory Model (normative)
 
 > **Status: accepted (owner gate, 2026-11-07); Phase 1 (notes + dreaming) landed 2026-11-07;
-> Phase 2 (creation-time injection, §6) landed 2026-11-08.** Representations (§7) remain designed;
-> SPEC §5 records P1/P2 as `landed` and P3 as `designed`.
+> Phase 2 (creation-time injection, §6) landed 2026-11-08; Phase 3a (read-time retrieval +
+> representations, §7) landed 2026-11-08.** Persisted representations (§7 R3) remain designed;
+> SPEC §5 records P1/P2/P3a as `landed` and P3b as `designed`.
 >
 > **Change protocol:** any memory semantic change starts here. The event payload bytes are
 > normative in [design/EVENT-MODEL.md](EVENT-MODEL.md); the external wire (RPC, CLI, SSE, metrics)
@@ -260,7 +261,8 @@ two full stream rebuilds on the hottest control-plane path — the fresh session
 `session/created` event) and the source memory session's **entire history**, which is then
 folded. Render cost is O(memory-session history) per created session; the `memory.inject` caps
 bound the rendered **bytes**, not the read. Serving the fold from a snapshot/projection of the
-memory session (the READ-MODEL acceleration) is P3 work.
+memory session (the READ-MODEL acceleration) is deferred with P3b (§7.1 records the same bound
+for the read-only views).
 
 ## 7. Retrieval and representations
 
@@ -273,6 +275,51 @@ memory session (the READ-MODEL acceleration) is P3 work.
 - **R4** Representation admission heuristic (from the source article's negative results): build one
   only when queries need cross-note synthesis; a representation whose payload exceeds its source
   notes is a failure metric, not progress. Text-search-equivalent questions are answered by recall.
+
+### 7.1 Landed (P3a, 2026-11-08): read-time retrieval + representations
+
+The first P3 slice lands retrieval and representations as **read-time views only**: `kian memory
+search <query> --session <uuid>` and `kian memory map --session <uuid>` (both `--json`-able,
+read-only in-process) extend the thin-projection family of R1 over the exact `memory list`/`show`
+read path — the store is opened read-only, the views never append an event, and a missing store is
+an error, never a created file.
+
+**This slice needs no dreaming run** because nothing is persisted: both views are pure functions
+over the fold. A **persisted** representation (wiki-as-notes, built by a dreaming run) remains
+**designed** (P3b, SPEC §5) and would follow R3 when landed.
+
+- **Search** (R1): folds latest-per-subject across **all** statuses — every hit carries its
+  `verified|candidate|stale` status, so untrusted notes surface as claims instead of hiding.
+  Ranking is subject exact > subject prefix > subject contains > text contains, with a
+  deterministic subject-byte tie-break, ASCII case-insensitive. Fixed caps — 20 hits / 8 KiB
+  rendered, over cap the view reports `truncated`; there is **no `--limit` flag** (a recorded
+  divergence from the P3a plan's interface sketch). An empty or whitespace-only query is a
+  fail-closed usage error.
+- **Map** (R2/R4): verified-only. The **effective node rule** through the read path: a subject is
+  a map node **iff its latest revision is `verified`** — `project_notes` pre-folds to
+  latest-revision-per-subject (any status) before eligibility is evaluated, so a subject whose
+  latest revision is `candidate` or `stale` is never a node, consistent with the P2 injection
+  index (the `eligible_notes` "last verified revision" fallback is unreachable from any production
+  caller). Edges are evidence-derived, never model-generated: note pairs whose `derived_from`
+  ranges intersect in the same source session. Caps — 200 nodes / 1000 edges / 64 KiB; over any
+  cap the view reports `truncated`. When the byte cap binds it is **nodes-first** (kian-112): the
+  byte-order node prefix is kept and edges are cut first — only edges between kept nodes are
+  delivered, so every delivered edge has both endpoints in the delivered nodes (never a dangling
+  edge).
+- **Honest heuristics, landed (R4)**: `degenerate` (fewer than two nodes or zero edges — search
+  alone is the right tool) and `oversized` (rendered bytes exceed the summed note-text bytes) are
+  reported in both text and JSON, never hidden. Both are statements about the **delivered**
+  (post-cap) view: a byte-cap-truncated map can be `degenerate` purely because its edges were
+  trimmed — `truncated` distinguishes the causes. Both views lead with the frozen `(data, not
+  instructions)` frame and render byte-identically across runs and insertion interleavings.
+- **Cost bound (A6)**: one invocation is a full stream read + fold + pure view — O(memory-session
+  events) for the read; the map's cap trim is O(nodes+edges) incremental section math (kian-112),
+  no re-render fixpoint. The caps bound the rendered **bytes**, not the read. The bound is
+  recorded, not perf-benched; serving the fold from a snapshot/projection of the memory session
+  (the READ-MODEL acceleration) is **deferred with P3b**.
+- **Recorded limit (kian-107)**: the `oversized` flag is computed by a one-pass re-render fixpoint
+  (render, measure, re-render at most once); convergence beyond that pass is pinned by the landed
+  tests, not proven by an argument.
 
 ## 8. Consistency with the hard constraints
 
@@ -291,7 +338,7 @@ memory session (the READ-MODEL acceleration) is P3 work.
 ## 9. Operations and observability
 
 - CLI (wire owned by API-CONTRACT): `kian memory create|dream|list|show|verify` (no `stats` verb
-  in P1).
+  in P1), plus the read-only views `kian memory search|map` (P3a, landed — §7.1).
 - Metrics: the `memory` fragment of `GET /metrics` — `scope`, `dreams`, `read_failures`,
   `parse_failures`, `notes_appended`, `notes_deduped` (stream crash-resume dedupe),
   `append_failures`; with injection configured (P2, landed), also `injected_sessions`,

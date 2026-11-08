@@ -73,6 +73,10 @@ const USAGE: &str = "usage:
                                          one dream request via the memory_dream ops method
   kian memory list --session <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          the projected notes of a memory session
+  kian memory search <query> --session <uuid> [--db <sqlite>] [--config <path>] [--json]
+                                         read-only lexical search over the folded notes
+  kian memory map --session <uuid> [--db <sqlite>] [--config <path>] [--json]
+                                         read-only knowledge map of the verified notes
   kian memory show --session <uuid> <event-id|subject> [--db <sqlite>] [--config <path>] [--json]
                                          one note by event id or subject
   kian memory verify --session <uuid> [--db <sqlite>] [--config <path>] [--json]
@@ -708,7 +712,7 @@ fn mock_channel_send(args: &[String]) -> ExitCode {
 fn memory(args: &[String]) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
         eprintln!(
-            "kian: `memory` requires a subcommand (create, dream, list, show, verify)\n{USAGE}"
+            "kian: `memory` requires a subcommand (create, dream, list, search, map, show, verify)\n{USAGE}"
         );
         return ExitCode::from(2);
     };
@@ -788,6 +792,37 @@ fn memory(args: &[String]) -> ExitCode {
                     parsed.json,
                 ),
                 "memory list",
+            )
+        }
+        "search" => {
+            let (Some(session), Some(query)) = (parsed.session, parsed.selector.clone()) else {
+                eprintln!("kian: memory search requires a session uuid and a <query>\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_search(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    &query,
+                    parsed.json,
+                ),
+                "memory search",
+            )
+        }
+        "map" => {
+            let Some(session) = parsed.session else {
+                eprintln!("kian: memory map requires a session uuid\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            run_command(
+                kian_cli::commands::run_memory_map(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    parsed.json,
+                ),
+                "memory map",
             )
         }
         "show" => {
@@ -908,10 +943,13 @@ fn parse_memory_args(args: &[String], usage_for: &str) -> Result<MemoryArgs, Str
                 None => return Err(format!("--to requires a seq number ({usage_for})")),
             },
             "--json" => out.json = true,
-            // `show`'s positional <event-id|subject> (event ids are
-            // uuid-shaped; subjects are free text).
+            // `show`'s positional <event-id|subject> and `search`'s
+            // positional <query> (event ids are uuid-shaped; subjects
+            // and queries are free text).
             other
-                if !other.starts_with("--") && out.selector.is_none() && sub_is_show(usage_for) =>
+                if !other.starts_with("--")
+                    && out.selector.is_none()
+                    && sub_takes_positional(usage_for) =>
             {
                 out.selector = Some(other.to_string());
             }
@@ -921,10 +959,10 @@ fn parse_memory_args(args: &[String], usage_for: &str) -> Result<MemoryArgs, Str
     Ok(out)
 }
 
-/// Whether the flag set is being parsed for `memory show` (the only
-/// subcommand with a positional selector).
-fn sub_is_show(usage_for: &str) -> bool {
-    usage_for.ends_with("show")
+/// Whether the flag set is being parsed for a subcommand with a
+/// positional argument (`show`: <event-id|subject>, `search`: <query>).
+fn sub_takes_positional(usage_for: &str) -> bool {
+    usage_for.ends_with("show") || usage_for.ends_with("search")
 }
 
 /// `kian wechat login [--config <path>] [--channel <name>] [--json]` —

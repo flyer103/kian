@@ -38,6 +38,20 @@
 //!   rides the provenance struct. Pure: no I/O, no state — the caller
 //!   (kian-101) admits the rendered row. The rendered bytes are frozen
 //!   content (constraint 3 / I5).
+//! - [`search`] — [`search_notes`]: the read-only lexical search over
+//!   the folded notes (MEMORY-MODEL §7 R1, P3): every status surfaces
+//!   with its status visible, ranked subject exact, then prefix, then
+//!   contains, then text contains, with a deterministic subject-byte
+//!   tie-break, hard hit/byte caps, a fail-closed empty-query error
+//!   and the fixed `(data, not instructions)` header. Pure: no I/O, no
+//!   state, no event appends.
+//! - [`map`] — [`build_note_map`]: the read-only knowledge map
+//!   (MEMORY-MODEL §7 R2/R4, P3): verified notes only as nodes, edges
+//!   derived solely from intersecting `derived_from` evidence ranges
+//!   (never model-generated links), hard node/edge/byte caps, and the
+//!   `degenerate`/`oversized` admission heuristics reported in the
+//!   fixed status line — a disposable representation, never a second
+//!   truth. Pure: no I/O, no state, no event appends.
 //!
 //! The event stream is the sole truth (constraint 1): every note lands
 //! as one `memory/note` event (the kind landed by kian-84, payload
@@ -47,8 +61,10 @@
 pub mod config;
 pub mod driver;
 pub mod index;
+pub mod map;
 pub mod parse;
 pub mod prompt;
+pub mod search;
 
 pub use config::{
     DEFAULT_INJECT_MAX_BYTES, DEFAULT_INJECT_MAX_ITEMS, DEFAULT_MAX_BYTES_READ, DEFAULT_MAX_NOTES,
@@ -60,8 +76,16 @@ pub use index::{
     render_memory_index_with,
 };
 pub use kian_loop::{LoopDriver, LoopOutcome};
+pub use map::{
+    DEFAULT_MAP_MAX_BYTES, DEFAULT_MAP_MAX_EDGES, DEFAULT_MAP_MAX_NODES, MAP_HEADER, MapCaps,
+    MapEdge, MapNode, MapView, build_note_map,
+};
 pub use parse::{NoteDraft, ParseError, parse_notes};
 pub use prompt::{
     DREAM_HEADER_MARK, DreamHeader, DreamRequest, dream_admit_payload, dream_idempotency_key,
     dream_marker, parse_dream_header, parse_dream_marker, render_dream_prompt,
+};
+pub use search::{
+    DEFAULT_SEARCH_MAX_BYTES, DEFAULT_SEARCH_MAX_HITS, Matched, SEARCH_EXCERPT_MAX_CHARS,
+    SEARCH_HEADER, SearchError, SearchHit, SearchView, ViewCaps, search_notes,
 };

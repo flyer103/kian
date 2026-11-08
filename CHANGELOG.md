@@ -852,3 +852,74 @@ directions).
   tag leak, CJK budget; §14 item 4 resolved, item 3 updated.
 - **Unverified remains** — `-14` token lifetime / automatic re-login; real text-length and rate
   limits; `baseurl` vs `api_base`; media/typing/group/multi-account/proactive push (phase 2).
+
+## 2026-11-08 — agent-memory P3a: read-only retrieval + representations (`kian memory search|map`) — default-green
+
+- **Scope** — MEMORY-MODEL §7's first landed slice: two read-only views over already-persisted
+  notes. **No new event kind (the durable set stays 22), no new crate, no table/migration, no wire
+  change, no event or model-context byte change.** `kian memory list|show|search|map` never append:
+  the CLI verbs open the store read-only; a missing store is an error, never a created file. This
+  slice needs **no dreaming run** because nothing is persisted — a persisted representation
+  (wiki-as-notes) stays designed (P3b) and would follow MEMORY-MODEL §7 R3.
+- **`kian-memory` pure projections (kian-107)** — `search.rs`: latest-per-subject fold over ALL
+  statuses (every hit carries `verified|candidate|stale` — untrusted notes surface as claims),
+  ranking subject exact > prefix > contains > text contains, deterministic subject-byte tie-break,
+  ASCII case-insensitive, caps 20 hits / 8 KiB with `truncated`. `map.rs`: verified-only nodes —
+  **effective rule through the read path: a subject is a node iff its latest revision is
+  `verified`** (`project_notes` pre-folds latest-per-subject before eligibility, so the
+  `eligible_notes` "last verified revision" fallback is unreachable from any production caller;
+  consistent with the P2 injection index and now stated in MEMORY-MODEL §7.1) — with
+  evidence-derived edges (note pairs whose `derived_from` ranges intersect in the same source
+  session, never model-generated), caps 200 nodes / 1000 edges / 64 KiB. The byte cap is
+  **nodes-first** (kian-112, fixing the review's B1): the byte-order node prefix is kept and edges
+  are cut first — only edges between kept nodes are delivered, so no edge ever dangles — and the
+  trim is O(nodes+edges) incremental section math, not a re-render fixpoint (B2: 14.7 s → 2.7 ms
+  at 200 notes / 57-char subjects). Honest heuristics `degenerate` (fewer than two nodes or zero
+  edges in the **delivered** view — search
+  alone is the right tool) and `oversized` (rendered bytes exceed the summed note-text bytes)
+  reported in text and JSON, never hidden. Both views render byte-identically across runs and
+  insertion interleavings and lead with the frozen `(data, not instructions)` frame.
+- **`kian memory search|map` verbs (kian-108)** — read-only in-process CLI verbs reusing the exact
+  `memory list`/`show` read path; text and `--json` agree on every flag. **Recorded divergence
+  from the P3a plan §2.1:** no `[--limit N]` flag — the caps are fixed (20 hits / 8 KiB; the map's
+  200/1000/64 KiB), accepted rather than silently diverged.
+- **Acceptance (kian-109, independent QA)** — 8/8 behaviours PASS over real sqlite (one fixture
+  lands its notes through a real memory-dream drain against the scripted mock provider):
+  `qa_views_never_write_and_missing_db_fails_closed` (event count + summed bytes identical
+  before/after all four verbs; no file created), `qa_views_are_byte_identical_across_runs_and_interleavings`,
+  `qa_over_limit_search_and_map_truncate_text_json_agree`,
+  `qa_map_is_verified_only_and_search_surfaces_every_status` (incl. a subject superseded by a
+  candidate revision — dropped from the map, `[stale]` in search),
+  `qa_map_reports_degenerate_and_oversized_honestly`,
+  `qa_both_views_lead_with_the_data_not_instructions_frame`,
+  `qa_real_drain_notes_and_a_deleting_event_change_the_view` (views derive only from the event
+  stream; no side store/cache file). Plus the kian-107/108 suites
+  (`fold_keeps_latest_revision_and_shows_status`, `map_is_verified_only`,
+  `degenerate_flag_is_reported`, `oversized_flag_compares_rendered_bytes_to_claim_bytes`,
+  `search_and_map_leave_event_count_and_bytes_unchanged`, `search_empty_query_is_refused`, …).
+- **Cost and limits (recorded)** — one invocation is a full stream read + fold + pure view,
+  O(memory-session events); the caps bound rendered bytes, not the read. The bound is recorded,
+  **not perf-benched** (A6); a snapshot-served fold (the READ-MODEL acceleration) is deferred with
+  P3b. The `oversized` flag is a one-pass re-render fixpoint — convergence beyond that pass is
+  pinned by the landed tests, not proven by an argument (kian-107 unverified item).
+- **Closeout (kian-110)** — MEMORY-MODEL §7 (+ §7.1 landed block, header, §9 verbs), SPEC §5 P3
+  split (P3a landed / P3b designed, moved not dropped), README feature bullet + advanced-usage
+  example + docs-map row, this entry.
+- **Fix (kian-112)** — the kian-111 independent review was BLOCKING on the map's byte cap: the
+  trim loop put edges outer / nodes inner, so once the 64 KiB budget bound it delivered ~944 edges
+  and 0–2 nodes — every edge dangling, no `## Nodes` section — contradicting the struct invariant,
+  the docs and README. Fixed by restructuring the trim nodes-first (largest fitting byte-order
+  node prefix, then only edges between kept nodes while each next edge line fits — closed by
+  construction) and replacing the O(nodes×edges) re-render fixpoint with O(nodes+edges) incremental
+  section lengths. Tests: strengthened `byte_cap_drops_edges_first_and_stays_within_budget` (all
+  nodes survive, edges cut, closed view, headers agree), added
+  `byte_cap_keeps_node_prefix_when_nodes_alone_overflow`, `large_byte_capped_map_stays_closed_and_within_budget`
+  (the 200-note/57-char review worst case) and the CLI-level
+  `map_byte_cap_keeps_nodes_and_cuts_edges_over_real_store` (60 verified notes / ordinary subjects
+  over a real sqlite store, shipped binary included). Measured: 60 notes 640 ms → 1.2 ms,
+  200/31-char 2.21 s → 2.7 ms, 200/57-char 14.68 s → 2.7 ms; dangling 944 → 0; bytes 65 406–65 421
+  ≤ 65 536. MEMORY-MODEL §7.1, README (feature wording + crate-map line) reconciled in the same
+  change.
+- **Gates** — build / `cargo test --workspace` (106 suites, 0 failed) / clippy `--workspace
+  --all-targets -D warnings` / fmt `--all --check` green; `docs_map` green. This closeout entry is
+  documentation-only on top of the already-gated tree.

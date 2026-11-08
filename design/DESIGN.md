@@ -1405,7 +1405,10 @@ caps) landed as the `kian-memory` bundle (row above); the `memory:` config secti
 `kian-cli`. Injection (P2) landed 2026-11-08: the frozen `render_memory_index` lives in
 `kian-memory` (row above), while the `memory.session`/`memory.inject` config, the create-path
 quiet admit (`Engine::admit_quiet` + the reserved `{content,memory}` row envelope, §3.2) and the
-`injected_*` metrics keys ride `kian-cli`. Representations (P3) remain designed. Placement and
+`injected_*` metrics keys ride `kian-cli`. Read-time retrieval + representations (P3a) landed
+2026-11-08: the pure `search_notes`/`build_note_map` projections and the `kian memory search|map`
+read-only verbs ride `kian-memory` + `kian-cli` (MEMORY-MODEL §7.1). Persisted representations
+(P3b) remain designed. Placement and
 non-goals are fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
 **Channels (bundle, ADR-018 — round 10, landed).** The real `ChannelAdapter` implementations

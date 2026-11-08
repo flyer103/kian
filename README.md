@@ -35,7 +35,8 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   the same `LoopDriver` seam and event kinds.
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
-  verification state); `kian memory create/dream/list/show/verify`. New sessions can open with a
+  verification state); `kian memory create/dream/list/show/verify` plus the read-only
+  `kian memory search|map` views over the notes. New sessions can open with a
   bounded, verified-only memory index injected once at creation (`memory.session`, config-gated,
   byte-identical when off).
 - **Read-model serving form** — versioned unchanged/delta projection reads, resumable SSE
@@ -75,7 +76,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/DESIGN.md](design/DESIGN.md) | The blueprint (HOW): execution model, recovery, plugin system, bundle |
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
-| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (Phases 1–2 landed; representations designed) |
+| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (P1–P2 and P3a retrieval landed; persisted representations designed) |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
@@ -511,6 +512,22 @@ when the key is absent. The `injected_*` keys in `curl -s localhost:7433/metrics
 count sessions, items, bytes, truncations and honest skips.
 ([design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) §6.)
 
+Two read-only views navigate the growing memory without any write (a missing store is an error,
+never a created file; caps and `truncated` flags bound the output):
+
+```bash
+target/debug/kian memory search rollback --session "$MEM" --config kian.yaml   # per-hit status
+target/debug/kian memory map      --session "$MEM" --config kian.yaml --json   # verified-only
+```
+
+Search folds latest-per-subject across all statuses and shows each hit's
+`verified|candidate|stale`; the map keeps only subjects whose latest revision is `verified` and
+joins notes by intersecting `derived_from` evidence — under its caps every delivered edge keeps
+both endpoints in the delivered nodes (the byte cap keeps the node prefix and cuts edges first) —
+reporting `degenerate` (use search instead) and `oversized` honestly instead of hiding a useless
+view
+([design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) §7).
+
 ### Read model (versions, snapshots, views, retention)
 
 Every serving read is versioned and disposable — the event stream stays the only truth.
@@ -582,7 +599,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-orchestrator` | Admit → Wake → Drain → Promote engine and the bounded three-layer recovery subsystem |
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
-| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — plus the frozen creation-time index renderer |
+| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — the frozen creation-time index renderer, and the read-only search/map views |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
 | `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |
