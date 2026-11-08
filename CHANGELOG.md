@@ -1002,3 +1002,88 @@ directions).
   (kian-store/postgres 16, kian-cli `postgres_serve` + `postgres_multi_replica`, `KIAN_PG_URL`
   per `docs/runbook-postgres.md`). This closeout entry is documentation-only on top of the
   already-gated tree.
+
+## 2026-11-08 — durable per-session execution-worker binding (`exec_worker`) — default-green
+
+Round 11 (cards kian-122..127): every delegated super-agent worker session is durably bound 1:1 to
+one `kiand` execution worker. [ADR-020](design/decisions/ADR-020-durable-worker-binding.md) is the
+decision record; DESIGN §4.1/§4.3/§4.7 and EVENT-MODEL §4.2/§6.3 carry the semantics. **No new
+event kind (the durable set stays 22), no new table, no wire/API change, no core change** — the
+durable footprint is two additive `exec_worker` keys on events that already existed.
+
+- **Config / catalog (kian-123)** — `endpoints[]` gains an optional `description` (fail-closed:
+  non-empty, ≤200 chars, no control characters — it is prompt-prefix content); duplicate ids still
+  refuse; `superagent.harness.dsh` × non-empty `endpoints:` now refuses boot (the dsh harness never
+  mounts the kian `exec`, so a binding there would be audit fiction). The worker catalog (ids +
+  descriptions, config order) feeds the `spawn_worker` schema enum and the Router prompt block.
+  Zero endpoints = feature off, byte-identical everywhere (wrapper, `thread/started`, schema,
+  prompt, routing).
+- **Binding bytes (kian-123)** — the delegation wrapper and both sides' `thread/started` gain the
+  additive top-level key `exec_worker: <endpoints[].id>` (`worker` keeps meaning the worker
+  *session* uuid); readers classify absent=Unbound / non-empty string=Bound / anything else
+  (incl. empty, wrong type, disagreeing copies)=Malformed → honest refusal, never a guess.
+  `SpawnRequest` carries the choice through one struct; the Router side emits `thread/started`
+  **before** admitting the task row (lineage-before-admit), bounding the crash window: a
+  never-started reservation is released after `queue_timeout_ms` with an audit line.
+- **Router surface (kian-123)** — `spawn_worker` gains the `exec_worker` argument: required with
+  ≥2 workers (refusal lists the catalog), omittable with exactly 1 (bound to that worker and
+  recorded — never silently unbound), refused with 0. The spawn result echoes the choice. The
+  prompt gains the catalog block (ids + descriptions + the choice rule) appended only when the
+  catalog is non-empty, so zero-endpoint renders are byte-identical.
+- **1:1 exclusivity (kian-123)** — a worker has at most one live bound worker session. The check
+  is a pure stream-derived function (`bound_workers` + status-aware `thread_liveness` +
+  `busy_owner`: `thread/completed{completed}`/`session/ended{completed,cancelled}` release,
+  `{failed,interrupted}` hold; NeverStarted held only inside the `queue_timeout_ms` window; read
+  errors fail closed) called **before any side effect** through the bundle-owned read-only
+  `WorkerStreamsPort` (implemented in `kian-cli`; the `RecallPort` precedent — the iron rule
+  holds, no store symbol in `kian-superagent`). A busy refusal names the owning worker session
+  uuid and thread id and leaves zero inbox rows / threads / `thread/started` / provider calls.
+- **Per-worker routing (kian-123 + B1 fix)** — assembly prebuilds one worker side per endpoint
+  (its own `exec` `RemoteExecTool`, its own async `start`/`stop` pair bound to that endpoint —
+  the async row already carries `endpoint_id`); `SuperAgentDriver` selects the side per drive
+  from the session's own stream binding: `Bound` → that worker; unconfigured bound id → a
+  **refusing** `exec` side (honest tool error, no queue row, no re-route, no local run);
+  `Malformed` → refusing side; legacy `Unbound` → the first **configured** endpoint (config
+  order, not map-key order — review B1 fixed with an L1 regression test and an L2 leg using
+  non-alphabetical ids) with exactly one per-session audit line. No resident routing state;
+  a `kian serve` restart re-derives the binding from the stream.
+- **L2 evidence (kian-124, default-green loopback)** — real `kian serve` + two real `kiand`
+  daemons (`crates/kian-cli/tests/worker_binding_l2.rs`, 8 tests): per-worker routing asserted by
+  endpoint-side effects; `kill -9` of a bound daemon mid-command re-drives the same worker id,
+  the session continues, one completed execution (at-least-once per ADR-007; exactly-once
+  endpoint execution **not** claimed); serve restart re-derives the binding; legacy unbound
+  routing; zero-endpoints byte-identity; async follows the bound worker; busy-refusal-then-
+  takeover.
+- **Independent QA (kian-125)** — 24 QA-authored L1 probes (`worker_binding_qa.rs` 14,
+  `worker_binding_routing_qa.rs` 8, async-carry) + 2 adversarial L2 legs (every binding names the
+  SECOND endpoint, so default-to-first bugs go red); 4 mutation red-witnesses (malformed-reader,
+  default-to-first spawn, unconfigured re-route, L2 default-to-first) confirmed and reverted
+  sha-256-verified. Full L1+L2+Docs matrix PASS.
+- **Review (kian-126)** — first verdict BLOCKING on one defect: the legacy-unbound route used
+  BTreeMap key order instead of config order (every round fixture was alphabetical, so nothing
+  went red). Fixed (t_8c3925f5: `worker_order` carried through `with_worker_sides`; regression
+  L1 test + a non-alphabetical L2 leg; RED/GREEN proven by restoring the defect) and re-reviewed
+  PASS (t_89f630a8) under a non-alphabetical fixture with its own two-daemon end-to-end probe and
+  two red-witness mutations. Six non-blocking notes recorded (N1 null-as-omitted, N2 one-sided
+  binding tolerance, N3 per-candidate stream rebuild cost, N4 cache-prose precision, N5 resident
+  audit-dedup set, N6 the L1 test does not pin the driver wiring — the L2 leg is the real guard).
+- **Measured (recorded)** — L2 suite ~13 s for 8 tests (loopback, sqlite); kill -9 leg ~9 s
+  (sleep-dominated); workspace test run 112 suites / 0 failed.
+- **Unverified (honest)** — the never-returning-worker honest queue timeout at L2 (needs a ≥60 s
+  queue-timeout run; the NeverStarted TTL window is L1-proven incl. the 999/1000 ms boundary);
+  spawn-internal crash windows stay L1-fixture-only (process-death points not injectable at L2);
+  exactly-once endpoint execution on kill -9 (at-least-once is the ADR-007 contract; the legs
+  prove exactly one *completed* execution); multi-Router exclusivity (single Router v1, out of
+  scope); postgres legs (sqlite is the round contract); prefix-cache stability across a
+  live-session binary upgrade is not L2-observable (one prefix invalidation on the Router's next
+  request is the documented cost — ADR-020 §Negative; persisted prompts/requests are never
+  rewritten); live deployment (Vultr + WeChat) is out of scope — the next discussion.
+- **Deferred with the round** — live rebind of a session to a different worker id (ADR-020
+  §Deferred: durable intent + queue fencing + seq-range projection, owner gate), deployment
+  tooling.
+- **Closeout (kian-127)** — SPEC §5 worker-binding section, README feature bullet + BYOM
+  advanced-usage example, this entry. `docs_map` green.
+
+Gates on the exact tree: build / `cargo test --workspace` (112 suites, 0 failed) / clippy
+`--workspace --all-targets -D warnings` / fmt `--all --check` / `cargo test -p kian-cli --test
+docs_map` all green.

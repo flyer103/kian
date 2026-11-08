@@ -377,6 +377,30 @@ contract is [design/READ-MODEL.md](../design/READ-MODEL.md); the decision record
 
 Non-goals: transparent cold-tier query, wildcard streams in OSS, multi-region active-active.
 
+### Durable per-session execution-worker binding
+
+Scope: the owner's worker shape — a worker is a `kiand` endpoint (`endpoints[].id`), the agent loop
+stays on the `kian serve` side, and every delegated worker session is bound **1:1** to one worker
+for its lifetime. The decision record is
+[ADR-020](../design/decisions/ADR-020-durable-worker-binding.md); semantics: DESIGN §4.1/§4.3/§4.7;
+the durable shape: EVENT-MODEL §4.2 (additive `exec_worker` key on the delegation wrapper and on
+both sides' `thread/started`). **No new event kind (the durable set stays 22), no new table, no
+wire surface, no core change.**
+
+| Item | Contents | Status |
+|------|----------|--------|
+| Worker catalog | `endpoints[]` gains an optional validated `description` (≤200 chars, no control characters — it renders into the Router prompt); the catalog (`id` + `description`, config order) feeds the `spawn_worker` schema enum and the prompt block; zero endpoints = feature off, byte-identical | landed |
+| Router-chosen binding | `spawn_worker` gains the `exec_worker` argument (required with ≥2 workers, omittable-with-honest-default with exactly 1, refused with 0); the choice is recorded as the additive `exec_worker` key on the delegation wrapper and both sides' `thread/started`, echoed in the spawn result — ADR-020 | landed |
+| 1:1 exclusivity | A worker has at most one live bound worker session; the check is a stream-derived pure function (`thread/completed` + `session/ended` on the worker stream: `completed`/`cancelled` release, `failed`/`interrupted` hold) called before any side effect through a bundle-owned read-only port; a busy refusal names the owning session and thread | landed |
+| Per-drive routing | One prebuilt worker side per endpoint (its own `exec` `RemoteExecTool`, its own async pair); the driver selects the side from the session's own stream binding before the first provider turn — bound id unconfigured ⇒ honest refusing side (no re-route, no local run); legacy unbound sessions keep the first-**configured**-endpoint route with one audit line; no resident routing state (restart rebuild = replay) | landed |
+| Lifecycle | Worker crash/restart/migration (same id) re-drives the durable queue (ADR-007) with the binding unchanged; lineage-before-admit spawn ordering bounds the crash window (a never-started reservation is released after `queue_timeout_ms` with an audit line); `harness.dsh` × `endpoints:` refuses boot (the harness never mounts the kian `exec`) | landed |
+| Live rebind of a session to a different worker id | Designed only (ADR-020 §Deferred: durable rebind intent, old-worker queue fencing, seq-range projection — needs an EVENT-MODEL change, owner gate); the landed reattachment path is the same worker id restarting/migrating | designed |
+| Deployment (Vultr + WeChat workers) | Explicitly the next discussion; no deployment tooling, no L3 claim | deferred |
+
+Non-goals recorded with the round: no new transport/protocol or daemon binary, no worker pooling,
+no bind-time liveness gate, no automatic failover (an offline worker parks honestly on the durable
+queue), no per-call endpoint choice.
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

@@ -31,6 +31,10 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   versioning/drift marking, and the `kian tickets` stage board.
 - **BYOM execution** — a `kiand` endpoint over a durable, at-least-once command queue with a
   heartbeat watchdog; offline work parks and resumes honestly.
+- **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
+  worker (Router-chosen from the configured catalog, recorded as additive event bytes,
+  re-derived from the stream): worker restarts, migrations and server reboots keep the
+  binding; a busy or unknown worker refuses honestly.
 - **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
   the same `LoopDriver` seam and event kinds.
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
@@ -390,6 +394,33 @@ cargo run -p kiand -- --listen 127.0.0.1:7401 --heartbeat-ms 1000
 Rows are at-least-once with command-id dedupe; an offline endpoint parks work durably, a restarted
 daemon reconnects and drains it, and the queue timeout is an honest `Timeout` — never a fake
 success. The heartbeat watchdog admits a durable health input to affected worker sessions.
+
+#### Durable worker binding (per session)
+
+`endpoints:` is also the worker catalog: each entry gains an optional human `description` the
+Router sees when picking a machine, and each delegated worker session is bound **1:1** to exactly
+one worker for its whole lifetime
+([ADR-020](design/decisions/ADR-020-durable-worker-binding.md)).
+
+```yaml
+endpoints:
+  - id: mac-mini
+    addr: "127.0.0.1:7401"
+    description: "local macOS dev machine — repo checkouts, cargo, git"
+  - id: vultr-builder
+    addr: "10.0.0.7:7401"
+    description: "linux builder — docker, long builds"
+```
+
+With two or more workers the Router must name one on every spawn —
+`spawn_worker {"task": "run the release build", "exec_worker": "vultr-builder"}` — and the choice
+is recorded as additive `exec_worker` bytes on the delegation (both sides' `thread/started`), then
+re-derived from the stream on every restart: the worker's `exec` routes only to its bound daemon
+across worker restarts, migrations (same id, new address) and server reboots, with no rebind and no
+failover to another machine. A busy or unknown worker refuses the spawn honestly before any side
+effect — the refusal names the owning session. With exactly one worker the argument may be omitted
+(recorded as the honest default); with zero `endpoints:` nothing changes anywhere
+([ADR-020](design/decisions/ADR-020-durable-worker-binding.md)).
 
 ### Postgres and multi-replica
 
