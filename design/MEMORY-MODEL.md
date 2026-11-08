@@ -256,13 +256,15 @@ consumes the row into ONE `input/admitted` carrying the message plus the additiv
   explicit "create as memory session" discriminator on the create call (a wire change,
   API-CONTRACT scope) and is deferred beyond P2.
 
-**Cost note (kian-104 review I1):** with injection configured, every `create_session` performs
-two full stream rebuilds on the hottest control-plane path — the fresh session's (a single
-`session/created` event) and the source memory session's **entire history**, which is then
-folded. Render cost is O(memory-session history) per created session; the `memory.inject` caps
-bound the rendered **bytes**, not the read. Serving the fold from a snapshot/projection of the
-memory session (the READ-MODEL acceleration) is deferred with P3b (§7.1 records the same bound
-for the read-only views).
+**Cost note (updated P3b-1; originally kian-104 review I1):** the fresh session's rebuild is a
+single `session/created` event. The source memory session's history is no longer read in full:
+since P3b-1 the fold input is the index-accelerated kind scan (`EventStore::scan_kind` over the
+per-session `idx_events_session_kind_seq` index, declared in READ-MODEL §6), so the read — and
+the render it feeds — is **O(memory/note events)**, not O(memory-session history); the
+read-only views benefit identically (§7.1 records the same bound). The `memory.inject` caps
+bound the rendered **bytes**, not the read; the bound is recorded, not a perf claim. Serving
+the fold from a snapshot/projection of the memory session (the READ-MODEL acceleration)
+remains deferred with the P3b remainder.
 
 ## 7. Retrieval and representations
 
@@ -312,11 +314,14 @@ over the fold. A **persisted** representation (wiki-as-notes, built by a dreamin
   (post-cap) view: a byte-cap-truncated map can be `degenerate` purely because its edges were
   trimmed — `truncated` distinguishes the causes. Both views lead with the frozen `(data, not
   instructions)` frame and render byte-identically across runs and insertion interleavings.
-- **Cost bound (A6)**: one invocation is a full stream read + fold + pure view — O(memory-session
-  events) for the read; the map's cap trim is O(nodes+edges) incremental section math (kian-112),
-  no re-render fixpoint. The caps bound the rendered **bytes**, not the read. The bound is
-  recorded, not perf-benched; serving the fold from a snapshot/projection of the memory session
-  (the READ-MODEL acceleration) is **deferred with P3b**.
+- **Cost bound (updated P3b-1; A6)**: one invocation is an index-accelerated kind-filtered
+  read + fold + pure view — **O(memory/note events)** for the read via `EventStore::scan_kind`
+  over the per-session kind index (declared in READ-MODEL §6), replacing the pre-P3b-1
+  O(memory-session events) full stream read; injection (§6's cost note) benefits identically.
+  The map's cap trim is O(nodes+edges) incremental section math (kian-112), no re-render
+  fixpoint. The caps bound the rendered **bytes**, not the read. The bound is recorded, not
+  perf-benched; serving the fold from a snapshot/projection of the memory session (the
+  READ-MODEL acceleration) is **designed with the P3b remainder**.
 - **Recorded limit (kian-107)**: the `oversized` flag is computed by a one-pass re-render fixpoint
   (render, measure, re-render at most once); convergence beyond that pass is pinned by the landed
   tests, not proven by an argument.

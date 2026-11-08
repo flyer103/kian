@@ -543,3 +543,215 @@ async fn unknown_source_skips_honestly_and_never_fails_creation() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- memory P3b-1 (kian-117): the injection read is narrow --------------
+
+use kian_core::events::{Event, SCHEMA_VERSION};
+use kian_core::model::Epoch;
+use kian_core::secrets::SecretRedactor;
+use kian_store::EventStore;
+use serde_json::json;
+
+async fn direct_append(
+    store: &EventStore,
+    sid: SessionId,
+    seq: u64,
+    epoch: Epoch,
+    kind: EventKind,
+    bytes: serde_json::Value,
+) {
+    let e = Event {
+        seq,
+        session: sid,
+        epoch,
+        ts: 1_761_900_000_000 + seq,
+        kind,
+        bytes,
+        version: SCHEMA_VERSION,
+    };
+    store
+        .append(
+            sid,
+            e,
+            kian_store::AppendGuard {
+                epoch,
+                expected_seq: seq,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// P3b-1 (kian-117): the creation-time injection reads the source
+/// memory session through the narrow `scan_kind` path. On a source
+/// stream interleaving notes with non-note events, the admitted
+/// `{content, memory}` payload must be byte-identical to the one the
+/// PRE-CHANGE read (full rebuild → fold → render → envelope) produces
+/// — including the `source_seq` pin — and the injection read must
+/// leave the source stream untouched (the A5 read-only witness).
+#[tokio::test]
+async fn injection_payload_byte_identical_on_a_mixed_source_stream() {
+    common::force_no_proxy();
+    let dir = common::temp_dir("inject-narrow");
+    let sqlite = dir.join("kian.sqlite");
+
+    // Seed the memory session directly (injection only reads the
+    // stream — no dream needed): two verified notes with shared
+    // evidence, one candidate, interleaved with three non-note events.
+    let memory = SessionId::new();
+    let source = SessionId::new();
+    let note = |subject: &str, status: &str| {
+        json!({
+            "subject": subject,
+            "text": format!("{subject} claim text."),
+            "status": status,
+            "verified_by": {"method": "transcript", "ref": "3"},
+            "derived_from": [{"session": source.0, "start_seq": 1, "end_seq": 5}],
+        })
+    };
+    let store = EventStore::open(&sqlite).await.unwrap();
+    direct_append(
+        &store,
+        memory,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        2,
+        Epoch(1),
+        EventKind::MemoryNote,
+        note("alpha subject", "verified"),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        3,
+        Epoch(1),
+        EventKind::DrainClaimed,
+        json!({}),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        4,
+        Epoch(1),
+        EventKind::MemoryNote,
+        note("beta subject", "verified"),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        5,
+        Epoch(1),
+        EventKind::TurnStart,
+        json!({"iteration": 0}),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        6,
+        Epoch(1),
+        EventKind::MemoryNote,
+        note("gamma candidate", "candidate"),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory,
+        7,
+        Epoch(1),
+        EventKind::AssistantMessage,
+        json!({"role": "assistant", "content": {"text": "tail"}}),
+    )
+    .await;
+    let events_before = store.rebuild(memory).await.unwrap().len();
+    store.close().await;
+
+    // The expected payload through the PRE-CHANGE read path: full
+    // rebuild, fold, render with the server's default caps and
+    // pattern-scanning redactor, then the exact-two-key envelope.
+    let store = EventStore::open(&sqlite).await.unwrap();
+    let full = store.rebuild(memory).await.unwrap();
+    let notes = kian_core::memory::project_notes(&full);
+    let eligible = kian_memory::eligible_notes(&notes);
+    let rendered = kian_memory::render_memory_index_with(
+        &notes,
+        &kian_memory::MemoryIndexConfig::default(),
+        &SecretRedactor::from_env_names(&[]),
+    )
+    .expect("the fixture has verified notes — it renders");
+    let expected =
+        kian_cli::memory::injection_admit_payload("e2e-agent", memory, &rendered, &eligible);
+    store.close().await;
+    // The I7 pin is unchanged: the greatest seq among the eligible
+    // notes (4 — beta), never the stream head (8 after the settle).
+    assert_eq!(rendered.source_seq, 4);
+
+    // The server over the same store, injection on (default caps).
+    let provider_base = scripted_answer_provider("plain answer").await;
+    let config_path = inject_config(
+        &dir,
+        &sqlite,
+        &provider_base,
+        &format!("\n  session: {}", memory.0),
+        "",
+    );
+    let config = kian_cli::config::ServeConfig::load(&config_path).expect("config");
+    let server = Arc::new(Server::from_config(config).await.expect("server"));
+    let control: Arc<dyn ControlPlane> = server.clone();
+    let base = mount(&server).await;
+
+    let session = control.create_session().await.expect("session");
+    let report = metrics(&base).await;
+    assert_eq!(report["memory"]["injected_sessions"], 1, "{report}");
+    assert_eq!(report["memory"]["injected_skips"], 0, "{report}");
+
+    // A5: the injection read appended nothing to the source stream.
+    let store = EventStore::open(&sqlite).await.unwrap();
+    assert_eq!(
+        store.rebuild(memory).await.unwrap().len(),
+        events_before,
+        "the narrow read leaves the source stream untouched"
+    );
+    store.close().await;
+
+    // Drain and compare the admitted payload byte for byte against the
+    // pre-change expectation.
+    control
+        .submit(session, serde_json::json!("the task"), None)
+        .await
+        .expect("submit");
+    assert!(
+        wait_for_async(10_000, || {
+            let result = control.projection(session);
+            async move { matches!(result.await, Ok(kian_core::state::SessionState::Completed)) }
+        })
+        .await,
+        "the session must settle"
+    );
+    let events = control.session_events(session).await.expect("events");
+    let injected = events
+        .iter()
+        .find(|ev| matches!(ev.kind, EventKind::InputAdmitted) && ev.bytes.get("memory").is_some())
+        .expect("the injected row");
+    assert_eq!(
+        injected.bytes["content"], expected["content"],
+        "the injected text is byte-identical to the pre-change fold"
+    );
+    assert_eq!(
+        injected.bytes["memory"], expected["memory"],
+        "the memory marker (scope, notes, items, bytes, truncated, source_seq, redactions) is byte-identical"
+    );
+    assert_eq!(injected.bytes["memory"]["source_seq"], json!(4));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

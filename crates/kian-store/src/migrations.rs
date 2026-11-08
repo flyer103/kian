@@ -96,6 +96,26 @@ const V4_VIEWS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS view_rows (\n    view TEXT NOT NULL,\n    session TEXT NOT NULL,\n    row_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    PRIMARY KEY (view, session)\n);\nCREATE TABLE IF NOT EXISTS view_state (\n    view TEXT PRIMARY KEY,\n    events_total INTEGER NOT NULL,\n    max_seq INTEGER NOT NULL,\n    digest TEXT NOT NULL,\n    built_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events (kind, ts)",
 };
 
+/// v6 — the per-session kind index (READ-MODEL §6, memory P3b-1). The
+/// per-session companion of v4's global `idx_events_kind_ts`
+/// (`audit_kind_index`): `session, kind, seq` serves
+/// `WHERE session = ? AND kind = ? ORDER BY seq` — the read shape behind
+/// `EventStore::scan_kind` — as an index-only lookup instead of a
+/// full-session stream read.
+///
+/// Like every SQL index this is **infrastructure, never truth** (R1):
+/// `session`/`kind`/`seq` are already projection columns of the truth
+/// table, the database maintains the index at append time (always
+/// fresh — no staleness class, no rebuild), and it can never disagree
+/// with the stream. A store that predates this generation still answers
+/// the same query correctly via the planner's fallback (slower, never
+/// wrong).
+const V6_SESSION_KIND_INDEX: Migration = Migration {
+    version: 6,
+    name: "v6_session_kind_index",
+    up: "CREATE INDEX IF NOT EXISTS idx_events_session_kind_seq ON events (session, kind, seq)",
+};
+
 /// v5 — the archive marker table (READ-MODEL §7, P2b). One row per
 /// session whose online rows left the store through the export-only
 /// retention path: the verified package's identity (path + hashes) and
@@ -125,6 +145,7 @@ pub fn chain() -> &'static [Migration] {
         V3_PROJECTION_SNAPSHOTS,
         V4_VIEWS,
         V5_ARCHIVED_SESSIONS,
+        V6_SESSION_KIND_INDEX,
     ]
 }
 
@@ -225,6 +246,16 @@ const PG_V5_ARCHIVED_SESSIONS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS archived_sessions (\n    session TEXT PRIMARY KEY,\n    last_seq BIGINT NOT NULL,\n    event_count BIGINT NOT NULL,\n    input_count BIGINT NOT NULL,\n    package_path TEXT NOT NULL,\n    events_sha256 TEXT NOT NULL,\n    inputs_sha256 TEXT NOT NULL,\n    manifest_sha256 TEXT NOT NULL,\n    archived_at BIGINT NOT NULL\n)",
 };
 
+/// v6 (postgres chain) — the per-session kind index, pg DDL (same
+/// version, name and shape as the sqlite generation; `session`, `kind`,
+/// `seq` are all TEXT/BIGINT columns, so the DDL is identical). See the
+/// sqlite twin's docs — infrastructure, never truth.
+const PG_V6_SESSION_KIND_INDEX: Migration = Migration {
+    version: 6,
+    name: "v6_session_kind_index",
+    up: "CREATE INDEX IF NOT EXISTS idx_events_session_kind_seq ON events (session, kind, seq)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -237,6 +268,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V3_PROJECTION_SNAPSHOTS,
         PG_V4_VIEWS,
         PG_V5_ARCHIVED_SESSIONS,
+        PG_V6_SESSION_KIND_INDEX,
     ]
 }
 
@@ -721,6 +753,37 @@ mod tests {
                 "    manifest_sha256 TEXT NOT NULL,\n",
                 "    archived_at BIGINT NOT NULL\n",
                 ")",
+            )
+        );
+    }
+
+    /// v6 is a committed generation the moment it ships: pinned
+    /// byte-for-byte like v0–v5 (append-only chain).
+    #[test]
+    fn v6_generation_sql_is_frozen() {
+        let v6: &Migration = &chain()[6];
+        assert_eq!(v6.version, 6);
+        assert_eq!(v6.name, "v6_session_kind_index");
+        assert_eq!(
+            v6.up,
+            concat!(
+                "CREATE INDEX IF NOT EXISTS idx_events_session_kind_seq ",
+                "ON events (session, kind, seq)",
+            )
+        );
+    }
+
+    /// The pg v6 generation is pinned like its sqlite twin.
+    #[test]
+    fn pg_v6_generation_sql_is_frozen() {
+        let pg = pg_chain();
+        assert_eq!(pg[6].version, 6);
+        assert_eq!(pg[6].name, "v6_session_kind_index");
+        assert_eq!(
+            pg[6].up,
+            concat!(
+                "CREATE INDEX IF NOT EXISTS idx_events_session_kind_seq ",
+                "ON events (session, kind, seq)",
             )
         );
     }

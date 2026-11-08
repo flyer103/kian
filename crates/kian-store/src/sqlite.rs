@@ -13,7 +13,7 @@
 
 use std::ops::Range;
 
-use kian_core::events::Event;
+use kian_core::events::{Event, EventKind};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::state::{SessionState, project};
 use sqlx::sqlite::SqlitePool;
@@ -43,6 +43,13 @@ const HEAD_SQL: &str =
 const VERSION_SQL: &str = "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
 
 const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? AND seq >= ? AND seq < ? ORDER BY seq ASC";
+
+/// The kind-filtered session read behind `EventStore::scan_kind`
+/// (memory P3b-1): served by the v6 `idx_events_session_kind_seq` index
+/// (`session, kind, seq` — equality on the first two, so the index order
+/// already satisfies the `ORDER BY seq`).
+const SCAN_KIND_SQL: &str =
+    "SELECT version, envelope FROM events WHERE session = ?1 AND kind = ?2 ORDER BY seq ASC";
 
 /// The CAS refused the write: re-read the head and classify which fence
 /// tripped — the same classification both backends share (§3: pg's
@@ -163,6 +170,47 @@ pub(crate) async fn scan(
                 session,
                 seq: event.seq,
             });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// The kind-filtered session read (`WHERE session = ? AND kind = ?`,
+/// seq-ascending) — the sqlite arm of `EventStore::scan_kind`. The same
+/// envelope/coherence decoding as [`scan`]; a `kind` projection column
+/// that disagrees with its envelope is a corrupt row, exactly like a
+/// drifting `version` or `session`.
+pub(crate) async fn scan_kind(
+    pool: &SqlitePool,
+    session: SessionId,
+    kind: EventKind,
+) -> Result<Vec<Event>, StoreError> {
+    let kind_key = kind.as_str();
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_KIND_SQL)
+        .bind(session.0.to_string())
+        .bind(kind_key)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col
+            || event.session != session
+            || event.kind.as_str() != kind_key
+        {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        // The `kind` column stores `as_str()`, which collapses
+        // `SessionEnded`'s four reasons into one key. The decoded kind is
+        // the exact value: a row whose full kind differs is not the
+        // requested kind (it is not corruption — same kind string) and is
+        // skipped, so the result is exactly `scan`-then-`e.kind == kind`.
+        if event.kind != kind {
+            continue;
         }
         events.push(event);
     }

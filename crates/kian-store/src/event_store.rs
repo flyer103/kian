@@ -399,6 +399,35 @@ impl EventStore {
         }
     }
 
+    /// Reads one session's events of a single kind back in seq order —
+    /// `WHERE session = ? AND kind = ? ORDER BY seq`, the
+    /// index-accelerated view of the truth table behind the memory read
+    /// paths (memory P3b-1).
+    ///
+    /// This is **not a derived-data read**: `session`/`kind`/`seq` are
+    /// projection columns of the `events` truth table itself, served by
+    /// the v6 `idx_events_session_kind_seq` SQL index (the per-session
+    /// companion of the global `audit_kind_index`, READ-MODEL §6). The
+    /// database maintains the index at append time, so it can never
+    /// disagree with the stream — no staleness class, no rebuild, and a
+    /// store that predates the index still answers correctly via the
+    /// planner's fallback (slower, never wrong). Byte-identical to
+    /// `scan(session, 0..)` followed by a `kind` filter **exactly**: the
+    /// `kind` column stores `as_str()`, which collapses `SessionEnded`'s
+    /// four reasons into one key, so the decoded `EventKind` is compared
+    /// again after the coherence check (a non-matching variant is skipped,
+    /// not reported as corruption).
+    pub async fn scan_kind(
+        &self,
+        session: SessionId,
+        kind: EventKind,
+    ) -> Result<Vec<Event>, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::scan_kind(pool, session, kind).await,
+            EventStore::Postgres(pool) => crate::postgres::scan_kind(pool, session, kind).await,
+        }
+    }
+
     /// The session's stream position: next free seq and epoch floor.
     pub async fn head(&self, session: SessionId) -> Result<Head, StoreError> {
         match self {
@@ -1076,6 +1105,291 @@ mod tests {
             store.head(sid).await.unwrap().next_seq
         );
         store.close().await;
+        cleanup(&path);
+    }
+
+    // -- scan_kind (memory P3b-1) -------------------------------------------
+
+    /// Deterministic tiny LCG so the "random" mixed-kind streams are
+    /// reproducible in failure output (no external dep).
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// Seeds a pseudo-random mixed-kind stream of `upto` events — the
+    /// parity fixture for `scan_kind`. MemoryNote is over-represented in
+    /// the pool so every fixture is guaranteed to contain notes.
+    async fn seed_mixed(store: &EventStore, session: SessionId, upto: u64, seed: u64) {
+        let mut state = seed;
+        let pool = [
+            EventKind::TurnStart,
+            EventKind::MemoryNote,
+            EventKind::InputAdmitted,
+            EventKind::ToolCall,
+            EventKind::MemoryNote,
+            EventKind::ControlInterrupt,
+        ];
+        for seq in 1..=upto {
+            let kind = if seq == 1 {
+                EventKind::SessionCreated
+            } else {
+                pool[(lcg(&mut state) % pool.len() as u64) as usize]
+            };
+            store
+                .append(
+                    session,
+                    ev(session, seq, Epoch(1), kind),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("seed_mixed append");
+        }
+    }
+
+    /// `scan_kind` is byte-identical to `scan`-then-filter on a
+    /// pseudo-random mixed-kind stream (A1: an index can never disagree
+    /// with the stream), returns only the requested kind in ascending
+    /// seq order, never leaks another session's events, and answers
+    /// empty — never an error — for an absent kind and an unknown
+    /// session.
+    #[tokio::test]
+    async fn scan_kind_parity_with_scan_then_filter_on_a_mixed_stream() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let other = SessionId::new();
+        seed_mixed(&store, sid, 300, 0x5EED_0001).await;
+        seed_mixed(&store, other, 120, 0x5EED_0002).await;
+
+        let full = store.scan(sid, all()).await.unwrap();
+        assert_eq!(full.len(), 300);
+        let expected: Vec<String> = ser(&full
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::MemoryNote))
+            .cloned()
+            .collect::<Vec<_>>());
+        let got = store.scan_kind(sid, EventKind::MemoryNote).await.unwrap();
+        assert!(!got.is_empty(), "fixture must contain memory/note events");
+        assert_eq!(
+            ser(&got),
+            expected,
+            "scan_kind must be byte-identical to scan-then-filter"
+        );
+
+        // Ordering: strictly ascending seqs, only the requested kind,
+        // never another session's rows.
+        for pair in got.windows(2) {
+            assert!(pair[0].seq < pair[1].seq, "seqs must arrive ascending");
+        }
+        assert!(
+            got.iter()
+                .all(|e| matches!(e.kind, EventKind::MemoryNote) && e.session == sid)
+        );
+
+        // A kind absent from the stream and an unknown session both
+        // answer empty.
+        assert!(
+            store
+                .scan_kind(
+                    sid,
+                    EventKind::SessionEnded {
+                        reason: EndReason::Completed
+                    }
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scan_kind(SessionId::new(), EventKind::MemoryNote)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// `scan_kind` is exact over the whole `EventKind` space, including
+    /// the variants whose `as_str` collapses: `SessionEnded{reason}` stores
+    /// one kind key for four reasons, so the decoded kind must be compared
+    /// again (kian-120 review B1). A `Completed` query must not return a
+    /// `Failed` row, and vice versa.
+    #[tokio::test]
+    async fn scan_kind_is_exact_for_session_ended_reasons() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let reasons = [
+            EndReason::Completed,
+            EndReason::Cancelled,
+            EndReason::Interrupted,
+            EndReason::Failed,
+        ];
+
+        let mut seq = 0u64;
+        macro_rules! push {
+            ($kind:expr) => {{
+                seq += 1;
+                store
+                    .append(
+                        sid,
+                        ev(sid, seq, Epoch(1), $kind),
+                        AppendGuard {
+                            epoch: Epoch(1),
+                            expected_seq: seq,
+                        },
+                    )
+                    .await
+                    .expect("append");
+            }};
+        }
+        push!(EventKind::SessionCreated);
+        for r in reasons {
+            push!(EventKind::SessionEnded { reason: r });
+        }
+
+        let full = store.scan(sid, all()).await.unwrap();
+        for r in reasons {
+            let k = EventKind::SessionEnded { reason: r };
+            let expected: Vec<String> = ser(&full
+                .iter()
+                .filter(|e| e.kind == k)
+                .cloned()
+                .collect::<Vec<_>>());
+            let got = store.scan_kind(sid, k).await.unwrap();
+            assert_eq!(ser(&got), expected, "scan_kind must be exact for {k:?}");
+            assert_eq!(got.len(), 1, "exactly the requested reason");
+        }
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// `scan_kind` works on the read-only store (the audit-reader pool
+    /// behind `kian session inspect`-style embedded reads).
+    #[tokio::test]
+    async fn scan_kind_works_on_a_read_only_store() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_mixed(&store, sid, 200, 0x5EED_0003).await;
+        let expected = ser(&store.scan_kind(sid, EventKind::MemoryNote).await.unwrap());
+        store.close().await;
+
+        let reader = EventStore::open_read_only(&path)
+            .await
+            .expect("read-only open");
+        assert_eq!(
+            ser(&reader.scan_kind(sid, EventKind::MemoryNote).await.unwrap()),
+            expected
+        );
+        reader.close().await;
+        cleanup(&path);
+    }
+
+    /// The kind-filtered read rides the v6 index, not a table scan: the
+    /// sqlite query plan must name `idx_events_session_kind_seq`.
+    #[tokio::test]
+    async fn scan_kind_query_plan_uses_the_session_kind_index() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_mixed(&store, sid, 50, 0x5EED_0004).await;
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT version, envelope FROM events \
+             WHERE session = ?1 AND kind = ?2 ORDER BY seq ASC",
+        )
+        .bind(sid.0.to_string())
+        .bind("memory/note")
+        .fetch_all(store.pool())
+        .await
+        .expect("explain query plan");
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, d)| d.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            detail.contains("idx_events_session_kind_seq"),
+            "plan does not use the per-session kind index: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN events"),
+            "plan degrades to a table scan: {detail}"
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A store that predates v6 (no index, no v6 bookkeeping row) still
+    /// answers `scan_kind` correctly via the planner's fallback (A2),
+    /// and the next read-write open forward-migrates it: v6 lands, the
+    /// index is physically recreated, and no event byte moves (A8).
+    #[tokio::test]
+    async fn pre_v6_store_reads_via_fallback_and_forward_migrates() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_mixed(&store, sid, 120, 0x5EED_0005).await;
+        let expected = ser(&store.scan_kind(sid, EventKind::MemoryNote).await.unwrap());
+        // Rewind to a pre-v6 schema: drop the index and forget v6 applied
+        // (the same rows a store last migrated by the v5 chain would hold).
+        sqlx::query("DROP INDEX IF EXISTS idx_events_session_kind_seq")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _kian_migrations WHERE version = 6")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.close().await;
+
+        // Read-only on the pre-v6 store: the fallback answers identically
+        // (slower, never wrong).
+        let reader = EventStore::open_read_only(&path)
+            .await
+            .expect("read-only open");
+        assert_eq!(
+            ser(&reader.scan_kind(sid, EventKind::MemoryNote).await.unwrap()),
+            expected
+        );
+        reader.close().await;
+
+        // Read-write reopen forward-migrates: v6 applied, the index
+        // physically exists, and the read is unchanged.
+        let reopened = EventStore::open(&path)
+            .await
+            .expect("forward-migrate reopen");
+        assert_eq!(
+            crate::migrations::applied_versions(reopened.pool())
+                .await
+                .unwrap(),
+            (0..=kian_store_chain_head()).collect::<Vec<_>>()
+        );
+        let index_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_events_session_kind_seq'",
+        )
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+        assert_eq!(index_rows, 1, "v6 must physically recreate the index");
+        assert_eq!(
+            ser(&reopened
+                .scan_kind(sid, EventKind::MemoryNote)
+                .await
+                .unwrap()),
+            expected
+        );
+        assert_eq!(
+            reopened.scan(sid, all()).await.unwrap().len(),
+            120,
+            "the migration touches no event rows"
+        );
+        reopened.close().await;
         cleanup(&path);
     }
 

@@ -940,3 +940,65 @@ directions).
   small N); the harness lives in a scratch directory and is not committed.
 - Recorded in `design/MEMORY-MODEL.md` §10.1 and `docs/SPEC.md` §5, deliberately **not** in the
   README (README policy: no live-run logs or benchmark methodology). No code changed.
+
+## 2026-11-08 — agent-memory P3b-1: index-accelerated memory reads (`scan_kind`) — default-green
+
+- **Scope** — the memory P3b-1 plan: replace the memory paths' full-stream read with an
+  index-accelerated, kind-filtered read of `memory/note` events. **No new event kind (the
+  durable set stays 22), no new view/snapshot/table — one adjacent migration that adds a SQL
+  index only — no wire or behavior change.** The stream stays the sole truth; every switched
+  read path is byte-identical. Persisted representations, dreaming cadence, the agent-side
+  memory tool and governed cross-scope reads stay designed (P3b remainder + ADR-019 track —
+  moved, not dropped).
+- **Store (kian-116)** — adjacent migration v6 on both chains adds `idx_events_session_kind_seq`
+  over `events (session, kind, seq)`; `EventStore::scan_kind(session, kind)` returns the
+  session's events of one kind in seq order (`WHERE session = ? AND kind = ? ORDER BY seq`),
+  served by the index (EXPLAIN QUERY PLAN: index-named plan, no `SCAN events` table scan). A
+  pre-v6 store reads correctly and byte-identically via the planner fallback, and a read-only
+  open never migrates. Tests (new only): `scan_kind_parity_with_scan_then_filter_on_a_mixed_stream`,
+  `scan_kind_works_on_a_read_only_store` (kian-store), and the env-gated pg twin
+  `pg_scan_kind_parity_index_and_read_only_pool`.
+- **CLI reads (kian-117)** — every memory read path in `kian-cli` goes through
+  `scan_kind(MemoryNote)`: the shared `memory_notes` helper (list/search/map/verify),
+  `run_memory_show`, and the creation-time injection's source-session read. Test (new only):
+  `injection_payload_byte_identical_on_a_mixed_source_stream` — the admitted `{content, memory}`
+  payload is byte-identical to the pre-change full-rebuild read (including the `source_seq`
+  pin) on a source stream interleaving notes with non-note events, and the injection read
+  leaves the source stream untouched.
+- **QA acceptance (kian-118, independent)** — `crates/kian-cli/tests/memory_p3b1_qa.rs`:
+  parity at three levels (store-level `scan_kind` == scan-then-filter on adversarial streams;
+  CLI-level fold/verb parity; L3 with the literal pre-change binary (git worktree @ 27700c8)
+  vs the post-change binary on the **same** sqlite store — all 10 verb renderings plus the
+  unknown-session error string byte-identical across the v6 store, the v5-rewound store
+  (fallback read) and after forward migration, 6/6 diff groups). Narrowness (index-only plan;
+  exactly the note rows on a 401-event mixed stream), read-only (event count / envelope bytes /
+  ordered-row digest unchanged; an INSERT through the same read-only pool is refused), and
+  migration (adjacent v5→v6, rollback leaves the stream digest constant, the pre-change
+  binary keeps working before and after) all verified. Tests:
+  `qa_scan_kind_matches_scan_then_filter_on_adversarial_streams`,
+  `qa_narrow_read_rides_the_index_and_feeds_byte_identical_verb_folds`,
+  `qa_memory_verbs_append_nothing_on_a_read_only_connection`,
+  `qa_pre_v6_store_falls_back_migrates_forward_and_rolls_back_untouched`; the recorded
+  (never-gating, `#[ignore]`) `qa_cost_probe_5000_notes_over_50000_events` and
+  `qa_l3_fixture_seed`.
+- **Measured (recorded, not asserted)** — cost probe, 50 001 events / 5 000 notes (~1 KiB
+  non-note payloads), sqlite, release, best-of-20: before (rebuild + fold + render — the
+  pre-change read re-expressed) **77.23 ms** → after (`scan_kind` + fold + render)
+  **16.78 ms** (**4.60x**); `memory list` end-to-end post-change 17.38 ms (best of 10).
+  Reproduces kian-117's recorded probe (a temporary harness, **not** committed): 53.33 ms →
+  12.63 ms / 4.22x; the committed QA probe measures 76.73 → 16.54 ms / 4.64x.
+- **Failure path (kian-120 M1, accepted)** — the switched memory reads surface `StoreError` text
+  directly instead of the old `InboxError::Store` `store error: …` prefix; every successful-output
+  path is byte-identical (old-vs-new binary comparison).
+- **Closeout (kian-119, this entry)** — MEMORY-MODEL §6's cost note and §7.1's cost bound now
+  record **O(memory/note events)** via the index-accelerated kind scan (a recorded bound, not
+  a perf claim); READ-MODEL §6 notes the memory read paths consume the truth table through the
+  declared per-session kind index (the `audit_kind_index` idea) — not a view, not a snapshot,
+  no new declared view, no freshness class; SPEC §5 splits the P3b row: **P3b-1 landed**, the
+  remainder (persisted representations, cadence, tool, governed cross-scope) designed.
+- **Gates** — build / `cargo test --workspace` (107 suites, 1322 passed, 0 failed, 7 ignored —
+  2 of them the new `#[ignore]` QA probes) / clippy `--workspace --all-targets -D warnings` /
+  fmt `--all --check` green at kian-118; `docs_map` green; env-gated pg suites green
+  (kian-store/postgres 16, kian-cli `postgres_serve` + `postgres_multi_replica`, `KIAN_PG_URL`
+  per `docs/runbook-postgres.md`). This closeout entry is documentation-only on top of the
+  already-gated tree.

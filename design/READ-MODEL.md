@@ -203,7 +203,8 @@ none may).
 | `session_directory` | events | session `head` | maintenance rebuild | drop/rebuild | observability, ≤ B |
 | `session_usage` | `turn/end` usage | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
 | `ticket_stage` | `thread/started`, outbox, directory | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
-| `audit_kind_index` | event kind/ts | store head | append-time or rebuild | drop/rebuild | observability |
+| `audit_kind_index` | event kind/ts | n/a | append-time (database-maintained) | drop/rebuild | none (never stale) |
+| `idx_events_session_kind_seq` | event session/kind/seq columns | n/a | append-time (database-maintained) | recreated by the v6 migration; an out-of-band drop is **not** repaired (reads stay correct, slower) | none (never stale) |
 | `session_cache` | `step/request` prefixes, `compact` | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
 
 Landed shape (P2a):
@@ -219,6 +220,18 @@ Landed shape (P2a):
   zero duplication of derived data, is maintained by the database at append time (always fresh —
   no staleness class, no rebuild), and can never disagree with the stream. A view table would
   duplicate one row per event only to go stale.
+- **P3b-1 (2026-11-08): the memory read paths ride the kind index.** A per-session
+  `(session, kind, seq)` SQL index (`idx_events_session_kind_seq`, migration v6 — the
+  `audit_kind_index` idea scoped per session) plus `EventStore::scan_kind(session, kind)`
+  serves every memory read (creation-time injection and `kian memory
+  list|show|search|map|verify`): a kind-filtered, index-ordered read of the truth table — not
+  a view, not a snapshot. No new declared view, no freshness class; outputs byte-identical to
+  the full-stream read it replaced.
+- **Postgres migration cost (P3b-1, recorded):** the v6 `idx_events_session_kind_seq` is a
+  blocking `CREATE INDEX` inside the migration transaction — on a large existing `events` table
+  the first boot after upgrade holds a SHARE lock and pauses writes for the build (the same
+  precedent as v4's `idx_events_kind_ts`; `CONCURRENTLY` is not available inside the migration
+  transaction). Schedule upgrades accordingly.
 - **`session_cache` was declared additively by the P2a change** (per §10's additive protocol):
   the round-9 plan requires `kian cache-stats` to be served from views when fresh, and §6 had
   declared no view over the prefix-stability counters. Its source is the `step/request` audit

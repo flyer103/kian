@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use kian_core::events::Event;
+use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
 use kian_core::state::SessionState;
 use kian_exec::ExecStore;
@@ -1050,9 +1050,11 @@ impl Server {
 
 impl Server {
     /// The creation-time memory injection (MEMORY-MODEL §6, kian-101):
-    /// rebuild the source memory session's stream, fold it, render the
-    /// bounded index and admit it as ONE quiet row — durable before
-    /// this returns, waking nothing (the next submit drains it first).
+    /// read the source memory session's `memory/note` events (narrow
+    /// `scan_kind` since P3b-1 — the fold ignores non-note events), fold
+    /// them, render the bounded index and admit it as ONE quiet row —
+    /// durable before this returns, waking nothing (the next submit
+    /// drains it first).
     ///
     /// Every failure is honest degradation (I8): inject nothing, count
     /// a skip, log the reason — session creation NEVER fails here.
@@ -1091,19 +1093,37 @@ impl Server {
             return;
         }
 
-        // The source snapshot (I7): rendered from the stream alone.
-        let source_events = match self.store.rebuild(*plan.source()).await {
+        // The source snapshot (I7): rendered from the stream alone —
+        // but the fold only ever consumed the `memory/note` events
+        // (`project_notes` ignores non-note events by contract), so
+        // P3b-1 (kian-117) reads exactly those via the index-
+        // accelerated `scan_kind` (READ-MODEL §6) instead of loading
+        // the whole stream. The stream stays the sole truth; the read
+        // is narrower, the fold and the injected payload are
+        // byte-identical.
+        let source_note_events = match self
+            .store
+            .scan_kind(*plan.source(), EventKind::MemoryNote)
+            .await
+        {
             Ok(events) => events,
             Err(e) => {
                 skip(&format!("source stream unreadable: {e}"));
                 return;
             }
         };
-        if source_events.is_empty() {
-            skip("unknown source memory session (no events)");
-            return;
+        if source_note_events.is_empty() {
+            // The pre-change distinction, kept without loading the
+            // stream: an empty note set is an unknown source only when
+            // the stream itself is empty (`head()` — one indexed
+            // lookup, no rows read).
+            let known = matches!(self.store.head(*plan.source()).await, Ok(h) if h.next_seq > 1);
+            if !known {
+                skip("unknown source memory session (no events)");
+                return;
+            }
         }
-        let notes = kian_core::memory::project_notes(&source_events);
+        let notes = kian_core::memory::project_notes(&source_note_events);
         let eligible = kian_memory::eligible_notes(&notes);
         let Some(rendered) =
             kian_memory::render_memory_index_with(&notes, plan.caps(), plan.redactor())

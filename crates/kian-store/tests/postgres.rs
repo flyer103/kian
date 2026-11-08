@@ -1320,3 +1320,98 @@ async fn pg_archive_marker_commit_and_inputs() {
     fresh.finish().await;
     pg.finish().await;
 }
+
+// -- scan_kind (memory P3b-1) -------------------------------------------------
+
+/// `scan_kind` on postgres: byte-identical to scan-then-filter on a
+/// pseudo-random mixed-kind stream (A1/A7 parity with the sqlite suite),
+/// seq-ascending, the v6 per-session kind index physically exists, and
+/// the read-only-pool open (no migration) reads the same rows.
+#[tokio::test]
+async fn pg_scan_kind_parity_index_and_read_only_pool() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let sid = SessionId::new();
+
+    // Deterministic LCG mixed-kind fixture (the same shape as the sqlite
+    // suite's `seed_mixed`; MemoryNote over-represented so notes exist).
+    let mut state = 0x5EED_0006u64;
+    let kinds = [
+        EventKind::TurnStart,
+        EventKind::MemoryNote,
+        EventKind::InputAdmitted,
+        EventKind::ToolCall,
+        EventKind::MemoryNote,
+        EventKind::ControlInterrupt,
+    ];
+    for seq in 1..=200u64 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let kind = if seq == 1 {
+            EventKind::SessionCreated
+        } else {
+            kinds[((state >> 33) % kinds.len() as u64) as usize]
+        };
+        append_ok(&pg.store, sid, seq, Epoch(1), kind).await;
+    }
+
+    let ser = |events: &[Event]| {
+        events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let full = pg.store.scan(sid, all()).await.expect("scan");
+    assert_eq!(full.len(), 200);
+    let expected: Vec<String> = ser(&full
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::MemoryNote))
+        .cloned()
+        .collect::<Vec<_>>());
+    let got = pg
+        .store
+        .scan_kind(sid, EventKind::MemoryNote)
+        .await
+        .expect("scan_kind");
+    assert!(!got.is_empty(), "fixture must contain memory/note events");
+    assert_eq!(
+        ser(&got),
+        expected,
+        "scan_kind must be byte-identical to scan-then-filter"
+    );
+    for pair in got.windows(2) {
+        assert!(pair[0].seq < pair[1].seq, "seqs must arrive ascending");
+    }
+
+    // The v6 index physically exists on the events table.
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&pg.url())
+        .await
+        .expect("index check connection");
+    let idx: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE tablename = 'events' AND indexname = 'idx_events_session_kind_seq'",
+    )
+    .fetch_one(&admin)
+    .await
+    .expect("pg_indexes read");
+    admin.close().await;
+    assert_eq!(idx, 1, "v6 must create idx_events_session_kind_seq");
+
+    // The read-only-pool open (which never migrates) reads the same rows.
+    let reader = EventStore::open_postgres_read_only(&pg.url())
+        .await
+        .expect("read-only pg open");
+    let ro = reader
+        .scan_kind(sid, EventKind::MemoryNote)
+        .await
+        .expect("read-only scan_kind");
+    assert_eq!(ser(&ro), expected);
+    reader.close().await;
+
+    pg.finish().await;
+}

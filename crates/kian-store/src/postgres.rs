@@ -23,7 +23,7 @@
 
 use std::ops::Range;
 
-use kian_core::events::Event;
+use kian_core::events::{Event, EventKind};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::state::{SessionState, project};
 use sqlx::postgres::PgPool;
@@ -56,6 +56,11 @@ const HEAD_SQL: &str =
 const VERSION_SQL: &str = "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = $1::text";
 
 const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = $1::text AND seq >= $2::bigint AND seq < $3::bigint ORDER BY seq ASC";
+
+/// The same kind-filtered session read as the sqlite twin (memory
+/// P3b-1): served by the v6 `idx_events_session_kind_seq` index on
+/// postgres too.
+const SCAN_KIND_SQL: &str = "SELECT version, envelope FROM events WHERE session = $1::text AND kind = $2::text ORDER BY seq ASC";
 
 /// Postgres sqlstate for a unique-constraint violation — the observable
 /// form of the concurrent same-session CAS race this backend must
@@ -174,6 +179,44 @@ pub(crate) async fn scan(
                 session,
                 seq: event.seq,
             });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// The kind-filtered session read — the postgres arm of
+/// `EventStore::scan_kind` (see the sqlite twin).
+pub(crate) async fn scan_kind(
+    pool: &PgPool,
+    session: SessionId,
+    kind: EventKind,
+) -> Result<Vec<Event>, StoreError> {
+    let kind_key = kind.as_str();
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_KIND_SQL)
+        .bind(session.0.to_string())
+        .bind(kind_key)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col
+            || event.session != session
+            || event.kind.as_str() != kind_key
+        {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        // The `kind` column stores `as_str()`, which collapses
+        // `SessionEnded`'s four reasons into one key. The decoded kind is
+        // the exact value: a row whose full kind differs is not the
+        // requested kind (it is not corruption — same kind string) and is
+        // skipped, so the result is exactly `scan`-then-`e.kind == kind`.
+        if event.kind != kind {
+            continue;
         }
         events.push(event);
     }

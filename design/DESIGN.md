@@ -458,11 +458,12 @@ consumed exactly once and no code path re-injects on resume, takeover or migrati
 probes show one injection event and `unexpected_prefix_change == 0`); the renderer is frozen
 stable content like the serialization contracts above; and with `memory.session` absent the
 create path admits nothing, leaving streams and request bytes byte-identical to a memory-off
-server. Cost bound (kian-104 review I1): with injection configured, every create performs two
-full stream rebuilds on the hottest control-plane path — the fresh session's (one
-`session/created` event) and the source memory session's **entire history**, which is then
-folded — so render cost is O(memory-session history) per created session; the `memory.inject`
-caps bound the rendered bytes, not the read. Serving the fold from a snapshot/projection is P3
+server. Cost bound (updated P3b-1; originally kian-104 review I1): the fresh session's
+rebuild is one `session/created` event, and the source memory session is no longer read in
+full — since P3b-1 the fold input is the index-accelerated kind scan (`scan_kind` over the
+per-session `idx_events_session_kind_seq` index), so the read is O(memory/note events), not
+O(memory-session history); the `memory.inject` caps bound the rendered bytes, not the read
+(a recorded bound, not a perf claim). Serving the fold from a snapshot/projection remains P3b
 work (READ-MODEL). Normative contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §6.
 
 **Serving-form acceleration (READ-MODEL, landed)**: projection reads, event streams and the
