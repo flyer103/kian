@@ -123,6 +123,14 @@ when the owner asks. Negative results commit documentation only — never broken
   non-context events, the dreaming drain, creation-time injection, representations as projections.
   **Any memory semantic change starts here**; the kind bytes stay in EVENT-MODEL, the wire in
   API-CONTRACT, the placement in DESIGN.
+- `design/READ-MODEL.md` — the normative serving-form contract (source of truth): versions,
+  unchanged/delta reads, resumable streams, verified snapshots, materialized views, opt-in
+  export-only retention and bounded-staleness reads. Truth stays the event stream; wire shapes
+  stay in API-CONTRACT. **Any serving/read-surface change starts here**.
+- `design/CHANNEL-WECHAT.md` — the normative WeChat iLink channel contract (source of truth,
+  best-effort by contract): protocol mapping, credential file, config/CLI, receive allowlist,
+  dedupe and the cursor bound, degradation. **Any WeChat channel change starts here**; a protocol
+  break degrades this channel only (ADR-018).
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.
