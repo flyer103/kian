@@ -501,34 +501,49 @@ impl Plugin for SuperAgentPlugin {
         // system); the completion bridge admits through the same
         // late-bound inbox port the bundle uses, and resolves invoking
         // sessions from committed `tool/call` events.
-        let mut async_jobs = None;
+        //
+        // (ADR-020, D11): carry, not refuse — ONE engine per
+        // configured endpoint, each bound to its own endpoint id
+        // (`async_jobs.endpoint_id` is already a persisted column;
+        // dispatch is `exec_tracked(job_id, &endpoint_id, …)`), with
+        // one shared metrics handle and one shared completion sink.
+        // Pair i mounts on worker side i; the Router keeps the
+        // first-endpoint pair (the Router is not a bound worker).
+        let mut async_jobs: Vec<Arc<kian_exec::AsyncJobs>> = Vec::new();
         let mut async_metrics = None;
         let mut async_pair: Option<Arc<dyn ToolProvider>> = None;
+        let mut async_pairs: Vec<Arc<dyn ToolProvider>> = Vec::new();
         if self.async_tools {
             let remote = remote.as_ref().ok_or_else(|| {
                 apply_error("superagent.async_tools requires the remote-exec plugin")
             })?;
-            let endpoint = remote
-                .endpoints
-                .first()
-                .map(|ep| ep.id.clone())
-                .ok_or_else(|| apply_error("superagent.async_tools requires an endpoint"))?;
+            if remote.endpoints.is_empty() {
+                return Err(apply_error(
+                    "superagent.async_tools requires a configured endpoint",
+                ));
+            }
             let metrics = Arc::new(crate::async_bridge::AsyncBridgeMetrics::default());
             let sink = crate::async_bridge::CompletionBridge::new(
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
                 self.event_store.clone(),
                 Arc::clone(&metrics),
             );
-            let jobs = kian_exec::AsyncJobs::new(
-                Arc::clone(&remote.backend),
-                endpoint,
-                sink,
-                crate::async_bridge::session_for_call(self.event_store.clone()),
-            );
-            async_pair =
-                Some(Arc::new(kian_exec::AsyncToolPair::new(Arc::clone(&jobs)))
+            let session_for_call = crate::async_bridge::session_for_call(self.event_store.clone());
+            for endpoint in &remote.endpoints {
+                let jobs = kian_exec::AsyncJobs::new(
+                    Arc::clone(&remote.backend),
+                    endpoint.id.clone(),
+                    Arc::clone(&sink) as Arc<dyn kian_exec::AsyncResultSink>,
+                    Arc::clone(&session_for_call),
+                );
+                async_pairs.push(Arc::new(kian_exec::AsyncToolPair::new(Arc::clone(&jobs)))
                     as Arc<dyn ToolProvider>);
-            async_jobs = Some(jobs);
+                async_jobs.push(jobs);
+            }
+            // The Router's default pair is the first endpoint's — the
+            // legacy behavior with one endpoint (default == only
+            // worker), byte-identical.
+            async_pair = async_pairs.first().cloned();
             async_metrics = Some(metrics);
         }
 
@@ -554,6 +569,19 @@ impl Plugin for SuperAgentPlugin {
         // (ADR-012): the mandate issuance policy rides the profile
         // into the spawn tool (the single issuance point).
         profile.mandate = self.mandate.clone();
+        // (ADR-020, D5/D7): the execution-worker catalog rides the
+        // profile into the bootstrap render (the judge-prompt block;
+        // empty = today's bytes) and the spawn tool surface.
+        if let Some(remote) = &remote {
+            profile.worker_catalog = remote
+                .endpoints
+                .iter()
+                .map(|ep| kian_superagent::WorkerEntry {
+                    id: ep.id.clone(),
+                    description: ep.description.clone(),
+                })
+                .collect();
+        }
         // the outbox bounded-retry config rides the profile (an
         // explicitly-built driver below overrides the auto-built one,
         // sharing one handle with the boot re-drive).
@@ -638,6 +666,31 @@ impl Plugin for SuperAgentPlugin {
             .with_followup_registry(Arc::clone(&followup_registry));
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
+        }
+        // (ADR-020, D5/D6/D9): the catalog + queue timeouts and the
+        // worker-streams read port ride the spawn tool — the spawn
+        // schema, argument validation and the exclusivity check all
+        // derive from them. Installed only when endpoints are
+        // configured (zero endpoints = feature off, no port read).
+        if let Some(remote) = &remote {
+            let catalog: Vec<kian_superagent::WorkerEntry> = remote
+                .endpoints
+                .iter()
+                .map(|ep| kian_superagent::WorkerEntry {
+                    id: ep.id.clone(),
+                    description: ep.description.clone(),
+                })
+                .collect();
+            let timeouts: std::collections::BTreeMap<String, u64> = remote
+                .endpoints
+                .iter()
+                .map(|ep| (ep.id.clone(), ep.queue_timeout_ms))
+                .collect();
+            let worker_streams =
+                crate::superagent::StoreWorkerStreams::new(self.event_store.clone());
+            router_tools = router_tools
+                .with_worker_catalog(catalog, timeouts)
+                .with_worker_streams(worker_streams);
         }
         let router_tools = Arc::new(router_tools);
         // the recall toolpack reads through the one `StoreRecall`
@@ -775,7 +828,10 @@ impl Plugin for SuperAgentPlugin {
                 default_agent.id
             )));
         }
-        let default_tools = Arc::new(FilteredTools::new(local_tools, &default_agent.tools));
+        let default_tools = Arc::new(FilteredTools::new(
+            local_tools.clone(),
+            &default_agent.tools,
+        ));
         let default_loop = Arc::new(ReActLoop::with_evidence_gate(
             default_agent,
             registry.clone(),
@@ -869,6 +925,119 @@ impl Plugin for SuperAgentPlugin {
             },
             crate::superagent::port_for_ctx(),
         );
+
+        // (ADR-020, D8/D11/D16): one prebuilt worker side per
+        // configured endpoint — its loop mounts EXACTLY ONE `exec`
+        // (its endpoint's `RemoteExecTool`), its own async pair bound
+        // to the same endpoint, the shared recall toolpack and the
+        // filtered local tools. Tool names and schemas are identical
+        // across sides ⇒ prompt-prefix neutral across sessions. The
+        // refusing-side factory covers the unconfigured-bound and
+        // malformed rows (D16/D2): a worker loop whose only `exec` is
+        // the honest refusal — no backend handle, zero enqueues.
+        // Zero endpoints installs nothing: the single `worker_side`
+        // above is today's exact path.
+        let mut worker_sides: std::collections::BTreeMap<
+            String,
+            kian_superagent::WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
+        > = std::collections::BTreeMap::new();
+        // (B1) the same ids in CONFIG order (the `endpoints` file
+        // order the schema enum and the prompt block already use) —
+        // the selection input for the legacy-unbound row. The
+        // BTreeMap above stays the id → side lookup; its key order
+        // (alphabetical) must never feed `select_side`.
+        let mut worker_order: Vec<String> = Vec::new();
+        let mut refuse_side: Option<crate::superagent::RefuseSideFactory> = None;
+        if let Some(remote) = &remote {
+            worker_order = crate::superagent::selection_input_in_config_order(&remote.endpoints);
+            let worker_react_config = ReActConfig {
+                slot: kian_core::model::SlotName("main".into()),
+                max_iterations: self.max_iterations,
+                permissions: self.worker_permissions.clone(),
+            };
+            for (index, endpoint) in remote.endpoints.iter().enumerate() {
+                let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
+                tools.push(Arc::new(kian_exec::RemoteExecTool::new(
+                    Arc::clone(&remote.backend),
+                    endpoint.id.clone(),
+                )));
+                if let Some(pair) = async_pairs.get(index) {
+                    tools.push(Arc::clone(pair));
+                }
+                if self.recall.worker {
+                    tools.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
+                }
+                tools.push(Arc::new(FilteredTools::new(
+                    local_tools.clone(),
+                    &self.worker_agent.tools,
+                )));
+                let side_loop = Arc::new(ReActLoop::with_config(
+                    self.worker_agent.clone(),
+                    registry.clone(),
+                    Arc::new(crate::superagent::CombinedTools::new(tools)),
+                    Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+                    worker_react_config.clone(),
+                ));
+                worker_sides.insert(
+                    endpoint.id.clone(),
+                    kian_superagent::WorkerLoopDriver::new(
+                        Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
+                        Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                        kian_superagent::WorkerLoopConfig {
+                            router: self.router_session,
+                            worker_version: self.worker_agent.version,
+                            gate: crate::superagent::clone_gate(&self.worker_gate),
+                        },
+                        crate::superagent::port_for_ctx(),
+                    ),
+                );
+            }
+            // The refusing-side factory (built per drive — the refusal
+            // rows are rare and never on the hot path; a fresh loop per
+            // drive is deterministic, no resident routing state).
+            let refuse_registry = registry.clone();
+            let refuse_agent = self.worker_agent.clone();
+            let refuse_policy: Arc<dyn RecoveryPolicySource> =
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>;
+            let refuse_config = worker_react_config;
+            let refuse_local = local_tools.clone();
+            let refuse_recall = self.recall.worker;
+            let refuse_recall_tools = recall_tools.clone();
+            let refuse_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
+            let refuse_gate = crate::superagent::clone_gate(&self.worker_gate);
+            let refuse_session = self.router_session;
+            let refuse_version = self.worker_agent.version;
+            refuse_side = Some(Arc::new(move |refusal: &crate::superagent::Refusal| {
+                let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
+                tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
+                    refusal.clone(),
+                )));
+                if refuse_recall {
+                    tools.push(Arc::new(refuse_recall_tools.clone()) as Arc<dyn ToolProvider>);
+                }
+                tools.push(Arc::new(FilteredTools::new(
+                    refuse_local.clone(),
+                    &refuse_agent.tools,
+                )));
+                let refuse_loop = Arc::new(ReActLoop::with_config(
+                    refuse_agent.clone(),
+                    refuse_registry.clone(),
+                    Arc::new(crate::superagent::CombinedTools::new(tools)),
+                    Arc::clone(&refuse_policy),
+                    refuse_config.clone(),
+                ));
+                kian_superagent::WorkerLoopDriver::new(
+                    Arc::new(crate::superagent::WorkerInnerDriver::React(refuse_loop)),
+                    Arc::clone(&refuse_inbox),
+                    kian_superagent::WorkerLoopConfig {
+                        router: refuse_session,
+                        worker_version: refuse_version,
+                        gate: crate::superagent::clone_gate(&refuse_gate),
+                    },
+                    crate::superagent::port_for_ctx(),
+                )
+            }));
+        }
         let mut driver = crate::superagent::SuperAgentDriver::new(
             self.router_session,
             self.worker_agent.version,
@@ -882,6 +1051,12 @@ impl Plugin for SuperAgentPlugin {
                 watchdog_side
                     .expect("the watchdog side is built exactly when the profile is present"),
             );
+        }
+        // (ADR-020, D8): the per-worker sides ride the driver — with
+        // none installed (zero endpoints) the driver routes exactly
+        // as before.
+        if let Some(refuse_side) = refuse_side {
+            driver = driver.with_worker_sides(worker_sides, worker_order, refuse_side);
         }
         let driver = Arc::new(driver);
 

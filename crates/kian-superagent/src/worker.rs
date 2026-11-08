@@ -218,6 +218,109 @@ pub fn delegation_mandate(content: &Value) -> Option<&Value> {
     content.as_object().and_then(|obj| obj.get(MANDATE_KEY))
 }
 
+// ---------------------------------------------------------------------------
+// The execution-worker binding key (ADR-020, spec D1/D2)
+// ---------------------------------------------------------------------------
+
+/// The execution-worker binding key (D1): **one spelling on every
+/// surface** — the delegation wrapper, the `thread/started` payload
+/// top level, the `spawn_worker` tool argument, and the spawn result
+/// echo. The value is the configured `endpoints[].id`, an opaque
+/// non-empty string. `worker` stays the worker **session** uuid and
+/// is never reused for the id.
+pub const EXEC_WORKER_KEY: &str = "exec_worker";
+
+/// The binding state of one surface (D2): the key is absent (legacy
+/// unbound, byte-identical), present with a non-empty string value
+/// (bound to that worker id), or present with anything else
+/// (malformed — refused honestly at use time, never guessed, never
+/// defaulted, never fallback-routed). [`Cow`] so stream-derived
+/// readers can return an owned id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerBinding<'a> {
+    /// The key is absent — a legacy unbound delegation.
+    Unbound,
+    /// The key names the bound execution worker.
+    Bound(std::borrow::Cow<'a, str>),
+    /// The key exists but is not a non-empty string.
+    Malformed,
+}
+
+impl WorkerBinding<'_> {
+    /// The same binding with an owned id (stream readers hand the
+    /// value out of the events' lifetime).
+    #[must_use]
+    pub fn into_owned(self) -> WorkerBinding<'static> {
+        match self {
+            Self::Unbound => WorkerBinding::Unbound,
+            Self::Bound(id) => {
+                WorkerBinding::Bound(std::borrow::Cow::Owned(id.as_ref().to_string()))
+            }
+            Self::Malformed => WorkerBinding::Malformed,
+        }
+    }
+}
+
+/// One surface's binding off a JSON value: `None` (key absent) ⇒
+/// [`WorkerBinding::Unbound`], a non-empty string ⇒ `Bound`, anything
+/// else ⇒ `Malformed` (D2).
+fn binding_of_value(value: Option<&Value>) -> WorkerBinding<'_> {
+    match value {
+        None => WorkerBinding::Unbound,
+        Some(Value::String(id)) if !id.is_empty() => {
+            WorkerBinding::Bound(std::borrow::Cow::Borrowed(id))
+        }
+        Some(_) => WorkerBinding::Malformed,
+    }
+}
+
+/// Reads the additive execution-worker binding off a delegation
+/// wrapper (the message `content`). The companion of
+/// [`delegation_mandate`]: the [`Delegation`] struct stays exactly
+/// its frozen shape, and every legacy parse path is byte-identical.
+#[must_use]
+pub fn delegation_worker_binding(content: &Value) -> WorkerBinding<'_> {
+    binding_of_value(content.as_object().and_then(|obj| obj.get(EXEC_WORKER_KEY)))
+}
+
+/// Reads the additive execution-worker binding off a `thread/started`
+/// payload's top level (the same key, the same spelling).
+#[must_use]
+pub fn thread_started_worker_binding(bytes: &Value) -> WorkerBinding<'_> {
+    binding_of_value(bytes.get(EXEC_WORKER_KEY))
+}
+
+/// The session's own binding, derived from its own stream alone (I1:
+/// no resident routing state; rebuild == replay). The stream's
+/// `thread/started` payload (naming this session as the worker) and
+/// the **first** `input/admitted` delegation wrapper must agree; a
+/// disagreement — or a malformed value on either side — reads
+/// [`WorkerBinding::Malformed`] and the routing layer refuses rather
+/// than picking one (D4).
+#[must_use]
+pub fn worker_binding_of(events: &[Event], session: SessionId) -> WorkerBinding<'static> {
+    let payload = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::ThreadStarted && event_worker(ev) == Some(session))
+        .map(|ev| thread_started_worker_binding(&ev.bytes));
+    let wrapper = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::InputAdmitted)
+        .and_then(|ev| ev.bytes.get("content"))
+        .map(delegation_worker_binding);
+    match (payload, wrapper) {
+        (None, None) => WorkerBinding::Unbound,
+        (Some(binding), None) | (None, Some(binding)) => binding.into_owned(),
+        (Some(payload), Some(wrapper)) => {
+            if payload == wrapper {
+                payload.into_owned()
+            } else {
+                WorkerBinding::Malformed
+            }
+        }
+    }
+}
+
 /// The result of revalidating a live worker's mandate before a
 /// follow-up routes to it (ADR-012's revalidation rule, composed with
 /// the live-routing path).
@@ -286,6 +389,24 @@ pub fn thread_started_payload(thread: &Thread, worker: SessionId, task_message: 
         "pinned_version": thread.pinned_version,
         "task": task_message,
     })
+}
+
+/// The bound `thread/started` payload (spec D4): exactly
+/// [`thread_started_payload`] plus **one** top-level
+/// [`EXEC_WORKER_KEY`] key — the additive-marker pattern. The payload
+/// stays frozen for legacy spawns (the sibling builder above is
+/// unchanged); both sides of one bound delegation render these same
+/// bytes because both embed the identical task message.
+#[must_use]
+pub fn thread_started_payload_bound(
+    thread: &Thread,
+    worker: SessionId,
+    task_message: &Value,
+    exec_worker: &str,
+) -> Value {
+    let mut payload = thread_started_payload(thread, worker, task_message);
+    payload[EXEC_WORKER_KEY] = Value::String(exec_worker.to_string());
+    payload
 }
 
 /// The `thread/completed` payload (§2 schema):
@@ -578,13 +699,26 @@ impl WorkerSpawner {
             .await
     }
 
-    async fn spawn_inner(
-        &self,
-        task: Value,
-        correlation: Option<Value>,
-        speculative: bool,
-        mandate: Option<Value>,
-    ) -> Result<SpawnedWorker, SpawnError> {
+    /// The struct-carrying spawn entry point (spec D3): the four
+    /// legacy methods above stay byte-identical and combinatorial
+    /// explosion is refused — every caller that needs the
+    /// execution-worker binding (and any future additive spawn field)
+    /// goes through one [`SpawnRequest`]. Admits immediately; the
+    /// bound Router path uses [`WorkerSpawner::prepare`] +
+    /// [`WorkerSpawner::admit`] so the Router-side `thread/started`
+    /// can land **before** the task row (D10).
+    pub async fn spawn_bound(&self, request: SpawnRequest) -> Result<SpawnedWorker, SpawnError> {
+        let spawned = self.prepare(&request);
+        self.admit(&spawned).await?;
+        Ok(spawned)
+    }
+
+    /// The pure half of a spawn (D10 step 7): mint the thread id, the
+    /// fresh worker session, the delegation wrapper (every additive
+    /// key included) and the task message. No IO, no side effects —
+    /// the caller emits its Router-side lineage first, then admits.
+    #[must_use]
+    pub fn prepare(&self, request: &SpawnRequest) -> SpawnedWorker {
         let thread = Thread {
             id: Uuid::new_v4(),
             parent_session: self.router,
@@ -596,26 +730,86 @@ impl WorkerSpawner {
         // delegation_content plus one key), the speculative marker
         // through the spelling — both additive, both optional, and
         // absent together the bytes are the frozen legacy form.
-        let mut wrapper = match &mandate {
-            Some(mandate) => mandate_delegation_content(thread.id, correlation, task, mandate),
-            None => delegation_content(thread.id, correlation, task),
+        let mut wrapper = match &request.mandate {
+            Some(mandate) => mandate_delegation_content(
+                thread.id,
+                request.correlation.clone(),
+                request.task.clone(),
+                mandate,
+            ),
+            None => {
+                delegation_content(thread.id, request.correlation.clone(), request.task.clone())
+            }
         };
-        if speculative {
+        if request.speculative {
             wrapper[SPECULATIVE_MARKER] = Value::Bool(true);
         }
+        // (ADR-020, D1/D2): the binding is the last additive key —
+        // inserted only on the bound path, never replaced, so legacy
+        // spawns stay byte-identical (absent, never null).
+        if let Some(exec_worker) = &request.exec_worker {
+            wrapper[EXEC_WORKER_KEY] = Value::String(exec_worker.clone());
+        }
         let task_message = json!({"role": "user", "content": wrapper});
-        // The admitted payload *is* the message content (the server's
-        // consumption write wraps it as {"role","content"}).
-        self.inbox
-            .admit(worker_session, wrapper, Some(task_input_key(thread.id)))
-            .await?;
-        self.inbox.wake(worker_session);
-        Ok(SpawnedWorker {
+        SpawnedWorker {
             thread,
             worker_session,
             task_message,
-        })
+        }
     }
+
+    /// The durable half of a spawn (D10 step 7): admit the task row
+    /// (idempotent per thread id — a retried dispatch never
+    /// double-admits), then wake. Durable row first, wake strictly
+    /// after (invariant 1).
+    pub async fn admit(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
+        let wrapper = spawned.task_message["content"].clone();
+        self.inbox
+            .admit(
+                spawned.worker_session,
+                wrapper,
+                Some(task_input_key(spawned.thread.id)),
+            )
+            .await?;
+        self.inbox.wake(spawned.worker_session);
+        Ok(())
+    }
+
+    async fn spawn_inner(
+        &self,
+        task: Value,
+        correlation: Option<Value>,
+        speculative: bool,
+        mandate: Option<Value>,
+    ) -> Result<SpawnedWorker, SpawnError> {
+        self.spawn_bound(SpawnRequest {
+            task,
+            correlation,
+            speculative,
+            mandate,
+            exec_worker: None,
+        })
+        .await
+    }
+}
+
+/// The struct-carrying spawn request (spec D3): `task`, the optional
+/// `correlation`, the `speculative` marker, the (ADR-012) `mandate`,
+/// and the (ADR-020) execution-worker binding. One entry point, no
+/// combinatorial `spawn_*` explosion.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnRequest {
+    /// The actual user content — what the Router asked the worker to do.
+    pub task: Value,
+    /// Optional ticket correlation (verbatim into the wrapper).
+    pub correlation: Option<Value>,
+    /// The speculative marker (`"speculative": true` in the wrapper).
+    pub speculative: bool,
+    /// The mandate object (ADR-012), carried verbatim.
+    pub mandate: Option<Value>,
+    /// The execution-worker binding (ADR-020, D1): the configured
+    /// `endpoints[].id`. `None` = legacy unbound, byte-identical.
+    pub exec_worker: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +858,10 @@ pub fn lineage_plan(
     let Some(first_input) = events.iter().find(|ev| ev.kind == EventKind::InputAdmitted) else {
         return LineagePlan::PassThrough;
     };
-    let Some(delegation) = first_input.bytes.get("content").and_then(parse_delegation) else {
+    let Some(content) = first_input.bytes.get("content") else {
+        return LineagePlan::PassThrough;
+    };
+    let Some(delegation) = parse_delegation(content) else {
         return LineagePlan::PassThrough;
     };
     let thread = Thread {
@@ -672,9 +869,24 @@ pub fn lineage_plan(
         parent_session: router,
         pinned_version: worker_version,
     };
+    // (ADR-020, D4): the worker side derives its binding from the
+    // FIRST input wrapper — when bound, the emitted `thread/started`
+    // is the sibling bound payload (legacy + the one top-level key),
+    // byte-identical to the Router side's event for the same spawn.
+    // A malformed binding has no id to record; the payload stays the
+    // legacy builder and `worker_binding_of` reads the stream
+    // Malformed (the routing layer refuses).
+    let started_bytes = match delegation_worker_binding(content) {
+        WorkerBinding::Bound(id) => {
+            thread_started_payload_bound(&thread, self_session, &first_input.bytes, &id)
+        }
+        WorkerBinding::Unbound | WorkerBinding::Malformed => {
+            thread_started_payload(&thread, self_session, &first_input.bytes)
+        }
+    };
     LineagePlan::Emit {
         thread_id: delegation.thread_id,
-        started_bytes: thread_started_payload(&thread, self_session, &first_input.bytes),
+        started_bytes,
     }
 }
 
@@ -761,6 +973,204 @@ pub fn delegation_pairs(router_events: &[Event], worker_events: &[Event]) -> Vec
         }
     }
     pairs.into_values().collect()
+}
+
+// ---------------------------------------------------------------------------
+// Worker exclusivity (ADR-020, I3/D9) — stream-derived, pure
+// ---------------------------------------------------------------------------
+
+/// Failures of a [`WorkerStreamsPort`] read. The bundle's honest
+/// "cannot decide" — the spawn is refused (fail-closed), never
+/// guessed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("worker streams port: {0}")]
+pub struct WorkerStreamsError(pub String);
+
+/// The bundle-owned read-only port over worker streams (spec D9, the
+/// [`crate::recall::RecallPort`] precedent): the exclusivity check
+/// reads the candidate bound workers' committed streams through this
+/// seam and nothing else. Assembly (`kian-cli`) implements it over
+/// the event store; this crate names no store symbol
+/// (`tests/iron_rule.rs`).
+pub trait WorkerStreamsPort: Send + Sync {
+    /// One worker session's full committed event stream.
+    fn read_stream(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<Event>, WorkerStreamsError>>;
+}
+
+/// One delegation bound to an execution worker, projected off the
+/// Router's own `thread/started` events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundThread {
+    pub thread_id: Uuid,
+    pub worker_session: SessionId,
+    /// The lineage event's `ts` — the clock the never-started
+    /// reservation's release bound (D10) measures from.
+    pub started_ts: u64,
+}
+
+/// Candidates per execution-worker id, from the ROUTER stream's
+/// `thread/started` payloads (top-level [`EXEC_WORKER_KEY`]). Legacy
+/// unbound threads contribute nothing — an unbound session is never
+/// registered as bound (D15).
+#[must_use]
+pub fn bound_workers(
+    router_events: &[Event],
+) -> std::collections::BTreeMap<String, Vec<BoundThread>> {
+    let mut map = std::collections::BTreeMap::new();
+    for ev in router_events {
+        if ev.kind != EventKind::ThreadStarted {
+            continue;
+        }
+        let WorkerBinding::Bound(id) = thread_started_worker_binding(&ev.bytes) else {
+            continue;
+        };
+        let (Some(thread_id), Some(worker_session)) = (event_thread_id(ev), event_worker(ev))
+        else {
+            continue;
+        };
+        map.entry(id.as_ref().to_string())
+            .or_insert_with(Vec::new)
+            .push(BoundThread {
+                thread_id,
+                worker_session,
+                started_ts: ev.ts,
+            });
+    }
+    map
+}
+
+/// The liveness of one worker stream — status-aware, over the frozen
+/// vocabulary (I3): `completed`/`cancelled` release the worker;
+/// `failed`/`interrupted` are resumable and still hold it; a stream
+/// with neither `session/created` nor `input/admitted` never started
+/// (a lineage-only reservation — D10's crash window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadLiveness {
+    /// Started and not terminally released — the worker is held.
+    Live,
+    /// `thread/completed{completed}` or `session/ended{completed |
+    /// cancelled}`: the worker is free.
+    Released,
+    /// No `session/created` and no `input/admitted` — the reservation
+    /// never became a session; released only after the queue timeout
+    /// from the lineage `ts`.
+    NeverStarted,
+}
+
+/// Projects one worker stream's liveness (the table above). The last
+/// terminal event decides: a `thread/completed{failed}` followed by
+/// `session/ended{completed}` reads Released; the reverse order reads
+/// what the final terminal says.
+#[must_use]
+pub fn thread_liveness(worker_events: &[Event]) -> ThreadLiveness {
+    let started = worker_events.iter().any(|ev| {
+        matches!(
+            ev.kind,
+            EventKind::SessionCreated | EventKind::InputAdmitted
+        )
+    });
+    if !started {
+        return ThreadLiveness::NeverStarted;
+    }
+    let mut liveness = ThreadLiveness::Live;
+    for ev in worker_events {
+        match &ev.kind {
+            EventKind::ThreadCompleted => {
+                let status = ev.bytes.get("status").and_then(Value::as_str);
+                liveness = if status == Some("completed") {
+                    ThreadLiveness::Released
+                } else {
+                    // `failed` (and the reserved `interrupted`):
+                    // resumable — the worker is still held.
+                    ThreadLiveness::Live
+                };
+            }
+            EventKind::SessionEnded { reason } => {
+                liveness = match reason {
+                    kian_core::events::EndReason::Completed
+                    | kian_core::events::EndReason::Cancelled => ThreadLiveness::Released,
+                    kian_core::events::EndReason::Failed
+                    | kian_core::events::EndReason::Interrupted => ThreadLiveness::Live,
+                };
+            }
+            _ => {}
+        }
+    }
+    liveness
+}
+
+/// The live owner a busy refusal names (I3): the owning worker
+/// session, its thread, and why it holds the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyOwner {
+    pub thread_id: Uuid,
+    pub worker_session: SessionId,
+    /// Why the owner still holds the worker (the refusal text).
+    pub reason: &'static str,
+}
+
+/// Why one bound session still holds the worker.
+const BUSY_REASON_LIVE: &str = "live worker session";
+const BUSY_REASON_NEVER_STARTED: &str = "never-started reservation inside the queue timeout";
+
+/// The exclusivity decision `spawn_worker` consumes before any side
+/// effect (I3/D9): pure over the Router's committed events plus the
+/// candidate worker streams read through the port. `Ok(None)` = the
+/// worker is free; `Ok(Some(owner))` = busy (the refusal names the
+/// owner); `Err` = a stream could not be read — fail-closed, the
+/// caller refuses honestly and never spawns on an undecidable fact.
+///
+/// A never-started reservation (the D10 crash window: lineage landed,
+/// the task row never did) is released once `now_ms - started_ts`
+/// reaches `ttl_ms` (`endpoints[].queue_timeout_ms`), with an audit
+/// line — before that it honestly holds the worker.
+pub async fn busy_owner(
+    router_events: &[Event],
+    port: &dyn WorkerStreamsPort,
+    exec_worker: &str,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Result<Option<BusyOwner>, WorkerStreamsError> {
+    let candidates = bound_workers(router_events);
+    let Some(candidates) = candidates.get(exec_worker) else {
+        return Ok(None);
+    };
+    for candidate in candidates {
+        let events = port.read_stream(candidate.worker_session).await?;
+        match thread_liveness(&events) {
+            ThreadLiveness::Released => continue,
+            ThreadLiveness::NeverStarted
+                if now_ms.saturating_sub(candidate.started_ts) >= ttl_ms =>
+            {
+                tracing::info!(
+                    target: "kian::router",
+                    worker = %exec_worker,
+                    worker_session = %candidate.worker_session.0,
+                    thread_id = %candidate.thread_id,
+                    "worker exclusivity audit: never-started reservation released after the queue timeout"
+                );
+                continue;
+            }
+            ThreadLiveness::NeverStarted => {
+                return Ok(Some(BusyOwner {
+                    thread_id: candidate.thread_id,
+                    worker_session: candidate.worker_session,
+                    reason: BUSY_REASON_NEVER_STARTED,
+                }));
+            }
+            ThreadLiveness::Live => {
+                return Ok(Some(BusyOwner {
+                    thread_id: candidate.thread_id,
+                    worker_session: candidate.worker_session,
+                    reason: BUSY_REASON_LIVE,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,5 +2263,570 @@ mod tests {
         // The spawner pins the template version (ADR-006).
         let t = worker_template("p", "m", 42);
         assert_eq!(t.version, 42);
+    }
+
+    // ------------------------------------------------------------------
+    // The execution-worker binding (ADR-020, I1/I7)
+    // ------------------------------------------------------------------
+
+    /// The bound wrapper is exactly the legacy wrapper plus ONE
+    /// additive key; without the binding the bytes are byte-identical
+    /// (the additive-marker discipline, I5).
+    #[test]
+    fn bound_wrapper_is_exactly_legacy_plus_one_additive_key() {
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        let legacy = spawner.prepare(&super::SpawnRequest {
+            task: json!("do the thing"),
+            correlation: Some(json!("evt-9")),
+            speculative: false,
+            mandate: None,
+            exec_worker: None,
+        });
+        let bound = spawner.prepare(&super::SpawnRequest {
+            task: json!("do the thing"),
+            correlation: Some(json!("evt-9")),
+            speculative: false,
+            mandate: None,
+            exec_worker: Some("mac-mini".into()),
+        });
+        // The same frozen fields over the BOUND spawn's own thread id
+        // (two prepares mint two threads — the id is the only
+        // per-spawn difference).
+        let legacy_wrapper =
+            delegation_content(bound.thread.id, Some(json!("evt-9")), json!("do the thing"));
+        let bound_wrapper = &bound.task_message["content"];
+        // Every frozen/additive legacy field is byte-identical.
+        for (key, value) in legacy_wrapper.as_object().expect("wrapper object") {
+            assert_eq!(
+                bound_wrapper.get(key),
+                Some(value),
+                "field `{key}` unchanged by the binding"
+            );
+        }
+        // Exactly one additive key, carrying the id verbatim.
+        assert_eq!(
+            bound_wrapper.as_object().map(serde_json::Map::len),
+            Some(
+                legacy_wrapper
+                    .as_object()
+                    .map(serde_json::Map::len)
+                    .unwrap()
+                    + 1
+            ),
+            "exactly one additive key"
+        );
+        assert_eq!(
+            super::delegation_worker_binding(bound_wrapper),
+            super::WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        // The legacy builder emits no key at all (absent, never null)
+        // and serializes to the frozen golden bytes.
+        assert!(legacy_wrapper.get(super::EXEC_WORKER_KEY).is_none());
+        assert_eq!(
+            super::delegation_worker_binding(&legacy_wrapper),
+            super::WorkerBinding::Unbound
+        );
+        assert_eq!(
+            legacy_wrapper.to_string(),
+            format!(
+                "{{\"correlation\":\"evt-9\",\"task\":\"do the thing\",\"thread_id\":\"{}\"}}",
+                bound.thread.id
+            )
+        );
+        assert_ne!(legacy.thread.id, bound.thread.id);
+    }
+
+    /// The bound `thread/started` payload is the frozen legacy payload
+    /// plus exactly one top-level key (spec D4), and both sides render
+    /// identical bytes for the same spawn.
+    #[test]
+    fn thread_started_payload_bound_is_legacy_plus_one_top_level_key() {
+        let thread = Thread {
+            id: tid(0xcc),
+            parent_session: sid(1),
+            pinned_version: 7,
+        };
+        let task = json!({"role": "user", "content": {"task": "x", "exec_worker": "mac-mini"}});
+        let legacy = thread_started_payload(&thread, sid(2), &task);
+        assert!(legacy.get(super::EXEC_WORKER_KEY).is_none());
+        let bound = super::thread_started_payload_bound(&thread, sid(2), &task, "mac-mini");
+        for (key, value) in legacy.as_object().expect("payload object") {
+            assert_eq!(bound.get(key), Some(value), "field `{key}` unchanged");
+        }
+        assert_eq!(
+            bound.as_object().map(serde_json::Map::len),
+            Some(legacy.as_object().map(serde_json::Map::len).unwrap() + 1),
+            "exactly one top-level additive key"
+        );
+        assert_eq!(
+            super::thread_started_worker_binding(&bound),
+            super::WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        // The task message rides verbatim — both sides embed the same
+        // bytes, so the worker-side derivation matches (I1).
+        assert_eq!(bound["task"], task);
+    }
+
+    /// Reader tolerance (D2): absent = legacy unbound; a non-empty
+    /// string = bound; "" / non-strings = Malformed — never guessed.
+    #[test]
+    fn binding_readers_tolerate_absent_and_refuse_malformed() {
+        use super::{WorkerBinding, delegation_worker_binding, thread_started_worker_binding};
+        let cases: Vec<serde_json::Value> = vec![
+            json!(""),          // empty string
+            json!(42),          // number
+            json!(null),        // explicit null
+            json!(true),        // boolean
+            json!({"id": "x"}), // object
+        ];
+        for malformed in cases {
+            let wrapper = json!({"thread_id": tid(1).to_string(), "task": "x", "exec_worker": malformed.clone()});
+            assert_eq!(
+                delegation_worker_binding(&wrapper),
+                WorkerBinding::Malformed,
+                "wrapper value {malformed} must read Malformed"
+            );
+            let payload = json!({"thread_id": tid(1).to_string(), "exec_worker": malformed});
+            assert_eq!(
+                thread_started_worker_binding(&payload),
+                WorkerBinding::Malformed,
+                "payload value must read Malformed"
+            );
+        }
+        // Absent (legacy) and non-wrapper content read Unbound.
+        let legacy = delegation_content(tid(2), None, json!("x"));
+        assert_eq!(delegation_worker_binding(&legacy), WorkerBinding::Unbound);
+        assert_eq!(
+            delegation_worker_binding(&json!("plain text")),
+            WorkerBinding::Unbound
+        );
+        let payload = thread_started_payload(
+            &Thread {
+                id: tid(3),
+                parent_session: sid(1),
+                pinned_version: 1,
+            },
+            sid(2),
+            &json!({}),
+        );
+        assert_eq!(
+            thread_started_worker_binding(&payload),
+            WorkerBinding::Unbound
+        );
+    }
+
+    /// `worker_binding_of` (I1): the session's own stream decides;
+    /// both surfaces must agree or the stream reads Malformed.
+    #[test]
+    fn worker_binding_of_is_stream_derived_and_agrees_or_refuses() {
+        use super::{WorkerBinding, worker_binding_of};
+        let worker = sid(20);
+        let started = |binding: serde_json::Value| {
+            event(
+                worker,
+                5,
+                EventKind::ThreadStarted,
+                json!({
+                    "thread_id": tid(0xee).to_string(),
+                    "parent": sid(10).0.to_string(),
+                    "worker": worker.0.to_string(),
+                    "pinned_version": 7,
+                    "task": {},
+                    "exec_worker": binding,
+                }),
+            )
+        };
+        let input = |binding: serde_json::Value| {
+            event(
+                worker,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": {
+                    "thread_id": tid(0xee).to_string(),
+                    "task": "x",
+                    "exec_worker": binding,
+                }}),
+            )
+        };
+        // Both surfaces bound and agreeing (rebuild == replay).
+        let events = vec![input(json!("mac-mini")), started(json!("mac-mini"))];
+        assert_eq!(
+            worker_binding_of(&events, worker),
+            WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        // Both legacy: unbound.
+        let legacy = vec![
+            input(serde_json::Value::Null.clone()),
+            started(serde_json::Value::Null.clone()),
+        ];
+        // (null is present-but-malformed; use truly-absent instead)
+        let mut legacy_stream = worker_stream_first_input(worker);
+        legacy_stream.push(event(
+            worker,
+            2,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": tid(0xee).to_string(),
+                "parent": sid(10).0.to_string(),
+                "worker": worker.0.to_string(),
+                "pinned_version": 7,
+                "task": {},
+            }),
+        ));
+        assert_eq!(
+            worker_binding_of(&legacy_stream, worker),
+            WorkerBinding::Unbound
+        );
+        // Wrapper-only (fresh worker before its first drive): the
+        // wrapper decides.
+        let fresh = vec![input(json!("mac-mini"))];
+        assert_eq!(
+            worker_binding_of(&fresh, worker),
+            WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        // Disagreeing copies: Malformed — never a pick.
+        let disagree = vec![input(json!("mac-mini")), started(json!("vultr"))];
+        assert_eq!(
+            worker_binding_of(&disagree, worker),
+            WorkerBinding::Malformed
+        );
+        let disagree_unbound = vec![input(json!("mac-mini")), started(serde_json::Value::Null)];
+        assert_eq!(
+            worker_binding_of(&disagree_unbound, worker),
+            WorkerBinding::Malformed
+        );
+        // Malformed wrapper value: Malformed even alone.
+        let malformed = vec![input(json!(""))];
+        assert_eq!(
+            worker_binding_of(&malformed, worker),
+            WorkerBinding::Malformed
+        );
+        // A lineage event naming ANOTHER session is not ours (the
+        // router-side event on the router stream never binds us).
+        let router_side = vec![event(
+            sid(10),
+            1,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": tid(0xee).to_string(),
+                "worker": worker.0.to_string(),
+                "exec_worker": "mac-mini",
+            }),
+        )];
+        assert_eq!(
+            worker_binding_of(&router_side, sid(99)),
+            WorkerBinding::Unbound
+        );
+        let _ = legacy; // (shape fixture kept explicit above)
+    }
+
+    /// The worker-side lineage derives the bound payload from the
+    /// FIRST input wrapper (D4): identical bytes to the Router side.
+    #[test]
+    fn lineage_plan_emits_the_bound_payload_from_the_first_wrapper() {
+        let router = sid(10);
+        let worker = sid(20);
+        let mut wrapper = delegation_content(tid(0xee), None, json!("the task"));
+        wrapper[super::EXEC_WORKER_KEY] = json!("mac-mini");
+        let events = vec![
+            event(
+                worker,
+                0,
+                EventKind::SessionCreated,
+                serde_json::Value::Null,
+            ),
+            event(
+                worker,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": wrapper}),
+            ),
+        ];
+        let plan = lineage_plan(&events, worker, router, 7);
+        let LineagePlan::Emit { started_bytes, .. } = plan else {
+            panic!("expected Emit, got {plan:?}");
+        };
+        // The top-level key carries the wrapper's value verbatim and
+        // the task message is the full first input — byte-identical to
+        // what the Router side emitted for the same spawn.
+        assert_eq!(started_bytes[super::EXEC_WORKER_KEY], json!("mac-mini"));
+        assert_eq!(
+            started_bytes["task"]["content"][super::EXEC_WORKER_KEY],
+            json!("mac-mini")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Worker exclusivity (ADR-020, I3/D9)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bound_workers_projects_only_bound_lineage_per_id() {
+        let router = sid(10);
+        let bound = |t: uuid::Uuid, w: SessionId, id: &str, ts: u64| {
+            event(
+                router,
+                ts,
+                EventKind::ThreadStarted,
+                json!({
+                    "thread_id": t.to_string(),
+                    "parent": router.0.to_string(),
+                    "worker": w.0.to_string(),
+                    "pinned_version": 7,
+                    "task": {},
+                    "exec_worker": id,
+                }),
+            )
+        };
+        let legacy = event(
+            router,
+            3,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": tid(3).to_string(),
+                "worker": sid(33).0.to_string(),
+                "task": {},
+            }),
+        );
+        let events = vec![
+            bound(tid(1), sid(21), "mac-mini", 100),
+            bound(tid(2), sid(22), "vultr", 200),
+            bound(tid(4), sid(23), "mac-mini", 300),
+            legacy,
+        ];
+        let map = super::bound_workers(&events);
+        assert_eq!(map.len(), 2, "legacy unbound lineage contributes nothing");
+        assert_eq!(map["mac-mini"].len(), 2);
+        assert_eq!(map["mac-mini"][0].thread_id, tid(1));
+        assert_eq!(map["mac-mini"][0].worker_session, sid(21));
+        // event() stamps ts = 1_000 + seq, so the seq-100 lineage reads
+        // ts 1_100 — the release bound measures from the event's `ts`.
+        assert_eq!(map["mac-mini"][0].started_ts, 1_100);
+        assert_eq!(map["vultr"][0].thread_id, tid(2));
+    }
+
+    #[test]
+    fn thread_liveness_follows_the_release_table() {
+        use super::ThreadLiveness;
+        use kian_core::events::EndReason;
+        let worker = sid(20);
+        let started = vec![
+            event(
+                worker,
+                0,
+                EventKind::SessionCreated,
+                serde_json::Value::Null,
+            ),
+            event(
+                worker,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "x"}),
+            ),
+        ];
+        let completed = |seq: u64| {
+            event(
+                worker,
+                seq,
+                EventKind::ThreadCompleted,
+                json!({"thread_id": tid(1).to_string(), "status": "completed", "summary": {}}),
+            )
+        };
+        let failed = |seq: u64| {
+            event(
+                worker,
+                seq,
+                EventKind::ThreadCompleted,
+                json!({"thread_id": tid(1).to_string(), "status": "failed", "summary": {}}),
+            )
+        };
+        let ended = |seq: u64, reason: EndReason| {
+            event(worker, seq, EventKind::SessionEnded { reason }, json!({}))
+        };
+        // Started, nothing terminal: live (worker held).
+        assert_eq!(super::thread_liveness(&started), ThreadLiveness::Live);
+        // thread/completed{completed}: released.
+        let mut stream = started.clone();
+        stream.push(completed(2));
+        assert_eq!(super::thread_liveness(&stream), ThreadLiveness::Released);
+        // session/ended{completed} and {cancelled}: released.
+        for reason in [EndReason::Completed, EndReason::Cancelled] {
+            let mut stream = started.clone();
+            stream.push(ended(2, reason));
+            assert_eq!(super::thread_liveness(&stream), ThreadLiveness::Released);
+        }
+        // session/ended{failed} and {interrupted}: still live (resumable).
+        for reason in [EndReason::Failed, EndReason::Interrupted] {
+            let mut stream = started.clone();
+            stream.push(ended(2, reason));
+            assert_eq!(super::thread_liveness(&stream), ThreadLiveness::Live);
+        }
+        // thread/completed{failed} with nothing terminal after: live.
+        let mut stream = started.clone();
+        stream.push(failed(2));
+        assert_eq!(super::thread_liveness(&stream), ThreadLiveness::Live);
+        // ...and the last terminal decides: a later completed releases.
+        stream.push(ended(3, EndReason::Completed));
+        assert_eq!(super::thread_liveness(&stream), ThreadLiveness::Released);
+        // No session/created and no input/admitted: never started.
+        assert_eq!(super::thread_liveness(&[]), ThreadLiveness::NeverStarted);
+    }
+
+    /// A scripted [`super::WorkerStreamsPort`] over fixed streams.
+    struct FakeWorkerStreams {
+        streams: std::sync::Mutex<std::collections::BTreeMap<SessionId, Vec<Event>>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeWorkerStreams {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self {
+                streams: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn set(&self, session: SessionId, events: Vec<Event>) {
+            self.streams.lock().unwrap().insert(session, events);
+        }
+    }
+
+    impl super::WorkerStreamsPort for FakeWorkerStreams {
+        fn read_stream(
+            &self,
+            session: SessionId,
+        ) -> futures::future::BoxFuture<'static, Result<Vec<Event>, super::WorkerStreamsError>>
+        {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(super::WorkerStreamsError("stream unreadable".into()))
+                });
+            }
+            let events = self
+                .streams
+                .lock()
+                .unwrap()
+                .get(&session)
+                .cloned()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_owner_holds_releases_and_fails_closed() {
+        let router = sid(10);
+        let worker = sid(21);
+        let router_events = vec![event(
+            router,
+            100,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": tid(7).to_string(),
+                "parent": router.0.to_string(),
+                "worker": worker.0.to_string(),
+                "pinned_version": 7,
+                "task": {},
+                "exec_worker": "mac-mini",
+            }),
+        )];
+        let port = FakeWorkerStreams::shared();
+
+        // Live worker session: busy, naming the owner session + thread.
+        port.set(
+            worker,
+            vec![
+                event(
+                    worker,
+                    0,
+                    EventKind::SessionCreated,
+                    serde_json::Value::Null,
+                ),
+                event(
+                    worker,
+                    1,
+                    EventKind::InputAdmitted,
+                    json!({"role": "user", "content": "x"}),
+                ),
+            ],
+        );
+        let owner = super::busy_owner(&router_events, port.as_ref(), "mac-mini", 1_000, 60_000)
+            .await
+            .expect("decidable")
+            .expect("busy");
+        assert_eq!(owner.worker_session, worker);
+        assert_eq!(owner.thread_id, tid(7));
+
+        // Released (thread/completed{completed}): the worker is free.
+        port.set(
+            worker,
+            vec![
+                event(
+                    worker,
+                    0,
+                    EventKind::SessionCreated,
+                    serde_json::Value::Null,
+                ),
+                event(
+                    worker,
+                    1,
+                    EventKind::InputAdmitted,
+                    json!({"role": "user", "content": "x"}),
+                ),
+                event(
+                    worker,
+                    2,
+                    EventKind::ThreadCompleted,
+                    json!({"thread_id": tid(7).to_string(), "status": "completed", "summary": {}}),
+                ),
+            ],
+        );
+        assert!(
+            super::busy_owner(&router_events, port.as_ref(), "mac-mini", 1_000, 60_000)
+                .await
+                .expect("decidable")
+                .is_none()
+        );
+
+        // A never-started reservation inside the ttl honestly holds
+        // (the lineage event's ts is 1_100 — event() stamps 1_000+seq).
+        port.set(worker, Vec::new());
+        let owner = super::busy_owner(&router_events, port.as_ref(), "mac-mini", 1_500, 60_000)
+            .await
+            .expect("decidable")
+            .expect("never-started holds inside the ttl");
+        assert_eq!(owner.worker_session, worker);
+
+        // Past the ttl (ts=1_100, now=2_000, ttl=500): released.
+        assert!(
+            super::busy_owner(&router_events, port.as_ref(), "mac-mini", 2_000, 500)
+                .await
+                .expect("decidable")
+                .is_none()
+        );
+
+        // An unreadable stream is fail-closed: an honest error, never
+        // a spawn.
+        port.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::busy_owner(&router_events, port.as_ref(), "mac-mini", 1_000, 60_000)
+                .await
+                .is_err()
+        );
+
+        // Another worker's candidates are untouched.
+        port.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::busy_owner(&router_events, port.as_ref(), "vultr", 1_000, 60_000)
+                .await
+                .expect("decidable")
+                .is_none()
+        );
     }
 }

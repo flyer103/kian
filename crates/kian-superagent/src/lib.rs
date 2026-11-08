@@ -178,10 +178,11 @@ pub use reasons::{DecisionKind, IntakeReason, outcome_reasons, routed_reason};
 pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, WorkerStatus, worker_sessions};
 pub use router::{
-    ChannelRegistry, DEFAULT_PARK_TICK_MS, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE,
-    JudgePrompt, MandatePolicy, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold,
-    RouterInbox, RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy,
-    build_mandate, enforce_speculation_cap, outstanding_threads,
+    ChannelRegistry, DEFAULT_PARK_TICK_MS, DEFAULT_WORKER_QUEUE_TIMEOUT_MS,
+    DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, MandatePolicy, REPLY_TOOL,
+    ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox, RouterProfile, RouterTools,
+    SILENT_REPRO_TEMPLATE, SpeculationPolicy, WorkerEntry, build_mandate, enforce_speculation_cap,
+    outstanding_threads, worker_catalog_block,
 };
 pub use rules::{
     AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
@@ -213,12 +214,14 @@ pub use wechat::{
     WechatConfig, WechatError, message_to_event, split_text,
 };
 pub use worker::{
-    Delegation, DelegationPair, LineagePlan, MANDATE_KEY, MandateRevalidation, PortFor,
-    REPORT_STATE_KEY, ReportState, SpawnError, SpawnedWorker, StreamPort, StreamPortError,
-    ThreadReport, WORKER_GATE_NAME, WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner,
-    completion_summary, delegation_content, delegation_is_speculative, delegation_mandate,
-    delegation_pairs, lineage_plan, mandate_delegation_content, parse_delegation,
-    parse_thread_report, revalidate_mandate, speculative_delegation_content,
-    thread_completed_payload, thread_report_content, thread_report_content_stated,
-    thread_started_payload,
+    BoundThread, BusyOwner, Delegation, DelegationPair, EXEC_WORKER_KEY, LineagePlan, MANDATE_KEY,
+    MandateRevalidation, PortFor, REPORT_STATE_KEY, ReportState, SpawnError, SpawnRequest,
+    SpawnedWorker, StreamPort, StreamPortError, ThreadLiveness, ThreadReport, WORKER_GATE_NAME,
+    WorkerBinding, WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner, WorkerStreamsError,
+    WorkerStreamsPort, bound_workers, busy_owner, completion_summary, delegation_content,
+    delegation_is_speculative, delegation_mandate, delegation_pairs, delegation_worker_binding,
+    lineage_plan, mandate_delegation_content, parse_delegation, parse_thread_report,
+    revalidate_mandate, speculative_delegation_content, thread_completed_payload, thread_liveness,
+    thread_report_content, thread_report_content_stated, thread_started_payload,
+    thread_started_payload_bound, thread_started_worker_binding, worker_binding_of,
 };

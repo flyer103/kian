@@ -80,8 +80,9 @@ use crate::provenance::{ChannelEventMarker, parse_channel_marker_lenient};
 use crate::registry::{PassthroughRegistry, spawn_topic};
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
-    PortFor, SpawnError, StreamPort, WorkerSpawner, delegation_is_speculative, parse_thread_report,
-    thread_started_payload,
+    PortFor, SpawnError, SpawnRequest, StreamPort, WorkerSpawner, WorkerStreamsPort, busy_owner,
+    delegation_is_speculative, parse_thread_report, thread_started_payload,
+    thread_started_payload_bound,
 };
 
 /// The `reply` tool name (Router-only).
@@ -103,9 +104,82 @@ pub use crate::templates::JUDGE_PROMPT_TEMPLATE;
 /// signal (and lets supervision observe an interrupt).
 pub const DEFAULT_PARK_TICK_MS: u64 = 50;
 
+/// (ADR-020, §5.1): the never-started reservation release bound used
+/// when the worker id carries no configured `queue_timeout_ms` — the
+/// same default `endpoints[].queue_timeout_ms` parses with.
+pub const DEFAULT_WORKER_QUEUE_TIMEOUT_MS: u64 = 60_000;
+
+/// Wall-clock now in unix milliseconds — the only clock the
+/// exclusivity check's never-started release bound needs.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Judge prompt
 // ---------------------------------------------------------------------------
+
+/// One execution-worker catalog entry (spec D5/D7): the configured
+/// `endpoints[].id` plus its optional human description. The catalog
+/// flows from config (in **config order** — the enum order and the
+/// prompt block order are deterministic) into the Router profile, the
+/// `spawn_worker` schema and the judge-prompt block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerEntry {
+    /// The worker identity (`endpoints[].id`) — opaque, non-empty.
+    pub id: String,
+    /// The optional human description (`endpoints[].description`),
+    /// validated fail-closed at config time (non-empty, ≤200 chars,
+    /// no control characters) because it renders into the prompt.
+    pub description: Option<String>,
+}
+
+impl WorkerEntry {
+    /// A catalog entry with no description (the id alone renders).
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            description: None,
+        }
+    }
+
+    /// A catalog entry with a description.
+    #[must_use]
+    pub fn with_description(id: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            description: Some(description.into()),
+        }
+    }
+}
+
+/// The judge-prompt catalog block (spec D7): appended by the render
+/// path **only when the catalog is non-empty** — zero endpoints
+/// renders today's exact bytes. Ids and descriptions render verbatim
+/// (already config-validated); no timestamps, no randomness, so one
+/// config always renders one block.
+#[must_use]
+pub fn worker_catalog_block(catalog: &[WorkerEntry]) -> String {
+    let listing = catalog
+        .iter()
+        .map(|entry| match &entry.description {
+            Some(description) => format!("{} — {}", entry.id, description),
+            None => entry.id.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Execution workers (the `endpoints` catalog): {listing}. Pass `exec_worker` on every \
+         spawn_worker call and pick the machine that has what the task needs (toolchains, \
+         repos, credentials). A worker runs at most one live task at a time; if the one you \
+         want is busy the spawn is refused and the refusal names its owner — choose another \
+         worker or wait. Never invent a worker id."
+    )
+}
 
 /// The Router's judge prompt template (declarative, part of the
 /// profile; rendered at bootstrap).
@@ -204,6 +278,13 @@ pub struct RouterProfile {
     /// per-worker-template scope texts here, stamping the current
     /// policy-version pointer.
     pub mandate: Option<MandatePolicy>,
+    /// (ADR-020, D7): the execution-worker catalog
+    /// (`endpoints[].{id,description}` in config order). Empty (the
+    /// default, and what a zero-endpoints config produces) renders
+    /// today's bootstrap bytes exactly; non-empty appends the
+    /// [`worker_catalog_block`] after the rendered prompt — the
+    /// prompt-prefix change a new `superagent.policy.version` pins.
+    pub worker_catalog: Vec<WorkerEntry>,
     /// the outbox bounded-retry configuration
     /// (`superagent.outbox`). `None` (the default, and what an absent
     /// config section produces) sends exactly once and reports the
@@ -231,6 +312,7 @@ impl RouterProfile {
             re_arm: Vec::new(),
             policy_version: None,
             mandate: None,
+            worker_catalog: Vec::new(),
             outbox: None,
         }
     }
@@ -260,6 +342,19 @@ impl RouterProfile {
             self.judge.render(0)
         } else {
             self.judge.render_re_arm(&self.re_arm, 0)
+        };
+        // (ADR-020, D7): the catalog block is appended after the
+        // rendered prompt — never inside the template — and only when
+        // the catalog is non-empty, so a zero-endpoints config
+        // bootstraps byte-identically to today. Persisted prompts are
+        // never rewritten; only the next bootstrap renders the block.
+        let rendered = if self.worker_catalog.is_empty() {
+            rendered
+        } else {
+            format!(
+                "{rendered}\n\n{}",
+                worker_catalog_block(&self.worker_catalog)
+            )
         };
         let key = if self.re_arm.is_empty() {
             ROUTER_BOOTSTRAP_KEY.to_string()
@@ -583,6 +678,21 @@ pub struct RouterTools {
     /// the legacy single-attempt send path, byte-identical. When
     /// present, `reply`/`deliver_structured` deliver through it.
     outbox: Option<Arc<OutboxDriver>>,
+    /// (ADR-020, D5/D6): the execution-worker catalog in config
+    /// order. Empty (the default) = the feature is off: the spawn
+    /// schema, the spawn validation and the wrapper stay exactly
+    /// today's bytes.
+    worker_catalog: Vec<WorkerEntry>,
+    /// (ADR-020, §5.1): per-worker-id queue timeouts
+    /// (`endpoints[].queue_timeout_ms`) — the release bound of a
+    /// never-started reservation. Missing ids fall back to the
+    /// module default.
+    worker_queue_timeouts: BTreeMap<String, u64>,
+    /// (ADR-020, D9): the read-only port over worker streams the
+    /// exclusivity check goes through. `None` (tests, or assembly
+    /// without the wiring) = no exclusivity check: `spawn_worker`
+    /// behaves as before.
+    worker_streams: Option<Arc<dyn WorkerStreamsPort>>,
     hold: Arc<RouterHold>,
 }
 
@@ -621,8 +731,91 @@ impl RouterTools {
                 .as_ref()
                 .map(|version| version.label().to_string()),
             outbox,
+            worker_catalog: profile.worker_catalog.clone(),
+            worker_queue_timeouts: BTreeMap::new(),
+            worker_streams: None,
             hold,
         }
+    }
+
+    /// (ADR-020): installs the execution-worker catalog (config
+    /// order) with its per-id queue timeouts — the spawn schema, the
+    /// argument validation and the catalog texts all derive from it.
+    /// An empty catalog is the feature-off default.
+    #[must_use]
+    pub fn with_worker_catalog(
+        mut self,
+        catalog: Vec<WorkerEntry>,
+        queue_timeouts: BTreeMap<String, u64>,
+    ) -> Self {
+        self.worker_catalog = catalog;
+        self.worker_queue_timeouts = queue_timeouts;
+        self
+    }
+
+    /// (ADR-020, D9): installs the read-only port over worker
+    /// streams — the exclusivity check's only read seam. Without it
+    /// no busy check runs (the test default).
+    #[must_use]
+    pub fn with_worker_streams(mut self, port: Arc<dyn WorkerStreamsPort>) -> Self {
+        self.worker_streams = Some(port);
+        self
+    }
+
+    /// The `spawn_worker` parameter schema (spec D6, the three
+    /// shapes). Zero endpoints renders today's exact bytes (no
+    /// property, no `required` change — the golden-tested legacy
+    /// form); one endpoint adds the property with a single-value
+    /// enum, **not** required (omission binds to it, recorded); two
+    /// or more add it with the full enum and make it required. The
+    /// description lists every `id — description` line (id first,
+    /// description omitted when absent) — generated from config, no
+    /// timestamps, no randomness: two boots with one config produce
+    /// one schema.
+    fn spawn_worker_parameters(&self) -> Value {
+        let mut parameters = json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The actual work, as user content \
+                 (a channel-event dispatch may pass the triggering wrapper serialized as JSON text)"},
+                "correlation": {"description": "Optional ticket correlation — a topic token \
+                 (bare string, e.g. the ticket thread key, or {\"topic\": …}); a token binds \
+                 the spawned worker as that topic's live Executor (follow-up ownership) and \
+                 orders outbox deliveries per (correlation, target conversation)"},
+                "speculative": {"type": "boolean", "description": "Spawn on a weak signal, \
+                 budgeted by the Router's speculation policy (refused honestly at the cap; \
+                 the worker's first message carries the speculative marker)"}
+            },
+            "required": ["task"],
+        });
+        if self.worker_catalog.is_empty() {
+            return parameters;
+        }
+        let ids: Vec<&str> = self
+            .worker_catalog
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let listing = self
+            .worker_catalog
+            .iter()
+            .map(|entry| match &entry.description {
+                Some(description) => format!("{} — {}", entry.id, description),
+                None => entry.id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        parameters["properties"][crate::worker::EXEC_WORKER_KEY] = json!({
+            "type": "string",
+            "enum": ids,
+            "description": format!(
+                "Execution worker to run this task's commands. Catalog: {listing}"
+            ),
+        });
+        if self.worker_catalog.len() >= 2 {
+            parameters["required"] = json!(["task", crate::worker::EXEC_WORKER_KEY]);
+        }
+        parameters
     }
 
     /// Shares the passthrough registry with the tool surface (
@@ -792,6 +985,10 @@ impl RouterTools {
             .get("speculative")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // (ADR-020, §3.2 step 2) worker-binding argument shape — the
+        // check precedes every side effect (no thread id is minted, no
+        // row lands, no lineage event is written on any refusal).
+        let exec_worker = self.resolve_exec_worker(&call.arguments)?;
         // follow-up ownership — the topic correlation of this
         // spawn, derived exactly the way the registry rebuild derives
         // topic bindings (the channel-event wrapper the Router judged),
@@ -829,6 +1026,46 @@ impl RouterTools {
                 owner.0
             )));
         }
+        // (ADR-020, I3/D9, §3.2 step 4) worker exclusivity — a pure
+        // stream check before any side effect: while one live bound
+        // session holds the worker, a second spawn naming it is
+        // refused with an error naming the owner session and thread.
+        // Only runs for a bound spawn with the worker-streams port
+        // installed (zero config means zero behavior).
+        if let (Some(id), Some(streams)) = (&exec_worker, &self.worker_streams) {
+            let events = port.read_stream().await.map_err(|e| {
+                ToolError::Execution(format!("worker busy check: stream read failed: {e}"))
+            })?;
+            let ttl_ms = self
+                .worker_queue_timeouts
+                .get(id)
+                .copied()
+                .unwrap_or(DEFAULT_WORKER_QUEUE_TIMEOUT_MS);
+            match busy_owner(&events, streams.as_ref(), id, wall_now_ms(), ttl_ms).await {
+                Err(e) => {
+                    return Err(ToolError::Execution(format!(
+                        "spawn refused: worker `{id}` busy check failed (worker stream read: {e})"
+                    )));
+                }
+                Ok(Some(owner)) => {
+                    tracing::info!(
+                        target: "kian::router",
+                        worker = %id,
+                        owner = %owner.worker_session.0,
+                        thread = %owner.thread_id,
+                        reason = owner.reason,
+                        "worker exclusivity audit: spawn refused, worker busy"
+                    );
+                    return Err(ToolError::Execution(format!(
+                        "spawn refused: worker `{id}` is busy — live worker session {} \
+                         (thread {}) is bound to it; wait for it to complete or end, or \
+                         choose another worker",
+                        owner.worker_session.0, owner.thread_id
+                    )));
+                }
+                Ok(None) => {}
+            }
+        }
         // speculative spawns are budgeted by the Router profile.
         // The cap check happens strictly before the admit — no thread
         // id is minted, no row lands — and every refusal is an honest
@@ -842,16 +1079,7 @@ impl RouterTools {
         // the current policy-version pointer. `None` (no
         // `superagent.mandate` config, or the template is unbounded)
         // keeps the wrapper byte-identical legacy.
-        let mandate = self.mandate.as_ref().and_then(|policy| {
-            build_mandate(
-                policy,
-                self.spawner.worker_template_id(),
-                &task,
-                self.router,
-                self.policy_label.as_deref(),
-            )
-        });
-        let spawned = if speculative {
+        if speculative {
             let policy = self.speculation.as_ref().ok_or_else(|| {
                 ToolError::Execution(
                     "speculative spawn refused: no speculation policy configured for this \
@@ -864,41 +1092,49 @@ impl RouterTools {
             })?;
             enforce_speculation_cap(policy, &events)
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
-            match mandate.clone() {
-                Some(mandate) => {
-                    self.spawner
-                        .spawn_speculative_with_mandate(task, correlation, mandate)
-                        .await
-                }
-                None => self.spawner.spawn_speculative(task, correlation).await,
-            }
-            .map_err(|e| ToolError::Execution(e.to_string()))?
-        } else {
-            match mandate.clone() {
-                Some(mandate) => {
-                    self.spawner
-                        .spawn_with_mandate(task, correlation, mandate)
-                        .await
-                }
-                None => self.spawner.spawn(task, correlation).await,
-            }
-            .map_err(|e| ToolError::Execution(e.to_string()))?
+        }
+        let mandate = self.mandate.as_ref().and_then(|policy| {
+            build_mandate(
+                policy,
+                self.spawner.worker_template_id(),
+                &task,
+                self.router,
+                self.policy_label.as_deref(),
+            )
+        });
+        // (ADR-020, D3/D10, §3.2 step 7) mint + lineage + admit: the
+        // pure mint first, then the Router-side `thread/started`
+        // (bound form when bound), then the task row, then the wake —
+        // lineage-before-admit. An emit failure admits nothing; an
+        // admit failure leaves a reservation the lease rule releases.
+        let request = SpawnRequest {
+            task,
+            correlation,
+            speculative,
+            mandate,
+            exec_worker,
         };
-        // Router-side lineage at dispatch: identical bytes to the
-        // worker-side event (the delegation pair is discoverable by
-        // scanning both streams). For a speculative spawn the embedded
-        // task message carries the marker — the audit-visible half of
-        // (the worker's own first input is the other half).
-        port.emit(
-            EventKind::ThreadStarted,
-            thread_started_payload(
+        let spawned = self.spawner.prepare(&request);
+        let started_bytes = match &request.exec_worker {
+            Some(id) => thread_started_payload_bound(
+                &spawned.thread,
+                spawned.worker_session,
+                &spawned.task_message,
+                id,
+            ),
+            None => thread_started_payload(
                 &spawned.thread,
                 spawned.worker_session,
                 &spawned.task_message,
             ),
-        )
-        .await
-        .map_err(|e| ToolError::Execution(format!("thread/started write failed: {e}")))?;
+        };
+        port.emit(EventKind::ThreadStarted, started_bytes)
+            .await
+            .map_err(|e| ToolError::Execution(format!("thread/started write failed: {e}")))?;
+        self.spawner
+            .admit(&spawned)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
         let mut output = json!({
             "thread_id": spawned.thread.id.to_string(),
             "worker": spawned.worker_session.0.to_string(),
@@ -907,6 +1143,23 @@ impl RouterTools {
         if speculative {
             output["speculative"] = json!(true);
             debug_assert!(delegation_is_speculative(&spawned.task_message["content"]));
+        }
+        // (ADR-020, D6/D8) the result echoes the binding when bound —
+        // the audit-visible half beside the two streams' payloads.
+        if let Some(id) = &request.exec_worker {
+            output[crate::worker::EXEC_WORKER_KEY] = json!(id);
+            debug_assert!(matches!(
+                crate::worker::delegation_worker_binding(&spawned.task_message["content"]),
+                crate::worker::WorkerBinding::Bound(_)
+            ));
+            tracing::debug!(
+                target: "kian::router",
+                thread_id = %spawned.thread.id,
+                worker_session = %spawned.worker_session.0,
+                exec_worker = %id,
+                defaulted = call.arguments.get(crate::worker::EXEC_WORKER_KEY).is_none(),
+                "worker binding audit: dispatched bound"
+            );
         }
         // the spawned worker is now the topic's live Executor.
         // Registration strictly after the durable lineage (`thread/started`)
@@ -926,7 +1179,7 @@ impl RouterTools {
         // reads it (a rebuild re-derives it from the `thread/started`
         // task payload). Registered for every mandated spawn, topic or
         // not: authority is a worker fact, not a topic fact.
-        if let Some(mandate) = &mandate
+        if let Some(mandate) = &request.mandate
             && let Some(registry) = &self.followup_registry
         {
             registry
@@ -937,7 +1190,7 @@ impl RouterTools {
         // the issuance audit line — the durable record is the
         // mandate object inside the wrapper (both streams' task
         // payloads); this line is the operator's console trace.
-        if let Some(mandate) = &mandate {
+        if let Some(mandate) = &request.mandate {
             let strength = mandate
                 .get("strength")
                 .and_then(serde_json::Value::as_str)
@@ -961,6 +1214,62 @@ impl RouterTools {
             is_error: false,
             redactions: Vec::new(),
         })
+    }
+
+    /// (ADR-020, D2/D6, §3.2 step 2) resolves the `exec_worker`
+    /// argument against the configured catalog. Every refusal here is
+    /// an honest `InvalidCall` that names the expected shape and/or
+    /// the configured ids — never a guess, never a default-to-first,
+    /// never a fallback route.
+    fn resolve_exec_worker(&self, args: &Value) -> Result<Option<String>, ToolError> {
+        use crate::worker::EXEC_WORKER_KEY;
+        if self.worker_catalog.is_empty() {
+            // Feature off (zero `endpoints:`): the argument is refused
+            // outright — an unbound spawn is the only spawn.
+            if args.get(EXEC_WORKER_KEY).is_some() {
+                return Err(ToolError::InvalidCall(
+                    "spawn_worker: worker binding is not configured on this server \
+                     (no `endpoints:`); omit `exec_worker`"
+                        .into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let ids: Vec<&str> = self
+            .worker_catalog
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let listing = ids.join(", ");
+        let id = match args.get(EXEC_WORKER_KEY) {
+            None | Some(Value::Null) => {
+                if ids.len() == 1 {
+                    // Exactly one configured worker: omission binds to
+                    // it — an honest default, still recorded (D6).
+                    ids[0].to_string()
+                } else {
+                    return Err(ToolError::InvalidCall(format!(
+                        "spawn_worker requires `exec_worker` (a non-empty string naming a \
+                         configured worker) — configured workers: {listing}"
+                    )));
+                }
+            }
+            Some(value) => match value.as_str() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => {
+                    return Err(ToolError::InvalidCall(format!(
+                        "spawn_worker: `exec_worker` must be a non-empty string naming a \
+                         configured worker — configured workers: {listing}"
+                    )));
+                }
+            },
+        };
+        if !ids.contains(&id.as_str()) {
+            return Err(ToolError::InvalidCall(format!(
+                "spawn_worker: unknown worker `{id}` — configured workers: {listing}"
+            )));
+        }
+        Ok(Some(id))
     }
 
     /// the shared send path of `reply`/`deliver_structured`.
@@ -1127,21 +1436,7 @@ impl ToolProvider for RouterTools {
                 name: SPAWN_WORKER_TOOL.to_string(),
                 description: "Dispatch a task to a fresh worker session; returns the thread id. "
                     .into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "task": {"type": "string", "description": "The actual work, as user content \
-                         (a channel-event dispatch may pass the triggering wrapper serialized as JSON text)"},
-                        "correlation": {"description": "Optional ticket correlation — a topic token \
-                         (bare string, e.g. the ticket thread key, or {\"topic\": …}); a token binds \
-                         the spawned worker as that topic's live Executor (follow-up ownership) and \
-                         orders outbox deliveries per (correlation, target conversation)"},
-                        "speculative": {"type": "boolean", "description": "Spawn on a weak signal, \
-                         budgeted by the Router's speculation policy (refused honestly at the cap; \
-                         the worker's first message carries the speculative marker)"}
-                    },
-                    "required": ["task"],
-                }),
+                parameters: self.spawn_worker_parameters(),
             },
             ToolSchema {
                 name: REPLY_TOOL.to_string(),
@@ -1219,6 +1514,9 @@ impl Clone for RouterTools {
             mandate: self.mandate.clone(),
             policy_label: self.policy_label.clone(),
             outbox: self.outbox.clone(),
+            worker_catalog: self.worker_catalog.clone(),
+            worker_queue_timeouts: self.worker_queue_timeouts.clone(),
+            worker_streams: self.worker_streams.clone(),
             hold: Arc::clone(&self.hold),
         }
     }
@@ -3411,5 +3709,434 @@ mod tests {
             assert!(matches!(settled_turn, Some(LoopOutcome::TurnDone)));
         }
         assert_eq!(inner.drives.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // The execution-worker binding at the Router surface
+    // (ADR-020, I3/I7 — D5/D6/D7)
+    // ------------------------------------------------------------------
+
+    fn catalog_two() -> Vec<super::WorkerEntry> {
+        vec![
+            super::WorkerEntry::with_description(
+                "mac-mini",
+                "local macOS dev machine — repo checkouts, cargo, git",
+            ),
+            super::WorkerEntry::new("vultr-builder"),
+        ]
+    }
+
+    /// Tools with a worker catalog (and optionally the worker-streams
+    /// port installed) over the scripted fixtures.
+    fn binding_tools(
+        catalog: Vec<super::WorkerEntry>,
+        streams: Option<Arc<dyn crate::worker::WorkerStreamsPort>>,
+    ) -> (
+        Arc<RouterTools>,
+        Arc<RouterHold>,
+        Arc<ScriptedPort>,
+        Arc<PayloadInbox>,
+    ) {
+        let router = sid(10);
+        let inbox = PayloadInbox::shared();
+        let spawner = Arc::new(WorkerSpawner::new(
+            router,
+            &worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        ));
+        let mut channels = ChannelRegistry::new();
+        channels.register(
+            "mock-im",
+            Arc::new(MockChannel::new("mock-im")) as Arc<dyn ChannelAdapter>,
+        );
+        let hold = RouterHold::shared();
+        let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+        profile.worker_catalog = catalog.clone();
+        let mut tools = RouterTools::new(spawner, channels, &profile, hold.clone())
+            .with_worker_catalog(
+                catalog,
+                std::collections::BTreeMap::from([
+                    ("mac-mini".to_string(), 60_000u64),
+                    ("vultr-builder".to_string(), 60_000u64),
+                ]),
+            );
+        if let Some(streams) = streams {
+            tools = tools.with_worker_streams(streams);
+        }
+        let (port, dyn_port) = ScriptedPort::shared(router);
+        hold.install(dyn_port);
+        (Arc::new(tools), hold, port, inbox)
+    }
+
+    /// Router-side bound lineage for one dispatched thread.
+    fn bound_started_event(router: SessionId, t: uuid::Uuid, worker: SessionId, id: &str) -> Event {
+        let mut payload = json!({
+            "thread_id": t.to_string(),
+            "parent": router.0.to_string(),
+            "worker": worker.0.to_string(),
+            "pinned_version": 7,
+            "task": {},
+        });
+        payload[crate::worker::EXEC_WORKER_KEY] = json!(id);
+        event(router, 1, EventKind::ThreadStarted, payload)
+    }
+
+    #[test]
+    fn spawn_worker_schema_one_endpoint_optional_and_two_required() {
+        // One endpoint: the property is present with a single-value
+        // enum and NOT required (omission binds to it, D6).
+        let (one, _hold, _port, _inbox) =
+            binding_tools(vec![super::WorkerEntry::new("mac-mini")], None);
+        let schema = one
+            .schemas()
+            .into_iter()
+            .find(|s| s.name == SPAWN_WORKER_TOOL)
+            .expect("spawn schema");
+        let params = &schema.parameters;
+        let exec = &params["properties"][crate::worker::EXEC_WORKER_KEY];
+        assert_eq!(exec["type"], json!("string"));
+        assert_eq!(exec["enum"], json!(["mac-mini"]));
+        assert!(
+            exec["description"]
+                .as_str()
+                .expect("description")
+                .contains("Catalog: mac-mini")
+        );
+        assert_eq!(params["required"], json!(["task"]), "not required");
+
+        // Two endpoints: present with the full enum and REQUIRED.
+        let (two, _hold, _port, _inbox) = binding_tools(catalog_two(), None);
+        let schema = two
+            .schemas()
+            .into_iter()
+            .find(|s| s.name == SPAWN_WORKER_TOOL)
+            .expect("spawn schema");
+        let params = &schema.parameters;
+        assert_eq!(
+            params["properties"][crate::worker::EXEC_WORKER_KEY]["enum"],
+            json!(["mac-mini", "vultr-builder"])
+        );
+        // The description lists every id — description line (id first,
+        // description omitted when absent).
+        let listing = params["properties"][crate::worker::EXEC_WORKER_KEY]["description"]
+            .as_str()
+            .expect("description");
+        assert!(
+            listing.contains("mac-mini — local macOS dev machine"),
+            "{listing}"
+        );
+        assert!(listing.contains("vultr-builder"), "{listing}");
+        assert_eq!(
+            params["required"],
+            json!(["task", crate::worker::EXEC_WORKER_KEY])
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_refuses_every_malformed_binding_with_zero_side_effects() {
+        // The full refusal matrix (I7): each refusal is an honest
+        // error naming the reason, and each leaves NO admit, NO
+        // thread/started, no minted thread.
+        let (tools, _hold, port, inbox) = binding_tools(catalog_two(), None);
+
+        // ≥2 endpoints, argument missing: InvalidCall listing the ids.
+        let err = tools
+            .invoke(call(SPAWN_WORKER_TOOL, json!({"task": "x"})))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("spawn_worker requires `exec_worker`"),
+            "{}",
+            err
+        );
+        assert!(
+            err.to_string().contains("mac-mini, vultr-builder"),
+            "{}",
+            err
+        );
+
+        // Unknown id.
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": "x", "exec_worker": "toaster"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown worker `toaster`"),
+            "{}",
+            err
+        );
+
+        // Malformed shapes: empty string, non-string.
+        for bad in [json!(""), json!(42), json!(["mac-mini"])] {
+            let err = tools
+                .invoke(call(
+                    SPAWN_WORKER_TOOL,
+                    json!({"task": "x", "exec_worker": bad}),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("`exec_worker` must be a non-empty string"),
+                "{bad}: {err}"
+            );
+        }
+        // An explicit JSON null reads as an omitted argument (the
+        // schema types the property string; null never becomes a
+        // binding) — the same missing-when-required refusal.
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": "x", "exec_worker": null}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("spawn_worker requires `exec_worker`"),
+            "{}",
+            err
+        );
+
+        // Zero side effects across the whole matrix.
+        assert!(inbox.admits.lock().unwrap().is_empty(), "no admit");
+        assert!(port.emitted.lock().unwrap().is_empty(), "no lineage");
+    }
+
+    #[tokio::test]
+    async fn spawn_worker_refuses_the_argument_when_no_endpoints_are_configured() {
+        // Feature off (I5): zero endpoints refuses the argument —
+        // an unbound spawn is the only spawn.
+        let (tools, _hold, _port, _inbox, _mock) = speculative_tools(None);
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": "x", "exec_worker": "mac-mini"}),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("worker binding is not configured on this server"),
+            "{}",
+            err
+        );
+        assert!(err.to_string().contains("omit `exec_worker`"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn single_catalog_entry_defaults_the_binding_and_records_it() {
+        // Exactly one worker (D6): omission binds to it — an honest
+        // default, still recorded on every surface (wrapper,
+        // thread/started, result echo).
+        let (tools, _hold, port, inbox) =
+            binding_tools(vec![super::WorkerEntry::new("mac-mini")], None);
+
+        let result = tools
+            .invoke(call(SPAWN_WORKER_TOOL, json!({"task": "plain work"})))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            result.output[crate::worker::EXEC_WORKER_KEY],
+            json!("mac-mini")
+        );
+
+        // The durable row (admitted wrapper) carries the binding.
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        assert_eq!(
+            crate::worker::delegation_worker_binding(&admits[0].1),
+            crate::worker::WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        // The Router-side lineage carries the same top-level key with
+        // the identical task-message bytes.
+        let emitted = port.emitted.lock().unwrap().clone();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, EventKind::ThreadStarted);
+        assert_eq!(
+            emitted[0].1[crate::worker::EXEC_WORKER_KEY],
+            json!("mac-mini")
+        );
+        assert_eq!(
+            emitted[0].1["task"],
+            json!({"role": "user", "content": admits[0].1})
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_worker_refusal_names_the_owner_then_releases_on_completion() {
+        // I3 at the tool surface: the refusal names the owning live
+        // session and thread, leaves no side effects; once the owner's
+        // thread completes the same worker accepts a new spawn.
+        struct SingleWorkerStreams {
+            worker: SessionId,
+            events: std::sync::Mutex<Vec<Event>>,
+        }
+        impl crate::worker::WorkerStreamsPort for SingleWorkerStreams {
+            fn read_stream(
+                &self,
+                session: SessionId,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<Vec<Event>, crate::worker::WorkerStreamsError>,
+            > {
+                let events = if session == self.worker {
+                    self.events.lock().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                Box::pin(async move { Ok(events) })
+            }
+        }
+        let owner_session = sid(31);
+        let streams = Arc::new(SingleWorkerStreams {
+            worker: owner_session,
+            events: std::sync::Mutex::new(vec![
+                event(
+                    owner_session,
+                    0,
+                    EventKind::SessionCreated,
+                    serde_json::Value::Null,
+                ),
+                event(
+                    owner_session,
+                    1,
+                    EventKind::InputAdmitted,
+                    json!({"role": "user", "content": "x"}),
+                ),
+            ]),
+        });
+        let (tools, _hold, port, inbox) = binding_tools(
+            catalog_two(),
+            Some(streams.clone() as Arc<dyn crate::worker::WorkerStreamsPort>),
+        );
+        // The Router stream carries one live bound delegation.
+        port.set_events(vec![bound_started_event(
+            sid(10),
+            tid(0xa1),
+            owner_session,
+            "mac-mini",
+        )]);
+
+        let err = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": "second task", "exec_worker": "mac-mini"}),
+            ))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("worker `mac-mini` is busy"), "{text}");
+        assert!(text.contains(&owner_session.0.to_string()), "{text}");
+        assert!(text.contains(&tid(0xa1).to_string()), "{text}");
+        assert!(text.contains("choose another worker"), "{text}");
+        // Zero side effects (I7): no admit, no NEW thread/started.
+        assert!(inbox.admits.lock().unwrap().is_empty(), "no admit");
+        assert!(port.emitted.lock().unwrap().is_empty(), "no new lineage");
+
+        // Release: the owner's thread completes; the same worker now
+        // accepts the spawn.
+        *streams.events.lock().unwrap() = vec![
+            event(
+                owner_session,
+                0,
+                EventKind::SessionCreated,
+                serde_json::Value::Null,
+            ),
+            event(
+                owner_session,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "x"}),
+            ),
+            event(
+                owner_session,
+                2,
+                EventKind::ThreadCompleted,
+                json!({"thread_id": tid(0xa1).to_string(), "status": "completed", "summary": {}}),
+            ),
+        ];
+        let result = tools
+            .invoke(call(
+                SPAWN_WORKER_TOOL,
+                json!({"task": "second task", "exec_worker": "mac-mini"}),
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1, "the spawn admitted");
+    }
+
+    #[test]
+    fn catalog_block_renders_deterministically_and_only_when_non_empty() {
+        // Zero endpoints: no block at all (today's bytes).
+        assert!(
+            !JudgePrompt::default()
+                .render(3)
+                .contains("Execution workers")
+        );
+        let block = super::worker_catalog_block(&catalog_two());
+        assert!(
+            block.starts_with(
+                "Execution workers (the `endpoints` catalog): mac-mini — local macOS dev \
+                 machine — repo checkouts, cargo, git; vultr-builder."
+            ),
+            "{block}"
+        );
+        assert!(block.contains("Pass `exec_worker` on every spawn_worker call"));
+        assert!(block.contains("Never invent a worker id."));
+        // Deterministic: the same catalog renders the same bytes.
+        assert_eq!(block, super::worker_catalog_block(&catalog_two()));
+        // An id without a description renders alone.
+        let solo = super::worker_catalog_block(&[super::WorkerEntry::new("solo")]);
+        assert!(solo.contains("catalog): solo."), "{solo}");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_appends_the_catalog_block_only_when_configured() {
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let router = sid(15);
+        let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+        profile.worker_catalog = catalog_two();
+        profile
+            .bootstrap(&*inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        // The block is appended AFTER the rendered prompt (the template
+        // text itself is untouched) and carries the catalog verbatim.
+        assert!(payload.starts_with(&profile.judge.render(0)));
+        assert!(
+            payload.contains("\n\nExecution workers (the `endpoints` catalog): mac-mini"),
+            "{payload}"
+        );
+        assert!(payload.ends_with("Never invent a worker id."));
+        // Zero endpoints (the default profile) renders exactly today's
+        // bytes — no separator, no block.
+        let legacy_inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let legacy = RouterProfile::new(sid(16), router_template("mock", "mock-router"));
+        legacy
+            .bootstrap(&*legacy_inbox as &dyn InboxWriter)
+            .await
+            .unwrap();
+        let legacy_payload = legacy_inbox.admits.lock().unwrap()[0]
+            .1
+            .as_str()
+            .expect("prompt payload")
+            .to_string();
+        assert_eq!(legacy_payload, legacy.judge.render(0));
     }
 }

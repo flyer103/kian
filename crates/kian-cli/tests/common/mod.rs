@@ -281,6 +281,7 @@ recovery:
 
 /// Forces the no-proxy environment for localhost (must run before any
 /// reqwest client is built).
+#[allow(dead_code)] // each integration test compiles this module separately
 pub fn force_no_proxy() {
     unsafe {
         std::env::set_var("NO_PROXY", "127.0.0.1,localhost");

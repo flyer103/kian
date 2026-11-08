@@ -1128,6 +1128,14 @@ impl IntakeConfig {
 ///   each affected live session (idempotent by a stable event id).
 ///   Live sessions are never rewritten either way (cache-byte
 ///   stability).
+///
+/// (ADR-020, D7) deployment note: a non-empty `endpoints:` catalog is
+/// prompt-prefix content — the judge prompt gains the worker-catalog
+/// block and `spawn_worker`'s schema gains the `exec_worker` property
+/// — so a deployment that enables (or edits) `endpoints:` must pin a
+/// **new** `version` label: new sessions bootstrap the new prefix,
+/// live sessions keep their persisted prompts byte-identically and
+/// the boot drift scan reports the mismatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyVersionConfig {
@@ -2101,6 +2109,14 @@ pub struct EndpointConfig {
     /// `now - last_heartbeat > offline_after`).
     #[serde(default = "default_offline_after_ms")]
     pub offline_after_ms: u64,
+    /// (ADR-020, D5): the optional human-readable description of the
+    /// worker — prompt-prefix content (it renders into the Router's
+    /// judge prompt and the `spawn_worker` catalog), so it validates
+    /// fail-closed: non-empty after trim, at most 200 characters, no
+    /// control characters. Absent parses and serializes byte-identically
+    /// to the legacy entry.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 fn default_queue_timeout_ms() -> u64 {
@@ -2140,6 +2156,32 @@ impl ServeConfig {
         let cfg: Self = serde_yaml::from_str(text)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// (ADR-020, D5): the execution-worker catalog handed to the
+    /// super-agent assembly — `endpoints[].{id, description}` in
+    /// **config order** (the order is the spawn-enum order and the
+    /// judge-prompt block order — deterministic). Empty = the feature
+    /// is off, nothing changes anywhere.
+    #[must_use]
+    pub fn worker_catalog(&self) -> Vec<kian_superagent::WorkerEntry> {
+        self.endpoints
+            .iter()
+            .map(|ep| kian_superagent::WorkerEntry {
+                id: ep.id.clone(),
+                description: ep.description.clone(),
+            })
+            .collect()
+    }
+
+    /// (ADR-020, D5): per-worker-id queue timeouts — the exclusivity
+    /// check's never-started release bound.
+    #[must_use]
+    pub fn worker_queue_timeouts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.endpoints
+            .iter()
+            .map(|ep| (ep.id.clone(), ep.queue_timeout_ms))
+            .collect()
     }
 
     /// Cross-reference validation (references resolve, semantics sane).
@@ -2332,6 +2374,24 @@ impl ServeConfig {
                  (the async start/stop pair routes through the remote-exec queue)",
             ));
         }
+        // (ADR-020, D12): the dsh harness and a worker catalog are
+        // mutually exclusive — the dsh child never mounts the kian
+        // `exec` tool, so a worker binding could not route any command
+        // (recording one there would be audit fiction). Zero-endpoints
+        // dsh configs boot exactly as before.
+        if self
+            .superagent
+            .as_ref()
+            .is_some_and(|sa| sa.harness.dsh.is_some())
+            && !self.endpoints.is_empty()
+        {
+            return Err(invalid(
+                "`superagent.harness.dsh` and a non-empty `endpoints:` list are mutually \
+                 exclusive: the dsh harness runs the worker loop inside the dsh child and \
+                 never uses the kian `exec` tool, so a worker binding could not route any \
+                 command — drop one of the two sections",
+            ));
+        }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
             return Err(invalid(
                 "plugin `react-loop` is the baseline loop; with the \
@@ -2448,6 +2508,33 @@ impl ServeConfig {
                     "endpoint `{}` offline_after_ms must be > 0",
                     ep.id
                 )));
+            }
+            // (ADR-020, D5): the description is prompt-prefix content —
+            // it renders into the Router's judge prompt and the
+            // spawn_worker catalog, so it validates fail-closed
+            // (non-empty, ≤200 chars, no control characters).
+            if let Some(description) = &ep.description {
+                if description.trim().is_empty() {
+                    return Err(invalid(format!(
+                        "endpoint `{}` description must be non-empty (it renders into the \
+                         Router prompt)",
+                        ep.id
+                    )));
+                }
+                if description.chars().count() > 200 {
+                    return Err(invalid(format!(
+                        "endpoint `{}` description must be at most 200 characters (it renders \
+                         into the Router prompt)",
+                        ep.id
+                    )));
+                }
+                if description.chars().any(char::is_control) {
+                    return Err(invalid(format!(
+                        "endpoint `{}` description must not contain control characters (it \
+                         renders into the Router prompt)",
+                        ep.id
+                    )));
+                }
             }
         }
 
@@ -5297,6 +5384,105 @@ recovery:
         assert!(
             ServeConfig::parse(&typo).is_err(),
             "an unknown api key must refuse"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (ADR-020) endpoints[].description + the worker catalog (D5) and
+    // the dsh × endpoints refusal (D12)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn endpoint_description_is_optional_and_validates_fail_closed() {
+        // Absent parses (byte-identical legacy entry) and yields no
+        // catalog description.
+        let cfg = ServeConfig::parse(&superagent_yaml()).expect("parses");
+        assert_eq!(cfg.endpoints.len(), 1);
+        assert_eq!(cfg.endpoints[0].description, None);
+        assert_eq!(
+            cfg.worker_catalog(),
+            vec![kian_superagent::WorkerEntry::new("ep1")]
+        );
+        assert_eq!(
+            cfg.worker_queue_timeouts(),
+            std::collections::BTreeMap::from([("ep1".to_string(), 5_000u64)])
+        );
+
+        // A sane description parses and flows into the catalog in
+        // config order.
+        let described = superagent_yaml().replace(
+            "  - id: ep1\n",
+            "  - id: ep1\n    description: \"local macOS dev machine — cargo, git\"\n",
+        );
+        let cfg = ServeConfig::parse(&described).expect("description parses");
+        assert_eq!(
+            cfg.worker_catalog(),
+            vec![kian_superagent::WorkerEntry::with_description(
+                "ep1",
+                "local macOS dev machine — cargo, git"
+            )]
+        );
+
+        // Fail-closed: empty / whitespace / over-200-chars / control
+        // characters all refuse to start (prompt-prefix content).
+        for bad in [
+            "\"\"",
+            "\"   \"",
+            &format!("\"{}\"", "x".repeat(201)),
+            "\"line one\\nline two\"",
+            "\"tab\\there\"",
+        ] {
+            let yaml = superagent_yaml().replace(
+                "  - id: ep1\n",
+                &format!("  - id: ep1\n    description: {bad}\n"),
+            );
+            let err = match ServeConfig::parse(&yaml) {
+                Err(err) => err,
+                Ok(_) => panic!("description {bad:?} must refuse"),
+            };
+            assert!(err.to_string().contains("description"), "{bad:?}: {err}");
+        }
+
+        // Exactly 200 characters parse (the bound is inclusive).
+        let exact = superagent_yaml().replace(
+            "  - id: ep1\n",
+            &format!("  - id: ep1\n    description: \"{}\"\n", "y".repeat(200)),
+        );
+        assert!(ServeConfig::parse(&exact).is_ok());
+    }
+
+    #[test]
+    fn dsh_harness_with_endpoints_refuses_boot() {
+        // D12: the combination is a fail-closed config error naming
+        // both sections; zero-endpoints dsh configs are unchanged.
+        let combined = superagent_yaml().replace(
+            "superagent:\n  router:",
+            "superagent:\n  harness:\n    dsh:\n      command: /usr/bin/true\n  router:",
+        );
+        let err = ServeConfig::parse(&combined).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("`superagent.harness.dsh` and a non-empty `endpoints:` list"),
+            "{text}"
+        );
+        assert!(text.contains("mutually exclusive"), "{text}");
+        assert!(text.contains("drop one of the two sections"), "{text}");
+
+        // Zero endpoints + dsh boots as before (the refusal is
+        // additive): splice the endpoints list out and drop the
+        // remote-exec plugin.
+        let dsh_only = superagent_yaml()
+            .replace(
+                "superagent:\n  router:",
+                "superagent:\n  harness:\n    dsh:\n      command: /usr/bin/true\n  router:",
+            )
+            .replace(", \"remote-exec\"", "");
+        let start = dsh_only.find("endpoints:\n").expect("endpoints block");
+        let end = dsh_only.find("providers:\n").expect("providers key");
+        let spliced = format!("{}{}", &dsh_only[..start], &dsh_only[end..]);
+        assert!(
+            ServeConfig::parse(&spliced).is_ok(),
+            "zero-endpoints dsh config boots exactly as before"
         );
     }
 }

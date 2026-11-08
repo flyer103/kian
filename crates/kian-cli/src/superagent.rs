@@ -52,7 +52,8 @@ use kian_store::EventStore;
 use kian_superagent::{
     AdmitReceipt, InboxWriteError, InboxWriter, LineagePlan, MockChannel, PassthroughRegistry,
     PortFor, RouterDriver, RouterInbox, RouterMetrics, RouterProfile, StreamPort, StreamPortError,
-    SubscriptionService, WorkerLoopDriver, lineage_plan, worker_sessions,
+    SubscriptionService, WorkerBinding, WorkerLoopDriver, WorkerStreamsError, lineage_plan,
+    worker_binding_of, worker_sessions,
 };
 
 use crate::config::EndpointConfig;
@@ -321,6 +322,196 @@ impl kian_superagent::RecallPort for StoreRecall {
 }
 
 // ---------------------------------------------------------------------------
+// The WorkerStreamsPort over the store's public rebuild (the D9 read
+// surface — the StoreRecall precedent)
+// ---------------------------------------------------------------------------
+
+/// Assembly's [`kian_superagent::WorkerStreamsPort`]: worker-stream
+/// reads served over the store's existing public rebuild API — reads
+/// only, no execution surface, no writes. The Router tools'
+/// exclusivity check (`busy_owner`) reads through this port and
+/// nothing else.
+pub struct StoreWorkerStreams {
+    store: EventStore,
+}
+
+impl StoreWorkerStreams {
+    /// A fresh port over `store`.
+    pub fn new(store: EventStore) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+}
+
+impl kian_superagent::WorkerStreamsPort for StoreWorkerStreams {
+    fn read_stream(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<Event>, WorkerStreamsError>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            store
+                .rebuild(session)
+                .await
+                .map_err(|e| WorkerStreamsError(e.to_string()))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker routing selection (ADR-020, D8/D15/D16 — I2)
+// ---------------------------------------------------------------------------
+
+/// The pure routing decision over (stream binding, configured
+/// worker ids) — the spec §4 selection table. A pure function: no
+/// side effects, no reads, the same inputs always yield the same
+/// decision (rebuild == replay).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionKind<'a> {
+    /// Bound to a configured worker — its prebuilt side runs.
+    Bound(&'a str),
+    /// Legacy unbound on a workers-configured server — the FIRST
+    /// endpoint (the legacy `CombinedTools` first-wins outcome), with
+    /// one audit line per session; never registered as bound.
+    LegacyFirst(&'a str),
+    /// Bound to an id that is no longer configured — refused (D16):
+    /// neither re-routed nor run locally.
+    BoundUnconfigured(&'a str),
+    /// Malformed binding on the stream — refused honestly.
+    Malformed,
+    /// Zero configured workers — today's local-exec path, byte-identical.
+    NoWorkers,
+}
+
+/// Selects the routing decision for one worker session (spec §4's
+/// selection table, pure). "No binding must not default to a bound
+/// worker": an unbound session routes to the *first* endpoint
+/// (legacy), never to whichever side happens to be prebuilt first.
+#[must_use]
+pub fn select_side<'a>(
+    binding: &'a WorkerBinding<'_>,
+    configured_ids: &'a [String],
+) -> SelectionKind<'a> {
+    match binding {
+        WorkerBinding::Bound(id) => {
+            let id: &str = id.as_ref();
+            if configured_ids.iter().any(|configured| configured == id) {
+                SelectionKind::Bound(id)
+            } else {
+                SelectionKind::BoundUnconfigured(id)
+            }
+        }
+        WorkerBinding::Unbound => match configured_ids.first() {
+            Some(first) => SelectionKind::LegacyFirst(first.as_str()),
+            None => SelectionKind::NoWorkers,
+        },
+        WorkerBinding::Malformed => SelectionKind::Malformed,
+    }
+}
+
+/// The selection input for [`select_side`]: the configured worker
+/// ids in **config order** (`endpoints` file order — the same order
+/// the `spawn_worker` schema enum and the judge-prompt catalog use,
+/// and the pre-change `CombinedTools` first-wins order the legacy
+/// route must reproduce). `worker_sides` is a `BTreeMap` kept for
+/// id → side lookup, so its `keys()` are ALPHABETICAL — feeding
+/// those to `select_side` routed legacy unbound sessions to the
+/// alphabetically-first id instead of the first *configured* one,
+/// silently changing which machine runs them (review finding B1,
+/// ADR-020 §7 / spec §6 / DESIGN §4.1).
+#[must_use]
+pub fn selection_input_in_config_order(endpoints: &[crate::config::EndpointConfig]) -> Vec<String> {
+    endpoints
+        .iter()
+        .map(|endpoint| endpoint.id.clone())
+        .collect()
+}
+
+/// Why a worker session's `exec` is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Bound to a worker id that is no longer configured (D16). The
+    /// message names the id.
+    Unconfigured(String),
+    /// The stream's binding is malformed (D2) — no id exists to name.
+    Malformed,
+}
+
+impl Refusal {
+    /// The honest tool error text (spec §4 / D16, verbatim shapes).
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unconfigured(id) => format!(
+                "exec refused: this session is bound to execution worker `{id}`, which is not \
+                 configured on this server — no command was queued and nothing ran elsewhere"
+            ),
+            Self::Malformed => "exec refused: this session carries a malformed `exec_worker` \
+                 binding on its stream — no command was queued and nothing ran elsewhere"
+                .to_string(),
+        }
+    }
+}
+
+/// Builds the refusing side for one drive (assembly glue: the factory
+/// captures the loop ingredients; the driver calls it only on the
+/// refusal rows, which are rare and never on the hot path).
+pub type RefuseSideFactory =
+    Arc<dyn Fn(&Refusal) -> WorkerLoopDriver<crate::superagent::WorkerInnerDriver> + Send + Sync>;
+
+/// The refusing `exec` tool (assembly glue, D16/D2): mounts the
+/// single name `exec` with the exact schema the remote tool exposes
+/// (prompt-prefix neutral), and every invoke returns the honest
+/// refusal. It holds **no backend handle** — structurally incapable
+/// of enqueueing a command anywhere (no queue row, no endpoint
+/// dispatch, no silent failover).
+pub struct RefusingExecTool {
+    refusal: Refusal,
+}
+
+impl RefusingExecTool {
+    #[must_use]
+    pub fn new(refusal: Refusal) -> Self {
+        Self { refusal }
+    }
+
+    /// The refusal this tool answers with (tests).
+    #[must_use]
+    pub fn refusal(&self) -> &Refusal {
+        &self.refusal
+    }
+}
+
+impl ToolProvider for RefusingExecTool {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        // Byte-identical to the RemoteExecTool schema: one uniform
+        // `exec` surface (name and schema unchanged — D8).
+        vec![ToolSchema {
+            name: "exec".into(),
+            description: "Run a command on the remote execution endpoint (argv vector, no shell)."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "command and arguments"
+                    },
+                    "cwd": {"type": "string"},
+                    "timeout_ms": {"type": "integer"}
+                },
+                "required": ["argv"]
+            }),
+        }]
+    }
+
+    fn invoke(&self, _call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+        let message = self.refusal.message();
+        Box::pin(async move { Err(ToolError::Execution(message)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The assembled driver
 // ---------------------------------------------------------------------------
 
@@ -491,6 +682,26 @@ pub struct SuperAgentDriver {
     /// each admitted tick is one judge turn.
     watchdog: Option<SessionId>,
     watchdog_side: Option<RouterDriver<ReActLoop>>,
+    /// (ADR-020, D8) one prebuilt worker side per configured worker,
+    /// keyed by endpoint id. Empty (zero `endpoints:`) = the feature
+    /// is off and `worker_side` above is today's exact path.
+    worker_sides: BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>,
+    /// (B1 fix) the SAME ids as `worker_sides`' keys but in **config
+    /// order** — the selection input for the legacy-unbound row
+    /// (`select_side`'s first-configured rule). The map stays the
+    /// lookup structure; the order list is the routing input.
+    worker_order: Vec<String>,
+    /// (ADR-020, D16/D2) builds the refusing side (a worker loop
+    /// whose only `exec` is the honest refusal) for the
+    /// unconfigured-bound and malformed rows. `None` when no sides
+    /// are installed (feature off).
+    refuse_side: Option<RefuseSideFactory>,
+    /// (ADR-020, D15) observability-only dedup so the
+    /// `legacy unbound` audit line logs **once per session** per
+    /// process. Never read for a routing decision — the selection
+    /// itself stays a pure function of (stream binding,
+    /// configured ids).
+    legacy_unbound_audited: Arc<Mutex<BTreeSet<SessionId>>>,
 }
 
 impl SuperAgentDriver {
@@ -510,6 +721,10 @@ impl SuperAgentDriver {
             default_side,
             watchdog: None,
             watchdog_side: None,
+            worker_sides: BTreeMap::new(),
+            worker_order: Vec::new(),
+            refuse_side: None,
+            legacy_unbound_audited: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -520,6 +735,29 @@ impl SuperAgentDriver {
     pub fn with_watchdog(mut self, session: SessionId, side: RouterDriver<ReActLoop>) -> Self {
         self.watchdog = Some(session);
         self.watchdog_side = Some(side);
+        self
+    }
+
+    /// (ADR-020, D8) attaches the per-worker sides (one prebuilt
+    /// `WorkerLoopDriver` per configured endpoint, keyed by id) and
+    /// the refusing-side factory. `worker_order` is the SAME ids in
+    /// **config order** (from `endpoints` file order —
+    /// [`selection_input_in_config_order`]); it is the selection
+    /// input, so the legacy-unbound row routes to the first
+    /// *configured* endpoint, never to the BTreeMap's
+    /// alphabetically-first key (B1). Additive: with no sides
+    /// installed the driver routes exactly as before (the entire
+    /// feature is behind the endpoints-presence discriminator).
+    #[must_use]
+    pub fn with_worker_sides(
+        mut self,
+        sides: BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>,
+        worker_order: Vec<String>,
+        refuse_side: RefuseSideFactory,
+    ) -> Self {
+        self.worker_sides = sides;
+        self.worker_order = worker_order;
+        self.refuse_side = Some(refuse_side);
         self
     }
 }
@@ -539,16 +777,91 @@ impl LoopDriver for SuperAgentDriver {
         // Classify by stream content before the first provider turn:
         // worker streams carry the delegation wrapper (or already carry
         // thread/started); plain sessions see the default agent.
+        //
+        // (ADR-020, D8): a worker session further selects ONE side per
+        // drive from its own stream's binding — bound ⇒ that worker's
+        // prebuilt side; legacy unbound ⇒ the first endpoint with one
+        // audit line per session; unconfigured-bound or malformed ⇒ the
+        // refusing side (never a fallback route, never local exec).
+        // With no sides installed (zero endpoints) the single
+        // `worker_side` below is today's exact path, byte-identical.
         let worker = self.worker_side.clone();
         let default = Arc::clone(&self.default_side);
         let router = self.router;
         let worker_version = self.worker_version;
         let session = ctx.session();
+        let sides = self.worker_sides.clone();
+        // (B1) the selection input is CONFIG order, not the map's
+        // (alphabetical) key order — see `worker_order`.
+        let order = self.worker_order.clone();
+        let refuse_side = self.refuse_side.clone();
+        let audited = Arc::clone(&self.legacy_unbound_audited);
         futures::stream::once(async move {
             let events = ctx.events().await.unwrap_or_default();
             match lineage_plan(&events, session, router, worker_version) {
                 LineagePlan::PassThrough => default.drive(ctx).boxed(),
-                LineagePlan::Emit { .. } | LineagePlan::Resume { .. } => worker.drive(ctx).boxed(),
+                plan @ (LineagePlan::Emit { .. } | LineagePlan::Resume { .. }) => {
+                    if sides.is_empty() {
+                        return worker.drive(ctx).boxed();
+                    }
+                    let binding = worker_binding_of(&events, session);
+                    let configured = order;
+                    match select_side(&binding, &configured) {
+                        SelectionKind::Bound(id) => {
+                            tracing::debug!(
+                                target: "kian::superagent",
+                                session = %session.0,
+                                exec_worker = %id,
+                                resumed = matches!(plan, LineagePlan::Resume { .. }),
+                                "worker routing audit: bound side selected"
+                            );
+                            sides[id].drive(ctx).boxed()
+                        }
+                        SelectionKind::LegacyFirst(id) => {
+                            let first = audited
+                                .lock()
+                                .expect("legacy unbound audit lock")
+                                .insert(session);
+                            if first {
+                                tracing::info!(
+                                    target: "kian::superagent",
+                                    session = %session.0,
+                                    exec_worker = %id,
+                                    "legacy unbound worker session routed to first endpoint \
+                                     `{id}`; not a supported mode"
+                                );
+                            }
+                            sides[id].drive(ctx).boxed()
+                        }
+                        SelectionKind::BoundUnconfigured(id) => {
+                            tracing::warn!(
+                                target: "kian::superagent",
+                                session = %session.0,
+                                exec_worker = %id,
+                                "worker routing audit: bound worker `{id}` is not configured; \
+                                 exec refused"
+                            );
+                            let factory = refuse_side
+                                .expect("the refusing factory is installed exactly when sides are");
+                            factory(&Refusal::Unconfigured(id.to_string()))
+                                .drive(ctx)
+                                .boxed()
+                        }
+                        SelectionKind::Malformed => {
+                            tracing::warn!(
+                                target: "kian::superagent",
+                                session = %session.0,
+                                "worker routing audit: malformed exec_worker binding; exec refused"
+                            );
+                            let factory = refuse_side
+                                .expect("the refusing factory is installed exactly when sides are");
+                            factory(&Refusal::Malformed).drive(ctx).boxed()
+                        }
+                        // Unreachable: `sides` is non-empty here, so an
+                        // unbound binding always yields LegacyFirst.
+                        SelectionKind::NoWorkers => worker.drive(ctx).boxed(),
+                    }
+                }
             }
         })
         .flatten()
@@ -1174,10 +1487,12 @@ pub struct SuperAgentServices {
     pub router_hold: Arc<kian_superagent::RouterHold>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
-    /// The async-jobs engine, present when `superagent.async_tools`
-    /// is on. The startup sweep re-drives and redelivers after the
-    /// inbox rebuild.
-    pub async_jobs: Option<Arc<kian_exec::AsyncJobs>>,
+    /// The async-jobs engines, one per configured endpoint when
+    /// `superagent.async_tools` is on (ADR-020 D11: each worker side
+    /// carries its own pair bound to its endpoint; the first entry is
+    /// the Router's default pair). The startup sweep re-drives and
+    /// redelivers every one after the inbox rebuild.
+    pub async_jobs: Vec<Arc<kian_exec::AsyncJobs>>,
     /// The completion bridge's counters, for `/metrics`.
     pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
     /// The cross-session read port: reads over the store's
@@ -1449,10 +1764,13 @@ pub async fn start_services(
     //     wake registry): re-offer settled rows (a crash between settle
     //     and deliver loses nothing — the admit key dedupes), then
     //     re-drive pending/inflight jobs (observers re-attach through
-    //     the queue; one row, one dispatch, ever).
-    if let Some(jobs) = &services.async_jobs {
+    //     the queue; one row, one dispatch, ever). One engine per
+    //     configured endpoint (ADR-020 D11) — every one sweeps.
+    for jobs in &services.async_jobs {
         jobs.redeliver_settled().await;
         jobs.redrive_pending().await;
+    }
+    if !services.async_jobs.is_empty() {
         record(&order, "async_jobs_redriven");
     }
 
@@ -1850,5 +2168,183 @@ mod tests {
         assert_eq!(snap["dropped_ignored"], serde_json::json!(1));
         assert_eq!(snap["dropped_not_explicit"], serde_json::json!(1));
         assert_eq!(snap["failures"], serde_json::json!(0));
+    }
+
+    // ------------------------------------------------------------------
+    // (ADR-020) per-worker routing selection — the pure matrix (I2)
+    // ------------------------------------------------------------------
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// The spec §4 selection table as a pure-function test: bound ⇒
+    /// that worker; legacy unbound ⇒ the FIRST endpoint; a bound id
+    /// missing from config ⇒ refusal, never a re-route; malformed ⇒
+    /// refusal; zero workers ⇒ today's local path. "No binding must
+    /// not default to a bound worker": with [mac-mini, vultr] the
+    /// unbound session selects mac-mini because it is FIRST, and with
+    /// the order flipped it selects vultr — the first endpoint, not a
+    /// bound worker and not whichever side is prebuilt.
+    #[test]
+    fn select_side_is_the_pure_selection_table() {
+        use kian_superagent::WorkerBinding;
+
+        let configured = ids(&["mac-mini", "vultr"]);
+        let bound = WorkerBinding::Bound(std::borrow::Cow::Borrowed("vultr"));
+        assert_eq!(
+            select_side(&bound, &configured),
+            SelectionKind::Bound("vultr")
+        );
+        // Bound to the FIRST id: still that side.
+        let first_bound = WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"));
+        assert_eq!(
+            select_side(&first_bound, &configured),
+            SelectionKind::Bound("mac-mini")
+        );
+        // Unbound ⇒ first endpoint (config order).
+        assert_eq!(
+            select_side(&WorkerBinding::Unbound, &configured),
+            SelectionKind::LegacyFirst("mac-mini")
+        );
+        let flipped = ids(&["vultr", "mac-mini"]);
+        assert_eq!(
+            select_side(&WorkerBinding::Unbound, &flipped),
+            SelectionKind::LegacyFirst("vultr"),
+            "the unbound route follows config order, not a bound worker"
+        );
+        // A bound id no longer configured: neither re-routed nor local.
+        let gone = WorkerBinding::Bound(std::borrow::Cow::Borrowed("toaster"));
+        assert_eq!(
+            select_side(&gone, &configured),
+            SelectionKind::BoundUnconfigured("toaster")
+        );
+        // Malformed: refusal on any config.
+        assert_eq!(
+            select_side(&WorkerBinding::Malformed, &configured),
+            SelectionKind::Malformed
+        );
+        // Zero workers: today's local-exec path.
+        assert_eq!(
+            select_side(&WorkerBinding::Unbound, &[]),
+            SelectionKind::NoWorkers
+        );
+    }
+
+    /// (B1 regression) The legacy-unbound route must follow CONFIG
+    /// order, not the `worker_sides` BTreeMap's (alphabetical) key
+    /// order. Config `endpoints: [zeta, alpha]` — non-alphabetical —
+    /// must select `zeta` (the pre-change `CombinedTools` first-wins
+    /// outcome); the map-key input the driver used before the fix
+    /// would have selected `alpha`, silently routing a legacy
+    /// session to a different machine while the audit line claimed
+    /// "first endpoint".
+    #[test]
+    fn legacy_unbound_selection_uses_config_order_not_map_key_order() {
+        use kian_superagent::WorkerBinding;
+
+        let endpoint = |id: &str| crate::config::EndpointConfig {
+            id: id.to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            queue_timeout_ms: 60_000,
+            offline_after_ms: 30_000,
+            description: None,
+        };
+        // Config order deliberately NOT alphabetical.
+        let endpoints = vec![endpoint("zeta"), endpoint("alpha")];
+        let input = selection_input_in_config_order(&endpoints);
+        assert_eq!(input, ids(&["zeta", "alpha"]));
+
+        // The unbound row selects the FIRST CONFIGURED endpoint.
+        assert_eq!(
+            select_side(&WorkerBinding::Unbound, &input),
+            SelectionKind::LegacyFirst("zeta"),
+            "the legacy-unbound route follows config order"
+        );
+
+        // The B1 witness, kept as the reason this test exists: the
+        // driver's pre-fix input (`worker_sides.keys()`, i.e. the
+        // sorted map keys) would have selected `alpha`.
+        let mut map_keys: Vec<String> = input.clone();
+        map_keys.sort();
+        assert_eq!(map_keys, ids(&["alpha", "zeta"]));
+        assert_eq!(
+            select_side(&WorkerBinding::Unbound, &map_keys),
+            SelectionKind::LegacyFirst("alpha"),
+            "the pre-fix (BTreeMap key order) input selected the wrong machine"
+        );
+        assert_ne!(
+            select_side(&WorkerBinding::Unbound, &input),
+            select_side(&WorkerBinding::Unbound, &map_keys),
+            "config order and key order must disagree on non-alphabetical configs"
+        );
+
+        // The order-sensitive change touches ONLY the unbound row:
+        // bound (configured) and bound-unconfigured stay
+        // order-independent on the same input.
+        let bound = WorkerBinding::Bound(std::borrow::Cow::Borrowed("alpha"));
+        assert_eq!(select_side(&bound, &input), SelectionKind::Bound("alpha"));
+        let gone = WorkerBinding::Bound(std::borrow::Cow::Borrowed("toaster"));
+        assert_eq!(
+            select_side(&gone, &input),
+            SelectionKind::BoundUnconfigured("toaster")
+        );
+        assert_eq!(
+            select_side(&WorkerBinding::Malformed, &input),
+            SelectionKind::Malformed
+        );
+    }
+
+    /// The refusing `exec` tool (D16/D2): the schema is the uniform
+    /// `exec` surface, every invoke is the honest refusal naming the
+    /// missing worker id — and the tool holds no backend handle, so
+    /// it is structurally incapable of enqueueing a command anywhere.
+    #[tokio::test]
+    async fn refusing_exec_tool_errors_honestly_without_a_backend() {
+        let tool = RefusingExecTool::new(Refusal::Unconfigured("toaster".into()));
+        // The schema matches the RemoteExecTool surface (name +
+        // parameters byte-identical — prompt-prefix neutral).
+        let schemas = tool.schemas();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "exec");
+        assert_eq!(
+            schemas[0].parameters["required"],
+            serde_json::json!(["argv"])
+        );
+        assert_eq!(
+            schemas[0].parameters["properties"]["argv"]["type"],
+            serde_json::json!("array")
+        );
+
+        let err = tool
+            .invoke(ToolCall {
+                id: "c1".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({"argv": ["ls"]}),
+            })
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exec refused: this session is bound to execution worker `toaster`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("no command was queued and nothing ran elsewhere"),
+            "{text}"
+        );
+
+        // The malformed refusal names the malformed binding.
+        let malformed = RefusingExecTool::new(Refusal::Malformed);
+        let text = malformed
+            .invoke(ToolCall {
+                id: "c2".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({"argv": ["ls"]}),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("malformed `exec_worker` binding"), "{text}");
     }
 }
