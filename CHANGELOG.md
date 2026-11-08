@@ -923,3 +923,20 @@ directions).
 - **Gates** — build / `cargo test --workspace` (106 suites, 0 failed) / clippy `--workspace
   --all-targets -D warnings` / fmt `--all --check` green; `docs_map` green. This closeout entry is
   documentation-only on top of the already-gated tree.
+
+## 2026-11-08 — agent memory live verification (P1/P2/P3a)
+
+**env-gated (live provider), not default-green.** With a real `deepseek-chat` endpoint (key via
+`providers.*.api_key_env`; no value captured) and a loopback `kian serve`:
+
+- Dream: an 8-fact runbook transcript dreamed over `[1,10)` produced 8 `runbook/*` notes, all
+  `verified` with transcript refs; a trivial transcript produced `[]` (honest empty,
+  `parse_failures=0`).
+- Injection: 8/8 new sessions received the index as their first `input/admitted`
+  (`role:"system"`, `synthetic:true`, `memory` marker; 64 items / 7 424 bytes total); the model's
+  first request carried it as `messages[0]`.
+- A/B (one model, 8 questions, keyword rubric): 0/8 memory-off vs 8/8 memory-on; prompt tokens
+  206 vs 2 110; completion 138 vs 97; turns 8 vs 8. Directional (synthetic corpus, single model,
+  small N); the harness lives in a scratch directory and is not committed.
+- Recorded in `design/MEMORY-MODEL.md` §10.1 and `docs/SPEC.md` §5, deliberately **not** in the
+  README (README policy: no live-run logs or benchmark methodology). No code changed.

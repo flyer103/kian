@@ -349,6 +349,11 @@ Scope: knowledge that survives a session boundary (P9). The normative contract i
 | P3a | Retrieval + representations (read-time) | `kian memory search <query> --session` / `kian memory map --session` (both `--json`-able): pure read-only projections over the folded notes in `kian-memory` + `kian-cli` — no writes, no new kinds; search folds latest-per-subject across all statuses with per-hit status (fixed caps 20 hits / 8 KiB, `truncated`, no `--limit`); the map is verified-only with the effective rule "a subject is a node iff its latest revision is verified", evidence-derived edges (`derived_from` range intersections in the same source session) and caps 200 nodes / 1000 edges / 64 KiB; `degenerate`/`oversized` reported, never hidden; O(memory-session events) per invocation, snapshot read deferred to P3b | landed |
 | P3b | Persisted representations + dreaming cadence | Wiki-as-notes built by a dreaming run (MEMORY-MODEL §7 R3), declarative dreaming cadence/budget, semantic search; snapshot-served fold for the views | designed |
 
+Live-model verification (2026-11-08, env-gated): dream + injected index + read views exercised
+against a real provider (`deepseek-chat`); the dream wrote 8 verified notes, 8/8 new sessions
+carried the index, and a single-model 8-question A/B scored 0/8 (off) vs 8/8 (on) at ~10x prompt
+tokens. Details, caveats and the README-policy note: MEMORY-MODEL §10.1.
+
 Non-goals recorded with the phases: no in-session memory tool (P1), no mid-session memory updates
 (P2), no representation as truth or unbounded build (P3a/P3b), no cross-agent shared memory (open).
 

@@ -366,6 +366,31 @@ end-to-end (real process/CLI).
 | M9 | Strip injection → replay is byte-identical to a pre-memory session | L3 |
 | M10 | Memory on/off comparison on the `issue-watch` dogfood records task outcome and per-question token cost | L3 (manual, recorded) |
 
+### 10.1 Live verification (2026-11-08)
+
+Recorded here, not in the README (README policy: no live-run logs or benchmark methodology).
+
+- **Environment**: `kian serve` on loopback with the `openai-compat` provider against
+  `deepseek-chat`; the key is read from the environment variable named by
+  `providers.*.api_key_env` (the variable *name* is recorded; no value is ever captured). P2 caps
+  at their defaults (20 items / 4096 bytes).
+- **Dream (real model)**: a source session carrying eight authoritative runbook facts, dreamed
+  over `[1,10)`, produced eight `runbook/*` notes, each `verified` with
+  `verified_by.method=transcript` and an in-range `ref`. A first dream over a trivial transcript
+  returned `[]` — the honest-empty path, `notes_appended=0`, `parse_failures=0`.
+- **Injection (real request)**: 8/8 new sessions carried the index as their first
+  `input/admitted` (`role:"system"`, `synthetic:true`, `memory` marker; 64 items / 7 424 bytes
+  total), and the model's first request carried it as `messages[0]`. An answer to a
+  "state the trim rule from memory" question used the injected claim.
+- **A/B (single model, N=8, deterministic keyword rubric)**: memory-off 0/8, memory-on 8/8;
+  prompt tokens 206 vs 2 110 (an always-on index costs ~9x on tiny questions), completion
+  138 vs 97, turns 8 vs 8. Directional only: synthetic corpus, one model, no judge model; the
+  harness ran in a scratch directory and is not part of the tree.
+- **Interpretation**: the index fixes factual recall it cannot otherwise recover; its cost is a
+  fixed per-session prefix, so large corpora (the article's 350k-file regime) are where the
+  snapshot-served fold and on-demand retrieval (P3b) matter. The article's ~20k-token/question
+  saving is a large-corpus result, not a claim for small sessions.
+
 ## 11. Open questions
 
 1. **Scope granularity**: agent identity is the P1 choice. Tenant-wide or per-thread memory needs a
