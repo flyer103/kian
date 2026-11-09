@@ -17,7 +17,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kian_endpoint::{Endpoint, HeartbeatTap};
+use kian_endpoint::proto::RegisterToken;
+use kian_endpoint::{Endpoint, HeartbeatTap, RegisterBackoff, RegisterInfo, register_loop};
 use kiand::config::{Config, Flags};
 use kiand::executor::DaemonExecutor;
 
@@ -26,6 +27,11 @@ const USAGE: &str = "usage:
         [--max-concurrent <n>] [--heartbeat-ms <n>] [--exec-timeout-ms <n>]
                                          run the endpoint daemon (default listen: 127.0.0.1:0;
                                          the bound address is printed on stdout)
+  kiand --register-to <kian-host:port> [--endpoint-id <id>] [--description <text>]
+        [--heartbeat-ms <n>] [--token-env <NAME>]
+                                         worker-dial register mode: dial kian, register with the
+                                         token from the environment variable NAME
+                                         (default KIAN_WORKER_TOKEN; only the NAME is on argv)
   kiand --version                        print the version
 
 configuration precedence: flags > environment (KIAND_ENDPOINT_ID, KIAND_LISTEN,
@@ -104,6 +110,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 let raw = next_value(&mut iter, "--exec-timeout-ms")?;
                 flags.exec_timeout_ms = Some(parse_num(&raw, "--exec-timeout-ms")?);
             }
+            "--register-to" => flags.register_to = Some(next_value(&mut iter, "--register-to")?),
+            "--description" => flags.description = Some(next_value(&mut iter, "--description")?),
+            "--token-env" => flags.token_env = Some(next_value(&mut iter, "--token-env")?),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -116,6 +125,129 @@ async fn run(config: Config) -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
+    if config.register_to.is_some() {
+        return run_worker(config).await;
+    }
+    run_server(config).await
+}
+
+/// Read the worker token from the named environment variable. Only the
+/// variable NAME is configurable; an absent/empty value refuses startup
+/// with an actionable message (never echoing any token material).
+fn worker_token(
+    env_name: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<RegisterToken, String> {
+    match get(env_name).filter(|v| !v.is_empty()) {
+        Some(value) => Ok(RegisterToken::new(value)),
+        None => Err(format!(
+            "register mode requires the worker token in environment variable \
+             `{env_name}` (set it, or point --token-env at another variable); \
+             only the variable name belongs on the command line"
+        )),
+    }
+}
+
+/// Worker-dial register mode: dial kian, register, serve the steady
+/// state, reconnect with bounded backoff. SIGTERM/SIGINT drains in-flight
+/// commands and sends `bye` before exiting; a terminal refusal logs one
+/// actionable line and exits non-zero.
+async fn run_worker(config: Config) -> ExitCode {
+    let addr = match config.register_addr() {
+        Ok(Some(addr)) => addr,
+        Ok(None) => unreachable!("run_worker is only entered in register mode"),
+        Err(e) => {
+            eprintln!("kiand: refusing to start — {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let token = match worker_token(&config.token_env, |key| std::env::var(key).ok()) {
+        Ok(token) => token,
+        Err(message) => {
+            eprintln!("kiand: refusing to start — {message}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let (executor, _inflight) = DaemonExecutor::new(config.exec_timeout_ms);
+    let endpoint = Arc::new(
+        Endpoint::new(config.endpoint_id.clone(), executor)
+            .with_max_concurrent(config.max_concurrent)
+            .with_heartbeat(Duration::from_millis(config.heartbeat_ms)),
+    );
+    let info = RegisterInfo {
+        endpoint_id: config.endpoint_id.clone(),
+        description: config.description.clone(),
+        token,
+    };
+    tracing::info!(
+        endpoint = %config.endpoint_id,
+        %addr,
+        max_concurrent = config.max_concurrent,
+        "kiand worker-dial register mode"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(sigterm) => sigterm,
+        Err(e) => {
+            eprintln!("kiand: cannot install SIGTERM handler: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut supervise = Box::pin(register_loop(
+        endpoint,
+        info,
+        addr,
+        RegisterBackoff::default(),
+        shutdown_rx,
+    ));
+    let result = tokio::select! {
+        result = &mut supervise => result,
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received; draining in-flight commands, then bye");
+            let _ = shutdown_tx.send(true);
+            supervise.await
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received; draining in-flight commands, then bye");
+            let _ = shutdown_tx.send(true);
+            supervise.await
+        }
+    };
+    match result {
+        Ok(()) => {
+            tracing::info!("register loop ended; exiting");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // The error is typed and token-free by construction; the hint
+            // names the fix, never the secret.
+            let hint = match &e {
+                kian_endpoint::EndpointError::RegisterRejected { reason, .. } => match reason {
+                    kian_endpoint::proto::RefusalReason::BadToken => format!(
+                        "check that `{}` holds the token kian expects",
+                        config.token_env
+                    ),
+                    kian_endpoint::proto::RefusalReason::VersionMismatch => {
+                        "upgrade kiand or kian so both speak the same KiandProto version".into()
+                    }
+                    kian_endpoint::proto::RefusalReason::DuplicateStatic => format!(
+                        "worker id `{}` is statically configured on kian; use a dynamic id",
+                        config.endpoint_id
+                    ),
+                    _ => "see the kian registration log for details".into(),
+                },
+                _ => "see the kian registration log for details".into(),
+            };
+            eprintln!("kiand: worker registration failed: {e} — {hint}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_server(config: Config) -> ExitCode {
     let addr = match config.listen_addr() {
         Ok(addr) => addr,
         Err(e) => {
@@ -220,5 +352,59 @@ async fn run(config: Config) -> ExitCode {
             "in-flight commands did not finish within the drain bound; exiting without them"
         );
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_token_env_refuses_startup_with_actionable_message() {
+        let err = worker_token("KIAN_WORKER_TOKEN", |_| None).unwrap_err();
+        assert!(
+            err.contains("KIAN_WORKER_TOKEN"),
+            "names the variable: {err}"
+        );
+        assert!(err.contains("--token-env"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn empty_token_env_value_is_treated_as_absent() {
+        let err = worker_token("KIAN_WORKER_TOKEN", |_| Some(String::new())).unwrap_err();
+        assert!(err.contains("KIAN_WORKER_TOKEN"));
+    }
+
+    #[test]
+    fn custom_token_env_name_is_honored_and_value_never_echoed() {
+        let token = worker_token("MY_SECRET_VAR", |key| {
+            (key == "MY_SECRET_VAR").then(|| "fake-test-token-0123456789".to_string())
+        })
+        .unwrap();
+        // The newtype redacts: neither Debug nor Display leaks the value.
+        assert!(!format!("{token:?}").contains("fake-test-token"));
+        assert!(!format!("{token}").contains("fake-test-token"));
+        // Errors naming the variable never carry the value either.
+        let err = worker_token("MY_SECRET_VAR", |_| None).unwrap_err();
+        assert!(err.contains("MY_SECRET_VAR"));
+    }
+
+    #[test]
+    fn register_mode_flags_parse() {
+        let args = vec![
+            "--register-to".to_string(),
+            "127.0.0.1:9920".to_string(),
+            "--endpoint-id".to_string(),
+            "box-a".to_string(),
+            "--description".to_string(),
+            "build box".to_string(),
+            "--token-env".to_string(),
+            "MY_SECRET_VAR".to_string(),
+        ];
+        let flags = parse_flags(&args).unwrap();
+        assert_eq!(flags.register_to.as_deref(), Some("127.0.0.1:9920"));
+        assert_eq!(flags.endpoint_id.as_deref(), Some("box-a"));
+        assert_eq!(flags.description.as_deref(), Some("build box"));
+        assert_eq!(flags.token_env.as_deref(), Some("MY_SECRET_VAR"));
     }
 }

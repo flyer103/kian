@@ -24,6 +24,10 @@ pub const DEFAULT_MAX_CONCURRENT: usize = kian_endpoint::endpoint::DEFAULT_MAX_C
 pub const DEFAULT_HEARTBEAT_MS: u64 = kian_endpoint::endpoint::DEFAULT_HEARTBEAT.as_millis() as u64;
 /// Exec timeout default mirrors `kian-cli`'s tooling constant.
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
+/// Default environment variable the worker token is read from in
+/// register mode. Only the variable NAME travels on the command line;
+/// the value never does.
+pub const DEFAULT_TOKEN_ENV: &str = "KIAN_WORKER_TOKEN";
 
 /// Optional config file, looked up at `./kiand.yaml` unless overridden.
 pub const DEFAULT_CONFIG_FILE: &str = "kiand.yaml";
@@ -64,6 +68,9 @@ pub struct Flags {
     pub max_concurrent: Option<usize>,
     pub heartbeat_ms: Option<u64>,
     pub exec_timeout_ms: Option<u64>,
+    pub register_to: Option<String>,
+    pub description: Option<String>,
+    pub token_env: Option<String>,
 }
 
 /// The `kiand.yaml` document: every key optional, unknown keys rejected.
@@ -75,6 +82,9 @@ pub struct FileConfig {
     pub max_concurrent: Option<usize>,
     pub heartbeat_ms: Option<u64>,
     pub exec_timeout_ms: Option<u64>,
+    pub register_to: Option<String>,
+    pub description: Option<String>,
+    pub token_env: Option<String>,
 }
 
 /// The resolved daemon configuration.
@@ -85,6 +95,12 @@ pub struct Config {
     pub max_concurrent: usize,
     pub heartbeat_ms: u64,
     pub exec_timeout_ms: u64,
+    /// Worker-dial register mode: dial this kian registration listener
+    /// instead of waiting for server-dial connections.
+    pub register_to: Option<String>,
+    pub description: Option<String>,
+    /// NAME of the environment variable holding the worker token.
+    pub token_env: String,
 }
 
 impl Config {
@@ -93,6 +109,18 @@ impl Config {
         self.listen.parse().map_err(|_| {
             ConfigError::Invalid(format!("listen `{}` is not a valid host:port", self.listen))
         })
+    }
+
+    /// Parse and validate the register-mode server address (fail-closed).
+    pub fn register_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        self.register_to
+            .as_deref()
+            .map(|raw| {
+                raw.parse().map_err(|_| {
+                    ConfigError::Invalid(format!("register_to `{raw}` is not a valid host:port"))
+                })
+            })
+            .transpose()
     }
 }
 
@@ -135,6 +163,16 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         .or(env_u64(env_get, ENV_EXEC_TIMEOUT_MS)?)
         .or_else(|| file.as_ref().and_then(|f| f.exec_timeout_ms))
         .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
+    let register_to = flags
+        .register_to
+        .or_else(|| file.as_ref().and_then(|f| f.register_to.clone()));
+    let description = flags
+        .description
+        .or_else(|| file.as_ref().and_then(|f| f.description.clone()));
+    let token_env = flags
+        .token_env
+        .or_else(|| file.as_ref().and_then(|f| f.token_env.clone()))
+        .unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string());
 
     let config = Config {
         endpoint_id,
@@ -142,6 +180,9 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         max_concurrent,
         heartbeat_ms,
         exec_timeout_ms,
+        register_to,
+        description,
+        token_env,
     };
     validate(config)
 }
@@ -224,6 +265,51 @@ fn validate(config: Config) -> Result<Config, ConfigError> {
     }
     // A bad listen address refuses to start before any socket opens.
     config.listen_addr()?;
+    // Register mode: the server address must parse, and the token-env
+    // NAME must be non-empty (the value is read at startup, never here).
+    config.register_addr()?;
+    if config.token_env.trim().is_empty() {
+        return Err(ConfigError::Invalid(
+            "token_env must name a non-empty environment variable".into(),
+        ));
+    }
+    // Register mode (spec §2.3): the worker validates its own identity
+    // and description shape at startup, so a malformed identity never
+    // reaches the wire — the server would otherwise answer `id_conflict`,
+    // which the register loop classifies as retryable and re-sends
+    // forever — and the operator's own invalid description refuses
+    // startup instead of being silently dropped server-side (P11).
+    // The rules are mirrored locally from `kian-exec`'s
+    // `valid_worker_id`/`valid_description` (spec §1.3): mirror
+    // discipline — that helper is deliberately not a dependency here.
+    // Listen-only mode (no `--register-to`) keeps today's behavior
+    // byte-identical, so these checks are register-mode only.
+    if config.register_to.is_some() {
+        let id = config.endpoint_id.trim();
+        if id.is_empty() || id.len() > 200 {
+            return Err(ConfigError::Invalid(
+                "register-mode endpoint_id must be 1..=200 bytes after trim".into(),
+            ));
+        }
+        if id.bytes().any(|b| b.is_ascii_control()) {
+            return Err(ConfigError::Invalid(
+                "register-mode endpoint_id must not contain control characters".into(),
+            ));
+        }
+        if let Some(description) = &config.description {
+            let trimmed = description.trim();
+            if trimmed.is_empty()
+                || trimmed.chars().count() > 200
+                || trimmed.chars().any(char::is_control)
+            {
+                return Err(ConfigError::Invalid(
+                    "register-mode description must be non-empty after trim, at most \
+                     200 characters, and free of control characters"
+                        .into(),
+                ));
+            }
+        }
+    }
     Ok(config)
 }
 
@@ -386,6 +472,106 @@ mod tests {
             err.to_string().contains("cannot read config file"),
             "was: {err}"
         );
+    }
+
+    #[test]
+    fn register_mode_fields_resolve_from_flags() {
+        let config = resolve(
+            no_env(),
+            Flags {
+                register_to: Some("127.0.0.1:9920".into()),
+                description: Some("build box".into()),
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.register_addr().unwrap().unwrap().to_string(),
+            "127.0.0.1:9920"
+        );
+        assert_eq!(config.description.as_deref(), Some("build box"));
+        assert_eq!(config.token_env, DEFAULT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn unparseable_register_to_is_rejected() {
+        let err = resolve(
+            no_env(),
+            Flags {
+                register_to: Some("not-an-address".into()),
+                ..Flags::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("register_to"), "was: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Register-mode identity/description shape rules (spec §2.3, B2)
+    // -----------------------------------------------------------------------
+
+    fn register_flags(endpoint_id: &str, description: Option<&str>) -> Flags {
+        Flags {
+            register_to: Some("127.0.0.1:9920".into()),
+            endpoint_id: Some(endpoint_id.into()),
+            description: description.map(str::to_string),
+            ..Flags::default()
+        }
+    }
+
+    #[test]
+    fn register_mode_rejects_oversized_endpoint_id() {
+        let err = resolve(no_env(), register_flags(&"x".repeat(201), None)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("endpoint_id"), "names the field: {text}");
+        assert!(text.contains("1..=200"), "names the rule: {text}");
+    }
+
+    #[test]
+    fn register_mode_rejects_control_character_endpoint_id() {
+        let err = resolve(no_env(), register_flags("box\u{7}a", None)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("endpoint_id"), "names the field: {text}");
+        assert!(text.contains("control"), "names the rule: {text}");
+    }
+
+    #[test]
+    fn register_mode_rejects_invalid_descriptions() {
+        for description in [
+            "   ",            // empty after trim
+            &"d".repeat(201), // over the 200-char bound
+            "build\u{7}box",  // control character
+        ] {
+            let err = resolve(no_env(), register_flags("box-a", Some(description))).unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("description"), "names the field: {text}");
+            assert!(
+                text.contains("200") || text.contains("non-empty") || text.contains("control"),
+                "names the rule: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_mode_accepts_valid_identity_and_description() {
+        let config = resolve(no_env(), register_flags("box-a", Some("build box"))).unwrap();
+        assert_eq!(config.endpoint_id, "box-a");
+        assert_eq!(config.description.as_deref(), Some("build box"));
+    }
+
+    /// Listen-only mode keeps today's behavior byte-identical: an id that
+    /// register mode would refuse still resolves without `--register-to`.
+    #[test]
+    fn listen_mode_is_not_subject_to_register_shape_rules() {
+        let config = resolve(
+            no_env(),
+            Flags {
+                endpoint_id: Some("x".repeat(201)),
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.endpoint_id.len(), 201);
     }
 
     /// A writable scratch dir for file-backed tests.

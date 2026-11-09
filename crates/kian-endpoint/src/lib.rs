@@ -20,10 +20,13 @@
 pub mod endpoint;
 pub mod executor;
 pub mod proto;
+pub mod register;
 pub mod tcp;
 
 pub use endpoint::{Endpoint, EndpointError, HeartbeatInfo, HeartbeatTap, ServerPeer};
 pub use executor::LocalExecutor;
+pub use proto::{RefusalReason, RegisterToken};
+pub use register::{RegisterBackoff, RegisterInfo, connect_registered, register_loop};
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +44,7 @@ mod tests {
             ("src/endpoint.rs", include_str!("endpoint.rs")),
             ("src/executor.rs", include_str!("executor.rs")),
             ("src/tcp.rs", include_str!("tcp.rs")),
+            ("src/register.rs", include_str!("register.rs")),
         ];
         // Assembled at runtime so this file itself stays free of the
         // literals it scans for.

@@ -90,6 +90,16 @@ pub struct ServeConfig {
     /// remote exec.
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+    /// The `workers:` section (R12): the dynamic-membership
+    /// registration listener. `None` (the section absent) is dynamic
+    /// membership **off** — no listener, no directory, no runtime
+    /// routes, byte-identical pre-R12 behavior everywhere (including
+    /// with `endpoints:` present: static pins behave exactly as
+    /// before). Present parses fail-closed (unknown keys refuse) and
+    /// gates the fail-closed startup validations (C2: private bind,
+    /// env-only token, positive `offline_after_ms`).
+    #[serde(default)]
+    pub workers: Option<WorkersConfig>,
     /// The `memory:` section (round-8 plan, kian-87). `None` (the
     /// section absent) is memory **off**: the assembly, the ops plane
     /// and every existing behavior are byte-identical. Present parses
@@ -1129,13 +1139,17 @@ impl IntakeConfig {
 ///   Live sessions are never rewritten either way (cache-byte
 ///   stability).
 ///
-/// (ADR-020, D7) deployment note: a non-empty `endpoints:` catalog is
-/// prompt-prefix content — the judge prompt gains the worker-catalog
-/// block and `spawn_worker`'s schema gains the `exec_worker` property
-/// — so a deployment that enables (or edits) `endpoints:` must pin a
-/// **new** `version` label: new sessions bootstrap the new prefix,
-/// live sessions keep their persisted prompts byte-identically and
-/// the boot drift scan reports the mismatch.
+/// (ADR-021 supersedes ADR-020 D7) deployment note: turning
+/// membership on (a non-empty `endpoints:` list or a `workers:`
+/// section) is prompt-prefix content — the judge prompt gains the
+/// frozen worker-membership block and `spawn_worker`'s schema gains
+/// the required plain-string `exec_worker` property — so a deployment
+/// that enables (or disables) either must pin a **new** `version`
+/// label: new sessions bootstrap the new prefix, live sessions keep
+/// their persisted prompts byte-identically and the boot drift scan
+/// reports the mismatch. Membership *changes* (a worker joining or
+/// leaving) never touch the prefix — the block is a constant and the
+/// catalog reaches the model only via `list_workers` results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyVersionConfig {
@@ -2094,6 +2108,68 @@ impl SuperAgentConfig {
 /// receiver; the wechat iLink channel).
 pub const KNOWN_CHANNEL_TYPES: [&str; 5] = ["mock-im", "lark", "timer", "github", "wechat"];
 
+/// The `workers:` section (R12, spec C1): the dynamic-membership
+/// registration listener. Workers dial in and self-register; joining or
+/// leaving never requires editing this file or restarting `kian serve`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkersConfig {
+    /// The private bind (`host:port`) of the registration listener.
+    /// Private ranges only (loopback, RFC1918, CGNAT, `::1`, ULA) —
+    /// reached over an SSH tunnel or Tailscale; a public bind refuses
+    /// startup unless `allow_public: true` is set explicitly.
+    pub listen: String,
+    /// The **name** of the environment variable holding the shared
+    /// worker token. The value is env-only: it never appears in this
+    /// file, argv, logs, events or error text. `kian serve` refuses to
+    /// start when the section is present and the variable is
+    /// absent/blank.
+    pub token_env: String,
+    /// Liveness bound: a worker is offline once its last heartbeat is
+    /// older than this (also the welcome cadence source: /3).
+    #[serde(default = "default_workers_offline_after_ms")]
+    pub offline_after_ms: u64,
+    /// Explicit public-bind override. Never set in any doc example —
+    /// it exposes a command-execution surface.
+    #[serde(default)]
+    pub allow_public: bool,
+}
+
+fn default_workers_offline_after_ms() -> u64 {
+    30_000
+}
+
+impl WorkersConfig {
+    /// The parsed listener bind (validated fail-closed).
+    pub fn listen_addr(&self) -> Result<std::net::SocketAddr, ConfigError> {
+        self.listen.parse().map_err(|e| {
+            invalid(format!(
+                "workers.listen `{}` is not a valid host:port: {e} \
+                     (expected `host:port`, e.g. `127.0.0.1:7400`)",
+                self.listen
+            ))
+        })
+    }
+
+    /// The C2 validations that are pure config (bind shape, private
+    /// range, positive `offline_after_ms`, non-blank `token_env`
+    /// **name**). The token **value** check (env present and non-blank)
+    /// is a startup check in the serve assembly, not a config
+    /// validation, so read-only verbs can still load the file.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let addr = self.listen_addr()?;
+        if self.offline_after_ms == 0 {
+            return Err(invalid("workers.offline_after_ms must be > 0"));
+        }
+        if self.token_env.trim().is_empty() {
+            return Err(invalid(
+                "workers.token_env must name the environment variable holding the worker token",
+            ));
+        }
+        kian_exec::validate_bind_addr(addr, self.allow_public).map_err(invalid)
+    }
+}
+
 /// One remote execution endpoint (over the durable queue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2360,36 +2436,43 @@ impl ServeConfig {
             ));
         }
         let has_remote_exec_plugin = self.plugins.iter().any(|p| p == "remote-exec");
-        if !self.endpoints.is_empty() != has_remote_exec_plugin {
+        // (C6) the remote-exec plugin's presence lock now covers the
+        // dynamic-membership half too: `workers:` on its own (zero
+        // `endpoints:`) still routes commands through the queue.
+        let has_workers_surface = !self.endpoints.is_empty() || self.workers.as_ref().is_some();
+        if has_workers_surface != has_remote_exec_plugin {
             return Err(invalid(
-                "plugin `remote-exec` and a non-empty `endpoints:` list \
-                 must be enabled together",
+                "plugin `remote-exec` and a non-empty `endpoints:` list (or a `workers:` \
+                 section) must be enabled together",
             ));
         }
         // the async pair routes through the queue — gating it
-        // on without endpoints would mount tools with nowhere to run.
-        if self.superagent.as_ref().is_some_and(|sa| sa.async_tools) && self.endpoints.is_empty() {
+        // on without any worker surface would mount tools with nowhere
+        // to run (C6: the same disjunction).
+        if self.superagent.as_ref().is_some_and(|sa| sa.async_tools) && !has_workers_surface {
             return Err(invalid(
-                "`superagent.async_tools` requires a non-empty `endpoints:` list \
-                 (the async start/stop pair routes through the remote-exec queue)",
+                "`superagent.async_tools` requires a non-empty `endpoints:` list or a \
+                 `workers:` section (the async start/stop pair routes through the \
+                 remote-exec queue)",
             ));
         }
-        // (ADR-020, D12): the dsh harness and a worker catalog are
+        // (ADR-020, D12; C6): the dsh harness and a worker surface are
         // mutually exclusive — the dsh child never mounts the kian
         // `exec` tool, so a worker binding could not route any command
-        // (recording one there would be audit fiction). Zero-endpoints
+        // (recording one there would be audit fiction). Zero-endpoint
         // dsh configs boot exactly as before.
         if self
             .superagent
             .as_ref()
             .is_some_and(|sa| sa.harness.dsh.is_some())
-            && !self.endpoints.is_empty()
+            && has_workers_surface
         {
             return Err(invalid(
-                "`superagent.harness.dsh` and a non-empty `endpoints:` list are mutually \
-                 exclusive: the dsh harness runs the worker loop inside the dsh child and \
-                 never uses the kian `exec` tool, so a worker binding could not route any \
-                 command — drop one of the two sections",
+                "`superagent.harness.dsh` and a worker surface (a non-empty `endpoints:` \
+                 list or a `workers:` section) are mutually exclusive: the dsh harness \
+                 runs the worker loop inside the dsh child and never uses the kian \
+                 `exec` tool, so a worker binding could not route any command — drop \
+                 one of the two sections",
             ));
         }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
@@ -2536,6 +2619,14 @@ impl ServeConfig {
                     )));
                 }
             }
+        }
+
+        // The `workers:` section (R12, C2): the pure-config validations
+        // (bind shape + private range, positive `offline_after_ms`,
+        // non-blank `token_env` name). The token **value** check is a
+        // serve-startup check (the assembly reads the env once).
+        if let Some(workers) = &self.workers {
+            workers.validate()?;
         }
 
         // The superagent section's cross-references.
@@ -3155,6 +3246,115 @@ recovery:
         assert_eq!(agent.model_slots.len(), 1);
         let policy = cfg.policy().unwrap();
         assert_eq!(policy.rules.len(), 2);
+    }
+
+    // -- workers: (R12, C1–C6) -------------------------------------
+
+    /// A config with a `workers:` section and zero `endpoints:` boots
+    /// (C6): the remote-exec plugin's presence lock covers the dynamic
+    /// half. Absent section parses to `None` (feature off).
+    #[test]
+    fn workers_section_parses_with_defaults() {
+        let base = valid_yaml();
+        let with_workers = format!(
+            "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+             workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n"
+        );
+        let cfg = ServeConfig::parse(&with_workers).expect("workers config");
+        let workers = cfg.workers.clone().expect("section present");
+        assert_eq!(workers.listen, "127.0.0.1:7400");
+        assert_eq!(workers.token_env, "KIAN_WORKER_TOKEN");
+        assert_eq!(workers.offline_after_ms, 30_000, "default");
+        assert!(!workers.allow_public, "default");
+        // No endpoints + workers + the plugin = valid (C6).
+        assert!(cfg.validate().is_ok(), "was: {:?}", cfg.validate().err());
+
+        let plain = ServeConfig::parse(&base).expect("valid config");
+        assert!(plain.workers.is_none(), "absent section = feature off");
+    }
+
+    /// Unknown keys refuse (deny_unknown_fields, C1).
+    #[test]
+    fn workers_section_refuses_unknown_keys() {
+        let base = valid_yaml();
+        let cfg_text = format!(
+            "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+             workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n  bogus: 1\n"
+        );
+        assert!(ServeConfig::parse(&cfg_text).is_err());
+    }
+
+    /// The C2 matrix, one refusal per row: unparseable listen, public
+    /// bind without the explicit override, `offline_after_ms == 0`,
+    /// blank `token_env`.
+    #[test]
+    fn workers_validations_refuse_fail_closed() {
+        let case = |listen: &str, token_env: &str, offline: u64| {
+            let workers = WorkersConfig {
+                listen: listen.into(),
+                token_env: token_env.into(),
+                offline_after_ms: offline,
+                allow_public: false,
+            };
+            workers.validate()
+        };
+        let err = case("not-an-addr", "T", 30_000).unwrap_err();
+        assert!(err.to_string().contains("host:port"), "was: {err}");
+        let err = case("8.8.8.8:7400", "T", 30_000).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("public address"), "was: {text}");
+        assert!(text.contains("Tailscale") || text.contains("SSH tunnel"));
+        assert!(text.contains("allow_public"));
+        // The explicit override lifts it (validated at the WorkersConfig
+        // level; the serve assembly still gates the env value).
+        let lifted = WorkersConfig {
+            listen: "8.8.8.8:7400".into(),
+            token_env: "T".into(),
+            offline_after_ms: 30_000,
+            allow_public: true,
+        };
+        assert!(lifted.validate().is_ok());
+        let err = case("127.0.0.1:7400", "T", 0).unwrap_err();
+        assert!(err.to_string().contains("offline_after_ms must be > 0"));
+        let err = case("127.0.0.1:7400", "  ", 30_000).unwrap_err();
+        assert!(err.to_string().contains("token_env"));
+        // Wildcards count as public (C3).
+        for wildcard in ["0.0.0.0:7400", "[::]:7400"] {
+            assert!(case(wildcard, "T", 30_000).is_err(), "{wildcard}");
+        }
+    }
+
+    /// The presence locks (C6): `workers:` without the remote-exec
+    /// plugin refuses; `async_tools` on workers-only boots; dsh plus
+    /// `workers:` refuses.
+    #[test]
+    fn workers_presence_locks() {
+        const WORKERS: &str =
+            "workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n";
+        const ENDPOINTS: &str = "endpoints:\n  - id: ep1\n    addr: \"127.0.0.1:7341\"\n    queue_timeout_ms: 5000\n    offline_after_ms: 500\n";
+
+        // workers: without the remote-exec plugin → refuse.
+        let no_plugin = superagent_yaml()
+            .replace(ENDPOINTS, WORKERS)
+            .replace(", \"remote-exec\"", "");
+        let err = ServeConfig::parse(&no_plugin).unwrap_err().to_string();
+        assert!(err.contains("remote-exec"), "was: {err}");
+
+        // `async_tools` with workers-only (zero endpoints) is now legal.
+        let with_async = superagent_yaml()
+            .replace(ENDPOINTS, WORKERS)
+            .replace("superagent:\n", "superagent:\n  async_tools: true\n");
+        let cfg = ServeConfig::parse(&with_async).expect("async_tools on workers-only");
+        assert!(cfg.validate().is_ok(), "was: {:?}", cfg.validate().err());
+
+        // dsh + workers → refuse (the D12 rationale extends to the
+        // dynamic surface).
+        let with_dsh = superagent_yaml().replace(ENDPOINTS, WORKERS).replace(
+            "superagent:\n",
+            "superagent:\n  harness:\n    dsh:\n      command: /usr/bin/true\n",
+        );
+        let err = ServeConfig::parse(&with_dsh).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "was: {err}");
     }
 
     /// golden fixture: a config with NO `event_store:` key parses to
@@ -5462,7 +5662,11 @@ recovery:
         let err = ServeConfig::parse(&combined).unwrap_err();
         let text = err.to_string();
         assert!(
-            text.contains("`superagent.harness.dsh` and a non-empty `endpoints:` list"),
+            text.contains("`superagent.harness.dsh` and a worker surface"),
+            "{text}"
+        );
+        assert!(
+            text.contains("non-empty `endpoints:` list or a `workers:` section"),
             "{text}"
         );
         assert!(text.contains("mutually exclusive"), "{text}");

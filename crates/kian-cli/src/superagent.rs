@@ -358,6 +358,199 @@ impl kian_superagent::WorkerStreamsPort for StoreWorkerStreams {
 }
 
 // ---------------------------------------------------------------------------
+// The WorkerDirectoryPort over the runtime directory + the durable
+// registry read (the R12 S4 read surface — the StoreWorkerStreams
+// precedent)
+// ---------------------------------------------------------------------------
+
+/// Assembly's [`kian_superagent::WorkerDirectoryPort`]: static config
+/// ids ∪ the runtime membership directory ∪ the durable
+/// `endpoint_registry` rows (the registry half keeps a known-but-
+/// offline worker bindable after a kian restart — rows are never
+/// pruned). Reads only: no writes, no wakes, no membership mutation.
+///
+/// State derivation (spec M3/L2): a directory member computes through
+/// `kian_exec`'s pure `member_state` (online iff connected AND fresh);
+/// an id known only from its registry row uses the CLI conjunction
+/// (online iff the row says `online` AND the heartbeat is fresh).
+/// `description`/`version` are runtime facts: absent until the worker
+/// (re-)registers (spec M4 — no migration, honest absence).
+pub struct StoreWorkerDirectory {
+    backend: Arc<kian_exec::RemoteExecBackend>,
+    directory: Arc<kian_exec::WorkerDirectory>,
+    /// The static pins (config order) — descriptions and per-id
+    /// liveness bounds.
+    endpoints: Vec<crate::config::EndpointConfig>,
+    /// `workers.offline_after_ms` — the liveness bound for dynamic
+    /// ids.
+    workers_offline_after_ms: u64,
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+impl StoreWorkerDirectory {
+    /// A fresh port over the shared backend, the runtime directory
+    /// and the static config.
+    pub fn new(
+        backend: Arc<kian_exec::RemoteExecBackend>,
+        directory: Arc<kian_exec::WorkerDirectory>,
+        endpoints: Vec<crate::config::EndpointConfig>,
+        workers_offline_after_ms: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            directory,
+            endpoints,
+            workers_offline_after_ms,
+        })
+    }
+
+    /// The per-id liveness bound: the static pin's own
+    /// `offline_after_ms` when configured, else the `workers:` bound.
+    fn offline_after(&self, id: &str) -> u64 {
+        self.endpoints
+            .iter()
+            .find(|ep| ep.id == id)
+            .map(|ep| ep.offline_after_ms)
+            .unwrap_or(self.workers_offline_after_ms)
+    }
+
+    /// The one snapshot both `members()` and `member()` derive from.
+    async fn snapshot(
+        &self,
+    ) -> Result<Vec<kian_superagent::MemberView>, kian_superagent::WorkerDirectoryError> {
+        let rows = self
+            .backend
+            .store()
+            .endpoints_lenient()
+            .await
+            .map_err(|e| kian_superagent::WorkerDirectoryError(format!("registry read: {e}")))?;
+        let now = wall_clock_ms();
+        let directory = self.directory.snapshot();
+        let mut views: std::collections::BTreeMap<String, kian_superagent::MemberView> =
+            std::collections::BTreeMap::new();
+        // registry rows first (the durable floor: every id ever seen)
+        for row in rows {
+            let offline_after = self.offline_after(&row.endpoint_id);
+            let fresh = now.saturating_sub(row.last_heartbeat_ms) <= offline_after;
+            let state = if row.state == "online" && fresh {
+                kian_superagent::MemberState::Online
+            } else {
+                kian_superagent::MemberState::Offline
+            };
+            views.insert(
+                row.endpoint_id.clone(),
+                kian_superagent::MemberView {
+                    id: row.endpoint_id.clone(),
+                    description: None,
+                    version: None,
+                    state,
+                    last_seen_ms: row.last_heartbeat_ms,
+                },
+            );
+        }
+        // the runtime directory wins where it knows the id (it also
+        // carries description/version and the draining window)
+        for (id, member) in directory {
+            let offline_after = self.offline_after(&id);
+            let state = match kian_exec::member_state(&member, now, offline_after) {
+                kian_exec::MemberState::Online => kian_superagent::MemberState::Online,
+                kian_exec::MemberState::Draining => kian_superagent::MemberState::Draining,
+                kian_exec::MemberState::Offline => kian_superagent::MemberState::Offline,
+            };
+            views.insert(
+                id.clone(),
+                kian_superagent::MemberView {
+                    id,
+                    description: member.description,
+                    version: Some(member.version),
+                    state,
+                    last_seen_ms: member.last_seen_ms,
+                },
+            );
+        }
+        // static pins are known even before any registry row exists
+        // (a fresh database): offline until their boot-seeded row says
+        // otherwise — but their config description is the known text.
+        for ep in &self.endpoints {
+            views
+                .entry(ep.id.clone())
+                .and_modify(|view| {
+                    if view.description.is_none() {
+                        view.description = ep.description.clone();
+                    }
+                })
+                .or_insert_with(|| kian_superagent::MemberView {
+                    id: ep.id.clone(),
+                    description: ep.description.clone(),
+                    version: None,
+                    state: kian_superagent::MemberState::Offline,
+                    last_seen_ms: 0,
+                });
+        }
+        Ok(views.into_values().collect())
+    }
+}
+
+impl kian_superagent::WorkerDirectoryPort for StoreWorkerDirectory {
+    fn known_ids(
+        &self,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<String>, kian_superagent::WorkerDirectoryError>,
+    > {
+        let this = self.clone_shallow();
+        Box::pin(async move {
+            let views = this.snapshot().await?;
+            Ok(views.into_iter().map(|v| v.id).collect())
+        })
+    }
+
+    fn members(
+        &self,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Vec<kian_superagent::MemberView>, kian_superagent::WorkerDirectoryError>,
+    > {
+        let this = self.clone_shallow();
+        Box::pin(async move { this.snapshot().await })
+    }
+
+    fn member(
+        &self,
+        id: &str,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<Option<kian_superagent::MemberView>, kian_superagent::WorkerDirectoryError>,
+    > {
+        let this = self.clone_shallow();
+        let id = id.to_string();
+        Box::pin(async move {
+            let views = this.snapshot().await?;
+            Ok(views.into_iter().find(|v| v.id == id))
+        })
+    }
+}
+
+// A plain clone helper over the Arc fields (the port methods need
+// 'static futures; the struct itself is only ever held in an Arc).
+impl StoreWorkerDirectory {
+    fn clone_shallow(&self) -> Arc<Self> {
+        Arc::new(Self {
+            backend: Arc::clone(&self.backend),
+            directory: Arc::clone(&self.directory),
+            endpoints: self.endpoints.clone(),
+            workers_offline_after_ms: self.workers_offline_after_ms,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-worker routing selection (ADR-020, D8/D15/D16 — I2)
 // ---------------------------------------------------------------------------
 
@@ -408,22 +601,35 @@ pub fn select_side<'a>(
     }
 }
 
-/// The selection input for [`select_side`]: the configured worker
-/// ids in **config order** (`endpoints` file order — the same order
-/// the `spawn_worker` schema enum and the judge-prompt catalog use,
-/// and the pre-change `CombinedTools` first-wins order the legacy
-/// route must reproduce). `worker_sides` is a `BTreeMap` kept for
-/// id → side lookup, so its `keys()` are ALPHABETICAL — feeding
-/// those to `select_side` routed legacy unbound sessions to the
-/// alphabetically-first id instead of the first *configured* one,
-/// silently changing which machine runs them (review finding B1,
-/// ADR-020 §7 / spec §6 / DESIGN §4.1).
+/// Builds one per-worker-id side on first use (R12, S1 — the lazy
+/// factory replacing ADR-020's boot-prebuilt loop): the same tool set
+/// R11 built at boot for a configured endpoint — that worker's
+/// `RemoteExecTool` (one `exec`, unchanged schema), its own async pair
+/// bound to that id (S3), the shared recall toolpack (when enabled),
+/// the filtered local tools. The `description` parameter is part of
+/// the pinned seam (spec §5.1); the side's tool surface does not vary
+/// with it (S5), so the assembly passes it through unused or `None`.
+pub type WorkerSideFactory = Arc<
+    dyn Fn(&str, Option<&str>) -> WorkerLoopDriver<crate::superagent::WorkerInnerDriver>
+        + Send
+        + Sync,
+>;
+
+/// The selection input for one drive (R12, S2): the static config ids
+/// (config order — the legacy-unbound first rule) ∪ the directory
+/// port's known ids, appended in the port's id-ascending order. One
+/// snapshot per drive; the Bound row matches against the full set,
+/// the legacy-unbound row against the static prefix only (see
+/// `SuperAgentDriver::drive`).
 #[must_use]
-pub fn selection_input_in_config_order(endpoints: &[crate::config::EndpointConfig]) -> Vec<String> {
-    endpoints
-        .iter()
-        .map(|endpoint| endpoint.id.clone())
-        .collect()
+pub fn known_ids_snapshot(static_order: &[String], port_ids: &[String]) -> Vec<String> {
+    let mut known = static_order.to_vec();
+    for id in port_ids {
+        if !known.contains(id) {
+            known.push(id.clone());
+        }
+    }
+    known
 }
 
 /// Why a worker session's `exec` is refused.
@@ -682,19 +888,30 @@ pub struct SuperAgentDriver {
     /// each admitted tick is one judge turn.
     watchdog: Option<SessionId>,
     watchdog_side: Option<RouterDriver<ReActLoop>>,
-    /// (ADR-020, D8) one prebuilt worker side per configured worker,
-    /// keyed by endpoint id. Empty (zero `endpoints:`) = the feature
-    /// is off and `worker_side` above is today's exact path.
-    worker_sides: BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>,
-    /// (B1 fix) the SAME ids as `worker_sides`' keys but in **config
-    /// order** — the selection input for the legacy-unbound row
-    /// (`select_side`'s first-configured rule). The map stays the
-    /// lookup structure; the order list is the routing input.
+    /// (R12, S1 — supersedes ADR-020 D8's boot-prebuilt map) the lazy
+    /// per-worker-id side cache: built on first use from the factory,
+    /// selected per drive from the stream's binding, and **never
+    /// evicted** (queue-first: a side's `exec` enqueues by id, so an
+    /// offline worker's side keeps working; eviction would only risk
+    /// a rebuild storm on a flapping worker — A13).
+    worker_sides:
+        Arc<Mutex<BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>>>,
+    /// The side factory (S1). `None` (zero `endpoints:` and no
+    /// `workers:`) = the feature is off and `worker_side` above is
+    /// today's exact path, byte-identical.
+    side_factory: Option<WorkerSideFactory>,
+    /// The static pins in **config order** (`endpoints` file order).
+    /// The legacy-unbound row routes to the first static pin (B1);
+    /// a bound row matches the statics ∪ the port's known ids.
     worker_order: Vec<String>,
+    /// (R12, S2): the bundle-owned directory port — the known-ids
+    /// snapshot source per drive (static ∪ live directory ∪ registry
+    /// rows). `None` = static ids only (tests without the wiring).
+    known_ids_port: Option<Arc<dyn kian_superagent::WorkerDirectoryPort>>,
     /// (ADR-020, D16/D2) builds the refusing side (a worker loop
     /// whose only `exec` is the honest refusal) for the
-    /// unconfigured-bound and malformed rows. `None` when no sides
-    /// are installed (feature off).
+    /// unconfigured-bound and malformed rows. `None` when no factory
+    /// is installed (feature off).
     refuse_side: Option<RefuseSideFactory>,
     /// (ADR-020, D15) observability-only dedup so the
     /// `legacy unbound` audit line logs **once per session** per
@@ -721,8 +938,10 @@ impl SuperAgentDriver {
             default_side,
             watchdog: None,
             watchdog_side: None,
-            worker_sides: BTreeMap::new(),
+            worker_sides: Arc::new(Mutex::new(BTreeMap::new())),
+            side_factory: None,
             worker_order: Vec::new(),
+            known_ids_port: None,
             refuse_side: None,
             legacy_unbound_audited: Arc::new(Mutex::new(BTreeSet::new())),
         }
@@ -738,26 +957,28 @@ impl SuperAgentDriver {
         self
     }
 
-    /// (ADR-020, D8) attaches the per-worker sides (one prebuilt
-    /// `WorkerLoopDriver` per configured endpoint, keyed by id) and
-    /// the refusing-side factory. `worker_order` is the SAME ids in
-    /// **config order** (from `endpoints` file order —
-    /// [`selection_input_in_config_order`]); it is the selection
-    /// input, so the legacy-unbound row routes to the first
-    /// *configured* endpoint, never to the BTreeMap's
-    /// alphabetically-first key (B1). Additive: with no sides
-    /// installed the driver routes exactly as before (the entire
-    /// feature is behind the endpoints-presence discriminator).
+    /// (R12, S1/S2 — supersedes ADR-020 D8's prebuilt map) attaches
+    /// the lazy per-worker-id side factory, the static pins in
+    /// **config order** (`endpoints` file order — the legacy-unbound
+    /// row routes to the first static pin, B1), the refusing-side
+    /// factory, and the directory port (the known-ids snapshot source
+    /// per drive: static ∪ live directory ∪ registry rows — the
+    /// registry half keeps a bound offline worker's side buildable
+    /// after a kian restart). Additive: with no factory installed the
+    /// driver routes exactly as before (the entire feature is behind
+    /// the endpoints-or-workers presence discriminator).
     #[must_use]
-    pub fn with_worker_sides(
+    pub fn with_lazy_worker_sides(
         mut self,
-        sides: BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>,
+        side_factory: WorkerSideFactory,
         worker_order: Vec<String>,
         refuse_side: RefuseSideFactory,
+        known_ids_port: Option<Arc<dyn kian_superagent::WorkerDirectoryPort>>,
     ) -> Self {
-        self.worker_sides = sides;
+        self.side_factory = Some(side_factory);
         self.worker_order = worker_order;
         self.refuse_side = Some(refuse_side);
+        self.known_ids_port = known_ids_port;
         self
     }
 }
@@ -778,22 +999,28 @@ impl LoopDriver for SuperAgentDriver {
         // worker streams carry the delegation wrapper (or already carry
         // thread/started); plain sessions see the default agent.
         //
-        // (ADR-020, D8): a worker session further selects ONE side per
-        // drive from its own stream's binding — bound ⇒ that worker's
-        // prebuilt side; legacy unbound ⇒ the first endpoint with one
-        // audit line per session; unconfigured-bound or malformed ⇒ the
-        // refusing side (never a fallback route, never local exec).
-        // With no sides installed (zero endpoints) the single
-        // `worker_side` below is today's exact path, byte-identical.
+        // (ADR-020, D8 → R12, S1/S2): a worker session selects ONE
+        // side per drive from its own stream's binding — bound ⇒ that
+        // worker's side, built lazily from the factory on first use
+        // and cached forever (never evicted: an offline worker's side
+        // enqueues by id — queue-first); legacy unbound ⇒ the first
+        // STATIC pin with one audit line per session; unknown-bound
+        // or malformed ⇒ the refusing side (never a fallback route,
+        // never local exec); nothing known ⇒ today's local path.
+        // With no factory installed (zero endpoints and no workers:)
+        // the single `worker_side` below is today's exact path,
+        // byte-identical.
         let worker = self.worker_side.clone();
         let default = Arc::clone(&self.default_side);
         let router = self.router;
         let worker_version = self.worker_version;
         let session = ctx.session();
-        let sides = self.worker_sides.clone();
-        // (B1) the selection input is CONFIG order, not the map's
-        // (alphabetical) key order — see `worker_order`.
+        let sides = Arc::clone(&self.worker_sides);
+        let side_factory = self.side_factory.clone();
+        // (B1) the legacy-unbound selection input is CONFIG order of
+        // the STATIC pins — never alphabetical, never dynamic.
         let order = self.worker_order.clone();
+        let port = self.known_ids_port.clone();
         let refuse_side = self.refuse_side.clone();
         let audited = Arc::clone(&self.legacy_unbound_audited);
         futures::stream::once(async move {
@@ -801,12 +1028,55 @@ impl LoopDriver for SuperAgentDriver {
             match lineage_plan(&events, session, router, worker_version) {
                 LineagePlan::PassThrough => default.drive(ctx).boxed(),
                 plan @ (LineagePlan::Emit { .. } | LineagePlan::Resume { .. }) => {
-                    if sides.is_empty() {
+                    let Some(factory) = side_factory else {
+                        // Feature off: today's single worker side.
                         return worker.drive(ctx).boxed();
-                    }
+                    };
                     let binding = worker_binding_of(&events, session);
-                    let configured = order;
-                    match select_side(&binding, &configured) {
+                    // (S2) one known-ids snapshot per drive: the
+                    // static pins ∪ the directory port's known ids.
+                    // A failed port read falls back to the static
+                    // pins with one warn — a drive never refuses on
+                    // an observability read.
+                    let port_ids = match &port {
+                        Some(port) => match port.known_ids().await {
+                            Ok(ids) => ids,
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "kian::superagent",
+                                    %error,
+                                    "worker routing audit: known-ids read failed; \
+                                     selecting from the static pins only"
+                                );
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    let known = known_ids_snapshot(&order, &port_ids);
+                    // Bound/malformed rows match the full known set;
+                    // the legacy-unbound row matches the STATIC prefix
+                    // only (S2: first static endpoint, or today's
+                    // local path when nothing is configured).
+                    let kind = match &binding {
+                        WorkerBinding::Unbound => select_side(&binding, &order),
+                        _ => select_side(&binding, &known),
+                    };
+                    // The never-evict cache lookup/build (S1): one
+                    // side per id per process, built on first use.
+                    let side_of = |id: &str| {
+                        let mut cache = sides.lock().expect("worker side cache lock");
+                        if !cache.contains_key(id) {
+                            // The factory seam carries an optional
+                            // description (spec §5.1); the side's tool
+                            // surface does not vary with it (S5), so
+                            // none is fetched here — no second port
+                            // read on the drive path.
+                            cache.insert(id.to_string(), factory(id, None));
+                        }
+                        cache.get(id).cloned().expect("just inserted")
+                    };
+                    match kind {
                         SelectionKind::Bound(id) => {
                             tracing::debug!(
                                 target: "kian::superagent",
@@ -815,7 +1085,7 @@ impl LoopDriver for SuperAgentDriver {
                                 resumed = matches!(plan, LineagePlan::Resume { .. }),
                                 "worker routing audit: bound side selected"
                             );
-                            sides[id].drive(ctx).boxed()
+                            side_of(id).drive(ctx).boxed()
                         }
                         SelectionKind::LegacyFirst(id) => {
                             let first = audited
@@ -831,18 +1101,18 @@ impl LoopDriver for SuperAgentDriver {
                                      `{id}`; not a supported mode"
                                 );
                             }
-                            sides[id].drive(ctx).boxed()
+                            side_of(id).drive(ctx).boxed()
                         }
                         SelectionKind::BoundUnconfigured(id) => {
                             tracing::warn!(
                                 target: "kian::superagent",
                                 session = %session.0,
                                 exec_worker = %id,
-                                "worker routing audit: bound worker `{id}` is not configured; \
-                                 exec refused"
+                                "worker routing audit: bound worker `{id}` is not known to this \
+                                 server; exec refused"
                             );
                             let factory = refuse_side
-                                .expect("the refusing factory is installed exactly when sides are");
+                                .expect("the refusing factory is installed exactly when the side factory is");
                             factory(&Refusal::Unconfigured(id.to_string()))
                                 .drive(ctx)
                                 .boxed()
@@ -854,11 +1124,11 @@ impl LoopDriver for SuperAgentDriver {
                                 "worker routing audit: malformed exec_worker binding; exec refused"
                             );
                             let factory = refuse_side
-                                .expect("the refusing factory is installed exactly when sides are");
+                                .expect("the refusing factory is installed exactly when the side factory is");
                             factory(&Refusal::Malformed).drive(ctx).boxed()
                         }
-                        // Unreachable: `sides` is non-empty here, so an
-                        // unbound binding always yields LegacyFirst.
+                        // Unbound with nothing known (no statics, no
+                        // dynamic ids): today's local path (S2).
                         SelectionKind::NoWorkers => worker.drive(ctx).boxed(),
                     }
                 }
@@ -1312,6 +1582,12 @@ pub async fn endpoint_registry(exec_store: &ExecStore) -> Result<Vec<EndpointReg
 // The assembled runtime
 // ---------------------------------------------------------------------------
 
+/// Builds one per-worker-id async jobs engine on demand (R12, S3):
+/// `AsyncJobs` is a stateless handle over the shared durable queue, so
+/// the lazy sides and the boot sweep each build their own instance
+/// per id.
+pub type AsyncJobsFactory = Arc<dyn Fn(&str) -> Arc<kian_exec::AsyncJobs> + Send + Sync>;
+
 /// The running super-agent services the [`crate::server::Server`]
 /// holds: everything with a background task or a metrics surface. The
 /// server's `ControlPlane`/`OpsPlane` impls reach the bundle only
@@ -1337,8 +1613,12 @@ pub struct SuperAgentRuntime {
     pub policy_drift: Arc<std::sync::atomic::AtomicU64>,
     /// The heartbeat watchdog (when endpoints are configured).
     pub watchdog: Option<Arc<HeartbeatWatchdog>>,
-    /// The remote-exec services (when endpoints are configured).
+    /// The remote-exec services (when a worker surface is configured).
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+    /// The worker-membership metrics counters (the registration
+    /// listener's edge counters — present iff `workers:` is
+    /// configured; the `/metrics` superagent fragment reads them).
+    pub worker_membership: Option<Arc<kian_exec::RegistrationMetrics>>,
     /// The completion bridge's counters (present when the async
     /// pair is mounted).
     pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
@@ -1403,6 +1683,22 @@ impl SuperAgentRuntime {
             })
         });
 
+        // Worker-membership edge counters (present iff `workers:` is
+        // configured — one per audited transition, deduped per
+        // generation by construction).
+        let worker_membership = self.worker_membership.as_ref().map(|m| {
+            let load =
+                |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+            serde_json::json!({
+                "joined": load(&m.joined),
+                "replaced": load(&m.replaced),
+                "left_bye": load(&m.left_bye),
+                "left_loss": load(&m.left_loss),
+                "refused": load(&m.refused),
+                "rate_limited": load(&m.rate_limited),
+            })
+        });
+
         serde_json::json!({
             "router_session": self.router.0,
             "evidence_verdicts": {
@@ -1421,6 +1717,7 @@ impl SuperAgentRuntime {
                 "truncated": truncated,
             },
             "watchdog": watchdog,
+            "worker_membership": worker_membership,
             "async_bridge": self.async_metrics.as_ref().map(|m| m.snapshot()),
         })
     }
@@ -1487,12 +1784,12 @@ pub struct SuperAgentServices {
     pub router_hold: Arc<kian_superagent::RouterHold>,
     /// Pre-opened exec services when endpoints are configured.
     pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
-    /// The async-jobs engines, one per configured endpoint when
-    /// `superagent.async_tools` is on (ADR-020 D11: each worker side
-    /// carries its own pair bound to its endpoint; the first entry is
-    /// the Router's default pair). The startup sweep re-drives and
-    /// redelivers every one after the inbox rebuild.
-    pub async_jobs: Vec<Arc<kian_exec::AsyncJobs>>,
+    /// The async-jobs engine factory when `superagent.async_tools` is
+    /// on (R12, S3: one lazily-built engine per worker id — the lazy
+    /// sides build their own instances; the startup sweep materializes
+    /// one per known id and re-drives/redelivers after the inbox
+    /// rebuild).
+    pub async_jobs_factory: Option<crate::superagent::AsyncJobsFactory>,
     /// The completion bridge's counters, for `/metrics`.
     pub async_metrics: Option<Arc<crate::async_bridge::AsyncBridgeMetrics>>,
     /// The cross-session read port: reads over the store's
@@ -1729,9 +2026,13 @@ pub async fn start_services(
     //     strictly after the consumers exist (a tick emitted before
     //     any subscriber is a tick nobody hears).
 
-    // 3. Watchdog + bridge (needs the engine-backed inbox).
+    // 3. Watchdog + bridge (needs the engine-backed inbox), and the
+    //    dynamic-membership registration listener (R12): boot = registry
+    //    rows exist, runtime directory empty — workers re-register; no
+    //    dynamic seeding, no forged joins (spec §3.2).
     let mut watchdog = None;
     let mut bridge = Vec::new();
+    let mut worker_membership = None;
     if let Some(remote) = &services.remote {
         seed_endpoint_registry(remote.backend.store(), &remote.endpoints).await?;
         let offline_after = remote
@@ -1739,6 +2040,7 @@ pub async fn start_services(
             .iter()
             .map(|ep| ep.offline_after_ms)
             .min()
+            .or_else(|| remote.workers.as_ref().map(|w| w.offline_after_ms))
             .unwrap_or(30_000);
         // Detection bound = offline_after + poll_interval; keep the
         // poll a fraction of the bound, capped at 1s.
@@ -1757,21 +2059,54 @@ pub async fn start_services(
         ));
         watchdog = Some(wd);
         record(&order, "watchdog_started");
+        // The registration listener accepts worker connections and
+        // attaches runtime routes through the sink (queue-first: rows
+        // parked before any route exist drain on registration).
+        if let Some(workers) = &remote.workers {
+            let listener = Arc::clone(&workers.listener);
+            worker_membership = Some(listener.metrics());
+            tokio::spawn(async move {
+                if let Err(error) = listener.run().await {
+                    tracing::error!(%error, "worker registration listener failed");
+                }
+            });
+            record(&order, "worker_listener_started");
+        }
     }
 
     // 3b. The async bridge's startup sweep, strictly after the
-    //     inbox rebuild (admitted completions must never race an empty
-    //     wake registry): re-offer settled rows (a crash between settle
-    //     and deliver loses nothing — the admit key dedupes), then
-    //     re-drive pending/inflight jobs (observers re-attach through
-    //     the queue; one row, one dispatch, ever). One engine per
-    //     configured endpoint (ADR-020 D11) — every one sweeps.
-    for jobs in &services.async_jobs {
-        jobs.redeliver_settled().await;
-        jobs.redrive_pending().await;
-    }
-    if !services.async_jobs.is_empty() {
-        record(&order, "async_jobs_redriven");
+    //    inbox rebuild (admitted completions must never race an empty
+    //    wake registry): re-offer settled rows (a crash between settle
+    //    and deliver loses nothing — the admit key dedupes), then
+    //    re-drive pending/inflight jobs (observers re-attach through
+    //    the queue; one row, one dispatch, ever).
+    //    (R12, S3): the engines are lazy per worker id — the sweep
+    //    materializes one instance per known id (static pins ∪
+    //    durable registry rows), so a dynamic worker's pending rows
+    //    re-drive after a kian restart too.
+    if let Some(factory) = &services.async_jobs_factory {
+        let mut known: Vec<String> = services
+            .remote
+            .as_ref()
+            .map(|remote| remote.endpoints.iter().map(|ep| ep.id.clone()).collect())
+            .unwrap_or_default();
+        if let Some(remote) = &services.remote
+            && let Ok(rows) = remote.backend.store().endpoints_lenient().await
+        {
+            for row in rows {
+                if !known.contains(&row.endpoint_id) {
+                    known.push(row.endpoint_id);
+                }
+            }
+        }
+        for id in &known {
+            let jobs = factory(id);
+            jobs.redeliver_settled().await;
+            jobs.redrive_pending().await;
+        }
+        if !known.is_empty() {
+            record(&order, "async_jobs_redriven");
+        }
     }
 
     // 4. Bootstrap the resident Router (idempotent admit + wake; the
@@ -1863,6 +2198,7 @@ pub async fn start_services(
         policy_drift: Arc::clone(&services.policy_drift),
         watchdog,
         remote: services.remote.clone(),
+        worker_membership,
         async_metrics: services.async_metrics.clone(),
         recall: Arc::clone(&services.recall),
         github_channels: services.github_channels.clone(),
@@ -2178,6 +2514,21 @@ mod tests {
         values.iter().map(|v| (*v).to_string()).collect()
     }
 
+    /// (R12, S2) The per-drive known-ids snapshot: the static config
+    /// order first (the legacy-unbound rule), then the directory
+    /// port's ids appended once each — the Bound row's membership set.
+    #[test]
+    fn known_ids_snapshot_unions_statics_and_port_ids_in_order() {
+        let statics = ids(&["zeta", "alpha"]);
+        let port = ids(&["alpha", "builder-1", "zeta"]);
+        assert_eq!(
+            known_ids_snapshot(&statics, &port),
+            ids(&["zeta", "alpha", "builder-1"]),
+            "statics keep config order; port ids append once each"
+        );
+        assert_eq!(known_ids_snapshot(&[], &[]), Vec::<String>::new());
+    }
+
     /// The spec §4 selection table as a pure-function test: bound ⇒
     /// that worker; legacy unbound ⇒ the FIRST endpoint; a bound id
     /// missing from config ⇒ refusal, never a re-route; malformed ⇒
@@ -2251,8 +2602,8 @@ mod tests {
             description: None,
         };
         // Config order deliberately NOT alphabetical.
-        let endpoints = vec![endpoint("zeta"), endpoint("alpha")];
-        let input = selection_input_in_config_order(&endpoints);
+        let endpoints = [endpoint("zeta"), endpoint("alpha")];
+        let input: Vec<String> = endpoints.iter().map(|ep| ep.id.clone()).collect();
         assert_eq!(input, ids(&["zeta", "alpha"]));
 
         // The unbound row selects the FIRST CONFIGURED endpoint.

@@ -208,8 +208,11 @@ async fn version_mismatch_handshake_is_rejected_as_terminal() {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
-        // Announce v+1.
-        let hello = r#"{"type":"hello","v":1,"endpoint_id":"future","max_concurrent":4}"#;
+        // Announce v+1 (relative to the live protocol version, so a
+        // future bump keeps this fixture a genuine mismatch).
+        let future = kian_exec::PROTOCOL_VERSION + 1;
+        let hello =
+            format!(r#"{{"type":"hello","v":{future},"endpoint_id":"future","max_concurrent":4}}"#);
         writer.write_all(hello.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
         // Watch whether the server (wrongly) welcomes us.
@@ -228,7 +231,7 @@ async fn version_mismatch_handshake_is_rejected_as_terminal() {
     assert_eq!(
         error,
         ConnectionError::VersionMismatch {
-            endpoint: 1,
+            endpoint: kian_exec::PROTOCOL_VERSION + 1,
             server: kian_exec::PROTOCOL_VERSION
         }
     );
@@ -316,10 +319,11 @@ async fn disconnect_fails_inflight_command_then_reconnect_succeeds() {
         {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
-            writer
-                .write_all(br#"{"type":"hello","v":0,"endpoint_id":"disc","max_concurrent":2}"#)
-                .await
-                .unwrap();
+            let hello = format!(
+                r#"{{"type":"hello","v":{},"endpoint_id":"disc","max_concurrent":2}}"#,
+                kian_exec::PROTOCOL_VERSION
+            );
+            writer.write_all(hello.as_bytes()).await.unwrap();
             writer.write_all(b"\n").await.unwrap();
             let mut lines = BufReader::new(reader).lines();
             let welcome = lines.next_line().await.unwrap().unwrap();
@@ -337,10 +341,11 @@ async fn disconnect_fails_inflight_command_then_reconnect_succeeds() {
         {
             let (stream, _) = listener.accept().await.unwrap();
             let (reader, mut writer) = stream.into_split();
-            writer
-                .write_all(br#"{"type":"hello","v":0,"endpoint_id":"disc","max_concurrent":2}"#)
-                .await
-                .unwrap();
+            let hello = format!(
+                r#"{{"type":"hello","v":{},"endpoint_id":"disc","max_concurrent":2}}"#,
+                kian_exec::PROTOCOL_VERSION
+            );
+            writer.write_all(hello.as_bytes()).await.unwrap();
             writer.write_all(b"\n").await.unwrap();
             let mut lines = BufReader::new(reader).lines();
             let welcome = lines.next_line().await.unwrap().unwrap();
@@ -518,12 +523,14 @@ async fn shutdown_sends_bye_on_the_wire() {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let (reader, mut writer) = stream.into_split();
-        // The endpoint opens: hello at v0, then awaits the welcome.
+        // The endpoint opens: hello at the live protocol version, then
+        // awaits the welcome.
         let mut lines = BufReader::new(reader).lines();
-        writer
-            .write_all(br#"{"type":"hello","v":0,"endpoint_id":"fake","max_concurrent":1}"#)
-            .await
-            .unwrap();
+        let hello = format!(
+            r#"{{"type":"hello","v":{},"endpoint_id":"fake","max_concurrent":1}}"#,
+            kian_exec::PROTOCOL_VERSION
+        );
+        writer.write_all(hello.as_bytes()).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
         let welcome = lines.next_line().await.unwrap().unwrap();
         assert!(

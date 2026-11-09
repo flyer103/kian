@@ -14,7 +14,65 @@ use uuid::Uuid;
 use kian_core::seams::{ExecCommand, ExecResult};
 
 /// Version of the KiandProto wire protocol implemented by this crate.
-pub const PROTOCOL_VERSION: u32 = 0;
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The closed register-refusal reason set (v1) — this crate's own
+/// independent declaration of the server half's contract (the mirror
+/// discipline; see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    VersionMismatch,
+    BadToken,
+    DuplicateStatic,
+    IdConflict,
+    Disabled,
+}
+
+impl RefusalReason {
+    /// The wire name (`version_mismatch`, `bad_token`, ...). Error text
+    /// and log lines use this, never a Debug rendering.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VersionMismatch => "version_mismatch",
+            Self::BadToken => "bad_token",
+            Self::DuplicateStatic => "duplicate_static",
+            Self::IdConflict => "id_conflict",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// The shared worker token as it travels inside a register frame.
+///
+/// Redacting on purpose: `Debug`/`Display` print `<redacted>` so `{:?}`
+/// of a whole frame — the common accidental leak path — can never print
+/// the value. Serialization is the bare string.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterToken(String);
+
+impl RegisterToken {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The raw value — the server compares constant-time; never log it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RegisterToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Display for RegisterToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
 
 /// Correlation id for one command execution. Scopes exactly one in-flight
 /// execution — never persisted, never a session key (brain–hand
@@ -57,6 +115,14 @@ pub enum ServerFrame {
     Ping,
     /// Graceful close.
     Bye,
+    /// Typed register refusal (v1): the server closes the connection
+    /// right after this frame. `detail` interpolates only the
+    /// `endpoint_id` and protocol versions — never a token.
+    Rejected {
+        reason: RefusalReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 /// Endpoint → server frames.
@@ -69,6 +135,18 @@ pub enum EndpointFrame {
     Hello {
         v: u32,
         endpoint_id: String,
+        max_concurrent: u32,
+    },
+    /// Worker-dial registration handshake (v1): announce identity,
+    /// optional description, the shared worker token, the protocol
+    /// revision (`version` — the frozen spelling; `hello` says `v`) and
+    /// the concurrency cap. Answered by `welcome` or a typed `rejected`.
+    Register {
+        endpoint_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        token: RegisterToken,
+        version: u32,
         max_concurrent: u32,
     },
     /// Liveness signal, emitted on the negotiated interval and on ping.
@@ -88,6 +166,8 @@ pub enum EndpointFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<CommandError>,
     },
+    /// Graceful leave (v1): same bytes as the server's `bye`.
+    Bye,
 }
 
 impl EndpointFrame {
@@ -185,6 +265,157 @@ mod tests {
 
     use super::*;
 
+    /// v1 golden: the full register frame — description present, token as
+    /// a bare string, revision spelled `version` (locked asymmetry).
+    #[test]
+    fn v1_golden_register_full() {
+        let frame = EndpointFrame::Register {
+            endpoint_id: "builder-1".into(),
+            description: Some("linux builder".into()),
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: 1,
+            max_concurrent: 4,
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({
+                "type": "register",
+                "endpoint_id": "builder-1",
+                "description": "linux builder",
+                "token": "t0ken-not-a-secret",
+                "version": 1,
+                "max_concurrent": 4
+            })
+        );
+    }
+
+    /// v1 golden: register without a description omits the key entirely
+    /// (there is no `"description":null` form).
+    #[test]
+    fn v1_golden_register_without_description() {
+        let frame = EndpointFrame::Register {
+            endpoint_id: "builder-1".into(),
+            description: None,
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: 1,
+            max_concurrent: 4,
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "type": "register",
+                "endpoint_id": "builder-1",
+                "token": "t0ken-not-a-secret",
+                "version": 1,
+                "max_concurrent": 4
+            })
+        );
+        assert!(value.get("description").is_none());
+    }
+
+    /// v1 golden: the worker's bye is `{"type":"bye"}`.
+    #[test]
+    fn v1_golden_bye() {
+        assert_eq!(
+            serde_json::to_value(&EndpointFrame::Bye).unwrap(),
+            json!({"type": "bye"})
+        );
+    }
+
+    /// v1 decode goldens: welcome (both heartbeat forms) and every
+    /// refusal reason parse into typed values — a mismatch is a typed
+    /// error path, never a panic.
+    #[test]
+    fn v1_decode_goldens_welcome_and_every_rejection() {
+        let welcome: ServerFrame =
+            serde_json::from_value(json!({"type": "welcome", "v": 1, "heartbeat_ms": 10000}))
+                .unwrap();
+        assert_eq!(
+            welcome,
+            ServerFrame::Welcome {
+                v: 1,
+                heartbeat_ms: Some(10_000)
+            }
+        );
+
+        let welcome_none: ServerFrame =
+            serde_json::from_value(json!({"type": "welcome", "v": 1, "heartbeat_ms": null}))
+                .unwrap();
+        assert_eq!(
+            welcome_none,
+            ServerFrame::Welcome {
+                v: 1,
+                heartbeat_ms: None
+            }
+        );
+
+        for (reason, wire) in [
+            (RefusalReason::VersionMismatch, "version_mismatch"),
+            (RefusalReason::BadToken, "bad_token"),
+            (RefusalReason::DuplicateStatic, "duplicate_static"),
+            (RefusalReason::IdConflict, "id_conflict"),
+            (RefusalReason::Disabled, "disabled"),
+        ] {
+            let frame: ServerFrame = serde_json::from_value(json!({
+                "type": "rejected",
+                "reason": wire
+            }))
+            .unwrap();
+            assert_eq!(
+                frame,
+                ServerFrame::Rejected {
+                    reason,
+                    detail: None
+                }
+            );
+            // Round-trips back to the minimal bytes.
+            assert_eq!(
+                serde_json::to_value(&frame).unwrap(),
+                json!({"type": "rejected", "reason": wire})
+            );
+        }
+
+        let with_detail: ServerFrame = serde_json::from_value(json!({
+            "type": "rejected",
+            "reason": "version_mismatch",
+            "detail": "server speaks KiandProto 1; worker announced 0"
+        }))
+        .unwrap();
+        assert_eq!(
+            with_detail,
+            ServerFrame::Rejected {
+                reason: RefusalReason::VersionMismatch,
+                detail: Some("server speaks KiandProto 1; worker announced 0".into()),
+            }
+        );
+
+        // The reason set is closed: an unknown string is a decode error.
+        assert!(serde_json::from_value::<RefusalReason>(json!("nope")).is_err());
+    }
+
+    /// P3: the token newtype redacts in Debug/Display; the wire form is
+    /// the bare string. `{:?}` of a whole register frame must not leak.
+    #[test]
+    fn v1_register_token_debug_is_redacted() {
+        let token = RegisterToken::new("t0ken-not-a-secret".into());
+        assert!(!format!("{token:?}").contains("t0ken-not-a-secret"));
+        assert!(format!("{token:?}").contains("<redacted>"));
+        assert!(!format!("{token}").contains("t0ken-not-a-secret"));
+        assert_eq!(
+            serde_json::to_value(&token).unwrap(),
+            json!("t0ken-not-a-secret")
+        );
+        let frame = EndpointFrame::Register {
+            endpoint_id: "builder-1".into(),
+            description: None,
+            token,
+            version: 1,
+            max_concurrent: 4,
+        };
+        assert!(!format!("{frame:?}").contains("t0ken-not-a-secret"));
+    }
+
     fn cmd(argv: &[&str]) -> ExecCommand {
         ExecCommand {
             argv: argv.iter().map(|s| s.to_string()).collect(),
@@ -212,12 +443,12 @@ mod tests {
         let id = Uuid::nil();
 
         let welcome = ServerFrame::Welcome {
-            v: 0,
+            v: 1,
             heartbeat_ms: Some(100),
         };
         assert_eq!(
             serde_json::to_value(&welcome).unwrap(),
-            json!({"type": "welcome", "v": 0, "heartbeat_ms": 100})
+            json!({"type": "welcome", "v": 1, "heartbeat_ms": 100})
         );
 
         let command = ServerFrame::Command {
@@ -243,13 +474,13 @@ mod tests {
         );
 
         let hello = EndpointFrame::Hello {
-            v: 0,
+            v: 1,
             endpoint_id: "dev".into(),
             max_concurrent: 4,
         };
         assert_eq!(
             serde_json::to_value(&hello).unwrap(),
-            json!({"type": "hello", "v": 0, "endpoint_id": "dev", "max_concurrent": 4})
+            json!({"type": "hello", "v": 1, "endpoint_id": "dev", "max_concurrent": 4})
         );
 
         let heartbeat = EndpointFrame::Heartbeat {
@@ -313,13 +544,21 @@ mod tests {
         assert_eq!(ok.command_id(), Some(id));
     }
 
-    /// A welcome without a version field decodes as v0: the field is
-    /// `#[serde(default)]` so future revisions can keep older frames
-    /// parseable.
+    /// A welcome without a version field decodes with `v == 0`
+    /// (`#[serde(default)]`, frozen v0 byte behavior). Since v1 the
+    /// endpoint must treat that as a version mismatch — the default is
+    /// *not* the current version.
     #[test]
     fn welcome_version_defaults_when_absent() {
         let welcome: ServerFrame = serde_json::from_value(json!({"type": "welcome"})).unwrap();
         assert_eq!(
+            welcome,
+            ServerFrame::Welcome {
+                v: 0,
+                heartbeat_ms: None
+            }
+        );
+        assert_ne!(
             welcome,
             ServerFrame::Welcome {
                 v: PROTOCOL_VERSION,
@@ -333,8 +572,16 @@ mod tests {
     fn encode_decode_line_round_trip() {
         let frames = vec![
             ServerFrame::Welcome {
-                v: 0,
+                v: 1,
                 heartbeat_ms: Some(250),
+            },
+            ServerFrame::Rejected {
+                reason: RefusalReason::BadToken,
+                detail: None,
+            },
+            ServerFrame::Rejected {
+                reason: RefusalReason::VersionMismatch,
+                detail: Some("server speaks KiandProto 1; worker announced 0".into()),
             },
             ServerFrame::Command {
                 id: Uuid::new_v4(),
@@ -352,10 +599,18 @@ mod tests {
 
         let endpoint_frames = vec![
             EndpointFrame::Hello {
-                v: 0,
+                v: 1,
                 endpoint_id: "e".into(),
                 max_concurrent: 1,
             },
+            EndpointFrame::Register {
+                endpoint_id: "builder-1".into(),
+                description: None,
+                token: RegisterToken::new("t0ken-not-a-secret".into()),
+                version: PROTOCOL_VERSION,
+                max_concurrent: 4,
+            },
+            EndpointFrame::Bye,
             EndpointFrame::Heartbeat {
                 endpoint_id: "e".into(),
                 ts_ms: 42,

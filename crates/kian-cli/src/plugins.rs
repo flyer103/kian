@@ -31,8 +31,10 @@ use std::time::Duration;
 use kian_core::model::{AgentDef, Permission, SessionId};
 use kian_core::seams::{ChannelAdapter, RecoveryPolicySource, ToolProvider};
 use kian_exec::{
-    ConnectionConfig, ConnectionManager, ExecStore, RemoteExecBackend, RemoteExecConfig,
-    RemoteExecTool,
+    ConnectionConfig, ConnectionManager, DefaultRoute, ExecStore, LeaveReason, MembershipConfig,
+    RegisteredTransport, RegisteredWorker, RegistrationConfig, RegistrationListener,
+    RegistrationSink, RemoteExecBackend, RemoteExecConfig, RemoteExecTool, RouteTransport,
+    SystemClock, WorkerDirectory, WorkerToken,
 };
 use kian_llm::provider::{
     OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink, PersistedRequest,
@@ -219,9 +221,26 @@ impl Plugin for ReActPlugin {
 // remote-exec: the durable queue + per-endpoint tools
 // ---------------------------------------------------------------------------
 
+/// The dynamic-membership services (built by [`RemoteExecPlugin`] when a
+/// `workers:` section is configured): the registration listener and the
+/// shared runtime directory.
+pub struct WorkersServices {
+    /// The registration listener (started by the superagent assembly's
+    /// service start — after the inbox rebuild, like the watchdog).
+    pub listener: Arc<RegistrationListener>,
+    /// The runtime membership directory (shared with the backend's
+    /// dynamic default resolution; snapshots + `member_state` live
+    /// there).
+    pub directory: Arc<WorkerDirectory>,
+    /// The configured `workers.offline_after_ms` (the watchdog's bound
+    /// when zero static endpoints exist).
+    pub offline_after_ms: u64,
+}
+
 /// The running remote-exec services (built by [`RemoteExecPlugin`]):
 /// one connection manager and one `RemoteExecTool` per configured
-/// endpoint, all over one durable queue.
+/// endpoint, all over one durable queue — plus, when `workers:` is
+/// configured, the dynamic-membership listener.
 pub struct RemoteExecServices {
     /// The shared backend (enqueue-first durable queue).
     pub backend: Arc<RemoteExecBackend>,
@@ -229,6 +248,9 @@ pub struct RemoteExecServices {
     pub managers: Vec<Arc<ConnectionManager>>,
     /// The endpoint configs (registry seeding, watchdog bounds).
     pub endpoints: Vec<crate::config::EndpointConfig>,
+    /// The dynamic-membership services (present iff `workers:` is
+    /// configured).
+    pub workers: Option<WorkersServices>,
 }
 
 impl RemoteExecServices {
@@ -249,12 +271,16 @@ impl RemoteExecServices {
 
 /// Registers [`RemoteExecServices`] over a pre-opened [`ExecStore`]
 /// (the async store open happens in `Server::from_config`; plugin
-/// `apply` is sync). Presence-locked to a non-empty `endpoints:` list.
+/// `apply` is sync). Presence-locked to a non-empty `endpoints:` list
+/// or a `workers:` section (C6).
 pub struct RemoteExecPlugin {
     /// The pre-opened, migrated exec store (same `kian.sqlite`).
     pub store: ExecStore,
     /// The configured endpoints.
     pub endpoints: Vec<crate::config::EndpointConfig>,
+    /// The `workers:` section (dynamic membership) — `None` is the
+    /// feature off, byte-identical everywhere.
+    pub workers: Option<crate::config::WorkersConfig>,
     /// row-lease identity: this replica's `drain.holder`. Under
     /// postgres the config validates it explicit-unique before we get
     /// here; sqlite passes the (defaulted) holder too — the lease is
@@ -264,6 +290,40 @@ pub struct RemoteExecPlugin {
     /// the exec output redactor — runs once per settled
     /// outcome, before the durable queue row is written.
     pub redactor: kian_core::secrets::SecretRedactor,
+}
+
+/// The assembly's [`RegistrationSink`]: membership edges become runtime
+/// routes (Q2) — `member_online` attaches the registered connection's
+/// transport (its first driver iteration re-drives the id's parked
+/// rows), `member_offline` detaches generation-scoped (A15; the rows
+/// stay durable and parked).
+struct ExecRegistrationSink {
+    backend: Arc<RemoteExecBackend>,
+}
+
+impl RegistrationSink for ExecRegistrationSink {
+    fn member_online(&self, worker: RegisteredWorker) -> futures::future::BoxFuture<'static, ()> {
+        let backend = self.backend.clone();
+        Box::pin(async move {
+            let id = worker.id.clone();
+            let generation = worker.generation;
+            let transport = RouteTransport::Registered(RegisteredTransport::new(worker));
+            backend.attach_route(id, transport, generation).await;
+        })
+    }
+
+    fn member_offline(
+        &self,
+        id: &str,
+        generation: u64,
+        _reason: LeaveReason,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let backend = self.backend.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            backend.detach_route(&id, generation).await;
+        })
+    }
 }
 
 impl Plugin for RemoteExecPlugin {
@@ -291,6 +351,8 @@ impl Plugin for RemoteExecPlugin {
         // Queue timeouts are per-endpoint in config; the backend takes
         // one — use the max so no endpoint's honest timeout is silently
         // shortened (the row's own abandonment timing stays the bound).
+        // Dynamic workers use the same backend-level bound (Q3: no new
+        // timeout knob).
         let max_timeout = self
             .endpoints
             .iter()
@@ -301,25 +363,87 @@ impl Plugin for RemoteExecPlugin {
             queue_timeout: Duration::from_millis(max_timeout),
             poll_interval: Duration::from_millis(250),
         };
-        let default_endpoint = self
-            .endpoints
-            .first()
-            .map(|ep| ep.id.clone())
-            .ok_or_else(|| apply_error("remote-exec: no endpoints configured"))?;
-        let backend = RemoteExecBackend::with_row_leases_redacting(
-            self.store,
-            routes,
-            default_endpoint,
-            config,
-            self.holder,
-            Duration::from_millis(max_timeout),
-            self.redactor,
-        )
-        .map_err(apply_error)?;
+        // The dynamic-membership half (when `workers:` is configured):
+        // read the env-only token (fail-closed — the value never
+        // travels further than the redacting `WorkerToken`), build the
+        // shared directory, the listener over it, and the sink that
+        // attaches routes onto the backend below.
+        let workers_services = match &self.workers {
+            Some(workers) => {
+                let value = std::env::var(workers.token_env.trim())
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or_else(|| {
+                        apply_error(format!(
+                            "remote-exec: workers.token_env `{}` is not set (or blank) — \
+                             the shared worker token is env-only; set the variable and \
+                             restart `kian serve`",
+                            workers.token_env.trim()
+                        ))
+                    })?;
+                let bind = workers
+                    .listen_addr()
+                    .map_err(|e| apply_error(format!("remote-exec: {}", e)))?;
+                let registration = RegistrationConfig::new(
+                    bind,
+                    WorkerToken::new(value),
+                    workers.offline_after_ms,
+                )
+                .with_static_ids(self.endpoints.iter().map(|ep| ep.id.clone()).collect());
+                let registration = RegistrationConfig {
+                    allow_public: workers.allow_public,
+                    ..registration
+                };
+                Some((registration, workers.offline_after_ms))
+            }
+            None => None,
+        };
+        // The backend is built with the directory (queue-first: zero
+        // static routes are fine when the listener will attach them at
+        // runtime); the listener then gets the sink holding that
+        // backend. The untracked `exec` path defaults to the first
+        // static pin when one exists, else the dynamic resolution.
+        let directory = WorkerDirectory::new();
+        let membership = workers_services
+            .as_ref()
+            .map(|(_, offline_after_ms)| MembershipConfig {
+                directory: Arc::clone(&directory),
+                offline_after_ms: *offline_after_ms,
+            });
+        let default_route = match self.endpoints.first() {
+            Some(ep) => DefaultRoute::Static(ep.id.clone()),
+            None => DefaultRoute::Dynamic,
+        };
+        let backend = Arc::new(
+            RemoteExecBackend::with_membership(
+                self.store,
+                routes,
+                default_route,
+                config,
+                self.holder,
+                Duration::from_millis(max_timeout),
+                self.redactor,
+                membership,
+            )
+            .map_err(apply_error)?,
+        );
+        let workers = workers_services.map(|(registration, offline_after_ms)| WorkersServices {
+            listener: Arc::new(RegistrationListener::new(
+                registration,
+                Arc::new(SystemClock),
+                Arc::new(ExecRegistrationSink {
+                    backend: Arc::clone(&backend),
+                }),
+                Arc::clone(&directory),
+            )),
+            directory,
+            offline_after_ms,
+        });
         let services = Arc::new(RemoteExecServices {
-            backend: Arc::new(backend),
+            backend,
             managers,
             endpoints: self.endpoints,
+            workers,
         });
         ctx.provide::<RemoteExecServices>(services)
     }
@@ -502,26 +626,27 @@ impl Plugin for SuperAgentPlugin {
         // late-bound inbox port the bundle uses, and resolves invoking
         // sessions from committed `tool/call` events.
         //
-        // (ADR-020, D11): carry, not refuse — ONE engine per
-        // configured endpoint, each bound to its own endpoint id
-        // (`async_jobs.endpoint_id` is already a persisted column;
-        // dispatch is `exec_tracked(job_id, &endpoint_id, …)`), with
-        // one shared metrics handle and one shared completion sink.
-        // Pair i mounts on worker side i; the Router keeps the
-        // first-endpoint pair (the Router is not a bound worker).
-        let mut async_jobs: Vec<Arc<kian_exec::AsyncJobs>> = Vec::new();
+        // (ADR-020, D11 → R12, S3): carry, not refuse — a **jobs
+        // factory** keyed by worker id (`async_jobs.endpoint_id` is
+        // already a persisted column; dispatch is `exec_tracked(job_id,
+        // &endpoint_id, …)`), with one shared metrics handle and one
+        // shared completion sink. The lazy side factory builds each
+        // id's pair on first use; the Router keeps the first static
+        // endpoint's pair (the legacy behavior — the Router is not a
+        // bound worker); a workers-only deployment honestly mounts no
+        // Router pair. The boot sweep (`start_services`) materializes
+        // one instance per known id.
         let mut async_metrics = None;
         let mut async_pair: Option<Arc<dyn ToolProvider>> = None;
-        let mut async_pairs: Vec<Arc<dyn ToolProvider>> = Vec::new();
+        let mut async_validation_pair: Option<Arc<dyn ToolProvider>> = None;
+        let mut async_jobs_factory: Option<crate::superagent::AsyncJobsFactory> = None;
         if self.async_tools {
             let remote = remote.as_ref().ok_or_else(|| {
                 apply_error("superagent.async_tools requires the remote-exec plugin")
             })?;
-            if remote.endpoints.is_empty() {
-                return Err(apply_error(
-                    "superagent.async_tools requires a configured endpoint",
-                ));
-            }
+            // The presence lock (C6) guarantees `endpoints:` non-empty
+            // or `workers:` present; a workers-only deployment is
+            // valid (per-side pairs ride the lazy sides).
             let metrics = Arc::new(crate::async_bridge::AsyncBridgeMetrics::default());
             let sink = crate::async_bridge::CompletionBridge::new(
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
@@ -529,21 +654,38 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&metrics),
             );
             let session_for_call = crate::async_bridge::session_for_call(self.event_store.clone());
-            for endpoint in &remote.endpoints {
-                let jobs = kian_exec::AsyncJobs::new(
-                    Arc::clone(&remote.backend),
-                    endpoint.id.clone(),
-                    Arc::clone(&sink) as Arc<dyn kian_exec::AsyncResultSink>,
-                    Arc::clone(&session_for_call),
+            let jobs_backend = Arc::clone(&remote.backend);
+            let jobs_sink = Arc::clone(&sink) as Arc<dyn kian_exec::AsyncResultSink>;
+            let jobs_session_for_call = Arc::clone(&session_for_call);
+            let jobs_factory = Arc::new(move |id: &str| {
+                kian_exec::AsyncJobs::new(
+                    Arc::clone(&jobs_backend),
+                    id.to_string(),
+                    Arc::clone(&jobs_sink),
+                    Arc::clone(&jobs_session_for_call),
+                )
+            });
+            // The Router's default pair is the first static
+            // endpoint's — the legacy behavior with one endpoint
+            // (default == only worker), byte-identical.
+            if let Some(first) = remote.endpoints.first() {
+                async_pair = Some(
+                    Arc::new(kian_exec::AsyncToolPair::new(jobs_factory(&first.id)))
+                        as Arc<dyn ToolProvider>,
                 );
-                async_pairs.push(Arc::new(kian_exec::AsyncToolPair::new(Arc::clone(&jobs)))
-                    as Arc<dyn ToolProvider>);
-                async_jobs.push(jobs);
             }
-            // The Router's default pair is the first endpoint's — the
-            // legacy behavior with one endpoint (default == only
-            // worker), byte-identical.
-            async_pair = async_pairs.first().cloned();
+            // A representative pair for the worker-template surface
+            // validation below (every pair's schemas are identical —
+            // S5: one uniform tool surface per side).
+            let representative = remote
+                .endpoints
+                .first()
+                .map(|ep| ep.id.as_str())
+                .unwrap_or("worker");
+            async_validation_pair = Some(Arc::new(kian_exec::AsyncToolPair::new(jobs_factory(
+                representative,
+            ))) as Arc<dyn ToolProvider>);
+            async_jobs_factory = Some(jobs_factory);
             async_metrics = Some(metrics);
         }
 
@@ -569,18 +711,12 @@ impl Plugin for SuperAgentPlugin {
         // (ADR-012): the mandate issuance policy rides the profile
         // into the spawn tool (the single issuance point).
         profile.mandate = self.mandate.clone();
-        // (ADR-020, D5/D7): the execution-worker catalog rides the
-        // profile into the bootstrap render (the judge-prompt block;
-        // empty = today's bytes) and the spawn tool surface.
+        // (R12, R1/R2 — supersedes ADR-020 D5/D7): membership on iff
+        // `endpoints:` is non-empty or `workers:` is configured — the
+        // bootstrap then appends the frozen membership block (a
+        // constant; ids never render). Off = today's bytes.
         if let Some(remote) = &remote {
-            profile.worker_catalog = remote
-                .endpoints
-                .iter()
-                .map(|ep| kian_superagent::WorkerEntry {
-                    id: ep.id.clone(),
-                    description: ep.description.clone(),
-                })
-                .collect();
+            profile.worker_membership = !remote.endpoints.is_empty() || remote.workers.is_some();
         }
         // the outbox bounded-retry config rides the profile (an
         // explicitly-built driver below overrides the auto-built one,
@@ -667,20 +803,15 @@ impl Plugin for SuperAgentPlugin {
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }
-        // (ADR-020, D5/D6/D9): the catalog + queue timeouts and the
-        // worker-streams read port ride the spawn tool — the spawn
-        // schema, argument validation and the exclusivity check all
-        // derive from them. Installed only when endpoints are
-        // configured (zero endpoints = feature off, no port read).
+        // (R12, R1/R4/S4): the membership surface — static pin ids
+        // (config order), per-id queue timeouts, the worker-streams
+        // read port and the read-only directory port (the runtime
+        // directory + the durable registry rows + the static config).
+        // Installed only when the remote-exec services exist (the C6
+        // presence lock guarantees `endpoints:` or `workers:`); zero
+        // config installs nothing — feature off, no port reads.
         if let Some(remote) = &remote {
-            let catalog: Vec<kian_superagent::WorkerEntry> = remote
-                .endpoints
-                .iter()
-                .map(|ep| kian_superagent::WorkerEntry {
-                    id: ep.id.clone(),
-                    description: ep.description.clone(),
-                })
-                .collect();
+            let static_ids: Vec<String> = remote.endpoints.iter().map(|ep| ep.id.clone()).collect();
             let timeouts: std::collections::BTreeMap<String, u64> = remote
                 .endpoints
                 .iter()
@@ -688,8 +819,30 @@ impl Plugin for SuperAgentPlugin {
                 .collect();
             let worker_streams =
                 crate::superagent::StoreWorkerStreams::new(self.event_store.clone());
+            // An empty directory stand-in for a static-only deployment
+            // (no listener exists to fill it; the registry rows and
+            // the static config still flow through the port).
+            let directory = remote
+                .workers
+                .as_ref()
+                .map(|w| Arc::clone(&w.directory))
+                .unwrap_or_else(kian_exec::WorkerDirectory::new);
+            let directory_port = crate::superagent::StoreWorkerDirectory::new(
+                Arc::clone(&remote.backend),
+                directory,
+                remote.endpoints.clone(),
+                remote
+                    .workers
+                    .as_ref()
+                    .map(|w| w.offline_after_ms)
+                    .unwrap_or(30_000),
+            );
             router_tools = router_tools
-                .with_worker_catalog(catalog, timeouts)
+                .with_worker_membership(
+                    static_ids,
+                    timeouts,
+                    Some(directory_port as Arc<dyn kian_superagent::WorkerDirectoryPort>),
+                )
                 .with_worker_streams(worker_streams);
         }
         let router_tools = Arc::new(router_tools);
@@ -754,7 +907,7 @@ impl Plugin for SuperAgentPlugin {
                 worker_mounted.extend(tool.schemas());
             }
         }
-        if let Some(pair) = &async_pair {
+        if let Some(pair) = &async_validation_pair {
             worker_mounted.extend(pair.schemas());
         }
         if self.recall.worker {
@@ -775,10 +928,11 @@ impl Plugin for SuperAgentPlugin {
                 worker_tools.push(provider);
             }
         }
-        // the worker template mounts the pair when gated on.
-        if let Some(pair) = &async_pair {
-            worker_tools.push(Arc::clone(pair));
-        }
+        // the single legacy worker side (feature off, or the
+        // nothing-known fallback) never mounts the async pair: a
+        // pair is bound to one worker id, and this side is not a
+        // bound worker. With membership on, the lazy sides carry
+        // their own per-id pairs (S3).
         // the worker template mounts the recall toolpack when
         // opted in (config-gated, default off — after the async pair,
         // before the local tools; stable order, unique names).
@@ -926,72 +1080,80 @@ impl Plugin for SuperAgentPlugin {
             crate::superagent::port_for_ctx(),
         );
 
-        // (ADR-020, D8/D11/D16): one prebuilt worker side per
-        // configured endpoint — its loop mounts EXACTLY ONE `exec`
-        // (its endpoint's `RemoteExecTool`), its own async pair bound
-        // to the same endpoint, the shared recall toolpack and the
-        // filtered local tools. Tool names and schemas are identical
-        // across sides ⇒ prompt-prefix neutral across sessions. The
-        // refusing-side factory covers the unconfigured-bound and
+        // (R12, S1/S3/S5 — supersedes ADR-020 D8's boot-prebuilt
+        // loop): the lazy per-worker-id side factory. Each id's side
+        // mounts EXACTLY ONE `exec` (its id's `RemoteExecTool`), its
+        // own async pair bound to the same id, the shared recall
+        // toolpack and the filtered local tools. Tool names and
+        // schemas are identical across sides ⇒ prompt-prefix neutral
+        // across sessions (and across joins/leaves — a side is built
+        // the same way whatever the membership state). The driver
+        // caches the built sides forever (never evicted, queue-first).
+        // The refusing-side factory covers the unconfigured-bound and
         // malformed rows (D16/D2): a worker loop whose only `exec` is
         // the honest refusal — no backend handle, zero enqueues.
-        // Zero endpoints installs nothing: the single `worker_side`
-        // above is today's exact path.
-        let mut worker_sides: std::collections::BTreeMap<
-            String,
-            kian_superagent::WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
-        > = std::collections::BTreeMap::new();
-        // (B1) the same ids in CONFIG order (the `endpoints` file
-        // order the schema enum and the prompt block already use) —
-        // the selection input for the legacy-unbound row. The
-        // BTreeMap above stays the id → side lookup; its key order
-        // (alphabetical) must never feed `select_side`.
+        // Zero remote services installs nothing: the single
+        // `worker_side` above is today's exact path.
+        let mut side_factory: Option<crate::superagent::WorkerSideFactory> = None;
         let mut worker_order: Vec<String> = Vec::new();
         let mut refuse_side: Option<crate::superagent::RefuseSideFactory> = None;
+        let mut directory_for_sides: Option<Arc<dyn kian_superagent::WorkerDirectoryPort>> = None;
         if let Some(remote) = &remote {
-            worker_order = crate::superagent::selection_input_in_config_order(&remote.endpoints);
+            worker_order = remote.endpoints.iter().map(|ep| ep.id.clone()).collect();
             let worker_react_config = ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
                 permissions: self.worker_permissions.clone(),
             };
-            for (index, endpoint) in remote.endpoints.iter().enumerate() {
+            let side_backend = Arc::clone(&remote.backend);
+            let side_registry = registry.clone();
+            let side_agent = self.worker_agent.clone();
+            let side_policy: Arc<dyn RecoveryPolicySource> =
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>;
+            let side_config = worker_react_config.clone();
+            let side_local = local_tools.clone();
+            let side_recall = self.recall.worker;
+            let side_recall_tools = recall_tools.clone();
+            let side_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
+            let side_gate = crate::superagent::clone_gate(&self.worker_gate);
+            let side_session = self.router_session;
+            let side_version = self.worker_agent.version;
+            let side_jobs_factory = async_jobs_factory.clone();
+            side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
-                    Arc::clone(&remote.backend),
-                    endpoint.id.clone(),
+                    Arc::clone(&side_backend),
+                    id.to_string(),
                 )));
-                if let Some(pair) = async_pairs.get(index) {
-                    tools.push(Arc::clone(pair));
+                if let Some(jobs_factory) = &side_jobs_factory {
+                    tools.push(Arc::new(kian_exec::AsyncToolPair::new(jobs_factory(id)))
+                        as Arc<dyn ToolProvider>);
                 }
-                if self.recall.worker {
-                    tools.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
+                if side_recall {
+                    tools.push(Arc::new(side_recall_tools.clone()) as Arc<dyn ToolProvider>);
                 }
                 tools.push(Arc::new(FilteredTools::new(
-                    local_tools.clone(),
-                    &self.worker_agent.tools,
+                    side_local.clone(),
+                    &side_agent.tools,
                 )));
                 let side_loop = Arc::new(ReActLoop::with_config(
-                    self.worker_agent.clone(),
-                    registry.clone(),
+                    side_agent.clone(),
+                    side_registry.clone(),
                     Arc::new(crate::superagent::CombinedTools::new(tools)),
-                    Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
-                    worker_react_config.clone(),
+                    Arc::clone(&side_policy),
+                    side_config.clone(),
                 ));
-                worker_sides.insert(
-                    endpoint.id.clone(),
-                    kian_superagent::WorkerLoopDriver::new(
-                        Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
-                        Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
-                        kian_superagent::WorkerLoopConfig {
-                            router: self.router_session,
-                            worker_version: self.worker_agent.version,
-                            gate: crate::superagent::clone_gate(&self.worker_gate),
-                        },
-                        crate::superagent::port_for_ctx(),
-                    ),
-                );
-            }
+                kian_superagent::WorkerLoopDriver::new(
+                    Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
+                    Arc::clone(&side_inbox),
+                    kian_superagent::WorkerLoopConfig {
+                        router: side_session,
+                        worker_version: side_version,
+                        gate: crate::superagent::clone_gate(&side_gate),
+                    },
+                    crate::superagent::port_for_ctx(),
+                )
+            }));
             // The refusing-side factory (built per drive — the refusal
             // rows are rare and never on the hot path; a fresh loop per
             // drive is deterministic, no resident routing state).
@@ -1037,6 +1199,25 @@ impl Plugin for SuperAgentPlugin {
                     crate::superagent::port_for_ctx(),
                 )
             }));
+            // The driver's known-ids source: the same read-only
+            // directory port the Router tools read (static ∪ live
+            // directory ∪ registry rows).
+            let directory = remote
+                .workers
+                .as_ref()
+                .map(|w| Arc::clone(&w.directory))
+                .unwrap_or_else(kian_exec::WorkerDirectory::new);
+            directory_for_sides = Some(crate::superagent::StoreWorkerDirectory::new(
+                Arc::clone(&remote.backend),
+                directory,
+                remote.endpoints.clone(),
+                remote
+                    .workers
+                    .as_ref()
+                    .map(|w| w.offline_after_ms)
+                    .unwrap_or(30_000),
+            )
+                as Arc<dyn kian_superagent::WorkerDirectoryPort>);
         }
         let mut driver = crate::superagent::SuperAgentDriver::new(
             self.router_session,
@@ -1052,11 +1233,17 @@ impl Plugin for SuperAgentPlugin {
                     .expect("the watchdog side is built exactly when the profile is present"),
             );
         }
-        // (ADR-020, D8): the per-worker sides ride the driver — with
-        // none installed (zero endpoints) the driver routes exactly
-        // as before.
-        if let Some(refuse_side) = refuse_side {
-            driver = driver.with_worker_sides(worker_sides, worker_order, refuse_side);
+        // (R12, S1/S2): the lazy side factory + static order + the
+        // refusing factory + the directory port ride the driver —
+        // with none installed (zero endpoints and no workers:) the
+        // driver routes exactly as before.
+        if let (Some(side_factory), Some(refuse_side)) = (side_factory, refuse_side) {
+            driver = driver.with_lazy_worker_sides(
+                side_factory,
+                worker_order,
+                refuse_side,
+                directory_for_sides,
+            );
         }
         let driver = Arc::new(driver);
 
@@ -1114,7 +1301,11 @@ impl Plugin for SuperAgentPlugin {
             router_hold: hold,
             watchdog_inbox: mounted_watchdog_inbox,
             remote,
-            async_jobs,
+            // (R12, S3): the async jobs factory — `start_services`
+            // materializes one instance per known id (static pins ∪
+            // registry rows) for the boot sweep; the lazy sides build
+            // their own instances on first use.
+            async_jobs_factory,
             async_metrics,
             // The one shared recall port: the toolpack and the runtime
             // surface (and the startup spill-index rebuild) all use it.

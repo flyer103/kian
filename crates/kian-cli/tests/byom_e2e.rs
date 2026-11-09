@@ -178,7 +178,12 @@ fn router_script() -> Vec<ScriptedResponse> {
         ScriptedResponse::ToolCall {
             id: "call-spawn-1".into(),
             name: "spawn_worker".into(),
-            arguments: serde_json::json!({"task": "run the deploy checklist"}),
+            // R12 R1: `exec_worker` is required on every spawn when
+            // membership is on.
+            arguments: serde_json::json!({
+                "task": "run the deploy checklist",
+                "exec_worker": "ep1"
+            }),
         },
         ScriptedResponse::Text("worker dispatched".into()),
     ]

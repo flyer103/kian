@@ -954,6 +954,194 @@ fn render_tickets(rows: &[TicketRow]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// workers — the runtime worker membership board (R12)
+// ---------------------------------------------------------------------------
+
+/// One row of the `kian workers` board: a worker id known to the
+/// durable registry (static pin or dynamic registration — registry rows
+/// are never pruned, M5) with its derived state and, when a live bound
+/// worker session exists, the owning session/thread.
+///
+/// `description` and `protocol_version` are **absent by construction**
+/// (spec D-L2/M4): they live only in the in-process runtime directory,
+/// and the CLI is a separate process reading the durable projection —
+/// a recorded boundary, not a bug.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct WorkerRow {
+    pub id: String,
+    /// `online` iff the registry row says `online` **and**
+    /// `now - last_heartbeat_ms <= offline_after_ms` for this id (the
+    /// conjunction of the transport view and freshness — D-L2).
+    /// `offline` otherwise; `draining` never appears (runtime-only,
+    /// M9).
+    pub state: &'static str,
+    pub last_seen_ms: u64,
+    /// The live bound worker session, when one exists (the
+    /// stream-derived exclusivity projection `list_workers` shares).
+    pub bound_session: Option<String>,
+    pub bound_thread: Option<String>,
+}
+
+/// `kian workers [--db <sqlite>] [--config <path>] [--json]` — the
+/// read-only worker membership board (spec §7/L1–L2): reads the
+/// durable `endpoint_registry` rows plus the Router streams'
+/// `thread/started` grouping; writes nothing (no events, no rows, no
+/// wakes, no ops RPC). Never refuses: an empty registry (or a database
+/// that predates remote exec) prints an empty board; a config that
+/// cannot load degrades to the default liveness bound, honestly noted.
+pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> CmdResult<String> {
+    let db = resolve_db(db, config_path)?;
+    // Config is best-effort here (never refuse): it supplies the
+    // per-id `offline_after_ms` bounds and tells us whether a
+    // superagent Router (the bound-session source) is configured.
+    let config = ServeConfig::load(config_path).ok();
+    let offline_after = |id: &str| -> u64 {
+        match &config {
+            Some(cfg) => cfg
+                .endpoints
+                .iter()
+                .find(|ep| ep.id == id)
+                .map(|ep| ep.offline_after_ms)
+                .or_else(|| cfg.workers.as_ref().map(|w| w.offline_after_ms))
+                .unwrap_or(30_000),
+            None => 30_000,
+        }
+    };
+
+    // The durable projection, read-only.
+    let exec = kian_exec::ExecStore::open_read_only(&db)
+        .await
+        .map_err(|e| format!("cannot open `{}` read-only: {e}", db.display()))?;
+    let registry = exec
+        .endpoints_lenient()
+        .await
+        .map_err(|e| format!("worker registry read: {e}"))?;
+    exec.close().await;
+    let now = now_ms();
+
+    // The bound live session/thread projection: `thread/started`
+    // grouping across streams (the re-arm-robust form — the same scan
+    // `ticket_board` performs), liveness per candidate worker stream.
+    let mut bound: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    if config.as_ref().is_some_and(|cfg| cfg.superagent.is_some()) {
+        let store = open_reader(&db).await?;
+        let mut bound_threads: std::collections::BTreeMap<
+            String,
+            Vec<kian_superagent::BoundThread>,
+        > = std::collections::BTreeMap::new();
+        let mut streams = std::collections::BTreeMap::new();
+        let sessions = crate::cache_metrics::sessions_with_events(&store)
+            .await
+            .map_err(|e| format!("session listing: {e}"))?;
+        let mut all_events = Vec::new();
+        for session in &sessions {
+            if let Ok(events) = store.rebuild(*session).await {
+                all_events.extend(events.iter().cloned());
+                streams.insert(*session, events);
+            }
+        }
+        for (id, threads) in kian_superagent::bound_workers(&all_events) {
+            bound_threads.insert(id, threads);
+        }
+        for (id, threads) in bound_threads {
+            // The live owner (at most one under 1:1): a malformed
+            // stream with more than one live binding omits the fields
+            // and is noted — never a guess.
+            let mut live: Vec<&kian_superagent::BoundThread> = Vec::new();
+            for thread in &threads {
+                let events = streams.get(&thread.worker_session);
+                let liveness = events.map(|events| kian_superagent::thread_liveness(events));
+                if liveness == Some(kian_superagent::ThreadLiveness::Live) {
+                    live.push(thread);
+                }
+            }
+            match live.as_slice() {
+                [only] => {
+                    bound.insert(
+                        id.clone(),
+                        (
+                            only.worker_session.0.to_string(),
+                            only.thread_id.to_string(),
+                        ),
+                    );
+                }
+                [] => {}
+                _ => {
+                    tracing::warn!(
+                        worker = %id,
+                        live = live.len(),
+                        "worker board: more than one live bound session (impossible under 1:1); \
+                         bound fields omitted"
+                    );
+                }
+            }
+        }
+        store.close().await;
+    }
+
+    // Rows: registry order is id-ascending; state per D-L2.
+    let rows: Vec<WorkerRow> = registry
+        .into_iter()
+        .map(|row| {
+            let fresh =
+                now.saturating_sub(row.last_heartbeat_ms) <= offline_after(&row.endpoint_id);
+            let state = if row.state == "online" && fresh {
+                "online"
+            } else {
+                "offline"
+            };
+            let (bound_session, bound_thread) = bound
+                .get(&row.endpoint_id)
+                .map(|(s, t)| (Some(s.clone()), Some(t.clone())))
+                .unwrap_or((None, None));
+            WorkerRow {
+                id: row.endpoint_id,
+                state,
+                last_seen_ms: row.last_heartbeat_ms,
+                bound_session,
+                bound_thread,
+            }
+        })
+        .collect();
+
+    if json {
+        let report = json!({"now_ms": now, "workers": rows});
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    Ok(render_workers(&rows, now))
+}
+
+/// Renders the board (deterministic: a pure function of the rows).
+fn render_workers(rows: &[WorkerRow], now_ms: u64) -> String {
+    if rows.is_empty() {
+        return "no workers registered in this store \
+            (description and protocol version are runtime-only facts — absent by design)\n"
+            .into();
+    }
+    let mut out = format!(
+        "{:<24} {:<8} {:>18} {}\n",
+        "WORKER", "STATE", "LAST HEARTBEAT", "BOUND SESSION (THREAD)"
+    );
+    for row in rows {
+        let binding = match (&row.bound_session, &row.bound_thread) {
+            (Some(session), Some(thread)) => {
+                format!("session {session} (thread {thread})")
+            }
+            _ => "-".into(),
+        };
+        out.push_str(&format!(
+            "{:<24} {:<8} {:>18} {}\n",
+            row.id,
+            row.state,
+            format_age(now_ms.saturating_sub(row.last_seen_ms)),
+            binding,
+        ));
+    }
+    out
+}
+
 /// The honest full-board derivation: every stream rebuilt, worker
 /// discovery, stage projection per worker. This is both `kian tickets`
 /// fallback **and** the `ticket_stage` view's build mechanism — one

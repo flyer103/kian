@@ -186,7 +186,7 @@ impl Server {
         // -- 2. plugin activation (ADR-004: static, compile-time) --------
         let policy = Arc::new(config.policy()?.table());
         let superagent_cfg = config.superagent.as_ref();
-        let has_remote = !config.endpoints.is_empty();
+        let has_remote = !config.endpoints.is_empty() || config.workers.is_some();
 
         // the webhook receiver's env-only secret + limits (filled
         // by the github arm below; present iff the route is
@@ -293,6 +293,7 @@ impl Server {
             plugins.register(RemoteExecPlugin {
                 store,
                 endpoints: config.endpoints.clone(),
+                workers: config.workers.clone(),
                 holder: config.drain.holder.clone(),
                 redactor: exec_redactor,
             });

@@ -29,7 +29,7 @@ use kian_superagent::{
     WorkerBinding, WorkerEntry, WorkerSpawner, WorkerStreamsError, WorkerStreamsPort,
     bound_workers, busy_owner, delegation_content, delegation_worker_binding, router_template,
     thread_liveness, thread_started_payload, thread_started_payload_bound,
-    thread_started_worker_binding, worker_binding_of, worker_catalog_block, worker_template,
+    thread_started_worker_binding, worker_binding_of, worker_template,
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -211,13 +211,14 @@ fn qa_tools(
     );
     let hold = RouterHold::shared();
     let mut profile = RouterProfile::new(router, router_template("mock", "qa-router"));
-    profile.worker_catalog = catalog.clone();
+    profile.worker_membership = !catalog.is_empty();
+    let static_ids: Vec<String> = catalog.iter().map(|entry| entry.id.clone()).collect();
     let timeouts: BTreeMap<String, u64> = catalog
         .iter()
         .map(|entry| (entry.id.clone(), 60_000u64))
         .collect();
     let mut tools = RouterTools::new(spawner, channels, &profile, hold.clone())
-        .with_worker_catalog(catalog, timeouts);
+        .with_worker_membership(static_ids, timeouts, None);
     if let Some(streams) = streams {
         tools = tools.with_worker_streams(streams);
     }
@@ -549,7 +550,9 @@ fn qa_stream_reader_agreement_matrix() {
 async fn qa_spawn_refusal_matrix_is_honest_and_traceless() {
     let (tools, inbox, port) = qa_tools(qa_catalog_two(), None);
 
-    // ≥2 workers, argument missing: names the requirement and lists ids.
+    // ≥2 workers, argument missing: names the requirement and points
+    // at `list_workers` (R1: the refusal text no longer lists ids —
+    // the catalog is live data, tool-result only).
     let err = tools
         .invoke(spawn_call(json!({"task": "qa work"})))
         .await
@@ -557,7 +560,7 @@ async fn qa_spawn_refusal_matrix_is_honest_and_traceless() {
     assert!(matches!(err, ToolError::InvalidCall(_)), "{err}");
     let text = err.to_string();
     assert!(text.contains("requires `exec_worker`"), "{text}");
-    assert!(text.contains("qa-one") && text.contains("qa-two"), "{text}");
+    assert!(text.contains("list_workers"), "{text}");
 
     // Unknown id: names it and lists the configured ids.
     let err = tools
@@ -653,9 +656,10 @@ async fn qa_zero_endpoints_refuse_the_argument() {
 }
 
 #[tokio::test]
-async fn qa_single_worker_default_is_recorded_on_every_surface() {
-    // Exactly one worker: omission binds to it — an honest default that
-    // is RECORDED (wrapper, lineage, result echo), never silent.
+async fn qa_single_worker_spawn_is_recorded_on_every_surface() {
+    // R1 supersedes D6's omission-default: with exactly one worker the
+    // argument is still REQUIRED. An explicit bind is then RECORDED on
+    // every surface (wrapper, lineage, result echo), never silent.
     let (tools, inbox, port) = qa_tools(
         vec![WorkerEntry::with_description(
             "qa-solo",
@@ -663,10 +667,20 @@ async fn qa_single_worker_default_is_recorded_on_every_surface() {
         )],
         None,
     );
-    let result = tools
+    // Omission is refused — never defaulted.
+    let err = tools
         .invoke(spawn_call(json!({"task": "qa solo work"})))
         .await
-        .expect("omission binds to the single worker");
+        .unwrap_err();
+    assert!(err.to_string().contains("requires `exec_worker`"), "{err}");
+    // The explicit bind lands on every surface.
+    let result = tools
+        .invoke(spawn_call(json!({
+            "task": "qa solo work",
+            "exec_worker": "qa-solo"
+        })))
+        .await
+        .expect("explicit bind spawns");
     assert!(!result.is_error);
     assert_eq!(result.output[EXEC_WORKER_KEY], json!("qa-solo"));
 
@@ -1044,33 +1058,38 @@ async fn qa_prompt_catalog_block_gates_on_non_empty_catalog() {
         "zero endpoints must not mention the binding: {empty_text}"
     );
 
-    // Non-empty catalog: the block lands, listing every id (with its
-    // description) plus the choice rule; deterministic across renders.
+    // Non-empty catalog (R12 R2): the FROZEN membership block lands —
+    // a constant; no ids, no descriptions ever render (I6), and the
+    // block is deterministic across renders.
     let inbox = QaInbox::shared();
     let mut full = RouterProfile::new(router, router_template("mock", "qa-router"));
-    full.worker_catalog = qa_catalog_two();
+    full.worker_membership = true;
     full.bootstrap(&*inbox).await.expect("bootstrap");
     let admitted = inbox.admits.lock().unwrap()[0].1.clone();
     let full_text = serde_json::to_string(&admitted).expect("serialize");
     assert!(full_text.contains("Execution workers"), "{full_text}");
     assert!(
-        full_text.contains("qa-one — the first QA worker"),
+        full_text.contains("Call `list_workers` to see the live catalog"),
         "{full_text}"
     );
-    assert!(full_text.contains("qa-two"), "{full_text}");
     assert!(
-        full_text.contains("Never invent a worker id"),
+        !full_text.contains("qa-one"),
+        "no catalog ids may render into the prompt (I6): {full_text}"
+    );
+    assert!(
+        full_text.contains("never invent a worker id."),
         "{full_text}"
     );
 
-    // The block function itself is deterministic for one catalog.
-    let block = worker_catalog_block(&qa_catalog_two());
-    assert_eq!(block, worker_catalog_block(&qa_catalog_two()));
+    // The block constant is membership-data-free by construction.
+    let block = kian_superagent::WORKER_MEMBERSHIP_PROMPT_BLOCK;
+    assert_eq!(block, kian_superagent::WORKER_MEMBERSHIP_PROMPT_BLOCK);
 }
 
 #[test]
-fn qa_spawn_schema_three_shapes() {
-    // One endpoint: present, single-value enum, NOT required.
+fn qa_spawn_schema_plain_string() {
+    // R1: `exec_worker` is a plain required string in EVERY catalog
+    // shape — no enum, no ids in the schema (I6).
     let (one, _, _) = qa_tools(vec![WorkerEntry::new("qa-solo")], None);
     let schema = one
         .schemas()
@@ -1078,13 +1097,16 @@ fn qa_spawn_schema_three_shapes() {
         .find(|s| s.name == SPAWN_WORKER_TOOL)
         .expect("schema");
     let params = &schema.parameters;
+    let solo_property = params["properties"][EXEC_WORKER_KEY].clone();
+    assert_eq!(solo_property["type"], json!("string"));
+    assert!(solo_property.get("enum").is_none());
     assert_eq!(
-        params["properties"][EXEC_WORKER_KEY]["enum"],
-        json!(["qa-solo"])
+        params["required"],
+        json!(["task", EXEC_WORKER_KEY]),
+        "required even at one (supersedes D6)"
     );
-    assert_eq!(params["required"], json!(["task"]), "not required at one");
 
-    // Two endpoints: full enum in catalog order, required.
+    // Two endpoints: the identical property bytes.
     let (two, _, _) = qa_tools(qa_catalog_two(), None);
     let schema = two
         .schemas()
@@ -1092,19 +1114,17 @@ fn qa_spawn_schema_three_shapes() {
         .find(|s| s.name == SPAWN_WORKER_TOOL)
         .expect("schema");
     let params = &schema.parameters;
+    assert_eq!(params["properties"][EXEC_WORKER_KEY], solo_property);
     assert_eq!(
-        params["properties"][EXEC_WORKER_KEY]["enum"],
-        json!(["qa-one", "qa-two"]),
-        "config order"
+        params["properties"][EXEC_WORKER_KEY]["type"],
+        json!("string")
     );
-    let listing = params["properties"][EXEC_WORKER_KEY]["description"]
-        .as_str()
-        .expect("description");
     assert!(
-        listing.contains("qa-one — the first QA worker"),
-        "{listing}"
+        !params["properties"][EXEC_WORKER_KEY]
+            .as_object()
+            .expect("property")
+            .contains_key("enum")
     );
-    assert!(listing.contains("qa-two"), "{listing}");
     assert_eq!(
         params["required"],
         json!(["task", EXEC_WORKER_KEY]),

@@ -302,7 +302,11 @@ fn qa_config_dsh_and_endpoints_are_mutually_exclusive() {
     let err = ServeConfig::parse(&combined).unwrap_err();
     let text = err.to_string();
     assert!(
-        text.contains("`superagent.harness.dsh` and a non-empty `endpoints:` list"),
+        text.contains("`superagent.harness.dsh` and a worker surface"),
+        "{text}"
+    );
+    assert!(
+        text.contains("non-empty `endpoints:` list or a `workers:` section"),
         "{text}"
     );
     assert!(text.contains("mutually exclusive"), "{text}");

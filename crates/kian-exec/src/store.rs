@@ -445,6 +445,43 @@ impl ExecStore {
         }
     }
 
+    /// Opens a sqlite database file **read-only** (no migrations, no
+    /// writes): the operator verbs' view (`kian workers` — the `kian
+    /// tickets` discipline). A file that never carried the exec tables
+    /// reads as empty (the verb never refuses on a fresh store).
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self, QueueStoreError> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(30));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await?;
+        Ok(Self::Sqlite(pool))
+    }
+
+    /// All registry rows, read-only-tolerant: a store whose exec tables
+    /// were never created (a database that predates remote exec, opened
+    /// read-only) reads as **empty**, not as an error — the operator
+    /// verbs never refuse on it.
+    pub async fn endpoints_lenient(&self) -> Result<Vec<EndpointRegistryRow>, QueueStoreError> {
+        match self.endpoints().await {
+            Ok(rows) => Ok(rows),
+            // "no such table" — a fresh/legacy file; honest empty.
+            Err(QueueStoreError::Sql(e)) => {
+                if e.to_string().contains("no such table")
+                    || e.to_string().contains("does not exist")
+                {
+                    Ok(Vec::new())
+                } else {
+                    Err(QueueStoreError::Sql(e))
+                }
+            }
+            other => other,
+        }
+    }
+
     // -- queue --------------------------------------------------------------
 
     /// Durably admit one command: the row exists (status `pending`) before

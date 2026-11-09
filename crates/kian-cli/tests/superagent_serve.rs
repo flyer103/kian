@@ -441,7 +441,12 @@ async fn watchdog_offline_admits_health_input_to_affected_worker_session() {
             ScriptedResponse::ToolCall {
                 id: "call-spawn-1".into(),
                 name: "spawn_worker".into(),
-                arguments: serde_json::json!({"task": "run the release checklist"}),
+                // R12 R1: `exec_worker` is required on every spawn when
+                // membership is on.
+                arguments: serde_json::json!({
+                    "task": "run the release checklist",
+                    "exec_worker": "ep1"
+                }),
             },
             ScriptedResponse::Text("worker dispatched".into()),
         ],

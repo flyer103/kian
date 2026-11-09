@@ -505,6 +505,20 @@ async fn run_connection(shared: &Arc<Shared>) -> Result<(), ConnectionError> {
                 Some(EndpointFrame::Hello { .. }) => {
                     break Err(ConnectionError::Protocol("duplicate hello".into()));
                 }
+                // v1: a register frame is only valid as the first frame of
+                // a worker-dial connection (the registration listener); on
+                // this server-dial connection it is a protocol violation.
+                Some(EndpointFrame::Register { .. }) => {
+                    break Err(ConnectionError::Protocol(
+                        "register frame on a server-dialed connection".into(),
+                    ));
+                }
+                // v1 (P12): a peer bye is a graceful transport end — the
+                // same path as loss, just distinguishable in the log.
+                Some(EndpointFrame::Bye) => {
+                    tracing::info!(endpoint = %endpoint_id, "endpoint said bye");
+                    break Err(ConnectionError::TransportClosed);
+                }
                 None => break Err(ConnectionError::TransportClosed),
             },
             _ = shutdown.changed() => {

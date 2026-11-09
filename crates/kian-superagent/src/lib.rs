@@ -100,6 +100,7 @@
 //!   `read_progress` over `RecallPort`; `intervene` as a steer row via
 //!   `InboxWriter`; `escalate` under the IM policy)
 
+pub mod directory;
 pub mod dsh;
 pub mod github;
 pub mod inbox;
@@ -126,6 +127,7 @@ pub mod watchdog;
 pub mod wechat;
 pub mod worker;
 
+pub use directory::{MemberState, MemberView, WorkerDirectoryError, WorkerDirectoryPort};
 pub use dsh::{
     BRIDGE_CONTRACT_VERSION, ContractError, ControlFrame, DshEvent, DshMapper, MapCtx, Mapped,
     PeerFrame, PeerSession, SUPPORTED_LOGICAL_FORMAT, control_line, parse_peer_frame,
@@ -179,10 +181,11 @@ pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, WorkerStatus, worker_sessions};
 pub use router::{
     ChannelRegistry, DEFAULT_PARK_TICK_MS, DEFAULT_WORKER_QUEUE_TIMEOUT_MS,
-    DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, MandatePolicy, REPLY_TOOL,
-    ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox, RouterProfile, RouterTools,
-    SILENT_REPRO_TEMPLATE, SpeculationPolicy, WorkerEntry, build_mandate, enforce_speculation_cap,
-    outstanding_threads, worker_catalog_block,
+    DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, LIST_WORKERS_DESCRIPTION,
+    LIST_WORKERS_TOOL, MandatePolicy, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold,
+    RouterInbox, RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy,
+    WORKER_MEMBERSHIP_PROMPT_BLOCK, WorkerEntry, build_mandate, enforce_speculation_cap,
+    outstanding_threads,
 };
 pub use rules::{
     AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,

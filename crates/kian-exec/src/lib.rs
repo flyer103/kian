@@ -41,7 +41,10 @@ pub mod async_tool;
 pub mod backend;
 pub mod connection;
 pub mod error;
+pub mod membership;
 pub mod proto;
+pub mod registration;
+pub mod route;
 pub mod store;
 pub mod tool;
 pub mod watchdog;
@@ -53,10 +56,19 @@ pub use async_jobs::{AsyncEnqueueOutcome, AsyncJob, AsyncJobStatus};
 pub use async_tool::{
     AsyncExecTool, AsyncJobs, AsyncResultSink, AsyncToolPair, SessionForCall, StopTool,
 };
-pub use backend::{RemoteExecBackend, RemoteExecConfig};
+pub use backend::{DefaultRoute, MembershipConfig, RemoteExecBackend, RemoteExecConfig};
 pub use connection::{BackoffConfig, ConnectionConfig, ConnectionManager, EndpointStatus};
 pub use error::ConnectionError;
-pub use proto::PROTOCOL_VERSION;
+pub use membership::{
+    MemberSnapshot, MemberState, WorkerDirectory, member_state, valid_description, valid_worker_id,
+};
+pub use proto::{PROTOCOL_VERSION, RefusalReason, RegisterToken};
+pub use registration::{
+    LeaveReason, NoopSink, RegisteredWorker, RegistrationConfig, RegistrationListener,
+    RegistrationMetrics, RegistrationSink, WorkerToken, constant_time_eq, is_private_bind_addr,
+    validate_bind_addr,
+};
+pub use route::{RegisteredTransport, RouteTransport};
 pub use store::{
     CommandOutcome, EndpointRegistryRow, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError,
     QueuedCommand,

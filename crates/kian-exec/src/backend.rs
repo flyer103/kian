@@ -15,7 +15,7 @@
 //! later duplicate command id gets the same honest Timeout).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -27,7 +27,9 @@ use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
 use kian_core::secrets::SecretRedactor;
 
 use crate::connection::ConnectionManager;
+use crate::membership::WorkerDirectory;
 use crate::proto::{CommandError, CommandId};
+use crate::route::RouteTransport;
 use crate::store::{
     CommandOutcome, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError, QueuedCommand, now_ms,
 };
@@ -40,13 +42,18 @@ fn store_error(e: QueueStoreError) -> ExecError {
 
 type Waiter = oneshot::Sender<Result<ExecResult, ExecError>>;
 
-/// Per-endpoint queue driver state.
+/// Per-endpoint queue driver state. Static pins are born at boot with
+/// generation 0; dynamic routes carry the registration's generation so
+/// teardown is generation-scoped (A15: a stale loss handler can never
+/// detach its successor's route).
 struct Route {
     endpoint_id: String,
-    manager: Arc<ConnectionManager>,
+    transport: RouteTransport,
     /// Caller → driver wake-up. `notify_one` is permit-based, so a wake
     /// arriving while the driver is busy loading rows is not lost.
     nudge: Notify,
+    /// Per-route stop signal (detach/shutdown). Also permit-based.
+    stop: Notify,
     /// In-flight cap for re-drive bursts, sized from the endpoint's
     /// announced `max_concurrent` at each connect (the connection manager's
     /// own per-connection semaphore is the hard cap).
@@ -54,12 +61,18 @@ struct Route {
     /// Command ids this process currently has dispatched (prevents the
     /// driver re-dispatching a row whose dispatch is already parked).
     dispatching: Mutex<HashSet<CommandId>>,
+    /// The registration generation this route belongs to (0 = static).
+    generation: u64,
+    /// The driver task (joined on detach/shutdown).
+    driver: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Shared queue state.
 struct QueueCore {
     store: ExecStore,
-    routes: HashMap<String, Arc<Route>>,
+    /// Runtime-mutable route registry (Q2): static pins are inserted at
+    /// construction; dynamic routes attach/detach with membership.
+    routes: RwLock<HashMap<String, Arc<Route>>>,
     config: RemoteExecConfig,
     /// the exec output redactor. Every `Ok` outcome passes it
     /// once, at settlement ([`QueueCore::complete`]) — the single choke
@@ -74,10 +87,14 @@ struct QueueCore {
     /// row-lease TTL — how long a claimed row stays owned without a
     /// heartbeat before any replica may re-drive it.
     row_lease_ttl: Duration,
+    /// The runtime membership directory (present iff dynamic membership
+    /// is on) — the dynamic `default_endpoint` resolution's read.
+    directory: Option<Arc<WorkerDirectory>>,
+    /// Liveness bound for that resolution (workers.offline_after_ms).
+    directory_offline_after_ms: u64,
     waiters: Mutex<HashMap<CommandId, Vec<(u64, Waiter)>>>,
     waiter_tokens: std::sync::atomic::AtomicU64,
     shutdown: watch::Sender<bool>,
-    drivers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 /// Tuning of the durable queue.
@@ -100,6 +117,29 @@ impl Default for RemoteExecConfig {
     }
 }
 
+/// The dynamic-membership inputs of [`RemoteExecBackend::with_membership`]:
+/// the shared runtime directory (zero static routes are allowed when it
+/// is supplied) and its liveness bound for the dynamic default
+/// resolution.
+#[derive(Clone)]
+pub struct MembershipConfig {
+    pub directory: Arc<WorkerDirectory>,
+    pub offline_after_ms: u64,
+}
+
+/// How the plain [`ExecBackend::exec`] (untracked, random command id)
+/// picks its endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultRoute {
+    /// A configured static pin (today's behavior: the first
+    /// `endpoints:` entry).
+    Static(String),
+    /// Runtime membership: the first `online` member at call time, else
+    /// the first known id, else the honest error (spec §4.1 — the
+    /// untracked path must never invent an id).
+    Dynamic,
+}
+
 /// The server-side remote [`ExecBackend`] over a durable sqlite queue
 /// . Cloneable; share one per process.
 ///
@@ -107,14 +147,14 @@ impl Default for RemoteExecConfig {
 /// ([`ConnectionManager::start`]); this type only observes them.
 pub struct RemoteExecBackend {
     core: Arc<QueueCore>,
-    default_endpoint: String,
+    default_route: DefaultRoute,
 }
 
 impl Clone for RemoteExecBackend {
     fn clone(&self) -> Self {
         Self {
             core: self.core.clone(),
-            default_endpoint: self.default_endpoint.clone(),
+            default_route: self.default_route.clone(),
         }
     }
 }
@@ -146,9 +186,9 @@ impl RemoteExecBackend {
 
     /// [`RemoteExecBackend::new`] with an explicit row-lease
     /// identity: `holder` names this replica (multi-replica postgres
-    /// assemblies pass the config-validated unique `drain.holder`),
-    /// `ttl` how long a claimed queue row stays owned without a
-    /// heartbeat. Existing call sites stay on [`Self::new`] unchanged.
+    /// assemblies pass the config-validated unique `drain.holder`), `ttl`
+    /// how long a claimed queue row stays owned without a heartbeat.
+    /// Existing call sites stay on [`Self::new`] unchanged.
     pub fn with_row_leases(
         store: ExecStore,
         routes: Vec<(String, Arc<ConnectionManager>)>,
@@ -184,18 +224,62 @@ impl RemoteExecBackend {
         ttl: Duration,
         redactor: SecretRedactor,
     ) -> std::result::Result<Self, String> {
-        if routes.is_empty() {
-            return Err("remote exec needs at least one endpoint route".into());
+        Self::with_membership(
+            store,
+            routes,
+            DefaultRoute::Static(default_endpoint.into()),
+            config,
+            holder,
+            ttl,
+            redactor,
+            None,
+        )
+    }
+
+    /// The membership constructor (spec §4.1): static routes may be
+    /// **empty** iff a [`MembershipConfig`] is supplied (a `workers:`
+    /// deployment with zero `endpoints:` still constructs — its routes
+    /// attach at runtime as workers register). `default_route` picks the
+    /// untracked `exec` path's endpoint: `Dynamic` resolves the first
+    /// online member at call time.
+    // The static-constructor chain (`new` → `with_row_leases` →
+    // `with_row_leases_redacting`, whose signatures the spec pins) feeds
+    // every lease/redactor argument through here — folding them into a
+    // params struct would fork that chain, so the arity is deliberate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_membership(
+        store: ExecStore,
+        routes: Vec<(String, Arc<ConnectionManager>)>,
+        default_route: DefaultRoute,
+        config: RemoteExecConfig,
+        holder: impl Into<String>,
+        ttl: Duration,
+        redactor: SecretRedactor,
+        membership: Option<MembershipConfig>,
+    ) -> std::result::Result<Self, String> {
+        if routes.is_empty() && membership.is_none() {
+            return Err(
+                "remote exec needs at least one endpoint route (or a `workers:` listener)".into(),
+            );
         }
-        let default_endpoint = default_endpoint.into();
+        let (directory, directory_offline_after_ms) = match &membership {
+            Some(membership) => (
+                Some(Arc::clone(&membership.directory)),
+                membership.offline_after_ms,
+            ),
+            None => (None, 30_000),
+        };
         let mut map = HashMap::new();
         for (endpoint_id, manager) in routes {
             let route = Arc::new(Route {
                 endpoint_id: endpoint_id.clone(),
-                manager,
+                transport: RouteTransport::Managed(manager),
                 nudge: Notify::new(),
+                stop: Notify::new(),
                 permits: Mutex::new(None),
                 dispatching: Mutex::new(HashSet::new()),
+                generation: 0,
+                driver: Mutex::new(None),
             });
             if map.insert(endpoint_id, route).is_some() {
                 return Err("duplicate endpoint route".into());
@@ -204,27 +288,123 @@ impl RemoteExecBackend {
         let (shutdown, _) = watch::channel(false);
         let core = Arc::new(QueueCore {
             store,
-            routes: map.clone(),
+            routes: RwLock::new(map.clone()),
             config,
             redactor,
             row_lease_holder: holder.into(),
             row_lease_ttl: ttl,
+            directory,
+            directory_offline_after_ms,
             waiters: Mutex::new(HashMap::new()),
             waiter_tokens: std::sync::atomic::AtomicU64::new(0),
             shutdown,
-            drivers: Mutex::new(Vec::new()),
         });
-        // One driver per route, all sharing the final core (dispatch
-        // completion resolves waiters through it).
-        let mut drivers = Vec::new();
+        // One driver per boot-created (static) route, all sharing the
+        // final core (dispatch completion resolves waiters through it).
+        // Dynamic routes spawn their drivers in `attach_route`.
         for (_, route) in map {
-            drivers.push(tokio::spawn(drive_route(core.clone(), route)));
+            let handle = tokio::spawn(drive_route(core.clone(), route.clone()));
+            *route.driver.lock().unwrap() = Some(handle);
         }
-        *core.drivers.lock().unwrap() = drivers;
         Ok(Self {
             core,
-            default_endpoint,
+            default_route,
         })
+    }
+
+    /// Attach a runtime route (dynamic registration, spec Q2). The
+    /// durable registry projection is upserted **before** the route
+    /// becomes visible (the §9.1 step-3-before-step-4 ordering), then
+    /// the per-route driver spawns — its first loop iteration re-drives
+    /// this id's parked `pending`/`inflight` rows. Replace semantics:
+    /// an existing route for the same id is stopped first.
+    pub async fn attach_route(
+        &self,
+        endpoint_id: impl Into<String>,
+        transport: RouteTransport,
+        generation: u64,
+    ) {
+        let id = endpoint_id.into();
+        let status = transport.status();
+        if let Err(e) = self
+            .core
+            .store
+            .upsert_endpoint(
+                &id,
+                &transport.addr().to_string(),
+                status.last_seen_ms,
+                "online",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, endpoint = %id, "registry upsert on attach failed");
+        }
+        // Replace: stop any incumbent driver for this id first (the map
+        // lock is never held across the await).
+        let incumbent = self.core.routes.write().unwrap().get(&id).cloned();
+        if let Some(incumbent) = incumbent {
+            stop_route(&incumbent).await;
+        }
+        let route = Arc::new(Route {
+            endpoint_id: id.clone(),
+            transport,
+            nudge: Notify::new(),
+            stop: Notify::new(),
+            permits: Mutex::new(None),
+            dispatching: Mutex::new(HashSet::new()),
+            generation,
+            driver: Mutex::new(None),
+        });
+        let handle = tokio::spawn(drive_route(self.core.clone(), route.clone()));
+        *route.driver.lock().unwrap() = Some(handle);
+        self.core.routes.write().unwrap().insert(id, route);
+    }
+
+    /// Detach a runtime route (leave), generation-scoped (A15): a no-op
+    /// unless the registry still holds exactly this generation's route,
+    /// so a stale loss handler never detaches its successor. The queue
+    /// rows stay durable and parked (queue-first); the final registry
+    /// projection reads `offline` at the transport's last-seen.
+    pub async fn detach_route(&self, endpoint_id: &str, generation: u64) {
+        let route = {
+            let routes = self.core.routes.read().unwrap();
+            match routes.get(endpoint_id) {
+                Some(route) if route.generation == generation => Arc::clone(route),
+                _ => return,
+            }
+        };
+        {
+            let mut routes = self.core.routes.write().unwrap();
+            // Remove exactly this route instance: a concurrent replace
+            // may already have swapped a newer one in (A15).
+            if routes
+                .get(endpoint_id)
+                .is_some_and(|held| Arc::ptr_eq(held, &route))
+            {
+                routes.remove(endpoint_id);
+            }
+        }
+        stop_route(&route).await;
+        let status = route.transport.status();
+        if let Err(e) = self
+            .core
+            .store
+            .upsert_endpoint(
+                endpoint_id,
+                &route.transport.addr().to_string(),
+                status.last_seen_ms,
+                "offline",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, endpoint = %endpoint_id, "registry upsert on detach failed");
+        }
+        tracing::debug!(endpoint = %endpoint_id, generation, "runtime route detached");
+    }
+
+    /// The runtime route ids currently attached (static + dynamic).
+    pub fn route_ids(&self) -> Vec<String> {
+        self.core.routes.read().unwrap().keys().cloned().collect()
     }
 
     /// The store behind the queue (registry reads for the watchdog,
@@ -239,9 +419,9 @@ impl RemoteExecBackend {
         (&self.core.row_lease_holder, self.core.row_lease_ttl)
     }
 
-    /// The configured default endpoint route.
-    pub fn default_endpoint(&self) -> &str {
-        &self.default_endpoint
+    /// The untracked `exec` path's configured default route.
+    pub fn default_route(&self) -> &DefaultRoute {
+        &self.default_route
     }
 
     /// Enqueue-first tracked execution (the [`crate::RemoteExecTool`] path):
@@ -249,6 +429,12 @@ impl RemoteExecBackend {
     /// caller's dedupe key, and the caller's future resolves from the
     /// correlated result — or an honest [`ExecError::Timeout`] with the row
     /// `abandoned`.
+    ///
+    /// Queue-first (Q1): a live route is **never** a precondition. The
+    /// row enqueues durably by the bound worker id; with no route it
+    /// parks `pending` until one attaches, the caller's
+    /// [`RemoteExecConfig::queue_timeout`] abandons it honestly, or the
+    /// row settles. Nothing is ever dispatched to a different worker.
     pub async fn exec_tracked(
         &self,
         command_id: CommandId,
@@ -256,9 +442,7 @@ impl RemoteExecBackend {
         cmd: ExecCommand,
         tool_call_ref: Option<String>,
     ) -> Result<ExecResult, ExecError> {
-        let route = self.core.route(endpoint_id).ok_or_else(|| {
-            ExecError::Io(format!("no endpoint route registered for {endpoint_id:?}"))
-        })?;
+        let route = self.core.route(endpoint_id);
         match self
             .core
             .store
@@ -303,25 +487,80 @@ impl RemoteExecBackend {
                     // Someone is already driving this command id; attach.
                 }
             },
-            EnqueueOutcome::Inserted => route.nudge.notify_one(),
+            // No route ⇒ the row simply parks (Q1); a route nudges its
+            // driver so an enqueue racing the loop still surfaces.
+            EnqueueOutcome::Inserted => {
+                if let Some(route) = route {
+                    route.nudge.notify_one();
+                }
+            }
         }
         self.core.await_outcome(command_id).await
     }
 
-    /// Stops the queue drivers and joins them. Endpoint managers are owned
-    /// by the caller and shut down separately.
+    /// Stops every queue driver (static and runtime) and joins them.
+    /// Endpoint managers are owned by the caller and shut down
+    /// separately; registered transports die with their inbound
+    /// channels (the listener's shutdown path).
     pub async fn shutdown(&self) {
         self.core.shutdown.send_replace(true);
-        let drivers: Vec<_> = self.core.drivers.lock().unwrap().drain(..).collect();
-        for driver in drivers {
-            let _ = driver.await;
+        let routes: Vec<Arc<Route>> = self
+            .core
+            .routes
+            .write()
+            .unwrap()
+            .drain()
+            .map(|(_, route)| route)
+            .collect();
+        for route in routes {
+            stop_route(&route).await;
         }
+    }
+}
+
+/// Signals one route's driver to stop (stop + nudge wake it out of any
+/// select) and joins it.
+async fn stop_route(route: &Arc<Route>) {
+    route.stop.notify_one();
+    route.nudge.notify_one();
+    let driver = route.driver.lock().unwrap().take();
+    if let Some(handle) = driver {
+        let _ = handle.await;
     }
 }
 
 impl QueueCore {
     fn route(&self, endpoint_id: &str) -> Option<Arc<Route>> {
-        self.routes.get(endpoint_id).cloned()
+        self.routes.read().unwrap().get(endpoint_id).cloned()
+    }
+
+    /// Resolve the untracked `exec` path's endpoint (spec §4.1): the
+    /// first `online` member at call time, else the first known id
+    /// (directory, else registry rows), else the honest error — never
+    /// an invented id.
+    async fn resolve_default(&self) -> Result<String, ExecError> {
+        let now = now_ms().max(0) as u64;
+        if let Some(directory) = &self.directory {
+            if let Some(id) = directory.first_online(now, self.directory_offline_after_ms) {
+                return Ok(id);
+            }
+            if let Some(id) = directory.known_ids().into_iter().next() {
+                return Ok(id);
+            }
+        }
+        // Directory empty (e.g. fresh boot): fall back to the durable
+        // registry's known ids — an offline-but-known worker still
+        // parks rows honestly.
+        match self.store.endpoints().await {
+            Ok(rows) if !rows.is_empty() => Ok(rows
+                .into_iter()
+                .map(|row| row.endpoint_id)
+                .min()
+                .expect("non-empty")),
+            _ => Err(ExecError::Io(
+                "no execution worker is configured on this server".into(),
+            )),
+        }
     }
 
     /// Resolve the caller's future from the correlated result; race the
@@ -465,19 +704,19 @@ impl QueueCore {
 ///   next connect; only a settled result or an honest abandonment ends it.
 async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
     let mut shutdown = core.shutdown.subscribe();
-    let mut status = route.manager.subscribe_status();
+    let mut status = route.transport.subscribe_status();
     loop {
         if *core.shutdown.borrow() {
             break;
         }
-        let st = route.manager.status();
+        let st = route.transport.status();
         // Registry projection (reads it): disposable, rebuilt from live
         // status on every loop turn — heartbeats refresh it while idle.
         if let Err(e) = core
             .store
             .upsert_endpoint(
                 &route.endpoint_id,
-                &route.manager.addr().to_string(),
+                &route.transport.addr().to_string(),
                 st.last_seen_ms,
                 if st.connected { "online" } else { "offline" },
             )
@@ -489,7 +728,7 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
             tokio::select! {
                 changed = status.changed() => {
                     if changed.is_err() {
-                        break; // manager dropped
+                        break; // transport dropped
                     }
                     continue;
                 }
@@ -499,11 +738,12 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
                     }
                     continue;
                 }
+                _ = route.stop.notified() => break,
             }
         }
         // Connected: refresh the re-drive cap from the announced
         // concurrency. In-flight dispatches keep their old permits — the
-        // connection manager's semaphore remains the hard cap.
+        // transport's own semaphore remains the hard cap.
         *route.permits.lock().unwrap() =
             Some(Arc::new(Semaphore::new(st.max_concurrent.max(1) as usize)));
         // Register the wake *before* loading so an enqueue racing the load
@@ -537,6 +777,7 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
                         break;
                     }
                 }
+                _ = route.stop.notified() => break,
             }
             continue;
         }
@@ -653,7 +894,7 @@ async fn drive_row_inner(
         })
     };
     let outcome: Result<Result<ExecResult, CommandError>, crate::error::ConnectionError> = route
-        .manager
+        .transport
         .dispatch_with_id(row.command_id, row.cmd)
         .await;
     hb_stop.notify_one();
@@ -718,13 +959,18 @@ async fn row_lease_heartbeat(
 
 // The plain seam impl: untracked, random command id, default route. Tools
 // use `exec_tracked` (via `RemoteExecTool`) to get command-id dedupe.
+// With dynamic membership the default resolves per call (the first
+// online member, else the first known id, else the honest error).
 impl ExecBackend for RemoteExecBackend {
     fn exec(&self, cmd: ExecCommand) -> BoxFuture<'static, Result<ExecResult, ExecError>> {
         let this = self.clone();
         Box::pin(async move {
             let id = Uuid::new_v4();
-            this.exec_tracked(id, &this.default_endpoint.clone(), cmd, None)
-                .await
+            let endpoint = match &this.default_route {
+                DefaultRoute::Static(endpoint) => endpoint.clone(),
+                DefaultRoute::Dynamic => this.core.resolve_default().await?,
+            };
+            this.exec_tracked(id, &endpoint, cmd, None).await
         })
     }
 }

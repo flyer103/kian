@@ -43,6 +43,19 @@ pub enum EndpointError {
     Protocol(String),
     #[error("protocol version mismatch: endpoint={endpoint} server={server}")]
     VersionMismatch { endpoint: u32, server: u32 },
+    /// v1: the server typed-refused the registration. Terminal reasons
+    /// (`version_mismatch`, `bad_token`, `duplicate_static`) stop the
+    /// register supervisor; the daemon logs one actionable line and exits
+    /// non-zero instead of retrying in a loop.
+    #[error(
+        "registration refused: {}{}",
+        .reason.as_str(),
+        .detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default()
+    )]
+    RegisterRejected {
+        reason: crate::proto::RefusalReason,
+        detail: Option<String>,
+    },
 }
 
 /// What the endpoint announced in its [`EndpointFrame::Hello`].
@@ -196,6 +209,22 @@ impl Endpoint {
             }
             None => return Err(EndpointError::TransportClosed),
         };
+        self.run_steady(inbound, outbound, heartbeat, None).await
+    }
+
+    /// The steady state both handshake modes share (v1): heartbeat
+    /// emitter + command dispatch until the peer goes away, says bye, or
+    /// — in register mode — the local shutdown fires, in which case
+    /// in-flight commands finish first and a worker `bye` closes the
+    /// connection gracefully.
+    pub(crate) async fn run_steady(
+        self: Arc<Self>,
+        mut inbound: mpsc::Receiver<ServerFrame>,
+        outbound: mpsc::Sender<EndpointFrame>,
+        heartbeat: Duration,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(), EndpointError> {
+        let mut shutdown = shutdown;
 
         // Per-connection in-flight counter (reported in heartbeats).
         let inflight = Arc::new(AtomicUsize::new(0));
@@ -236,36 +265,67 @@ impl Endpoint {
         }
 
         let result = loop {
-            match inbound.recv().await {
-                Some(ServerFrame::Command { id, cmd }) => {
-                    self.spawn_execution(id, cmd, &outbound, &inflight).await;
-                }
-                Some(ServerFrame::Ping) => {
-                    let info = HeartbeatInfo {
-                        endpoint_id: self.endpoint_id.clone(),
-                        ts_ms: now_ms(),
-                        inflight: inflight.load(Ordering::SeqCst) as u32,
-                    };
-                    let frame = EndpointFrame::Heartbeat {
-                        endpoint_id: info.endpoint_id.clone(),
-                        ts_ms: info.ts_ms,
-                        inflight: info.inflight,
-                    };
-                    if outbound.send(frame).await.is_err() {
-                        break Err(EndpointError::TransportClosed);
+            tokio::select! {
+                frame = inbound.recv() => match frame {
+                    Some(ServerFrame::Command { id, cmd }) => {
+                        self.spawn_execution(id, cmd, &outbound, &inflight).await;
                     }
-                    if let Some(tap) = self.heartbeat_tap.as_ref() {
-                        tap(info);
+                    Some(ServerFrame::Ping) => {
+                        let info = HeartbeatInfo {
+                            endpoint_id: self.endpoint_id.clone(),
+                            ts_ms: now_ms(),
+                            inflight: inflight.load(Ordering::SeqCst) as u32,
+                        };
+                        let frame = EndpointFrame::Heartbeat {
+                            endpoint_id: info.endpoint_id.clone(),
+                            ts_ms: info.ts_ms,
+                            inflight: info.inflight,
+                        };
+                        if outbound.send(frame).await.is_err() {
+                            break Err(EndpointError::TransportClosed);
+                        }
+                        if let Some(tap) = self.heartbeat_tap.as_ref() {
+                            tap(info);
+                        }
                     }
+                    Some(ServerFrame::Welcome { .. }) => {
+                        break Err(EndpointError::Protocol("duplicate welcome".into()));
+                    }
+                    // v1: a rejection after the handshake is unexpected (the
+                    // server closes right after a refusal) — a typed error,
+                    // never a panic.
+                    Some(ServerFrame::Rejected { reason, .. }) => {
+                        break Err(EndpointError::Protocol(format!(
+                            "rejected after handshake: {}",
+                            serde_json::to_value(reason)
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|_| "?".into())
+                        )));
+                    }
+                    Some(ServerFrame::Bye) => break Ok(()),
+                    None => break Ok(()), // peer went away — expected, not an error
+                },
+                // Register mode only: local shutdown (SIGTERM/SIGINT) —
+                // handled after the loop as a graceful drain + worker bye.
+                fired = shutdown_fired(&mut shutdown) => {
+                    if fired { break Ok(()); }
                 }
-                Some(ServerFrame::Welcome { .. }) => {
-                    break Err(EndpointError::Protocol("duplicate welcome".into()));
-                }
-                Some(ServerFrame::Bye) => break Ok(()),
-                None => break Ok(()), // peer went away — expected, not an error
             }
         };
         let _ = shutdown_tx.send(true);
+        // Graceful leave (v1, register mode): finish in-flight commands,
+        // then close with a worker `bye`. The caller (the register
+        // supervisor / the daemon) bounds this drain.
+        if matches!(&result, Ok(())) && shutdown.as_ref().is_some_and(|rx| *rx.borrow()) {
+            while inflight.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tracing::info!(
+                endpoint = %self.endpoint_id,
+                "drained; sending bye"
+            );
+            let _ = outbound.send(EndpointFrame::Bye).await;
+        }
         result
     }
 
@@ -311,6 +371,20 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// Resolve when the optional shutdown watch flips to `true`. A dropped
+/// sender (no shutdown source) never fires — the endpoint's hello-mode
+/// behavior is unchanged.
+async fn shutdown_fired(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    match shutdown {
+        Some(rx) => match rx.changed().await {
+            // Sender dropped: no further shutdown signals exist.
+            Err(_) => std::future::pending().await,
+            Ok(()) => *rx.borrow_and_update(),
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// The server-side half of one connection: send [`ServerFrame`]s, receive

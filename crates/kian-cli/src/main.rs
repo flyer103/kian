@@ -58,6 +58,11 @@ const USAGE: &str = "usage:
   kian tickets [--db <sqlite>] [--config <path>] [--json]
                                          Ticket stage board: every worker session's
                                          'what is it waiting for' stage
+  kian workers [--db <sqlite>] [--config <path>] [--json]
+                                         worker membership board: id, online|offline,
+                                         last heartbeat, bound live session/thread
+                                         (read-only; description and protocol version
+                                         are runtime-only facts, absent by design)
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event
   kian wechat login [--config <path>] [--channel <name>] [--json]
@@ -101,6 +106,7 @@ fn main() -> ExitCode {
         Some("memory") => memory(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
+        Some("workers") => workers(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("wechat") => wechat(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
@@ -1087,6 +1093,42 @@ fn tickets(args: &[String]) -> ExitCode {
     run_command(
         kian_cli::commands::run_tickets(&config, db.as_deref(), json),
         "tickets",
+    )
+}
+
+/// `kian workers [--db <sqlite>] [--config <path>] [--json]` — the
+/// worker membership board (read-only embedded; never refuses).
+fn workers(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!("kian: --db requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown workers option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    run_command(
+        kian_cli::commands::run_workers(&config, db.as_deref(), json),
+        "workers",
     )
 }
 
