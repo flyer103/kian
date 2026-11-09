@@ -1158,11 +1158,11 @@ stays 22), no new table, no migration, no new HTTP surface, no core change.**
   federation (out of scope, single kian instance by design); persisting description/version across
   a restart and a stale-id TTL (open questions recorded in the round spec §11); deployment
   (Vultr/WeChat) stays the owner's discussion.
-- **Open follow-up (owner action)** — AGENTS.md's docs-map list could not be updated in this run
-  (protected file; the required consent timed out). The intended one-line entry:
-  `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
+- **Owner follow-up (applied)** — the closeout run could not update AGENTS.md's docs-map list
+  (protected file; the required consent timed out), so it landed in the owner follow-up docs
+  commit: `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
   binding/dispatch, catalog, security boundary); any worker-membership semantic change starts here.
-  `docs_map` does not gate AGENTS.md content, so no test is affected.
+  `docs_map` does not gate AGENTS.md content, so no test was affected.
 
 Gates on the exact committed tree: build / `cargo test --workspace` (122 suites, 1489 passed,
 0 failed) / clippy `--workspace --all-targets -D warnings` / fmt `--all --check` /

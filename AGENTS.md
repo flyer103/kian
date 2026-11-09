@@ -130,6 +130,10 @@ when the owner asks. Negative results commit documentation only — never broken
   best-effort by contract): protocol mapping, credential file, config/CLI, receive allowlist,
   dedupe and the cursor bound, degradation. **Any WeChat channel change starts here**; a protocol
   break degrades this channel only (ADR-018).
+- `design/WORKER-MODEL.md` — the normative worker-domain contract (source of truth): membership
+  lifecycle, binding/dispatch, catalog/discovery, security boundary, version policy and
+  degradation. **Any worker-membership semantic change starts here**; wire shapes stay in
+  API-CONTRACT, event kinds in EVENT-MODEL, placement in DESIGN.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.
