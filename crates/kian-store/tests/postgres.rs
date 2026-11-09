@@ -1326,7 +1326,11 @@ async fn pg_archive_marker_commit_and_inputs() {
 /// `scan_kind` on postgres: byte-identical to scan-then-filter on a
 /// pseudo-random mixed-kind stream (A1/A7 parity with the sqlite suite),
 /// seq-ascending, the v6 per-session kind index physically exists, and
-/// the read-only-pool open (no migration) reads the same rows.
+/// the read-only-pool open (no migration) reads the same rows. A second
+/// stream seeds `SessionEnded` with all four `EndReason`s: the `kind`
+/// column collapses them into one key, so this backend's post-decode
+/// exactness guard (kian-120 B1) is exercised here too, mirroring the
+/// sqlite `scan_kind_is_exact_for_session_ended_reasons`.
 #[tokio::test]
 async fn pg_scan_kind_parity_index_and_read_only_pool() {
     if !gated() {
@@ -1386,6 +1390,62 @@ async fn pg_scan_kind_parity_index_and_read_only_pool() {
         assert!(pair[0].seq < pair[1].seq, "seqs must arrive ascending");
     }
 
+    // SessionEnded exactness on this backend: the kind column stores
+    // `as_str()`, collapsing the four EndReasons into "session/ended",
+    // so `scan_kind` must re-compare the decoded kind and skip
+    // wrong-reason rows (never CorruptRow) — the sqlite suite's
+    // `scan_kind_is_exact_for_session_ended_reasons` on pg (kian-120
+    // B1, kian-121 audit follow-up).
+    let sid2 = SessionId::new();
+    let reasons = [
+        EndReason::Completed,
+        EndReason::Cancelled,
+        EndReason::Interrupted,
+        EndReason::Failed,
+    ];
+    append_ok(&pg.store, sid2, 1, Epoch(1), EventKind::SessionCreated).await;
+    for (i, r) in reasons.iter().enumerate() {
+        append_ok(
+            &pg.store,
+            sid2,
+            2 + i as u64,
+            Epoch(1),
+            EventKind::SessionEnded { reason: *r },
+        )
+        .await;
+    }
+    let full2 = pg
+        .store
+        .scan(sid2, all())
+        .await
+        .expect("scan SessionEnded stream");
+    assert_eq!(full2.len(), 1 + reasons.len());
+    let reason_expectations: Vec<(EventKind, Vec<String>)> = reasons
+        .iter()
+        .map(|r| {
+            let k = EventKind::SessionEnded { reason: *r };
+            let expected = ser(&full2
+                .iter()
+                .filter(|e| e.kind == k)
+                .cloned()
+                .collect::<Vec<_>>());
+            (k, expected)
+        })
+        .collect();
+    for (k, expected) in &reason_expectations {
+        let got = pg
+            .store
+            .scan_kind(sid2, *k)
+            .await
+            .expect("scan_kind SessionEnded");
+        assert_eq!(
+            ser(&got),
+            *expected,
+            "scan_kind must be exact for {k:?} on postgres"
+        );
+        assert_eq!(got.len(), 1, "exactly the requested reason");
+    }
+
     // The v6 index physically exists on the events table.
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -1411,6 +1471,17 @@ async fn pg_scan_kind_parity_index_and_read_only_pool() {
         .await
         .expect("read-only scan_kind");
     assert_eq!(ser(&ro), expected);
+    for (k, reason_expected) in &reason_expectations {
+        let ro2 = reader
+            .scan_kind(sid2, *k)
+            .await
+            .expect("read-only scan_kind SessionEnded");
+        assert_eq!(
+            ser(&ro2),
+            *reason_expected,
+            "read-only scan_kind must be exact for {k:?} on postgres"
+        );
+    }
     reader.close().await;
 
     pg.finish().await;
