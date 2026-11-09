@@ -35,6 +35,10 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   worker (Router-chosen from the configured catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
   binding; a busy or unknown worker refuses honestly.
+- **Runtime worker membership** — workers join and leave a running server without config edits
+  or restarts: `kiand --register-to` authenticates on a private, token-gated listener and the
+  connection becomes the command route; commands queue durably per worker id while one is
+  offline, `list_workers` exposes the live catalog, and join/leave never changes a prompt byte.
 - **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
   the same `LoopDriver` seam and event kinds.
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
@@ -83,6 +87,7 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 | [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (P1–P2 and P3a retrieval landed; persisted representations designed) |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
+| [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
@@ -421,6 +426,33 @@ failover to another machine. A busy or unknown worker refuses the spawn honestly
 effect — the refusal names the owning session. With exactly one worker the argument may be omitted
 (recorded as the honest default); with zero `endpoints:` nothing changes anywhere
 ([ADR-020](design/decisions/ADR-020-durable-worker-binding.md)).
+
+#### Runtime worker membership (workers join/leave without a restart)
+
+Workers can also register themselves at runtime — no `kian.yaml` edit, no `kian serve` restart
+([ADR-021](design/decisions/ADR-021-runtime-worker-membership.md), the contract is
+[WORKER-MODEL.md](design/WORKER-MODEL.md)):
+
+```yaml
+workers:                       # absent = dynamic membership off (byte-identical)
+  listen: "127.0.0.1:7400"     # private bind only (loopback/RFC1918/CGNAT/ULA)
+  token_env: KIAN_WORKER_TOKEN # env-only shared token; the value never lives in the file
+```
+
+```bash
+export KIAN_WORKER_TOKEN=...   # unset/blank refuses server startup (fail-closed)
+# on the worker machine (reach the listener over an SSH tunnel or Tailscale):
+cargo run -p kiand -- --register-to 127.0.0.1:7400 --endpoint-id mac-mini \
+  --description "local macOS dev machine"   # registers over KiandProto v1; the
+                                            # connection becomes the command route
+kian workers                   # read-only operator view: id, state, bound session
+```
+
+Joining makes the worker spawnable immediately (`list_workers` shows it `online`); leaving —
+graceful `bye` or `kill -9` — marks it offline within `offline_after_ms`. Commands for a
+known-but-offline worker park durably and run when it returns; an unknown id is refused naming the
+known ids. Static `endpoints:` pins and dynamic workers share one catalog (a colliding id is
+refused), and membership changes never touch a prompt or tool-schema byte.
 
 ### Postgres and multi-replica
 

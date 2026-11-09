@@ -401,6 +401,31 @@ Non-goals recorded with the round: no new transport/protocol or daemon binary, n
 no bind-time liveness gate, no automatic failover (an offline worker parks honestly on the durable
 queue), no per-call endpoint choice.
 
+### Runtime worker membership (R12)
+
+Scope: workers join and leave a running `kian serve` at runtime — `kiand --register-to` dials kian,
+authenticates with an env-only shared token on a **private** registration listener, and the accepted
+connection *is* the command route for that worker id. Joining or leaving never edits `kian.yaml` and
+never restarts the server; a kian restart/upgrade requires no worker-side change (workers reconnect
+and re-register). The decision record is
+[ADR-021](../design/decisions/ADR-021-runtime-worker-membership.md) (supersedes ADR-020 D5/D6/D7
+only); the worker-domain contract is [WORKER-MODEL](../design/WORKER-MODEL.md); the wire is
+KiandProto v1 ([API-CONTRACT](../design/API-CONTRACT.md) §8). **No new event kind, no new table, no
+new HTTP surface, no core change; one wire version bump with dual goldens.**
+
+| Item | Contents | Status |
+|------|----------|--------|
+| Registration (KiandProto v1) | Worker-dial `register`/`welcome`/`rejected` handshake over the same line framing; closed five-reason refusal set (`version_mismatch`/`bad_token`/`duplicate_static`/`id_conflict`/`disabled`) with typed terminal-vs-retryable reactions; worker-side `bye`; legacy static `hello`→`welcome` kept at v1; upgrade order kian-first, no v0 shim — API-CONTRACT §8 | landed |
+| Membership directory + liveness | Runtime-only directory (id → description, version, generation, last-seen, peer); state is **computed** (online = live connection ∧ fresh heartbeat); durable projection is the existing `endpoint_registry` row — no migration, no new truth; duplicate dynamic id replaces (generation+1, audited); static-vs-dynamic id collision refused; stale ids never pruned (offline-known stays honest) | landed |
+| Queue-first dispatch | `exec` enqueues durably by the bound worker id with no live-route requirement; rows park `pending` until the worker registers or the honest `queue_timeout` abandons them; no cross-worker dispatch, no failover; runtime routes attach/detach with membership | landed |
+| Router surface | `spawn_worker.exec_worker` is a plain non-empty string (no enum, no catalog block — supersedes ADR-020 D5–D7); one frozen prompt instruction line; new read-only `list_workers` tool (id, description?, state, bound session/thread); spawn validates against the runtime catalog — unknown refused naming known ids, offline-known allowed with a queue note, busy refused naming the owner; no membership byte ever enters a prompt or tool schema | landed |
+| Operator verb | `kian workers [--json]`: read-only embedded view over the durable projection (id, state, last-seen, bound session/thread); description/version absent by construction after a restart until re-registration | landed |
+| Security boundary | Private-bind-only listener (loopback/RFC1918/CGNAT/ULA; wildcard counts as public) with `allow_public` override; env-only token, constant-time compare, redacting type, bounded failed attempts; token never in config/argv/logs/events/metrics | landed |
+| Single kian instance | A worker registers to exactly one `kian serve`; no federation, relay, cross-instance dispatch or multi-replica membership | landed (boundary) |
+| Shared-token limitation | Any token holder may register under any id (impersonation/replacement); acceptable for the single-operator deployment, not for hosted use | landed (recorded limitation; mTLS R13) |
+| mTLS / per-worker identity, token rotation without restart | R13 deferral — [WORKER-MODEL](../design/WORKER-MODEL.md) §9 | deferred |
+| Live rebind / worker retirement / takeover | Unchanged from R11 (ADR-020 §Deferred, ADR-021 §Deferred) — the same id returning reattaches; a permanently lost worker ends in the honest timeout | deferred |
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

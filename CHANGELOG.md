@@ -1087,3 +1087,83 @@ durable footprint is two additive `exec_worker` keys on events that already exis
 Gates on the exact tree: build / `cargo test --workspace` (112 suites, 0 failed) / clippy
 `--workspace --all-targets -D warnings` / fmt `--all --check` / `cargo test -p kian-cli --test
 docs_map` all green.
+
+## 2026-11-09 — runtime worker membership (self-registration, dynamic join/leave) — default-green
+
+Round 12 (cards kian-128..135): workers join and leave a running `kian serve` at runtime.
+[ADR-021](design/decisions/ADR-021-runtime-worker-membership.md) is the decision record
+(supersedes ADR-020 D5/D6/D7 only — the static catalog surfaces); the worker-domain contract is
+[WORKER-MODEL.md](design/WORKER-MODEL.md) (new normative doc); the wire is
+KiandProto **v1** ([API-CONTRACT](design/API-CONTRACT.md) §8). **No new event kind (the durable set
+stays 22), no new table, no migration, no new HTTP surface, no core change.**
+
+- **Protocol v1 (kian-129)** — `PROTOCOL_VERSION = 1` in both halves with dual goldens; new frames
+  `register {endpoint_id, description?, token, version, max_concurrent}` (worker-dial), `bye`
+  (endpoint side), `rejected {reason, detail?}`; a closed five-reason refusal set
+  (`version_mismatch` / `bad_token` / `duplicate_static` / `id_conflict` / `disabled`, no serde
+  fallback); the token travels in a redacting newtype so no `{:?}` can print it;
+  `welcome.heartbeat_ms = max(1, offline_after_ms/3)` server-directed. Legacy static endpoints keep
+  `hello`→`welcome` at v1. Upgrade order kian-first, no v0 shim: a v0 peer gets a typed refusal +
+  audit line, never a half-compatible connection.
+- **Registration listener (kian-129)** — private-bind-only (`workers.listen`; loopback/RFC1918/
+  CGNAT/ULA — wildcard counts as public; `allow_public: true` overrides), env-only shared token
+  (`workers.token_env`, constant-time compare, one attempt per connection, 5-refusals/60 s per-peer
+  window, clock-injected in tests), handshake discipline (register must be the first frame, 10 s
+  deadline, no half-registered state), duplicate-id replace (serialized per id, old connection
+  closed, generation+1, audited) and `duplicate_static` pin protection.
+- **Membership directory (kian-130)** — runtime-only `WorkerDirectory`; state is **computed**
+  (`online` = live connection ∧ fresh heartbeat; `draining` = teardown window; else `offline`);
+  durable projection is the existing `endpoint_registry` row — no migration; the existing heartbeat
+  watchdog covers dynamic members unchanged (absence admits the ordinary `endpoint_health` input).
+  Stale ids are never pruned: offline-known binding stays honest. `kian workers [--json]` is the
+  read-only operator verb (description/version absent after a restart until re-registration).
+- **Queue-first dispatch (kian-130)** — `exec` enqueues durably by the bound worker id with no
+  live-route requirement; rows park `pending` until the worker registers or the honest
+  `queue_timeout` abandons them; runtime routes attach/detach with membership and re-drive
+  `pending`+`inflight`; no cross-worker dispatch, no failover, callers survive route swaps.
+- **Router surface (kian-131)** — `spawn_worker.exec_worker` is a plain non-empty string (no enum,
+  no catalog block — the ADR-020 D5–D7 supersede); one frozen prompt instruction line appended only
+  when membership is on; new read-only Router-only `list_workers` tool (sorted by id, membership
+  data only in results); spawn validation against the runtime catalog (unknown refused naming known
+  ids, offline-known allowed with the `offline — commands will queue` note, busy refused naming the
+  owner); lazy per-worker side cache, never evicted; per-side async pairs carried (S3).
+- **L2 lifecycle (kian-132)** — real `kian serve` + real register-mode `kiand` over loopback
+  (7 tests): join without restart/config edit (spawn + endpoint-side exec effect); bye and `kill -9`
+  offlining within the bound + watchdog health input + parked-row re-drive with an exactly-once
+  endpoint witness; kian `kill -9`/restart with re-registration, stream-rebuilt binding and exactly
+  one end write; same-id worker restart with the binding unchanged; honest refusals (bad token, v0
+  frame, duplicate_static) with actionable worker errors and zero side effects; static+dynamic
+  coexistence; async carry; prompt/tool-schema prefix byte-stability across join and leave.
+- **Independent QA (kian-133)** — 19 QA-authored L1 probes + 2 L2 legs, every brief §7 row PASS;
+  4 red-witness mutations (ct-compare early-exit, route-required enqueue error, catalog block in the
+  judge prompt, offline releasing the 1:1 binding) confirmed RED then reverted sha256-verified.
+- **Review (kian-134)** — first verdict BLOCKING on two defects, both fixed (t_f35284fc) and
+  re-reviewed PASS (t_74af0785, independent reviewer, fingerprint e9bc80a5): B1 the constant-time
+  token fold truncated the length mismatch to a byte (token + 256k NULs compared equal) — now folds
+  as `u8::from(a.len() != b.len())`; B2 `kiand` lacked worker-side identity/description validation
+  (malformed id ⇒ `id_conflict` ⇒ unbounded retry) — register mode now validates both at startup,
+  exit 2, no dial. Non-gating notes N1–N5 recorded open.
+- **Closeout (kian-135, this entry)** — API-CONTRACT §8 v1 (handshake, frames, reason set, upgrade
+  order) + §9.1/§9.2 goldens; WORKER-MODEL.md (proposed → normative) wired into the docs map
+  (`docs_map` AUTHORED 10 → 11); ADR-021 status → landed; SPEC §5 R12 section (membership,
+  single-instance boundary, shared-token limitation, R13 deferrals); README feature bullet + runtime
+  membership advanced-usage example + docs-map row; this entry.
+- **Unverified (honest)** — the v0→v1 upgrade window has no L2 with a real old binary (the L1
+  typed-refusal golden is the evidence, spec-permitted); Tailscale/SSH-tunnel reachability and any
+  non-loopback bind are deployment properties, documented not tested; per-spawn directory-snapshot
+  cost is unmeasured (small scale assumed); the shared-token impersonation limitation is a design
+  fact, not a tested behavior; no L3 deployment evidence.
+- **Deferred with the round** — mTLS/per-worker identity and token rotation without restart (R13);
+  live rebind/retirement/takeover (unchanged, ADR-020/021 §Deferred); multi-instance membership
+  federation (out of scope, single kian instance by design); persisting description/version across
+  a restart and a stale-id TTL (open questions recorded in the round spec §11); deployment
+  (Vultr/WeChat) stays the owner's discussion.
+- **Open follow-up (owner action)** — AGENTS.md's docs-map list could not be updated in this run
+  (protected file; the required consent timed out). The intended one-line entry:
+  `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
+  binding/dispatch, catalog, security boundary); any worker-membership semantic change starts here.
+  `docs_map` does not gate AGENTS.md content, so no test is affected.
+
+Gates on the exact committed tree: build / `cargo test --workspace` (122 suites, 1489 passed,
+0 failed) / clippy `--workspace --all-targets -D warnings` / fmt `--all --check` /
+`cargo test -p kian-cli --test docs_map` (6 tests) all green.
