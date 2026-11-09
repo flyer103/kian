@@ -376,42 +376,87 @@ drop (duplicate delivery id, unsupported/filtered event type, or a repository ou
 table). Delivery-id dedupe is downstream, per `(session, event_id)` — the webhook route itself does
 not keep a delivery table.
 
-## 8. KiandProto v0 — BYOM endpoint protocol
+## 8. KiandProto v1 — BYOM endpoint protocol
 
-Transport: TCP, one JSON object per line (UTF-8, no framing header). The endpoint (`kiand`) listens;
-the server (`kian-exec`) dials it per the `endpoints:` configuration. One bidirectional stream
-carries the whole conversation.
+Transport: TCP, one JSON object per line (UTF-8, no framing header). One bidirectional stream carries
+the whole conversation. Since v1 there are **two dial directions** over the same framing:
 
-`PROTOCOL_VERSION = 0`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
+| Path | Who dials | Handshake | Use |
+|---|---|---|---|
+| **worker-dial** (v1) | the worker (`kiand --register-to`) | worker → `register`; server → `welcome` or `rejected` | dynamic membership ([WORKER-MODEL](WORKER-MODEL.md) §2) |
+| **server-dial** (v0, legacy) | the server (`kian-exec`), per the `endpoints:` config | endpoint → `hello`; server → `welcome` | static pinned workers |
+
+After a successful handshake both paths carry the same steady-state frames
+(`command`/`result`/`ping`/`heartbeat`/`bye`) on that one connection; a worker-dial connection *is*
+the command route for that worker id.
+
+`PROTOCOL_VERSION = 1`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
 pinned by their own golden tests. A wire change updates both crates' goldens and bumps
 `PROTOCOL_VERSION` in both, in the same commit.
 
-### 8.1 Handshake
+### 8.1 Handshake — worker-dial (register mode, v1)
 
-1. Endpoint → server: `hello`.
-2. Server → endpoint: `welcome` (carries the negotiated heartbeat cadence when present).
-3. The server may send `ping` at any time; the endpoint answers with a `heartbeat`.
-4. `bye` is a graceful close; the server treats transport loss as liveness loss, not as a command
-   outcome.
+1. The server opens a **private** registration listener (`workers.listen` in `kian.yaml`;
+   loopback/RFC1918/CGNAT/IPv6-ULA; a public or wildcard bind refuses startup unless
+   `workers.allow_public: true`). The listener refuses to start when the env-only shared worker
+   token (`workers.token_env`) is absent or blank — fail-closed ([WORKER-MODEL](WORKER-MODEL.md) §6).
+2. Worker → server: `register` — **exactly one, and the first decodable frame** on the connection.
+   No `register` within the 10 s deadline, a second `register`, or any other first frame closes the
+   connection immediately with one `protocol` audit line; there is no half-registered state.
+3. Server → worker: `welcome` (carries `v` and the server-directed heartbeat cadence
+   `heartbeat_ms = max(1, offline_after_ms / 3)`; the worker honours the server value over its own
+   `--heartbeat-ms`), **or** `rejected` and the connection closes.
+4. Steady state: the server may send `ping` (answered with `heartbeat`); the worker sends
+   `heartbeat` on cadence; `bye` from either side is a graceful close; the server treats transport
+   loss as liveness loss, not as a command outcome.
 
-### 8.2 Frames
+**Auth.** The `register` token is compared **constant-time**; the token value never appears in
+config, argv, logs, events, error text or `/metrics` (it travels in a redacting type). Failed auth
+is bounded twice: one attempt per connection (the server closes after a refusal, never re-prompts)
+and a per-peer-address window — after 5 refusals in 60 s, further connections from that address are
+closed without reading a frame. With a **shared** token any holder may register under any id
+([WORKER-MODEL](WORKER-MODEL.md) §6 records the limitation; mTLS is the planned fix).
 
-Server → endpoint:
+**Duplicate id.** A newer authenticated `register` for a live dynamic id **replaces** the incumbent:
+serialized per id, the old connection is closed (server `bye` first), the route is swapped, the
+connection generation increments, one `replaced` audit line; the old connection's outstanding
+commands re-drive on the new route by the ordinary queue rule. A registration whose id matches a
+static `endpoints[].id` is refused `duplicate_static` — the static entry is the pin.
+
+**Identity and description shape.** `endpoint_id`: 1–200 bytes after trim, no control characters
+(the worker validates the same rule at startup and refuses to boot, so a malformed id never reaches
+the wire; the server re-checks — a violation answers `id_conflict`). `description` (optional):
+non-empty after trim, ≤200 chars, no control characters — a violation is **dropped with one audit
+line and the registration still succeeds** (the id is what matters; it never fails the handshake
+and never reaches a model). `max_concurrent == 0` clamps to 1 with a `warn`.
+
+### 8.2 Handshake — server-dial (legacy static endpoints, `hello` at v1)
+
+Unchanged shape: endpoint → `hello {v, endpoint_id, max_concurrent}`; server → `welcome`. The
+`hello`/`welcome` frames name the protocol revision `v`; the `register` frame names it `version` —
+a locked asymmetry, frozen by the v1 goldens (a rename is a wire break).
+
+### 8.3 Frames
+
+Server → worker/endpoint:
 
 | `type` | Fields |
 |---|---|
-| `welcome` | `v` (protocol version), `heartbeat_ms` (optional) |
+| `welcome` | `v` (protocol version), `heartbeat_ms` (optional; serializes `null` when absent — no `skip_serializing_if`) |
 | `command` | `id` (command UUID), `cmd` (`ExecCommand`) |
 | `ping` | — |
 | `bye` | — |
+| `rejected` (v1) | `reason`, `detail` (optional; omitted — not `null` — when absent) |
 
-Endpoint → server:
+Endpoint/worker → server:
 
 | `type` | Fields |
 |---|---|
 | `hello` | `v`, `endpoint_id`, `max_concurrent` |
+| `register` (v1) | `endpoint_id`, `description` (optional; omitted when absent), `token`, `version`, `max_concurrent` |
 | `heartbeat` | `endpoint_id`, `ts_ms`, `inflight` |
 | `result` | `id` (command UUID), plus exactly one of `result` (`ExecResult`) or `error` (`CommandError`) |
+| `bye` (v1) | — |
 
 `ExecCommand`: `{"argv":[<string>...],"env":{<string>:<string>},"cwd":<string>|null,"timeout_ms":<u64>|null}`.
 
@@ -420,11 +465,45 @@ Endpoint → server:
 
 `CommandError`: `{"code":"spawn"|"timeout"|"io","message":"<string>"}`.
 
-### 8.3 Delivery semantics
+**v1 reason set (closed — no fallback, no `#[serde(other)]`)**, with the worker-side reaction each
+refusal demands:
+
+| `reason` | Trigger | Worker reaction |
+|---|---|---|
+| `version_mismatch` | announced revision ≠ `PROTOCOL_VERSION` | **terminal**: log once with actionable text, exit non-zero; never a retry loop |
+| `bad_token` | token missing/blank/mismatched (constant-time) | **terminal**: log once naming the `token_env` variable, exit non-zero |
+| `duplicate_static` | id matches a static `endpoints[].id` | **terminal**: log naming the static pin |
+| `id_conflict` | per-id registration slot held past the wait bound, or a malformed `endpoint_id` | retryable with bounded backoff |
+| `disabled` | server not admitting members (shutdown/drain) | retryable with bounded backoff |
+
+`rejected.detail` is generated from fixed templates that interpolate **only** the `endpoint_id` and
+protocol version numbers — never a token, never a worker-supplied description.
+
+Worker reconnect policy (register mode): bounded backoff, 500 ms ×2 up to a 30 s cap, unbounded
+attempts while the process lives; transport refusal/EOF is retryable. `SIGTERM`/`SIGINT` ⇒ finish
+in-flight commands, send `bye`, exit 0. Audit lines carry the id and peer address only.
+
+### 8.4 Delivery semantics
 
 The queue is server-side and durable; delivery is at-least-once with command-id correlation/dedupe
-([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). That semantics lives in DESIGN §4.3;
-this section fixes only the frames.
+([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 dispatch is **queue-first by
+worker id**: a command enqueues durably even with no live route (a registered worker's route appears
+and disappears at runtime) and parks `pending` until a route appears or the `queue_timeout` abandons
+it honestly; there is no cross-worker dispatch. That semantics lives in
+[WORKER-MODEL](WORKER-MODEL.md) §4 and DESIGN §4.3; this section fixes only the frames.
+
+### 8.5 Upgrade v0 → v1
+
+**Upgrade order: kian first, workers second.** There is **no v0 compatibility shim** — a peer on the
+wrong revision is refused with `version_mismatch` plus one audit line, never a half-compatible
+connection ([ADR-021](decisions/ADR-021-runtime-worker-membership.md)). Window consequences, all
+honest and visible:
+
+- A v0 **static endpoint** dialed by v1 kian answers `hello{v:0}` ⇒ typed terminal
+  `VersionMismatch`, one audit line, the route stays offline (never a fake connect).
+- A v0 **worker** (a `kiand` with no `--register-to`) never registers; it reads offline until
+  upgraded.
+- A v1 worker pointed at a v0 kian gets a refused dial and keeps its bounded backoff.
 
 ## 9. Versioning and freeze
 
@@ -435,7 +514,8 @@ this section fixes only the frames.
 - SSE frame names (`kian`, `done`, `error`) and their `data` shape.
 - `/metrics` top-level keys and their meaning (nested fields additive).
 - Webhook required headers and the status matrix.
-- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`.
+- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v1
+  register/rejected frame bytes and the closed five-reason set, pinned by both halves' goldens.
 
 ### 9.2 Change classes
 
@@ -444,8 +524,10 @@ this section fixes only the frames.
   Additive changes ship with this file and tests updated in the same change.
 - **Breaking** (requires a new design decision): removing/renaming a method, param, result field, error
   code, SSE frame, metrics key or KiandProto frame; changing a status code's meaning; changing the
-  trust model. The wire is frozen additive-only after the `kian-sdk` freeze — the SDK's public
-  surface *is* this contract.
+  trust model; changing a KiandProto handshake or the rejection reason set. The wire is frozen
+  additive-only after the `kian-sdk` freeze — the SDK's public
+  surface *is* this contract. The KiandProto v0 → v1 bump (register mode, worker-dial) is the
+  recorded instance: [ADR-021](decisions/ADR-021-runtime-worker-membership.md), §8.5.
 
 ### 9.3 Version numbers
 

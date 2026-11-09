@@ -819,8 +819,10 @@ graph LR
   — never its `addr`. A session's worker binding is by id, so a daemon that dies, restarts or moves
   (same id, reachable at its configured address — a stable tunnel, or an edited `addr` plus a server
   restart) is the same worker to the binding, and the durable queue re-drives its outstanding rows on
-  reconnect (§4.1). The catalog is the `endpoints:` list itself (`id` + optional human `description`);
-  duplicate ids keep refusing to boot, and zero endpoints means the binding feature is off.
+  reconnect (§4.1). The **static** catalog is the `endpoints:` list itself (`id` + optional human
+  `description`); duplicate ids keep refusing to boot, and no endpoints plus no `workers:` section
+  means the binding feature is off. Since ADR-021 the live catalog additionally contains workers that
+  registered themselves over the registration listener (see "Runtime membership" below).
   Consequences recorded here: the async `start`/`stop` pair is mounted **per worker side**, bound to
   that worker's endpoint (`AsyncJobs` already persists `endpoint_id` per job row), so an async
   execution cannot escape a bound session's worker — refusing `superagent.async_tools` outright would
@@ -829,6 +831,49 @@ graph LR
   dsh harness runs the loop inside the dsh child and never mounts the kian `exec` tool, so a recorded
   binding could not route anything (a claimed-but-unenforceable binding is the exact dishonesty this
   section's audit exists to prevent).
+- **Runtime membership — the directory, the routes and the runtime catalog** (ADR-021; semantics in
+  [`design/WORKER-MODEL.md`](WORKER-MODEL.md), wire in [`design/API-CONTRACT.md`](API-CONTRACT.md) §8).
+  Membership is **runtime, not configuration**: with a `workers:` section (`listen`, `token_env`,
+  `offline_after_ms`, `allow_public`) `kian serve` opens a **worker-dialed** KiandProto v1 registration
+  listener on a private address, outside `/rpc`/`/ops/rpc`/`/metrics` and gated by an env-only shared
+  token. A worker (`kiand --register-to …`) registers, and kian **reuses that connection as the
+  command channel** for its id — the route. Joining or leaving never touches `kian.yaml` and never
+  restarts the server.
+  - **The directory is runtime state** (`kian-exec`: id → description, protocol version, connection
+    generation, last-seen, observed peer address) and its state is *computed*, never stored: `online`
+    means a live connection **and** a heartbeat inside `offline_after_ms`; `draining` is the teardown
+    window; everything else is `offline`. The durable projection is the **existing**
+    `endpoint_registry` row — no migration, no new table, no new event kind: dynamic members write
+    ordinary registry rows, so the existing heartbeat watchdog and its `endpoint_health` health-input
+    bridge cover them with no new code path. Membership is liveness, never truth (constraint 1); the
+    binding stays stream-derived (ADR-020 D3).
+  - **Replace, never split.** A newer authenticated registration for a live id replaces the incumbent
+    (serialized per id, old connection closed, route swapped, generation incremented, audited); a
+    dynamic id that collides with a static pin is refused, because the static entry owns its identity.
+    Stale ids are never pruned: they stay visible and offline, which is what makes an offline-known
+    binding honest.
+  - **Queue-first dispatch.** `exec` enqueues durably by the session's bound worker id with **no**
+    requirement that a route exists; with no route the row parks `pending` and either drains when the
+    worker registers or ends in the honest `queue_timeout`. A route's driver is the only component that
+    dispatches, it only ever reads its own id's rows, and there is no fallback route, no failover and
+    no local-exec substitution for a bound session (§4.3's exec layer, ADR-007).
+  - **Per-worker sides become runtime-provided.** Instead of one prebuilt `WorkerLoopDriver` per
+    configured worker, the assembly keeps a **lazy per-id side cache** built from a factory and never
+    evicts it (an offline worker's side still enqueues by id); the per-drive selection rule from the
+    stream is unchanged, and the known-id input is config ids ∪ the directory's ids, read through a
+    bundle-owned read-only port (the `RecallPort` precedent; no `kian-core` seam).
+  - **The catalog is queried, not rendered.** The Router gets a read-only `list_workers` tool
+    (id, description, `online|offline|draining`, live bound session/thread) and `spawn_worker` takes a
+    plain worker id; nothing about membership enters a prompt or a tool schema (§4.7). A spawn may
+    bind a **known but offline** worker — the result and audit say `offline — commands will queue` —
+    and an unknown id is refused naming the known ids. `kian workers [--json]` is the read-only
+    operator view over the durable projection (id, state, bound session/thread; description and
+    protocol version are runtime-only until the worker re-registers).
+  - **One kian instance.** A worker registers to exactly one `kian serve`. Multi-replica membership,
+    worker-to-all-replicas, relays and cross-instance dispatch are out of scope (owner decision,
+    ADR-021 §Deferred); a second server is a different deployment with a different membership. The
+    shared token also does **not** prove per-worker identity (any holder may claim any id) — an
+    accepted single-operator limitation with mTLS recorded as the R13 fix.
 - **The two axes of separation**: where execution runs (ExecBackend provider: local /
  remote-endpoint / sandbox / cloud machine) and who the loop is (LoopDriver seam, see §6.2) —
  independently pluggable.
@@ -1070,13 +1115,32 @@ gap fixes recorded in the closing bullets.
  (the residency counter a parked resident polls — a raw-engine admit would strand behind
  the park). The version is replayable: it lives in persisted bootstrap prompts and marker
  inputs — derivable from the stream, no `policy/version` kind (rejected: the persisted
- prompt is the record). ADR-020's worker catalog is prompt-prefix content of the same kind: the
- `spawn_worker` schema gains the `exec_worker` argument and the render path appends the catalog
- block (id + description + the choice rule) to the judge prompt **only when the catalog is
- non-empty**, so a zero-endpoints deployment renders today's exact bytes. New sessions pin a new
- label; persisted prompts are never rewritten and the drift machinery only reports the mismatch —
- while a resident Router's first request after the upgrade pays one prefix invalidation (the same
- recorded cost as the earlier `speculative` argument on that schema).
+ prompt is the record). ADR-020 initially made the worker catalog prompt-prefix content of the same
+ kind: the `spawn_worker` schema carried an `exec_worker` argument with a config-derived enum and the
+ render path appended the catalog block (id + description + the choice rule) to the judge prompt.
+ **ADR-021 superseded exactly that** (ADR-020 D5/D6/D7): with runtime membership the catalog is a
+ moving set, so nothing about it may live in the prefix. `exec_worker` is now a plain non-empty string
+ (required whenever membership is on), the render path appends **one frozen instruction line** ("call
+ `list_workers`; never invent an id") and no ids, counts or state, and membership data reaches the
+ model only through `list_workers` **tool results** (post-prefix). No configured workers renders
+ today's exact bytes. New sessions pin a new label; persisted prompts are never rewritten and the
+ drift machinery only reports the mismatch — while a resident Router's first request after the
+ upgrade pays one prefix invalidation (the same recorded cost as the earlier `speculative` argument
+ on that schema).
+- **Prompt-prefix stability across membership changes** (ADR-021; semantics in
+  [`design/WORKER-MODEL.md`](WORKER-MODEL.md) §5). A join, a leave, a replace, a kian restart or a
+  worker upgrade changes **no** prompt byte and **no** tool-schema byte. The schema is a function of
+  configuration only (membership off / on), the instruction line is a constant, and every volatile
+  fact — which ids exist, which are online, who is bound to what — travels in `list_workers` results,
+  which sit after the prefix in the conversation. This is the cache-byte axiom (constraint 3) applied
+  to a live set: a dynamic catalog in the prefix would invalidate a resident Router's cached prefix
+  every time a worker joined or left, i.e. exactly when the deployment is churning. The one deliberate
+  invalidation point in this feature is the **upgrade** itself: R12's policy version renders the new
+  instruction line for new sessions, live sessions keep their persisted prompts, and the drift
+  machinery reports the mismatch instead of rewriting anything. Residual cost recorded honestly:
+  `list_workers` results are ordinary context and grow with the catalog, so a large catalog costs
+  tokens on every result — bounded by the small number of real workers, and the reason the row shape
+  stays minimal (id, optional description, state, bound session/thread).
 - **Delegation mandate (ADR-012)** — the authority object separating *what to
  do* (task) from *with what authority* (Mandate; references 001/002) lands as an
  **additive `"mandate"` object on the -frozen delegation wrapper** (the 
