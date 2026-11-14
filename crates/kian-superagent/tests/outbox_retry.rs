@@ -695,6 +695,7 @@ async fn killed_mid_retry_intent_re_drives_from_the_stream_rebuild() {
             &pending,
             &ImPolicy::default(),
             &StructuredPolicy::default(),
+            &port.events(),
             &dyn_port,
         )
         .await;

@@ -777,15 +777,28 @@ re-drive re-sends it, at-least-once), park-prefixed error ⇒ parked (visible, t
 the driver — a person releases), other error ⇒ suppressed/invalid/legacy (never re-driven),
 receipt/ok ⇒ delivered. No durable outbox state exists anywhere.
 
+**Details requests (no truncation).** The IM shaping has a second mode for the one case where the
+budget would hide what a person explicitly asked for: a reply answering a details request. The
+request is derived by the bundle from the Router's own committed stream — the latest admitted
+channel input on the reply's channel, bounded by the reply's own `tool/call` seq — and matched
+**exactly** against the closed `DETAIL_REQUEST_TEXTS` vocabulary (`详情`, `详细`, `完整结果`,
+`details`, …) after trimming surrounding punctuation/whitespace; a passing mention (`详情页打不开`)
+never qualifies. The full mode delivers the complete text with `truncated: false` and the additive
+`detail: true` receipt bit (legacy summary receipts are byte-identical); the channel's own long-text
+split is the only boundary, so nothing is cut. The mode is never model-declared and never a tool
+argument (a cached tool schema cannot flip it); a pinned resident prompt therefore still behaves
+correctly. The derivation is a pure function over events, so the boot outbox re-drive derives the
+same answer at the intent's `tool/call` seq and re-sends the intent's exact bytes.
+
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
 | Any channel | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |
-| IM | ≤100-unit hard rule (a CJK character counts one unit; CJK has no inter-word spaces); only direct questions / short conclusions; notify only when a decision or acceptance is needed |
+| IM | ≤100-unit hard rule on normal replies (a CJK character counts one unit; CJK has no inter-word spaces); only direct questions / short conclusions; notify only when a decision or acceptance is needed. A reply answering a details request (`详情` and the closed vocabulary, derived from the stream) takes the full-delivery mode: the complete text, `truncated: false`, additive `detail: true` receipt |
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
 | GitHub (adapter) | the second *real* adapter beside lark, the "group-chat message + CI events" family (`issues`/`issue_comment`/`pull_request`/`push`/`check_run`/`status`): receive is webhook-shaped deliveries verified by the receiver surface (HMAC precedes parsing) and handed to the adapter, which maps each delivery to one provenance-carrying `ChannelEvent` (delivery id → `event_id` idempotency, repo → `group`, `owner/repo` or an exact `owner/repo#N` key → `topic` from the config table — the table is the receive allowlist —, verbatim sender, adapter-declared `explicit` on @-mentions in human text); send is PR review comment / issue comment / PR description via the REST API, resolving only on 2xx + id acceptance, structured content rendered as markdown sections; token env-only (`KIAN_GITHUB_TOKEN`, fail-closed when send is configured; receive needs none); the channel is untrusted by default |
 | Email/docs | Structured summary drafting |
 | Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
-| Lark/Feishu | the first *real* adapter: IM row — same ImPolicy (≤100 words) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default |
+| Lark/Feishu | the first *real* adapter: IM row — same ImPolicy (≤100-unit normal replies, details-request full mode) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default |
 | WeChat (iLink) | the third *real* adapter, **best-effort by contract** (ADR-018; [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md)): receive is one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink Bot API (`POST /ilink/bot/getupdates`, server-held ~35 s) mapping each text message to one provenance-carrying `ChannelEvent` (`message_id` → `event_id` as a lossless decimal string, `from_user_id` → `sender.user_id`, `group` always `None`, text only); the config `topics` table doubles as the receive allowlist (unknown sender → honest drop + audit); send is `POST /ilink/bot/sendmessage` echoing the **latest inbound `context_token`** for that user — reply-only, since with no token there is no deliverable send, so no proactive push — resolving only on `ret == 0`; the credential is a QR-issued session token in a local 0600 file written by `kian wechat login` (explicit config path, never in `kian.yaml`, never logged — the one deliberate deviation from the env-only static-secret rule), and `errcode -14` pauses the channel for an hour and resumes on a credentials-file change; no position table (empty cursor, honest idempotent re-poll), no new surface, no new event kind; a protocol break degrades this channel only |
 
 ### 4.3 BYOM endpoint (kiand daemon / endpoint SDK)
