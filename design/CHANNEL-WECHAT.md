@@ -208,8 +208,9 @@ change (§15).
    updated from every **admitted** inbound message — one whose sender passed the §3 allowlist —
    **before** the event is fanned out to subscribers. A message from a non-allowlisted sender
    updates nothing: its `context_token` is never cached, so a sender the allowlist rejected never
-   becomes a reachable recipient. The cache is transport state: not persisted, not an event,
-   rebuilt by the next admitted inbound message.
+   becomes a reachable recipient. The cache is transport state: not an event, and — since ADR-026 —
+   additionally persisted **best-effort** in a TTL-bounded state file (§6) so a restart does not
+   lose the reply capability; the in-memory map remains the source the send path reads.
 2. A send always echoes the latest token seen for that user — the official client's behaviour.
    Kian does not attempt to bind a reply to one specific inbound message id.
 3. **No token ⇒ no send.** A user we have never received from cannot be reached; the adapter
@@ -218,6 +219,21 @@ change (§15).
    outbox's bounded retry still runs and parks honestly if the token never appears.
 4. Tokens are credentials-adjacent: never logged, never written to an event, never put in an error
    message. A stale token surfaces as `-14` (§11), not as a send failure with the token in it.
+   Persistence (ADR-026) is a TTL-bounded state file beside the credential file, not an event.
+
+### 5.1 The reply-token state file (ADR-026)
+
+- **Path**: `wechat.context_state_file`, default `<credentials_file>.context-state.json`; mode
+  `0600` (parent `0700`), atomic temp+rename. `kian wechat login` never writes it.
+- **Schema**: `{"version":1,"tokens":{"<from_user_id>":{"token":"<context_token>",
+  "updated_at_unix_ms":<u64>}}}`. Only senders the `topics` allowlist admitted are cached.
+- **Lifecycle**: an admitted inbound updates the in-memory map first, then writes the file on a
+  blocking task; a write failure is one warn line and never blocks admission or a reply. Startup
+  loads the file, drops entries older than `context_ttl_ms` (default 1 h), and treats a missing,
+  malformed, old-version or unreadable file as **empty** (one warn) — never a startup failure.
+  A token the server rejects still follows the `-14` degradation path (§11).
+- **Security**: the file is a reply capability, not the bot token; never logged, never exported,
+  never in an event or `/metrics`. The credential file remains the only place the bot token lives.
 
 ## 6. Credential file
 
@@ -265,6 +281,8 @@ superagent:
         topics:                   # required, non-empty; receive allowlist + routing topic
           "oXXXX@im.wechat": "wechat"
         poll_timeout_ms: 45000    # optional; client long-poll timeout (server holds ~35 s)
+        context_state_file: ./.state/wechat-context.json  # optional; default <credentials_file>.context-state.json
+        context_ttl_ms: 3600000   # optional; reply-token TTL (default 1 h)
 ```
 
 Validation (all fail-closed at startup, each naming the offending key):
@@ -277,6 +295,8 @@ Validation (all fail-closed at startup, each naming the offending key):
 | `credentials_file` | required; missing/unreadable/malformed file refuses startup naming `kian wechat login` |
 | `api_base` | defaults to `https://ilinkai.weixin.qq.com`; must be an `http(s)://` URL with a non-empty host — `https` in production; plain `http://` is accepted deliberately so local mock-iLink tests and deployments work |
 | `poll_timeout_ms` | optional; defaults above the server's ~35 s hold |
+| `context_state_file` | optional; default derived beside the credential file; must not equal `credentials_file`; blank explicit value refuses |
+| `context_ttl_ms` | optional; default 3600000 (1 h); zero refuses |
 | cross-references | every `subscriptions[].channel`, `speak_rules[].channel`, `untrusted_channels[]` and `intake.thread_keys[].channel` naming this channel keeps validating |
 | trust | the channel is **forced** untrusted; the config cannot turn the marker off (§9) |
 
@@ -350,6 +370,8 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 | Condition | Detection | Behavior | Blast radius |
 |---|---|---|---|
 | Stale bot token | `errcode == -14` | Pause **all** iLink requests for 1 h (mirroring the official client), audit line, sends return `Unavailable` naming `kian wechat login`; poll the credential file's mtime (≤5 s) and resume on change | this channel only |
+| Missing/malformed/expired reply-token state | startup / load | empty state (one warn); sends without a token stay honestly `Unavailable` until a new inbound; a stale token follows the `-14` row | this channel only |
+| Reply-token state write failure | atomic write | warn line, in-memory token still serves the reply; never blocks admission | this channel only |
 | Client-side long-poll timeout | client timeout at `poll_timeout_ms` | Normal and expected (the server holds the request): return an empty batch and re-poll; no backoff, no audit noise above debug. Applies to the `getupdates` receive poll **and** the `get_qrcode_status` login long-poll alike — a timed-out status poll is treated as `wait` and re-polled, never a fatal login error | this channel only |
 | `ret != 0` / other `errcode` | response fields | Backoff 2 s doubling to a 30 s cap, audit line with the code, retry the same request | this channel only |
 | Empty model response / policy rejection | upstream | not this contract — the loop's honesty rules apply; a rejected send never becomes a `channel/delivered` | sessions unchanged |
@@ -386,12 +408,16 @@ shape): login state machine (`wait` → `scaned_but_redirect` → `confirmed`, p
 (ring + durable idempotency); `-14` → paused + `Unavailable` + resume after an mtime change; the
 exact `sendmessage` payload (§2.4: `from_user_id: ""`, `client_id`, `message_type: 2`,
 `message_state: 2`, the inbound `context_token`); missing token → `Unavailable`; the ordered 2000-
-character split; `ret != 0` → `DeliveryFailed`; transport timeout → `Timeout`.
+character split; `ret != 0` → `DeliveryFailed`; transport timeout → `Timeout`; the ADR-026
+state file: write/load, TTL filtering, malformed/missing/old-version → empty, 0600 mode, and a
+rebuilt channel sending with the persisted token.
 
 **L2 — real `Server` + sqlite + mock iLink**: one inbound message → exactly one admission; a
 restart replay of the same `message_id` → still exactly one; a channel failure (paused channel,
 failed send) leaves the session's state and stream untouched; the token never appears in any log
-line, config file or fixture; `NO_PROXY=127.0.0.1,localhost` for the local end-to-end legs (macOS
+line, config file or fixture; the reply-token state file survives a channel rebuild and enables a
+reply without a new inbound (ADR-026), and a state-file write failure leaves admission and the
+in-memory reply path intact; `NO_PROXY=127.0.0.1,localhost` for the local end-to-end legs (macOS
 system proxy).
 
 **L3 — env-gated, owner-run, never faked**: a real QR scan with a phone, then the unverified items
@@ -440,6 +466,9 @@ unverified until actually executed.
    `NO_PROXY=127.0.0.1,localhost`; the live iLink call is external HTTPS.
 7. Media, typing, `notifystart`/`notifystop`, group chat, multi-account and proactive push are out
    of scope (phase 2).
+9. The ADR-026 TTL is a conservative bridge (1 h), not a measured iLink capability lifetime: the
+   real server-side validity of a persisted `context_token` across a kian restart has not been
+   measured live; a stale token follows the `-14` path. The TTL is configurable.
 8. Whether the adapter must send to the `baseurl` the login response carries (recorded in the
    credential file's `base_url`) instead of the configured `api_base` is **UNVERIFIED** — the
    adapter uses `api_base` for every call and treats the recorded `base_url` as diagnostics-only;

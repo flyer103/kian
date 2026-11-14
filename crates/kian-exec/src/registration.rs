@@ -64,6 +64,10 @@ pub struct RegisteredWorker {
     pub generation: u64,
     pub peer_addr: SocketAddr,
     pub version: u32,
+    /// The validated description from this registration (ADR-025). The
+    /// sink caches it on the registry; `None` means the declaration
+    /// omitted it (or it was dropped as invalid).
+    pub description: Option<String>,
     pub max_concurrent: u32,
     pub writer: mpsc::Sender<ServerFrame>,
     pub inbound: mpsc::Receiver<EndpointFrame>,
@@ -575,6 +579,7 @@ impl RegistrationListener {
                 generation,
                 peer_addr: peer,
                 version,
+                description: description.clone(),
                 max_concurrent,
                 writer: writer_tx.clone(),
                 inbound: inbound_rx,

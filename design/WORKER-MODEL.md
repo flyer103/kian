@@ -55,6 +55,10 @@ graph LR
   different lifecycles.
 - **Member** — the runtime directory entry for an id: description, protocol version, connection
   generation, last-seen, observed peer address. Disposable; a projection of live connections.
+- **Last-declared cache** — the two *declaration* facts (description, protocol version) persisted on
+  the registry row for the cold-start catalog (ADR-025). It is a cache, not a membership fact: the
+  live directory wins while the worker is connected, and a row served from the cache is flagged
+  `declaration_stale`. State/liveness/bindability never come from it.
 - **Binding** — the durable, session-immutable assignment of one worker session to one worker id
   (ADR-020). Not a member, not a connection, not a route.
 - **Route** — the live command channel for one worker id, created when a member registers and torn
@@ -79,7 +83,7 @@ everything else is offline. The durable projection never carries a third state.
 | **Graceful leave** | the worker sends `bye`, then exits | route detached, state draining → offline, audit line distinguishes a graceful leave |
 | **Crash** | transport loss with no `bye` | identical in effect to a leave, different audit wording; the row stays durable and parked |
 | **Replace** | a newer authenticated `register` for an id that is currently online | after serializing on the per-id slot: the old connection is closed, its route detached, the new route attached, the generation incremented, one `replaced` audit line. The old connection's outstanding rows re-drive on the new route by the ordinary queue rule — no special fencing code |
-| **Kian restart** | process start | the directory is empty; registry rows persist with stale timestamps, so every id reads offline with no description/version until it re-registers. Dynamic ids are **not** re-seeded: kian does not invent members it has not been told about this process lifetime |
+| **Kian restart** | process start | the directory is empty; registry rows persist with stale timestamps, so every id reads offline. The last-declared description/version survive on the registry row and are served for registry-only ids with `declaration_stale: true` (ADR-025) until the worker re-registers — then the live declaration replaces the cache. Dynamic ids are **not** re-seeded: kian does not invent members it has not been told about this process lifetime |
 | **Kian upgrade** | new binary, same identity | same as a restart, plus the version policy (§7). No worker-side config change is ever required |
 | **Worker restart / upgrade** | the worker process restarts with the same id | it reconnects with bounded backoff and re-registers; the binding is unchanged; subsequent commands go to the same id |
 | **Version mismatch** | a peer whose protocol revision differs | typed refusal, one audit line, no state change, no half-compatible connection (§7) |
@@ -88,8 +92,9 @@ everything else is offline. The durable projection never carries a third state.
 
 Membership facts never enter the event stream: no `worker/joined`, `worker/left` or similar kind, and
 no membership column anywhere durable except the existing registry row (id, addr, last heartbeat,
-state). **Stale ids are never pruned** in this contract: a previously known id stays visible and
-offline, which is what makes §3's offline-known binding honest. (A TTL would make a known worker look
+state, and the two last-declared cache columns of ADR-025 — declarations, not liveness). **Stale ids
+are never pruned** in this contract: a previously known id stays visible and offline, which is what
+makes §3's offline-known binding honest. (A TTL would make a known worker look
 unknown and turn an honest park into a refusal — the reason the TTL question is deferred.)
 
 ## 3. Binding contract
@@ -148,7 +153,10 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   is **not** configuration-only and **not** prompt content.
 - **`list_workers`** (Router-only, read-only, no arguments) returns the live catalog: id, optional
   description, state (`online`/`offline`/`draining`), and the live bound session/thread when one
-  exists. Rows are ordered by id. It writes nothing — no event, no row, no wake.
+  exists. A registry-only id's description/version come from the last-declared cache and the row
+  carries additive `"declaration_stale": true` (ADR-025); a live registration's row omits the flag
+  and is byte-identical to the pre-cache result. Rows are ordered by id. It writes nothing — no
+  event, no row, no wake.
 - **Spawn validation order** (every refusal precedes every side effect): argument shape → feature off
   (nothing configured) → unknown id (refusal names the known ids) → 1:1 busy (names the owning session
   and thread) → offline-known allowed (with the queue note) → follow-up ownership → speculation cap →
@@ -216,7 +224,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 | Bad/absent token | comparison | typed refusal + audit, one attempt per connection, per-peer bound, rate-limited closes beyond the window | that peer |
 | Listener configured but token env unset/blank | startup validation | the whole `serve` process refuses to start | whole process (configured capability) |
 | Public/non-private bind without `allow_public` | startup validation | the whole `serve` process refuses to start | whole process |
-| Kian crash / restart | process start | directory empty, registry rows stale ⇒ every worker reads offline until it re-registers; bindings rebuild from streams; rows re-drive | all workers, transiently |
+| Kian crash / restart | process start | directory empty, registry rows stale ⇒ every worker reads offline; the last-declared cache keeps the description/version (flagged stale) for registry-only ids; bindings rebuild from streams; rows re-drive | all workers, transiently |
 | Listener shutdown / drain | shutdown | live members get a `bye`, routes detach, rows stay parked; registering peers are refused | all workers |
 | Fs path escapes the root (`..`) | server-side lexical check before enqueue; worker-side re-check | honest `InvalidCall` (no row) or a typed `io` error result — never a write outside the intended path | that call |
 | Fs body over 1 MiB / non-UTF-8 read | worker-side bound / decode | typed `io` error surfaced as the local `{"error": …}` tool result; no truncation, no partial write | that call |
@@ -241,7 +249,9 @@ seam.
   `--workspace-root`, lexical `..` guard; [ADR-023](decisions/ADR-023-worker-fs-tools.md)). Binary
   bodies, streaming/large files, `fs_edit`/glob, a symlink-proof sandbox and fs tools on the Router
   or plain sessions are out of scope.
-- **No membership data in prompts or tool schemas** — `list_workers` results only.
+- **No membership data in prompts or tool schemas** — `list_workers` results only. The last-declared
+  cache is non-authoritative: the live directory wins, a cached row is labeled `declaration_stale`,
+  and no membership decision (identity, state, bindability, routing, spawn legality) reads it.
 - **No public listener**; no hosted multi-tenant concerns.
 - **No new event kind, table, migration, HTTP route or ops method.**
 - Deployment (Vultr, WeChat) remains the owner's later discussion.
@@ -271,6 +281,7 @@ seam.
 | A wire frame/field/error/reason, `PROTOCOL_VERSION` | no — [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 | both halves' goldens, SDK fixtures if any, this file's §7 pointer if the policy changes |
 | An event payload key (`exec_worker`, `thread/started`) | no — [EVENT-MODEL](EVENT-MODEL.md) §3/§4.2 | code, tests, DESIGN §4.1 |
 | The worker command families (exec, fs) / dispatch semantics | **yes** — this file | API-CONTRACT §8 for frames; code + L2 tests; ADR when the family set changes |
+| A durable registry column / last-declared cache change | **yes** — this file | ADR + kian-exec migration; code + store tests; `list_workers`/CLI surfaces |
 | A new event kind or authoritative table | **owner gate** (ADR + EVENT-MODEL) — not a spec decision | — |
 | Assembly/HOW, crate placement, config surface, CLI shape | no — [DESIGN](DESIGN.md) §4.3/§4.7 | config validation tests, docs map |
 | Rationale, alternatives, deferred seams | no — a new ADR (append-only; supersede by linking) | — |

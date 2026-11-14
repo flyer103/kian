@@ -940,6 +940,62 @@ async fn non_allowlisted_senders_never_become_reachable_send_targets() {
     std::fs::remove_file(cred).ok();
 }
 
+/// ADR-026: the reply token survives a channel rebuild (the restart
+/// bridge) through the best-effort state file; the revived channel can
+/// send without a new inbound message.
+#[tokio::test]
+async fn a_rebuilt_channel_uses_the_persisted_context_token() {
+    force_no_proxy();
+    let mock = IlinkMock::new();
+    let base = mock.clone().serve().await;
+    let cred = temp_credential_path("state-revive");
+    write_credentials(&cred, "fake-bot-token-1");
+    let state_file =
+        std::env::temp_dir().join(format!("kian-wechat-state-{}.json", uuid::Uuid::new_v4()));
+    let mut config = wechat_config(&base, &cred);
+    config.context_state_file = state_file.clone();
+
+    // Seed one inbound through the first channel instance.
+    mock.push_updates(json!({
+        "ret": 0, "errcode": 0,
+        "msgs": [wx_message(json!("m-seed"), USER, "hello bot", "ctx-token-persist")],
+        "get_updates_buf": "c-seed",
+    }));
+    let channel = WechatChannel::new("wechat", config.clone()).expect("channel");
+    let mut stream = channel.subscribe();
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("seed event")
+        .expect("stream open");
+    assert_eq!(event.event_id, "m-seed");
+    // The persist happens on a blocking task; wait for the file.
+    let persisted = within(5, || {
+        std::fs::metadata(&state_file).ok().map(|m| m.len() > 0)
+    })
+    .await;
+    assert_eq!(persisted, Some(true), "state file written");
+
+    // A new channel over the same state file (the restart) sees the token
+    // without any new inbound message.
+    let revived = WechatChannel::new("wechat", config).expect("revived channel");
+    assert_eq!(
+        revived.cached_context_token(USER).as_deref(),
+        Some("ctx-token-persist")
+    );
+    let receipt = revived
+        .send(ChannelDelivery {
+            channel: "wechat".into(),
+            target: json!({"user_id": USER}),
+            content: json!("reply after restart"),
+        })
+        .await
+        .expect("reply with the persisted token");
+    assert!(!receipt.message_id.is_empty());
+    assert!(mock.request_count("/ilink/bot/sendmessage") >= 1);
+    std::fs::remove_file(cred).ok();
+    std::fs::remove_file(state_file).ok();
+}
+
 #[tokio::test]
 async fn a_send_without_a_cached_token_is_honestly_unavailable() {
     force_no_proxy();

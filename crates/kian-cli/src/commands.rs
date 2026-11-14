@@ -963,13 +963,21 @@ fn render_tickets(rows: &[TicketRow]) -> String {
 /// are never pruned, M5) with its derived state and, when a live bound
 /// worker session exists, the owning session/thread.
 ///
-/// `description` and `protocol_version` are **absent by construction**
-/// (spec D-L2/M4): they live only in the in-process runtime directory,
-/// and the CLI is a separate process reading the durable projection —
-/// a recorded boundary, not a bug.
+/// `description` and `protocol_version` are the worker's **last
+/// declared** facts from the durable registry cache (ADR-025): they are
+/// present when the worker declared them and omitted for ids known only
+/// from config. The live runtime directory (with its freshness) is a
+/// different process's view; this CLI reads the durable projection.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct WorkerRow {
     pub id: String,
+    /// Last-declared description from the durable registry cache
+    /// (ADR-025); omitted when the worker never declared one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Last-declared protocol revision from the durable cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
     /// `online` iff the registry row says `online` **and**
     /// `now - last_heartbeat_ms <= offline_after_ms` for this id (the
     /// conjunction of the transport view and freshness — D-L2).
@@ -1098,6 +1106,8 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
                 .unwrap_or((None, None));
             WorkerRow {
                 id: row.endpoint_id,
+                description: row.description,
+                protocol_version: row.protocol_version,
                 state,
                 last_seen_ms: row.last_heartbeat_ms,
                 bound_session,
@@ -1116,9 +1126,7 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
 /// Renders the board (deterministic: a pure function of the rows).
 fn render_workers(rows: &[WorkerRow], now_ms: u64) -> String {
     if rows.is_empty() {
-        return "no workers registered in this store \
-            (description and protocol version are runtime-only facts — absent by design)\n"
-            .into();
+        return "no workers registered in this store\n".into();
     }
     let mut out = format!(
         "{:<24} {:<8} {:>18} {}\n",

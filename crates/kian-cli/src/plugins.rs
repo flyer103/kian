@@ -307,8 +307,18 @@ impl RegistrationSink for ExecRegistrationSink {
         Box::pin(async move {
             let id = worker.id.clone();
             let generation = worker.generation;
+            let description = worker.description.clone();
+            let protocol_version = worker.version;
             let transport = RouteTransport::Registered(RegisteredTransport::new(worker));
-            backend.attach_route(id, transport, generation).await;
+            backend
+                .attach_route_with_declaration(
+                    id,
+                    transport,
+                    generation,
+                    description.as_deref(),
+                    protocol_version,
+                )
+                .await;
         })
     }
 

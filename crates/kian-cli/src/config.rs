@@ -1867,6 +1867,13 @@ pub struct WechatChannelSection {
     /// request ~35 s; the client waits longer).
     #[serde(default = "default_wechat_poll_timeout_ms")]
     pub poll_timeout_ms: u64,
+    /// Optional best-effort reply-token state file (ADR-026); defaults
+    /// to `<credentials_file>.context-state.json`.
+    #[serde(default)]
+    pub context_state_file: Option<String>,
+    /// How long a persisted reply token stays usable (default 1 h).
+    #[serde(default = "default_wechat_context_ttl_ms")]
+    pub context_ttl_ms: u64,
 }
 
 fn default_wechat_api_base() -> String {
@@ -1875,6 +1882,10 @@ fn default_wechat_api_base() -> String {
 
 fn default_wechat_poll_timeout_ms() -> u64 {
     kian_superagent::wechat::DEFAULT_POLL_TIMEOUT.as_millis() as u64
+}
+
+fn default_wechat_context_ttl_ms() -> u64 {
+    kian_superagent::wechat::context_state::DEFAULT_CONTEXT_TTL.as_millis() as u64
 }
 
 impl WechatChannelSection {
@@ -1889,6 +1900,15 @@ impl WechatChannelSection {
             self.topics.clone(),
         );
         config.poll_timeout = std::time::Duration::from_millis(self.poll_timeout_ms);
+        config.context_ttl = std::time::Duration::from_millis(self.context_ttl_ms);
+        if let Some(path) = self
+            .context_state_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            config.context_state_file = path.into();
+        }
         config
             .validate()
             .map(|_| ())
@@ -2775,6 +2795,21 @@ impl ServeConfig {
                             return Err(invalid(format!(
                                 "superagent.channels `{name}`.wechat.poll_timeout_ms must be \
                                  > 0 (above the server's ~35 s hold)"
+                            )));
+                        }
+                        if section.context_ttl_ms == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.context_ttl_ms must be > 0"
+                            )));
+                        }
+                        if section
+                            .context_state_file
+                            .as_deref()
+                            .is_some_and(|p| p.trim().is_empty())
+                        {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.wechat.context_state_file must \
+                                 not be blank when present (omit it to derive the default)"
                             )));
                         }
                         let api_base = section.api_base.trim();
@@ -4555,23 +4590,32 @@ recovery:
 
     #[test]
     fn wechat_channel_config_parses_with_defaults() {
-        let (section, _path) = wechat_section_with_credentials("defaults");
+        let (section, cred) = wechat_section_with_credentials("defaults");
         let cfg = ServeConfig::parse(&wechat_yaml(&section)).expect("wechat config parses");
         let sa = cfg.superagent.as_ref().unwrap();
         let wechat = sa.channels["wechat"].wechat.as_ref().expect("section");
         assert_eq!(wechat.api_base, "https://ilinkai.weixin.qq.com");
         assert_eq!(wechat.poll_timeout_ms, 45_000);
+        assert_eq!(wechat.context_ttl_ms, 3_600_000);
         assert_eq!(
             wechat.topics,
             BTreeMap::from([("oUSER@im.wechat".to_string(), "wechat".to_string())])
         );
+        let runtime = wechat.to_runtime("wechat").expect("credentials exist");
+        assert_eq!(runtime.context_ttl, std::time::Duration::from_secs(3600));
+        assert_eq!(
+            runtime.context_state_file,
+            kian_superagent::wechat::context_state::default_state_path(&cred),
+            "default state file sits beside the credential file"
+        );
 
-        // Explicit overrides parse.
-        let overrides = format!(
-            "      wechat:\n        api_base: \"http://127.0.0.1:9\"\n        poll_timeout_ms: 5000\n        credentials_file: \"{}\"\n        topics:\n          oUSER@im.wechat: wechat\n",
-            std::env::temp_dir()
-                .join("kian-wechat-unused.json")
-                .display()
+        // Explicit overrides parse and reach the runtime config.
+        let state = format!("{}.state", cred.display());
+        let overrides = section.replace(
+            "      wechat:\n",
+            &format!(
+                "      wechat:\n        api_base: \"http://127.0.0.1:9\"\n        poll_timeout_ms: 5000\n        context_ttl_ms: 60000\n        context_state_file: \"{state}\"\n"
+            ),
         );
         let cfg = ServeConfig::parse(&wechat_yaml(&overrides)).expect("overrides parse");
         let wechat = cfg.superagent.as_ref().unwrap().channels["wechat"]
@@ -4580,6 +4624,10 @@ recovery:
             .unwrap();
         assert_eq!(wechat.api_base, "http://127.0.0.1:9");
         assert_eq!(wechat.poll_timeout_ms, 5_000);
+        assert_eq!(wechat.context_ttl_ms, 60_000);
+        let runtime = wechat.to_runtime("wechat").expect("credentials exist");
+        assert_eq!(runtime.context_ttl, std::time::Duration::from_secs(60));
+        assert_eq!(runtime.context_state_file, std::path::PathBuf::from(&state));
     }
 
     #[test]
@@ -4642,6 +4690,40 @@ recovery:
             let err = ServeConfig::parse(&wechat_yaml(extra)).unwrap_err();
             assert!(err.to_string().contains(needle), "unexpected: {err}");
         }
+    }
+
+    #[test]
+    fn wechat_context_state_is_fail_closed() {
+        // Parse-level: a zero TTL and a blank explicit path refuse.
+        for (extra, needle) in [
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        context_ttl_ms: 0\n        topics:\n          oU: wechat\n",
+                "context_ttl_ms must be > 0",
+            ),
+            (
+                "      wechat:\n        credentials_file: ./x.json\n        context_state_file: \"  \"\n        topics:\n          oU: wechat\n",
+                "context_state_file must",
+            ),
+        ] {
+            let err = ServeConfig::parse(&wechat_yaml(extra)).unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+        // Runtime-level: the state file may not be the credential file.
+        let (section, cred) = wechat_section_with_credentials("state-same");
+        let same = format!(
+            "      wechat:\n        credentials_file: \"{}\"\n        context_state_file: \"{}\"\n        topics:\n          oUSER@im.wechat: wechat\n",
+            cred.display(),
+            cred.display()
+        );
+        let cfg = ServeConfig::parse(&wechat_yaml(&same)).expect("shape parses");
+        let err = cfg.superagent.as_ref().unwrap().channels["wechat"]
+            .wechat
+            .as_ref()
+            .unwrap()
+            .to_runtime("wechat")
+            .unwrap_err();
+        assert!(err.to_string().contains("must differ"), "{err}");
+        let _ = section;
     }
 
     #[test]

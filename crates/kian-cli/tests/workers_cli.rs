@@ -24,7 +24,14 @@ async fn seeded_registry() -> PathBuf {
     // Fresh online row, stale online row (reads offline per D-L2), and
     // an already-offline row.
     store
-        .upsert_endpoint("builder-1", "127.0.0.1:50001", now, "online")
+        .upsert_endpoint_with_declaration(
+            "builder-1",
+            "127.0.0.1:50001",
+            now,
+            "online",
+            Some("linux builder"),
+            2,
+        )
         .await
         .unwrap();
     store
@@ -94,12 +101,21 @@ async fn workers_text_and_json_agree() {
             ("zbox".into(), "offline".into()),
         ]
     );
-    // description/protocol_version absent by construction (D-L2/M4).
+    // ADR-025: the last-declared cache is visible for the worker that
+    // declared it; workers with no declaration keep the fields absent.
     for row in rows {
-        assert!(row.get("description").is_none());
-        assert!(row.get("protocol_version").is_none());
         assert!(row["bound_session"].is_null());
         assert!(row["bound_thread"].is_null());
+        match row["id"].as_str().unwrap() {
+            "builder-1" => {
+                assert_eq!(row["description"], "linux builder");
+                assert_eq!(row["protocol_version"], 2);
+            }
+            _ => {
+                assert!(row.get("description").is_none());
+                assert!(row.get("protocol_version").is_none());
+            }
+        }
     }
 
     // The text board carries exactly the same facts.

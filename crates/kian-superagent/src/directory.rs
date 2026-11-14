@@ -65,8 +65,12 @@ pub struct MemberView {
     pub id: String,
     pub description: Option<String>,
     /// The worker's declared protocol revision — `None` when only the
-    /// durable registry row knows the id (no migration, spec M4).
+    /// durable registry row knows the id.
     pub version: Option<u32>,
+    /// `true` when `description`/`version` come from the durable
+    /// last-declared cache (the worker is not connected this process
+    /// lifetime) — ADR-025. Live directory facts are always `false`.
+    pub declaration_stale: bool,
     pub state: MemberState,
     /// The liveness clock the state was computed against (server
     /// clock, ms since epoch; 0 when unknown).
