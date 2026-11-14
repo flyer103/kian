@@ -469,6 +469,7 @@ later channel inputs were admitted but never consumed.
 | Budget scope | `ReActConfig.budget_scope: Lifetime | PerEpisode`; only the super-agent assembly's Router and watchdog sides select `PerEpisode`; worker/plain loops keep the legacy lifetime scope (byte- and behavior-identical) | landed |
 | Park, not freeze | On exhaustion the loop emits `EPISODE_BUDGET_STOP_REASON_PREFIX`; the `RouterDriver` parks (the idle-final-answer path) instead of propagating `Stopped`, so no `session/ended` is written and the next input starts a fresh episode. `turn/start` keeps the lifetime iteration number for audit/replay | landed |
 | Observability | One warn audit line per park plus the additive `superagent.router_batching.episode_budget_parks` metric; no new event kind, wire or table | landed |
+| Empty episode | A resident iteration with no eligible input and a context ending on an assistant message settles without a provider call (ADR-027); tool-result continuations and newly taken inputs proceed; non-resident loops unchanged. This removes the empty-batch `reasoning_content` 400 that could follow a no-reasoning assistant turn | landed |
 | Explicit terminal ends | cancel/fatal still end terminally; the boot-time re-arm remains the recovery. Runtime re-arm for explicit ends is a recorded deferred follow-up (needs a runtime-rebindable Router binding across subscriptions, driver, tools and worker reports) | landed (boundary) |
 
 ### Deferred (unchanged)

@@ -1276,13 +1276,17 @@ Gates on the exact committed tree: build / `cargo test --workspace` (122 suites,
   mock inputs the Router parked three times and stayed `running` (delivered 2 of 3 before the next
   finding); the stranded messages from the incident were lost (admitted on the frozen stream) and
   were resent.
-- **Residual finding (independent of ADR-024)** — after a reply whose assistant turn carried no
-  `reasoning_content` (the model can omit it on trivial turns), the Router's empty-batch turn sends
-  a request whose history ends on that assistant message and DeepSeek rejects it with the same 400;
-  it surfaces as one soft failure (`failed` → idle) and the next input recovers, so replies still
-  arrive but the session churns. This is an empty-batch provider call, not a budget issue; the
-  follow-up is to skip a judge turn when the batch is empty (or disable thinking), tracked
-  separately. L2 (scripted provider) proves the budget fix 3/3; the live 2/3 is this residual.
+- **Residual fixed (ADR-027)** — after a reply whose assistant turn carried no
+  `reasoning_content` (the model can omit it on trivial turns), the Router's empty-batch turn sent
+  a request whose history ended on that assistant message and DeepSeek rejected it with the same
+  400; the session went `failed → idle` and the next input recovered, so replies arrived but the
+  session churned. A resident ReAct iteration now settles **without a provider call** when
+  `take_eligible_inputs` returned nothing and the context ends on an assistant message (tool-result
+  continuations and new inputs proceed; worker/plain loops unchanged). No event, wire or config
+  change; one debug audit line. L1 predicate test; live re-check: two messages after the redeploy
+  delivered both replies with zero `soft failure` lines over the following windows, and a `kian`
+  restart with the live Router added no `step/request` and no 400 (previously the empty-batch turn
+  fired there); workers re-registered, session still `running`.
 
 ## 2026-11-14 — WeChat details reply is delivered whole (no truncation)
 
@@ -1354,5 +1358,4 @@ state; both are isolated from the resident-budget change on a separate branch.
   ADR-025 (worker cache) and ADR-026 (WeChat reply tokens). Not deployed; the live `context_token`
   TTL across a real WeChat restart and a live post-restart cold catalog are unverified until this
   branch is deployed.
-
 

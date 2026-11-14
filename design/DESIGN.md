@@ -1028,8 +1028,11 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
  The successor starts with a fresh in-context view (one possible re-draft across the succession
  boundary — observable, not hidden). **Resident budget scope (ADR-024):** a resident loop's
  iteration budget is per episode, so a long-lived Router no longer chains successors at every
- budget exhaustion and no longer freezes on one; explicit terminal ends (cancel/fatal) still
- re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
+ budget exhaustion and no longer freezes on one. An empty episode — no eligible input and a
+ context ending on an assistant message — settles without a provider call (ADR-027), so a resident
+ never spends a judge turn (or trips a thinking-mode `reasoning_content` 400) on "nothing pending";
+ a tool-result continuation and every newly taken input still proceed. Explicit terminal ends
+ (cancel/fatal) still re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
  runtime-rebindable Router binding shared by subscriptions, driver routing, tools and worker
  completion reports, which is a separate semantic change.
 

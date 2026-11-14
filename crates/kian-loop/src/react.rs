@@ -382,12 +382,30 @@ impl Inner {
         // 1. Promote newly eligible inputs at this safe boundary (we are
         //    between provider turns here; DrainCtx refuses otherwise —
         //    steer never interleaves an in-flight turn).
-        let _ = ctx.take_eligible_inputs().await?;
+        let taken = ctx.take_eligible_inputs().await?;
 
         // 2. Rebuild the truth and derive the model context (A2/A3).
         let mut events = ctx.events().await?;
         let binding = self.binding_for(ctx, &mut events).await?;
         let messages = derive_model_context(&events)?;
+
+        // (ADR-025) A resident episode with no eligible input and a context
+        // that ends on an assistant message has nothing to judge: settle
+        // (the RouterDriver parks) without spending a provider call. A
+        // tool-result continuation ends on `tool` and still proceeds; a new
+        // input is `taken` and still proceeds. Non-resident loops are
+        // untouched.
+        if resident_empty_batch(
+            self.config.budget_scope,
+            taken.is_empty(),
+            messages.last().map(|m| m.role.as_str()),
+        ) {
+            tracing::debug!(
+                session = %ctx.session().0,
+                "resident empty batch: settling without a provider call (ADR-025)"
+            );
+            return Ok(Flow::Settled);
+        }
 
         // 3. Iteration counter — derived from the stream, so the budget
         //    survives episodes and restarts (constraint 1 in spirit).
@@ -1096,6 +1114,14 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
     Some(string_or_compact("assistant", content))
 }
 
+/// (ADR-025) Whether a resident iteration has no work to judge: the loop is
+/// episode-scoped, `take_eligible_inputs` returned nothing, and the context
+/// ends on an assistant message (the empty-batch shape). A tool-result
+/// continuation (last role `tool`) or any newly taken input is real work.
+fn resident_empty_batch(scope: BudgetScope, taken_empty: bool, last_role: Option<&str>) -> bool {
+    scope == BudgetScope::PerEpisode && taken_empty && last_role == Some("assistant")
+}
+
 /// Maps a provider error onto the classifier's class names (
 /// vocabulary) for the policy lookup.
 fn error_class(e: &ProviderError) -> &'static str {
@@ -1469,6 +1495,39 @@ mod tests {
     /// ADR-024: the budget scope selects which counter the limit applies
     /// to — the lifetime `turn/start` count (worker/plain) or the current
     /// episode's count (resident loops).
+    /// (ADR-025) Only a resident episode ending on an assistant message with
+    /// nothing taken is skipped; tool-result continuations, new inputs and
+    /// lifetime loops are real work.
+    #[test]
+    fn resident_empty_batch_is_skipped_only_for_resident_assistant_tails() {
+        use super::resident_empty_batch;
+        assert!(resident_empty_batch(
+            BudgetScope::PerEpisode,
+            true,
+            Some("assistant")
+        ));
+        assert!(!resident_empty_batch(
+            BudgetScope::PerEpisode,
+            false,
+            Some("assistant")
+        ));
+        assert!(!resident_empty_batch(
+            BudgetScope::PerEpisode,
+            true,
+            Some("tool")
+        ));
+        assert!(!resident_empty_batch(
+            BudgetScope::PerEpisode,
+            true,
+            Some("user")
+        ));
+        assert!(!resident_empty_batch(
+            BudgetScope::Lifetime,
+            true,
+            Some("assistant")
+        ));
+    }
+
     #[test]
     fn budget_scope_selects_lifetime_or_episode_counter() {
         assert_eq!(BudgetScope::Lifetime.used(9, 0), 9);
