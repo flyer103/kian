@@ -1167,3 +1167,84 @@ stays 22), no new table, no migration, no new HTTP surface, no core change.**
 Gates on the exact committed tree: build / `cargo test --workspace` (122 suites, 1489 passed,
 0 failed) / clippy `--workspace --all-targets -D warnings` / fmt `--all --check` /
 `cargo test -p kian-cli --test docs_map` (6 tests) all green.
+
+## 2026-11-14 — README corrections + owner-run remote deployment (documentation only)
+
+- **README (corrected)** — `exec_worker` is required whenever worker membership is on: the R11
+  sentence "with exactly one worker the argument may be omitted" was superseded by R12 (the schema
+  is a plain string and the single-pin default is refused) but survived in the README. The worker
+  section now states how a laptop reaches a private listener (SSH tunnel, or a Tailscale
+  `100.64.0.0/10` address — in the private set; `workers.allow_public` is the recorded escape hatch,
+  not the deployment shape), and the provider note says an OpenAI-compatible gateway is just another
+  `base_url` because the provider contract is chat-completions + SSE. `docs_map` green (6 tests). No
+  code, config-schema, event, wire, or crate change.
+- **Owner-run L3 (infrastructure only — no repo artifact, no deployment tooling)** — a
+  `kian serve` on a Vultr Ubuntu 22.04 x86_64 host with the registration listener, HTTP API and
+  vadis all loopback-bound (UFW: 22 only); vadis as the OpenAI-compatible gateway (the `deepseek`
+  provider, model `deepseek/deepseek-flash`); a `kiand` builder dynamically registered on the same
+  host; a laptop `kiand` registered through an SSH tunnel; the WeChat iLink channel. Observed live:
+  a WeChat message → Router judge → `spawn_worker` → real `exec` on the selected machine → WeChat
+  reply; both joins in `/metrics`; a laptop `kill -9` offlined `mac-mini` and a restart re-registered
+  it; a `kian` restart re-registered both workers within seconds with the bindings rebuilt from the
+  streams. Binaries cross-built on the workstation (cargo-zigbuild, `x86_64-unknown-linux-gnu`) —
+  deployment pieces stayed out of the repository by request.
+- **Known issue (provider)** — DeepSeek V4 thinking mode requires the assistant's
+  `reasoning_content` to be replayed; kian does not carry it. A resident-Router turn whose history
+  ends on an assistant message (the empty-batch judge turn) is therefore rejected upstream with a
+  400 `format_error`, surfacing as one soft failure that the next admitted input recovers. One
+  occurrence in the run; not changed here (a fix is a provider-body/replay decision, not a
+  deployment knob). Evidence: the vadis trace records `upstream_status: 400` and DeepSeek's
+  `reasoning_content ... must be passed back`.
+- **Observation (read-model projection)** — `kian tickets` reports completed worker sessions as
+  `queued`. The spawn path claims the drain (seq 2) before admitting the delegation input (seq 3),
+  so stage arm 5 ("no `drain/claimed` after the last input") fires before the terminal-completed
+  arm; reproduced on all three sessions of the run, while `session inspect` shows them `completed`.
+  Not changed here (it is a bundle projection question, not an event or wire fact).
+- **Unverified (honest)** — WeChat token expiry (`errcode -14`) and the credential-mtime resume were
+  not exercised; tunnel/worker persistence on the laptop is a shell process, not a supervised
+  service; the deployment is single-operator with the shared worker token (mTLS stays R13); no
+  postgres, no multi-replica, no public listener.
+
+## 2026-11-14 — reasoning replay + worker filesystem tools (KiandProto v2)
+
+- **Reasoning replay (ADR-022, landed)** — DeepSeek V4 thinking mode requires the assistant's
+  `reasoning_content` to be replayed; kian dropped it, so a resident-Router turn ending on an
+  assistant message (the empty-batch judge turn) was rejected 400. `assistant/message` content now
+  carries an optional `reasoning_content` (EVENT-MODEL §4.1); the ReAct stream assembler captures
+  `delta.reasoning_content` in arrival order and the message → chat conversion re-emits the
+  top-level wire field. A legacy message without the key produces byte-identical request bytes:
+  `FROZEN_CHAT_BODY_SHA256` is unchanged and the golden test passes. L1: delta assembly + payload
+  + replay test; L3: a live Router request replayed 1,479 bytes of assistant reasoning and the
+  empty-batch 400 disappeared (the live run no longer logs it). Cost note: replayed reasoning is
+  input tokens on thinking sessions only; no trimming or synthesis.
+- **Worker filesystem tools (ADR-023, landed)** — a bound worker session's
+  `fs_list`/`fs_read`/`fs_write` now execute on the worker's machine. KiandProto v2 adds the
+  `fs_command`/`fs_result` frame pair (`PROTOCOL_VERSION = 2`; exec frames keep their v1 bytes);
+  the durable queue migration v3 adds `kind TEXT NOT NULL DEFAULT 'exec'` so every pre-v3 row
+  decodes as exec and re-drives unchanged; `RemoteFsTool` mounts the three local-identical
+  schemas on a bound worker side (filtered by the agent's `tools:`), the refusing side mounts the
+  same names with an honest refusal, and `kiand --workspace-root` (default cwd, must exist) plus a
+  shared lexical `..` guard and 1 MiB read/write bounds contain the surface. At-least-once applies
+  to fs writes (same path/content on a re-drive). L1: fs execution, path/limits, queue
+  round-trip + legacy-row decode, schema parity; L2: a real `kiand` over TCP serving
+  write→read→list, an honest missing-file error and a no-row refusal.
+- **Deployment** — the owner instance was upgraded kian-first to v2 (builder worker and local
+  worker re-registered; the WeChat Router path stayed alive). Cross-built with cargo-zigbuild; no
+  deployment artifacts in the repo. Honest gap: the v1→v2 window was not exercised with a real old
+  worker binary (the typed refusal and the queue's legacy-row decode are tested), and the worker fs
+  round-trip over WeChat is verified after the redeploy (recorded below once observed).
+- **L3 owner verification (after the v2 redeploy)** — a Router-dispatched task on
+  `vultr-builder` used `fs_write` (`{"written":true}`) then `fs_read` (`{"content":"v2-ok"}`) and the
+  file appeared at `/srv/work/kian-fs-check.txt`; a second task on the local `mac-mini` worker used
+  `fs_write`/`fs_read` and created the file under the laptop workspace
+  (`kian-fs-local.txt` = `mac-ok`). Reasoning replay is observable in the live requests: a worker
+  session replayed 239/17/621-byte assistant reasoning across its later turns, and the Router
+  replayed 1,479 bytes of reasoning on a later turn; no `400`/`reasoning_content` soft failure
+  appeared after the redeploy. The WeChat long-poll connection was live after the restart.
+- **Incident (honest)** — mid-run the Vultr host stopped answering SSH (TCP accepted, no sshd
+  banner) for several minutes; the owner recovered access and the deployment was re-verified. The
+  host was healthy after recovery (load 0.06, 7 GB free) and no kian re-drive storm was visible in
+  the journal; the cause was not established, so it is recorded as an unresolved operational
+  incident, not attributed to the v2 change.
+- **Verification note** — full workspace tests green (including the new L2 fs suite), clippy
+  `--workspace --all-targets -D warnings` green, fmt check green, `docs_map` 6/6 green.

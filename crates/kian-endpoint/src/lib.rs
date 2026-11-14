@@ -19,6 +19,7 @@
 //! data-egress tiering, no credential-less use here yet.
 pub mod endpoint;
 pub mod executor;
+pub mod fs;
 pub mod proto;
 pub mod register;
 pub mod tcp;

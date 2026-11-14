@@ -176,10 +176,10 @@ fn qa_ok_result() -> ExecResult {
 
 #[test]
 fn qa_frame_goldens_v1_value_equality_and_round_trip() {
-    assert_eq!(PROTOCOL_VERSION, 1, "P1: server half is v1");
+    assert_eq!(PROTOCOL_VERSION, 2, "P1: server half is v2");
 
     // register, full: exact value shape (description present).
-    let full = qa_register("builder-1", "t0ken-not-a-secret", 1);
+    let full = qa_register("builder-1", "t0ken-not-a-secret", PROTOCOL_VERSION);
     assert_eq!(
         serde_json::to_value(&full).unwrap(),
         serde_json::json!({
@@ -187,7 +187,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
             "endpoint_id": "builder-1",
             "description": "qa probe worker",
             "token": "t0ken-not-a-secret",
-            "version": 1,
+            "version": 2,
             "max_concurrent": 3,
         })
     );
@@ -196,7 +196,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
         endpoint_id: "builder-1".into(),
         description: None,
         token: RegisterToken::new("t0ken-not-a-secret".into()),
-        version: 1,
+        version: PROTOCOL_VERSION,
         max_concurrent: 4,
     };
     let bare_value = serde_json::to_value(&bare).unwrap();
@@ -206,7 +206,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
             "type": "register",
             "endpoint_id": "builder-1",
             "token": "t0ken-not-a-secret",
-            "version": 1,
+            "version": 2,
             "max_concurrent": 4,
         })
     );
@@ -230,13 +230,13 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
     assert_eq!(
         serde_json::to_value(&ServerFrame::Rejected {
             reason: RefusalReason::VersionMismatch,
-            detail: Some("server speaks KiandProto 1; worker announced 0".into()),
+            detail: Some("server speaks KiandProto 2; worker announced 0".into()),
         })
         .unwrap(),
         serde_json::json!({
             "type": "rejected",
             "reason": "version_mismatch",
-            "detail": "server speaks KiandProto 1; worker announced 0",
+            "detail": "server speaks KiandProto 2; worker announced 0",
         })
     );
     for (reason, wire) in [
@@ -267,11 +267,11 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
     // welcome keeps the null heartbeat_ms form (frozen v0 byte shape).
     assert_eq!(
         serde_json::to_value(&ServerFrame::Welcome {
-            v: 1,
+            v: PROTOCOL_VERSION,
             heartbeat_ms: None,
         })
         .unwrap(),
-        serde_json::json!({"type": "welcome", "v": 1, "heartbeat_ms": null})
+        serde_json::json!({"type": "welcome", "v": 2, "heartbeat_ms": null})
     );
 
     // encode → decode line round-trip over every endpoint-frame variant.
@@ -280,7 +280,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
         bare,
         EndpointFrame::Bye,
         EndpointFrame::Hello {
-            v: 1,
+            v: PROTOCOL_VERSION,
             endpoint_id: "dev".into(),
             max_concurrent: 4,
         },
@@ -304,11 +304,11 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
     }
     let server_samples = vec![
         ServerFrame::Welcome {
-            v: 1,
+            v: PROTOCOL_VERSION,
             heartbeat_ms: Some(10_000),
         },
         ServerFrame::Welcome {
-            v: 1,
+            v: PROTOCOL_VERSION,
             heartbeat_ms: None,
         },
         ServerFrame::Command {
@@ -336,7 +336,7 @@ fn qa_register_token_redacts_on_every_print_path() {
     assert!(!format!("{token:?}").contains("qa-secret"));
     assert!(!format!("{token}").contains("qa-secret"));
     assert!(format!("{token:?}").contains("<redacted>"));
-    let frame = qa_register("w", "qa-secret-value-do-not-print", 1);
+    let frame = qa_register("w", "qa-secret-value-do-not-print", PROTOCOL_VERSION);
     let debug = format!("{frame:?}");
     assert!(!debug.contains("qa-secret"), "frame debug leaks: {debug}");
     // Serialization still carries the bare value (it must — the wire).
@@ -358,7 +358,9 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
 
     // bad token: typed refusal, no detail, connection closed.
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("qa-w1", "wrong-token", 1)).await;
+    client
+        .send(&qa_register("qa-w1", "wrong-token", PROTOCOL_VERSION))
+        .await;
     match client.recv().await {
         Some(ServerFrame::Rejected {
             reason: RefusalReason::BadToken,
@@ -378,7 +380,7 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
             reason: RefusalReason::VersionMismatch,
             detail: Some(text),
         }) => assert_eq!(
-            text, "server speaks KiandProto 1; worker announced 0",
+            text, "server speaks KiandProto 2; worker announced 0",
             "P10: fixed template, versions only"
         ),
         other => panic!("version_mismatch must be typed, got {other:?}"),
@@ -388,7 +390,7 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
     // static pin collision: duplicate_static, static entry stays the pin.
     let mut client = QaClient::connect(addr).await;
     client
-        .send(&qa_register("qa-static-pin", QA_TOKEN, 1))
+        .send(&qa_register("qa-static-pin", QA_TOKEN, PROTOCOL_VERSION))
         .await;
     match client.recv().await {
         Some(ServerFrame::Rejected {
@@ -401,7 +403,9 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
 
     // malformed id (control character): id_conflict (the shape defence).
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("bad\u{1}id", QA_TOKEN, 1)).await;
+    client
+        .send(&qa_register("bad\u{1}id", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     match client.recv().await {
         Some(ServerFrame::Rejected {
             reason: RefusalReason::IdConflict,
@@ -427,10 +431,12 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
     // the honest path: welcome at v1 with the P6 cadence
     // max(1, offline_after_ms / 3) = 10_000 for 30_000.
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("qa-w1", QA_TOKEN, 1)).await;
+    client
+        .send(&qa_register("qa-w1", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     match client.recv().await {
         Some(ServerFrame::Welcome {
-            v: 1,
+            v: PROTOCOL_VERSION,
             heartbeat_ms: Some(10_000),
         }) => {}
         other => panic!("welcome must carry the server-directed cadence, got {other:?}"),
@@ -448,7 +454,9 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
 
     // A second register during steady state is a protocol violation:
     // the connection closes (never a half re-registration).
-    client.send(&qa_register("qa-w1", QA_TOKEN, 1)).await;
+    client
+        .send(&qa_register("qa-w1", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     client.recv_eof_expected().await;
 }
 
@@ -466,13 +474,13 @@ async fn qa_clamp_and_description_drop_are_non_fatal() {
             endpoint_id: "qa-w0".into(),
             description: Some("bad\u{7}description".into()),
             token: RegisterToken::new(QA_TOKEN.into()),
-            version: 1,
+            version: PROTOCOL_VERSION,
             max_concurrent: 0,
         })
         .await;
     match client.recv().await {
         Some(ServerFrame::Welcome {
-            v: 1,
+            v: PROTOCOL_VERSION,
             heartbeat_ms: Some(10_000),
         }) => {}
         other => panic!("registration must succeed, got {other:?}"),
@@ -569,7 +577,9 @@ async fn qa_failed_auth_window_bound() {
     // one attempt — the server closes after a refusal).
     for _ in 0..5 {
         let mut client = QaClient::connect(addr).await;
-        client.send(&qa_register("qa-w", "wrong", 1)).await;
+        client
+            .send(&qa_register("qa-w", "wrong", PROTOCOL_VERSION))
+            .await;
         match client.recv().await {
             Some(ServerFrame::Rejected {
                 reason: RefusalReason::BadToken,
@@ -583,21 +593,30 @@ async fn qa_failed_auth_window_bound() {
     // The 6th connection from the same peer: closed WITHOUT reading a
     // frame — no refusal reply at all.
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("qa-w", "wrong", 1)).await;
+    client
+        .send(&qa_register("qa-w", "wrong", PROTOCOL_VERSION))
+        .await;
     client.recv_eof_expected().await;
 
     // Same peer, now the CORRECT token: still rate-limited inside the
     // window (the bound is per address, not per token value).
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("qa-w", QA_TOKEN, 1)).await;
+    client
+        .send(&qa_register("qa-w", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     client.recv_eof_expected().await;
 
     // Past the 60 s window the address is released (clock injected).
     clock.advance_to(1_000_000 + 61_000);
     let mut client = QaClient::connect(addr).await;
-    client.send(&qa_register("qa-w", QA_TOKEN, 1)).await;
+    client
+        .send(&qa_register("qa-w", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     match client.recv().await {
-        Some(ServerFrame::Welcome { v: 1, .. }) => {}
+        Some(ServerFrame::Welcome {
+            v: PROTOCOL_VERSION,
+            ..
+        }) => {}
         other => panic!("window expired: good token registers, got {other:?}"),
     }
 }
@@ -680,7 +699,8 @@ async fn qa_membership_edges_replace_bye_and_freshness() {
 
     // Generation 1 joins.
     let mut a = QaClient::connect(addr).await;
-    a.send(&qa_register("qa-w", QA_TOKEN, 1)).await;
+    a.send(&qa_register("qa-w", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     a.recv().await.expect("welcome gen 1");
 
     // Heartbeat freshness drives the computed state (M3): connected but
@@ -707,9 +727,13 @@ async fn qa_membership_edges_replace_bye_and_freshness() {
     // A newer registration for the same id REPLACES the incumbent: the
     // old connection receives a server bye, the generation increments.
     let mut b = QaClient::connect(addr).await;
-    b.send(&qa_register("qa-w", QA_TOKEN, 1)).await;
+    b.send(&qa_register("qa-w", QA_TOKEN, PROTOCOL_VERSION))
+        .await;
     match b.recv().await {
-        Some(ServerFrame::Welcome { v: 1, .. }) => {}
+        Some(ServerFrame::Welcome {
+            v: PROTOCOL_VERSION,
+            ..
+        }) => {}
         other => panic!("replacement registers, got {other:?}"),
     }
     match a.recv().await {
@@ -776,7 +800,7 @@ impl QaFakeRoute {
             id: id.to_string(),
             generation: 1,
             peer_addr: "127.0.0.1:59999".parse().unwrap(),
-            version: 1,
+            version: PROTOCOL_VERSION,
             max_concurrent: 2,
             writer: writer_tx.clone(),
             inbound: inbound_rx,

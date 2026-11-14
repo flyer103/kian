@@ -29,6 +29,9 @@ pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 /// the value never does.
 pub const DEFAULT_TOKEN_ENV: &str = "KIAN_WORKER_TOKEN";
 
+/// Default root the v2 filesystem commands resolve under (ADR-023).
+pub const DEFAULT_WORKSPACE_ROOT: &str = ".";
+
 /// Optional config file, looked up at `./kiand.yaml` unless overridden.
 pub const DEFAULT_CONFIG_FILE: &str = "kiand.yaml";
 
@@ -38,6 +41,7 @@ pub const ENV_LISTEN: &str = "KIAND_LISTEN";
 pub const ENV_MAX_CONCURRENT: &str = "KIAND_MAX_CONCURRENT";
 pub const ENV_HEARTBEAT_MS: &str = "KIAND_HEARTBEAT_MS";
 pub const ENV_EXEC_TIMEOUT_MS: &str = "KIAND_EXEC_TIMEOUT_MS";
+pub const ENV_WORKSPACE_ROOT: &str = "KIAND_WORKSPACE_ROOT";
 
 /// Every way loading the daemon configuration can refuse to start.
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +75,7 @@ pub struct Flags {
     pub register_to: Option<String>,
     pub description: Option<String>,
     pub token_env: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
 /// The `kiand.yaml` document: every key optional, unknown keys rejected.
@@ -85,6 +90,7 @@ pub struct FileConfig {
     pub register_to: Option<String>,
     pub description: Option<String>,
     pub token_env: Option<String>,
+    pub workspace_root: Option<String>,
 }
 
 /// The resolved daemon configuration.
@@ -101,6 +107,9 @@ pub struct Config {
     pub description: Option<String>,
     /// NAME of the environment variable holding the worker token.
     pub token_env: String,
+    /// Root the v2 filesystem commands resolve under (ADR-023). Validated
+    /// to exist and be a directory at startup.
+    pub workspace_root: String,
 }
 
 impl Config {
@@ -173,6 +182,11 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         .token_env
         .or_else(|| file.as_ref().and_then(|f| f.token_env.clone()))
         .unwrap_or_else(|| DEFAULT_TOKEN_ENV.to_string());
+    let workspace_root = flags
+        .workspace_root
+        .or_else(|| env_get(ENV_WORKSPACE_ROOT))
+        .or_else(|| file.as_ref().and_then(|f| f.workspace_root.clone()))
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_string());
 
     let config = Config {
         endpoint_id,
@@ -183,6 +197,7 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         register_to,
         description,
         token_env,
+        workspace_root,
     };
     validate(config)
 }
@@ -262,6 +277,16 @@ fn validate(config: Config) -> Result<Config, ConfigError> {
         return Err(ConfigError::Invalid(
             "exec_timeout_ms must be at least 1 (the daemon never runs unbounded commands)".into(),
         ));
+    }
+    // The v2 filesystem root must exist and be a directory before any
+    // connection opens (fail-closed; a bad root would otherwise turn every
+    // fs command into an opaque io error).
+    let root = std::path::Path::new(&config.workspace_root);
+    if !root.is_dir() {
+        return Err(ConfigError::Invalid(format!(
+            "workspace_root `{}` is not an existing directory",
+            config.workspace_root
+        )));
     }
     // A bad listen address refuses to start before any socket opens.
     config.listen_addr()?;

@@ -113,6 +113,12 @@ pub struct ChatMessage {
     /// Present only on assistant tool-call turns (the wire `tool_calls`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<WireToolCall>>,
+    /// Thinking-mode reasoning the provider returned for this assistant
+    /// turn. Replayed verbatim when present (DeepSeek V4 requires it);
+    /// skipped entirely when absent, so legacy bodies stay byte-identical
+    /// (ADR-022, DESIGN §3.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -124,6 +130,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_call_id: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 }
@@ -968,12 +975,14 @@ mod tests {
                         arguments: "{\"path\":\"notes.txt\"}".into(),
                     },
                 }]),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".into(),
                 content: Some("{\"content\":\"hello kian\"}".into()),
                 tool_call_id: Some("call-1".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
         let a = build_chat_body("kimi-k2", &messages, &tools);
@@ -1008,12 +1017,14 @@ mod tests {
                         arguments: "{\"path\":\"a.txt\"}".into(),
                     },
                 }]),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".into(),
                 content: Some("{\"content\":\"x\"}".into()),
                 tool_call_id: Some("call-9".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
         ];
         let body = build_chat_body("m1", &round_trip, &[]);

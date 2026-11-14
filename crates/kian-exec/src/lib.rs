@@ -40,6 +40,7 @@ pub mod async_jobs;
 pub mod async_tool;
 pub mod backend;
 pub mod connection;
+pub mod dispatch;
 pub mod error;
 pub mod membership;
 pub mod proto;
@@ -73,7 +74,7 @@ pub use store::{
     CommandOutcome, EndpointRegistryRow, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError,
     QueuedCommand,
 };
-pub use tool::RemoteExecTool;
+pub use tool::{RemoteExecTool, RemoteFsTool};
 pub use watchdog::{
     Clock, HeartbeatWatchdog, ManualClock, SystemClock, WatchdogConfig, WatchdogMetrics,
 };

@@ -279,7 +279,7 @@ async fn version_mismatch_refused_typed() {
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(
         line.trim(),
-        "{\"type\":\"rejected\",\"reason\":\"version_mismatch\",\"detail\":\"server speaks KiandProto 1; worker announced 0\"}"
+        "{\"type\":\"rejected\",\"reason\":\"version_mismatch\",\"detail\":\"server speaks KiandProto 2; worker announced 0\"}"
     );
     // The connection is closed after the refusal — EOF follows.
     let mut trailing = String::new();
@@ -452,7 +452,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(
-                b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":1,\"max_concurrent\":1}\n",
+                b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
             )
             .await
             .unwrap();
@@ -468,7 +468,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":1,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -493,7 +493,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":1,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -585,7 +585,7 @@ async fn welcome_carries_directed_heartbeat_cadence() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"cadence\",\"token\":\"t0ken-not-a-secret\",\"version\":1,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"cadence\",\"token\":\"t0ken-not-a-secret\",\"version\":2,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -596,6 +596,6 @@ async fn welcome_carries_directed_heartbeat_cadence() {
         .unwrap();
     assert_eq!(
         line.trim(),
-        "{\"type\":\"welcome\",\"v\":1,\"heartbeat_ms\":10000}"
+        "{\"type\":\"welcome\",\"v\":2,\"heartbeat_ms\":10000}"
     );
 }

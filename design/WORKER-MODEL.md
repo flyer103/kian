@@ -119,8 +119,10 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 
 ## 4. Dispatch and queue
 
-- **Queue-first by id.** `exec` enqueues a durable row keyed by the session's bound worker id **before
-  any dispatch**, and then awaits the correlated outcome. A missing route is not an error: the row
+- **Queue-first by id.** `exec` (and, since v2, each `fs_list`/`fs_read`/`fs_write`) enqueues a
+  durable row keyed by the session's bound worker id **before any dispatch**, and then awaits the
+  correlated outcome. Both command families share one queue, one command-id dedupe and one queue
+  timeout; the row carries its family so a restart re-drives it through the same frame family. A missing route is not an error: the row
   parks `pending` until a route appears, or `queue_timeout` abandons it honestly (the caller gets a
   timeout, the row stays terminal and answers a duplicate id with the same honest timeout).
 - **Runtime routes.** A route exists iff the member is online. Attaching a route re-drives that id's
@@ -129,7 +131,9 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 - **At-least-once with command-id dedupe.** Delivery is ADR-007's: a row may be dispatched more than
   once across a crash or a reconnect (the endpoint may therefore execute a command twice), but it
   **settles once** — the command id is the dedupe key and a settled row answers every re-execution
-  from the durable record.
+  from the durable record. For the v2 filesystem family the same rule is recorded explicitly:
+  `fs_list`/`fs_read` are idempotent, and a repeated `fs_write` writes the same path and content
+  again (mtime may move) — never a different payload.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
 - **Honest timeout.** `queue_timeout` (per static endpoint; the backend-level maximum for dynamic
@@ -176,16 +180,22 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 - **No new inbound HTTP surface.** The listener is the KiandProto socket, not an HTTP route; `/rpc`,
   `/ops/rpc` and `/metrics` keep their existing (unauthenticated, deployment-bounded) posture. A
   worker never gets control-plane access.
+- **Fs root is a guard, not a sandbox.** The v2 filesystem commands resolve under the worker's
+  `--workspace-root` and refuse `..` lexically; `exec` already runs arbitrary programs as the same
+  user, so fs adds no authority. A symlink can still point outside the root — recorded, not
+  claimed as isolation (same caveat as the local built-in fs tools).
 
 ## 7. Version and upgrade policy
 
-- **KiandProto v1.** `PROTOCOL_VERSION = 1` in both halves (`kian-exec`, `kian-endpoint`), declared
-  independently and pinned by dual goldens in the same change; frames and the closed rejection reason
-  set live in [API-CONTRACT](API-CONTRACT.md) §8.
+- **KiandProto v2.** `PROTOCOL_VERSION = 2` in both halves (`kian-exec`, `kian-endpoint`), declared
+  independently and pinned by dual goldens in the same change; frames (exec + the v2 filesystem
+  pair) and the closed rejection reason set live in [API-CONTRACT](API-CONTRACT.md) §8.
 - **Upgrade order: kian first, workers second.** During the window a v0 static endpoint is refused
   with a typed terminal version error plus one audit line (its route stays offline; never a fake
-  connect), and a v0 worker — which has no register mode at all — simply never registers and reads
-  offline. Both are visible and honest, and neither is a half-compatible connection.
+  connect); a v0 worker — which has no register mode at all — simply never registers and reads
+  offline; and a v1 worker (no filesystem frames) is refused `version_mismatch` until upgraded,
+  with its parked commands staying parked (no lost work, no dispatch to a wrong machine). Both are
+  visible and honest, and neither is a half-compatible connection.
 - **No compatibility shim.** A peer on the wrong revision is refused, never silently accepted: the v0
   and v1 steady states differ only by the version integer, so "compatibility" would buy nothing except
   an invisible half-upgraded deployment.
@@ -208,6 +218,8 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 | Public/non-private bind without `allow_public` | startup validation | the whole `serve` process refuses to start | whole process |
 | Kian crash / restart | process start | directory empty, registry rows stale ⇒ every worker reads offline until it re-registers; bindings rebuild from streams; rows re-drive | all workers, transiently |
 | Listener shutdown / drain | shutdown | live members get a `bye`, routes detach, rows stay parked; registering peers are refused | all workers |
+| Fs path escapes the root (`..`) | server-side lexical check before enqueue; worker-side re-check | honest `InvalidCall` (no row) or a typed `io` error result — never a write outside the intended path | that call |
+| Fs body over 1 MiB / non-UTF-8 read | worker-side bound / decode | typed `io` error surfaced as the local `{"error": …}` tool result; no truncation, no partial write | that call |
 | Queue timeout | timer | row abandoned honestly, caller gets a timeout; a duplicate command id answers with the same timeout | that command |
 
 No degradation path maps onto a `completed` session, invents a result, silently swallows a command, or
@@ -225,8 +237,11 @@ seam.
   recorded in ADR-020 §Deferred and ADR-021 §Deferred and is an owner gate, not a spec detail.
 - **No mTLS, no per-worker identity, no token rotation without restart** (R13).
 - **No worker pools**: 1:1 stays.
+- **The worker fs surface is the three text tools** (`fs_list`/`fs_read`/`fs_write`, 1 MiB bounds,
+  `--workspace-root`, lexical `..` guard; [ADR-023](decisions/ADR-023-worker-fs-tools.md)). Binary
+  bodies, streaming/large files, `fs_edit`/glob, a symlink-proof sandbox and fs tools on the Router
+  or plain sessions are out of scope.
 - **No membership data in prompts or tool schemas** — `list_workers` results only.
-- **No non-`exec` worker tool**: the worker surface stays one `exec` with an unchanged schema.
 - **No public listener**; no hosted multi-tenant concerns.
 - **No new event kind, table, migration, HTTP route or ops method.**
 - Deployment (Vultr, WeChat) remains the owner's later discussion.
@@ -244,6 +259,9 @@ seam.
 - The shared-token impersonation limitation is a design fact, not a tested behaviour: the tests can
   only assert that no *other* identity channel exists.
 - No L3 (real deployment) evidence exists for this contract.
+- The v1 → v2 upgrade window has not been exercised with a real old worker binary in this round; the
+  typed refusal is L1 and the queue's legacy-row decode is tested, but the cross-version deployment
+  window stays unverified until measured.
 
 ## 11. Change protocol
 
@@ -252,6 +270,7 @@ seam.
 | Membership semantics (lifecycle, states, pruning, bind policy) | **yes** | `design/WORKER-MODEL.md` first; then code + tests; ADR if the *why* changes |
 | A wire frame/field/error/reason, `PROTOCOL_VERSION` | no — [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 | both halves' goldens, SDK fixtures if any, this file's §7 pointer if the policy changes |
 | An event payload key (`exec_worker`, `thread/started`) | no — [EVENT-MODEL](EVENT-MODEL.md) §3/§4.2 | code, tests, DESIGN §4.1 |
+| The worker command families (exec, fs) / dispatch semantics | **yes** — this file | API-CONTRACT §8 for frames; code + L2 tests; ADR when the family set changes |
 | A new event kind or authoritative table | **owner gate** (ADR + EVENT-MODEL) — not a spec decision | — |
 | Assembly/HOW, crate placement, config surface, CLI shape | no — [DESIGN](DESIGN.md) §4.3/§4.7 | config validation tests, docs map |
 | Rationale, alternatives, deferred seams | no — a new ADR (append-only; supersede by linking) | — |

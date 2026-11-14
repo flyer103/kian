@@ -19,6 +19,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use uuid::Uuid;
 
+use std::path::PathBuf;
+
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecBackend, ExecCommand, ExecResult};
 
 use crate::proto::{CommandError, CommandId, EndpointFrame, PROTOCOL_VERSION, ServerFrame};
@@ -89,6 +92,8 @@ pub type HeartbeatTap = Arc<dyn Fn(HeartbeatInfo) + Send + Sync>;
 pub struct Endpoint {
     endpoint_id: String,
     executor: Arc<dyn ExecBackend>,
+    /// Root the v2 filesystem commands are resolved under (ADR-023).
+    workspace_root: PathBuf,
     max_concurrent: usize,
     heartbeat: Duration,
     heartbeat_tap: Option<HeartbeatTap>,
@@ -102,11 +107,20 @@ impl Endpoint {
         Self {
             endpoint_id: endpoint_id.into(),
             executor,
+            workspace_root: PathBuf::from("."),
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             heartbeat: DEFAULT_HEARTBEAT,
             heartbeat_tap: None,
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
         }
+    }
+
+    /// Root the v2 filesystem commands resolve under. Defaults to the
+    /// process working directory; the daemon's `--workspace-root` sets it.
+    #[must_use]
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = root.into();
+        self
     }
 
     /// Cap concurrent executions (across all connections). Must be called
@@ -270,6 +284,9 @@ impl Endpoint {
                     Some(ServerFrame::Command { id, cmd }) => {
                         self.spawn_execution(id, cmd, &outbound, &inflight).await;
                     }
+                    Some(ServerFrame::FsCommandFrame { id, cmd }) => {
+                        self.spawn_fs(id, cmd, &outbound, &inflight).await;
+                    }
                     Some(ServerFrame::Ping) => {
                         let info = HeartbeatInfo {
                             endpoint_id: self.endpoint_id.clone(),
@@ -362,6 +379,45 @@ impl Endpoint {
                 );
             }
             drop(permit); // hold the permit through delivery
+        });
+    }
+
+    /// Execute one filesystem command under the workspace root and answer
+    /// with the v2 result frame. The permit is held until the result has
+    /// been delivered (same backpressure discipline as `exec`).
+    async fn spawn_fs(
+        self: &Arc<Self>,
+        id: CommandId,
+        cmd: FsCommand,
+        outbound: &mpsc::Sender<EndpointFrame>,
+        inflight: &Arc<AtomicUsize>,
+    ) {
+        let permit = match self.semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let root = self.workspace_root.clone();
+        let outbound = outbound.clone();
+        let inflight = inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let frame =
+                match tokio::task::spawn_blocking(move || crate::fs::execute(&root, &cmd)).await {
+                    Ok(Ok(result)) => EndpointFrame::fs_ok(id, result),
+                    Ok(Err(error)) => EndpointFrame::fs_failed(id, error),
+                    Err(e) => EndpointFrame::fs_failed(
+                        id,
+                        CommandError {
+                            code: crate::proto::ErrorCode::Io,
+                            message: format!("fs worker join failed: {e}"),
+                        },
+                    ),
+                };
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            if outbound.send(frame).await.is_err() {
+                tracing::warn!(command_id = %id, "fs result dropped: connection closed");
+            }
+            drop(permit);
         });
     }
 }
@@ -463,6 +519,32 @@ impl ServerPeer {
                 };
             }
             // Heartbeats and results of other commands flow past.
+        }
+        Err(EndpointError::TransportClosed)
+    }
+
+    /// Execute one filesystem command and await its result (heartbeats and
+    /// other frames flow past). Test/embedding helper for v2.
+    pub async fn execute_fs(
+        &mut self,
+        cmd: FsCommand,
+    ) -> Result<Result<FsResult, CommandError>, EndpointError> {
+        let id = Uuid::new_v4();
+        self.send(ServerFrame::FsCommandFrame { id, cmd }).await?;
+        while let Some(frame) = self.inbound.recv().await {
+            if let Some((fid, result, error)) = frame.fs_result_parts() {
+                if fid != id {
+                    tracing::warn!(command_id = %fid, "fs result for a different command; ignoring");
+                    continue;
+                }
+                return match (result, error) {
+                    (Some(result), None) => Ok(Ok(result)),
+                    (None, Some(error)) => Ok(Err(error)),
+                    _ => Err(EndpointError::Protocol(
+                        "fs result carries neither result nor error".into(),
+                    )),
+                };
+            }
         }
         Err(EndpointError::TransportClosed)
     }

@@ -23,15 +23,17 @@ use tokio::sync::{Notify, Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
 use kian_core::secrets::SecretRedactor;
 
 use crate::connection::ConnectionManager;
 use crate::membership::WorkerDirectory;
-use crate::proto::{CommandError, CommandId};
+use crate::proto::CommandId;
 use crate::route::RouteTransport;
 use crate::store::{
-    CommandOutcome, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError, QueuedCommand, now_ms,
+    CommandOutcome, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError, QueuedCommand,
+    WorkerCommand, now_ms,
 };
 
 /// Caller-visible failures of the queue machinery, mapped onto the exec
@@ -40,7 +42,7 @@ fn store_error(e: QueueStoreError) -> ExecError {
     ExecError::Io(format!("exec queue store: {e}"))
 }
 
-type Waiter = oneshot::Sender<Result<ExecResult, ExecError>>;
+type Waiter = oneshot::Sender<Result<CommandOutcome, ExecError>>;
 
 /// Per-endpoint queue driver state. Static pins are born at boot with
 /// generation 0; dynamic routes carry the registration's generation so
@@ -442,11 +444,51 @@ impl RemoteExecBackend {
         cmd: ExecCommand,
         tool_call_ref: Option<String>,
     ) -> Result<ExecResult, ExecError> {
+        self.tracked(
+            command_id,
+            endpoint_id,
+            WorkerCommand::Exec(cmd),
+            tool_call_ref,
+        )
+        .await?
+        .to_exec()
+    }
+
+    /// Enqueue-first tracked filesystem execution (the
+    /// [`crate::RemoteFsTool`] path, ADR-023). Identical queue/correlation/
+    /// timeout discipline as [`RemoteExecBackend::exec_tracked`]; the
+    /// caller gets the fs result shape.
+    pub async fn fs_tracked(
+        &self,
+        command_id: CommandId,
+        endpoint_id: &str,
+        cmd: FsCommand,
+        tool_call_ref: Option<String>,
+    ) -> Result<FsResult, ExecError> {
+        self.tracked(
+            command_id,
+            endpoint_id,
+            WorkerCommand::Fs(cmd),
+            tool_call_ref,
+        )
+        .await?
+        .to_fs()
+    }
+
+    /// The shared enqueue → park → correlate path for both command
+    /// families.
+    async fn tracked(
+        &self,
+        command_id: CommandId,
+        endpoint_id: &str,
+        command: WorkerCommand,
+        tool_call_ref: Option<String>,
+    ) -> Result<CommandOutcome, ExecError> {
         let route = self.core.route(endpoint_id);
         match self
             .core
             .store
-            .enqueue(command_id, endpoint_id, &cmd, tool_call_ref.as_deref())
+            .enqueue(command_id, endpoint_id, &command, tool_call_ref.as_deref())
             .await
             .map_err(store_error)?
         {
@@ -470,16 +512,21 @@ impl RemoteExecBackend {
                             let (stderr, stderr_report) =
                                 self.core.redactor.redact_with_report(&result.stderr);
                             let stored = result.redactions.clone();
-                            Ok(ExecResult {
-                                stdout,
-                                stderr,
-                                redactions: kian_core::secrets::merge_redaction_reports(
-                                    stored.into_iter().chain(stdout_report).chain(stderr_report),
-                                ),
-                                ..result
+                            Ok(CommandOutcome::Ok {
+                                result: ExecResult {
+                                    stdout,
+                                    stderr,
+                                    redactions: kian_core::secrets::merge_redaction_reports(
+                                        stored
+                                            .into_iter()
+                                            .chain(stdout_report)
+                                            .chain(stderr_report),
+                                    ),
+                                    ..result
+                                },
                             })
                         }
-                        other => other.to_exec(),
+                        other => Ok(other),
                     };
                 }
                 QueueStatus::Abandoned => return Err(ExecError::Timeout),
@@ -565,13 +612,13 @@ impl QueueCore {
 
     /// Resolve the caller's future from the correlated result; race the
     /// queue timeout honestly.
-    async fn await_outcome(&self, command_id: CommandId) -> Result<ExecResult, ExecError> {
+    async fn await_outcome(&self, command_id: CommandId) -> Result<CommandOutcome, ExecError> {
         let (token, receiver) = self.register_waiter(command_id);
         // Close the completion race: if the row settled between enqueue and
         // this registration, prefer the recorded outcome.
         if let Some(outcome) = self.settled_outcome(command_id).await? {
             self.drop_waiter(&command_id, token);
-            return outcome.to_exec();
+            return Ok(outcome);
         }
         tokio::select! {
             outcome = receiver => {
@@ -587,7 +634,7 @@ impl QueueCore {
                     // competing abandonment) won the race against the timer.
                     Ok(false) => {
                         if let Some(outcome) = self.settled_outcome(command_id).await? {
-                            outcome.to_exec()
+                            Ok(outcome)
                         } else {
                             Err(ExecError::Timeout)
                         }
@@ -612,7 +659,7 @@ impl QueueCore {
     fn register_waiter(
         &self,
         command_id: CommandId,
-    ) -> (u64, oneshot::Receiver<Result<ExecResult, ExecError>>) {
+    ) -> (u64, oneshot::Receiver<Result<CommandOutcome, ExecError>>) {
         let (sender, receiver) = oneshot::channel();
         let token = self
             .waiter_tokens
@@ -666,7 +713,6 @@ impl QueueCore {
         };
         match self.store.mark_done(command_id, &outcome).await {
             Ok(true) => {
-                let mapped = outcome.to_exec();
                 let waiters: Vec<Waiter> = self
                     .waiters
                     .lock()
@@ -677,7 +723,7 @@ impl QueueCore {
                     .map(|(_, waiter)| waiter)
                     .collect();
                 for waiter in waiters {
-                    let _ = waiter.send(mapped.clone());
+                    let _ = waiter.send(Ok(outcome.clone()));
                 }
             }
             // Terminal already (timeout won): the row keeps its honest
@@ -893,21 +939,28 @@ async fn drive_row_inner(
             row_lease_heartbeat(store, id, holder, ttl, stop).await;
         })
     };
-    let outcome: Result<Result<ExecResult, CommandError>, crate::error::ConnectionError> = route
-        .transport
-        .dispatch_with_id(row.command_id, row.cmd)
-        .await;
+    let outcome: Result<CommandOutcome, crate::error::ConnectionError> = match &row.command {
+        WorkerCommand::Exec(cmd) => route
+            .transport
+            .dispatch_with_id(row.command_id, cmd.clone())
+            .await
+            .map(|reply| match reply {
+                Ok(result) => CommandOutcome::Ok { result },
+                Err(error) => CommandOutcome::Err { error },
+            }),
+        WorkerCommand::Fs(cmd) => route
+            .transport
+            .dispatch_fs_with_id(row.command_id, cmd.clone())
+            .await
+            .map(|reply| match reply {
+                Ok(result) => CommandOutcome::Fs { result },
+                Err(error) => CommandOutcome::Err { error },
+            }),
+    };
     hb_stop.notify_one();
     let _ = heartbeat.await;
     match outcome {
-        Ok(Ok(result)) => {
-            core.complete(row.command_id, CommandOutcome::Ok { result })
-                .await
-        }
-        Ok(Err(error)) => {
-            core.complete(row.command_id, CommandOutcome::Err { error })
-                .await
-        }
+        Ok(outcome) => core.complete(row.command_id, outcome).await,
         // Transport loss / manager stop: fail honestly *without* settling
         // the row — the next connect re-drives it (at-least-once). The
         // caller's queue timeout remains the honesty bound.

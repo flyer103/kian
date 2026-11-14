@@ -33,8 +33,8 @@ use kian_core::seams::{ChannelAdapter, RecoveryPolicySource, ToolProvider};
 use kian_exec::{
     ConnectionConfig, ConnectionManager, DefaultRoute, ExecStore, LeaveReason, MembershipConfig,
     RegisteredTransport, RegisteredWorker, RegistrationConfig, RegistrationListener,
-    RegistrationSink, RemoteExecBackend, RemoteExecConfig, RemoteExecTool, RouteTransport,
-    SystemClock, WorkerDirectory, WorkerToken,
+    RegistrationSink, RemoteExecBackend, RemoteExecConfig, RemoteExecTool, RemoteFsTool,
+    RouteTransport, SystemClock, WorkerDirectory, WorkerToken,
 };
 use kian_llm::provider::{
     OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink, PersistedRequest,
@@ -906,6 +906,10 @@ impl Plugin for SuperAgentPlugin {
             for tool in remote.tools() {
                 worker_mounted.extend(tool.schemas());
             }
+            // v2: the worker fs surface rides the same (static or
+            // dynamic) endpoints; every worker side mounts it filtered
+            // by the agent's `tools:` list.
+            worker_mounted.extend(kian_exec::RemoteFsTool::fs_schemas());
         }
         if let Some(pair) = &async_validation_pair {
             worker_mounted.extend(pair.schemas());
@@ -924,8 +928,13 @@ impl Plugin for SuperAgentPlugin {
         let mut worker_tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
         if let Some(remote) = &remote {
             for tool in remote.tools() {
+                let endpoint_id = tool.endpoint_id().to_string();
                 let provider: Arc<dyn ToolProvider> = tool;
                 worker_tools.push(provider);
+                worker_tools.push(Arc::new(FilteredTools::new(
+                    Arc::new(RemoteFsTool::new(Arc::clone(&remote.backend), endpoint_id)),
+                    &self.worker_agent.tools,
+                )));
             }
         }
         // the single legacy worker side (feature off, or the
@@ -1125,6 +1134,13 @@ impl Plugin for SuperAgentPlugin {
                     Arc::clone(&side_backend),
                     id.to_string(),
                 )));
+                tools.push(Arc::new(FilteredTools::new(
+                    Arc::new(kian_exec::RemoteFsTool::new(
+                        Arc::clone(&side_backend),
+                        id.to_string(),
+                    )),
+                    &side_agent.tools,
+                )));
                 if let Some(jobs_factory) = &side_jobs_factory {
                     tools.push(Arc::new(kian_exec::AsyncToolPair::new(jobs_factory(id)))
                         as Arc<dyn ToolProvider>);
@@ -1173,6 +1189,10 @@ impl Plugin for SuperAgentPlugin {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
                     refusal.clone(),
+                )));
+                tools.push(Arc::new(FilteredTools::new(
+                    Arc::new(crate::superagent::RefusingFsTool::new(refusal.clone())),
+                    &refuse_agent.tools,
                 )));
                 if refuse_recall {
                     tools.push(Arc::new(refuse_recall_tools.clone()) as Arc<dyn ToolProvider>);

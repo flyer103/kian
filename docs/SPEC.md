@@ -390,7 +390,7 @@ wire surface, no core change.**
 | Item | Contents | Status |
 |------|----------|--------|
 | Worker catalog | `endpoints[]` gains an optional validated `description` (≤200 chars, no control characters — it renders into the Router prompt); the catalog (`id` + `description`, config order) feeds the `spawn_worker` schema enum and the prompt block; zero endpoints = feature off, byte-identical | landed |
-| Router-chosen binding | `spawn_worker` gains the `exec_worker` argument (required with ≥2 workers, omittable-with-honest-default with exactly 1, refused with 0); the choice is recorded as the additive `exec_worker` key on the delegation wrapper and both sides' `thread/started`, echoed in the spawn result — ADR-020 | landed |
+| Router-chosen binding | `spawn_worker` gains the `exec_worker` argument (required whenever membership is on — a plain non-empty string since R12; refused with zero workers); the choice is recorded as the additive `exec_worker` key on the delegation wrapper and both sides' `thread/started`, echoed in the spawn result — ADR-020 | landed |
 | 1:1 exclusivity | A worker has at most one live bound worker session; the check is a stream-derived pure function (`thread/completed` + `session/ended` on the worker stream: `completed`/`cancelled` release, `failed`/`interrupted` hold) called before any side effect through a bundle-owned read-only port; a busy refusal names the owning session and thread | landed |
 | Per-drive routing | One prebuilt worker side per endpoint (its own `exec` `RemoteExecTool`, its own async pair); the driver selects the side from the session's own stream binding before the first provider turn — bound id unconfigured ⇒ honest refusing side (no re-route, no local run); legacy unbound sessions keep the first-**configured**-endpoint route with one audit line; no resident routing state (restart rebuild = replay) | landed |
 | Lifecycle | Worker crash/restart/migration (same id) re-drives the durable queue (ADR-007) with the binding unchanged; lineage-before-admit spawn ordering bounds the crash window (a never-started reservation is released after `queue_timeout_ms` with an audit line); `harness.dsh` × `endpoints:` refuses boot (the harness never mounts the kian `exec`) | landed |
@@ -425,6 +425,35 @@ new HTTP surface, no core change; one wire version bump with dual goldens.**
 | Shared-token limitation | Any token holder may register under any id (impersonation/replacement); acceptable for the single-operator deployment, not for hosted use | landed (recorded limitation; mTLS R13) |
 | mTLS / per-worker identity, token rotation without restart | R13 deferral — [WORKER-MODEL](../design/WORKER-MODEL.md) §9 | deferred |
 | Live rebind / worker retirement / takeover | Unchanged from R11 (ADR-020 §Deferred, ADR-021 §Deferred) — the same id returning reattaches; a permanently lost worker ends in the honest timeout | deferred |
+
+### Worker filesystem tools (KiandProto v2, R13)
+
+Scope: a bound worker session's `fs_list`/`fs_read`/`fs_write` execute on the **worker's** machine,
+under its `--workspace-root`; the local built-ins stay for the Router/plain sessions. Wire:
+[ADR-023](../design/decisions/ADR-023-worker-fs-tools.md), API-CONTRACT §8.3/§8.6; semantics:
+[WORKER-MODEL](../design/WORKER-MODEL.md) §4/§6/§9. **No new event kind, no new HTTP route, no new
+ops method; one wire bump (v1 → v2) and one additive queue migration (v3 `kind`).**
+
+| Item | Contents | Status |
+|------|----------|--------|
+| Wire v2 fs pair | `fs_command`/`fs_result` frames; `PROTOCOL_VERSION = 2`; exec frames keep v1 bytes; dual goldens; upgrade order kian-first, no shim (a v1 worker reads offline with rows parked) | landed |
+| Queue v3 | `exec_queue.kind TEXT NOT NULL DEFAULT 'exec'`; pre-v3 rows decode as exec and re-drive unchanged; fs rows share the queue, command-id dedupe and `queue_timeout`; no cross-worker dispatch | landed |
+| Per-drive routing + schemas | A bound worker side mounts `RemoteFsTool` (filtered by the agent's `tools:`) and the refusing side mounts the same three names with an honest refusal; schemas/result shapes are byte-identical to the local built-ins (golden parity) | landed |
+| Root + limits | `kiand --workspace-root` (default cwd, must exist); lexical `..` guard on both sides; 1 MiB read/write bounds; non-UTF-8 read is a typed `io` error surfaced as the local `{"error": …}` result; root is a guard, not a sandbox | landed |
+| Live deployment | Owner deployment (Vultr + local worker + WeChat) redeployed at v2; the L3 fs round-trip through the WeChat Router path is recorded in CHANGELOG | landed (owner L3) |
+| Binary/streaming/fs_edit/glob, symlink-proof sandbox | Out of scope (WORKER-MODEL §9) | deferred |
+
+### Thinking-mode reasoning replay (ADR-022)
+
+Providers that require the assistant's reasoning to be replayed (DeepSeek V4 thinking mode) get
+`reasoning_content` persisted in the assistant event and re-sent verbatim; a legacy assistant
+message without the key produces byte-identical request bytes (the frozen chat-body hash is
+unchanged). No new event kind, no wire change. L1/L2 tests; the live empty-batch Router turn no
+longer returns 400. **Landing note: the v1 → v2 worker protocol bump is independent of this row.**
+| Item | Contents | Status |
+|------|----------|--------|
+| Capture + replay | ReAct stream assembler concatenates `reasoning_content`; `assistant/message` content carries it; the message → chat conversion re-emits the top-level field | landed |
+| Cost | Replayed reasoning is input tokens on thinking sessions only; observable through usage events; no trimming/synthesis | recorded |
 
 ### Deferred (unchanged)
 | Item | Reason |

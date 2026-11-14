@@ -39,6 +39,10 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   or restarts: `kiand --register-to` authenticates on a private, token-gated listener and the
   connection becomes the command route; commands queue durably per worker id while one is
   offline, `list_workers` exposes the live catalog, and join/leave never changes a prompt byte.
+- **Worker filesystem tools** — `fs_list`/`fs_read`/`fs_write` execute on the **bound worker's**
+  machine (its `--workspace-root`, a lexical path guard, 1 MiB bounds) with the same schemas and
+  result shapes as the local built-ins; the durable queue, 1:1 binding and no-failover rules are
+  unchanged (KiandProto v2, [ADR-023](design/decisions/ADR-023-worker-fs-tools.md)).
 - **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
   the same `LoopDriver` seam and event kinds.
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
@@ -53,8 +57,8 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   the event stream stays the only truth.
 - **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats, `/metrics`, and a
   frozen wire-only `kian-sdk`.
-- **Model-neutral and self-hostable** — any OpenAI-compatible provider; one Rust process plus
-  embedded sqlite is the whole system, with no hosted service required.
+- **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
+  process plus embedded sqlite is the whole system, with no hosted service required.
 
 ## How it works
 
@@ -102,7 +106,9 @@ embedded and a single `kian serve` process is the whole system.
 
 The commands below were run against this tree; the output blocks are abridged from those runs. The
 provider was a local OpenAI-compatible SSE stub, so no credentials or network were needed. Point
-`base_url`/`model` at any real OpenAI-compatible endpoint and the same session runs against a model.
+`base_url`/`model` at any real OpenAI-compatible endpoint and the same session runs against a model;
+a gateway that fronts several provider accounts is just another such endpoint, because the provider
+contract is `base_url` + OpenAI chat-completions + SSE.
 
 ### 1. Build
 
@@ -303,7 +309,7 @@ agents:
     id: worker
     model_slots:
       main: { provider: local, model: gpt-4o-mini }
-    tools: ["fs_read", "fs_write", "exec"]
+    tools: ["fs_list", "fs_read", "fs_write", "exec"]   # fs_* run on the bound worker (v2)
 superagent:
   router: { session_id: "00000000-0000-0000-0000-000000000001", agent: router, slot: router }
   worker: { agent: worker }
@@ -393,8 +399,14 @@ superagent:
 The cloud loop can execute commands on a remote endpoint daemon (`kiand`) over a durable queue:
 
 ```bash
-cargo run -p kiand -- --listen 127.0.0.1:7401 --heartbeat-ms 1000
+cargo run -p kiand -- --listen 127.0.0.1:7401 --heartbeat-ms 1000 --workspace-root .
 ```
+
+A worker session's `exec` runs commands on its bound worker; since KiandProto v2 its
+`fs_list`/`fs_read`/`fs_write` do too, resolved under that worker's `--workspace-root` (default: the
+daemon's working directory; the server's local fs tools are not used for a bound session). The
+worker surface is text-only with a 1 MiB read/write bound; a larger body or a `..` path is an
+honest tool error.
 
 Rows are at-least-once with command-id dedupe; an offline endpoint parks work durably, a restarted
 daemon reconnects and drains it, and the queue timeout is an honest `Timeout` — never a fake
@@ -417,15 +429,18 @@ endpoints:
     description: "linux builder — docker, long builds"
 ```
 
-With two or more workers the Router must name one on every spawn —
+Whenever worker membership is on (any `endpoints:` entry or a `workers:` section), the Router must
+name one on every spawn —
 `spawn_worker {"task": "run the release build", "exec_worker": "vultr-builder"}` — and the choice
 is recorded as additive `exec_worker` bytes on the delegation (both sides' `thread/started`), then
 re-derived from the stream on every restart: the worker's `exec` routes only to its bound daemon
 across worker restarts, migrations (same id, new address) and server reboots, with no rebind and no
 failover to another machine. A busy or unknown worker refuses the spawn honestly before any side
-effect — the refusal names the owning session. With exactly one worker the argument may be omitted
-(recorded as the honest default); with zero `endpoints:` nothing changes anywhere
-([ADR-020](design/decisions/ADR-020-durable-worker-binding.md)).
+effect — the refusal names the owning session. There is no single-worker default: the argument is
+required as soon as membership is on (a schema that depended on how many workers happen to be known
+would change bytes when one joins), and with no workers configured the feature is off and the
+argument is refused ([ADR-020](design/decisions/ADR-020-durable-worker-binding.md),
+[WORKER-MODEL.md](design/WORKER-MODEL.md)).
 
 #### Runtime worker membership (workers join/leave without a restart)
 
@@ -443,8 +458,8 @@ workers:                       # absent = dynamic membership off (byte-identical
 export KIAN_WORKER_TOKEN=...   # unset/blank refuses server startup (fail-closed)
 # on the worker machine (reach the listener over an SSH tunnel or Tailscale):
 cargo run -p kiand -- --register-to 127.0.0.1:7400 --endpoint-id mac-mini \
-  --description "local macOS dev machine"   # registers over KiandProto v1; the
-                                            # connection becomes the command route
+  --description "local macOS dev machine" --workspace-root .   # registers over
+                                            # KiandProto v2; the connection becomes the command route
 kian workers                   # read-only operator view: id, state, bound session
 ```
 
@@ -453,6 +468,14 @@ graceful `bye` or `kill -9` — marks it offline within `offline_after_ms`. Comm
 known-but-offline worker park durably and run when it returns; an unknown id is refused naming the
 known ids. Static `endpoints:` pins and dynamic workers share one catalog (a colliding id is
 refused), and membership changes never touch a prompt or tool-schema byte.
+
+Reaching a server on another machine: the listener accepts only a private bind, so a laptop reaches
+a remote `kian serve` through an SSH tunnel (`ssh -N -L 7400:127.0.0.1:7400 <server>`, then
+`--register-to 127.0.0.1:7400`) or over Tailscale — its `100.64.0.0/10` addresses are in the
+private set. `workers.allow_public: true` exists as an explicit escape hatch, but it exposes a
+command-execution surface under one shared token; a tunnel is the supported shape. A worker on the
+server itself is an ordinary static `endpoints:` pin (kian dials it, so it needs no token), and the
+local worker's `--description` is what the Router sees in `list_workers` when it picks a machine.
 
 ### Postgres and multi-replica
 

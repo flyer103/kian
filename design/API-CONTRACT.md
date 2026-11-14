@@ -376,25 +376,26 @@ drop (duplicate delivery id, unsupported/filtered event type, or a repository ou
 table). Delivery-id dedupe is downstream, per `(session, event_id)` — the webhook route itself does
 not keep a delivery table.
 
-## 8. KiandProto v1 — BYOM endpoint protocol
+## 8. KiandProto v2 — BYOM endpoint protocol
 
 Transport: TCP, one JSON object per line (UTF-8, no framing header). One bidirectional stream carries
-the whole conversation. Since v1 there are **two dial directions** over the same framing:
+the whole conversation. Since v1 there are **two dial directions** over the same framing (v2 keeps
+both and adds the filesystem command pair, [ADR-023](decisions/ADR-023-worker-fs-tools.md)):
 
 | Path | Who dials | Handshake | Use |
 |---|---|---|---|
-| **worker-dial** (v1) | the worker (`kiand --register-to`) | worker → `register`; server → `welcome` or `rejected` | dynamic membership ([WORKER-MODEL](WORKER-MODEL.md) §2) |
-| **server-dial** (v0, legacy) | the server (`kian-exec`), per the `endpoints:` config | endpoint → `hello`; server → `welcome` | static pinned workers |
+| **worker-dial** (v2) | the worker (`kiand --register-to`) | worker → `register`; server → `welcome` or `rejected` | dynamic membership ([WORKER-MODEL](WORKER-MODEL.md) §2) |
+| **server-dial** (legacy) | the server (`kian-exec`), per the `endpoints:` config | endpoint → `hello`; server → `welcome` | static pinned workers |
 
 After a successful handshake both paths carry the same steady-state frames
-(`command`/`result`/`ping`/`heartbeat`/`bye`) on that one connection; a worker-dial connection *is*
-the command route for that worker id.
+(`command`/`result`, `fs_command`/`fs_result`, `ping`/`heartbeat`/`bye`) on that one connection; a
+worker-dial connection *is* the command route for that worker id.
 
-`PROTOCOL_VERSION = 1`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
+`PROTOCOL_VERSION = 2`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
 pinned by their own golden tests. A wire change updates both crates' goldens and bumps
 `PROTOCOL_VERSION` in both, in the same commit.
 
-### 8.1 Handshake — worker-dial (register mode, v1)
+### 8.1 Handshake — worker-dial (register mode, v2)
 
 1. The server opens a **private** registration listener (`workers.listen` in `kian.yaml`;
    loopback/RFC1918/CGNAT/IPv6-ULA; a public or wildcard bind refuses startup unless
@@ -430,11 +431,11 @@ non-empty after trim, ≤200 chars, no control characters — a violation is **d
 line and the registration still succeeds** (the id is what matters; it never fails the handshake
 and never reaches a model). `max_concurrent == 0` clamps to 1 with a `warn`.
 
-### 8.2 Handshake — server-dial (legacy static endpoints, `hello` at v1)
+### 8.2 Handshake — server-dial (legacy static endpoints, `hello` at v2)
 
 Unchanged shape: endpoint → `hello {v, endpoint_id, max_concurrent}`; server → `welcome`. The
 `hello`/`welcome` frames name the protocol revision `v`; the `register` frame names it `version` —
-a locked asymmetry, frozen by the v1 goldens (a rename is a wire break).
+a locked asymmetry, frozen by the v2 goldens (a rename is a wire break).
 
 ### 8.3 Frames
 
@@ -444,19 +445,21 @@ Server → worker/endpoint:
 |---|---|
 | `welcome` | `v` (protocol version), `heartbeat_ms` (optional; serializes `null` when absent — no `skip_serializing_if`) |
 | `command` | `id` (command UUID), `cmd` (`ExecCommand`) |
+| `fs_command` (v2) | `id` (command UUID), `cmd` (`FsCommand`) |
 | `ping` | — |
 | `bye` | — |
-| `rejected` (v1) | `reason`, `detail` (optional; omitted — not `null` — when absent) |
+| `rejected` (v2) | `reason`, `detail` (optional; omitted — not `null` — when absent) |
 
 Endpoint/worker → server:
 
 | `type` | Fields |
 |---|---|
 | `hello` | `v`, `endpoint_id`, `max_concurrent` |
-| `register` (v1) | `endpoint_id`, `description` (optional; omitted when absent), `token`, `version`, `max_concurrent` |
+| `register` (v2) | `endpoint_id`, `description` (optional; omitted when absent), `token`, `version`, `max_concurrent` |
 | `heartbeat` | `endpoint_id`, `ts_ms`, `inflight` |
 | `result` | `id` (command UUID), plus exactly one of `result` (`ExecResult`) or `error` (`CommandError`) |
-| `bye` (v1) | — |
+| `fs_result` (v2) | `id` (command UUID), plus exactly one of `result` (`FsResult`) or `error` (`CommandError`) |
+| `bye` (v2) | — |
 
 `ExecCommand`: `{"argv":[<string>...],"env":{<string>:<string>},"cwd":<string>|null,"timeout_ms":<u64>|null}`.
 
@@ -465,7 +468,18 @@ Endpoint/worker → server:
 
 `CommandError`: `{"code":"spawn"|"timeout"|"io","message":"<string>"}`.
 
-**v1 reason set (closed — no fallback, no `#[serde(other)]`)**, with the worker-side reaction each
+`FsCommand` (v2, ADR-023): one tagged object —
+`{"kind":"fs_list","path":"<string>"}`, `{"kind":"fs_read","path":"<string>"}`, or
+`{"kind":"fs_write","path":"<string>","content":"<string>"}`. Paths are non-empty and never contain
+`..`; the worker resolves them under its `--workspace-root` (default: its working directory) and
+re-checks the rule. Read and write bodies are bounded at 1 MiB each; a larger body is a typed
+`io` error, never a truncation.
+
+`FsResult`: `{"kind":"fs_list","entries":[...]}`, `{"kind":"fs_read","content":"<string>"}` or
+`{"kind":"fs_write","written":true}` — the exact local built-in tool result shapes. The server maps
+a failure onto the same honest `{"error": …}` tool result the local tools produce.
+
+**v2 reason set (closed — no fallback, no `#[serde(other)]`)**, with the worker-side reaction each
 refusal demands:
 
 | `reason` | Trigger | Worker reaction |
@@ -486,7 +500,7 @@ in-flight commands, send `bye`, exit 0. Audit lines carry the id and peer addres
 ### 8.4 Delivery semantics
 
 The queue is server-side and durable; delivery is at-least-once with command-id correlation/dedupe
-([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 dispatch is **queue-first by
+([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 (unchanged at v2) dispatch is **queue-first by
 worker id**: a command enqueues durably even with no live route (a registered worker's route appears
 and disappears at runtime) and parks `pending` until a route appears or the `queue_timeout` abandons
 it honestly; there is no cross-worker dispatch. That semantics lives in
@@ -505,6 +519,22 @@ honest and visible:
   upgraded.
 - A v1 worker pointed at a v0 kian gets a refused dial and keeps its bounded backoff.
 
+### 8.6 Upgrade v1 → v2 (filesystem commands)
+
+**Upgrade order: kian first, workers second.** v2 is additive on the wire — the `command`/`result`
+frames keep their v1 bytes exactly; the only new frames are `fs_command`/`fs_result`, and the
+handshake revision moves 1 → 2. There is **no compatibility shim**: a v1 worker (which cannot decode
+v2) is refused `version_mismatch` and stays offline until it is upgraded; a v2 worker pointed at a
+v1 kian is refused and keeps its bounded backoff. Window consequences:
+
+- A v1 worker reads offline (typed terminal refusal at the listener) while the v2 kian runs; the
+  queue keeps parking its rows — no lost work, no cross-worker dispatch.
+- A v2 kian's queue migration v3 adds the `kind` column with `DEFAULT 'exec'`: every pre-v3 row
+  decodes as the exec family and re-drives byte-identically after the upgrade. Fs rows exist only
+  after the upgrade.
+- The worker's `--workspace-root` defaults to its working directory; an explicit root must exist
+  and be a directory (fail-closed at startup).
+
 ## 9. Versioning and freeze
 
 ### 9.1 Frozen surface
@@ -514,8 +544,8 @@ honest and visible:
 - SSE frame names (`kian`, `done`, `error`) and their `data` shape.
 - `/metrics` top-level keys and their meaning (nested fields additive).
 - Webhook required headers and the status matrix.
-- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v1
-  register/rejected frame bytes and the closed five-reason set, pinned by both halves' goldens.
+- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v2
+  register/rejected/fs frames and the closed five-reason set, pinned by both halves' goldens.
 
 ### 9.2 Change classes
 
@@ -527,7 +557,8 @@ honest and visible:
   trust model; changing a KiandProto handshake or the rejection reason set. The wire is frozen
   additive-only after the `kian-sdk` freeze — the SDK's public
   surface *is* this contract. The KiandProto v0 → v1 bump (register mode, worker-dial) is the
-  recorded instance: [ADR-021](decisions/ADR-021-runtime-worker-membership.md), §8.5.
+  recorded instance: [ADR-021](decisions/ADR-021-runtime-worker-membership.md), §8.5; the v1 → v2
+  bump (worker filesystem commands) is [ADR-023](decisions/ADR-023-worker-fs-tools.md), §8.6.
 
 ### 9.3 Version numbers
 

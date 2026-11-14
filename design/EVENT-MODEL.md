@@ -105,7 +105,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |
 | `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
 | `step/request` | — | DrainActivity | `{"slot":<str>,"provider":<str>,"model":<str>,"iteration":<u64>,"body":<exact request bytes>}` | loop / provider persist hook | **A2**: persisted before the request flies; replay is byte-identical. |
-| `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...]}}` | loop | The sent bytes are the truth; never rewritten. |
+| `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...],"reasoning_content"?:<str>}}` | loop | The sent bytes are the truth; never rewritten. `reasoning_content` is the provider's thinking-mode reasoning, part of context (replayed on the wire); absent for non-thinking providers and legacy events ([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). |
 | `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). |
 | `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]` | loop / exec | Redaction provenance never carries secret values. |
 | `compact` | c | DrainActivity | `{"from_seq":<u64>,"to_seq":<u64>,"summary":{"role":<str>,"content":<json>}}` | recovery reactor | The only deliberate prefix-invalidation point; ranges pairwise-disjoint, `a < b <= seq`. |
@@ -130,6 +130,12 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 `{"role": <non-empty string>, "content": <any JSON>, "synthetic"?: true}`. `content` passes through
 verbatim and is never reformatted (wire dialect v2 and the frozen request serialization are part of
 this contract). `synthetic: true` marks steer-injected context and is strippable for replay/export.
+
+Assistant messages may carry `"reasoning_content": <str>` **inside `content`** — the provider's
+thinking-mode reasoning, persisted verbatim and replayed on the next request when present
+([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). It is context, not an additive
+provenance key: a legacy assistant message without the key produces byte-identical request bytes,
+and a non-thinking provider never emits it.
 
 ### 4.2 Additive provenance keys (non-context)
 

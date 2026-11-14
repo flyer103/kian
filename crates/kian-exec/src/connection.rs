@@ -26,6 +26,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecCommand, ExecResult};
 
 use crate::error::ConnectionError;
@@ -40,7 +41,7 @@ const FRAME_CHANNEL_CAP: usize = 64;
 
 /// What a dispatched command's oneshot carries: the correlated outcome, or
 /// the connection failure that prevented one.
-type DispatchOutcome = Result<Result<ExecResult, CommandError>, ConnectionError>;
+use crate::dispatch::{DispatchOutcome, DispatchReply};
 
 /// Bounded reconnect backoff: delay grows geometrically up to `max` and
 /// stays there. The reconnect loop itself is unbounded (intermittent
@@ -289,6 +290,39 @@ impl ConnectionManager {
         id: CommandId,
         cmd: ExecCommand,
     ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::Command { id, cmd })
+            .await?
+        {
+            DispatchReply::Exec(outcome) => Ok(outcome),
+            DispatchReply::Fs(_) => Err(ConnectionError::Protocol(
+                "fs result on an exec command id".into(),
+            )),
+        }
+    }
+
+    /// Dispatch one filesystem command (v2, ADR-023) and await its
+    /// correlated result. Same permit/parking/correlation discipline as
+    /// [`ConnectionManager::dispatch_with_id`].
+    pub async fn dispatch_fs_with_id(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd })
+            .await?
+        {
+            DispatchReply::Fs(outcome) => Ok(outcome),
+            DispatchReply::Exec(_) => Err(ConnectionError::Protocol(
+                "exec result on an fs command id".into(),
+            )),
+        }
+    }
+
+    /// Park the correlation slot, write one frame, await its correlated
+    /// reply (or the transport's honest failure).
+    async fn dispatch_frame(&self, id: CommandId, frame: ServerFrame) -> DispatchOutcome {
         let handle = self.live_conn().await?;
         // Hold a permit for the whole flight: caps our in-flight count at
         // the endpoint's announced concurrency.
@@ -300,12 +334,7 @@ impl ConnectionManager {
             .map_err(|_| ConnectionError::TransportClosed)?;
         let (sender, receiver) = oneshot::channel();
         self.shared.pending.lock().unwrap().insert(id, sender);
-        if handle
-            .writer
-            .send(ServerFrame::Command { id, cmd })
-            .await
-            .is_err()
-        {
+        if handle.writer.send(frame).await.is_err() {
             self.shared.pending.lock().unwrap().remove(&id);
             drop(permit);
             return Err(ConnectionError::TransportClosed);
@@ -486,8 +515,8 @@ async fn run_connection(shared: &Arc<Shared>) -> Result<(), ConnectionError> {
                 }
                 Some(EndpointFrame::CommandResult { id, result, error }) => {
                     let outcome = match (result, error) {
-                        (Some(result), None) => Ok(Ok(result)),
-                        (None, Some(error)) => Ok(Err(error)),
+                        (Some(result), None) => Ok(DispatchReply::Exec(Ok(result))),
+                        (None, Some(error)) => Ok(DispatchReply::Exec(Err(error))),
                         _ => break Err(ConnectionError::Protocol(format!(
                             "result frame for {id} must carry exactly one of result/error"
                         ))),
@@ -499,6 +528,24 @@ async fn run_connection(shared: &Arc<Shared>) -> Result<(), ConnectionError> {
                         None => tracing::warn!(
                             command_id = %id,
                             "result for unknown command (already failed or duplicate)"
+                        ),
+                    }
+                }
+                Some(EndpointFrame::FsCommandResult { id, result, error }) => {
+                    let outcome = match (result, error) {
+                        (Some(result), None) => Ok(DispatchReply::Fs(Ok(result))),
+                        (None, Some(error)) => Ok(DispatchReply::Fs(Err(error))),
+                        _ => break Err(ConnectionError::Protocol(format!(
+                            "fs result frame for {id} must carry exactly one of result/error"
+                        ))),
+                    };
+                    match shared.pending.lock().unwrap().remove(&id) {
+                        Some(sender) => {
+                            let _ = sender.send(outcome);
+                        }
+                        None => tracing::warn!(
+                            command_id = %id,
+                            "fs result for unknown command (already failed or duplicate)"
                         ),
                     }
                 }

@@ -560,6 +560,61 @@ async fn slow_remote_command_never_blocks_the_runtime() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// v3 (ADR-023): an `fs` row round-trips its command and result, and a
+/// row inserted without the `kind` column (a pre-v3 row) decodes as the
+/// exec family — parked work survives the upgrade.
+#[tokio::test]
+async fn fs_rows_round_trip_and_legacy_rows_decode_as_exec() {
+    use kian_core::fs::{FsCommand, FsResult};
+    use kian_exec::store::{CommandKind, CommandOutcome, WorkerCommand};
+
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+
+    let fs_id = Uuid::new_v4();
+    store
+        .enqueue(
+            fs_id,
+            "box",
+            WorkerCommand::Fs(FsCommand::Read {
+                path: "a.txt".into(),
+            }),
+            Some("call-fs"),
+        )
+        .await
+        .unwrap();
+    let row = store.get(fs_id).await.unwrap().unwrap();
+    assert_eq!(row.command.kind(), CommandKind::Fs);
+    let outcome = CommandOutcome::Fs {
+        result: FsResult::Read {
+            content: "hello".into(),
+        },
+    };
+    assert!(store.mark_done(fs_id, &outcome).await.unwrap());
+    let row = store.get(fs_id).await.unwrap().unwrap();
+    assert_eq!(row.outcome, Some(outcome));
+
+    // A pre-v3 row: the INSERT omits `kind`, the v3 DEFAULT applies.
+    let legacy = Uuid::new_v4();
+    let legacy_cmd = serde_json::to_string(&cmd(&["true"])).unwrap();
+    sqlx::query(
+        "INSERT INTO exec_queue (command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at) \
+         VALUES (?, ?, ?, 'pending', NULL, NULL, 0, 0)",
+    )
+    .bind(legacy.to_string())
+    .bind("box")
+    .bind(legacy_cmd)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let row = store.get(legacy).await.unwrap().unwrap();
+    assert_eq!(row.command.kind(), CommandKind::Exec);
+    assert!(matches!(row.command, WorkerCommand::Exec(_)));
+
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
 /// Store-level contract: enqueue dedupe, monotone status transitions, and
 /// committed `done` rows are immutable (the runtime half of the review
 /// assertion).

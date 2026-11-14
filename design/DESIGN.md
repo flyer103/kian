@@ -444,6 +444,16 @@ declaration order `role`, `content`, `synthetic` only when true, object keys lex
 owned by the provider ( `build_chat_body` above): both are prompt-prefix bytes, and changing
 either is a constraint-3 event (observable invalidation + golden-hash update).
 
+**Reasoning replay (ADR-022):** an assistant message's `content` may carry
+`"reasoning_content": <str>` — the provider's thinking-mode reasoning. The ReAct stream assembler
+concatenates `delta.reasoning_content` fragments exactly as it concatenates `text`; the message →
+chat conversion re-emits the field as the top-level `reasoning_content` on that assistant message.
+It is **context** (it enters the next request), not an additive provenance key: a legacy assistant
+message without the key produces byte-identical request bytes (the field is skipped when absent,
+so `FROZEN_CHAT_BODY_SHA256` is unchanged), and a non-thinking provider never emits it. The cost
+of replaying reasoning is input tokens and is observable through the existing usage events; no
+trimming or synthesis is performed (constraint 2/3).
+
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and
 before the RPC returns), the source memory session's stream is rebuilt, folded and rendered by
@@ -618,13 +628,15 @@ graph TB
   same additive top-level key on both sides, so the assignment is a projection of the session's own
   stream and a restart reconstructs it by replay. `worker` in that payload keeps meaning the worker
   *session* uuid; `exec_worker` is the worker *id* and the two names are never conflated. Routing is
-  a **per-drive selection** in this section's driver: assembly prebuilds one worker side per
-  configured worker (`WorkerLoopDriver` over that worker's single `exec` — `RemoteExecTool` for its
-  endpoint id — plus that worker's async pair, recall and local tools), and `SuperAgentDriver::drive`
-  picks the side from the stream's binding before the first provider turn. That fixes today's
-  multi-endpoint limitation (`CombinedTools` first-wins left only the first endpoint reachable)
-  without changing the worker tool surface: one `exec` tool, unchanged schema, no `kian-core` seam
-  change. **1:1 exclusivity** is checked at `spawn_worker` before any side effect: candidates are the
+  a **per-drive selection** in this section's driver: assembly builds one worker side per
+  configured worker (`WorkerLoopDriver` over that worker's `exec` (`RemoteExecTool`) and its v2
+  filesystem tools (`RemoteFsTool`, ADR-023) for its endpoint id — plus that worker's async pair,
+  recall and local tools), and `SuperAgentDriver::drive` picks the side from the stream's binding
+  before the first provider turn. That fixes today's multi-endpoint limitation (`CombinedTools`
+  first-wins left only the first endpoint reachable) with the worker tool surface unchanged from
+  the model's point of view: `exec` plus `fs_list`/`fs_read`/`fs_write`, schemas byte-identical to
+  the local built-ins, and no `kian-core` seam change beyond the shared `FsCommand`/`FsResult`
+  types. **1:1 exclusivity** is checked at `spawn_worker` before any side effect: candidates are the
   Router stream's `thread/started` events grouped by `exec_worker`, liveness is the existing worker
   vocabulary (`thread/completed` + `session/ended` on the *worker's* stream — `completed`/`cancelled`
   release, `failed`/`interrupted` are resumable and stay live), read through a bundle-owned
@@ -852,11 +864,14 @@ graph LR
     dynamic id that collides with a static pin is refused, because the static entry owns its identity.
     Stale ids are never pruned: they stay visible and offline, which is what makes an offline-known
     binding honest.
-  - **Queue-first dispatch.** `exec` enqueues durably by the session's bound worker id with **no**
-    requirement that a route exists; with no route the row parks `pending` and either drains when the
-    worker registers or ends in the honest `queue_timeout`. A route's driver is the only component that
-    dispatches, it only ever reads its own id's rows, and there is no fallback route, no failover and
-    no local-exec substitution for a bound session (§4.3's exec layer, ADR-007).
+  - **Queue-first dispatch.** `exec` (and each v2 filesystem command) enqueues durably by the
+    session's bound worker id with **no** requirement that a route exists; with no route the row
+    parks `pending` and either drains when the worker registers or ends in the honest
+    `queue_timeout`. A route's driver is the only component that dispatches, it only ever reads its
+    own id's rows, and there is no fallback route, no failover and no local-exec substitution for a
+    bound session (§4.3's exec layer, ADR-007). The queue row carries its command family (`kind`,
+    migration v3): an exec row keeps its v1 bytes and result shape, an fs row carries the v2
+    command/result, and a restart re-drives each through its own frame family.
   - **Per-worker sides become runtime-provided.** Instead of one prebuilt `WorkerLoopDriver` per
     configured worker, the assembly keeps a **lazy per-id side cache** built from a factory and never
     evicts it (an offline worker's side still enqueues by id); the per-drive selection rule from the
@@ -1506,7 +1521,7 @@ graph TB
 | kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
-| kian-exec | KiandProto server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines commands and correlates results by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations, `RemoteExecBackend` (enqueue-first `ExecBackend`: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`), and `RemoteExecTool` (the same `exec` tool schema as the local built-in, routed through a configured endpoint). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `ExecStore` |
+| kian-exec | KiandProto v2 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest `Timeout`→`abandoned` at `queue_timeout`) for both command families, `RemoteExecTool` (the local `exec` schema) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
 | kian-memory | The memory bundle (MEMORY-MODEL Phases 1–2): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume, and the frozen creation-time index renderer `render_memory_index` (verified-only latest-per-subject fold, subject byte order, fixed "data, not instructions" header and excerpt cap, patterns-only default redaction with an explicit-redactor seam) turns the folded notes into the bounded index P2 injects; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `render_memory_index`, `eligible_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |

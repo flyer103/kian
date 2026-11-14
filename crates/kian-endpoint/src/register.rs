@@ -359,7 +359,7 @@ mod tests {
         assert!(register.contains("\"endpoint_id\":\"builder-1\""));
         assert!(register.contains("\"description\":\"linux builder\""));
         assert!(register.contains("\"token\":\"t0ken-not-a-secret\""));
-        assert!(register.contains("\"version\":1"));
+        assert!(register.contains(&format!("\"version\":{}", PROTOCOL_VERSION)));
         peer.send(&welcome(10_000)).await;
 
         let id = uuid::Uuid::new_v4();

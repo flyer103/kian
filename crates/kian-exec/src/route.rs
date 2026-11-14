@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecCommand, ExecResult};
 
 use crate::connection::{ConnectionManager, EndpointStatus};
@@ -31,9 +32,7 @@ use crate::proto::{CommandError, CommandId, EndpointFrame, ServerFrame};
 use crate::registration::RegisteredWorker;
 use crate::store::now_ms;
 
-/// What a dispatched command's oneshot carries (mirrors the connection
-/// manager's dispatch outcome).
-type DispatchOutcome = Result<Result<ExecResult, CommandError>, ConnectionError>;
+use crate::dispatch::{DispatchOutcome, DispatchReply};
 
 /// The transport one queue route dispatches over.
 pub enum RouteTransport {
@@ -80,6 +79,19 @@ impl RouteTransport {
         match self {
             Self::Managed(manager) => manager.dispatch_with_id(id, cmd).await,
             Self::Registered(registered) => registered.dispatch_with_id(id, cmd).await,
+        }
+    }
+
+    /// Dispatch one filesystem command (v2, ADR-023) and await its
+    /// correlated result.
+    pub async fn dispatch_fs_with_id(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self {
+            Self::Managed(manager) => manager.dispatch_fs_with_id(id, cmd).await,
+            Self::Registered(registered) => registered.dispatch_fs_with_id(id, cmd).await,
         }
     }
 }
@@ -153,8 +165,8 @@ impl RegisteredTransport {
                     }
                     EndpointFrame::CommandResult { id, result, error } => {
                         let outcome = match (result, error) {
-                            (Some(result), None) => Ok(Ok(result)),
-                            (None, Some(error)) => Ok(Err(error)),
+                            (Some(result), None) => Ok(DispatchReply::Exec(Ok(result))),
+                            (None, Some(error)) => Ok(DispatchReply::Exec(Err(error))),
                             _ => {
                                 tracing::warn!(
                                     endpoint = %pump.id,
@@ -172,6 +184,30 @@ impl RegisteredTransport {
                                 endpoint = %pump.id,
                                 command_id = %id,
                                 "result for unknown command (already failed or duplicate)"
+                            ),
+                        }
+                    }
+                    EndpointFrame::FsCommandResult { id, result, error } => {
+                        let outcome = match (result, error) {
+                            (Some(result), None) => Ok(DispatchReply::Fs(Ok(result))),
+                            (None, Some(error)) => Ok(DispatchReply::Fs(Err(error))),
+                            _ => {
+                                tracing::warn!(
+                                    endpoint = %pump.id,
+                                    command_id = %id,
+                                    "fs result frame must carry exactly one of result/error; dropping"
+                                );
+                                continue;
+                            }
+                        };
+                        match pump.pending.lock().unwrap().remove(&id) {
+                            Some(sender) => {
+                                let _ = sender.send(outcome);
+                            }
+                            None => tracing::debug!(
+                                endpoint = %pump.id,
+                                command_id = %id,
+                                "fs result for unknown command (already failed or duplicate)"
                             ),
                         }
                     }
@@ -227,7 +263,38 @@ impl RegisteredTransport {
         id: CommandId,
         cmd: ExecCommand,
     ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
-        // Hold a permit for the whole flight (the announced cap).
+        match self
+            .dispatch_frame(id, ServerFrame::Command { id, cmd })
+            .await?
+        {
+            DispatchReply::Exec(outcome) => Ok(outcome),
+            DispatchReply::Fs(_) => Err(ConnectionError::Protocol(
+                "fs result on an exec command id".into(),
+            )),
+        }
+    }
+
+    /// Dispatch one filesystem command (v2) and await its correlated
+    /// result.
+    pub async fn dispatch_fs_with_id(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd })
+            .await?
+        {
+            DispatchReply::Fs(outcome) => Ok(outcome),
+            DispatchReply::Exec(_) => Err(ConnectionError::Protocol(
+                "exec result on an fs command id".into(),
+            )),
+        }
+    }
+
+    /// Park the correlation slot, write one frame, await the correlated
+    /// reply. The permit is held for the whole flight (the announced cap).
+    async fn dispatch_frame(&self, id: CommandId, frame: ServerFrame) -> DispatchOutcome {
         let permit = self
             .permits
             .clone()
@@ -236,12 +303,7 @@ impl RegisteredTransport {
             .map_err(|_| ConnectionError::TransportClosed)?;
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, sender);
-        if self
-            .writer
-            .send(ServerFrame::Command { id, cmd })
-            .await
-            .is_err()
-        {
+        if self.writer.send(frame).await.is_err() {
             self.pending.lock().unwrap().remove(&id);
             drop(permit);
             return Err(ConnectionError::TransportClosed);

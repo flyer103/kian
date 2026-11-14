@@ -20,15 +20,17 @@ pub(crate) async fn enqueue(
     command_id: Uuid,
     endpoint_id: &str,
     cmd_json: &str,
+    kind: &str,
     tool_call_ref: Option<&str>,
     now: i64,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "INSERT INTO exec_queue (command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at)\n             VALUES ($1::text, $2::text, $3::text, 'pending', $4::text, NULL, $5::bigint, $6::bigint)\n             ON CONFLICT(command_id) DO NOTHING",
+        "INSERT INTO exec_queue (command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at)\n             VALUES ($1::text, $2::text, $3::text, $4::text, 'pending', $5::text, NULL, $6::bigint, $7::bigint)\n             ON CONFLICT(command_id) DO NOTHING",
     )
     .bind(command_id.to_string())
     .bind(endpoint_id)
     .bind(cmd_json)
+    .bind(kind)
     .bind(tool_call_ref)
     .bind(now)
     .bind(now)
@@ -39,7 +41,7 @@ pub(crate) async fn enqueue(
 
 pub(crate) async fn get(pool: &PgPool, command_id: Uuid) -> Result<Option<QueueRow>, sqlx::Error> {
     sqlx::query_as::<_, QueueRow>(
-        "SELECT command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE command_id = $1::text",
+        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE command_id = $1::text",
     )
     .bind(command_id.to_string())
     .fetch_optional(pool)
@@ -101,7 +103,7 @@ pub(crate) async fn drivable(
     endpoint_id: &str,
 ) -> Result<Vec<QueueRow>, sqlx::Error> {
     sqlx::query_as::<_, QueueRow>(
-        "SELECT command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE endpoint_id = $1::text AND status IN ('pending', 'inflight') ORDER BY created_at ASC, command_id ASC",
+        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE endpoint_id = $1::text AND status IN ('pending', 'inflight') ORDER BY created_at ASC, command_id ASC",
     )
     .bind(endpoint_id)
     .fetch_all(pool)

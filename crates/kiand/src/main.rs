@@ -24,6 +24,7 @@ use kiand::executor::DaemonExecutor;
 
 const USAGE: &str = "usage:
   kiand [--config <path>] [--endpoint-id <id>] [--listen <host:port>]
+        [--workspace-root <dir>]
         [--max-concurrent <n>] [--heartbeat-ms <n>] [--exec-timeout-ms <n>]
                                          run the endpoint daemon (default listen: 127.0.0.1:0;
                                          the bound address is printed on stdout)
@@ -110,6 +111,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 let raw = next_value(&mut iter, "--exec-timeout-ms")?;
                 flags.exec_timeout_ms = Some(parse_num(&raw, "--exec-timeout-ms")?);
             }
+            "--workspace-root" => {
+                flags.workspace_root = Some(next_value(&mut iter, "--workspace-root")?)
+            }
             "--register-to" => flags.register_to = Some(next_value(&mut iter, "--register-to")?),
             "--description" => flags.description = Some(next_value(&mut iter, "--description")?),
             "--token-env" => flags.token_env = Some(next_value(&mut iter, "--token-env")?),
@@ -173,7 +177,9 @@ async fn run_worker(config: Config) -> ExitCode {
     let endpoint = Arc::new(
         Endpoint::new(config.endpoint_id.clone(), executor)
             .with_max_concurrent(config.max_concurrent)
-            .with_heartbeat(Duration::from_millis(config.heartbeat_ms)),
+            .with_workspace_root(config.workspace_root.clone())
+            .with_heartbeat(Duration::from_millis(config.heartbeat_ms))
+            .with_workspace_root(config.workspace_root.clone()),
     );
     let info = RegisterInfo {
         endpoint_id: config.endpoint_id.clone(),
@@ -283,6 +289,7 @@ async fn run_server(config: Config) -> ExitCode {
     let endpoint = Arc::new(
         Endpoint::new(config.endpoint_id.clone(), executor)
             .with_max_concurrent(config.max_concurrent)
+            .with_workspace_root(config.workspace_root.clone())
             .with_heartbeat(Duration::from_millis(config.heartbeat_ms))
             .with_heartbeat_tap(tap),
     );

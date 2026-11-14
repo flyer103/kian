@@ -11,10 +11,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecCommand, ExecResult};
 
 /// Version of the KiandProto wire protocol implemented by this crate.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The closed register-refusal reason set (v1) — this crate's own
 /// independent declaration of the server half's contract (the mirror
@@ -111,6 +112,10 @@ pub enum ServerFrame {
     /// Execute one command; answer with a [`EndpointFrame::CommandResult`]
     /// carrying the same `id`.
     Command { id: CommandId, cmd: ExecCommand },
+    /// Execute one filesystem command (v2, ADR-023); answer with an
+    /// [`EndpointFrame::FsCommandResult`] carrying the same `id`.
+    #[serde(rename = "fs_command")]
+    FsCommandFrame { id: CommandId, cmd: FsCommand },
     /// Liveness probe; the endpoint answers with an immediate heartbeat.
     Ping,
     /// Graceful close.
@@ -166,6 +171,16 @@ pub enum EndpointFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<CommandError>,
     },
+    /// Result of one [`ServerFrame::FsCommandFrame`] (v2, ADR-023).
+    /// Exactly one of `result` / `error` is present.
+    #[serde(rename = "fs_result")]
+    FsCommandResult {
+        id: CommandId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<FsResult>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<CommandError>,
+    },
     /// Graceful leave (v1): same bytes as the server's `bye`.
     Bye,
 }
@@ -189,10 +204,38 @@ impl EndpointFrame {
         }
     }
 
-    /// The correlation id when this is a result frame.
+    /// Build a successful filesystem result frame (v2).
+    pub fn fs_ok(id: CommandId, result: FsResult) -> Self {
+        Self::FsCommandResult {
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// Build a failed filesystem result frame (v2).
+    pub fn fs_failed(id: CommandId, error: CommandError) -> Self {
+        Self::FsCommandResult {
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+
+    /// The correlation id when this is a result frame (either family).
     pub fn command_id(&self) -> Option<CommandId> {
         match self {
-            Self::CommandResult { id, .. } => Some(*id),
+            Self::CommandResult { id, .. } | Self::FsCommandResult { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Split a filesystem result frame into its outcome parts (v2).
+    pub fn fs_result_parts(&self) -> Option<(CommandId, Option<FsResult>, Option<CommandError>)> {
+        match self {
+            Self::FsCommandResult { id, result, error } => {
+                Some((*id, result.clone(), error.clone()))
+            }
             _ => None,
         }
     }

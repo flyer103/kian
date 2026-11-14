@@ -643,18 +643,28 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The honest tool error text (spec §4 / D16, verbatim shapes).
+    /// The honest tool error text (spec §4 / D16, verbatim shapes). The
+    /// exec spelling is frozen; the fs family says "fs refused" and
+    /// carries the same binding facts.
     #[must_use]
-    pub fn message(&self) -> String {
+    pub fn message_for(&self, tool: &str) -> String {
+        let family = if tool == "exec" { "exec" } else { "fs" };
         match self {
             Self::Unconfigured(id) => format!(
-                "exec refused: this session is bound to execution worker `{id}`, which is not \
+                "{family} refused: this session is bound to execution worker `{id}`, which is not \
                  configured on this server — no command was queued and nothing ran elsewhere"
             ),
-            Self::Malformed => "exec refused: this session carries a malformed `exec_worker` \
-                 binding on its stream — no command was queued and nothing ran elsewhere"
-                .to_string(),
+            Self::Malformed => format!(
+                "{family} refused: this session carries a malformed `exec_worker` binding on its \
+                 stream — no command was queued and nothing ran elsewhere"
+            ),
         }
+    }
+
+    /// The frozen exec refusal text.
+    #[must_use]
+    pub fn message(&self) -> String {
+        self.message_for("exec")
     }
 }
 
@@ -713,6 +723,38 @@ impl ToolProvider for RefusingExecTool {
 
     fn invoke(&self, _call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
         let message = self.refusal.message();
+        Box::pin(async move { Err(ToolError::Execution(message)) })
+    }
+}
+
+/// The refusing fs tool (assembly glue, D16/D2): mounts the three v2 fs
+/// names with the exact schemas the remote fs tool exposes, and every
+/// invoke returns the honest refusal. Structurally holds no backend handle
+/// — nothing can be enqueued on a refusal row.
+pub struct RefusingFsTool {
+    refusal: Refusal,
+}
+
+impl RefusingFsTool {
+    #[must_use]
+    pub fn new(refusal: Refusal) -> Self {
+        Self { refusal }
+    }
+
+    /// The refusal this tool answers with (tests).
+    #[must_use]
+    pub fn refusal(&self) -> &Refusal {
+        &self.refusal
+    }
+}
+
+impl ToolProvider for RefusingFsTool {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        kian_exec::RemoteFsTool::fs_schemas()
+    }
+
+    fn invoke(&self, call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+        let message = self.refusal.message_for(&call.name);
         Box::pin(async move { Err(ToolError::Execution(message)) })
     }
 }

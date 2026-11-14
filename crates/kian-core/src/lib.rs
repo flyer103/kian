@@ -24,6 +24,7 @@
 pub mod context;
 pub mod control;
 pub mod events;
+pub mod fs;
 pub mod invariants;
 pub mod memory;
 pub mod model;

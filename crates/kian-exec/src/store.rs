@@ -40,6 +40,7 @@ use sqlx::sqlite::{
 };
 use uuid::Uuid;
 
+use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecCommand, ExecError, ExecResult};
 
 use crate::proto::{CommandError, ErrorCode};
@@ -102,7 +103,99 @@ impl QueueStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandOutcome {
     Ok { result: ExecResult },
+    Fs { result: FsResult },
     Err { error: CommandError },
+}
+
+/// The two command families the durable queue carries (ADR-023). The
+/// stored `kind` column disambiguates the payload and result JSON; rows
+/// written before the v3 migration carry the default `exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    Exec,
+    Fs,
+}
+
+impl CommandKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Fs => "fs",
+        }
+    }
+
+    fn from_str(raw: &str) -> Result<Self, QueueStoreError> {
+        match raw {
+            "exec" => Ok(Self::Exec),
+            "fs" => Ok(Self::Fs),
+            other => Err(QueueStoreError::Corrupt(format!(
+                "unknown command kind {other:?}"
+            ))),
+        }
+    }
+}
+
+/// One queued worker command: the `exec` family (unchanged wire shape) or
+/// the v2 filesystem family.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkerCommand {
+    Exec(ExecCommand),
+    Fs(FsCommand),
+}
+
+impl From<ExecCommand> for WorkerCommand {
+    fn from(cmd: ExecCommand) -> Self {
+        Self::Exec(cmd)
+    }
+}
+
+impl From<&ExecCommand> for WorkerCommand {
+    fn from(cmd: &ExecCommand) -> Self {
+        Self::Exec(cmd.clone())
+    }
+}
+
+impl From<&WorkerCommand> for WorkerCommand {
+    fn from(cmd: &WorkerCommand) -> Self {
+        cmd.clone()
+    }
+}
+
+impl WorkerCommand {
+    #[must_use]
+    pub fn kind(&self) -> CommandKind {
+        match self {
+            Self::Exec(_) => CommandKind::Exec,
+            Self::Fs(_) => CommandKind::Fs,
+        }
+    }
+
+    #[must_use]
+    pub fn as_exec(&self) -> Option<&ExecCommand> {
+        match self {
+            Self::Exec(cmd) => Some(cmd),
+            Self::Fs(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_fs(&self) -> Option<&FsCommand> {
+        match self {
+            Self::Fs(cmd) => Some(cmd),
+            Self::Exec(_) => None,
+        }
+    }
+
+    fn to_cmd_json(&self) -> Result<String, QueueStoreError> {
+        let value = match self {
+            Self::Exec(cmd) => serde_json::to_value(cmd),
+            Self::Fs(cmd) => serde_json::to_value(cmd),
+        }
+        .map_err(|e| QueueStoreError::Corrupt(format!("cmd not serializable: {e}")))?;
+        serde_json::to_string(&value)
+            .map_err(|e| QueueStoreError::Corrupt(format!("cmd not serializable: {e}")))
+    }
 }
 
 impl CommandOutcome {
@@ -115,6 +208,23 @@ impl CommandOutcome {
                 ErrorCode::Timeout => ExecError::Timeout,
                 ErrorCode::Io => ExecError::Io(error.message),
             }),
+            Self::Fs { .. } => Err(ExecError::Io(
+                "fs result on the exec path (internal)".into(),
+            )),
+        }
+    }
+
+    /// Map onto the fs tool's result shape (the fs family's counterpart).
+    pub fn to_fs(self) -> Result<FsResult, ExecError> {
+        match self {
+            Self::Fs { result } => Ok(result),
+            Self::Ok { .. } => Err(ExecError::Io(
+                "exec result on the fs path (internal)".into(),
+            )),
+            Self::Err { error } => Err(match error.code {
+                ErrorCode::Timeout => ExecError::Timeout,
+                _ => ExecError::Io(error.message),
+            }),
         }
     }
 
@@ -122,26 +232,38 @@ impl CommandOutcome {
         match self {
             Self::Ok { result } => serde_json::to_string(&serde_json::json!({ "ok": result }))
                 .expect("exec results always serialize"),
+            Self::Fs { result } => serde_json::to_string(&serde_json::json!({ "fs": result }))
+                .expect("fs results always serialize"),
             Self::Err { error } => serde_json::to_string(&serde_json::json!({ "error": error }))
                 .expect("command errors always serialize"),
         }
     }
 
-    fn from_json(raw: &str) -> Result<Self, QueueStoreError> {
+    fn from_json(raw: &str, kind: CommandKind) -> Result<Self, QueueStoreError> {
         let value: serde_json::Value = serde_json::from_str(raw)
             .map_err(|e| QueueStoreError::Corrupt(format!("bad outcome json: {e}")))?;
-        if let Some(result) = value.get("ok") {
-            serde_json::from_value(result.clone())
-                .map(|result| Self::Ok { result })
-                .map_err(|e| QueueStoreError::Corrupt(format!("bad ok outcome: {e}")))
-        } else if let Some(error) = value.get("error") {
-            serde_json::from_value(error.clone())
+        if let Some(error) = value.get("error") {
+            return serde_json::from_value(error.clone())
                 .map(|error| Self::Err { error })
-                .map_err(|e| QueueStoreError::Corrupt(format!("bad err outcome: {e}")))
-        } else {
-            Err(QueueStoreError::Corrupt(
-                "outcome json carries neither ok nor error".into(),
-            ))
+                .map_err(|e| QueueStoreError::Corrupt(format!("bad err outcome: {e}")));
+        }
+        match kind {
+            CommandKind::Exec => {
+                let result = value.get("ok").ok_or_else(|| {
+                    QueueStoreError::Corrupt("exec outcome carries no `ok`".into())
+                })?;
+                serde_json::from_value(result.clone())
+                    .map(|result| Self::Ok { result })
+                    .map_err(|e| QueueStoreError::Corrupt(format!("bad ok outcome: {e}")))
+            }
+            CommandKind::Fs => {
+                let result = value
+                    .get("fs")
+                    .ok_or_else(|| QueueStoreError::Corrupt("fs outcome carries no `fs`".into()))?;
+                serde_json::from_value(result.clone())
+                    .map(|result| Self::Fs { result })
+                    .map_err(|e| QueueStoreError::Corrupt(format!("bad fs outcome: {e}")))
+            }
         }
     }
 }
@@ -151,7 +273,7 @@ impl CommandOutcome {
 pub struct QueuedCommand {
     pub command_id: Uuid,
     pub endpoint_id: String,
-    pub cmd: ExecCommand,
+    pub command: WorkerCommand,
     pub status: QueueStatus,
     pub tool_call_ref: Option<String>,
     /// Present iff `status == Done`.
@@ -230,10 +352,26 @@ const V2_QUEUE_ROW_LEASES: Migration = Migration {
     up: "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\nALTER TABLE exec_queue ADD COLUMN claimed_until_ms INTEGER;\nALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\nALTER TABLE async_jobs ADD COLUMN claimed_until_ms INTEGER",
 };
 
+/// v3 — the queue command family (ADR-023): `exec` rows keep their
+/// payload and result bytes; `fs` rows (KiandProto v2) carry the fs
+/// command/result JSON. `DEFAULT 'exec'` is what makes every pre-v3 row
+/// decode as the exec family after the additive ALTER — no row rewrite,
+/// no lost parked work.
+const V3_EXEC_QUEUE_KIND: Migration = Migration {
+    version: 3,
+    name: "v3_exec_queue_kind",
+    up: "ALTER TABLE exec_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'exec'",
+};
+
 /// The registered adjacent sqlite chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
-    &[V0_REGISTRY_QUEUE, V1_ASYNC_JOBS, V2_QUEUE_ROW_LEASES]
+    &[
+        V0_REGISTRY_QUEUE,
+        V1_ASYNC_JOBS,
+        V2_QUEUE_ROW_LEASES,
+        V3_EXEC_QUEUE_KIND,
+    ]
 }
 
 /// v0 (postgres chain) — same version and name as the sqlite
@@ -260,6 +398,14 @@ const PG_V2_QUEUE_ROW_LEASES: Migration = Migration {
     up: "ALTER TABLE exec_queue ADD COLUMN claimed_by TEXT;\nALTER TABLE exec_queue ADD COLUMN claimed_until_ms BIGINT;\nALTER TABLE async_jobs ADD COLUMN claimed_by TEXT;\nALTER TABLE async_jobs ADD COLUMN claimed_until_ms BIGINT",
 };
 
+/// v3 (postgres chain) — the queue command family, pg DDL. Same version
+/// and name as the sqlite v3.
+const PG_V3_EXEC_QUEUE_KIND: Migration = Migration {
+    version: 3,
+    name: "v3_exec_queue_kind",
+    up: "ALTER TABLE exec_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'exec'",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] (enforced by `pg_chain_mirrors_sqlite_chain_versions_and_names`).
 pub fn pg_chain() -> &'static [Migration] {
@@ -267,6 +413,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V0_REGISTRY_QUEUE,
         PG_V1_ASYNC_JOBS,
         PG_V2_QUEUE_ROW_LEASES,
+        PG_V3_EXEC_QUEUE_KIND,
     ]
 }
 
@@ -491,16 +638,25 @@ impl ExecStore {
         &self,
         command_id: Uuid,
         endpoint_id: &str,
-        cmd: &ExecCommand,
+        command: impl Into<WorkerCommand>,
         tool_call_ref: Option<&str>,
     ) -> Result<EnqueueOutcome, QueueStoreError> {
-        let cmd_json = serde_json::to_string(cmd)
-            .map_err(|e| QueueStoreError::Corrupt(format!("cmd not serializable: {e}")))?;
+        let command = command.into();
+        let cmd_json = command.to_cmd_json()?;
+        let kind = command.kind().as_str();
         let now = now_ms();
         let inserted = match self {
             Self::Sqlite(pool) => {
-                crate::sqlite::enqueue(pool, command_id, endpoint_id, &cmd_json, tool_call_ref, now)
-                    .await?
+                crate::sqlite::enqueue(
+                    pool,
+                    command_id,
+                    endpoint_id,
+                    &cmd_json,
+                    kind,
+                    tool_call_ref,
+                    now,
+                )
+                .await?
             }
             Self::Postgres(pool) => {
                 crate::postgres::enqueue(
@@ -508,6 +664,7 @@ impl ExecStore {
                     command_id,
                     endpoint_id,
                     &cmd_json,
+                    kind,
                     tool_call_ref,
                     now,
                 )
@@ -723,7 +880,8 @@ impl ExecStore {
 /// Parses one queue row tuple. `result` is stored as the raw outcome JSON;
 /// its kind (ok / err) is recovered from the payload shape.
 fn parse_row(
-    (command_id, endpoint_id, cmd, status, tool_call_ref, result, created_at, updated_at): (
+    (command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at): (
+        String,
         String,
         String,
         String,
@@ -736,20 +894,29 @@ fn parse_row(
 ) -> Result<QueuedCommand, QueueStoreError> {
     let command_id = Uuid::parse_str(&command_id)
         .map_err(|e| QueueStoreError::Corrupt(format!("bad command id: {e}")))?;
-    let cmd: ExecCommand = serde_json::from_str(&cmd)
-        .map_err(|e| QueueStoreError::Corrupt(format!("bad cmd json: {e}")))?;
+    let kind = CommandKind::from_str(&kind)?;
+    let command = match kind {
+        CommandKind::Exec => WorkerCommand::Exec(
+            serde_json::from_str(&cmd)
+                .map_err(|e| QueueStoreError::Corrupt(format!("bad cmd json: {e}")))?,
+        ),
+        CommandKind::Fs => WorkerCommand::Fs(
+            serde_json::from_str(&cmd)
+                .map_err(|e| QueueStoreError::Corrupt(format!("bad fs cmd json: {e}")))?,
+        ),
+    };
     let status = QueueStatus::from_str(&status)?;
     let outcome = match (&result, status) {
         (None, QueueStatus::Done) => {
             return Err(QueueStoreError::Corrupt("done row without result".into()));
         }
         (None, _) => None,
-        (Some(raw), _) => Some(CommandOutcome::from_json(raw)?),
+        (Some(raw), _) => Some(CommandOutcome::from_json(raw, kind)?),
     };
     Ok(QueuedCommand {
         command_id,
         endpoint_id,
-        cmd,
+        command,
         status,
         tool_call_ref,
         outcome,

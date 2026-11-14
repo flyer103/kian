@@ -296,7 +296,7 @@ impl QaRawWorker {
         line.push('\n');
         this.writer.write_all(line.as_bytes()).await.unwrap();
         match this.recv().await {
-            Some(ServerFrame::Welcome { v: 1, .. }) => Some(this),
+            Some(ServerFrame::Welcome { v: 2, .. }) => Some(this),
             other => {
                 // Surface the refusal frame through `last_refusal`.
                 if let Some(ServerFrame::Rejected { reason, .. }) = other {
@@ -420,7 +420,13 @@ async fn qa_runtime_membership_over_real_processes() {
     for _ in 0..100 {
         if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
             drop(stream);
-            let probe = QaRawWorker::dial(addr, "qa-probe", "definitely-wrong-token", 1).await;
+            let probe = QaRawWorker::dial(
+                addr,
+                "qa-probe",
+                "definitely-wrong-token",
+                kian_exec::PROTOCOL_VERSION,
+            )
+            .await;
             match probe {
                 None => {
                     listener_up = true;
@@ -442,13 +448,14 @@ async fn qa_runtime_membership_over_real_processes() {
 
     // JOIN: no kian restart, no config edit — the test process is the
     // worker. Heartbeat keeps it fresh while we probe.
-    let worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, 1)
+    let worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, kian_exec::PROTOCOL_VERSION)
         .await
         .expect("correct token registers");
     wait_cli_state(&config, "qa-raw-1", "online", 5_000).await;
 
     // Wrong token against the live listener (typed, terminal).
-    let refused = QaRawWorker::dial(addr, "qa-raw-2", "wrong-again", 1).await;
+    let refused =
+        QaRawWorker::dial(addr, "qa-raw-2", "wrong-again", kian_exec::PROTOCOL_VERSION).await;
     assert!(refused.is_none(), "wrong token refused");
     wait_cli_state(&config, "qa-raw-1", "online", 5_000).await;
 
@@ -457,7 +464,7 @@ async fn qa_runtime_membership_over_real_processes() {
     wait_cli_state(&config, "qa-raw-1", "offline", 8_000).await;
 
     // RE-REGISTER the same id: online again (same id binding shape).
-    let mut worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, 1)
+    let mut worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, kian_exec::PROTOCOL_VERSION)
         .await
         .expect("re-register accepted");
     worker.heartbeat("qa-raw-1").await;

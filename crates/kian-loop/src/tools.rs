@@ -342,23 +342,12 @@ impl LocalTools {
     }
 }
 
-/// True iff `rel` never escapes upward (lexical confinement check; the
-/// root itself is the only base).
-fn is_confined(rel: &str) -> bool {
-    !Path::new(rel)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-}
-
-/// Validates that a parsed fs path stays inside the root.
+/// Validates that a parsed fs path stays inside the root (the one lexical
+/// rule shared with the worker-side executor, `kian_core::fs`).
 fn confine(rel: String) -> Result<String, ToolError> {
-    if is_confined(&rel) {
-        Ok(rel)
-    } else {
-        Err(ToolError::InvalidCall(format!(
-            "path {rel:?} must not contain '..'"
-        )))
-    }
+    kian_core::fs::confine_path(&rel)
+        .map(|()| rel)
+        .map_err(ToolError::InvalidCall)
 }
 
 impl ToolProvider for LocalTools {

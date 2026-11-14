@@ -14,6 +14,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use uuid::Uuid;
 
+use kian_core::fs::FsCommand;
 use kian_core::seams::{ExecCommand, ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema};
 
 use crate::RemoteExecBackend;
@@ -116,6 +117,126 @@ impl ToolProvider for RemoteExecTool {
                 redactions,
             })
         })
+    }
+}
+
+/// The model-visible worker filesystem tools (KiandProto v2, ADR-023):
+/// `fs_list`, `fs_read`, `fs_write`, byte-identical schemas to the local
+/// built-in tools so a bound worker session sees the same tool surface
+/// whether the call runs locally or on the worker.
+pub struct RemoteFsTool {
+    backend: Arc<RemoteExecBackend>,
+    endpoint_id: String,
+}
+
+impl RemoteFsTool {
+    pub fn new(backend: Arc<RemoteExecBackend>, endpoint_id: impl Into<String>) -> Self {
+        Self {
+            backend,
+            endpoint_id: endpoint_id.into(),
+        }
+    }
+
+    /// The endpoint this tool routes through.
+    pub fn endpoint_id(&self) -> &str {
+        &self.endpoint_id
+    }
+
+    /// The three schemas (shared by the sync tool and the refusing side;
+    /// parity with `kian-loop`'s local fs schemas is golden-tested).
+    pub fn fs_schemas() -> Vec<ToolSchema> {
+        vec![
+            ToolSchema {
+                name: "fs_list".into(),
+                description: "List entries of a directory under the workspace root.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            },
+            ToolSchema {
+                name: "fs_read".into(),
+                description: "Read a text file under the workspace root.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            },
+            ToolSchema {
+                name: "fs_write".into(),
+                description: "Write a text file under the workspace root (side-effecting).".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        ]
+    }
+}
+
+impl ToolProvider for RemoteFsTool {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        Self::fs_schemas()
+    }
+
+    fn invoke(&self, call: ToolCall) -> BoxFuture<'static, Result<ToolResult, ToolError>> {
+        let parsed = parse_fs(&call);
+        let call_id = call.id;
+        let backend = self.backend.clone();
+        let endpoint_id = self.endpoint_id.clone();
+        Box::pin(async move {
+            let cmd = parsed?;
+            let command_id = command_id_for_tool_call(&call_id);
+            let tool_call_ref = call_id.clone();
+            let (value, is_error) = match backend
+                .fs_tracked(command_id, &endpoint_id, cmd, Some(tool_call_ref))
+                .await
+            {
+                Ok(result) => (result.to_tool_output(), false),
+                Err(e) => (serde_json::json!({"error": e.to_string()}), true),
+            };
+            Ok(ToolResult {
+                call_id,
+                output: value,
+                is_error,
+                redactions: Vec::new(),
+            })
+        })
+    }
+}
+
+/// Same argument contract as the local built-in fs tools: a workspace
+/// path (the dotted historical spellings stay invocable for replay) and,
+/// for writes, the content. The lexical `..` rule is enforced here before
+/// anything is queued and re-checked on the worker.
+fn parse_fs(call: &ToolCall) -> Result<FsCommand, ToolError> {
+    let path = call
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ToolError::InvalidCall("'path' must be a non-empty string".into()))?
+        .to_string();
+    kian_core::fs::confine_path(&path).map_err(ToolError::InvalidCall)?;
+    match call.name.as_str() {
+        "fs_list" | "fs.list" => Ok(FsCommand::List { path }),
+        "fs_read" | "fs.read" => Ok(FsCommand::Read { path }),
+        "fs_write" | "fs.write" => {
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::InvalidCall("'content' must be a string".into()))?
+                .to_string();
+            Ok(FsCommand::Write { path, content })
+        }
+        other => Err(ToolError::InvalidCall(format!("unknown tool {other:?}"))),
     }
 }
 

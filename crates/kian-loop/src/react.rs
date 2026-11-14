@@ -503,6 +503,7 @@ impl Inner {
         // non-null usage is captured across the whole turn, including an
         // attempt that emitted usage before failing.
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls: BTreeMap<u64, CallAcc> = BTreeMap::new();
         let mut usage: Option<Value> = None;
         let mut stream_error: Option<ProviderError> = None;
@@ -513,7 +514,7 @@ impl Inner {
                         usage = Some(u.clone()); // last wins
                     }
                     if !chunk.delta.is_null() {
-                        assemble_delta(&chunk.delta, &mut text, &mut calls);
+                        assemble_delta(&chunk.delta, &mut text, &mut reasoning, &mut calls);
                     }
                 }
                 Err(e) => {
@@ -562,6 +563,11 @@ impl Inner {
                     .map(|c| json!({"id": c.id, "name": c.name, "arguments": c.arguments}))
                     .collect(),
             );
+        }
+        if !reasoning.is_empty() {
+            // ADR-022: thinking-mode reasoning is context — persisted
+            // verbatim and replayed by `assistant_message` below.
+            content["reasoning_content"] = Value::String(reasoning);
         }
         if let Err(e) = ctx
             .append(
@@ -771,9 +777,17 @@ impl CallAcc {
 
 /// Folds one streamed delta into the assembled turn. Content fragments
 /// concatenate; tool-call fragments accumulate by stream index.
-fn assemble_delta(delta: &Value, text: &mut String, calls: &mut BTreeMap<u64, CallAcc>) {
+fn assemble_delta(
+    delta: &Value,
+    text: &mut String,
+    reasoning: &mut String,
+    calls: &mut BTreeMap<u64, CallAcc>,
+) {
     if let Some(fragment) = delta.get("content").and_then(Value::as_str) {
         text.push_str(fragment);
+    }
+    if let Some(fragment) = delta.get("reasoning_content").and_then(Value::as_str) {
+        reasoning.push_str(fragment);
     }
     if let Some(list) = delta.get("tool_calls").and_then(Value::as_array) {
         for entry in list {
@@ -932,6 +946,7 @@ fn string_or_compact(role: &str, content: &Value) -> ChatMessage {
         content: Some(text),
         tool_call_id: None,
         tool_calls: None,
+        reasoning_content: None,
     }
 }
 
@@ -948,6 +963,7 @@ fn tool_result_message(content: &Value) -> ChatMessage {
             content: Some(serde_json::to_string(&output).unwrap_or_default()),
             tool_call_id: Some(call_id.to_owned()),
             tool_calls: None,
+            reasoning_content: None,
         };
     }
     ChatMessage {
@@ -955,7 +971,17 @@ fn tool_result_message(content: &Value) -> ChatMessage {
         content: Some(serde_json::to_string(content).unwrap_or_default()),
         tool_call_id: Some(String::new()),
         tool_calls: None,
+        reasoning_content: None,
     }
+}
+
+/// The replayed reasoning of an assistant payload, if present
+/// (ADR-022). Absent/blank/non-string ⇒ `None` (legacy bytes unchanged).
+fn reasoning_field(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    obj.get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
 }
 
 /// An assistant payload: a tool-call turn, its per-call transcript
@@ -995,6 +1021,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
                 .map(str::to_owned),
             tool_call_id: None,
             tool_calls: calls,
+            reasoning_content: reasoning_field(obj),
         });
     }
     // The per-call `tool/call` transcript duplicate: the enclosing
@@ -1008,6 +1035,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
             content: Some(text.to_owned()),
             tool_call_id: None,
             tool_calls: None,
+            reasoning_content: reasoning_field(obj),
         });
     }
     Some(string_or_compact("assistant", content))
@@ -1056,6 +1084,7 @@ mod tests {
     use kian_core::model::SessionId;
     use kian_core::seams::{ToolCall, ToolResult};
     use kian_core::secrets::{Redaction, RedactionKind};
+    use kian_llm::provider::build_chat_body;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1385,11 +1414,13 @@ mod tests {
     #[test]
     fn delta_assembly_concatenates_content_fragments() {
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls = Default::default();
         for fragment in ["Hello", ", ", "kian"] {
             assemble_delta(
                 &serde_json::json!({"content": fragment}),
                 &mut text,
+                &mut reasoning,
                 &mut calls,
             );
         }
@@ -1397,15 +1428,61 @@ mod tests {
         assert!(calls.is_empty());
     }
 
+    /// ADR-022: reasoning fragments concatenate in arrival order, persist
+    /// inside the assistant payload, and replay as the top-level wire
+    /// field; a legacy payload without the key stays byte-identical.
+    #[test]
+    fn reasoning_fragments_are_persisted_and_replayed() {
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Default::default();
+        assemble_delta(
+            &json!({"reasoning_content": "think "}),
+            &mut text,
+            &mut reasoning,
+            &mut calls,
+        );
+        assemble_delta(
+            &json!({"reasoning_content": "harder"}),
+            &mut text,
+            &mut reasoning,
+            &mut calls,
+        );
+        assemble_delta(
+            &json!({"content": "answer"}),
+            &mut text,
+            &mut reasoning,
+            &mut calls,
+        );
+        assert_eq!(reasoning, "think harder");
+        assert_eq!(text, "answer");
+
+        let with = to_chat_message(&msg(
+            "assistant",
+            json!({"text": text, "reasoning_content": reasoning}),
+        ))
+        .unwrap();
+        assert_eq!(with.reasoning_content.as_deref(), Some("think harder"));
+        let body = build_chat_body("m", &[with], &[]);
+        assert_eq!(body["messages"][0]["reasoning_content"], "think harder");
+
+        let legacy = to_chat_message(&msg("assistant", json!({"text": "answer"}))).unwrap();
+        assert!(legacy.reasoning_content.is_none());
+        let body = build_chat_body("m", &[legacy], &[]);
+        assert!(body["messages"][0].get("reasoning_content").is_none());
+    }
+
     #[test]
     fn delta_assembly_accumulates_tool_call_fragments_by_index() {
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls = Default::default();
         assemble_delta(
             &serde_json::json!({"tool_calls": [
                 {"index": 0, "id": "call-1", "function": {"name": "fs.read"}}
             ]}),
             &mut text,
+            &mut reasoning,
             &mut calls,
         );
         assemble_delta(
@@ -1413,6 +1490,7 @@ mod tests {
                 {"index": 0, "function": {"arguments": "{\"pa"}}
             ]}),
             &mut text,
+            &mut reasoning,
             &mut calls,
         );
         assemble_delta(
@@ -1420,6 +1498,7 @@ mod tests {
                 {"index": 0, "function": {"arguments": "th\": \"a.txt\"}"}}
             ]}),
             &mut text,
+            &mut reasoning,
             &mut calls,
         );
         let finished: Vec<_> = calls.into_values().map(|c| c.finish()).collect();
