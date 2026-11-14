@@ -27,7 +27,9 @@ durable entity, make the **event stream** the only source of truth, and make eac
 (a **drain**) disposable and restartable.
 
 **One-line claim:** Kian is the Temporal of agents — an open-source, model-neutral, self-hostable
-durable execution runtime that makes agent tasks killable, resumable, migratable and auditable.
+durable execution runtime built on three promises: agent work survives the process (killable,
+resumable, migratable, auditable), compute stays on machines you own (BYOM), and the loop stays
+yours (harness integration).
 
 ## 2. The model
 
@@ -127,17 +129,18 @@ mutates projections directly. After a crash, replay rebuilds every in-memory str
 
 ## 4. Crate map
 
-Thirteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
+Fourteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
 `kian-orchestrator` depends only on core + store + seam traits, and no provider, channel or harness
 implementation ever enters its dependency tree.
 
 | Crate | One line |
 |-------|----------|
-| `kian-core` | Concept model, the 21 event kinds, session state machine, projection engine, model-context derivation, seam traits |
+| `kian-core` | Concept model, the 22 event kinds, session state machine, projection engine, model-context derivation, seam traits |
 | `kian-store` | EventStore with `expectedSeq` CAS + epoch fencing, inbox, claims/leases, dual backend (`sqlite` default, `postgres` optional) |
 | `kian-orchestrator` | The Admit → Wake → Drain → Promote engine and the three-layer recovery subsystem (pure classification + declarative policy table + budget) |
 | `kian-llm` | OpenAI-compatible `ModelProvider`, model slots, and the persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
+| `kian-memory` | The memory bundle: notes and dreaming, creation-time injection, and the read-only search/map representations |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, five-mode dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto **endpoint-side** SDK library (embeddable in any process) |
 | `kian-exec` | KiandProto **server half**: connection manager, durable command queue with row leases, heartbeat watchdog |

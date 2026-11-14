@@ -5,7 +5,9 @@
 ## 1. Positioning
 
 **Kian = the Temporal of agents**: an open-source, model-neutral, self-hostable durable execution
-runtime that makes agent tasks **killable, resumable, migratable and auditable**.
+runtime built on three promises: agent work is **killable, resumable, migratable and auditable**
+(durable execution), compute runs on **machines you own** (BYOM), and the **loop stays yours**
+(harness integration).
 
 Kian is **not**:
 

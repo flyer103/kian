@@ -1,13 +1,16 @@
 # Kian — the durable execution runtime for agents
 
 > **One-liner: the Temporal of agents — an open-source, model-neutral, self-hostable durable
-> execution runtime that makes agent tasks killable, resumable, migratable and auditable, with the
-> super-agent reference architecture as a first-class workload.**
+> execution runtime built on three promises: agent work survives the process (killable, resumable,
+> migratable, auditable), compute stays on machines you own (BYOM), and the loop stays yours
+> (harness integration).**
 
 A single-session agent dies with its process, cannot be redirected at a safe boundary, cannot prove
 what it did, and re-pays for its own context on every turn. Kian makes the **Session** the durable
 entity, the **event stream** the only truth, and each execution interval (a **drain**) disposable —
-so a crash, a deploy or a machine move costs a restart, not the work.
+so a crash, a deploy or a machine move costs a restart, not the work. The machine stays yours
+(BYOM), the loop stays yours (harness integration), and the super-agent reference architecture rides
+on top as a bundle, never baked into the core.
 
 ## Features
 
@@ -43,7 +46,7 @@ The same runtime also ships:
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
-  worker (Router-chosen from the configured catalog, recorded as additive event bytes,
+  worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
   binding; a busy or unknown worker refuses honestly.
 - **Runtime worker membership** — workers join and leave a running server without config edits
@@ -64,8 +67,8 @@ The same runtime also ships:
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
   the event stream stays the only truth.
-- **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats, `/metrics`, and a
-  frozen wire-only `kian-sdk`.
+- **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats/workers, `/metrics`, and
+  a frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
   process plus embedded sqlite is the whole system, with no hosted service required.
 
@@ -78,6 +81,9 @@ The same runtime also ships:
 - **Drain** — the execution hold interval: claim the session (epoch + lease), consume everything
   eligible, promote inputs only at provider-turn safe boundaries, then exit. A drain has no durable
   identity; after a crash a new drain replays the stream and continues.
+- **BYOM endpoint** — the hands: a `kiand` daemon runs the session's commands on a machine you
+  choose over a durable at-least-once queue; a worker session's 1:1 binding to its daemon is event
+  bytes re-derived from the stream, so restarts and migrations keep it.
 - **Admit before wake** — inputs are durable rows before any wake fires; wakes are advisory (they
   may fold or be lost), and the inbox rebuild at startup re-derives them.
 - **Safety by fencing** — the end write is one atomic append; every drain write carries a monotonic
@@ -97,7 +103,7 @@ The same runtime also ships:
 | [design/DESIGN.md](design/DESIGN.md) | The blueprint (HOW): execution model, recovery, plugin system, bundle |
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
-| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, injection, representations (P1–P2 and P3a retrieval landed; persisted representations designed) |
+| [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, creation-time injection, retrieval and representations |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
@@ -122,7 +128,7 @@ contract is `base_url` + OpenAI chat-completions + SSE.
 ### 1. Build
 
 ```bash
-cargo build --workspace          # 13 crates
+cargo build --workspace
 ```
 
 ### 2. Write `kian.yaml`
@@ -655,6 +661,7 @@ target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes +
 | Surface | What it does |
 |---------|--------------|
 | `kian tickets [--json]` | Read-only Ticket stage board: `queued`, `working`, `awaiting-answer`, `awaiting-review`, `delivery-retry`, `blocked-failed`, `idle` |
+| `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
@@ -689,7 +696,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 
 | Crate | One line |
 |-------|----------|
-| `kian-core` | Concept model, the 21 event kinds, session state machine, projection engine, model-context derivation, seam traits |
+| `kian-core` | Concept model, the event-kind catalog, session state machine, projection engine, model-context derivation, seam traits |
 | `kian-store` | EventStore with `expectedSeq` CAS + epoch fencing, inbox, claims/leases, dual backend (sqlite default, postgres optional) |
 | `kian-orchestrator` | Admit → Wake → Drain → Promote engine and the bounded three-layer recovery subsystem |
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
