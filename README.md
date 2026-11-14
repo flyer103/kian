@@ -11,9 +11,22 @@ so a crash, a deploy or a machine move costs a restart, not the work.
 
 ## Features
 
+Three properties separate a *runtime* from an agent framework: work that survives the process,
+machines you choose, and the loop you already run. Kian ships each as a product surface.
+
 - **Durable execution** — a crash, deploy or machine move costs a restart, not the work: a new
   drain recovers the session, steers land at provider-turn safe boundaries, and interrupts are
-  durable (never mapped onto `completed`).
+  durable (never mapped onto `completed`). `kill -9` mid-turn, restart on the same sqlite file, and
+  the turn finishes with a byte-identical context.
+- **BYOM execution** — bring your own machine: a `kiand` daemon runs commands on the box you
+  choose, over a durable at-least-once queue with a heartbeat watchdog, bound 1:1 to its worker
+  session for that session's whole life; offline work parks and resumes honestly.
+- **Harness integration** — bring your own loop: the built-in ReAct loop, or an existing harness
+  such as dsh, behind the same `LoopDriver` seam and event kinds — durability does not force a
+  rewrite of the loop that already works.
+
+The same runtime also ships:
+
 - **Audit by construction** — the append-only event stream is the only truth; replay is
   byte-identical and `session export` produces a replayable audit package.
 - **Cost as an invariant** — model request bytes are persisted before send, history is never
@@ -29,8 +42,6 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   of Recall, and untrusted-input marking.
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
-- **BYOM execution** — a `kiand` endpoint over a durable, at-least-once command queue with a
-  heartbeat watchdog; offline work parks and resumes honestly.
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the configured catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
@@ -43,8 +54,6 @@ so a crash, a deploy or a machine move costs a restart, not the work.
   machine (its `--workspace-root`, a lexical path guard, 1 MiB bounds) with the same schemas and
   result shapes as the local built-ins; the durable queue, 1:1 binding and no-failover rules are
   unchanged (KiandProto v2, [ADR-023](design/decisions/ADR-023-worker-fs-tools.md)).
-- **Harness integration** — the built-in ReAct loop, or an existing harness such as dsh, behind
-  the same `LoopDriver` seam and event kinds.
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
