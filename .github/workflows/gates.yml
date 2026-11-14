@@ -31,6 +31,18 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # The workspace's debug test binaries no longer fit the hosted
+      # runner's default free space: linking `kian-loop`'s lib test died
+      # with `ld ... signal 7 [Bus error]`, an mmap write against a full
+      # disk. Free the preinstalled toolchains this repo never uses before
+      # the cache restore (which also writes into the target dir).
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          sudo apt-get clean
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
