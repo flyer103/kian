@@ -218,6 +218,13 @@ pub enum LoopOutcome {
     SoftFailed { reason: String },
 }
 
+/// Stop reason prefix a resident loop (the Router, the watchdog) emits
+/// when its **per-episode** iteration budget is exhausted. The
+/// `RouterDriver` recognizes it and parks the resident instead of ending
+/// the session (ADR-024); it is an in-process contract, not an event or a
+/// wire value.
+pub const EPISODE_BUDGET_STOP_REASON_PREFIX: &str = "episode iteration budget exhausted";
+
 /// Seam (DESIGN §6.2): the agent loop as control flow inside a drain.
 /// Built-in: the async ReAct loop (kian-loop). The context type is
 /// left abstract on purpose — it is the drain handle surface (inbox take,

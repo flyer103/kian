@@ -771,6 +771,7 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
         ReActConfig {
             slot: SlotName("main".into()),
             max_iterations: 2,
+            budget_scope: crate::react::BudgetScope::Lifetime,
             permissions: std::collections::BTreeMap::new(),
         },
     )

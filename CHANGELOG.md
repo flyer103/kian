@@ -1248,3 +1248,38 @@ Gates on the exact committed tree: build / `cargo test --workspace` (122 suites,
   incident, not attributed to the v2 change.
 - **Verification note** — full workspace tests green (including the new L2 fs suite), clippy
   `--workspace --all-targets -D warnings` green, fmt check green, `docs_map` 6/6 green.
+
+## 2026-11-14 — resident iteration budget is per episode (ADR-024)
+
+- **Incident root cause** — the ReAct iteration budget was session-lifetime scoped, so the resident
+  Router ended `completed` at its 32nd turn; later WeChat messages were admitted as durable rows on
+  the frozen stream and never consumed (no reply) until a `kian serve` restart ran the boot-time
+  re-arm. The deployment's own `drain.max_iterations: 32` override made it immediate, but the
+  default is also finite — the trap was the product's, not just the config's.
+- **Change (ADR-024)** — `ReActConfig` gains `BudgetScope::{Lifetime, PerEpisode}` (default
+  `Lifetime`). The super-agent assembly gives the Router and watchdog `PerEpisode`: the counter is
+  scoped to one inner-loop drive (one batch/episode), while `turn/start` keeps the lifetime number
+  for audit. On exhaustion the loop emits a dedicated stop reason and the `RouterDriver` **parks**
+  (the same path as an idle final answer) instead of ending the session; the next input starts a
+  fresh episode. One warn audit line plus the additive
+  `superagent.router_batching.episode_budget_parks` metric. No event, wire, table or tool-schema
+  change; worker/plain loops are byte-identical.
+- **Explicit terminals unchanged** — cancel/fatal still end terminally and use the boot-time re-arm;
+  runtime re-arm for those is a recorded deferred follow-up (a runtime-rebindable Router binding
+  across subscriptions, driver routing, Router tools and worker completion reports).
+- **Tests** — L1: budget-scope counter selection; L2 (`superagent_serve`): with
+  `drain.max_iterations = 1`, three channel inputs still deliver three replies and the Router
+  session stays non-terminal (legacy scope would freeze after the first). Full workspace gates
+  green.
+- **Deployment / L3** — the accidental `drain.max_iterations: 32` override was removed from the
+  owner config; kian was rebuilt/redeployed with the fix. With `drain.max_iterations: 1` and three
+  mock inputs the Router parked three times and stayed `running` (delivered 2 of 3 before the next
+  finding); the stranded messages from the incident were lost (admitted on the frozen stream) and
+  were resent.
+- **Residual finding (independent of ADR-024)** — after a reply whose assistant turn carried no
+  `reasoning_content` (the model can omit it on trivial turns), the Router's empty-batch turn sends
+  a request whose history ends on that assistant message and DeepSeek rejects it with the same 400;
+  it surfaces as one soft failure (`failed` → idle) and the next input recovers, so replies still
+  arrive but the session churns. This is an empty-batch provider call, not a budget issue; the
+  follow-up is to skip a judge turn when the batch is empty (or disable thinking), tracked
+  separately. L2 (scripted provider) proves the budget fix 3/3; the live 2/3 is this residual.

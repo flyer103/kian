@@ -980,9 +980,11 @@ never a second truth. Contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §7.
 ### 4.6 Resident re-arm
 
 A resident session (the Router, the watchdog) can end **terminally** — `session/ended{completed}`
-(freeze) — most mundanely because the loop's iteration budget is *lifetime*-scoped (the counter
-counts every `turn/start` ever committed), so a long-lived resident exhausts it and the engine's
-`Stopped → Completed` path freezes the stream. Once terminal, the engine's drain projects
+(freeze) — from an explicit cancel or a fatal error. Routine budget exhaustion no longer ends a
+resident: resident loops are budgeted **per episode** ([ADR-024](decisions/ADR-024-resident-per-episode-budget.md)):
+the lifetime `turn/start` counter remains the audit number, but the budget decision uses an
+episode-scoped count, and the `RouterDriver` parks on exhaustion instead of propagating a
+`Stopped` to the engine. Once terminal (from an explicit cause), the engine's drain projects
 `Terminal` forever: later inputs stay pending, and the (already consumed) idempotent bootstrap
 row cannot re-wake the session. A **soft failure** (`session/ended{failed}`) is the other story:
 it projects back to `idle` (§2.2) and the *next admitted input* re-opens the same session — no
@@ -1010,9 +1012,12 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
 - **Honesty unchanged.** No fake completions, no catch-up ticks: inputs that arrived while the
  predecessor was terminal were never consumed and stay honestly pending on the frozen stream.
  The successor starts with a fresh in-context view (one possible re-draft across the succession
- boundary — observable, not hidden). Known interaction: with the lifetime iteration budget
- unchanged, a resident Router will chain successors at every budget exhaustion; moving the
- budget to per-episode for resident loops is a follow-up (tracked), not a contract change here.
+ boundary — observable, not hidden). **Resident budget scope (ADR-024):** a resident loop's
+ iteration budget is per episode, so a long-lived Router no longer chains successors at every
+ budget exhaustion and no longer freezes on one; explicit terminal ends (cancel/fatal) still
+ re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
+ runtime-rebindable Router binding shared by subscriptions, driver routing, tools and worker
+ completion reports, which is a separate semantic change.
 
 ### 4.7 Bundle domain-policy layer
 

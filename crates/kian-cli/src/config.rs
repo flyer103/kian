@@ -374,7 +374,8 @@ pub struct DrainConfig {
     /// Heartbeat period, milliseconds.
     #[serde(default = "default_heartbeat")]
     pub heartbeat_interval_ms: u64,
-    /// ReAct iteration budget per session.
+    /// ReAct iteration budget per session; resident loops (Router/watchdog) budget it per
+    /// episode instead (ADR-024).
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
     /// The model slot `serve` drives.

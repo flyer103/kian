@@ -629,8 +629,7 @@ impl Server {
                 config: ReActConfig {
                     slot: kian_core::model::SlotName(config.drain.slot.clone()),
                     max_iterations: config.drain.max_iterations,
-                    // the default agent's per-call permission table
-                    // (absent = empty = allow-all, byte-identical).
+                    budget_scope: kian_loop::BudgetScope::Lifetime,
                     permissions: config.agent.permissions.clone(),
                 },
                 gate: config.agent.evidence_gate.clone(),
@@ -1758,6 +1757,7 @@ fn build_dream_driver(
         ReActConfig {
             slot: kian_core::model::SlotName("main".into()),
             max_iterations: config.drain.max_iterations,
+            budget_scope: kian_loop::BudgetScope::Lifetime,
             permissions: agent_cfg.permissions.clone(),
         },
         agent_cfg.evidence_gate.clone(),

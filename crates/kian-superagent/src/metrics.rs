@@ -93,6 +93,9 @@ struct RouterMetricsState {
     /// `ROUTER_BATCH_BUCKETS.len() + 1` counters — the last is overflow.
     buckets: [u64; ROUTER_BATCH_BUCKETS.len() + 1],
     last_turn: Option<TurnRecord>,
+    /// Resident per-episode budget parks (ADR-024). Additive, monotone;
+    /// no decision reads it.
+    episode_budget_parks: u64,
 }
 
 /// Counters + a bounded batch-size histogram over the Router's judge
@@ -124,6 +127,13 @@ impl RouterMetrics {
         state.turn_duration_ms_total = state.turn_duration_ms_total.saturating_add(duration_ms);
         state.buckets[bucket_index(batch)] += 1;
         state.last_turn = Some(TurnRecord { batch, duration_ms });
+    }
+
+    /// One resident episode parked because its per-episode budget was
+    /// exhausted (ADR-024) — the session did not end.
+    pub fn record_episode_budget_park(&self) {
+        let mut state = self.state.lock().expect("router metrics lock");
+        state.episode_budget_parks += 1;
     }
 
     /// Judge turns recorded so far.
@@ -180,6 +190,7 @@ impl RouterMetrics {
             "amortized_ms_per_input": amortized,
             "batch_histogram": Value::Object(histogram),
             "last_turn": last_turn,
+            "episode_budget_parks": state.episode_budget_parks,
         })
     }
 }

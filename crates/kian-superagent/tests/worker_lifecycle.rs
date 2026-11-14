@@ -495,6 +495,7 @@ fn build_harness(
         ReActConfig {
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 16,
+            budget_scope: kian_loop::BudgetScope::Lifetime,
             permissions: std::collections::BTreeMap::new(),
         },
     ));

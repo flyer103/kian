@@ -518,6 +518,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
         ReActConfig {
             slot: SlotName("router".into()),
             max_iterations: 10_000,
+            budget_scope: kian_loop::BudgetScope::Lifetime,
             permissions: std::collections::BTreeMap::new(),
         },
     ));
@@ -532,6 +533,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             // fully observed — comfortably above DEFAULT_MAX_ITERATIONS
             // (32) and far below the defensive cap.
             max_iterations: 20_000,
+            budget_scope: kian_loop::BudgetScope::Lifetime,
             permissions: std::collections::BTreeMap::new(),
         },
     ));

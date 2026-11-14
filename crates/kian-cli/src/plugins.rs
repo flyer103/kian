@@ -887,9 +887,7 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName(self.router_slot.clone()),
                 max_iterations: self.max_iterations,
-                // the Router judge loop does not evaluate
-                // permissions (a table on its agent refuses boot at
-                // config validation — ADR-015).
+                budget_scope: kian_loop::BudgetScope::PerEpisode,
                 permissions: BTreeMap::new(),
             },
         ));
@@ -960,9 +958,7 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
-                // the worker template's permission table rides the
-                // inner ReAct loop (the dsh harness path does not
-                // evaluate it — ADR-015 records the boundary).
+                budget_scope: kian_loop::BudgetScope::Lifetime,
                 permissions: self.worker_permissions.clone(),
             },
         ));
@@ -1003,9 +999,7 @@ impl Plugin for SuperAgentPlugin {
             ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
-                // the default agent's permission table (the
-                // plain-session loop is the built-in loop of the
-                // bundle assembly).
+                budget_scope: kian_loop::BudgetScope::Lifetime,
                 permissions: self.default_permissions.clone(),
             },
             self.default_gate,
@@ -1050,9 +1044,7 @@ impl Plugin for SuperAgentPlugin {
                 ReActConfig {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
-                    // the Watchdog judge loop does not evaluate
-                    // permissions (a table on its agent refuses boot at
-                    // config validation — ADR-015).
+                    budget_scope: kian_loop::BudgetScope::PerEpisode,
                     permissions: BTreeMap::new(),
                 },
             ));
@@ -1112,6 +1104,7 @@ impl Plugin for SuperAgentPlugin {
             let worker_react_config = ReActConfig {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
+                budget_scope: kian_loop::BudgetScope::Lifetime,
                 permissions: self.worker_permissions.clone(),
             };
             let side_backend = Arc::clone(&remote.backend);

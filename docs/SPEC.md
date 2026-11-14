@@ -457,6 +457,19 @@ longer returns 400. **Landing note: the v1 → v2 worker protocol bump is indepe
 | Capture + replay | ReAct stream assembler concatenates `reasoning_content`; `assistant/message` content carries it; the message → chat conversion re-emits the top-level field | landed |
 | Cost | Replayed reasoning is input tokens on thinking sessions only; observable through usage events; no trimming/synthesis | recorded |
 
+### Resident iteration budget — per episode (R13, ADR-024)
+
+Scope: a resident loop's iteration budget is **per episode**, not per session lifetime. This closes
+DESIGN §4.6's tracked follow-up and the owner incident where the Router froze at its 32nd turn and
+later channel inputs were admitted but never consumed.
+
+| Item | Contents | Status |
+|------|----------|--------|
+| Budget scope | `ReActConfig.budget_scope: Lifetime | PerEpisode`; only the super-agent assembly's Router and watchdog sides select `PerEpisode`; worker/plain loops keep the legacy lifetime scope (byte- and behavior-identical) | landed |
+| Park, not freeze | On exhaustion the loop emits `EPISODE_BUDGET_STOP_REASON_PREFIX`; the `RouterDriver` parks (the idle-final-answer path) instead of propagating `Stopped`, so no `session/ended` is written and the next input starts a fresh episode. `turn/start` keeps the lifetime iteration number for audit/replay | landed |
+| Observability | One warn audit line per park plus the additive `superagent.router_batching.episode_budget_parks` metric; no new event kind, wire or table | landed |
+| Explicit terminal ends | cancel/fatal still end terminally; the boot-time re-arm remains the recovery. Runtime re-arm for explicit ends is a recorded deferred follow-up (needs a runtime-rebindable Router binding across subscriptions, driver, tools and worker reports) | landed (boundary) |
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

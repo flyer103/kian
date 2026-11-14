@@ -35,7 +35,7 @@ pub use evidence::{
 };
 pub use kian_core::seams::{LoopDriver, LoopOutcome};
 pub use react::{
-    CLASS_EMPTY_RESPONSE, DEFAULT_MAX_ITERATIONS, LoopError, ReActConfig, ReActLoop,
+    BudgetScope, CLASS_EMPTY_RESPONSE, DEFAULT_MAX_ITERATIONS, LoopError, ReActConfig, ReActLoop,
     to_chat_message,
 };
 pub use tools::{

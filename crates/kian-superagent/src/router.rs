@@ -2126,6 +2126,29 @@ where
                                     finish_turn(&core, turn).await;
                                     Some((LoopOutcome::TurnDone, Phase::Park { ctx, seen }))
                                 }
+                                // (ADR-024) A resident episode that
+                                // exhausts its per-episode budget parks
+                                // like an idle final answer — the
+                                // session must not freeze and strand the
+                                // next input. The next admitted row
+                                // starts a fresh episode with a fresh
+                                // budget.
+                                Some(LoopOutcome::Stopped { reason })
+                                    if reason.starts_with(
+                                        kian_core::seams::EPISODE_BUDGET_STOP_REASON_PREFIX,
+                                    ) =>
+                                {
+                                    finish_turn(&core, turn).await;
+                                    if let Some(metrics) = &core.metrics {
+                                        metrics.metrics().record_episode_budget_park();
+                                    }
+                                    tracing::warn!(
+                                        target: "kian::superagent",
+                                        reason = %reason,
+                                        "resident Router episode budget exhausted; parking until the next input"
+                                    );
+                                    Some((LoopOutcome::TurnDone, Phase::Park { ctx, seen }))
+                                }
                                 // Honest terminals propagate unchanged:
                                 // intentional stops and soft failures
                                 // stay visible in the stream.

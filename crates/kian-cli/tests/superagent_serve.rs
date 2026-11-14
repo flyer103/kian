@@ -15,6 +15,7 @@ use std::time::Duration;
 use common::{ScriptedResponse, force_no_proxy, spawn_scripted_provider, temp_dir};
 use kian_cli::server::Server;
 use kian_core::events::EventKind;
+use kian_core::state::project;
 use kian_store::EventStore;
 
 const ROUTER_SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -37,6 +38,7 @@ fn write_superagent_config(
     worker_provider: &str,
     endpoint: Option<(&str, u64, u64)>,
     worker_gate: bool,
+    max_iterations: usize,
 ) -> std::path::PathBuf {
     let sqlite = dir.join("kian.sqlite");
     let worker_gate = if worker_gate {
@@ -101,7 +103,7 @@ agents:
     api_key_env: KIAN_E2E_API_KEY
 plugins: ["openai-compat", "local-tools", "superagent"{remote}]
 drain:
-  max_iterations: 8
+  max_iterations: {max_iterations}
 tools:
   root: "{dir}"
   exec_timeout_ms: 5000
@@ -118,6 +120,7 @@ recovery:
         dir = dir.display(),
         worker_gate = worker_gate,
         remote = remote,
+        max_iterations = max_iterations,
     );
     let yaml = if let Some((addr, queue_timeout_ms, offline_after_ms)) = endpoint {
         yaml.replace(
@@ -234,7 +237,7 @@ async fn serve_smoke_mock_channel_send_observes_router_drain() {
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
 
-    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false);
+    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false, 8);
     let (base, _server) = spawn_server(&config).await;
     let client = reqwest::Client::new();
 
@@ -326,6 +329,98 @@ async fn serve_smoke_mock_channel_send_observes_router_drain() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-024: a resident Router budget is per episode, not lifetime
+// ---------------------------------------------------------------------------
+
+/// With `drain.max_iterations = 1`, every Router episode gets one provider
+/// turn. Three channel inputs therefore consume three turns beyond the
+/// bootstrap — under the legacy *lifetime* scope the Router would freeze
+/// (`session/ended{completed}`) after the first, strand the next two and
+/// deliver nothing. The per-episode budget parks instead, so all three
+/// replies are delivered and the session stays live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_router_budget_is_per_episode_not_lifetime() {
+    force_no_proxy();
+    let dir = temp_dir("c28-budget");
+
+    let reply = |id: &str, text: &str| ScriptedResponse::ToolCall {
+        id: id.into(),
+        name: "reply".into(),
+        arguments: serde_json::json!({"channel": "mock-im", "text": text}),
+    };
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            reply("call-1", "one"),
+            reply("call-2", "two"),
+            reply("call-3", "three"),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+
+    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false, 1);
+    let (base, _server) = spawn_server(&config).await;
+    let client = reqwest::Client::new();
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+
+    wait_for_router(&read_only, "bootstrap judge turn", |events| {
+        count_kind(events, EventKind::TurnStart) >= 1
+            && count_kind(events, EventKind::AssistantMessage) >= 1
+    })
+    .await;
+
+    for (i, text) in ["first", "second", "third"].iter().enumerate() {
+        let out = ops_rpc(
+            &client,
+            &base,
+            "mock_channel_send",
+            serde_json::json!({"channel": "mock-im", "payload": {"text": text}}),
+        )
+        .await;
+        assert_eq!(out["result"]["channel"], "mock-im");
+        wait_for_router(&read_only, "reply delivered", |events| {
+            count_kind(events, EventKind::ChannelDelivered) > i
+        })
+        .await;
+    }
+
+    let events = wait_for_router(&read_only, "three replies", |events| {
+        count_kind(events, EventKind::ChannelDelivered) >= 3
+    })
+    .await;
+    let turns = count_kind(&events, EventKind::TurnStart);
+    assert!(
+        turns >= 4,
+        "bootstrap + three episodes must run past a lifetime cap of 1, got {turns}"
+    );
+    let state = project(&events).expect("project");
+    assert!(
+        !state.is_terminal(),
+        "the resident Router must not freeze on per-episode budget exhaustion (state {state:?})"
+    );
+
+    let metrics: serde_json::Value = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics json");
+    let parks = metrics["superagent"]["router_batching"]["episode_budget_parks"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(parks >= 2, "episode parks must be observable, got {parks}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // /metrics exposes the router-batching series (article §7.2 shape)
 // ---------------------------------------------------------------------------
 
@@ -345,7 +440,7 @@ async fn metrics_route_exposes_the_router_batching_series() {
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
 
-    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false);
+    let config = write_superagent_config(&dir, &router_base, &worker_base, None, false, 8);
     let (base, _server) = spawn_server(&config).await;
     let client = reqwest::Client::new();
 
@@ -475,6 +570,7 @@ async fn watchdog_offline_admits_health_input_to_affected_worker_session() {
         &worker_base,
         Some((&format!("127.0.0.1:{port}"), 3000, 300)),
         true, // worker evidence gate: final_message_present
+        8,
     );
     let (base, _server) = spawn_server(&config).await;
     let client = reqwest::Client::new();
@@ -656,6 +752,7 @@ async fn startup_order_subscriptions_and_watchdog_start_after_rebuild() {
         &worker_base,
         Some((&format!("127.0.0.1:{port}"), 5000, 500)),
         false,
+        8,
     );
 
     let (server, _cfg) = Server::from_config_file(&config).await.expect("assemble");

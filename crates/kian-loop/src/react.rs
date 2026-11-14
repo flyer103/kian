@@ -75,6 +75,31 @@ pub const CLASS_EMPTY_RESPONSE: &str = "empty_response";
 /// Iteration budget default: stops honest loops that never converge.
 pub const DEFAULT_MAX_ITERATIONS: usize = 32;
 
+/// How a loop's iteration budget is scoped (ADR-024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetScope {
+    /// The budget counts every `turn/start` ever committed on the session
+    /// (the legacy behavior; correct for short-lived worker/plain
+    /// sessions).
+    #[default]
+    Lifetime,
+    /// The budget counts the current episode's turns only (resident loops:
+    /// the Router and the watchdog). Exhaustion parks the resident; it
+    /// never ends the session.
+    PerEpisode,
+}
+
+impl BudgetScope {
+    /// The budget counter this scope compares against the limit.
+    #[must_use]
+    fn used(self, lifetime_iteration: usize, episode_iterations: usize) -> usize {
+        match self {
+            Self::Lifetime => lifetime_iteration,
+            Self::PerEpisode => episode_iterations,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -86,8 +111,12 @@ pub struct ReActConfig {
     /// bindings, ADR-006).
     pub slot: SlotName,
     /// Maximum provider turns per session (counted from the event stream,
-    /// so the budget survives episodes and restarts).
+    /// so the budget survives episodes and restarts — the legacy scope).
+    /// With [`BudgetScope::PerEpisode`] (resident loops, ADR-024) the same
+    /// value bounds one episode instead.
     pub max_iterations: usize,
+    /// Whether the budget is lifetime-scoped (default) or per episode.
+    pub budget_scope: BudgetScope,
     /// Per-call tool permission table (ADR-015): tool name →
     /// `allow`/`deny`. **Absent = empty = allow-all**, and with an empty
     /// table the `tool/call` payload stays byte-identical to the legacy
@@ -101,6 +130,7 @@ impl Default for ReActConfig {
         Self {
             slot: SlotName("main".into()),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            budget_scope: BudgetScope::Lifetime,
             permissions: BTreeMap::new(),
         }
     }
@@ -198,6 +228,9 @@ impl ReActLoop {
 struct LoopState {
     ctx: DrainCtx,
     done: bool,
+    /// Per-episode turn count for [`BudgetScope::PerEpisode`]; reset per
+    /// drive stream (ADR-024).
+    drain_iterations: usize,
 }
 
 impl LoopDriver for ReActLoop {
@@ -205,24 +238,31 @@ impl LoopDriver for ReActLoop {
 
     fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
         let inner = Arc::clone(&self.0);
-        futures::stream::unfold(LoopState { ctx, done: false }, move |mut st| {
-            let inner = Arc::clone(&inner);
-            async move {
-                if st.done {
-                    return None;
+        futures::stream::unfold(
+            LoopState {
+                ctx,
+                done: false,
+                drain_iterations: 0,
+            },
+            move |mut st| {
+                let inner = Arc::clone(&inner);
+                async move {
+                    if st.done {
+                        return None;
+                    }
+                    let outcome = match inner.iteration(&st.ctx, &mut st.drain_iterations).await {
+                        Flow::TurnDone => LoopOutcome::TurnDone,
+                        Flow::Settled => LoopOutcome::Settled,
+                        Flow::Stopped(reason) => LoopOutcome::Stopped { reason },
+                        Flow::Soft(reason) => LoopOutcome::SoftFailed { reason },
+                    };
+                    if !matches!(outcome, LoopOutcome::TurnDone) {
+                        st.done = true;
+                    }
+                    Some((outcome, st))
                 }
-                let outcome = match inner.iteration(&st.ctx).await {
-                    Flow::TurnDone => LoopOutcome::TurnDone,
-                    Flow::Settled => LoopOutcome::Settled,
-                    Flow::Stopped(reason) => LoopOutcome::Stopped { reason },
-                    Flow::Soft(reason) => LoopOutcome::SoftFailed { reason },
-                };
-                if !matches!(outcome, LoopOutcome::TurnDone) {
-                    st.done = true;
-                }
-                Some((outcome, st))
-            }
-        })
+            },
+        )
         .boxed()
     }
 }
@@ -278,8 +318,8 @@ pub enum LoopError {
 
 impl Inner {
     /// One ReAct iteration.
-    async fn iteration(&self, ctx: &DrainCtx) -> Flow {
-        let flow = match self.run_iteration(ctx).await {
+    async fn iteration(&self, ctx: &DrainCtx, drain_iterations: &mut usize) -> Flow {
+        let flow = match self.run_iteration(ctx, drain_iterations).await {
             Ok(flow) => flow,
             Err(e) => return Flow::Soft(format!("loop error: {e}")),
         };
@@ -334,7 +374,11 @@ impl Inner {
         }
     }
 
-    async fn run_iteration(&self, ctx: &DrainCtx) -> Result<Flow, LoopError> {
+    async fn run_iteration(
+        &self,
+        ctx: &DrainCtx,
+        drain_iterations: &mut usize,
+    ) -> Result<Flow, LoopError> {
         // 1. Promote newly eligible inputs at this safe boundary (we are
         //    between provider turns here; DrainCtx refuses otherwise —
         //    steer never interleaves an in-flight turn).
@@ -351,10 +395,21 @@ impl Inner {
             .iter()
             .filter(|ev| matches!(ev.kind, EventKind::TurnStart))
             .count();
-        if iteration >= self.config.max_iterations {
-            return Ok(Flow::Stopped(format!(
-                "iteration budget exhausted after {iteration} turns"
-            )));
+        let used = self.config.budget_scope.used(iteration, *drain_iterations);
+        if used >= self.config.max_iterations {
+            let reason = match self.config.budget_scope {
+                BudgetScope::Lifetime => {
+                    format!("iteration budget exhausted after {iteration} turns")
+                }
+                BudgetScope::PerEpisode => format!(
+                    "{} after {used} turns",
+                    kian_core::seams::EPISODE_BUDGET_STOP_REASON_PREFIX
+                ),
+            };
+            return Ok(Flow::Stopped(reason));
+        }
+        if self.config.budget_scope == BudgetScope::PerEpisode {
+            *drain_iterations += 1;
         }
 
         // 4. The provider turn. begin/end bracket every outcome (including
@@ -1075,7 +1130,7 @@ fn action_note(action: Option<RecoveryAction>) -> String {
 #[cfg(test)]
 mod tests {
     use crate::react::{
-        CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop, assemble_delta, consult_policy,
+        BudgetScope, CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop, assemble_delta, consult_policy,
         to_chat_message, tool_result_payload,
     };
     use crate::test_support::{NoopPolicy, NoopTools, agent_def};
@@ -1409,6 +1464,17 @@ mod tests {
             json!({"id": "call-1", "name": "fs_read", "arguments": {"path": "a.txt"}})
         );
         assert!(!ctx_with[0].synthetic);
+    }
+
+    /// ADR-024: the budget scope selects which counter the limit applies
+    /// to — the lifetime `turn/start` count (worker/plain) or the current
+    /// episode's count (resident loops).
+    #[test]
+    fn budget_scope_selects_lifetime_or_episode_counter() {
+        assert_eq!(BudgetScope::Lifetime.used(9, 0), 9);
+        assert_eq!(BudgetScope::Lifetime.used(0, 9), 0);
+        assert_eq!(BudgetScope::PerEpisode.used(9, 2), 2);
+        assert_eq!(BudgetScope::PerEpisode.used(0, 0), 0);
     }
 
     #[test]
