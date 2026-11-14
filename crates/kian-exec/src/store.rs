@@ -289,6 +289,14 @@ pub struct EndpointRegistryRow {
     pub addr: String,
     pub last_heartbeat_ms: u64,
     pub state: String,
+    /// The worker's **last-declared** description, cached across restarts
+    /// (ADR-025). `None` until the first registration declares one (or
+    /// when the latest declaration omitted / was invalid). Never
+    /// authoritative: the live directory wins while a worker is connected.
+    pub description: Option<String>,
+    /// The worker's last-declared protocol revision (ADR-025), cached for
+    /// the cold-start catalog. `None` for ids known only from config.
+    pub protocol_version: Option<u32>,
 }
 
 /// Wall-clock milliseconds since the unix epoch (i64, matching the store's
@@ -363,6 +371,18 @@ const V3_EXEC_QUEUE_KIND: Migration = Migration {
     up: "ALTER TABLE exec_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'exec'",
 };
 
+/// v4 — the last-declared worker cache on the registry projection
+/// (ADR-025): `description` / `protocol_version` survive a kian restart so
+/// the Router catalog and `kian workers` are not id-only for a known
+/// worker that has not re-registered yet. Additive nullable columns; a
+/// pre-v4 row reads as "no declaration", and the live registration always
+/// wins over the cache.
+const V4_REGISTRY_DECLARATION: Migration = Migration {
+    version: 4,
+    name: "v4_registry_declaration",
+    up: "ALTER TABLE endpoint_registry ADD COLUMN description TEXT;\nALTER TABLE endpoint_registry ADD COLUMN protocol_version INTEGER",
+};
+
 /// The registered adjacent sqlite chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
@@ -371,6 +391,7 @@ pub fn chain() -> &'static [Migration] {
         V1_ASYNC_JOBS,
         V2_QUEUE_ROW_LEASES,
         V3_EXEC_QUEUE_KIND,
+        V4_REGISTRY_DECLARATION,
     ]
 }
 
@@ -406,6 +427,14 @@ const PG_V3_EXEC_QUEUE_KIND: Migration = Migration {
     up: "ALTER TABLE exec_queue ADD COLUMN kind TEXT NOT NULL DEFAULT 'exec'",
 };
 
+/// v4 (postgres chain) — the last-declared worker cache, pg DDL. Same
+/// version and name as the sqlite v4.
+const PG_V4_REGISTRY_DECLARATION: Migration = Migration {
+    version: 4,
+    name: "v4_registry_declaration",
+    up: "ALTER TABLE endpoint_registry ADD COLUMN description TEXT;\nALTER TABLE endpoint_registry ADD COLUMN protocol_version BIGINT",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] (enforced by `pg_chain_mirrors_sqlite_chain_versions_and_names`).
 pub fn pg_chain() -> &'static [Migration] {
@@ -414,6 +443,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V1_ASYNC_JOBS,
         PG_V2_QUEUE_ROW_LEASES,
         PG_V3_EXEC_QUEUE_KIND,
+        PG_V4_REGISTRY_DECLARATION,
     ]
 }
 
@@ -862,6 +892,49 @@ impl ExecStore {
             Self::Postgres(pool) => {
                 crate::postgres::upsert_endpoint(pool, endpoint_id, addr, last_heartbeat_ms, state)
                     .await?
+            }
+        }
+        Ok(())
+    }
+
+    /// Upserts the registry row **with the worker's last declaration**
+    /// (ADR-025). Called on a successful registration before the route is
+    /// attached; the declaration columns are overwritten by every
+    /// registration (a registration that omits the description clears the
+    /// cached one). Heartbeat/detach upserts never touch these columns.
+    pub async fn upsert_endpoint_with_declaration(
+        &self,
+        endpoint_id: &str,
+        addr: &str,
+        last_heartbeat_ms: u64,
+        state: &str,
+        description: Option<&str>,
+        protocol_version: u32,
+    ) -> Result<(), QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::upsert_endpoint_with_declaration(
+                    pool,
+                    endpoint_id,
+                    addr,
+                    last_heartbeat_ms,
+                    state,
+                    description,
+                    protocol_version,
+                )
+                .await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::upsert_endpoint_with_declaration(
+                    pool,
+                    endpoint_id,
+                    addr,
+                    last_heartbeat_ms,
+                    state,
+                    description,
+                    protocol_version,
+                )
+                .await?
             }
         }
         Ok(())

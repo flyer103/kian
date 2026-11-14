@@ -128,6 +128,7 @@ impl RegisteredTransport {
             generation,
             peer_addr,
             version,
+            description: _,
             max_concurrent,
             writer,
             mut inbound,

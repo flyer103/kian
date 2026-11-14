@@ -266,6 +266,7 @@ fn view(id: &str, state: MemberState) -> MemberView {
         id: id.into(),
         description: Some(format!("the {id} QA worker")),
         version: Some(1),
+        declaration_stale: false,
         state,
         last_seen_ms: 10_000,
     }

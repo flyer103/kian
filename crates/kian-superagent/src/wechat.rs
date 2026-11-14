@@ -52,6 +52,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::warn;
 
+pub mod context_state;
 pub mod credentials;
 pub mod login;
 pub mod protocol;
@@ -111,6 +112,8 @@ pub enum WechatError {
     NoTopics,
     #[error("wechat topic-mapping key/value must not be empty (`{0}`)")]
     EmptyTopicEntry(String),
+    #[error("wechat context state: {0}")]
+    BadContextState(String),
     #[error("{0}")]
     Credentials(#[from] credentials::CredentialError),
     #[error("wechat http client: {0}")]
@@ -145,6 +148,12 @@ pub struct WechatConfig {
     pub credential_poll_interval: Duration,
     /// Pacing between immediately-answered polls.
     pub poll_interval: Duration,
+    /// Best-effort reply-token state file (ADR-026); defaults to
+    /// `<credentials_file>.context-state.json`.
+    pub context_state_file: PathBuf,
+    /// How long a persisted reply token stays usable after its inbound
+    /// message (default 1 h).
+    pub context_ttl: Duration,
 }
 
 /// `api_base` shape: an `http(s)://` URL with a non-empty host
@@ -165,9 +174,12 @@ impl WechatConfig {
         credentials_file: impl Into<PathBuf>,
         topics: BTreeMap<String, String>,
     ) -> Self {
+        let credentials_file: PathBuf = credentials_file.into();
+        let context_state_file = context_state::default_state_path(&credentials_file);
         Self {
             api_base: api_base.into(),
-            credentials_file: credentials_file.into(),
+            credentials_file,
+            context_state_file,
             topics,
             poll_timeout: DEFAULT_POLL_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
@@ -176,6 +188,7 @@ impl WechatConfig {
             stale_pause: DEFAULT_STALE_PAUSE,
             credential_poll_interval: DEFAULT_CREDENTIAL_POLL_INTERVAL,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            context_ttl: context_state::DEFAULT_CONTEXT_TTL,
         }
     }
 
@@ -193,6 +206,21 @@ impl WechatConfig {
             if user_id.trim().is_empty() || topic.trim().is_empty() {
                 return Err(WechatError::EmptyTopicEntry(format!("{user_id}→{topic}")));
             }
+        }
+        if self.context_ttl.is_zero() {
+            return Err(WechatError::BadContextState(
+                "context_ttl must be greater than zero".into(),
+            ));
+        }
+        if self.context_state_file.as_os_str().is_empty() {
+            return Err(WechatError::BadContextState(
+                "context_state_file must not be empty".into(),
+            ));
+        }
+        if self.context_state_file == self.credentials_file {
+            return Err(WechatError::BadContextState(
+                "context_state_file must differ from credentials_file".into(),
+            ));
         }
         Ok(credentials::load(&self.credentials_file)?)
     }
@@ -217,7 +245,7 @@ struct Inner {
     /// Latest `context_token` per ADMITTED user — transport state,
     /// memory only, updated before fan-out and only for senders the
     /// allowlist admitted (§5).
-    context_tokens: Mutex<HashMap<String, String>>,
+    context_tokens: Mutex<HashMap<String, context_state::CachedToken>>,
     subscribers: Mutex<Vec<tokio::sync::mpsc::Sender<ChannelEvent>>>,
     poll_started: AtomicBool,
     paused: AtomicBool,
@@ -241,6 +269,16 @@ impl WechatChannel {
                 "wechat audit: credential file is group/world-readable; run `kian wechat login` to rewrite it 0600"
             );
         }
+        let context_tokens =
+            context_state::load(&config.context_state_file, config.context_ttl, now_ms());
+        if !context_tokens.is_empty() {
+            tracing::debug!(
+                target: "kian::wechat_channel",
+                state_file = %config.context_state_file.display(),
+                users = context_tokens.len(),
+                "wechat: loaded persisted reply tokens"
+            );
+        }
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -248,7 +286,7 @@ impl WechatChannel {
                 config,
                 client: IlinkClient::new().map_err(WechatError::from)?,
                 credentials: Mutex::new(credentials),
-                context_tokens: Mutex::new(HashMap::new()),
+                context_tokens: Mutex::new(context_tokens),
                 subscribers: Mutex::new(Vec::new()),
                 poll_started: AtomicBool::new(false),
                 paused: AtomicBool::new(false),
@@ -307,7 +345,7 @@ impl WechatChannel {
             .lock()
             .expect("wechat channel lock")
             .get(user_id)
-            .cloned()
+            .map(|entry| entry.token.clone())
     }
 
     /// Starts the shared receive driver exactly once (idempotent across
@@ -370,7 +408,7 @@ impl WechatChannel {
                                 // `topics` key. Caching before the decision
                                 // would make an allowlist-rejected sender a
                                 // reachable send target.
-                                cache_context_token(&inner, &message);
+                                cache_context_token(&inner, &message).await;
                                 if seen.insert(event.event_id.clone()) {
                                     fan_out(&inner, event);
                                 }
@@ -581,22 +619,44 @@ pub fn message_to_event(
 /// a dropped inbound's token is never cached, so a sender the allowlist
 /// rejected never becomes a reachable recipient. Bot echoes carry no
 /// `from_user_id`, so our own sends never poison the cache.
-fn cache_context_token(inner: &Inner, message: &Value) {
-    if let (Some(user), Some(token)) = (
-        message
-            .get("from_user_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty()),
-        message
-            .get("context_token")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty()),
-    ) {
-        inner
-            .context_tokens
-            .lock()
-            .expect("wechat channel lock")
-            .insert(user.to_string(), token.to_string());
+async fn cache_context_token(inner: &Inner, message: &Value) {
+    let Some((user, token)) = message
+        .get("from_user_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .zip(
+            message
+                .get("context_token")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty()),
+        )
+    else {
+        return;
+    };
+    let snapshot = {
+        let mut guard = inner.context_tokens.lock().expect("wechat channel lock");
+        guard.insert(
+            user.to_string(),
+            context_state::CachedToken {
+                token: token.to_string(),
+                updated_at_unix_ms: now_ms(),
+            },
+        );
+        guard.clone()
+    };
+    // Best-effort durable bridge (ADR-026): a write failure never blocks
+    // admission or the reply (the in-memory map still serves it).
+    let path = inner.config.context_state_file.clone();
+    match tokio::task::spawn_blocking(move || context_state::save(&path, &snapshot)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            target: "kian::wechat_channel",
+            "wechat audit: context state persist failed: {e}"
+        ),
+        Err(e) => tracing::warn!(
+            target: "kian::wechat_channel",
+            "wechat audit: context state persist task failed: {e}"
+        ),
     }
 }
 
@@ -673,7 +733,7 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
         .lock()
         .expect("wechat channel lock")
         .get(user_id)
-        .cloned()
+        .map(|entry| entry.token.clone())
     else {
         return Err(ChannelError::Unavailable(format!(
             "wechat send to `{user_id}` has no cached context_token: proactive push is \

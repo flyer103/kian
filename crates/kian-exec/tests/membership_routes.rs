@@ -82,6 +82,7 @@ fn registered(id: &str, generation: u64) -> (RegisteredWorker, FakeWorker) {
     let (inbound_tx, inbound_rx) = mpsc::channel(64);
     (
         RegisteredWorker {
+            description: None,
             id: id.into(),
             generation,
             peer_addr: "127.0.0.1:50000".parse().unwrap(),

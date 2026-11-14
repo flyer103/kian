@@ -326,19 +326,67 @@ impl RemoteExecBackend {
         transport: RouteTransport,
         generation: u64,
     ) {
-        let id = endpoint_id.into();
+        self.attach_route_inner(endpoint_id.into(), transport, generation, None)
+            .await;
+    }
+
+    /// [`RemoteExecBackend::attach_route`] carrying the worker's last
+    /// declaration (ADR-025): the registration handoff caches
+    /// `description`/`protocol_version` on the registry row in the same
+    /// upsert that marks it online, so a kian restart does not lose the
+    /// catalog text before the worker re-registers.
+    pub async fn attach_route_with_declaration(
+        &self,
+        endpoint_id: impl Into<String>,
+        transport: RouteTransport,
+        generation: u64,
+        description: Option<&str>,
+        protocol_version: u32,
+    ) {
+        self.attach_route_inner(
+            endpoint_id.into(),
+            transport,
+            generation,
+            Some((description, protocol_version)),
+        )
+        .await;
+    }
+
+    async fn attach_route_inner(
+        &self,
+        id: String,
+        transport: RouteTransport,
+        generation: u64,
+        declaration: Option<(Option<&str>, u32)>,
+    ) {
         let status = transport.status();
-        if let Err(e) = self
-            .core
-            .store
-            .upsert_endpoint(
-                &id,
-                &transport.addr().to_string(),
-                status.last_seen_ms,
-                "online",
-            )
-            .await
-        {
+        let registry = match declaration {
+            Some((description, protocol_version)) => {
+                self.core
+                    .store
+                    .upsert_endpoint_with_declaration(
+                        &id,
+                        &transport.addr().to_string(),
+                        status.last_seen_ms,
+                        "online",
+                        description,
+                        protocol_version,
+                    )
+                    .await
+            }
+            None => {
+                self.core
+                    .store
+                    .upsert_endpoint(
+                        &id,
+                        &transport.addr().to_string(),
+                        status.last_seen_ms,
+                        "online",
+                    )
+                    .await
+            }
+        };
+        if let Err(e) = registry {
             tracing::warn!(error = %e, endpoint = %id, "registry upsert on attach failed");
         }
         // Replace: stop any incumbent driver for this id first (the map

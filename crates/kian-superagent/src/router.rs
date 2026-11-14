@@ -1432,6 +1432,11 @@ impl RouterTools {
                 if let Some(description) = &view.description {
                     row["description"] = json!(description);
                 }
+                if view.declaration_stale {
+                    // ADR-025: the description/version are the durable
+                    // last declaration, not this process's live facts.
+                    row["declaration_stale"] = json!(true);
+                }
                 if let Some((session, thread)) = bound.get(&view.id) {
                     row["bound_session"] = json!(session);
                     row["bound_thread"] = json!(thread);
@@ -4188,6 +4193,7 @@ mod tests {
                 id: id.to_string(),
                 description: None,
                 version: Some(1),
+                declaration_stale: false,
                 state,
                 last_seen_ms: 0,
             }
@@ -4790,8 +4796,11 @@ mod tests {
             FakeDirectory::view("mac-mini", crate::directory::MemberState::Online),
             FakeDirectory::view("builder-1", crate::directory::MemberState::Offline),
         ]);
-        // a description rides only when known
+        // a description rides only when known; the offline row carries
+        // the durable last-declared cache (ADR-025) and is marked stale.
         directory.members.lock().unwrap()[0].description = Some("local macOS dev machine".into());
+        directory.members.lock().unwrap()[1].description = Some("cached builder".into());
+        directory.members.lock().unwrap()[1].declaration_stale = true;
         let (tools, _hold, port, inbox) = binding_tools(
             vec![],
             Some(directory),
@@ -4815,11 +4824,13 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["builder-1", "mac-mini"]);
         assert_eq!(rows[0]["state"], json!("offline"));
-        assert!(rows[0].get("description").is_none());
+        assert_eq!(rows[0]["description"], json!("cached builder"));
+        assert_eq!(rows[0]["declaration_stale"], json!(true));
         assert_eq!(rows[0]["bound_session"], json!(owner_session.0.to_string()));
         assert_eq!(rows[0]["bound_thread"], json!(tid(0xb2).to_string()));
         assert_eq!(rows[1]["state"], json!("online"));
         assert_eq!(rows[1]["description"], json!("local macOS dev machine"));
+        assert!(rows[1].get("declaration_stale").is_none());
         assert!(rows[1].get("bound_session").is_none());
         // Deterministic: same snapshot ⇒ same result bytes.
         let again = tools

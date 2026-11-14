@@ -895,8 +895,9 @@ graph LR
     plain worker id; nothing about membership enters a prompt or a tool schema (§4.7). A spawn may
     bind a **known but offline** worker — the result and audit say `offline — commands will queue` —
     and an unknown id is refused naming the known ids. `kian workers [--json]` is the read-only
-    operator view over the durable projection (id, state, bound session/thread; description and
-    protocol version are runtime-only until the worker re-registers).
+    operator view over the durable projection (id, state, bound session/thread; the worker's
+    last-declared description/protocol version come from the ADR-025 registry cache — labeled
+    `declaration_stale` in `list_workers` — and the live directory wins once it reconnects).
   - **One kian instance.** A worker registers to exactly one `kian serve`. Multi-replica membership,
     worker-to-all-replicas, relays and cross-instance dispatch are out of scope (owner decision,
     ADR-021 §Deferred); a second server is a different deployment with a different membership. The

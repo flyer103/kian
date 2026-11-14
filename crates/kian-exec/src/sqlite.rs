@@ -23,6 +23,10 @@ pub(crate) type QueueRow = (
     i64,
 );
 
+/// One `endpoint_registry` row's raw columns (ADR-025 adds the
+/// last-declared description/version).
+pub(crate) type RegistryRow = (String, String, i64, String, Option<String>, Option<i64>);
+
 /// One `async_jobs` row's raw columns (parsed by the shared
 /// `async_jobs::parse_async_row`).
 pub(crate) type AsyncRow = (
@@ -252,19 +256,46 @@ pub(crate) async fn upsert_endpoint(
     Ok(())
 }
 
+pub(crate) async fn upsert_endpoint_with_declaration(
+    pool: &SqlitePool,
+    endpoint_id: &str,
+    addr: &str,
+    last_heartbeat_ms: u64,
+    state: &str,
+    description: Option<&str>,
+    protocol_version: u32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version) VALUES (?, ?, ?, ?, ?, ?)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = excluded.addr, last_heartbeat_ms = excluded.last_heartbeat_ms, state = excluded.state, description = excluded.description, protocol_version = excluded.protocol_version",
+    )
+    .bind(endpoint_id)
+    .bind(addr)
+    .bind(last_heartbeat_ms as i64)
+    .bind(state)
+    .bind(description)
+    .bind(i64::from(protocol_version))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn endpoints(pool: &SqlitePool) -> Result<Vec<EndpointRegistryRow>, sqlx::Error> {
-    let rows: Vec<(String, String, i64, String)> =
-        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state FROM endpoint_registry ORDER BY endpoint_id ASC")
+    let rows: Vec<RegistryRow> =
+        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version FROM endpoint_registry ORDER BY endpoint_id ASC")
             .fetch_all(pool)
             .await?;
     Ok(rows
         .into_iter()
-        .map(|(endpoint_id, addr, hb, state)| EndpointRegistryRow {
-            endpoint_id,
-            addr,
-            last_heartbeat_ms: hb.max(0) as u64,
-            state,
-        })
+        .map(
+            |(endpoint_id, addr, hb, state, description, protocol_version)| EndpointRegistryRow {
+                endpoint_id,
+                addr,
+                last_heartbeat_ms: hb.max(0) as u64,
+                state,
+                description,
+                protocol_version: protocol_version.and_then(|v| u32::try_from(v).ok()),
+            },
+        )
         .collect())
 }
 

@@ -78,6 +78,15 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      # Same disk bound as the gates job: the postgres job's final
+      # `cargo test --workspace` links the same large test binaries.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell
+          sudo apt-get clean
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: postgres-gated suites (must run, not skip)

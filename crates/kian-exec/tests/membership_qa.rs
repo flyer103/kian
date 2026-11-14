@@ -797,6 +797,7 @@ impl QaFakeRoute {
         let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(16);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
         let worker = kian_exec::registration::RegisteredWorker {
+            description: None,
             id: id.to_string(),
             generation: 1,
             peer_addr: "127.0.0.1:59999".parse().unwrap(),

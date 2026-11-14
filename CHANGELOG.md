@@ -1328,3 +1328,31 @@ Gates on the exact committed tree: build / `cargo test --workspace` (122 suites,
   One flake observed and cleared: `fan_in_e2e::fan_in_unknown_session_errors_once_and_continues`
   (a 5-second frame budget) failed once in the first full run under parallel load, then passed
   alone and in the clean re-run — recorded, not attributed to this change.
+## 2026-11-14 — last-declared worker cache + durable WeChat reply tokens (P1)
+
+Two cold-start/reply gaps found in the owner deployment are closed with additive, best-effort
+state; both are isolated from the resident-budget change on a separate branch.
+
+- **Last-declared worker cache (ADR-025)** — `endpoint_registry` migration v4 adds nullable
+  `description`/`protocol_version`; the registration upsert writes the declaration, heartbeat and
+  detach upserts never touch it, and a registration that omits the description clears the cached
+  text (the latest declaration is the fact). The directory read serves the cache only for
+  registry-only ids and labels it `declaration_stale: true`; the live directory always wins.
+  `list_workers` gains the additive flag on cached rows (live rows byte-identical);
+  `kian workers --json` exposes the two fields when declared. Store tests cover reopen,
+  heartbeat-preserves and description-clear; the CLI and Router surfaces are covered too.
+- **Durable WeChat reply tokens (ADR-026)** — a best-effort, TTL-bounded `0600` state file beside
+  the credential file (`<credentials_file>.context-state.json` by default, `context_state_file` /
+  `context_ttl_ms` configurable, default 1 h) persists the latest admitted sender's
+  `context_token`; a channel rebuilt after a restart can reply without a new inbound. Admission
+  never waits on disk (the in-memory map updates first, the write is best-effort with one warn on
+  failure); a missing/malformed/expired state file is empty, never a startup failure; a stale
+  token still follows the existing `-14` degradation. The token stays out of events, exports,
+  logs and metrics. L1 covers write/load/TTL/malformed/0600 and a rebuilt channel sending with
+  the persisted token; the live restart story is L1-verified against the mock iLink server.
+- **Status** — rebased onto the per-episode budget change (ADR-024); this branch's contracts are
+  ADR-025 (worker cache) and ADR-026 (WeChat reply tokens). Not deployed; the live `context_token`
+  TTL across a real WeChat restart and a live post-restart cold catalog are unverified until this
+  branch is deployed.
+
+

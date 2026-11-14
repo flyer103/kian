@@ -447,8 +447,9 @@ impl StoreWorkerDirectory {
                 row.endpoint_id.clone(),
                 kian_superagent::MemberView {
                     id: row.endpoint_id.clone(),
-                    description: None,
-                    version: None,
+                    description: row.description.clone(),
+                    version: row.protocol_version,
+                    declaration_stale: true,
                     state,
                     last_seen_ms: row.last_heartbeat_ms,
                 },
@@ -469,6 +470,7 @@ impl StoreWorkerDirectory {
                     id,
                     description: member.description,
                     version: Some(member.version),
+                    declaration_stale: false,
                     state,
                     last_seen_ms: member.last_seen_ms,
                 },
@@ -489,6 +491,7 @@ impl StoreWorkerDirectory {
                     id: ep.id.clone(),
                     description: ep.description.clone(),
                     version: None,
+                    declaration_stale: false,
                     state: kian_superagent::MemberState::Offline,
                     last_seen_ms: 0,
                 });

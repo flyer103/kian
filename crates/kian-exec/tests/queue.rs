@@ -560,6 +560,67 @@ async fn slow_remote_command_never_blocks_the_runtime() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// ADR-025: the last-declared description/version survives a restart on
+/// the registry projection; heartbeat upserts preserve it, and a later
+/// declaration without a description clears the cached text.
+#[tokio::test]
+async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    store
+        .upsert_endpoint_with_declaration(
+            "builder-1",
+            "127.0.0.1:50001",
+            10,
+            "online",
+            Some("linux builder"),
+            2,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_endpoint("builder-1", "127.0.0.1:50001", 20, "offline")
+        .await
+        .unwrap();
+    let row = store
+        .endpoints()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.endpoint_id == "builder-1")
+        .unwrap();
+    assert_eq!(row.description.as_deref(), Some("linux builder"));
+    assert_eq!(row.protocol_version, Some(2));
+    store.close().await;
+
+    let store = ExecStore::open(&db).await.unwrap();
+    let row = store
+        .endpoints()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.endpoint_id == "builder-1")
+        .unwrap();
+    assert_eq!(row.description.as_deref(), Some("linux builder"));
+    assert_eq!(row.protocol_version, Some(2));
+
+    store
+        .upsert_endpoint_with_declaration("builder-1", "127.0.0.1:50001", 30, "online", None, 3)
+        .await
+        .unwrap();
+    let row = store
+        .endpoints()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.endpoint_id == "builder-1")
+        .unwrap();
+    assert_eq!(row.description, None);
+    assert_eq!(row.protocol_version, Some(3));
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
 /// v3 (ADR-023): an `fs` row round-trips its command and result, and a
 /// row inserted without the `kind` column (a pre-v3 row) decodes as the
 /// exec family — parked work survives the upgrade.
