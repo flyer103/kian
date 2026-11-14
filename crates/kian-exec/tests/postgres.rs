@@ -403,7 +403,9 @@ async fn pg_v2_queue_row_lease_columns_exist_and_default_unclaimed() {
             let _ = (claimed_by, claimed_until_ms);
         }
     }
-    // The applied chain is exactly [0, 1, 2].
+    // The applied chain is exactly [0, 1, 2, 3] — v3 is the exec-queue
+    // `kind` column (ADR-023), the additive ALTER that lets pre-v3 rows
+    // decode as the exec family.
     let versions: Vec<i64> =
         sqlx::query_as("SELECT version FROM _kian_exec_migrations ORDER BY version ASC")
             .fetch_all(pg.store.pg_pool().unwrap())
@@ -412,7 +414,7 @@ async fn pg_v2_queue_row_lease_columns_exist_and_default_unclaimed() {
             .into_iter()
             .map(|(v,)| v)
             .collect();
-    assert_eq!(versions, vec![0, 1, 2]);
+    assert_eq!(versions, vec![0, 1, 2, 3]);
 
     pg.finish().await;
 }
