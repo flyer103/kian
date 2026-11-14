@@ -1283,3 +1283,48 @@ Gates on the exact committed tree: build / `cargo test --workspace` (122 suites,
   arrive but the session churns. This is an empty-batch provider call, not a budget issue; the
   follow-up is to skip a judge turn when the batch is empty (or disable thinking), tracked
   separately. L2 (scripted provider) proves the budget fix 3/3; the live 2/3 is this residual.
+
+## 2026-11-14 — WeChat details reply is delivered whole (no truncation)
+
+- **Defect** — the documented IM flow offers `回复「详情」看完整结果`, but every reply went through the
+  same ≤100-unit shaping: when a person took the offer, the complete content the model sent was cut
+  at the limit, so the one interaction that promises "the complete result" delivered a prefix. The
+  truncation lived in the bundle policy, not the channel — the WeChat adapter already splits long
+  text at ~2000 characters losslessly. There was no delivery mode for a details request, only a
+  prompt sentence.
+- **Change (bundle only)** — `ImPolicy` gains the full-delivery mode (`enforce_full`: complete text,
+  `truncated: false`, the unit count still honest). The mode is derived from the Router's own
+  committed stream — the latest admitted channel input on the reply's channel, bounded by the
+  reply's own `tool/call` seq (log-before-execute) — and matched **exactly** against the closed
+  `DETAIL_REQUEST_TEXTS` vocabulary (`详情`, `详细`, `完整结果`, `完整内容`, `details`, …) after
+  trimming surrounding punctuation. It is never model-declared and never a tool argument, so a
+  pinned old Router prompt still delivers the full result. The receipt carries the additive
+  `detail: true` bit (summary receipts stay byte-identical); a long full delivery rides the
+  channel's existing ordered split. **No new event kind, no wire, table, config or tool-schema
+  change**; the judge prompt gains one details-request sentence (a new-session default — persisted
+  prompts replay byte-identically, constraint 3).
+- **Re-drive byte-identity** — the mode is a pure function over events, so the outbox boot re-drive
+  derives it at the intent's own `tool/call` seq and re-sends the intent's exact bytes; a details
+  reply killed mid-send is not re-truncated. `redrive` now takes the stream it already rebuilds
+  from.
+- **Bounds** — channel-scoped and exact: a passing mention ("详情页打不开") never lifts the budget;
+  a newer inbound message on the same channel before the reply leaves the summary budget in force
+  (the derivation is bounded by the call's seq, so mid-turn admits cannot flip it); full delivery
+  has no unit cap — the transport split is the only boundary.
+- **Tests** — L1: policy vocabulary/shaping/receipt schema; provenance stream derivation
+  (seq/channel bound, wrapper shapes, worker-report skipping); router wiring (whole delivery, call
+  boundary, other channel, missing call); outbox reconstruction and receipt. L2 (`superagent_demo`):
+  a `详情` input on the assembled server delivers the 120-unit reply whole with a `detail: true`
+  receipt, while the existing over-limit summary test still cuts at 100 units.
+- **Docs** — DESIGN §4.2 (IM row + the derivation paragraph), CHANNEL-WECHAT §4 (output shape +
+  details reply), EVENT-MODEL §3 (`channel/delivered` additive `detail`), SPEC §1/§4 wording.
+  No ADR: bundle output-policy behavior, contract recorded in DESIGN/CHANNEL-WECHAT.
+- **Unverified (named)** — a real model turn that follows the new prompt sentence and sends the
+  complete content (CI has no provider key; the L2 path scripts the reply text); multi-part
+  (>2000-char) detail delivery against the live iLink server; the deployment's own redeploy is the
+  owner's follow-up. `NO_PROXY=127.0.0.1,localhost` was forced in every e2e test.
+- **Gates on the final tree** — `cargo test --workspace` 123 suites green (1506 passed / 0 failed /
+  7 ignored), clippy `--workspace --all-targets -D warnings`, fmt `--all --check`, `docs_map` 6/6.
+  One flake observed and cleared: `fan_in_e2e::fan_in_unknown_session_errors_once_and_continues`
+  (a 5-second frame budget) failed once in the first full run under parallel load, then passed
+  alone and in the clean re-run — recorded, not attributed to this change.

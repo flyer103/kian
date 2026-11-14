@@ -51,6 +51,12 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
 12. **English only.** All repository text is English — docs, code comments, commit messages, file
     names. Frozen reference snapshots in `a vendored archive/` are captured source material, not
     authored text, and keep their original language.
+13. **Bundle shaping is replayable at its own `tool/call` seq.** When a bundle output branch
+    depends on runtime context (which shaping mode, which ack, which target), derive it as a pure
+    function of the committed stream evaluated at the write's own `tool/call` seq — never from the
+    live tail or process state. The outbox re-drive reconstructs a pending intent from that same
+    seq and re-applies the shaping; a branch that cannot be re-derived there silently changes the
+    bytes a retry sends.
 
 ## Environment gotchas
 

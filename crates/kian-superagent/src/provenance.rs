@@ -22,6 +22,7 @@
 //! Marking never filters: drop/allow decisions stay with the
 //! admission classes and the Router's judge.
 
+use kian_core::events::{Event, EventKind};
 use kian_core::seams::ChannelEvent;
 use serde_json::{Value, json};
 
@@ -273,14 +274,96 @@ pub fn correlation_topic(correlation: &Value) -> Option<String> {
     }
 }
 
+/// The plain text an admitted channel input declares, when its raw
+/// payload carries one: the top-level `text` (mock IM, WeChat iLink)
+/// or Lark's JSON-encoded `body.content.text`. `None` for raws with no
+/// plain text (GitHub structured deliveries), for a wrapper naming a
+/// different channel, and for inline/spilled views (they carry an
+/// excerpt, never the message).
+///
+/// `content` is the admitted message payload's `content` — the
+/// `{"kian": …}` wrapper itself ([`channel_input_payload`]), or its
+/// JSON-encoded spelling.
+#[must_use]
+pub fn channel_input_text(content: &Value, channel: &str) -> Option<String> {
+    let marker = parse_channel_marker_lenient(content)?;
+    if marker.channel != channel {
+        return None;
+    }
+    raw_plain_text(&marker.raw)
+}
+
+/// The plain text of a channel raw payload — the adapter-declared
+/// shapes the details-request detector reads: a top-level `text`
+/// string (mock IM, WeChat iLink) or Lark's `body.content`, a
+/// JSON-encoded string carrying `text`. Unknown shapes yield `None`
+/// (that channel simply never triggers a details delivery).
+#[must_use]
+pub fn raw_plain_text(raw: &Value) -> Option<String> {
+    if let Some(text) = raw.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let body = raw.get("body")?.get("content")?.as_str()?;
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The seq of the committed `tool/call` event carrying `call_id` — the
+/// boundary a reply's derivation never crosses: only inputs committed
+/// before the call were in the model's context, so an input admitted
+/// mid-turn cannot flip the delivery mode. `None` when the call is
+/// absent from `events` (a port outside the loop's log-before-execute
+/// path); a caller then treats the reply as a summary.
+#[must_use]
+pub fn tool_call_seq(events: &[Event], call_id: &str) -> Option<u64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == EventKind::ToolCall
+                && event.bytes.pointer("/content/id").and_then(Value::as_str) == Some(call_id)
+        })
+        .map(|event| event.seq)
+}
+
+/// The text of the latest admitted channel input on `channel` strictly
+/// before `seq` — the input a reply answers. Worker completion reports
+/// (non-channel inputs) are skipped: the details request may be several
+/// inputs back and is still the live question. `None` when no channel
+/// input precedes the boundary.
+#[must_use]
+pub fn latest_channel_input_text_before(
+    events: &[Event],
+    seq: u64,
+    channel: &str,
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.seq < seq)
+        .filter(|event| event.kind == EventKind::InputAdmitted)
+        .find_map(|event| {
+            event
+                .bytes
+                .get("content")
+                .and_then(|content| channel_input_text(content, channel))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CHANNEL_EVENT_TYPE, ChannelEventMarker, ShapingConfig, channel_input_payload,
-        parse_channel_marker, shape_channel_input, wrap_channel_event,
+        channel_input_text, latest_channel_input_text_before, parse_channel_marker, raw_plain_text,
+        shape_channel_input, tool_call_seq, wrap_channel_event,
     };
+    use kian_core::events::{Event, EventKind};
+    use kian_core::model::{Epoch, SessionId};
     use kian_core::seams::ChannelEvent;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn event() -> ChannelEvent {
         ChannelEvent {
@@ -669,5 +752,132 @@ mod tests {
         assert_eq!(raw_view(&raw, false), raw);
         assert!(!is_untrusted_view(&raw_view(&raw, false)));
         assert_eq!(raw_view(&raw, true), json!({"untrusted": true, "raw": raw}));
+    }
+
+    // -----------------------------------------------------------------
+    // Details-request derivation (the reply delivery mode)
+    // -----------------------------------------------------------------
+
+    fn sid(n: u128) -> SessionId {
+        SessionId(uuid::Uuid::from_u128(n))
+    }
+
+    fn committed(seq: u64, kind: EventKind, bytes: Value) -> Event {
+        Event {
+            seq,
+            session: sid(7),
+            epoch: Epoch(1),
+            ts: 0,
+            kind,
+            bytes,
+            version: Event::current_version(),
+        }
+    }
+
+    fn admitted(seq: u64, content: Value) -> Event {
+        committed(
+            seq,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": content}),
+        )
+    }
+
+    fn report(seq: u64) -> Event {
+        admitted(
+            seq,
+            json!({"thread_id": "t-1", "status": "completed", "summary": "done"}),
+        )
+    }
+
+    fn text_wrapper(text: &str, event_id: &str) -> Value {
+        wrap_channel_event(&ChannelEvent {
+            channel: "mock-im".into(),
+            event_id: event_id.into(),
+            topic: Some("ci".into()),
+            sender: None,
+            group: None,
+            payload: json!({"text": text}),
+            ts_ms: 1,
+        })
+    }
+
+    #[test]
+    fn channel_input_text_reads_the_adapter_declared_shapes() {
+        // mock IM / WeChat: the raw's top-level text.
+        let wrapper = text_wrapper("@kian deploy", "evt-1");
+        assert_eq!(
+            channel_input_text(&wrapper, "mock-im").as_deref(),
+            Some("@kian deploy")
+        );
+        // A wrapper naming another channel never matches.
+        assert!(channel_input_text(&wrapper, "ci").is_none());
+        // The JSON-encoded wrapper spelling parses too (the live
+        // tool-argument dialect).
+        let encoded = json!(wrapper.to_string());
+        assert_eq!(
+            channel_input_text(&encoded, "mock-im").as_deref(),
+            Some("@kian deploy")
+        );
+        // Lark: the verbatim message carries its text JSON-encoded.
+        let lark = json!({"kian": {
+            "type": "channel_event", "channel": "lark", "topic": "oc_1", "event_id": "om_1",
+            "raw": {"message_id": "om_1", "body": {"content": "{\"text\":\"详情\"}"}},
+        }});
+        assert_eq!(channel_input_text(&lark, "lark").as_deref(), Some("详情"));
+        // A raw with no plain text (GitHub structured delivery) never
+        // matches.
+        let github = json!({"kian": {
+            "type": "channel_event", "channel": "gh", "topic": "a/b", "event_id": "d1",
+            "raw": {"issue": {"body": "hi"}},
+        }});
+        assert!(channel_input_text(&github, "gh").is_none());
+        // Inline/spilled views carry an excerpt, never the message.
+        let spilled = json!({"kian": {
+            "type": "channel_event", "channel": "mock-im", "topic": null,
+            "inline": {"excerpt": "text", "neighbors": {}}, "spill": true,
+            "continuation": {"event_id": "evt-2"},
+        }});
+        assert!(channel_input_text(&spilled, "mock-im").is_none());
+        // The bare text extractor stays shape-strict.
+        assert_eq!(raw_plain_text(&json!({"text": "x"})).as_deref(), Some("x"));
+        assert!(raw_plain_text(&json!({"body": "not json"})).is_none());
+    }
+
+    #[test]
+    fn latest_channel_input_is_bounded_by_seq_and_channel() {
+        let call = committed(
+            4,
+            EventKind::ToolCall,
+            json!({"role": "assistant", "content": {
+                "id": "call-1", "name": "reply", "arguments": {},
+            }}),
+        );
+        let events = vec![
+            admitted(1, text_wrapper("@kian deploy", "evt-1")),
+            // A worker completion report is not a channel input: the
+            // live question behind it stays the answer.
+            report(2),
+            admitted(3, text_wrapper("详情", "evt-2")),
+            call,
+        ];
+        assert_eq!(
+            latest_channel_input_text_before(&events, 4, "mock-im").as_deref(),
+            Some("详情")
+        );
+        assert_eq!(
+            latest_channel_input_text_before(&events, 5, "mock-im").as_deref(),
+            Some("详情")
+        );
+        // Strictly before: at the detail input's own seq the previous
+        // input is still the latest.
+        assert_eq!(
+            latest_channel_input_text_before(&events, 3, "mock-im").as_deref(),
+            Some("@kian deploy")
+        );
+        // Channel-scoped: another channel never borrows the request.
+        assert!(latest_channel_input_text_before(&events, 4, "lark").is_none());
+        // The call boundary is found by its id; an unknown id is None.
+        assert_eq!(tool_call_seq(&events, "call-1"), Some(4));
+        assert_eq!(tool_call_seq(&events, "call-9"), None);
     }
 }

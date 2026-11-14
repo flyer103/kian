@@ -219,6 +219,7 @@ async fn run_superagent_flow(
     router_script: Vec<ScriptedResponse>,
     worker_script: Vec<ScriptedResponse>,
     worker_gate: &str,
+    input_text: &str,
 ) -> S4Run {
     let dir = temp_dir(&format!("c28-{tag}"));
     let (router_base, _router_mock) = spawn_scripted_provider(router_script, 0).await;
@@ -244,7 +245,7 @@ async fn run_superagent_flow(
         &client,
         &base,
         "mock_channel_send",
-        serde_json::json!({"channel": "mock-im", "payload": {"text": "please run the release checklist"}}),
+        serde_json::json!({"channel": "mock-im", "payload": {"text": input_text}}),
     )
     .await;
     let injected_event_id = out["result"]["event_id"]
@@ -365,7 +366,14 @@ const PASSING_GATE: &str = "    evidence_gate:\n      enabled: true\n      check
 async fn superagent_router_judges_and_dispatches() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_superagent_flow("judge", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow(
+        "judge",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+    )
+    .await;
 
     // The channel event was admitted to the Router with the injected
     // event id verbatim (routing provenance rides inside content).
@@ -466,7 +474,14 @@ async fn superagent_router_judges_and_dispatches() {
 async fn superagent_worker_completes_with_evidence() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_superagent_flow("evidence", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow(
+        "evidence",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+    )
+    .await;
 
     // The worker acted: one exec tool call and a non-error result.
     assert!(
@@ -555,7 +570,14 @@ async fn superagent_worker_completes_with_evidence() {
 async fn superagent_reply_within_word_limit() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_superagent_flow("wordlimit", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow(
+        "wordlimit",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+    )
+    .await;
 
     // The scripted reply was 120 words; the §4.2 cap held on the
     // assembled path: the audit event says 100 words, truncated.
@@ -595,6 +617,55 @@ async fn superagent_reply_within_word_limit() {
 }
 
 // ---------------------------------------------------------------------------
+// a details request ("详情") is delivered whole — never truncated
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superagent_details_request_reply_is_delivered_whole() {
+    force_no_proxy();
+    let (router, worker) = standard_scripts();
+    // The person answered the Router's `回复「详情」看完整结果` offer.
+    let run = run_superagent_flow("details", router, worker, PASSING_GATE, "详情").await;
+
+    // The 120-unit reply was delivered complete: the receipt is the
+    // honest full-delivery shape (no cut, the additive `detail` bit).
+    let delivered = run
+        .router_events
+        .iter()
+        .find(|e| {
+            e.kind == EventKind::ChannelDelivered && e.bytes["policy"] == serde_json::json!("im")
+        })
+        .expect("im channel/delivered");
+    assert_eq!(
+        delivered.bytes["words"],
+        serde_json::json!(120),
+        "{delivered:?}"
+    );
+    assert_eq!(delivered.bytes["truncated"], serde_json::json!(false));
+    assert_eq!(delivered.bytes["detail"], serde_json::json!(true));
+
+    let runtime = run
+        .server
+        .superagent_runtime()
+        .expect("superagent runtime assembled");
+    let mock = runtime.mock_channel("mock-im").expect("mock-im channel");
+    let deliveries = mock.deliveries();
+    let im = deliveries
+        .iter()
+        .find(|d| d.delivery.content.get("text").is_some())
+        .expect("the im delivery reached the channel");
+    let text = im.delivery.content["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        over_limit_reply(),
+        "the whole reply reached the channel, not a prefix"
+    );
+    assert!(!text.ends_with('…'), "no truncation marker");
+
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
+
+// ---------------------------------------------------------------------------
 // the structured delivery carries background/changes/verification
 // ---------------------------------------------------------------------------
 
@@ -602,7 +673,14 @@ async fn superagent_reply_within_word_limit() {
 async fn superagent_structured_delivery() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_superagent_flow("structured", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow(
+        "structured",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+    )
+    .await;
 
     // Both deliveries landed: one im, one structured — with word
     // counts on the im event.
@@ -657,7 +735,14 @@ async fn superagent_structured_delivery() {
 async fn superagent_delegation_audit_export_replays() {
     force_no_proxy();
     let (router, worker) = standard_scripts();
-    let run = run_superagent_flow("export", router, worker, PASSING_GATE).await;
+    let run = run_superagent_flow(
+        "export",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+    )
+    .await;
 
     // Export both sessions through the JSONL path.
     let router_out = run.dir.join("router-audit.jsonl");

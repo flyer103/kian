@@ -74,7 +74,7 @@ use crate::outbox::{
 };
 use crate::policy::{
     ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
-    im_delivered_payload, speak_key, structured_delivered_payload,
+    im_delivered_payload, im_delivered_payload_full, speak_key, structured_delivered_payload,
 };
 use crate::policy_version::{NO_POLICY_LABEL, PolicyVersion, with_policy_header};
 use crate::provenance::{ChannelEventMarker, parse_channel_marker_lenient};
@@ -613,6 +613,10 @@ pub fn build_mandate(
 #[derive(Default)]
 pub struct RouterHold {
     port: RwLock<Option<Arc<dyn StreamPort>>>,
+    /// The per-hold details-request derivation (one committed-stream
+    /// read per hold; every call inside a hold sees the same inputs, so
+    /// the answer never changes mid-hold).
+    detail: RwLock<Option<bool>>,
 }
 
 impl std::fmt::Debug for RouterHold {
@@ -633,12 +637,21 @@ impl RouterHold {
     /// Installs the port for the current execution hold.
     pub fn install(&self, port: Arc<dyn StreamPort>) {
         *self.port.write().expect("router hold lock") = Some(port);
+        *self.detail.write().expect("router detail lock") = None;
     }
 
     /// The current hold's port, if one was installed.
     #[must_use]
     pub fn port(&self) -> Option<Arc<dyn StreamPort>> {
         self.port.read().expect("router hold lock").clone()
+    }
+
+    fn detail_mode(&self) -> Option<bool> {
+        *self.detail.read().expect("router detail lock")
+    }
+
+    fn set_detail_mode(&self, detail: bool) {
+        *self.detail.write().expect("router detail lock") = Some(detail);
     }
 }
 
@@ -1474,6 +1487,38 @@ impl RouterTools {
             .map_err(|park| ToolError::Execution(park.error_message()))
     }
 
+    /// Whether this `reply` answers a details request (`详情` and the
+    /// closed [`crate::policy::DETAIL_REQUEST_TEXTS`] vocabulary): the
+    /// latest channel input on `channel` committed **before** this
+    /// call's own `tool/call` event. Derived from the stream — never
+    /// model-declared — and bounded by the call's seq so an input
+    /// admitted mid-turn cannot flip the mode, while a crash/outbox
+    /// re-drive derives exactly the same answer from the same seq.
+    ///
+    /// One committed-stream read per hold: every call inside a hold
+    /// sees the same pending inputs. An absent `tool/call` (a port
+    /// outside the loop's log-before-execute path) reads as a summary.
+    async fn reply_full_mode(
+        &self,
+        port: &Arc<dyn StreamPort>,
+        call_id: &str,
+        channel: &str,
+    ) -> Result<bool, ToolError> {
+        if let Some(detail) = self.hold.detail_mode() {
+            return Ok(detail);
+        }
+        let events = port.read_stream().await.map_err(|e| {
+            ToolError::Execution(format!("details-request stream read failed: {e}"))
+        })?;
+        let detail = crate::provenance::tool_call_seq(&events, call_id)
+            .and_then(|seq| {
+                crate::provenance::latest_channel_input_text_before(&events, seq, channel)
+            })
+            .is_some_and(|text| crate::policy::is_detail_request(&text));
+        self.hold.set_detail_mode(detail);
+        Ok(detail)
+    }
+
     async fn reply(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let port = self.port()?;
         let args = &call.arguments;
@@ -1491,9 +1536,20 @@ impl RouterTools {
         self.speak_gate(&port, channel, SpeakKind::Decision, &target)
             .await?;
 
+        // details-request derivation: derived from the Router's own
+        // committed stream (the latest channel input on this channel,
+        // bounded by this call's own tool/call seq) — never
+        // model-declared. A details request takes the full-delivery
+        // mode; the summary budget stays in force otherwise.
+        let full = self.reply_full_mode(&port, &call.id, channel).await?;
+
         // §4.2 IM policy: shape the text BEFORE the send (policy lives
         // in the bundle, not the adapter).
-        let enforced = self.im.enforce(text);
+        let enforced = if full {
+            self.im.enforce_full(text)
+        } else {
+            self.im.enforce(text)
+        };
         let delivery = ChannelDelivery {
             channel: channel.to_string(),
             target: target.clone(),
@@ -1505,8 +1561,14 @@ impl RouterTools {
         // channel/delivered lands only after the send succeeded; under
         // an enabled outbox the receipt carries the additive
         // `attempt`/`first_attempt_ms` keys (legacy payloads stay
-        // byte-identical).
-        let payload = im_delivered_payload(channel, &target, &enforced);
+        // byte-identical). A full delivery carries the additive
+        // `detail: true` bit — the honest marker that an over-budget
+        // `words` count was the requested answer, not a policy miss.
+        let payload = if full {
+            im_delivered_payload_full(channel, &target, &enforced)
+        } else {
+            im_delivered_payload(channel, &target, &enforced)
+        };
         let payload = if self.outbox.is_some() {
             with_attempt_keys(payload, &delivered)
         } else {
@@ -2408,13 +2470,24 @@ mod tests {
     struct RecordingPort {
         session: SessionId,
         emitted: Mutex<Vec<(EventKind, serde_json::Value)>>,
+        /// The committed events `read_stream` serves (empty = the
+        /// legacy no-history port).
+        events: Mutex<Vec<Event>>,
     }
 
     impl RecordingPort {
         fn shared(session: SessionId) -> (Arc<Self>, Arc<dyn StreamPort>) {
+            Self::shared_with_events(session, Vec::new())
+        }
+
+        fn shared_with_events(
+            session: SessionId,
+            events: Vec<Event>,
+        ) -> (Arc<Self>, Arc<dyn StreamPort>) {
             let port = Arc::new(Self {
                 session,
                 emitted: Mutex::new(Vec::new()),
+                events: Mutex::new(events),
             });
             let dyn_port: Arc<dyn StreamPort> = Arc::clone(&port) as Arc<dyn StreamPort>;
             (port, dyn_port)
@@ -2434,7 +2507,8 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, StreamPortError>> {
-            Box::pin(async { Ok(Vec::new()) })
+            let events = self.events.lock().unwrap().clone();
+            Box::pin(async move { Ok(events) })
         }
     }
 
@@ -2716,6 +2790,181 @@ mod tests {
         assert_eq!(emitted[0].1["words"], json!(100));
         assert_eq!(emitted[0].1["truncated"], json!(true));
         assert_eq!(emitted[0].1["channel"], json!("mock-im"));
+    }
+
+    /// A `详情` reply is derived from the committed stream (the latest
+    /// channel input before the call) and delivered whole — the
+    /// requested answer is never cut.
+    #[tokio::test]
+    async fn reply_after_a_details_request_is_delivered_whole() {
+        let (tools, hold, mock, _inbox) = tools_for_test();
+        let router = sid(10);
+        let events = vec![
+            event(
+                router,
+                1,
+                EventKind::InputAdmitted,
+                json!({
+                    "role": "user",
+                    "content": {"kian": {
+                        "type": "channel_event", "channel": "mock-im", "topic": "wechat",
+                        "event_id": "evt-7",
+                        "raw": {"text": "详情", "from_user_id": "oU"},
+                    }},
+                }),
+            ),
+            // The loop's log-before-execute record of the call itself:
+            // the derivation boundary.
+            event(
+                router,
+                2,
+                EventKind::ToolCall,
+                json!({
+                    "role": "assistant",
+                    "content": {"id": "call-1", "name": "reply", "arguments": {}},
+                }),
+            ),
+        ];
+        let (rec, dyn_port) = RecordingPort::shared_with_events(router, events);
+        hold.install(dyn_port);
+
+        let long_text: String = (1..=120)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = tools
+            .invoke(call(
+                REPLY_TOOL,
+                json!({
+                    "channel": "mock-im", "text": long_text.clone(), "target": {"user_id": "oU"},
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.output["words"], json!(120));
+        assert_eq!(
+            result.output["truncated"],
+            json!(false),
+            "the details reply is not cut"
+        );
+
+        // The channel received the complete text — no ellipsis.
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].delivery.content["text"], json!(long_text));
+
+        // The receipt is the honest full-delivery shape (additive
+        // `detail` bit on the IM schema).
+        let emitted = rec.emitted.lock().unwrap().clone();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
+        assert_eq!(emitted[0].1["policy"], json!("im"));
+        assert_eq!(emitted[0].1["words"], json!(120));
+        assert_eq!(emitted[0].1["truncated"], json!(false));
+        assert_eq!(emitted[0].1["detail"], json!(true));
+    }
+
+    /// The derivation is bounded by the call's own seq and the channel:
+    /// an input committed *after* the call, another channel's request,
+    /// or an absent call event stays on the summary budget.
+    #[tokio::test]
+    async fn details_request_mode_never_crosses_the_call_boundary_or_channel() {
+        let (tools, hold, mock, _inbox) = tools_for_test();
+        let router = sid(10);
+        let wrapper = |channel: &str, text: &str, event_id: &str| {
+            json!({"role": "user", "content": {"kian": {
+                "type": "channel_event", "channel": channel, "topic": "t",
+                "event_id": event_id, "raw": {"text": text},
+            }}})
+        };
+        let events = vec![
+            // Another channel's details request.
+            event(
+                router,
+                1,
+                EventKind::InputAdmitted,
+                wrapper("lark", "详情", "evt-1"),
+            ),
+            // The tool/call boundary.
+            event(
+                router,
+                2,
+                EventKind::ToolCall,
+                json!({"role": "assistant", "content": {
+                    "id": "call-1", "name": "reply", "arguments": {},
+                }}),
+            ),
+            // A details request admitted *after* the call (mid-turn):
+            // it was not in the model's context, so it cannot flip the
+            // mode.
+            event(
+                router,
+                3,
+                EventKind::InputAdmitted,
+                wrapper("mock-im", "详情", "evt-2"),
+            ),
+        ];
+        let (_rec, dyn_port) = RecordingPort::shared_with_events(router, events);
+        hold.install(dyn_port);
+
+        let long_text: String = (1..=120)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = tools
+            .invoke(call(
+                REPLY_TOOL,
+                json!({"channel": "mock-im", "text": long_text, "target": {"chat_id": 7}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.output["truncated"], json!(true));
+        let delivered = mock.deliveries();
+        assert!(
+            delivered[0].delivery.content["text"]
+                .as_str()
+                .unwrap()
+                .ends_with('…'),
+            "summary shaping stays in force"
+        );
+    }
+
+    /// An absent `tool/call` event (a port outside the loop's
+    /// log-before-execute path) reads as a summary — never a guess.
+    #[tokio::test]
+    async fn a_missing_call_event_reads_as_a_summary_reply() {
+        let (tools, hold, mock, _inbox) = tools_for_test();
+        let router = sid(10);
+        let events = vec![event(
+            router,
+            1,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": {"kian": {
+                "type": "channel_event", "channel": "mock-im", "topic": "t",
+                "event_id": "evt-7", "raw": {"text": "详情"},
+            }}}),
+        )];
+        let (_rec, dyn_port) = RecordingPort::shared_with_events(router, events);
+        hold.install(dyn_port);
+        let long_text: String = (1..=120)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = tools
+            .invoke(call(
+                REPLY_TOOL,
+                json!({"channel": "mock-im", "text": long_text, "target": {"chat_id": 7}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.output["truncated"], json!(true));
+        assert!(
+            mock.deliveries()[0].delivery.content["text"]
+                .as_str()
+                .unwrap()
+                .ends_with('…')
+        );
     }
 
     #[tokio::test]

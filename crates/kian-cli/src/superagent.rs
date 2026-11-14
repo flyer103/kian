@@ -2034,7 +2034,9 @@ pub async fn start_services(
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 };
-                let outcomes = driver.redrive(&pending, &im, &structured, &port).await;
+                let outcomes = driver
+                    .redrive(&pending, &im, &structured, &router_events, &port)
+                    .await;
                 for (call_id, outcome) in outcomes {
                     match outcome {
                         Ok(delivered) => tracing::info!(

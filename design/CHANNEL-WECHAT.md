@@ -187,10 +187,20 @@ change (§15).
 - One inbound message may be answered once; nothing here sends to a user with no inbound (§5).
 - **Output shape**: the reply text is plain text (the client renders no markdown). The Router
   prompt forbids markdown/emoji and asks for a complete answer inside the IM budget; the shared IM
-  policy enforces ≤100 **units**, where each CJK character counts one unit (CJK has no inter-word
-  spaces, so a whitespace-token count would never trigger). Over-budget text is cut at the last
-  complete sentence that keeps at least half the budget, with an honest `truncated` receipt; the
-  Router is told to summarize and offer `回复「详情」看完整结果` instead of relying on truncation.
+  policy enforces ≤100 **units** on normal replies, where each CJK character counts one unit (CJK
+  has no inter-word spaces, so a whitespace-token count would never trigger). Over-budget text is
+  cut at the last complete sentence that keeps at least half the budget, with an honest
+  `truncated` receipt; the Router is told to summarize and offer `回复「详情」看完整结果` instead
+  of relying on truncation.
+- **Details reply (no truncation)**: a reply answering an explicit details request — the same
+  `回复「详情」看完整结果` offer, matched exactly against the shared IM policy's closed
+  `详情`/`详细`/`完整结果`/`details` vocabulary — takes the **full-delivery** mode: the complete
+  text, `truncated: false`, and long text rides the ~2000-character ordered split above (no part is
+  dropped, no part is cut). The mode is derived by the bundle from the Router's own committed
+  stream: the latest admitted channel input on the same channel, bounded by the reply's own
+  `tool/call` seq. It is never model-declared and never parsed by this adapter, so a pinned old
+  Router prompt still delivers the full result; the receipt carries the additive `detail: true`
+  bit. A passing mention of the word ("详情页打不开") never lifts the budget — the match is exact.
 
 ## 5. The `context_token` rule
 

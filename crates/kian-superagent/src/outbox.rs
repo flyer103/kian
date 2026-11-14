@@ -84,7 +84,8 @@ use uuid::Uuid;
 
 use crate::StreamPort;
 use crate::policy::{
-    ImPolicy, StructuredPolicy, im_delivered_payload, speak_key, structured_delivered_payload,
+    EnforcedReply, ImPolicy, StructuredPolicy, im_delivered_payload, im_delivered_payload_full,
+    speak_key, structured_delivered_payload,
 };
 use crate::router::{DELIVER_STRUCTURED_TOOL, REPLY_TOOL};
 use crate::stage::OutboxView;
@@ -863,19 +864,23 @@ impl OutboxDriver {
     /// The delivery is reconstructed from the intent's verbatim
     /// arguments plus the live output policies — the same pure
     /// shaping the original tool path applied, so the re-driven bytes
-    /// equal the intent's bytes. Returns one `(call_id, outcome)` per
-    /// re-driven entry.
+    /// equal the intent's bytes; the details-request mode is derived
+    /// from `events` at the entry's own `tool/call` seq, exactly as the
+    /// tool path derived it at send time. Returns one `(call_id,
+    /// outcome)` per re-driven entry.
     pub async fn redrive(
         &self,
         entries: &[OutboxEntry],
         im: &ImPolicy,
         structured: &StructuredPolicy,
+        events: &[Event],
         port: &Arc<dyn StreamPort>,
     ) -> Vec<(String, Result<Delivered, OutboxPark>)> {
         let mut out = Vec::new();
         for entry in entries.iter().filter(|e| e.state == OutboxState::Pending) {
             self.metrics.record_redrive();
-            let Some(delivery) = reconstruct_delivery(entry, im, structured) else {
+            let detail = reply_detail_mode(events, entry);
+            let Some(delivery) = reconstruct_delivery(entry, im, structured, detail) else {
                 tracing::warn!(
                     target: "kian::outbox",
                     call_id = %entry.call_id,
@@ -886,11 +891,12 @@ impl OutboxDriver {
             let channel = delivery.channel.clone();
             let target = delivery.target.clone();
             let base_payload = if entry.tool == REPLY_TOOL {
-                im_delivered_payload(
-                    &channel,
-                    &target,
-                    &im.enforce(&arguments_text(&entry.arguments)),
-                )
+                let enforced = shape_reply(im, entry, detail);
+                if detail {
+                    im_delivered_payload_full(&channel, &target, &enforced)
+                } else {
+                    im_delivered_payload(&channel, &target, &enforced)
+                }
             } else {
                 structured_delivered_payload(&channel, &target)
             };
@@ -936,17 +942,46 @@ pub fn with_attempt_keys(mut payload: Value, delivered: &Delivered) -> Value {
     payload
 }
 
+/// Whether a re-driven delivery intent answered a details request:
+/// derived from the intent's own `tool/call` seq (`entry.seq`) and
+/// channel exactly as the tool path derived it at send time, so the
+/// re-driven bytes equal the intent's bytes even after a restart. A
+/// non-`reply` intent is never a details delivery.
+#[must_use]
+pub fn reply_detail_mode(events: &[Event], entry: &OutboxEntry) -> bool {
+    if entry.tool != REPLY_TOOL {
+        return false;
+    }
+    let Some(channel) = entry.arguments.get("channel").and_then(Value::as_str) else {
+        return false;
+    };
+    crate::provenance::latest_channel_input_text_before(events, entry.seq, channel)
+        .is_some_and(|text| crate::policy::is_detail_request(&text))
+}
+
+/// The `reply` shaping an intent takes: the summary budget, or the
+/// full delivery when the intent answered a details request.
+fn shape_reply(im: &ImPolicy, entry: &OutboxEntry, detail: bool) -> EnforcedReply {
+    let text = arguments_text(&entry.arguments);
+    if detail {
+        im.enforce_full(&text)
+    } else {
+        im.enforce(&text)
+    }
+}
+
 /// Rebuilds the `ChannelDelivery` an intent's arguments describe: the
 /// same pure shaping the tool path applied (`reply` → ImPolicy word
-/// cap; `deliver_structured` → the payload verbatim, re-validated).
-/// `None` when the intent cannot be reconstructed (unknown tool,
-/// missing payload, failed validation) — the re-drive says so, never
-/// guesses.
+/// cap, or the full delivery for a details request; `deliver_structured`
+/// → the payload verbatim, re-validated). `None` when the intent cannot
+/// be reconstructed (unknown tool, missing payload, failed validation) —
+/// the re-drive says so, never guesses.
 #[must_use]
 pub fn reconstruct_delivery(
     entry: &OutboxEntry,
     im: &ImPolicy,
     structured: &StructuredPolicy,
+    detail: bool,
 ) -> Option<ChannelDelivery> {
     let channel = entry.arguments.get("channel")?.as_str()?.to_string();
     let target = entry
@@ -955,7 +990,7 @@ pub fn reconstruct_delivery(
         .cloned()
         .unwrap_or(Value::Null);
     let content = if entry.tool == REPLY_TOOL {
-        serde_json::json!({"text": im.enforce(&arguments_text(&entry.arguments)).text})
+        serde_json::json!({"text": shape_reply(im, entry, detail).text})
     } else {
         let payload = entry.arguments.get("payload")?.clone();
         structured.validate(&payload).ok()?;
@@ -1404,7 +1439,7 @@ mod tests {
             seq: 1,
             state: OutboxState::Pending,
         };
-        let d = reconstruct_delivery(&reply, &im, &structured).expect("reply reconstructs");
+        let d = reconstruct_delivery(&reply, &im, &structured, false).expect("reply reconstructs");
         assert_eq!(d.channel, "mock-im");
         assert_eq!(d.content, json!({"text": im.enforce("one two three").text}));
 
@@ -1414,7 +1449,7 @@ mod tests {
                               "payload": {"background": "b", "changes": "c", "verification": "v"}}),
             ..reply
         };
-        let d2 = reconstruct_delivery(&structured_entry, &im, &structured)
+        let d2 = reconstruct_delivery(&structured_entry, &im, &structured, false)
             .expect("structured reconstructs");
         assert_eq!(
             d2.content,
@@ -1427,7 +1462,97 @@ mod tests {
             arguments: json!({"channel": "mock-im", "target": {"issue": 7}, "payload": {"background": "b"}}),
             ..structured_entry
         };
-        assert!(reconstruct_delivery(&invalid, &im, &structured).is_none());
+        assert!(reconstruct_delivery(&invalid, &im, &structured, false).is_none());
+    }
+
+    /// A details request reconstructs as the full delivery — the
+    /// exact bytes the tool path attempted — so a boot re-drive never
+    /// re-truncates what the person asked to see in full.
+    #[test]
+    fn details_request_reconstruction_is_the_full_delivery() {
+        let im = ImPolicy::default();
+        let structured = StructuredPolicy::default();
+        let long: String = (1..=120)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let entry = OutboxEntry {
+            ticket: "t".into(),
+            conversation: "mock-im:x".into(),
+            tool: REPLY_TOOL.into(),
+            call_id: "c1".into(),
+            arguments: json!({"channel": "mock-im", "target": {"chat_id": 1},
+                              "text": long.clone()}),
+            seq: 4,
+            state: OutboxState::Pending,
+        };
+        let summary = reconstruct_delivery(&entry, &im, &structured, false).expect("summary");
+        assert!(
+            summary.content["text"].as_str().unwrap().ends_with('…'),
+            "the summary shape still cuts"
+        );
+        let full = reconstruct_delivery(&entry, &im, &structured, true).expect("full");
+        assert_eq!(full.content, json!({"text": long}));
+    }
+
+    /// The mode is derived at the intent's own seq and channel — the
+    /// same boundary the tool path used at send time.
+    #[test]
+    fn reply_detail_mode_is_derived_at_the_intent_seq() {
+        use kian_core::events::Event;
+        use kian_core::model::{Epoch, SessionId};
+        let session = SessionId(uuid::Uuid::nil());
+        let ev = |seq, kind, bytes| Event {
+            seq,
+            session,
+            epoch: Epoch(1),
+            ts: 1,
+            kind,
+            bytes,
+            version: 0,
+        };
+        let wrapper = |text: &str| {
+            json!({"kian": {
+                "type": "channel_event", "channel": "mock-im", "topic": "t",
+                "event_id": text, "raw": {"text": text},
+            }})
+        };
+        let events = vec![
+            ev(
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": wrapper("详情")}),
+            ),
+            // A worker report between the request and the reply: it is
+            // not a channel input and never hides the request.
+            ev(
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": {"thread_id": "t", "status": "completed"}}),
+            ),
+        ];
+        let reply = OutboxEntry {
+            ticket: "t".into(),
+            conversation: "mock-im:x".into(),
+            tool: REPLY_TOOL.into(),
+            call_id: "c1".into(),
+            arguments: json!({"channel": "mock-im", "target": {"chat_id": 1}, "text": "x"}),
+            seq: 3,
+            state: OutboxState::Pending,
+        };
+        assert!(reply_detail_mode(&events, &reply));
+        // Another channel never borrows the request.
+        let mut other_channel = reply.clone();
+        other_channel.arguments = json!({"channel": "lark", "target": {"chat_id": 1}, "text": "x"});
+        assert!(!reply_detail_mode(&events, &other_channel));
+        // A structured intent is never a details delivery.
+        let mut structured_entry = reply.clone();
+        structured_entry.tool = DELIVER_STRUCTURED_TOOL.into();
+        assert!(!reply_detail_mode(&events, &structured_entry));
+        // An intent older than the request reads as a summary.
+        let mut early = reply.clone();
+        early.seq = 1;
+        assert!(!reply_detail_mode(&events, &early));
     }
 
     #[test]

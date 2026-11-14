@@ -72,8 +72,9 @@
 //! - [`templates`] — the Router/Worker `AgentDef` templates and the
 //!   structural profile rules (workers never hold channel tools)
 //! - [`policy`] — the DESIGN §4.2 channel output policies:
-//!   `ImPolicy` (≤100-word rule) and `StructuredPolicy` (section
-//!   contract, honest rejection) — bundle-only placement
+//!   `ImPolicy` (≤100-word rule, plus the details-request full-delivery
+//!   mode derived from the event stream) and `StructuredPolicy`
+//!   (section contract, honest rejection) — bundle-only placement
 //! - [`router`] — the resident Router profile: judge prompt +
 //!   bootstrap, `RouterTools` (spawn_worker / reply /
 //!   deliver_structured), the `RouterDriver` residency decorator, and
@@ -157,14 +158,15 @@ pub use outbox::{
     DEFAULT_BACKOFF_CAP_MS, DEFAULT_BACKOFF_START_MS, DEFAULT_MAX_ATTEMPTS, Delivered,
     ManualRetryClock, OutboxConfig, OutboxDriver, OutboxEntry, OutboxMetrics, OutboxPark,
     OutboxState, OutboxStatus, PARK_ERROR_PREFIX, RetryClock, SystemRetryClock, ThreadOutboxView,
-    conversation_key, intent_ticket, outbox_pending, reconstruct_delivery, with_attempt_keys,
-    worker_conversation_keys,
+    conversation_key, intent_ticket, outbox_pending, reconstruct_delivery, reply_detail_mode,
+    with_attempt_keys, worker_conversation_keys,
 };
 pub use policy::{
-    DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME, ImPolicy,
-    PolicyError, STRUCTURED_POLICY_NAME, SpeakCondition, SpeakContext, SpeakKind, SpeakPolicy,
-    SpeakRule, SpeakTracker, SpeakVerdict, StructuredPolicy, count_words, im_delivered_payload,
-    speak_key, structured_delivered_payload,
+    DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, DETAIL_REQUEST_TEXTS, ELLIPSIS, EnforcedReply,
+    IM_POLICY_NAME, ImPolicy, PolicyError, STRUCTURED_POLICY_NAME, SpeakCondition, SpeakContext,
+    SpeakKind, SpeakPolicy, SpeakRule, SpeakTracker, SpeakVerdict, StructuredPolicy, count_words,
+    im_delivered_payload, im_delivered_payload_full, is_detail_request, speak_key,
+    structured_delivered_payload,
 };
 pub use policy_version::{
     DriftMarking, DriftRecord, NO_POLICY_LABEL, PolicyVersion, drift, notify_drift,
@@ -173,8 +175,9 @@ pub use policy_version::{
 };
 pub use provenance::{
     CHANNEL_EVENT_TYPE, ChannelEventMarker, ShapingConfig, channel_event_untrusted,
-    channel_input_payload, is_untrusted_view, parse_channel_marker, raw_view, shape_channel_input,
-    shape_channel_input_marked, wrap_channel_event, wrap_channel_event_marked,
+    channel_input_payload, channel_input_text, is_untrusted_view, latest_channel_input_text_before,
+    parse_channel_marker, raw_plain_text, raw_view, shape_channel_input,
+    shape_channel_input_marked, tool_call_seq, wrap_channel_event, wrap_channel_event_marked,
 };
 pub use reasons::{DecisionKind, IntakeReason, outcome_reasons, routed_reason};
 pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};

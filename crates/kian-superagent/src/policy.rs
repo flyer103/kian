@@ -11,7 +11,12 @@
 //!   Word count = whitespace tokens of the plain-text reply. An
 //!   over-limit reply is truncated at the limit with an ellipsis and
 //!   recorded `truncated: true`; exact-limit and under-limit replies
-//!   pass verbatim.
+//!   pass verbatim. A reply that answers a **details request**
+//!   ([`is_detail_request`], derived from the event stream, never
+//!   model-declared) takes the full-delivery mode instead
+//!   ([`ImPolicy::enforce_full`]): the complete text, `truncated:
+//!   false`, and the additive `detail: true` receipt bit — the
+//!   answer a person asked for in full is never cut.
 //! - [`StructuredPolicy`] — the §4.2 structured-delivery row: a payload
 //!   missing a required section is **rejected honestly** (an error to
 //!   the loop), never silently sent.
@@ -185,6 +190,21 @@ impl ImPolicy {
             truncated: true,
         }
     }
+
+    /// Shapes `text` for a **details request** ([`is_detail_request`]):
+    /// the complete text while `truncated: false` — the unit budget is
+    /// still counted into `words`, but it never cuts the answer a person
+    /// explicitly asked for in full. The channel's own long-text split
+    /// is the only remaining boundary, so a details reply is delivered
+    /// whole (multiple ordered messages when the client needs to split).
+    #[must_use]
+    pub fn enforce_full(&self, text: &str) -> EnforcedReply {
+        EnforcedReply {
+            text: text.to_string(),
+            words: count_words(text),
+            truncated: false,
+        }
+    }
 }
 
 /// The §4.2 structured-delivery output policy template.
@@ -242,6 +262,59 @@ pub fn im_delivered_payload(channel: &str, target: &Value, reply: &EnforcedReply
         "words": reply.words,
         "truncated": reply.truncated,
     })
+}
+
+/// The `channel/delivered` payload for a **details-request delivery**:
+/// the IM receipt plus the additive `detail: true` audit bit. Summary
+/// receipts never carry the key, so their bytes are unchanged (the
+/// additions-only payload rule); the receipt is what tells a reader the
+/// over-budget `words` count was a full delivery, not a policy miss.
+#[must_use]
+pub fn im_delivered_payload_full(channel: &str, target: &Value, reply: &EnforcedReply) -> Value {
+    let mut payload = im_delivered_payload(channel, target, reply);
+    payload["detail"] = Value::Bool(true);
+    payload
+}
+
+/// The closed vocabulary of replies that count as a **details
+/// request** — exactly the spellings the Router prompt offers
+/// (`回复「详情」看完整结果`). A reply outside this set never changes the
+/// delivery mode: the summary budget stays in force.
+pub const DETAIL_REQUEST_TEXTS: [&str; 9] = [
+    "详情",
+    "看详情",
+    "详细",
+    "详情一下",
+    "完整结果",
+    "看完整结果",
+    "完整内容",
+    "detail",
+    "details",
+];
+
+/// Punctuation that may wrap a details reply without changing it.
+const DETAIL_PUNCTUATION: &[char] = &[
+    '。', '．', '.', '!', '！', '?', '？', ',', '，', '、', ';', '；', ':', '：', '「', '」', '『',
+    '』', '“', '”', '‘', '’', '\'', '"', '(', ')', '（', '）', '[', ']', '【', '】', '《', '》',
+];
+
+/// True iff `text` is a details request: trimmed, stripped of
+/// surrounding punctuation/whitespace, then compared exactly
+/// (ASCII case-insensitive) against [`DETAIL_REQUEST_TEXTS`].
+///
+/// Exact matching is deliberate: a passing mention of the word — a bug
+/// report like "详情页打不开" — must not lift the word budget. The
+/// canonical trigger is the offer the Router itself sends
+/// (`回复「详情」看完整结果`), so a person who answers it with the
+/// bracketed word always matches.
+#[must_use]
+pub fn is_detail_request(text: &str) -> bool {
+    let normalized =
+        text.trim_matches(|ch: char| ch.is_whitespace() || DETAIL_PUNCTUATION.contains(&ch));
+    !normalized.is_empty()
+        && DETAIL_REQUEST_TEXTS
+            .iter()
+            .any(|trigger| normalized.eq_ignore_ascii_case(trigger))
 }
 
 /// The `channel/delivered` payload for a structured delivery (no word
@@ -549,7 +622,8 @@ impl SpeakTracker {
 mod tests {
     use super::{
         DEFAULT_MAX_WORDS, DEFAULT_SECTIONS, ELLIPSIS, EnforcedReply, IM_POLICY_NAME,
-        STRUCTURED_POLICY_NAME, count_words, im_delivered_payload, structured_delivered_payload,
+        STRUCTURED_POLICY_NAME, count_words, im_delivered_payload, im_delivered_payload_full,
+        is_detail_request, structured_delivered_payload,
     };
     use crate::policy::{ImPolicy, PolicyError, StructuredPolicy};
     use serde_json::json;
@@ -752,5 +826,79 @@ mod tests {
         );
         // `words` is omitted for structured deliveries (schema `words?`).
         assert!(payload.get("words").is_none());
+    }
+
+    #[test]
+    fn detail_requests_are_exact_and_punctuation_tolerant() {
+        // The canonical reply to the Router's offer, in every spelling
+        // a person may type around it.
+        for text in [
+            "详情",
+            "详情。",
+            " 详情 ",
+            "「详情」",
+            "详情！",
+            "详细",
+            "完整结果",
+            "完整内容",
+            "看完整结果",
+            "详情一下",
+            "details",
+            "DETAIL",
+        ] {
+            assert!(is_detail_request(text), "should match: {text:?}");
+        }
+        // Exact matching: a passing mention never lifts the word budget
+        // (the "详情页打不开" bug report is not a details request).
+        for text in [
+            "",
+            "   ",
+            "详情页打不开",
+            "我要看详情",
+            "请问详情是什么",
+            "完整",
+            "more details please",
+            "..",
+        ] {
+            assert!(!is_detail_request(text), "should not match: {text:?}");
+        }
+    }
+
+    #[test]
+    fn full_delivery_keeps_the_whole_text_and_marks_the_receipt() {
+        let policy = ImPolicy::default();
+        let original = words(120);
+        let enforced = policy.enforce_full(&original);
+        assert_eq!(enforced.text, original);
+        assert_eq!(enforced.words, 120, "the delivered count is still honest");
+        assert!(!enforced.truncated);
+        assert!(!enforced.text.ends_with(ELLIPSIS));
+
+        // CJK over-budget text is kept whole too.
+        let cjk = format!("{}{}", "你好".repeat(80), "。");
+        let full = policy.enforce_full(&cjk);
+        assert_eq!(full.text, cjk);
+        assert_eq!(full.words, count_words(&cjk));
+        assert!(!full.truncated);
+
+        // The receipt carries the additive `detail` bit; the summary
+        // receipt bytes stay exactly the legacy shape.
+        let target = json!({"chat_id": 7});
+        assert_eq!(
+            im_delivered_payload_full("mock-im", &target, &enforced),
+            json!({
+                "channel": "mock-im",
+                "target": {"chat_id": 7},
+                "policy": IM_POLICY_NAME,
+                "words": 120,
+                "truncated": false,
+                "detail": true,
+            })
+        );
+        assert!(
+            im_delivered_payload("mock-im", &target, &enforced)
+                .get("detail")
+                .is_none()
+        );
     }
 }
