@@ -1,6 +1,6 @@
-# ADR-028: Exec waits are bounded per phase; abandonment is never silent; a budget stop is `interrupted`
+# ADR-030: Exec waits are bounded per phase; abandonment is never silent; a budget stop is `interrupted`
 
-- **Status**: proposed
+- **Status**: accepted (owner gate, 2026-11-15)
 - **Date**: 2026-11-15
 - **Context**: a delegated worker ran `hermes-agent` (a 23-minute external agent) through the
   synchronous `exec` tool with `timeout_ms: 3000000`. The call returned

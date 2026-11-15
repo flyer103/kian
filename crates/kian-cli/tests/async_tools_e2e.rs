@@ -289,7 +289,7 @@ async fn boot(
     boot_with_bound(tag, worker_script, gate_at, 20_000).await
 }
 
-/// Same boot with an explicit dispatch bound (ADR-028's execution phase needs
+/// Same boot with an explicit dispatch bound (ADR-030's execution phase needs
 /// the dispatch wait to expire while the worker is still executing).
 async fn boot_with_bound(
     tag: &str,
@@ -581,7 +581,7 @@ async fn start_returns_fast_steer_interleaves_and_completion_lands() {
     let _ = (events, fx.dir);
 }
 
-/// ADR-028: a `start` job that outlives the *dispatch* wait still delivers its
+/// ADR-030: a `start` job that outlives the *dispatch* wait still delivers its
 /// real result. The observer takes the execution wait (bounded by the
 /// command's own `timeout_ms`) instead of giving up at `queue_timeout` and
 /// reporting an abandoned job honestly over work that was still running.

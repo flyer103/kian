@@ -87,7 +87,7 @@ impl ToolProvider for RemoteExecTool {
             let cmd = parsed?;
             let wait_bound_ms =
                 u64::try_from(backend.queue_timeout().as_millis()).unwrap_or(u64::MAX);
-            // ADR-028: the sync call's wait is the deployment's queue wait
+            // ADR-030: the sync call's wait is the deployment's queue wait
             // bound, never the command's `timeout_ms`. A `timeout_ms` above
             // it would be a promise this call cannot keep, so it is refused
             // before anything is enqueued — no row, no dispatch, no
@@ -122,7 +122,7 @@ impl ToolProvider for RemoteExecTool {
             // successes (constraint 7). The redaction provenance
             // report from the settlement pass rides the ToolResult; the
             // four legacy fields stay, and a wait expiry adds what it
-            // observed (ADR-028) so the model never has to guess whether
+            // observed (ADR-030) so the model never has to guess whether
             // the command is still running.
             let (value, is_error, redactions) = match backend
                 .exec_tracked_watched(

@@ -10,7 +10,7 @@
 //! deduped by command id at the row level).
 //!
 //! The caller's future resolves from the correlated result. How long it
-//! waits is per phase (ADR-028): the *dispatch* wait is `queue_timeout`, and
+//! waits is per phase (ADR-030): the *dispatch* wait is `queue_timeout`, and
 //! expiry there abandons the row (terminal — a later duplicate command id
 //! gets the same honest Timeout); the *execution* wait is the command's own
 //! kill bound, and expiry there never mutates the row — only the watcher
@@ -46,7 +46,7 @@ fn store_error(e: QueueStoreError) -> ExecError {
 
 type Waiter = oneshot::Sender<Result<CommandOutcome, ExecError>>;
 
-/// Which waits a caller takes over one durable queue row (ADR-028).
+/// Which waits a caller takes over one durable queue row (ADR-030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitPolicy {
     /// The synchronous `exec` tool: one *dispatch* wait, then abandon. A
@@ -59,7 +59,7 @@ pub enum WaitPolicy {
     Job,
 }
 
-/// What a queue row was doing when a wait expired (ADR-028). The value is
+/// What a queue row was doing when a wait expired (ADR-030). The value is
 /// observed, never guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpiredRow {
@@ -91,7 +91,7 @@ impl ExpiredRow {
 }
 
 /// A watched wait's failures: the seam's own failures plus the honest
-/// timeout that carries what the row was doing (ADR-028).
+/// timeout that carries what the row was doing (ADR-030).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecWaitError {
     /// The wait bound expired. `row` says what was observed; `bound_ms` is
@@ -105,7 +105,7 @@ pub enum ExecWaitError {
 
 impl ExecWaitError {
     /// Collapses onto the seam's error shape: a timeout is the seam's
-    /// honest [`ExecError::Timeout`], so pre-ADR-028 callers stay identical.
+    /// honest [`ExecError::Timeout`], so pre-ADR-030 callers stay identical.
     #[must_use]
     pub fn into_exec_error(self) -> ExecError {
         match self {
@@ -115,7 +115,7 @@ impl ExecWaitError {
     }
 }
 
-/// The execution wait bound for one command (ADR-028):
+/// The execution wait bound for one command (ADR-030):
 /// `2 * exec_bound + queue_timeout` — one dispatch, one at-least-once
 /// re-dispatch, and one dispatch-wait of slack.
 fn execution_bound(dispatch_bound: Duration, exec_bound_ms: Option<u64>) -> Duration {
@@ -598,7 +598,7 @@ impl RemoteExecBackend {
     }
 
     /// Enqueue-first tracked execution with an explicit wait policy
-    /// (ADR-028). [`WaitPolicy::Caller`] keeps the historical single
+    /// (ADR-030). [`WaitPolicy::Caller`] keeps the historical single
     /// dispatch wait; [`WaitPolicy::Job`] adds the execution wait bounded by
     /// the command's own worker-side `timeout_ms` and never mutates the row.
     pub async fn exec_tracked_watched(
@@ -646,7 +646,7 @@ impl RemoteExecBackend {
 
     /// The shared enqueue → park → correlate path for both command
     /// families. `policy` decides how long the caller waits after the row
-    /// stops being `pending` (ADR-028); the enqueue half is identical.
+    /// stops being `pending` (ADR-030); the enqueue half is identical.
     async fn tracked(
         &self,
         command_id: CommandId,

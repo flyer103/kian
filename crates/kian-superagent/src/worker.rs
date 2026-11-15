@@ -902,7 +902,7 @@ fn event_thread_id(ev: &Event) -> Option<Uuid> {
     Uuid::parse_str(raw).ok()
 }
 
-/// The `(status, summary)` one worker outcome reports (ADR-028).
+/// The `(status, summary)` one worker outcome reports (ADR-030).
 ///
 /// The loop's only intentional-stop producer is iteration-budget exhaustion,
 /// where the last assistant turn is by construction a pending tool call with
@@ -2174,7 +2174,7 @@ mod tests {
     // Completion summary
     // ------------------------------------------------------------------
 
-    /// ADR-028: a budget stop is `interrupted` with its reason as the
+    /// ADR-030: a budget stop is `interrupted` with its reason as the
     /// summary — never `completed` over a pending tool call with no text.
     #[test]
     fn a_budget_stop_reports_interrupted_with_its_reason() {

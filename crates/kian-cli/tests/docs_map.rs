@@ -102,7 +102,7 @@ fn every_authored_doc_link_resolves() {
 /// The ADR series is append-only and contiguous (no gaps that would
 /// silently break cross-references like "see ADR-006").
 #[test]
-fn adr_series_is_contiguous_from_001() {
+fn adr_series_is_contiguous_from_001_and_unique() {
     let root = repo_root();
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     for entry in std::fs::read_dir(root.join("design/decisions")).expect("decisions dir") {
@@ -113,7 +113,14 @@ fn adr_series_is_contiguous_from_001() {
             .and_then(|r| r.split('-').next())
             .and_then(|n| n.parse::<u32>().ok())
         {
-            seen.insert(n);
+            // Append-only numbering: a second file claiming a taken number is
+            // a merge-order accident (two branches mint the same ADR in
+            // parallel), and it silently makes every prose reference
+            // ambiguous — so the series is also unique.
+            assert!(
+                seen.insert(n),
+                "ADR-{n:03} is claimed by more than one file; the next ADR takes the next free number"
+            );
         }
     }
     assert!(!seen.is_empty(), "no ADRs found");

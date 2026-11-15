@@ -1359,7 +1359,7 @@ state; both are isolated from the resident-budget change on a separate branch.
   TTL across a real WeChat restart and a live post-restart cold catalog are unverified until this
   branch is deployed.
 
-## 2026-11-15 — per-phase exec waits + honest timeout result + budget stop is `interrupted` (ADR-028)
+## 2026-11-15 — per-phase exec waits + honest timeout result + budget stop is `interrupted` (ADR-030)
 
 A delegated worker ran a 23-minute external agent through the synchronous `exec` tool with
 `timeout_ms: 3000000`. The call returned `{"error":"execution timed out"}` after exactly 60 s
@@ -1400,9 +1400,13 @@ the user saw 14 minutes of silence. The real result was discarded
   in this change: `thread_liveness` then still reads `Released` (worker reusable), and making the
   end reason `interrupted` would hold the worker until a designed resume/cancel exists — deferred
   to its own ADR.
-- **Docs** — new ADR-028; WORKER-MODEL §4 rewritten (the old bullet claimed `queue_timeout` was a
+- **Docs** — new ADR-030; WORKER-MODEL §4 rewritten (the old bullet claimed `queue_timeout` was a
   "bound on an absent worker" while the code also bounded running commands); DESIGN crate map
-  updated. No EVENT-MODEL/API-CONTRACT change: `tool/result.output` is opaque JSON and no wire or
+  updated. The record was minted as ADR-028 and renumbered to ADR-030 on merge: the
+  harness-hook plugin record that landed in parallel (R13) already held 028, so the series had
+  two claimants. `docs_map` now also asserts ADR numbers are **unique**
+  (`adr_series_is_contiguous_from_001_and_unique`) — contiguity alone never caught it.
+  No EVENT-MODEL/API-CONTRACT change: `tool/result.output` is opaque JSON and no wire or
   event kind moved.
 - **Verified** — L1: `kian-exec/tests/async_tools.rs` `job_outliving_the_dispatch_wait_delivers_the_real_result`
   (a real `kian-endpoint` executor over TCP, a 1 s command under a 400 ms dispatch bound, real
