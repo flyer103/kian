@@ -856,14 +856,18 @@ graph LR
   dsh harness runs the loop inside the dsh child and never mounts the kian `exec` tool, so a recorded
   binding could not route anything (a claimed-but-unenforceable binding is the exact dishonesty this
   section's audit exists to prevent).
-- **Runtime membership — the directory, the routes and the runtime catalog** (ADR-021; semantics in
-  [`design/WORKER-MODEL.md`](WORKER-MODEL.md), wire in [`design/API-CONTRACT.md`](API-CONTRACT.md) §8).
-  Membership is **runtime, not configuration**: with a `workers:` section (`listen`, `token_env`,
-  `offline_after_ms`, `allow_public`) `kian serve` opens a **worker-dialed** KiandProto v1 registration
-  listener on a private address, outside `/rpc`/`/ops/rpc`/`/metrics` and gated by an env-only shared
-  token. A worker (`kiand --register-to …`) registers, and kian **reuses that connection as the
-  command channel** for its id — the route. Joining or leaving never touches `kian.yaml` and never
-  restarts the server.
+- **Runtime membership — the directory, the routes and the runtime catalog** (ADR-021, ADR-031;
+  semantics in [`design/WORKER-MODEL.md`](WORKER-MODEL.md), wire in
+  [`design/API-CONTRACT.md`](API-CONTRACT.md) §8). Membership is **runtime, not configuration**: with a
+  `workers:` section (`listen`, `offline_after_ms`, `allow_public`, `queue_timeout_ms`, and either a
+  shared `token_env` or per-worker `tokens`) `kian serve` opens a **worker-dialed** KiandProto v3
+  registration listener on a private address, outside
+  `/rpc`/`/ops/rpc`/`/metrics` and gated by env-only tokens. A worker (`kiand --register-to …`)
+  registers, and kian **reuses that connection as the command channel** for its id — the route.
+  Joining or leaving never touches `kian.yaml` and never restarts the server. Enrollment
+  (`workers.tokens` / `workers.enrolled_only`) is the exception: admitting a **new** enrolled id is a
+  config edit, because per-device credentials are a security boundary (ADR-031 D1); a non-strict
+  deployment keeps the shared-token runtime join/leave behavior.
   - **The directory is runtime state** (`kian-exec`: id → description, protocol version, connection
     generation, last-seen, observed peer address) and its state is *computed*, never stored: `online`
     means a live connection **and** a heartbeat inside `offline_after_ms`; `draining` is the teardown
@@ -891,8 +895,9 @@ graph LR
     stream is unchanged, and the known-id input is config ids ∪ the directory's ids, read through a
     bundle-owned read-only port (the `RecallPort` precedent; no `kian-core` seam).
   - **The catalog is queried, not rendered.** The Router gets a read-only `list_workers` tool
-    (id, description, `online|offline|draining`, live bound session/thread) and `spawn_worker` takes a
-    plain worker id; nothing about membership enters a prompt or a tool schema (§4.7). A spawn may
+    (id, description, `online|offline|draining`, the worker-declared `capabilities`, live bound
+    session/thread) and `spawn_worker` takes a plain worker id; nothing about membership enters a
+    prompt or a tool schema (§4.7). A spawn may
     bind a **known but offline** worker — the result and audit say `offline — commands will queue` —
     and an unknown id is refused naming the known ids. `kian workers [--json]` is the read-only
     operator view over the durable projection (id, state, bound session/thread; the worker's
@@ -1579,7 +1584,7 @@ graph TB
 | kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
-| kian-exec | KiandProto v2 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
+| kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
 | kian-memory | The memory bundle (MEMORY-MODEL Phases 1–2): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume, and the frozen creation-time index renderer `render_memory_index` (verified-only latest-per-subject fold, subject byte order, fixed "data, not instructions" header and excerpt cap, patterns-only default redaction with an explicit-redactor seam) turns the folded notes into the bounded index P2 injects; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `render_memory_index`, `eligible_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |

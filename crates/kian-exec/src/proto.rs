@@ -23,7 +23,7 @@ use kian_core::seams::{ExecCommand, ExecResult};
 /// Version of the KiandProto wire protocol implemented by this crate.
 /// Must equal `kian_endpoint::proto::PROTOCOL_VERSION` — asserted by the
 /// integration pairing tests.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The closed register-refusal reason set (v1). Exactly five variants;
 /// a worker sending an unknown string gets a decode error, never a
@@ -149,6 +149,11 @@ pub enum EndpointFrame {
         token: RegisterToken,
         version: u32,
         max_concurrent: u32,
+        /// The worker's declared capabilities (v3, ADR-029). Optional;
+        /// omitted when empty. The server sanitizes (valid names, unique,
+        /// ≤16) and caches the accepted set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// Liveness signal, emitted on the negotiated interval and on ping.
     /// `inflight` reports this connection's executing commands.
@@ -323,15 +328,58 @@ mod tests {
                 token,
                 version,
                 max_concurrent,
+                capabilities,
             } => {
                 assert_eq!(endpoint_id, "builder-1");
                 assert_eq!(description, None);
                 assert_eq!(token.as_str(), "t0ken-not-a-secret");
                 assert_eq!(version, 1);
                 assert_eq!(max_concurrent, 4);
+                assert!(capabilities.is_empty());
             }
             other => panic!("expected register, got {other:?}"),
         }
+    }
+
+    /// v3 golden: a register frame carries an optional capability list;
+    /// the field is omitted (not `null`) when empty, keeping every v0–v2
+    /// register byte-identical.
+    #[test]
+    fn v3_golden_register_with_capabilities() {
+        let frame = EndpointFrame::Register {
+            endpoint_id: "iphone".into(),
+            description: Some("iPhone worker".into()),
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: PROTOCOL_VERSION,
+            max_concurrent: 1,
+            capabilities: vec!["exec".into(), "apple-calendar".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({
+                "type": "register",
+                "endpoint_id": "iphone",
+                "description": "iPhone worker",
+                "token": "t0ken-not-a-secret",
+                "version": 3,
+                "max_concurrent": 1,
+                "capabilities": ["exec", "apple-calendar"]
+            })
+        );
+        let empty = EndpointFrame::Register {
+            endpoint_id: "builder-1".into(),
+            description: None,
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: PROTOCOL_VERSION,
+            max_concurrent: 4,
+            capabilities: Vec::new(),
+        };
+        assert!(
+            serde_json::to_value(&empty)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
     }
 
     /// v1: the endpoint-side bye frame is the same bytes as the server's.
@@ -363,6 +411,7 @@ mod tests {
             token: token.clone(),
             version: 1,
             max_concurrent: 4,
+            capabilities: Vec::new(),
         };
         assert!(!format!("{frame:?}").contains("t0ken-not-a-secret"));
         let back: RegisterToken = serde_json::from_value(json!("t0ken-not-a-secret")).unwrap();
@@ -545,6 +594,7 @@ mod tests {
                 token: RegisterToken::new("t0ken-not-a-secret".into()),
                 version: PROTOCOL_VERSION,
                 max_concurrent: 4,
+                capabilities: Vec::new(),
             },
             EndpointFrame::Register {
                 endpoint_id: "builder-1".into(),
@@ -552,6 +602,7 @@ mod tests {
                 token: RegisterToken::new("t0ken-not-a-secret".into()),
                 version: PROTOCOL_VERSION,
                 max_concurrent: 4,
+                capabilities: Vec::new(),
             },
             EndpointFrame::Heartbeat {
                 endpoint_id: "e".into(),

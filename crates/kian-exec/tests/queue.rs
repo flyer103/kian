@@ -560,9 +560,10 @@ async fn slow_remote_command_never_blocks_the_runtime() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// ADR-025: the last-declared description/version survives a restart on
-/// the registry projection; heartbeat upserts preserve it, and a later
-/// declaration without a description clears the cached text.
+/// ADR-025/ADR-029: the last-declared description/version/capabilities
+/// survive a restart on the registry projection; heartbeat upserts
+/// preserve them, and a later declaration without them clears the cached
+/// values.
 #[tokio::test]
 async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
     let db = temp_db();
@@ -575,6 +576,7 @@ async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
             "online",
             Some("linux builder"),
             2,
+            &["exec".into(), "apple-calendar".into()],
         )
         .await
         .unwrap();
@@ -591,6 +593,7 @@ async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
         .unwrap();
     assert_eq!(row.description.as_deref(), Some("linux builder"));
     assert_eq!(row.protocol_version, Some(2));
+    assert_eq!(row.capabilities, vec!["exec", "apple-calendar"]);
     store.close().await;
 
     let store = ExecStore::open(&db).await.unwrap();
@@ -603,9 +606,18 @@ async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
         .unwrap();
     assert_eq!(row.description.as_deref(), Some("linux builder"));
     assert_eq!(row.protocol_version, Some(2));
+    assert_eq!(row.capabilities, vec!["exec", "apple-calendar"]);
 
     store
-        .upsert_endpoint_with_declaration("builder-1", "127.0.0.1:50001", 30, "online", None, 3)
+        .upsert_endpoint_with_declaration(
+            "builder-1",
+            "127.0.0.1:50001",
+            30,
+            "online",
+            None,
+            3,
+            &[],
+        )
         .await
         .unwrap();
     let row = store
@@ -617,6 +629,7 @@ async fn registry_last_declaration_survives_reopen_and_heartbeat_keeps_it() {
         .unwrap();
     assert_eq!(row.description, None);
     assert_eq!(row.protocol_version, Some(3));
+    assert!(row.capabilities.is_empty(), "latest declaration clears");
     store.close().await;
     let _ = std::fs::remove_file(&db);
 }

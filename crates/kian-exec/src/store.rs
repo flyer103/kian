@@ -297,6 +297,10 @@ pub struct EndpointRegistryRow {
     /// The worker's last-declared protocol revision (ADR-025), cached for
     /// the cold-start catalog. `None` for ids known only from config.
     pub protocol_version: Option<u32>,
+    /// The worker's last-declared **sanitized** capability list (v3,
+    /// ADR-029), cached for the cold-start catalog. Empty means the latest
+    /// declaration omitted it (or no declaration has happened yet).
+    pub capabilities: Vec<String>,
 }
 
 /// Wall-clock milliseconds since the unix epoch (i64, matching the store's
@@ -383,6 +387,15 @@ const V4_REGISTRY_DECLARATION: Migration = Migration {
     up: "ALTER TABLE endpoint_registry ADD COLUMN description TEXT;\nALTER TABLE endpoint_registry ADD COLUMN protocol_version INTEGER",
 };
 
+/// v5 — the worker-declared capability cache (KiandProto v3, ADR-029):
+/// the sanitized list is JSON text on the existing registry projection.
+/// Additive nullable column; a pre-v5 row reads as "no declaration".
+const V5_REGISTRY_CAPABILITIES: Migration = Migration {
+    version: 5,
+    name: "v5_registry_capabilities",
+    up: "ALTER TABLE endpoint_registry ADD COLUMN capabilities TEXT",
+};
+
 /// The registered adjacent sqlite chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
@@ -392,6 +405,7 @@ pub fn chain() -> &'static [Migration] {
         V2_QUEUE_ROW_LEASES,
         V3_EXEC_QUEUE_KIND,
         V4_REGISTRY_DECLARATION,
+        V5_REGISTRY_CAPABILITIES,
     ]
 }
 
@@ -435,6 +449,14 @@ const PG_V4_REGISTRY_DECLARATION: Migration = Migration {
     up: "ALTER TABLE endpoint_registry ADD COLUMN description TEXT;\nALTER TABLE endpoint_registry ADD COLUMN protocol_version BIGINT",
 };
 
+/// v5 (postgres chain) — the capability cache, pg DDL. Same version and
+/// name as the sqlite v5.
+const PG_V5_REGISTRY_CAPABILITIES: Migration = Migration {
+    version: 5,
+    name: "v5_registry_capabilities",
+    up: "ALTER TABLE endpoint_registry ADD COLUMN capabilities TEXT",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] (enforced by `pg_chain_mirrors_sqlite_chain_versions_and_names`).
 pub fn pg_chain() -> &'static [Migration] {
@@ -444,6 +466,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V2_QUEUE_ROW_LEASES,
         PG_V3_EXEC_QUEUE_KIND,
         PG_V4_REGISTRY_DECLARATION,
+        PG_V5_REGISTRY_CAPABILITIES,
     ]
 }
 
@@ -898,10 +921,12 @@ impl ExecStore {
     }
 
     /// Upserts the registry row **with the worker's last declaration**
-    /// (ADR-025). Called on a successful registration before the route is
-    /// attached; the declaration columns are overwritten by every
-    /// registration (a registration that omits the description clears the
-    /// cached one). Heartbeat/detach upserts never touch these columns.
+    /// (ADR-025/ADR-029: description, protocol version, capabilities).
+    /// Called on a successful registration before the route is attached;
+    /// the declaration columns are overwritten by every registration (a
+    /// registration that omits a declaration clears the cached value).
+    /// Heartbeat/detach upserts never touch these columns.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_endpoint_with_declaration(
         &self,
         endpoint_id: &str,
@@ -910,6 +935,7 @@ impl ExecStore {
         state: &str,
         description: Option<&str>,
         protocol_version: u32,
+        capabilities: &[String],
     ) -> Result<(), QueueStoreError> {
         match self {
             Self::Sqlite(pool) => {
@@ -921,6 +947,7 @@ impl ExecStore {
                     state,
                     description,
                     protocol_version,
+                    capabilities,
                 )
                 .await?
             }
@@ -933,6 +960,7 @@ impl ExecStore {
                     state,
                     description,
                     protocol_version,
+                    capabilities,
                 )
                 .await?
             }

@@ -76,6 +76,9 @@ pub struct Flags {
     pub description: Option<String>,
     pub token_env: Option<String>,
     pub workspace_root: Option<String>,
+    /// Repeatable `--capability` (v3). The list is validated at startup
+    /// and sent in the register frame; an empty list omits the wire key.
+    pub capabilities: Vec<String>,
 }
 
 /// The `kiand.yaml` document: every key optional, unknown keys rejected.
@@ -91,6 +94,8 @@ pub struct FileConfig {
     pub description: Option<String>,
     pub token_env: Option<String>,
     pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// The resolved daemon configuration.
@@ -110,6 +115,10 @@ pub struct Config {
     /// Root the v2 filesystem commands resolve under (ADR-023). Validated
     /// to exist and be a directory at startup.
     pub workspace_root: String,
+    /// Declared capabilities (v3, ADR-029): lowercase `[a-z0-9._-]`,
+    /// 1..=64 bytes, at most 16, unique. Refuse startup on a bad entry so
+    /// the worker never sends a declaration the server would sanitize.
+    pub capabilities: Vec<String>,
 }
 
 impl Config {
@@ -187,6 +196,11 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         .or_else(|| env_get(ENV_WORKSPACE_ROOT))
         .or_else(|| file.as_ref().and_then(|f| f.workspace_root.clone()))
         .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_string());
+    let mut capabilities = file
+        .as_ref()
+        .map(|f| f.capabilities.clone())
+        .unwrap_or_default();
+    capabilities.extend(flags.capabilities.clone());
 
     let config = Config {
         endpoint_id,
@@ -198,6 +212,7 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         description,
         token_env,
         workspace_root,
+        capabilities,
     };
     validate(config)
 }
@@ -297,6 +312,27 @@ fn validate(config: Config) -> Result<Config, ConfigError> {
         return Err(ConfigError::Invalid(
             "token_env must name a non-empty environment variable".into(),
         ));
+    }
+    if config.capabilities.len() > kian_core::worker::MAX_CAPABILITIES {
+        return Err(ConfigError::Invalid(format!(
+            "capabilities: at most {} entries are allowed",
+            kian_core::worker::MAX_CAPABILITIES
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for capability in &config.capabilities {
+        if capability.trim() != capability || !kian_core::worker::valid_capability_name(capability)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "capability `{capability}` is not a valid name \
+                 (lowercase [a-z0-9._-], 1..=64 bytes, no surrounding whitespace)"
+            )));
+        }
+        if !seen.insert(capability.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "capability `{capability}` is declared more than once"
+            )));
+        }
     }
     // Register mode (spec §2.3): the worker validates its own identity
     // and description shape at startup, so a malformed identity never
@@ -516,6 +552,55 @@ mod tests {
         );
         assert_eq!(config.description.as_deref(), Some("build box"));
         assert_eq!(config.token_env, DEFAULT_TOKEN_ENV);
+    }
+
+    #[test]
+    fn capabilities_resolve_and_validate_fail_closed() {
+        let config = resolve(
+            no_env(),
+            Flags {
+                register_to: Some("127.0.0.1:9920".into()),
+                capabilities: vec!["exec".into(), "apple-calendar".into()],
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.capabilities, vec!["exec", "apple-calendar"]);
+
+        for (capability, needle) in [
+            ("Exec", "not a valid name"),
+            (" apple", "not a valid name"),
+            ("a b", "not a valid name"),
+        ] {
+            let err = resolve(
+                no_env(),
+                Flags {
+                    capabilities: vec![capability.into()],
+                    ..Flags::default()
+                },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "{capability}: {err}");
+        }
+        let err = resolve(
+            no_env(),
+            Flags {
+                capabilities: vec!["exec".into(), "exec".into()],
+                ..Flags::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than once"), "was: {err}");
+        let too_many: Vec<String> = (0..17).map(|i| format!("cap-{i}")).collect();
+        let err = resolve(
+            no_env(),
+            Flags {
+                capabilities: too_many,
+                ..Flags::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most 16"), "was: {err}");
     }
 
     #[test]

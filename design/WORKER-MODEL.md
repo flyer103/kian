@@ -26,7 +26,7 @@
 | Crate placement, assembly, config surface, CLI verb shape | [DESIGN](DESIGN.md) §4.3/§4.7 |
 
 This contract introduces **no** new event kind, **no** new table, **no** new HTTP route, **no** new
-ops method, and **no** new metrics key. It fixes one wire version bump (KiandProto v1, owned by
+ops method, and **no** new metrics key. It fixes one wire version (KiandProto v3, owned by
 API-CONTRACT §8) and one additive config section (`workers:`).
 
 ```mermaid
@@ -66,6 +66,14 @@ graph LR
 - **Static worker / dynamic worker** — a static worker is a pinned `endpoints:` entry (kian dials it;
   its description is config-owned); a dynamic worker is one that registered itself over the
   registration listener.
+- **Enrolled worker** — a dynamic id listed in `workers.tokens`; it authenticates with its own
+  token, and a listed id never accepts the shared token. With `workers.enrolled_only: true` the
+  enrollment map is the complete admission set ([ADR-031](decisions/ADR-031-worker-enrollment.md)).
+- **Capability declaration** — the optional `capabilities` list a worker sends in `register`
+  (v3, [ADR-032](decisions/ADR-032-worker-declared-capabilities.md)). The server sanitizes it and
+  caches the accepted list on the registry (migration v5); `list_workers` and `kian workers`
+  surface the live declaration or the cached one. It never enters a prompt, a tool schema or the
+  event stream.
 - **Drain holder** — the single process permitted to run a session's drain (ADR-009). Not a worker
   fact; listed here only because "1:1" and "no split brain" are different rules.
 
@@ -143,9 +151,13 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   no "any online worker", no local-exec substitution for a bound session.
 - **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being
   waited on, never by one knob for both:
-  - *Dispatch wait* — the row is `pending`: no route has taken it. `queue_timeout` (per static
-    endpoint; the backend-level maximum for dynamic workers) is the bound on an absent worker;
-    expiry marks the row `abandoned`, which is honest because nothing ran.
+  - *Dispatch wait* — the row is `pending`: no route has taken it. `queue_timeout` is the bound on
+    an absent worker: the backend takes one value — the max over static
+    `endpoints[].queue_timeout_ms` and `workers.queue_timeout_ms`
+    ([ADR-031](decisions/ADR-031-worker-enrollment.md) D3). Expiry marks the row `abandoned`, which
+    is honest because nothing ran. The bound is global by construction: raising it for an
+    intermittent device also lengthens every queued command's dispatch wait and shifts the
+    execution bound below by the same amount.
   - *Execution wait* — the row is `inflight`: a worker is executing it. The command's own
     `timeout_ms` (the worker-side kill bound) is what bounds it, so the wait bound is
     `2 * exec_bound + queue_timeout` (`exec_bound = timeout_ms`, or `queue_timeout` when absent) —
@@ -180,11 +192,12 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 - **The catalog is runtime data.** It is static config ids ∪ every id the registry has ever seen. It
   is **not** configuration-only and **not** prompt content.
 - **`list_workers`** (Router-only, read-only, no arguments) returns the live catalog: id, optional
-  description, state (`online`/`offline`/`draining`), and the live bound session/thread when one
-  exists. A registry-only id's description/version come from the last-declared cache and the row
-  carries additive `"declaration_stale": true` (ADR-025); a live registration's row omits the flag
-  and is byte-identical to the pre-cache result. Rows are ordered by id. It writes nothing — no
-  event, no row, no wake.
+  description, state (`online`/`offline`/`draining`), the worker-declared `capabilities` array when
+  non-empty (ADR-032), and the live bound session/thread when one exists. A registry-only id's
+  description/version/capabilities come from the last-declared cache and the row carries additive
+  `"declaration_stale": true` (ADR-025/ADR-032); a live registration's row omits the flag and is
+  byte-identical to the pre-cache result. An id with an empty declaration omits the field. Rows
+  are ordered by id. It writes nothing — no event, no row, no wake.
 - **Spawn validation order** (every refusal precedes every side effect): argument shape → feature off
   (nothing configured) → unknown id (refusal names the known ids) → 1:1 busy (names the owning session
   and thread) → offline-known allowed (with the queue note) → follow-up ownership → speculation cap →
@@ -192,9 +205,10 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 - **Prompt/schema stability.** The `spawn_worker` schema and the judge prompt contain **no** membership
   data: `exec_worker` is a plain non-empty string (required whenever membership is on, never an enum),
   and the prompt carries one frozen instruction line telling the model to call `list_workers` and
-  never invent an id. A join or leave therefore changes no prefix byte. New sessions pin a new
-  `superagent.policy.version` when the text changes; live sessions keep their persisted prompts and
-  the drift machinery reports the mismatch instead of rewriting them.
+  never invent an id. A join, a leave or a capability-catalog edit therefore changes no prefix byte
+  (capabilities are result-only). New sessions pin a new `superagent.policy.version` when the text
+  changes; live sessions keep their persisted prompts and the drift machinery reports the mismatch
+  instead of rewriting them.
 
 ## 6. Security boundary
 
@@ -202,17 +216,19 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   `100.64.0.0/10` or IPv6 ULA. A wildcard or public bind refuses startup unless
   `workers.allow_public: true` is set explicitly; no doc example sets it. Reaching a private listener
   from another machine is SSH tunnel or Tailscale/WireGuard — never a published port.
-- **Env-only shared token.** `workers.token_env` names an environment variable; the listener refuses
-  to start if it is absent or blank. The value is compared constant-time, never written to config,
-  argv, logs, events, error text or metrics, and is held in a redacting type so an accidental
-  `{:?}` cannot print it. Failed attempts are bounded (one per connection; a per-peer window bound),
-  and every refusal is audited without secret material.
-- **Recorded limitation: a shared token is not per-worker identity.** Any token holder may register
-  under any id, including an id in active use — which would replace that worker's connection and
-  re-drive its commands on the attacker's machine. This is acceptable only for the single-operator
-  R12 deployment where the transport (SSH/Tailscale) already authenticates the *user*, and the token
-  closes the same-host hole. **mTLS / per-worker identity is the R13 fix** and a prerequisite for any
-  hosted or multi-tenant use.
+- **Env-only tokens.** `workers.token_env` names the shared token's environment variable;
+  `workers.tokens` maps an id to its own variable name. The listener refuses to start when a named
+  variable is absent or blank. Values are compared constant-time, never written to config, argv,
+  logs, events, error text or metrics, and are held in a redacting type so an accidental `{:?}`
+  cannot print them. Failed attempts are bounded (one per connection; a per-peer window bound), and
+  every refusal is audited without secret material.
+- **Enrollment narrows the shared-token limitation.** A listed id authenticates only with its own
+  token: the shared token cannot replace it. With `workers.enrolled_only: true` (requires a
+  non-empty enrollment map and forbids `token_env`) only listed ids are admitted at all. In hybrid
+  mode (both configured) an unlisted id still falls back to the shared token — the R12 limitation
+  **narrows, it does not disappear**. **mTLS / per-worker certificates is the R13 fix** and remains
+  a prerequisite for any hosted or multi-tenant use; per-worker bearer tokens are not a substitute
+  ([ADR-031](decisions/ADR-031-worker-enrollment.md)).
 - **No new inbound HTTP surface.** The listener is the KiandProto socket, not an HTTP route; `/rpc`,
   `/ops/rpc` and `/metrics` keep their existing (unauthenticated, deployment-bounded) posture. A
   worker never gets control-plane access.
@@ -223,9 +239,11 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 
 ## 7. Version and upgrade policy
 
-- **KiandProto v2.** `PROTOCOL_VERSION = 2` in both halves (`kian-exec`, `kian-endpoint`), declared
+- **KiandProto v3.** `PROTOCOL_VERSION = 3` in both halves (`kian-exec`, `kian-endpoint`), declared
   independently and pinned by dual goldens in the same change; frames (exec + the v2 filesystem
-  pair) and the closed rejection reason set live in [API-CONTRACT](API-CONTRACT.md) §8.
+  pair + the v3 optional `register.capabilities` field) and the closed rejection reason set live in
+  [API-CONTRACT](API-CONTRACT.md) §8. ADR-031's enrollment and queue-bound parts are config-only
+  (no wire change); its D2 config catalog is superseded by ADR-032's worker declaration.
 - **Upgrade order: kian first, workers second.** During the window a v0 static endpoint is refused
   with a typed terminal version error plus one audit line (its route stays offline; never a fake
   connect); a v0 worker — which has no register mode at all — simply never registers and reads
@@ -249,7 +267,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 | Duplicate id vs static pin | registration | refused and audited; static pin unchanged | that id only |
 | Malformed registration payload | validation | refused (`id_conflict`) or the description is dropped with an audit line; no state change | that connection |
 | Version mismatch | handshake | typed refusal + audit; connection closed; no state change | that worker |
-| Bad/absent token | comparison | typed refusal + audit, one attempt per connection, per-peer bound, rate-limited closes beyond the window | that peer |
+| Bad/absent token, or an unlisted id in strict mode | comparison | typed `bad_token` refusal + audit, one attempt per connection, per-peer bound, rate-limited closes beyond the window; strict mode does not reveal whether the id is enrolled | that peer |
 | Listener configured but token env unset/blank | startup validation | the whole `serve` process refuses to start | whole process (configured capability) |
 | Public/non-private bind without `allow_public` | startup validation | the whole `serve` process refuses to start | whole process |
 | Kian crash / restart | process start | directory empty, registry rows stale ⇒ every worker reads offline; the last-declared cache keeps the description/version (flagged stale) for registry-only ids; bindings rebuild from streams; rows re-drive | all workers, transiently |
@@ -271,8 +289,17 @@ seam.
   back reattaches to its binding. A permanently lost worker ends in the honest timeout. The rebind
   design (durable intent, fencing for the old worker's queued rows, a seq-range projection rule) is
   recorded in ADR-020 §Deferred and ADR-021 §Deferred and is an owner gate, not a spec detail.
-- **No mTLS, no per-worker identity, no token rotation without restart** (R13).
+- **No mTLS and no per-worker certificates; no token rotation without restart.** Per-worker bearer
+  tokens (ADR-031) narrow the shared-token hole but are not an identity proof; the R13 fix remains
+  mTLS. Rotation today is "set a new env value and restart".
 - **No worker pools**: 1:1 stays.
+- **Capabilities are declarations, not authority.** The worker declares them in `register` (v3);
+  the server sanitizes (lowercase `[a-z0-9._-]`, ≤16, unique) and caches the accepted list. A
+  wrong or stale entry misleads selection; it grants nothing. Capability-based spawn validation and
+  enforcement are out of scope. Static pins have no declaration in this phase (`hello` unchanged);
+  their catalog row omits the field.
+- **No per-id queue timeout, rebind or failover.** The dynamic bound (`workers.queue_timeout_ms`)
+  is one backend-level value; the ADR-020 deferred machinery is unchanged.
 - **The worker fs surface is the three text tools** (`fs_list`/`fs_read`/`fs_write`, 1 MiB bounds,
   `--workspace-root`, lexical `..` guard; [ADR-023](decisions/ADR-023-worker-fs-tools.md)). Binary
   bodies, streaming/large files, `fs_edit`/glob, a symlink-proof sandbox and fs tools on the Router
@@ -281,7 +308,8 @@ seam.
   cache is non-authoritative: the live directory wins, a cached row is labeled `declaration_stale`,
   and no membership decision (identity, state, bindability, routing, spawn legality) reads it.
 - **No public listener**; no hosted multi-tenant concerns.
-- **No new event kind, table, migration, HTTP route or ops method.**
+- **No new event kind, table, HTTP route or ops method.** One additive registry-column migration
+  (v5, the capability cache) is part of ADR-032.
 - Deployment (Vultr, WeChat) remains the owner's later discussion.
 
 ## 10. UNVERIFIED (must stay visible)
@@ -295,7 +323,15 @@ seam.
   not tested. Only loopback legs run in CI.
 - Per-spawn cost (directory snapshot + registry read) is unmeasured; small scale is assumed.
 - The shared-token impersonation limitation is a design fact, not a tested behaviour: the tests can
-  only assert that no *other* identity channel exists.
+  only assert that no *other* identity channel exists. Per-worker tokens and strict enrollment are
+  tested over real loopback TCP (accept/refuse matrix) and config validation; token rotation,
+  leak revocation and a real multi-device deployment are unverified.
+- The capability declaration is worker-supplied and tested through `register` → the directory →
+  `list_workers`/`kian workers` (sanitization, live view, cached view). Drift between the declared
+  list and the worker's actual build is undetected by construction (a declaration is not an
+  execution proof), and there is no L3 evidence.
+- The global `workers.queue_timeout_ms` trade-off is documented, not measured: no test exercises a
+  phone-length bound against a static worker's timeout expectation.
 - No L3 (real deployment) evidence exists for this contract.
 - The v1 → v2 upgrade window has not been exercised with a real old worker binary in this round; the
   typed refusal is L1 and the queue's legacy-row decode is tested, but the cross-version deployment
@@ -307,6 +343,7 @@ seam.
 |---|---|---|
 | Membership semantics (lifecycle, states, pruning, bind policy) | **yes** | `design/WORKER-MODEL.md` first; then code + tests; ADR if the *why* changes |
 | A wire frame/field/error/reason, `PROTOCOL_VERSION` | no — [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 | both halves' goldens, SDK fixtures if any, this file's §7 pointer if the policy changes |
+| A `workers:` config field (`tokens`, `enrolled_only`, `queue_timeout_ms`) | **yes** — this file | `kian-cli` config validation + assembly, `list_workers`/`kian workers` surfaces, ADR when the security or timeout *why* changes |
 | An event payload key (`exec_worker`, `thread/started`) | no — [EVENT-MODEL](EVENT-MODEL.md) §3/§4.2 | code, tests, DESIGN §4.1 |
 | The worker command families (exec, fs) / dispatch semantics | **yes** — this file | API-CONTRACT §8 for frames; code + L2 tests; ADR when the family set changes |
 | A durable registry column / last-declared cache change | **yes** — this file | ADR + kian-exec migration; code + store tests; `list_workers`/CLI surfaces |

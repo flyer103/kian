@@ -1432,6 +1432,12 @@ impl RouterTools {
                 if let Some(description) = &view.description {
                     row["description"] = json!(description);
                 }
+                if !view.capabilities.is_empty() {
+                    // The worker-declared, sanitized list (v3, ADR-029),
+                    // live or cached. A result-only field — never a
+                    // prompt or a schema byte.
+                    row["capabilities"] = json!(view.capabilities);
+                }
                 if view.declaration_stale {
                     // ADR-025: the description/version are the durable
                     // last declaration, not this process's live facts.
@@ -4196,6 +4202,7 @@ mod tests {
                 id: id.to_string(),
                 description: None,
                 version: Some(1),
+                capabilities: Vec::new(),
                 declaration_stale: false,
                 state,
                 last_seen_ms: 0,

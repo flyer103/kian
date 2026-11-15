@@ -449,6 +449,7 @@ impl StoreWorkerDirectory {
                     id: row.endpoint_id.clone(),
                     description: row.description.clone(),
                     version: row.protocol_version,
+                    capabilities: row.capabilities,
                     declaration_stale: true,
                     state,
                     last_seen_ms: row.last_heartbeat_ms,
@@ -464,12 +465,14 @@ impl StoreWorkerDirectory {
                 kian_exec::MemberState::Draining => kian_superagent::MemberState::Draining,
                 kian_exec::MemberState::Offline => kian_superagent::MemberState::Offline,
             };
+            let capabilities = member.capabilities;
             views.insert(
                 id.clone(),
                 kian_superagent::MemberView {
                     id,
                     description: member.description,
                     version: Some(member.version),
+                    capabilities,
                     declaration_stale: false,
                     state,
                     last_seen_ms: member.last_seen_ms,
@@ -491,6 +494,7 @@ impl StoreWorkerDirectory {
                     id: ep.id.clone(),
                     description: ep.description.clone(),
                     version: None,
+                    capabilities: Vec::new(),
                     declaration_stale: false,
                     state: kian_superagent::MemberState::Offline,
                     last_seen_ms: 0,

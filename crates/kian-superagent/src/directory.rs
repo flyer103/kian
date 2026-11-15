@@ -67,6 +67,11 @@ pub struct MemberView {
     /// The worker's declared protocol revision — `None` when only the
     /// durable registry row knows the id.
     pub version: Option<u32>,
+    /// The worker-declared, sanitized capability list (v3, ADR-029):
+    /// live for a connected member, the last-declared cache for a
+    /// registry-only id. Empty when the latest declaration omitted it
+    /// (or for a static pin, which has no declaration in v3).
+    pub capabilities: Vec<String>,
     /// `true` when `description`/`version` come from the durable
     /// last-declared cache (the worker is not connected this process
     /// lifetime) — ADR-025. Live directory facts are always `false`.

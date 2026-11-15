@@ -70,6 +70,17 @@ async fn start_listener(
 ) {
     let config = RegistrationConfig::new("127.0.0.1:0".parse().unwrap(), worker_token(), 30_000)
         .with_static_ids(static_ids);
+    start_configured(config, clock).await
+}
+
+async fn start_configured(
+    config: RegistrationConfig,
+    clock: Arc<dyn Clock>,
+) -> (
+    Arc<RegistrationListener>,
+    Arc<RecSink>,
+    std::net::SocketAddr,
+) {
     let sink = Arc::new(RecSink::default());
     let listener = Arc::new(RegistrationListener::new(
         config,
@@ -96,6 +107,7 @@ fn info(id: &str, token: &str) -> RegisterInfo {
         endpoint_id: id.into(),
         description: Some("linux builder".into()),
         token: RegisterToken::new(token.into()),
+        capabilities: Vec::new(),
     }
 }
 
@@ -262,6 +274,149 @@ async fn bad_token_refused() {
     );
 }
 
+/// Per-worker tokens: an enrolled id authenticates only with its own
+/// token, so a token holder for another id cannot replace it. Strict
+/// mode also refuses an unlisted id even when it presents a valid token
+/// for a listed one.
+#[tokio::test]
+async fn per_worker_tokens_bind_id_to_token() {
+    let config = RegistrationConfig::with_worker_tokens(
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        std::collections::BTreeMap::from([
+            ("iphone".into(), WorkerToken::new("iphone-secret".into())),
+            ("build".into(), WorkerToken::new("build-secret".into())),
+        ]),
+        true,
+        30_000,
+    );
+    let (_listener, sink, addr) = start_configured(config, Arc::new(SystemClock)).await;
+    // build's token presented for iphone → bad_token.
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let err = connect_registered(endpoint(), info("iphone", "build-secret"), addr, shutdown)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        kian_endpoint::EndpointError::RegisterRejected {
+            reason: kian_endpoint::RefusalReason::BadToken,
+            ..
+        }
+    ));
+    // An unlisted id is refused in strict mode, even with a valid
+    // enrolled token.
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let err = connect_registered(endpoint(), info("other", "iphone-secret"), addr, shutdown)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        kian_endpoint::EndpointError::RegisterRejected {
+            reason: kian_endpoint::RefusalReason::BadToken,
+            ..
+        }
+    ));
+    // The enrolled id with its own token registers.
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let conn = tokio::spawn(connect_registered(
+        endpoint(),
+        info("iphone", "iphone-secret"),
+        addr,
+        shutdown,
+    ));
+    until("sink sees iphone", || {
+        sink.online
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == "iphone")
+    })
+    .await;
+    conn.abort();
+}
+
+/// Hybrid mode: an enrolled id rejects the shared token (the override
+/// wins), while an unlisted id still falls back to it — the documented
+/// narrowing of the shared-token limitation, not a full fix.
+#[tokio::test]
+async fn per_worker_tokens_override_but_shared_fallback_remains() {
+    let config = RegistrationConfig::with_worker_tokens(
+        "127.0.0.1:0".parse().unwrap(),
+        Some(WorkerToken::new("shared-secret".into())),
+        std::collections::BTreeMap::from([(
+            "iphone".into(),
+            WorkerToken::new("iphone-secret".into()),
+        )]),
+        false,
+        30_000,
+    );
+    let (_listener, sink, addr) = start_configured(config, Arc::new(SystemClock)).await;
+    // The shared token must not replace the enrolled id.
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let err = connect_registered(endpoint(), info("iphone", "shared-secret"), addr, shutdown)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        kian_endpoint::EndpointError::RegisterRejected {
+            reason: kian_endpoint::RefusalReason::BadToken,
+            ..
+        }
+    ));
+    // An unlisted id still uses the shared fallback.
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let conn = tokio::spawn(connect_registered(
+        endpoint(),
+        info("other", "shared-secret"),
+        addr,
+        shutdown,
+    ));
+    until("sink sees other", || {
+        sink.online
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == "other")
+    })
+    .await;
+    conn.abort();
+}
+
+/// v3: the server sanitizes a declaration (invalid alphabet, duplicates,
+/// over-limit) and records the accepted set on the live directory; the
+/// registration still succeeds (no new refusal reason for a bad list).
+#[tokio::test]
+async fn capabilities_are_sanitized_and_recorded() {
+    let (listener, sink, addr) = start_listener(vec![], Arc::new(SystemClock)).await;
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let mut info = info("iphone", TOKEN);
+    info.capabilities = vec![
+        "exec".into(),
+        "bad name".into(),
+        "exec".into(),
+        "apple-calendar".into(),
+        "UPPER".into(),
+    ];
+    let conn = tokio::spawn(connect_registered(endpoint(), info, addr, shutdown));
+    until("sink sees iphone", || {
+        sink.online
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == "iphone")
+    })
+    .await;
+    let member = listener
+        .snapshot()
+        .remove("iphone")
+        .expect("member recorded");
+    assert_eq!(
+        member.capabilities,
+        vec!["exec".to_string(), "apple-calendar".to_string()]
+    );
+    conn.abort();
+}
+
 /// A register announcing v0 → typed `version_mismatch` with the fixed
 /// detail template; never a crash, never a half connection.
 #[tokio::test]
@@ -279,7 +434,7 @@ async fn version_mismatch_refused_typed() {
     reader.read_line(&mut line).await.unwrap();
     assert_eq!(
         line.trim(),
-        "{\"type\":\"rejected\",\"reason\":\"version_mismatch\",\"detail\":\"server speaks KiandProto 2; worker announced 0\"}"
+        "{\"type\":\"rejected\",\"reason\":\"version_mismatch\",\"detail\":\"server speaks KiandProto 3; worker announced 0\"}"
     );
     // The connection is closed after the refusal — EOF follows.
     let mut trailing = String::new();
@@ -452,7 +607,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(
-                b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
+                b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":3,\"max_concurrent\":1}\n",
             )
             .await
             .unwrap();
@@ -468,7 +623,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":3,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -493,7 +648,7 @@ async fn rate_bound_closes_sixth_attempt_without_reading() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":2,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"bad\",\"token\":\"wrong\",\"version\":3,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -515,6 +670,7 @@ async fn invalid_description_dropped_registration_kept() {
         endpoint_id: "builder-1".into(),
         description: Some("ctrl\u{7}bad".into()),
         token: RegisterToken::new(TOKEN.into()),
+        capabilities: Vec::new(),
     };
     let conn = tokio::spawn(connect_registered(
         endpoint(),
@@ -585,7 +741,7 @@ async fn welcome_carries_directed_heartbeat_cadence() {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            b"{\"type\":\"register\",\"endpoint_id\":\"cadence\",\"token\":\"t0ken-not-a-secret\",\"version\":2,\"max_concurrent\":1}\n",
+            b"{\"type\":\"register\",\"endpoint_id\":\"cadence\",\"token\":\"t0ken-not-a-secret\",\"version\":3,\"max_concurrent\":1}\n",
         )
         .await
         .unwrap();
@@ -596,6 +752,6 @@ async fn welcome_carries_directed_heartbeat_cadence() {
         .unwrap();
     assert_eq!(
         line.trim(),
-        "{\"type\":\"welcome\",\"v\":2,\"heartbeat_ms\":10000}"
+        "{\"type\":\"welcome\",\"v\":3,\"heartbeat_ms\":10000}"
     );
 }

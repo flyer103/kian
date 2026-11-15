@@ -407,14 +407,16 @@ queue), no per-call endpoint choice.
 ### Runtime worker membership (R12)
 
 Scope: workers join and leave a running `kian serve` at runtime — `kiand --register-to` dials kian,
-authenticates with an env-only shared token on a **private** registration listener, and the accepted
-connection *is* the command route for that worker id. Joining or leaving never edits `kian.yaml` and
+authenticates with an env-only token (the shared token, or its own token when enrolled by id —
+ADR-031) on a **private** registration listener, and the accepted connection *is* the command route
+for that worker id. Joining or leaving never edits `kian.yaml` and
 never restarts the server; a kian restart/upgrade requires no worker-side change (workers reconnect
 and re-register). The decision record is
 [ADR-021](../design/decisions/ADR-021-runtime-worker-membership.md) (supersedes ADR-020 D5/D6/D7
 only); the worker-domain contract is [WORKER-MODEL](../design/WORKER-MODEL.md); the wire is
-KiandProto v1 ([API-CONTRACT](../design/API-CONTRACT.md) §8). **No new event kind, no new table, no
-new HTTP surface, no core change; one wire version bump with dual goldens.**
+KiandProto v3 ([API-CONTRACT](../design/API-CONTRACT.md) §8). **No new event kind, no new HTTP
+surface, no core change; wire v3 adds only the optional `register.capabilities` field, with dual
+goldens.**
 
 | Item | Contents | Status |
 |------|----------|--------|
@@ -423,12 +425,13 @@ new HTTP surface, no core change; one wire version bump with dual goldens.**
 | Queue-first dispatch | `exec` enqueues durably by the bound worker id with no live-route requirement; rows park `pending` until the worker registers or the honest `queue_timeout` abandons them; no cross-worker dispatch, no failover; runtime routes attach/detach with membership | landed |
 | Router surface | `spawn_worker.exec_worker` is a plain non-empty string (no enum, no catalog block — supersedes ADR-020 D5–D7); one frozen prompt instruction line; new read-only `list_workers` tool (id, description?, state, bound session/thread; a registry-only id's description comes from the ADR-025 last-declared cache with `declaration_stale: true`); spawn validates against the runtime catalog — unknown refused naming known ids, offline-known allowed with a queue note, busy refused naming the owner; no membership byte ever enters a prompt or tool schema | landed |
 | Operator verb | `kian workers [--json]`: read-only embedded view over the durable projection (id, state, last-seen, bound session/thread, and — since ADR-025 — the last-declared description/protocol version when declared; absent otherwise) | landed |
-| Security boundary | Private-bind-only listener (loopback/RFC1918/CGNAT/ULA; wildcard counts as public) with `allow_public` override; env-only token, constant-time compare, redacting type, bounded failed attempts; token never in config/argv/logs/events/metrics | landed |
+| Security boundary | Private-bind-only listener (loopback/RFC1918/CGNAT/ULA; wildcard counts as public) with `allow_public` override; env-only tokens (shared or per-worker enrollment, ADR-031), constant-time compare, redacting type, bounded failed attempts; token never in config/argv/logs/events/metrics | landed |
 | Single kian instance | A worker registers to exactly one `kian serve`; no federation, relay, cross-instance dispatch or multi-replica membership | landed (boundary) |
-| Shared-token limitation | Any token holder may register under any id (impersonation/replacement); acceptable for the single-operator deployment, not for hosted use | landed (recorded limitation; mTLS R13) |
+| Shared-token limitation | Narrowed by per-worker enrollment (ADR-031): a listed id accepts only its own token; in hybrid mode an unlisted id still shares the fallback. mTLS remains the R13 fix | landed (narrowed; mTLS R13) |
 | mTLS / per-worker identity, token rotation without restart | R13 deferral — [WORKER-MODEL](../design/WORKER-MODEL.md) §9 | deferred |
 | Live rebind / worker retirement / takeover | Unchanged from R11 (ADR-020 §Deferred, ADR-021 §Deferred) — the same id returning reattaches; a permanently lost worker ends in the honest timeout | deferred |
 | Last-declared worker cache | `endpoint_registry` migration v4 adds nullable `description`/`protocol_version`; the registration upsert writes them, heartbeats never touch them, a description-less registration clears the text; `list_workers` serves the cache for registry-only ids with `declaration_stale: true`; live wins; no membership decision reads it — [ADR-025](../design/decisions/ADR-025-worker-last-declared-cache.md) | landed |
+| Worker-declared capabilities | `register.capabilities` (v3, optional): the worker declares its own list, the server sanitizes (lowercase `[a-z0-9._-]`, ≤16, unique) with one audit line and still registers; migration v5 caches the accepted JSON list on `endpoint_registry`; `list_workers`/`kian workers` serve the live or cached list; static pins omit it — [ADR-032](../design/decisions/ADR-032-worker-declared-capabilities.md) | landed |
 
 ### Worker filesystem tools (KiandProto v2, R13)
 

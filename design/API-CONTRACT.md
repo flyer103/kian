@@ -376,31 +376,33 @@ drop (duplicate delivery id, unsupported/filtered event type, or a repository ou
 table). Delivery-id dedupe is downstream, per `(session, event_id)` — the webhook route itself does
 not keep a delivery table.
 
-## 8. KiandProto v2 — BYOM endpoint protocol
+## 8. KiandProto v3 — BYOM endpoint protocol
 
 Transport: TCP, one JSON object per line (UTF-8, no framing header). One bidirectional stream carries
-the whole conversation. Since v1 there are **two dial directions** over the same framing (v2 keeps
-both and adds the filesystem command pair, [ADR-023](decisions/ADR-023-worker-fs-tools.md)):
+the whole conversation. Since v1 there are **two dial directions** over the same framing (v3 keeps
+both; v2 added the filesystem command pair, [ADR-023](decisions/ADR-023-worker-fs-tools.md), and v3
+adds the optional worker capability declaration, [ADR-032](decisions/ADR-032-worker-declared-capabilities.md)):
 
 | Path | Who dials | Handshake | Use |
 |---|---|---|---|
-| **worker-dial** (v2) | the worker (`kiand --register-to`) | worker → `register`; server → `welcome` or `rejected` | dynamic membership ([WORKER-MODEL](WORKER-MODEL.md) §2) |
+| **worker-dial** (v3) | the worker (`kiand --register-to`) | worker → `register`; server → `welcome` or `rejected` | dynamic membership ([WORKER-MODEL](WORKER-MODEL.md) §2) |
 | **server-dial** (legacy) | the server (`kian-exec`), per the `endpoints:` config | endpoint → `hello`; server → `welcome` | static pinned workers |
 
 After a successful handshake both paths carry the same steady-state frames
 (`command`/`result`, `fs_command`/`fs_result`, `ping`/`heartbeat`/`bye`) on that one connection; a
 worker-dial connection *is* the command route for that worker id.
 
-`PROTOCOL_VERSION = 2`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
+`PROTOCOL_VERSION = 3`, declared independently by both halves (`kian-exec` and `kian-endpoint`) and
 pinned by their own golden tests. A wire change updates both crates' goldens and bumps
 `PROTOCOL_VERSION` in both, in the same commit.
 
-### 8.1 Handshake — worker-dial (register mode, v2)
+### 8.1 Handshake — worker-dial (register mode, v3)
 
 1. The server opens a **private** registration listener (`workers.listen` in `kian.yaml`;
    loopback/RFC1918/CGNAT/IPv6-ULA; a public or wildcard bind refuses startup unless
-   `workers.allow_public: true`). The listener refuses to start when the env-only shared worker
-   token (`workers.token_env`) is absent or blank — fail-closed ([WORKER-MODEL](WORKER-MODEL.md) §6).
+   `workers.allow_public: true`). The listener refuses to start when a configured env-only token
+   variable (the shared `workers.token_env` or any `workers.tokens` entry) is absent or blank —
+   fail-closed ([WORKER-MODEL](WORKER-MODEL.md) §6; enrollment is ADR-031 and config-only).
 2. Worker → server: `register` — **exactly one, and the first decodable frame** on the connection.
    No `register` within the 10 s deadline, a second `register`, or any other first frame closes the
    connection immediately with one `protocol` audit line; there is no half-registered state.
@@ -415,8 +417,10 @@ pinned by their own golden tests. A wire change updates both crates' goldens and
 config, argv, logs, events, error text or `/metrics` (it travels in a redacting type). Failed auth
 is bounded twice: one attempt per connection (the server closes after a refusal, never re-prompts)
 and a per-peer-address window — after 5 refusals in 60 s, further connections from that address are
-closed without reading a frame. With a **shared** token any holder may register under any id
-([WORKER-MODEL](WORKER-MODEL.md) §6 records the limitation; mTLS is the planned fix).
+closed without reading a frame. An id listed in `workers.tokens` is checked only against its own
+token; with `workers.enrolled_only` an unlisted id is refused. Otherwise a **shared** token admits
+any id ([WORKER-MODEL](WORKER-MODEL.md) §6 records the narrowed limitation; mTLS is the planned
+fix).
 
 **Duplicate id.** A newer authenticated `register` for a live dynamic id **replaces** the incumbent:
 serialized per id, the old connection is closed (server `bye` first), the route is swapped, the
@@ -429,13 +433,17 @@ static `endpoints[].id` is refused `duplicate_static` — the static entry is th
 the wire; the server re-checks — a violation answers `id_conflict`). `description` (optional):
 non-empty after trim, ≤200 chars, no control characters — a violation is **dropped with one audit
 line and the registration still succeeds** (the id is what matters; it never fails the handshake
-and never reaches a model). `max_concurrent == 0` clamps to 1 with a `warn`.
+and never reaches a model). `capabilities` (v3, optional): each name is lowercase
+`[a-z0-9._-]`, 1–64 bytes; at most 16, unique. The worker validates its own list at startup and
+refuses to boot on an invalid entry; the server re-sanitizes (trim, drop invalid/duplicate/
+over-limit) **with one audit line and the registration still succeeds** — a bad declaration never
+fails the handshake and never grants authority. `max_concurrent == 0` clamps to 1 with a `warn`.
 
-### 8.2 Handshake — server-dial (legacy static endpoints, `hello` at v2)
+### 8.2 Handshake — server-dial (legacy static endpoints, `hello` at v3)
 
 Unchanged shape: endpoint → `hello {v, endpoint_id, max_concurrent}`; server → `welcome`. The
 `hello`/`welcome` frames name the protocol revision `v`; the `register` frame names it `version` —
-a locked asymmetry, frozen by the v2 goldens (a rename is a wire break).
+a locked asymmetry, frozen by the v3 goldens (a rename is a wire break).
 
 ### 8.3 Frames
 
@@ -455,7 +463,7 @@ Endpoint/worker → server:
 | `type` | Fields |
 |---|---|
 | `hello` | `v`, `endpoint_id`, `max_concurrent` |
-| `register` (v2) | `endpoint_id`, `description` (optional; omitted when absent), `token`, `version`, `max_concurrent` |
+| `register` (v3) | `endpoint_id`, `description` (optional; omitted when absent), `token`, `version`, `max_concurrent`, `capabilities` (optional; omitted when empty; ≤16 unique names) |
 | `heartbeat` | `endpoint_id`, `ts_ms`, `inflight` |
 | `result` | `id` (command UUID), plus exactly one of `result` (`ExecResult`) or `error` (`CommandError`) |
 | `fs_result` (v2) | `id` (command UUID), plus exactly one of `result` (`FsResult`) or `error` (`CommandError`) |
@@ -500,7 +508,7 @@ in-flight commands, send `bye`, exit 0. Audit lines carry the id and peer addres
 ### 8.4 Delivery semantics
 
 The queue is server-side and durable; delivery is at-least-once with command-id correlation/dedupe
-([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 (unchanged at v2) dispatch is **queue-first by
+([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 (unchanged at v3) dispatch is **queue-first by
 worker id**: a command enqueues durably even with no live route (a registered worker's route appears
 and disappears at runtime) and parks `pending` until a route appears or the `queue_timeout` abandons
 it honestly; there is no cross-worker dispatch. That semantics lives in
@@ -535,6 +543,23 @@ v1 kian is refused and keeps its bounded backoff. Window consequences:
 - The worker's `--workspace-root` defaults to its working directory; an explicit root must exist
   and be a directory (fail-closed at startup).
 
+### 8.7 Upgrade v2 → v3 (worker-declared capabilities)
+
+**Upgrade order: kian first, workers second.** v3 is additive on the wire: every v2 frame keeps its
+bytes; the only change is the optional `capabilities` key on `register`, and the handshake revision
+moves 2 → 3. There is **no compatibility shim**: a v2 worker is refused `version_mismatch` and stays
+offline until upgraded; a v3 worker pointed at a v2 kian is refused and keeps its bounded backoff.
+Window consequences:
+
+- A v2 worker reads offline (typed terminal refusal at the listener) while the v3 kian runs; its
+  parked rows stay parked — no lost work, no cross-worker dispatch.
+- The registry cache migration v5 adds a nullable `capabilities` TEXT column. Pre-v5 rows read as
+  an empty list; a registration that omits the key clears the cached list (the latest declaration
+  is the fact). `list_workers`/`kian workers` keep serving registry-only ids; their
+  `declaration_stale` flag now also covers the cached capabilities.
+- Static endpoints have no capability declaration in v3 (`hello` is unchanged); a static pin's
+  catalog row omits the field. This is recorded as a non-goal, not an accident.
+
 ## 9. Versioning and freeze
 
 ### 9.1 Frozen surface
@@ -544,8 +569,9 @@ v1 kian is refused and keeps its bounded backoff. Window consequences:
 - SSE frame names (`kian`, `done`, `error`) and their `data` shape.
 - `/metrics` top-level keys and their meaning (nested fields additive).
 - Webhook required headers and the status matrix.
-- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v2
-  register/rejected/fs frames and the closed five-reason set, pinned by both halves' goldens.
+- KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v3
+  register (including `capabilities`)/rejected/fs frames and the closed five-reason set, pinned by
+  both halves' goldens.
 
 ### 9.2 Change classes
 
@@ -558,7 +584,9 @@ v1 kian is refused and keeps its bounded backoff. Window consequences:
   additive-only after the `kian-sdk` freeze — the SDK's public
   surface *is* this contract. The KiandProto v0 → v1 bump (register mode, worker-dial) is the
   recorded instance: [ADR-021](decisions/ADR-021-runtime-worker-membership.md), §8.5; the v1 → v2
-  bump (worker filesystem commands) is [ADR-023](decisions/ADR-023-worker-fs-tools.md), §8.6.
+  bump (worker filesystem commands) is [ADR-023](decisions/ADR-023-worker-fs-tools.md), §8.6; the
+  v2 → v3 bump (worker-declared capabilities) is
+  [ADR-032](decisions/ADR-032-worker-declared-capabilities.md), §8.7.
 
 ### 9.3 Version numbers
 

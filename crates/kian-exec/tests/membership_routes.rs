@@ -83,6 +83,7 @@ fn registered(id: &str, generation: u64) -> (RegisteredWorker, FakeWorker) {
     (
         RegisteredWorker {
             description: None,
+            capabilities: Vec::new(),
             id: id.into(),
             generation,
             peer_addr: "127.0.0.1:50000".parse().unwrap(),
@@ -648,6 +649,7 @@ async fn full_loop_register_drains_bye_detaches() {
             endpoint_id: "e2e-box".into(),
             description: Some("e2e box".into()),
             token: kian_endpoint::proto::RegisterToken::new(TOKEN.into()),
+            capabilities: Vec::new(),
         },
         addr,
         shutdown_rx,
@@ -767,6 +769,7 @@ async fn dynamic_default_resolves_the_online_member() {
             endpoint_id: "default-box".into(),
             description: None,
             token: kian_endpoint::proto::RegisterToken::new(TOKEN.into()),
+            capabilities: Vec::new(),
         },
         addr,
         shutdown_rx,
