@@ -552,6 +552,10 @@ pub struct SuperAgentPlugin {
     /// (`superagent.outbox`). `None` = the legacy single-attempt send
     /// path, byte-identical.
     pub outbox: Option<kian_superagent::OutboxConfig>,
+    /// (R15) the multiagent delegation bounds
+    /// (`superagent.multiagent`). `None` = the delegation feature is
+    /// off — today's spawn bytes, byte-identical (M8, §8.1).
+    pub multiagent: Option<kian_superagent::MultiagentLimits>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -748,6 +752,12 @@ impl Plugin for SuperAgentPlugin {
         // (ADR-012): the mandate issuance policy rides the profile
         // into the spawn tool (the single issuance point).
         profile.mandate = self.mandate.clone();
+        // (R15): the delegation bounds ride the profile into the
+        // spawn tool's §5.4 validation chain (seq+derive → depth →
+        // max_children, all before every side effect). `None` =
+        // feature off — the whole multiagent branch is skipped and
+        // today's spawn bytes stand (M8, §8.1).
+        profile.multiagent = self.multiagent;
         // (R12, R1/R2 — supersedes ADR-020 D5/D7): membership on iff
         // `endpoints:` is non-empty or `workers:` is configured — the
         // bootstrap then appends the frozen membership block (a
@@ -881,6 +891,17 @@ impl Plugin for SuperAgentPlugin {
                     Some(directory_port as Arc<dyn kian_superagent::WorkerDirectoryPort>),
                 )
                 .with_worker_streams(worker_streams);
+        } else if self.multiagent.is_some() {
+            // (R15-C5): multiagent on with `endpoints:`/`workers:`
+            // empty — the child-stream port still installs on the
+            // tool surface (C3 item 4): the §5.4 fail-closed port
+            // check and the caps walk read the children's streams
+            // through it. Installing it does not change today's
+            // feature-off wiring: this branch is reachable only when
+            // the block is present.
+            let worker_streams =
+                crate::superagent::StoreWorkerStreams::new(self.event_store.clone());
+            router_tools = router_tools.with_worker_streams(worker_streams);
         }
         let router_tools = Arc::new(router_tools);
         // the recall toolpack reads through the one `StoreRecall`
@@ -1114,6 +1135,11 @@ impl Plugin for SuperAgentPlugin {
                 router: self.router_session,
                 worker_version: self.worker_agent.version,
                 gate: crate::superagent::clone_gate(&self.worker_gate),
+                // (R15-C5): the delegation bounds ride the worker
+                // loop — the join (C4) reads the child's own
+                // `thread/started.parent` only when the driving side
+                // carries them; None = feature off, ambient today.
+                multiagent: self.multiagent,
             },
             crate::superagent::port_for_ctx(),
         );
@@ -1158,6 +1184,10 @@ impl Plugin for SuperAgentPlugin {
             let side_session = self.router_session;
             let side_version = self.worker_agent.version;
             let side_jobs_factory = async_jobs_factory.clone();
+            // (R15-C5): the sides drive spawned children in
+            // configured-endpoint deployments — they carry the same
+            // delegation bounds as the primary worker side.
+            let side_multiagent = self.multiagent;
             side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
@@ -1196,6 +1226,7 @@ impl Plugin for SuperAgentPlugin {
                         router: side_session,
                         worker_version: side_version,
                         gate: crate::superagent::clone_gate(&side_gate),
+                        multiagent: side_multiagent,
                     },
                     crate::superagent::port_for_ctx(),
                 )
@@ -1215,6 +1246,7 @@ impl Plugin for SuperAgentPlugin {
             let refuse_gate = crate::superagent::clone_gate(&self.worker_gate);
             let refuse_session = self.router_session;
             let refuse_version = self.worker_agent.version;
+            let refuse_multiagent = self.multiagent;
             refuse_side = Some(Arc::new(move |refusal: &crate::superagent::Refusal| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
@@ -1245,6 +1277,7 @@ impl Plugin for SuperAgentPlugin {
                         router: refuse_session,
                         worker_version: refuse_version,
                         gate: crate::superagent::clone_gate(&refuse_gate),
+                        multiagent: refuse_multiagent,
                     },
                     crate::superagent::port_for_ctx(),
                 )

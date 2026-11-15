@@ -952,6 +952,15 @@ pub struct SuperAgentConfig {
     /// fail-closed by [`SuperAgentConfig::outbox_config`].
     #[serde(default)]
     pub outbox: Option<OutboxConfigDef>,
+    /// (R15) the multiagent delegation bounds
+    /// (`superagent.multiagent`): `max_children`/`max_depth`/
+    /// `child_timeout_ms`, every field optional with the §5.3
+    /// defaults. **Absent (the default) = the delegation feature is
+    /// off** — today's spawn bytes, byte-identical (M8, §8.1).
+    /// Present (even empty) enables it; converted fail-closed by
+    /// [`SuperAgentConfig::multiagent_config`].
+    #[serde(default)]
+    pub multiagent: Option<MultiagentConfigDef>,
     /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
     /// surfaces in the Inline `neighbors` block (`thread_key`) as
@@ -1038,6 +1047,34 @@ impl SuperAgentConfig {
             .map_err(|message| invalid(format!("superagent.outbox: {message}")))?;
         Ok(Some(converted))
     }
+
+    /// Converts the multiagent section to the bundle's
+    /// [`kian_superagent::MultiagentLimits`], fail-closed (a zero
+    /// bound refuses to start, naming the key). `Ok(None)` when the
+    /// block is absent — the delegation feature is off, today's
+    /// spawn bytes byte-identical (M8, §8.1).
+    pub fn multiagent_config(
+        &self,
+    ) -> Result<Option<kian_superagent::MultiagentLimits>, ConfigError> {
+        let Some(config) = self.multiagent.as_ref() else {
+            return Ok(None);
+        };
+        let converted = kian_superagent::MultiagentLimits {
+            max_children: config
+                .max_children
+                .unwrap_or(kian_superagent::DEFAULT_MAX_CHILDREN),
+            max_depth: config
+                .max_depth
+                .unwrap_or(kian_superagent::DEFAULT_MAX_DEPTH),
+            child_timeout_ms: config
+                .child_timeout_ms
+                .unwrap_or(kian_superagent::DEFAULT_CHILD_TIMEOUT_MS),
+        };
+        converted
+            .validate()
+            .map_err(|message| invalid(format!("superagent.multiagent: {message}")))?;
+        Ok(Some(converted))
+    }
 }
 
 /// The `superagent.outbox` section:
@@ -1050,6 +1087,22 @@ pub struct OutboxConfigDef {
     pub max_attempts: Option<u32>,
     pub backoff_start_ms: Option<u64>,
     pub backoff_cap_ms: Option<u64>,
+}
+
+/// The `superagent.multiagent` section (MULTIAGENT-MODEL §7.1):
+/// `{max_children?, max_depth?, child_timeout_ms?}` — every field
+/// optional with the §5.3 defaults (4 children, 1 hop, 15 minutes);
+/// an empty section enables the feature with the defaults. The
+/// spelling is **`child_timeout_ms`** (pin P4): the anchors' A2 error
+/// would name `timeout_ms`, and this struct's
+/// `#[serde(deny_unknown_fields)]` makes that typo a boot refusal,
+/// never a silent default. Absent section = the feature is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MultiagentConfigDef {
+    pub max_children: Option<u32>,
+    pub max_depth: Option<u32>,
+    pub child_timeout_ms: Option<u64>,
 }
 
 /// The `superagent.intake` section (ADR-013):
