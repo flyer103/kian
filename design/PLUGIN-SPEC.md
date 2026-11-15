@@ -150,6 +150,15 @@ lockfile does not grow a package. [`crates/kian-plugin/tests/static_only.rs`](..
 passing **untouched**: `sha2` matches none of its refusal patterns (§13.2). There is no tier 2 (§16,
 owner D8).
 
+**The ABI is a process boundary, not a language boundary.** A sidecar may be written in any language
+that can read and write newline-delimited UTF-8 JSON on stdio — a compiled binary, a scripting
+runtime, a shell pipeline; the carrier is all kian sees. kian never inspects the child beyond
+`argv[0]` and its digest (§6.2 rule 6); the child's runtime, frameworks and dependencies are
+invisible to the contract. The obligations that do bind the child are exactly the protocol's:
+restate the identity in `ready` (§7.3), answer each `id` once in the hook's legal mode (§7.4), and
+honour the purity rule for verdicts (§8.6) — a dynamic-language plugin's `ready` set equality is
+checked by the protocol but rests on its own honour (§17).
+
 The other two edges the ports require, stated exactly (§4, ADR-028 D11):
 
 - **`kian-loop` grows a dependency edge on `kian-plugin`.** Its port sites must *construct* the views
