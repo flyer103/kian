@@ -35,6 +35,9 @@ nothing needs sending, or wait for an answer).
 
 Phase 1 covers the **plain-session** path end to end: config → deferral → durable wait → answer →
 resume, over the existing event stream, with no hold on the drain and no second write path. It
+answers a *decision* (approve/reject on a frozen call), not a free-text clarification; a
+clarification tool would reuse the same wait with a text result instead of a decision, and is a
+phase-2 candidate rather than the permission arm. It
 exists because kian's three resumable-end ingredients were explicitly recorded as missing:
 ADR-015 §7 names them ("a durable pending-confirmation state, a human/control-plane response path
 into the inbox, and hold semantics for a drain paused mid-turn — each its own design question"), and
@@ -106,10 +109,13 @@ pub fn pending_calls(events: &[Event]) -> Vec<PendingCall>;
 `tool/result` (`content.call_id` equal). Calls are returned in append order. It reads `Event`s, not
 `Message`s: `permission` is a non-context provenance key, so `derive_model_context` cannot see it.
 
-**F2 — The cheap necessary condition.** A session can have a non-empty pending set only if its last
-`session/ended` reason is `awaiting_input`. Callers therefore gate the fold on the already-loaded
-state projection: a long-lived session that never asked pays nothing; a waiting session pays one
-bounded scan per claim.
+**F2 — Two reads, one definition.** *Claim-time* (the engine deciding whether a claimed session may
+be driven): a non-empty pending set implies the last `session/ended` reason is `awaiting_input`, so
+the fold is gated on the already-loaded state projection — a long-lived session that never asked
+pays nothing, and a waiting session pays one scan per claim. *Settle-time* (the engine choosing the
+end reason of the episode it just ran): the fold is windowed to the episode `(claim seq, head]`,
+which is bounded by the drain's own writes and needs no gate. The two reads use the same
+`pending_calls`; only the window differs.
 
 **F3 — Batching.** Several calls of one assistant batch may be pending at once. Non-ask calls in the
 same batch still execute (they were allowed; their results are independent). Answers may arrive in
@@ -119,9 +125,11 @@ any order; the turn resumes only when the set is empty. A provider request never
 `tool/result` would land outside the range). The compact appender refuses such a range; this keeps
 `pending_calls` correct across compression without reading into a summarized prefix.
 
-**F5 — Resume cost.** Phase 1 accepts the gated scan (F2). Carrying the pending set on the read-model
-snapshot is a phase-2 optimization, recorded as an open question (§15), not a correctness
-prerequisite: the stream is the truth and the projection is rebuildable.
+**F5 — Resume cost.** The built-in loop already reads the durable events once per turn
+(`LoopDriver::Ctx::events`), so the settle-time fold adds no new read path and the claim-time fold is
+gated (F2). Carrying the pending set on the read-model snapshot is a phase-2 optimization, recorded
+as an open question (§15), not a correctness prerequisite: the stream is the truth and the
+projection is rebuildable.
 
 **F6 — No persistence, no table.** There is no pending-state table, no inbox status column and no
 in-memory wait: a process restart loses nothing because a new drain re-derives the set from the
@@ -132,6 +140,9 @@ stream.
 **A1 — Admission, not an event write.** The control plane admits one durable inbox row in the
 reserved control envelope (the ADR-014 pattern, new `action:"confirm"`) and wakes. It never appends
 an event, never inspects a drain and never invokes a tool.
+
+An answer admitted while the session happens to be `running` (a crash-replay window) is consumed at
+the next safe boundary like any input; no special rule is needed.
 
 **A2 — Consumption binds row → audit event.** The owning drain consumes the row into one
 `control/confirm` event (non-context, `DrainActivity`) in one fenced write, exactly as a message row
@@ -145,6 +156,10 @@ time; the answer does not re-serialize it), then appends `tool/result` with the 
 `{"call_id", "output":{"error":"permission denied by user","policy":"ask","reason"?},
 "is_error":true}` — the ADR-015 deny shape with `policy:"ask"`, because a person denied it, not a
 table. No invocation happens either way before the answer is durable.
+
+*Hook interop.* At ask time the `tool/pre` port is not consulted (the call will not execute). On
+approve, the invocation goes through the normal pre-tool path, so a hook veto after approval is a
+normal hook denial on that result; the hook's own `ask` verdict is phase 3, not this plane.
 
 **A4 — Idempotency.** `(session, call_id)` has at most one answer applied: the drain appends a
 `tool/result` only if none exists for that `call_id`, under the drain's expectedSeq CAS. A duplicate
@@ -191,9 +206,9 @@ statement, and the widening is one closed value (`completed|cancelled|interrupte
 closed set `idle|running|completed|cancelled`.
 
 **D4 — Derivation is a projection, not a driver signal.** The engine derives the reason from the
-stream (F2's gate + the episode fold); the `LoopDriver`/`LoopOutcome` seam is unchanged. This keeps
-the phase-1 kernel from touching the loop seam; a driver-level "deferred" signal is only needed if a
-hook must defer *before* the call is appended (phase 3, ADR-028 integration).
+stream (the settle-time windowed fold, F2); the `LoopDriver`/`LoopOutcome` seam is unchanged. This
+keeps the phase-1 kernel from touching the loop seam; a driver-level "deferred" signal is only
+needed if a hook must defer *before* the call is appended (phase 3, ADR-028 integration).
 
 ## 7. The resume rule
 
@@ -374,8 +389,8 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 | 3 | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening; channel-side answers (an IM reply mapped to a `confirm`) | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
 
-**Phase-1 non-goals, explicit.** No hook `ask`; no IM/channel answering (free text is not a
-decision — the mapping needs semantic judgment); no automatic expiry; no `ask` on worker/resident
+**Phase-1 non-goals, explicit.** No hook `ask`; no free-text clarification path (a decision only);
+no IM/channel answering (free text is not a decision — the mapping needs semantic judgment); no automatic expiry; no `ask` on worker/resident
 agents; no UI card; no new session state; no change to `LoopDriver`/`LoopOutcome`; no outbox row for
 the request (the request is the stream; a delivery row is the bundle's business).
 
