@@ -63,6 +63,10 @@ pub struct RegisterInfo {
     pub endpoint_id: String,
     pub description: Option<String>,
     pub token: RegisterToken,
+    /// The worker's declared capabilities (v3, ADR-029). Validated and
+    /// bounded by the caller (`kiand`); the wire form omits an empty
+    /// list.
+    pub capabilities: Vec<String>,
 }
 
 /// One register-mode connection: dial, register, then serve the steady
@@ -109,6 +113,7 @@ async fn register_session(
             token: info.token.clone(),
             version: PROTOCOL_VERSION,
             max_concurrent: endpoint.max_concurrent() as u32,
+            capabilities: info.capabilities.clone(),
         })
         .await
         .map_err(|_| EndpointError::TransportClosed)?;
@@ -257,6 +262,7 @@ mod tests {
             endpoint_id: "builder-1".into(),
             description: Some("linux builder".into()),
             token: RegisterToken::new(TOKEN.into()),
+            capabilities: Vec::new(),
         }
     }
 

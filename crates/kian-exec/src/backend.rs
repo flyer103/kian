@@ -436,12 +436,13 @@ impl RemoteExecBackend {
         generation: u64,
         description: Option<&str>,
         protocol_version: u32,
+        capabilities: &[String],
     ) {
         self.attach_route_inner(
             endpoint_id.into(),
             transport,
             generation,
-            Some((description, protocol_version)),
+            Some((description, protocol_version, capabilities)),
         )
         .await;
     }
@@ -451,11 +452,11 @@ impl RemoteExecBackend {
         id: String,
         transport: RouteTransport,
         generation: u64,
-        declaration: Option<(Option<&str>, u32)>,
+        declaration: Option<(Option<&str>, u32, &[String])>,
     ) {
         let status = transport.status();
         let registry = match declaration {
-            Some((description, protocol_version)) => {
+            Some((description, protocol_version, capabilities)) => {
                 self.core
                     .store
                     .upsert_endpoint_with_declaration(
@@ -465,6 +466,7 @@ impl RemoteExecBackend {
                         "online",
                         description,
                         protocol_version,
+                        capabilities,
                     )
                     .await
             }

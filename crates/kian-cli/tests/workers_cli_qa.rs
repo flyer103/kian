@@ -118,11 +118,27 @@ async fn seeded(dir: &std::path::Path) -> PathBuf {
     // Identical physical staleness (60 s): inside the pin's 600 s bound,
     // outside the dynamic 5 s bound.
     store
-        .upsert_endpoint("slow-pin", "127.0.0.1:7401", now - 60_000, "online")
+        .upsert_endpoint_with_declaration(
+            "slow-pin",
+            "127.0.0.1:7401",
+            now - 60_000,
+            "online",
+            None,
+            3,
+            &["exec".to_string()],
+        )
         .await
         .unwrap();
     store
-        .upsert_endpoint("zz-dyn", "127.0.0.1:55555", now - 60_000, "online")
+        .upsert_endpoint_with_declaration(
+            "zz-dyn",
+            "127.0.0.1:55555",
+            now - 60_000,
+            "online",
+            None,
+            3,
+            &["apple-calendar".to_string(), "apple-health".to_string()],
+        )
         .await
         .unwrap();
     store
@@ -177,6 +193,39 @@ async fn qa_workers_per_id_bounds_and_form_agreement() {
             )
         })
         .collect();
+    // The durable last-declared capability cache reaches both output
+    // forms; an id without a declaration omits the field entirely.
+    let caps: Vec<(String, Vec<String>)> = rows
+        .iter()
+        .filter_map(|row| {
+            row.get("capabilities").map(|caps| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    caps.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| c.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        caps,
+        vec![
+            ("slow-pin".to_string(), vec!["exec".to_string()]),
+            (
+                "zz-dyn".to_string(),
+                vec!["apple-calendar".to_string(), "apple-health".to_string()]
+            ),
+        ]
+    );
+    assert!(!plain_text.is_empty());
+    assert!(
+        plain_text.contains("apple-calendar"),
+        "text board carries capabilities: {plain_text}"
+    );
+
     // Sorted by id ascending, and the per-id derivation: aa-dyn fresh ⇒
     // online; zz-dyn 60 s stale vs a 5 s dynamic bound ⇒ offline;
     // slow-pin 60 s stale vs its 600 s pin bound ⇒ online.
@@ -191,7 +240,14 @@ async fn qa_workers_per_id_bounds_and_form_agreement() {
     );
     for row in rows {
         assert!(row.get("description").is_none(), "D-L2: absent");
-        assert!(row.get("protocol_version").is_none(), "M4: absent");
+        // A declaration (needed to seed capabilities) also caches the
+        // protocol version; the undeclared aa-dyn row keeps M4's absent
+        // shape.
+        assert_eq!(
+            row.get("protocol_version").is_some(),
+            row.get("capabilities").is_some(),
+            "declaration fields travel together"
+        );
     }
     // The text board carries exactly the same facts in the same order.
     assert_eq!(text_facts(&plain_text), json_facts);

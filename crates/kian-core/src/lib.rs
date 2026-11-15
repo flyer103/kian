@@ -31,3 +31,4 @@ pub mod model;
 pub mod seams;
 pub mod secrets;
 pub mod state;
+pub mod worker;

@@ -159,6 +159,16 @@ struct RegisterDaemon {
 
 impl RegisterDaemon {
     fn spawn(register_to: &str, id: &str, dir: &Path, token: &str) -> RegisterDaemon {
+        Self::spawn_with_capabilities(register_to, id, dir, token, &[])
+    }
+
+    fn spawn_with_capabilities(
+        register_to: &str,
+        id: &str,
+        dir: &Path,
+        token: &str,
+        capabilities: &[&str],
+    ) -> RegisterDaemon {
         // stderr → a file in the worker dir: register-mode logs go to
         // stderr, and keeping them makes L2 failures diagnosable.
         let stderr_path = dir.join(format!("{id}.kiand.stderr.log"));
@@ -167,19 +177,22 @@ impl RegisterDaemon {
         let stderr =
             unsafe { Stdio::from(std::os::fd::OwnedFd::from_raw_fd(stderr.into_raw_fd())) };
         let mut command = Command::new(kiand_bin());
+        command.args([
+            "--register-to",
+            register_to,
+            "--endpoint-id",
+            id,
+            "--description",
+            "l2 membership daemon",
+            "--heartbeat-ms",
+            "200",
+            "--exec-timeout-ms",
+            "60000",
+        ]);
+        for capability in capabilities {
+            command.args(["--capability", capability]);
+        }
         command
-            .args([
-                "--register-to",
-                register_to,
-                "--endpoint-id",
-                id,
-                "--description",
-                "l2 membership daemon",
-                "--heartbeat-ms",
-                "200",
-                "--exec-timeout-ms",
-                "60000",
-            ])
             .env(KIAND_TOKEN_ENV, token)
             .current_dir(dir)
             .stdout(Stdio::null())
@@ -2175,4 +2188,66 @@ async fn async_tools_follow_the_dynamic_worker() {
     worker.kill9().await;
     kill_serve(&mut serve).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// L2 (v3, ADR-029): a real `kiand --register-to --capability` declares
+/// its capabilities on the wire; the real `kian workers --json` board
+/// shows the cached declaration while the worker is online.
+#[tokio::test]
+async fn worker_declared_capabilities_reach_the_operator_board() {
+    force_no_proxy();
+    let dir = temp_dir("l2m-caps");
+    let dir_w = dir.join("worker-caps");
+    std::fs::create_dir_all(&dir_w).expect("worker dir");
+
+    let serve_port = free_port();
+    let listen_port = free_port();
+    let (router_base, _router_mock) =
+        spawn_scripted_provider(vec![text("bootstrap acknowledged")], 0).await;
+    let (worker_base, _worker_mock) = spawn_scripted_provider(vec![text("idle")], 0).await;
+    let config = write_membership_config(
+        &dir,
+        &router_base,
+        &worker_base,
+        serve_port,
+        &[],
+        Some(&WorkersSpec {
+            listen_port,
+            offline_after_ms: 8_000,
+        }),
+        false,
+    );
+    let (mut serve, _base) = boot_serve(&config, serve_port).await;
+
+    let mut worker = RegisterDaemon::spawn_with_capabilities(
+        &format!("127.0.0.1:{listen_port}"),
+        "dyn-caps",
+        &dir_w,
+        WORKER_TOKEN,
+        &["exec", "apple-calendar", "apple-health"],
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let board = kian_workers_json(&config).await;
+        let row = board["workers"]
+            .as_array()
+            .expect("workers array")
+            .iter()
+            .find(|row| row["id"].as_str() == Some("dyn-caps"));
+        if let Some(row) = row
+            && row["state"].as_str() == Some("online")
+            && row["capabilities"] == serde_json::json!(["exec", "apple-calendar", "apple-health"])
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capabilities never reached the board; board: {board}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    worker.kill9().await;
+    kill_serve(&mut serve).await;
 }

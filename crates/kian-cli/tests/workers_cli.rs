@@ -31,6 +31,7 @@ async fn seeded_registry() -> PathBuf {
             "online",
             Some("linux builder"),
             2,
+            &[],
         )
         .await
         .unwrap();

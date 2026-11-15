@@ -25,7 +25,15 @@ pub(crate) type QueueRow = (
 
 /// One `endpoint_registry` row's raw columns (ADR-025 adds the
 /// last-declared description/version).
-pub(crate) type RegistryRow = (String, String, i64, String, Option<String>, Option<i64>);
+pub(crate) type RegistryRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+);
 
 /// One `async_jobs` row's raw columns (parsed by the shared
 /// `async_jobs::parse_async_row`).
@@ -256,6 +264,7 @@ pub(crate) async fn upsert_endpoint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upsert_endpoint_with_declaration(
     pool: &SqlitePool,
     endpoint_id: &str,
@@ -264,9 +273,10 @@ pub(crate) async fn upsert_endpoint_with_declaration(
     state: &str,
     description: Option<&str>,
     protocol_version: u32,
+    capabilities: &[String],
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version) VALUES (?, ?, ?, ?, ?, ?)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = excluded.addr, last_heartbeat_ms = excluded.last_heartbeat_ms, state = excluded.state, description = excluded.description, protocol_version = excluded.protocol_version",
+        "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version, capabilities) VALUES (?, ?, ?, ?, ?, ?, ?)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = excluded.addr, last_heartbeat_ms = excluded.last_heartbeat_ms, state = excluded.state, description = excluded.description, protocol_version = excluded.protocol_version, capabilities = excluded.capabilities",
     )
     .bind(endpoint_id)
     .bind(addr)
@@ -274,6 +284,7 @@ pub(crate) async fn upsert_endpoint_with_declaration(
     .bind(state)
     .bind(description)
     .bind(i64::from(protocol_version))
+    .bind(serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".into()))
     .execute(pool)
     .await?;
     Ok(())
@@ -281,19 +292,26 @@ pub(crate) async fn upsert_endpoint_with_declaration(
 
 pub(crate) async fn endpoints(pool: &SqlitePool) -> Result<Vec<EndpointRegistryRow>, sqlx::Error> {
     let rows: Vec<RegistryRow> =
-        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version FROM endpoint_registry ORDER BY endpoint_id ASC")
+        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version, capabilities FROM endpoint_registry ORDER BY endpoint_id ASC")
             .fetch_all(pool)
             .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(endpoint_id, addr, hb, state, description, protocol_version)| EndpointRegistryRow {
-                endpoint_id,
-                addr,
-                last_heartbeat_ms: hb.max(0) as u64,
-                state,
-                description,
-                protocol_version: protocol_version.and_then(|v| u32::try_from(v).ok()),
+            |(endpoint_id, addr, hb, state, description, protocol_version, capabilities)| {
+                let capabilities = capabilities
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_default();
+                EndpointRegistryRow {
+                    endpoint_id,
+                    addr,
+                    last_heartbeat_ms: hb.max(0) as u64,
+                    state,
+                    description,
+                    protocol_version: protocol_version.and_then(|v| u32::try_from(v).ok()),
+                    capabilities,
+                }
             },
         )
         .collect())

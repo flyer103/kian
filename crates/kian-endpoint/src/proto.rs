@@ -15,7 +15,7 @@ use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecCommand, ExecResult};
 
 /// Version of the KiandProto wire protocol implemented by this crate.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The closed register-refusal reason set (v1) — this crate's own
 /// independent declaration of the server half's contract (the mirror
@@ -153,6 +153,10 @@ pub enum EndpointFrame {
         token: RegisterToken,
         version: u32,
         max_concurrent: u32,
+        /// The worker's declared capabilities (v3, ADR-029). Optional;
+        /// omitted when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// Liveness signal, emitted on the negotiated interval and on ping.
     /// `inflight` reports this connection's executing commands.
@@ -318,6 +322,7 @@ mod tests {
             token: RegisterToken::new("t0ken-not-a-secret".into()),
             version: 1,
             max_concurrent: 4,
+            capabilities: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&frame).unwrap(),
@@ -342,6 +347,7 @@ mod tests {
             token: RegisterToken::new("t0ken-not-a-secret".into()),
             version: 1,
             max_concurrent: 4,
+            capabilities: Vec::new(),
         };
         let value = serde_json::to_value(&frame).unwrap();
         assert_eq!(
@@ -355,6 +361,46 @@ mod tests {
             })
         );
         assert!(value.get("description").is_none());
+    }
+
+    /// v3 golden: the endpoint half's register frame declares the same
+    /// optional capability list (empty omitted, never `null`).
+    #[test]
+    fn v3_golden_register_with_capabilities() {
+        let frame = EndpointFrame::Register {
+            endpoint_id: "iphone".into(),
+            description: Some("iPhone worker".into()),
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: PROTOCOL_VERSION,
+            max_concurrent: 1,
+            capabilities: vec!["exec".into(), "apple-calendar".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            json!({
+                "type": "register",
+                "endpoint_id": "iphone",
+                "description": "iPhone worker",
+                "token": "t0ken-not-a-secret",
+                "version": 3,
+                "max_concurrent": 1,
+                "capabilities": ["exec", "apple-calendar"]
+            })
+        );
+        let empty = EndpointFrame::Register {
+            endpoint_id: "builder-1".into(),
+            description: None,
+            token: RegisterToken::new("t0ken-not-a-secret".into()),
+            version: PROTOCOL_VERSION,
+            max_concurrent: 4,
+            capabilities: Vec::new(),
+        };
+        assert!(
+            serde_json::to_value(&empty)
+                .unwrap()
+                .get("capabilities")
+                .is_none()
+        );
     }
 
     /// v1 golden: the worker's bye is `{"type":"bye"}`.
@@ -455,6 +501,7 @@ mod tests {
             token,
             version: 1,
             max_concurrent: 4,
+            capabilities: Vec::new(),
         };
         assert!(!format!("{frame:?}").contains("t0ken-not-a-secret"));
     }
@@ -652,6 +699,7 @@ mod tests {
                 token: RegisterToken::new("t0ken-not-a-secret".into()),
                 version: PROTOCOL_VERSION,
                 max_concurrent: 4,
+                capabilities: Vec::new(),
             },
             EndpointFrame::Bye,
             EndpointFrame::Heartbeat {

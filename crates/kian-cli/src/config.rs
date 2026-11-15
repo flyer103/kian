@@ -2142,10 +2142,11 @@ pub struct WorkersConfig {
     pub listen: String,
     /// The **name** of the environment variable holding the shared
     /// worker token. The value is env-only: it never appears in this
-    /// file, argv, logs, events or error text. `kian serve` refuses to
-    /// start when the section is present and the variable is
-    /// absent/blank.
-    pub token_env: String,
+    /// file, argv, logs, events or error text. Optional when `tokens`
+    /// enrolls every admitted worker id; `kian serve` refuses to start
+    /// when the named variable is absent/blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
     /// Liveness bound: a worker is offline once its last heartbeat is
     /// older than this (also the welcome cadence source: /3).
     #[serde(default = "default_workers_offline_after_ms")]
@@ -2154,10 +2155,32 @@ pub struct WorkersConfig {
     /// it exposes a command-execution surface.
     #[serde(default)]
     pub allow_public: bool,
+    /// Backend-level queue bound for dynamic workers
+    /// (`workers.queue_timeout_ms`). The backend takes one bound (the
+    /// max over static pins and this value), so raising it lengthens
+    /// the honest timeout of every queued command.
+    #[serde(default = "default_workers_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+    /// Admission mode (phase 1 of the per-worker-identity work): when
+    /// true, only ids in `tokens` may register. Requires a non-empty
+    /// `tokens` map and forbids `token_env` (no shared fallback — a
+    /// half-enrolled deployment must not look strict while accepting a
+    /// shared token).
+    #[serde(default)]
+    pub enrolled_only: bool,
+    /// Per-worker credentials: `id -> environment variable name`. Each
+    /// listed id authenticates with its own token; a listed id never
+    /// accepts the shared token. Values stay env-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: BTreeMap<String, String>,
 }
 
 fn default_workers_offline_after_ms() -> u64 {
     30_000
+}
+
+fn default_workers_queue_timeout_ms() -> u64 {
+    60_000
 }
 
 impl WorkersConfig {
@@ -2173,19 +2196,60 @@ impl WorkersConfig {
     }
 
     /// The C2 validations that are pure config (bind shape, private
-    /// range, positive `offline_after_ms`, non-blank `token_env`
-    /// **name**). The token **value** check (env present and non-blank)
-    /// is a startup check in the serve assembly, not a config
-    /// validation, so read-only verbs can still load the file.
+    /// range, positive timeouts, token **names**). The token **values**
+    /// (env present and non-blank) are startup checks in the serve
+    /// assembly, not config validations, so read-only verbs can still
+    /// load the file.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let addr = self.listen_addr()?;
         if self.offline_after_ms == 0 {
             return Err(invalid("workers.offline_after_ms must be > 0"));
         }
-        if self.token_env.trim().is_empty() {
+        if self.queue_timeout_ms == 0 {
+            return Err(invalid("workers.queue_timeout_ms must be > 0"));
+        }
+        if let Some(name) = &self.token_env
+            && name.trim().is_empty()
+        {
             return Err(invalid(
                 "workers.token_env must name the environment variable holding the worker token",
             ));
+        }
+        let has_shared = self
+            .token_env
+            .as_ref()
+            .is_some_and(|n| !n.trim().is_empty());
+        if self.enrolled_only {
+            if self.tokens.is_empty() {
+                return Err(invalid(
+                    "workers.enrolled_only requires a non-empty `tokens` map",
+                ));
+            }
+            if has_shared {
+                return Err(invalid(
+                    "workers.enrolled_only forbids `token_env`: a strict deployment must not \
+                     also accept a shared token",
+                ));
+            }
+        }
+        if !has_shared && self.tokens.is_empty() {
+            return Err(invalid(
+                "workers: configure `token_env` (shared token) or a non-empty `tokens` map \
+                 (per-worker tokens); one is required",
+            ));
+        }
+        for (id, token_env) in &self.tokens {
+            if id.trim() != id || !kian_exec::valid_worker_id(id) {
+                return Err(invalid(format!(
+                    "workers.tokens `{id}`: worker ids are 1..=200 bytes after trim, \
+                     no control characters"
+                )));
+            }
+            if token_env.trim().is_empty() {
+                return Err(invalid(format!(
+                    "workers.tokens `{id}` must name a non-empty environment variable"
+                )));
+            }
         }
         kian_exec::validate_bind_addr(addr, self.allow_public).map_err(invalid)
     }
@@ -3299,14 +3363,41 @@ recovery:
         let cfg = ServeConfig::parse(&with_workers).expect("workers config");
         let workers = cfg.workers.clone().expect("section present");
         assert_eq!(workers.listen, "127.0.0.1:7400");
-        assert_eq!(workers.token_env, "KIAN_WORKER_TOKEN");
+        assert_eq!(workers.token_env.as_deref(), Some("KIAN_WORKER_TOKEN"));
         assert_eq!(workers.offline_after_ms, 30_000, "default");
+        assert_eq!(workers.queue_timeout_ms, 60_000, "default");
         assert!(!workers.allow_public, "default");
+        assert!(!workers.enrolled_only, "default");
+        assert!(workers.tokens.is_empty(), "default");
         // No endpoints + workers + the plugin = valid (C6).
         assert!(cfg.validate().is_ok(), "was: {:?}", cfg.validate().err());
 
         let plain = ServeConfig::parse(&base).expect("valid config");
         assert!(plain.workers.is_none(), "absent section = feature off");
+    }
+
+    /// The enrolled form parses: per-worker token env names, the
+    /// strict-mode flag and the dynamic queue bound.
+    #[test]
+    fn workers_enrolled_form_parses() {
+        let base = valid_yaml();
+        let cfg_text = format!(
+            "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+             workers:\n  listen: \"127.0.0.1:7400\"\n  enrolled_only: true\n  \
+             queue_timeout_ms: 600000\n  offline_after_ms: 120000\n  \
+             tokens:\n    iphone: KIAN_IPHONE_TOKEN\n    build-box: KIAN_BUILD_TOKEN\n"
+        );
+        let cfg = ServeConfig::parse(&cfg_text).expect("enrolled workers config");
+        let workers = cfg.workers.clone().expect("section present");
+        assert!(workers.token_env.is_none());
+        assert!(workers.enrolled_only);
+        assert_eq!(workers.queue_timeout_ms, 600_000);
+        assert_eq!(workers.offline_after_ms, 120_000);
+        assert_eq!(
+            workers.tokens.get("iphone").map(String::as_str),
+            Some("KIAN_IPHONE_TOKEN")
+        );
+        assert!(cfg.validate().is_ok(), "was: {:?}", cfg.validate().err());
     }
 
     /// Unknown keys refuse (deny_unknown_fields, C1).
@@ -3321,22 +3412,33 @@ recovery:
     }
 
     /// The C2 matrix, one refusal per row: unparseable listen, public
-    /// bind without the explicit override, `offline_after_ms == 0`,
-    /// blank `token_env`.
+    /// bind without the explicit override, zero timeouts, no token
+    /// source, blank token names, strict mode without enrollment, and
+    /// invalid token ids.
     #[test]
     fn workers_validations_refuse_fail_closed() {
-        let case = |listen: &str, token_env: &str, offline: u64| {
-            let workers = WorkersConfig {
+        fn workers(
+            listen: &str,
+            token_env: Option<&str>,
+            offline: u64,
+            queue: u64,
+        ) -> WorkersConfig {
+            WorkersConfig {
                 listen: listen.into(),
-                token_env: token_env.into(),
+                token_env: token_env.map(str::to_string),
                 offline_after_ms: offline,
                 allow_public: false,
-            };
-            workers.validate()
+                queue_timeout_ms: queue,
+                enrolled_only: false,
+                tokens: BTreeMap::new(),
+            }
+        }
+        let case = |listen: &str, token_env: Option<&str>, offline: u64| {
+            workers(listen, token_env, offline, 60_000).validate()
         };
-        let err = case("not-an-addr", "T", 30_000).unwrap_err();
+        let err = case("not-an-addr", Some("T"), 30_000).unwrap_err();
         assert!(err.to_string().contains("host:port"), "was: {err}");
-        let err = case("8.8.8.8:7400", "T", 30_000).unwrap_err();
+        let err = case("8.8.8.8:7400", Some("T"), 30_000).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("public address"), "was: {text}");
         assert!(text.contains("Tailscale") || text.contains("SSH tunnel"));
@@ -3344,19 +3446,61 @@ recovery:
         // The explicit override lifts it (validated at the WorkersConfig
         // level; the serve assembly still gates the env value).
         let lifted = WorkersConfig {
-            listen: "8.8.8.8:7400".into(),
-            token_env: "T".into(),
-            offline_after_ms: 30_000,
             allow_public: true,
+            ..workers("8.8.8.8:7400", Some("T"), 30_000, 60_000)
         };
         assert!(lifted.validate().is_ok());
-        let err = case("127.0.0.1:7400", "T", 0).unwrap_err();
+        let err = case("127.0.0.1:7400", Some("T"), 0).unwrap_err();
         assert!(err.to_string().contains("offline_after_ms must be > 0"));
-        let err = case("127.0.0.1:7400", "  ", 30_000).unwrap_err();
+        let err = case("127.0.0.1:7400", Some("  "), 30_000).unwrap_err();
         assert!(err.to_string().contains("token_env"));
+        // No source at all refuses.
+        let err = case("127.0.0.1:7400", None, 30_000).unwrap_err();
+        assert!(err.to_string().contains("required"), "was: {err}");
+        // Zero queue timeout refuses.
+        let err = workers("127.0.0.1:7400", Some("T"), 30_000, 0)
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("queue_timeout_ms must be > 0"));
+        // Strict mode needs enrollment and no shared fallback.
+        let strict_no_tokens = WorkersConfig {
+            enrolled_only: true,
+            ..workers("127.0.0.1:7400", None, 30_000, 60_000)
+        };
+        assert!(
+            strict_no_tokens
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("enrolled_only requires")
+        );
+        let strict_with_shared = WorkersConfig {
+            enrolled_only: true,
+            tokens: BTreeMap::from([("iphone".into(), "IPHONE_TOKEN".into())]),
+            ..workers("127.0.0.1:7400", Some("T"), 30_000, 60_000)
+        };
+        assert!(
+            strict_with_shared
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("forbids `token_env`")
+        );
+        // Token declarations validate their ids.
+        let bad_id = WorkersConfig {
+            tokens: BTreeMap::from([("bad\nid".into(), "T".into())]),
+            ..workers("127.0.0.1:7400", None, 30_000, 60_000)
+        };
+        assert!(
+            bad_id
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("worker ids")
+        );
         // Wildcards count as public (C3).
         for wildcard in ["0.0.0.0:7400", "[::]:7400"] {
-            assert!(case(wildcard, "T", 30_000).is_err(), "{wildcard}");
+            assert!(case(wildcard, Some("T"), 30_000).is_err(), "{wildcard}");
         }
     }
 

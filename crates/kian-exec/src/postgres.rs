@@ -208,6 +208,7 @@ pub(crate) async fn upsert_endpoint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upsert_endpoint_with_declaration(
     pool: &PgPool,
     endpoint_id: &str,
@@ -216,9 +217,10 @@ pub(crate) async fn upsert_endpoint_with_declaration(
     state: &str,
     description: Option<&str>,
     protocol_version: u32,
+    capabilities: &[String],
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version) VALUES ($1::text, $2::text, $3::bigint, $4::text, $5::text, $6::bigint)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = EXCLUDED.addr, last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, state = EXCLUDED.state, description = EXCLUDED.description, protocol_version = EXCLUDED.protocol_version",
+        "INSERT INTO endpoint_registry (endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version, capabilities) VALUES ($1::text, $2::text, $3::bigint, $4::text, $5::text, $6::bigint, $7::text)\n             ON CONFLICT(endpoint_id) DO UPDATE SET addr = EXCLUDED.addr, last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, state = EXCLUDED.state, description = EXCLUDED.description, protocol_version = EXCLUDED.protocol_version, capabilities = EXCLUDED.capabilities",
     )
     .bind(endpoint_id)
     .bind(addr)
@@ -226,6 +228,7 @@ pub(crate) async fn upsert_endpoint_with_declaration(
     .bind(state)
     .bind(description)
     .bind(i64::from(protocol_version))
+    .bind(serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".into()))
     .execute(pool)
     .await?;
     Ok(())
@@ -233,19 +236,26 @@ pub(crate) async fn upsert_endpoint_with_declaration(
 
 pub(crate) async fn endpoints(pool: &PgPool) -> Result<Vec<EndpointRegistryRow>, sqlx::Error> {
     let rows: Vec<RegistryRow> =
-        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version FROM endpoint_registry ORDER BY endpoint_id ASC")
+        sqlx::query_as("SELECT endpoint_id, addr, last_heartbeat_ms, state, description, protocol_version, capabilities FROM endpoint_registry ORDER BY endpoint_id ASC")
             .fetch_all(pool)
             .await?;
     Ok(rows
         .into_iter()
         .map(
-            |(endpoint_id, addr, hb, state, description, protocol_version)| EndpointRegistryRow {
-                endpoint_id,
-                addr,
-                last_heartbeat_ms: hb.max(0) as u64,
-                state,
-                description,
-                protocol_version: protocol_version.and_then(|v| u32::try_from(v).ok()),
+            |(endpoint_id, addr, hb, state, description, protocol_version, capabilities)| {
+                let capabilities = capabilities
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or_default();
+                EndpointRegistryRow {
+                    endpoint_id,
+                    addr,
+                    last_heartbeat_ms: hb.max(0) as u64,
+                    state,
+                    description,
+                    protocol_version: protocol_version.and_then(|v| u32::try_from(v).ok()),
+                    capabilities,
+                }
             },
         )
         .collect())

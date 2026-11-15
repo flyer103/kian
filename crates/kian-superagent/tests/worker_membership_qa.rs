@@ -266,6 +266,7 @@ fn view(id: &str, state: MemberState) -> MemberView {
         id: id.into(),
         description: Some(format!("the {id} QA worker")),
         version: Some(1),
+        capabilities: Vec::new(),
         declaration_stale: false,
         state,
         last_seen_ms: 10_000,
@@ -497,8 +498,10 @@ async fn qa_list_workers_deterministic_sorted_and_read_only() {
     // The static pin appears through the port seam (the real port
     // merges registry + directory + static pins), so the fake carries
     // it as a member view too.
+    let mut zeta = view("qa-zeta", MemberState::Offline);
+    zeta.capabilities = vec!["apple-calendar".into(), "apple-health".into()];
     let directory = QaDirectory::with(vec![
-        view("qa-zeta", MemberState::Offline),
+        zeta,
         view("qa-alpha", MemberState::Online),
         view("qa-mid", MemberState::Online),
         view("qa-static", MemberState::Offline),
@@ -530,6 +533,13 @@ async fn qa_list_workers_deterministic_sorted_and_read_only() {
     assert_eq!(workers[0]["state"], json!("online"));
     assert_eq!(workers[3]["state"], json!("offline"));
     assert!(workers[0]["description"].is_string());
+    // The config-owned capability catalog is a result-only field: it
+    // appears when declared and is absent (not null) otherwise.
+    assert_eq!(
+        workers[3]["capabilities"],
+        json!(["apple-calendar", "apple-health"])
+    );
+    assert!(workers[0].get("capabilities").is_none());
     for w in workers {
         assert!(w.get("bound_session").is_none() || w["bound_session"].is_null());
     }

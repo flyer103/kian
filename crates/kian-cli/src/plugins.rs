@@ -309,6 +309,7 @@ impl RegistrationSink for ExecRegistrationSink {
             let generation = worker.generation;
             let description = worker.description.clone();
             let protocol_version = worker.version;
+            let capabilities = worker.capabilities.clone();
             let transport = RouteTransport::Registered(RegisteredTransport::new(worker));
             backend
                 .attach_route_with_declaration(
@@ -317,6 +318,7 @@ impl RegistrationSink for ExecRegistrationSink {
                     generation,
                     description.as_deref(),
                     protocol_version,
+                    &capabilities,
                 )
                 .await;
         })
@@ -361,42 +363,52 @@ impl Plugin for RemoteExecPlugin {
         // Queue timeouts are per-endpoint in config; the backend takes
         // one — use the max so no endpoint's honest timeout is silently
         // shortened (the row's own abandonment timing stays the bound).
-        // Dynamic workers use the same backend-level bound (Q3: no new
-        // timeout knob).
-        let max_timeout = self
-            .endpoints
-            .iter()
-            .map(|ep| ep.queue_timeout_ms)
-            .max()
-            .unwrap_or(60_000);
+        // Dynamic workers contribute `workers.queue_timeout_ms`; the
+        // backend-level bound is global, so an intermittent worker's
+        // longer bound also lengthens the honest timeout of every queued
+        // command (documented trade-off).
+        let max_timeout = backend_queue_timeout(&self.endpoints, self.workers.as_ref());
         let config = RemoteExecConfig {
             queue_timeout: Duration::from_millis(max_timeout),
             poll_interval: Duration::from_millis(250),
         };
         // The dynamic-membership half (when `workers:` is configured):
-        // read the env-only token (fail-closed — the value never
-        // travels further than the redacting `WorkerToken`), build the
-        // shared directory, the listener over it, and the sink that
-        // attaches routes onto the backend below.
+        // read the env-only tokens (fail-closed — values never travel
+        // further than the redacting `WorkerToken`), build the shared
+        // directory, the listener over it, and the sink that attaches
+        // routes onto the backend below.
         let workers_services = match &self.workers {
             Some(workers) => {
-                let value = std::env::var(workers.token_env.trim())
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .ok_or_else(|| {
-                        apply_error(format!(
-                            "remote-exec: workers.token_env `{}` is not set (or blank) — \
-                             the shared worker token is env-only; set the variable and \
-                             restart `kian serve`",
-                            workers.token_env.trim()
-                        ))
-                    })?;
+                let read_token = |name: &str, field: &str| -> Result<WorkerToken, _> {
+                    std::env::var(name.trim())
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .map(WorkerToken::new)
+                        .ok_or_else(|| {
+                            apply_error(format!(
+                                "remote-exec: workers.{field} `{}` is not set (or blank) — \
+                                 worker tokens are env-only; set the variable and restart \
+                                 `kian serve`",
+                                name.trim()
+                            ))
+                        })
+                };
+                let shared = match workers.token_env.as_deref() {
+                    Some(name) => Some(read_token(name, "token_env")?),
+                    None => None,
+                };
+                let mut worker_tokens = std::collections::BTreeMap::new();
+                for (id, name) in &workers.tokens {
+                    worker_tokens.insert(id.clone(), read_token(name, "tokens")?);
+                }
                 let bind = workers
                     .listen_addr()
                     .map_err(|e| apply_error(format!("remote-exec: {}", e)))?;
-                let registration = RegistrationConfig::new(
+                let registration = RegistrationConfig::with_worker_tokens(
                     bind,
-                    WorkerToken::new(value),
+                    shared,
+                    worker_tokens,
+                    workers.enrolled_only,
                     workers.offline_after_ms,
                 )
                 .with_static_ids(self.endpoints.iter().map(|ep| ep.id.clone()).collect());
@@ -457,6 +469,21 @@ impl Plugin for RemoteExecPlugin {
         });
         ctx.provide::<RemoteExecServices>(services)
     }
+}
+
+/// The backend's single queue bound: the max over static pins and the
+/// dynamic `workers.queue_timeout_ms`. One value by construction — the
+/// global trade-off is recorded in ADR-028 D3 / WORKER-MODEL §4.
+fn backend_queue_timeout(
+    endpoints: &[crate::config::EndpointConfig],
+    workers: Option<&crate::config::WorkersConfig>,
+) -> u64 {
+    endpoints
+        .iter()
+        .map(|ep| ep.queue_timeout_ms)
+        .chain(workers.map(|w| w.queue_timeout_ms))
+        .max()
+        .unwrap_or(60_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,5 +1364,47 @@ impl Plugin for SuperAgentPlugin {
             watchdog: self.watchdog.clone(),
         });
         ctx.provide::<crate::superagent::SuperAgentServices>(services)
+    }
+}
+
+#[cfg(test)]
+mod backend_queue_timeout_tests {
+    use super::backend_queue_timeout;
+    use crate::config::{EndpointConfig, WorkersConfig};
+
+    fn endpoint(id: &str, timeout: u64) -> EndpointConfig {
+        EndpointConfig {
+            id: id.into(),
+            addr: "127.0.0.1:1".into(),
+            queue_timeout_ms: timeout,
+            offline_after_ms: 30_000,
+            description: None,
+        }
+    }
+
+    fn workers(timeout: u64) -> WorkersConfig {
+        WorkersConfig {
+            listen: "127.0.0.1:7400".into(),
+            token_env: Some("T".into()),
+            offline_after_ms: 30_000,
+            allow_public: false,
+            queue_timeout_ms: timeout,
+            enrolled_only: false,
+            tokens: Default::default(),
+        }
+    }
+
+    #[test]
+    fn takes_the_max_of_static_and_dynamic_bounds() {
+        assert_eq!(backend_queue_timeout(&[], None), 60_000);
+        assert_eq!(backend_queue_timeout(&[endpoint("a", 5_000)], None), 5_000);
+        assert_eq!(
+            backend_queue_timeout(&[endpoint("a", 5_000)], Some(&workers(600_000))),
+            600_000
+        );
+        assert_eq!(
+            backend_queue_timeout(&[endpoint("a", 900_000)], Some(&workers(600_000))),
+            900_000
+        );
     }
 }

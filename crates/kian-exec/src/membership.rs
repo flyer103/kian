@@ -33,6 +33,10 @@ pub struct MemberSnapshot {
     pub description: Option<String>,
     /// The worker's declared protocol revision.
     pub version: u32,
+    /// The sanitized capabilities declared in this registration (v3,
+    /// ADR-029). Config-independent live facts; the durable cache keeps
+    /// the last declaration for registry-only ids.
+    pub capabilities: Vec<String>,
     /// +1 on every accepted registration (replace included).
     pub generation: u64,
     pub max_concurrent: u32,
@@ -85,6 +89,7 @@ pub fn valid_description(description: &str) -> bool {
 pub(crate) struct MemberEntry {
     pub(crate) description: Option<String>,
     pub(crate) version: u32,
+    pub(crate) capabilities: Vec<String>,
     pub(crate) generation: u64,
     pub(crate) max_concurrent: u32,
     pub(crate) peer_addr: SocketAddr,
@@ -100,6 +105,7 @@ impl MemberEntry {
             id: id.to_string(),
             description: self.description.clone(),
             version: self.version,
+            capabilities: self.capabilities.clone(),
             generation: self.generation,
             max_concurrent: self.max_concurrent,
             peer_addr: self.peer_addr,
@@ -165,11 +171,13 @@ impl WorkerDirectory {
     /// Insert/replace a registration's directory entry with no live
     /// connection yet (spec §9.1 step 2). Returns the new generation
     /// (`+1` on every accepted registration, replace included).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
         id: &str,
         description: Option<String>,
         version: u32,
+        capabilities: Vec<String>,
         max_concurrent: u32,
         peer_addr: SocketAddr,
         last_seen_ms: u64,
@@ -184,6 +192,7 @@ impl WorkerDirectory {
             MemberEntry {
                 description,
                 version,
+                capabilities,
                 generation,
                 max_concurrent,
                 peer_addr,
@@ -260,6 +269,7 @@ mod tests {
             id: "builder-1".into(),
             description: Some("linux builder".into()),
             version: 1,
+            capabilities: Vec::new(),
             generation: 1,
             max_concurrent: 4,
             peer_addr: "127.0.0.1:50000".parse().unwrap(),

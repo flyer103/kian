@@ -1435,3 +1435,57 @@ the user saw 14 minutes of silence. The real result was discarded
 - **Gates on the final tree** — `cargo test --workspace` 123 suites green (1521 passed / 0 failed
   / 7 ignored), clippy `--workspace --all-targets -D warnings`, fmt `--all --check`, `docs_map`
   6/6.
+
+## 2026-11-15 — worker enrollment + worker-declared capabilities (ADR-031, ADR-032)
+
+A device worker (the iPhone design in [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md))
+exposed three gaps in the R12 worker domain; this change closes them with per-worker enrollment, a
+worker-declared capability list on the wire, and a configurable dynamic queue bound. ADR-031's
+config-owned capability catalog was superseded by ADR-032 before release; the final shape is
+wire-declared.
+
+- **Per-worker tokens (ADR-031 D1)** — `workers.token_env` is now optional; `workers.tokens` maps an
+  id to its own env-var name. A listed id authenticates only against its own token (constant-time,
+  env-only, redacting); `workers.enrolled_only: true` admits only listed ids and forbids the shared
+  fallback. The R12 shared-token impersonation limitation **narrows** (a shared-token holder can no
+  longer replace an enrolled id); it does not disappear in hybrid mode, and mTLS stays the R13 fix.
+  Refusals reuse `bad_token` — strict mode reveals nothing about whether an id is enrolled.
+- **Worker-declared capabilities (ADR-032, KiandProto v3)** — `register.capabilities` is an optional
+  list the worker sends about itself. The worker validates its own list at startup (lowercase
+  `[a-z0-9._-]`, 1..=64 bytes, ≤16, unique) and refuses to boot on a bad entry; the server
+  re-sanitizes (trim, drop invalid/duplicate/over-limit) with one audit line and the registration
+  still succeeds. The accepted list is the live directory fact for connected members and a new
+  nullable registry cache column (migration v5) for registry-only ids; `list_workers` and
+  `kian workers` serve the live or cached list, and the cached row's `declaration_stale` now covers
+  capabilities too. Result-only: never a prompt, a tool schema or an event. Static pins have no
+  declaration in v3 (`hello` unchanged) and omit the field.
+- **Dynamic queue bound (ADR-031 D3)** — `workers.queue_timeout_ms` joins the backend's single queue
+  bound (max over static pins and this value). The bound is global by construction: tuning it for an
+  intermittent phone also lengthens every queued command's honest timeout. Recorded, not hidden;
+  per-id timeouts/rebind remain out of scope.
+- **Config validation** — at least one token source; strict mode requires enrollment and forbids
+  `token_env`; token env names and worker ids validate fail-closed. The `workers.capabilities`
+  config field from the first phase is removed (one source: the worker's declaration).
+- **Wire + migration** — `PROTOCOL_VERSION` moves 2 → 3 in both halves; no compatibility shim (a v2
+  worker reads offline with rows parked). Registry migration v5 adds nullable `capabilities` TEXT on
+  sqlite and postgres; pre-v5 rows read as an empty list, and a registration that omits the key
+  clears the cache. No new event kind, table, HTTP route or ops method.
+- **Tests** — L1: config parse/validation matrix (enrolled form, strict-mode conflicts, timeout
+  zero), per-worker token accept/refuse over real loopback TCP (enrolled id rejects another id's
+  token and the shared token; strict mode refuses unlisted ids; hybrid fallback still works), the
+  v3 proto goldens in both halves, capability sanitization on the live directory, registry cache
+  round-trip/reopen/clear, `list_workers` capabilities + result-only/schema stability,
+  `kian workers` JSON/text agreement, and the backend timeout max. L2: a real `kian serve` + `kiand
+  --register-to --capability` registers the declared list and the real `kian workers --json` board
+  shows it online with the cached capabilities.
+- **Unverified (named)** — no iPhone app exists; a Rust/tokio worker inside iSH, background
+  suspension longevity, battery/performance and App Store review are unmeasured. A declaration is
+  not an execution proof: drift between the declared list and the worker's actual build is
+  undetected by construction. Token rotation/revocation and a real multi-device deployment are
+  untested. The global queue-bound trade-off is documented, not measured. Static-pin capabilities
+  (`hello.capabilities`) and capability-based spawn validation are non-goals. A workers-only
+  deployment (no `superagent:`) still does not start the registration listener — a pre-existing
+  startup-wiring gap, not introduced here.
+- **Gates on the final tree** — `cargo test --workspace` 123 suites green (1526 passed / 0 failed /
+  7 ignored; env-gated postgres/live suites skipped), `cargo clippy --workspace --all-targets --
+  -D warnings`, `cargo fmt --all -- --check`, and `docs_map` 6/6.

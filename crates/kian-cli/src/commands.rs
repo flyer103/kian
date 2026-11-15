@@ -978,6 +978,12 @@ pub struct WorkerRow {
     /// Last-declared protocol revision from the durable cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// The worker's last-declared **sanitized** capability list from the
+    /// durable registry cache (v3, ADR-029); omitted when the latest
+    /// declaration omitted it. Like `description`/`protocol_version`, it
+    /// is the durable declaration, not a live fact.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     /// `online` iff the registry row says `online` **and**
     /// `now - last_heartbeat_ms <= offline_after_ms` for this id (the
     /// conjunction of the transport view and freshness — D-L2).
@@ -1104,10 +1110,12 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
                 .get(&row.endpoint_id)
                 .map(|(s, t)| (Some(s.clone()), Some(t.clone())))
                 .unwrap_or((None, None));
+            let capabilities = row.capabilities;
             WorkerRow {
                 id: row.endpoint_id,
                 description: row.description,
                 protocol_version: row.protocol_version,
+                capabilities,
                 state,
                 last_seen_ms: row.last_heartbeat_ms,
                 bound_session,
@@ -1129,8 +1137,8 @@ fn render_workers(rows: &[WorkerRow], now_ms: u64) -> String {
         return "no workers registered in this store\n".into();
     }
     let mut out = format!(
-        "{:<24} {:<8} {:>18} {}\n",
-        "WORKER", "STATE", "LAST HEARTBEAT", "BOUND SESSION (THREAD)"
+        "{:<24} {:<8} {:>18} {:<28} {}\n",
+        "WORKER", "STATE", "LAST HEARTBEAT", "CAPABILITIES", "BOUND SESSION (THREAD)"
     );
     for row in rows {
         let binding = match (&row.bound_session, &row.bound_thread) {
@@ -1139,11 +1147,17 @@ fn render_workers(rows: &[WorkerRow], now_ms: u64) -> String {
             }
             _ => "-".into(),
         };
+        let capabilities = if row.capabilities.is_empty() {
+            "-".to_string()
+        } else {
+            row.capabilities.join(",")
+        };
         out.push_str(&format!(
-            "{:<24} {:<8} {:>18} {}\n",
+            "{:<24} {:<8} {:>18} {:<28} {}\n",
             row.id,
             row.state,
             format_age(now_ms.saturating_sub(row.last_seen_ms)),
+            capabilities,
             binding,
         ));
     }

@@ -29,7 +29,7 @@ const USAGE: &str = "usage:
                                          run the endpoint daemon (default listen: 127.0.0.1:0;
                                          the bound address is printed on stdout)
   kiand --register-to <kian-host:port> [--endpoint-id <id>] [--description <text>]
-        [--heartbeat-ms <n>] [--token-env <NAME>]
+        [--capability <name>]... [--heartbeat-ms <n>] [--token-env <NAME>]
                                          worker-dial register mode: dial kian, register with the
                                          token from the environment variable NAME
                                          (default KIAN_WORKER_TOKEN; only the NAME is on argv)
@@ -117,6 +117,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--register-to" => flags.register_to = Some(next_value(&mut iter, "--register-to")?),
             "--description" => flags.description = Some(next_value(&mut iter, "--description")?),
             "--token-env" => flags.token_env = Some(next_value(&mut iter, "--token-env")?),
+            "--capability" => flags
+                .capabilities
+                .push(next_value(&mut iter, "--capability")?),
             other => return Err(format!("unknown option `{other}`")),
         }
     }
@@ -185,6 +188,7 @@ async fn run_worker(config: Config) -> ExitCode {
         endpoint_id: config.endpoint_id.clone(),
         description: config.description.clone(),
         token,
+        capabilities: config.capabilities.clone(),
     };
     tracing::info!(
         endpoint = %config.endpoint_id,

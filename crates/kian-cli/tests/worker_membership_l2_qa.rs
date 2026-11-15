@@ -291,12 +291,13 @@ impl QaRawWorker {
             token: RegisterToken::new(token.into()),
             version,
             max_concurrent: 2,
+            capabilities: Vec::new(),
         };
         let mut line = encode_endpoint_frame(&register);
         line.push('\n');
         this.writer.write_all(line.as_bytes()).await.unwrap();
         match this.recv().await {
-            Some(ServerFrame::Welcome { v: 2, .. }) => Some(this),
+            Some(ServerFrame::Welcome { v: 3, .. }) => Some(this),
             other => {
                 // Surface the refusal frame through `last_refusal`.
                 if let Some(ServerFrame::Rejected { reason, .. }) = other {

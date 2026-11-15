@@ -116,6 +116,7 @@ fn qa_register(id: &str, token: &str, version: u32) -> EndpointFrame {
         token: RegisterToken::new(token.into()),
         version,
         max_concurrent: 3,
+        capabilities: Vec::new(),
     }
 }
 
@@ -176,7 +177,7 @@ fn qa_ok_result() -> ExecResult {
 
 #[test]
 fn qa_frame_goldens_v1_value_equality_and_round_trip() {
-    assert_eq!(PROTOCOL_VERSION, 2, "P1: server half is v2");
+    assert_eq!(PROTOCOL_VERSION, 3, "P1: server half is v3");
 
     // register, full: exact value shape (description present).
     let full = qa_register("builder-1", "t0ken-not-a-secret", PROTOCOL_VERSION);
@@ -187,7 +188,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
             "endpoint_id": "builder-1",
             "description": "qa probe worker",
             "token": "t0ken-not-a-secret",
-            "version": 2,
+            "version": 3,
             "max_concurrent": 3,
         })
     );
@@ -198,6 +199,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
         token: RegisterToken::new("t0ken-not-a-secret".into()),
         version: PROTOCOL_VERSION,
         max_concurrent: 4,
+        capabilities: Vec::new(),
     };
     let bare_value = serde_json::to_value(&bare).unwrap();
     assert_eq!(
@@ -206,7 +208,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
             "type": "register",
             "endpoint_id": "builder-1",
             "token": "t0ken-not-a-secret",
-            "version": 2,
+            "version": 3,
             "max_concurrent": 4,
         })
     );
@@ -230,13 +232,13 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
     assert_eq!(
         serde_json::to_value(&ServerFrame::Rejected {
             reason: RefusalReason::VersionMismatch,
-            detail: Some("server speaks KiandProto 2; worker announced 0".into()),
+            detail: Some("server speaks KiandProto 3; worker announced 0".into()),
         })
         .unwrap(),
         serde_json::json!({
             "type": "rejected",
             "reason": "version_mismatch",
-            "detail": "server speaks KiandProto 2; worker announced 0",
+            "detail": "server speaks KiandProto 3; worker announced 0",
         })
     );
     for (reason, wire) in [
@@ -271,7 +273,7 @@ fn qa_frame_goldens_v1_value_equality_and_round_trip() {
             heartbeat_ms: None,
         })
         .unwrap(),
-        serde_json::json!({"type": "welcome", "v": 2, "heartbeat_ms": null})
+        serde_json::json!({"type": "welcome", "v": 3, "heartbeat_ms": null})
     );
 
     // encode → decode line round-trip over every endpoint-frame variant.
@@ -380,7 +382,7 @@ async fn qa_register_refusal_matrix_and_welcome_cadence() {
             reason: RefusalReason::VersionMismatch,
             detail: Some(text),
         }) => assert_eq!(
-            text, "server speaks KiandProto 2; worker announced 0",
+            text, "server speaks KiandProto 3; worker announced 0",
             "P10: fixed template, versions only"
         ),
         other => panic!("version_mismatch must be typed, got {other:?}"),
@@ -476,6 +478,7 @@ async fn qa_clamp_and_description_drop_are_non_fatal() {
             token: RegisterToken::new(QA_TOKEN.into()),
             version: PROTOCOL_VERSION,
             max_concurrent: 0,
+            capabilities: Vec::new(),
         })
         .await;
     match client.recv().await {
@@ -678,7 +681,7 @@ fn qa_bind_policy_matrix() {
         30_000,
     );
     assert!(config.validate().is_err(), "blank token refuses");
-    config.token = WorkerToken::new(QA_TOKEN.into());
+    config.token = Some(WorkerToken::new(QA_TOKEN.into()));
     config.offline_after_ms = 0;
     assert!(config.validate().is_err(), "offline_after_ms == 0 refuses");
     config.offline_after_ms = 30_000;
@@ -798,6 +801,7 @@ impl QaFakeRoute {
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
         let worker = kian_exec::registration::RegisteredWorker {
             description: None,
+            capabilities: Vec::new(),
             id: id.to_string(),
             generation: 1,
             peer_addr: "127.0.0.1:59999".parse().unwrap(),

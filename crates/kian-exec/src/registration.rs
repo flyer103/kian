@@ -68,6 +68,8 @@ pub struct RegisteredWorker {
     /// sink caches it on the registry; `None` means the declaration
     /// omitted it (or it was dropped as invalid).
     pub description: Option<String>,
+    /// The sanitized capability declaration (v3, ADR-029).
+    pub capabilities: Vec<String>,
     pub max_concurrent: u32,
     pub writer: mpsc::Sender<ServerFrame>,
     pub inbound: mpsc::Receiver<EndpointFrame>,
@@ -228,7 +230,17 @@ struct ListenerState {
 /// Configuration of the registration listener.
 pub struct RegistrationConfig {
     pub bind: SocketAddr,
-    pub token: WorkerToken,
+    /// The shared fallback token (legacy single-token mode). `None`
+    /// means strict enrollment: only `worker_tokens` ids may register.
+    pub token: Option<WorkerToken>,
+    /// Per-worker credentials (`id -> token`). A listed id authenticates
+    /// with its own token and never accepts the shared fallback; an
+    /// unlisted id falls back to `token` unless `enrolled_only`.
+    pub worker_tokens: BTreeMap<String, WorkerToken>,
+    /// Strict admission: only `worker_tokens` ids are admitted. Requires
+    /// a non-empty map and forbids a shared token (config validation
+    /// enforces the same rule fail-closed).
+    pub enrolled_only: bool,
     /// Liveness bound; the welcome cadence is `max(1, offline_after_ms/3)`
     /// (P6).
     pub offline_after_ms: u64,
@@ -243,10 +255,35 @@ pub struct RegistrationConfig {
 }
 
 impl RegistrationConfig {
+    /// The legacy/shared-token form (one token for every admitted id).
     pub fn new(bind: SocketAddr, token: WorkerToken, offline_after_ms: u64) -> Self {
         Self {
             bind,
+            token: Some(token),
+            worker_tokens: BTreeMap::new(),
+            enrolled_only: false,
+            offline_after_ms,
+            static_ids: Vec::new(),
+            allow_public: false,
+            register_deadline: REGISTER_DEADLINE,
+            slot_wait: REGISTER_SLOT_WAIT,
+        }
+    }
+
+    /// The enrollment form: optional shared fallback plus per-worker
+    /// tokens. `enrolled_only` makes the map the complete admission set.
+    pub fn with_worker_tokens(
+        bind: SocketAddr,
+        token: Option<WorkerToken>,
+        worker_tokens: BTreeMap<String, WorkerToken>,
+        enrolled_only: bool,
+        offline_after_ms: u64,
+    ) -> Self {
+        Self {
+            bind,
             token,
+            worker_tokens,
+            enrolled_only,
             offline_after_ms,
             static_ids: Vec::new(),
             allow_public: false,
@@ -266,10 +303,58 @@ impl RegistrationConfig {
         if self.offline_after_ms == 0 {
             return Err("workers.offline_after_ms must be > 0".into());
         }
-        if self.token.as_str().trim().is_empty() {
+        if self.token.is_none() && self.worker_tokens.is_empty() {
+            return Err(
+                "workers: one of the shared token or the per-worker token map is required".into(),
+            );
+        }
+        if self.enrolled_only {
+            if self.worker_tokens.is_empty() {
+                return Err("workers.enrolled_only requires a non-empty token map".into());
+            }
+            if self.token.is_some() {
+                return Err("workers.enrolled_only forbids the shared token".into());
+            }
+        }
+        if let Some(token) = &self.token
+            && token.as_str().trim().is_empty()
+        {
             return Err("the worker token is absent or blank".into());
         }
+        for (id, token) in &self.worker_tokens {
+            if !valid_worker_id(id) {
+                return Err(format!(
+                    "workers.tokens `{id}`: worker ids are 1..=200 bytes after trim, \
+                     no control characters"
+                ));
+            }
+            if token.as_str().trim().is_empty() {
+                return Err(format!(
+                    "workers.tokens `{id}`: the token is absent or blank"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Constant-time admission decision for one presented token.
+    ///
+    /// An enrolled id is checked only against its own token; an
+    /// unlisted id falls back to the shared token (legacy mode) or is
+    /// refused (`enrolled_only`). A listed id never accepts the shared
+    /// token, so a shared-token holder cannot replace an enrolled
+    /// worker's connection.
+    fn admits(&self, endpoint_id: &str, presented: &[u8]) -> bool {
+        if let Some(expected) = self.worker_tokens.get(endpoint_id) {
+            return constant_time_eq(presented, expected.as_str().as_bytes());
+        }
+        if self.enrolled_only {
+            return false;
+        }
+        match &self.token {
+            Some(shared) => constant_time_eq(presented, shared.as_str().as_bytes()),
+            None => false,
+        }
     }
 }
 
@@ -438,14 +523,22 @@ impl RegistrationListener {
         // deadline.
         let first =
             tokio::time::timeout(self.config.register_deadline, next_frame(&mut lines)).await;
-        let (endpoint_id, description, token, version, max_concurrent) = match first {
+        let (endpoint_id, description, token, version, max_concurrent, capabilities) = match first {
             Ok(Some(EndpointFrame::Register {
                 endpoint_id,
                 description,
                 token,
                 version,
                 max_concurrent,
-            })) => (endpoint_id, description, token, version, max_concurrent),
+                capabilities,
+            })) => (
+                endpoint_id,
+                description,
+                token,
+                version,
+                max_concurrent,
+                capabilities,
+            ),
             _ => {
                 tracing::warn!(peer = %peer, "protocol: first frame must be register; closing");
                 return; // no reply frame, no half-registered state
@@ -465,10 +558,7 @@ impl RegistrationListener {
             .await;
             return;
         }
-        if !constant_time_eq(
-            token.as_str().as_bytes(),
-            self.config.token.as_str().as_bytes(),
-        ) {
+        if !self.config.admits(&endpoint_id, token.as_str().as_bytes()) {
             self.count_refusal(peer);
             self.refuse(&mut writer, peer, RefusalReason::BadToken, None)
                 .await;
@@ -511,6 +601,21 @@ impl RegistrationListener {
             }
             None => None,
         };
+
+        // v3 (ADR-029): sanitize the declaration; invalid/duplicate
+        // entries are dropped with an audit line, never a new refusal
+        // reason (a worker's own bad list must not brick registration).
+        let declared = capabilities.len();
+        let capabilities = kian_core::worker::sanitize_capabilities(&capabilities);
+        if capabilities.len() != declared {
+            tracing::warn!(
+                endpoint_id = %endpoint_id,
+                peer = %peer,
+                declared,
+                accepted = capabilities.len(),
+                "dropped invalid, duplicate or over-limit capability declarations"
+            );
+        }
 
         // P8: clamp the announced cap.
         let max_concurrent = if max_concurrent == 0 {
@@ -562,6 +667,7 @@ impl RegistrationListener {
             &endpoint_id,
             description.clone(),
             version,
+            capabilities.clone(),
             max_concurrent,
             peer,
             now,
@@ -580,6 +686,7 @@ impl RegistrationListener {
                 peer_addr: peer,
                 version,
                 description: description.clone(),
+                capabilities: capabilities.clone(),
                 max_concurrent,
                 writer: writer_tx.clone(),
                 inbound: inbound_rx,

@@ -50,9 +50,10 @@ The same runtime also ships:
   re-derived from the stream): worker restarts, migrations and server reboots keep the
   binding; a busy or unknown worker refuses honestly.
 - **Runtime worker membership** — workers join and leave a running server without config edits
-  or restarts: `kiand --register-to` authenticates on a private, token-gated listener and the
-  connection becomes the command route; commands queue durably per worker id while one is
-  offline, `list_workers` exposes the live catalog, and join/leave never changes a prompt byte.
+  or restarts: `kiand --register-to` authenticates on a private listener (shared token or
+  per-worker enrollment) and the connection becomes the command route; commands queue durably per
+  worker id while one is offline, `list_workers` exposes the live catalog including an
+  worker-declared capability list, and join/leave never changes a prompt byte.
 - **Worker filesystem tools** — `fs_list`/`fs_read`/`fs_write` execute on the **bound worker's**
   machine (its `--workspace-root`, a lexical path guard, 1 MiB bounds) with the same schemas and
   result shapes as the local built-ins; the durable queue, 1:1 binding and no-failover rules are
@@ -111,6 +112,7 @@ The same runtime also ships:
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Running postgres mode and the multi-replica replay |
+| [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md) | iPhone worker design, repo placement, enrollment and the verification matrix |
 | [a vendored archive/](a vendored archive/) | Frozen snapshots of the design inputs (read-only) |
 | [CHANGELOG.md](CHANGELOG.md) | What landed when, and what is env-gated |
 
@@ -469,13 +471,26 @@ workers:                       # absent = dynamic membership off (byte-identical
   token_env: KIAN_WORKER_TOKEN # env-only shared token; the value never lives in the file
 ```
 
+For per-device credentials, enroll workers by id (ADR-031); the worker declares its capabilities on `register` (ADR-032):
+
+```yaml
+workers:
+  listen: "127.0.0.1:7400"
+  enrolled_only: true          # only listed ids; forbids the shared token
+  tokens:                      # id -> env var name (values stay env-only)
+    iphone: KIAN_IPHONE_TOKEN
+    mac-mini: KIAN_MAC_MINI_TOKEN
+  queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
+```
+
 ```bash
 export KIAN_WORKER_TOKEN=...   # unset/blank refuses server startup (fail-closed)
 # on the worker machine (reach the listener over an SSH tunnel or Tailscale):
 cargo run -p kiand -- --register-to 127.0.0.1:7400 --endpoint-id mac-mini \
-  --description "local macOS dev machine" --workspace-root .   # registers over
-                                            # KiandProto v2; the connection becomes the command route
-kian workers                   # read-only operator view: id, state, bound session
+  --description "local macOS dev machine" --workspace-root . \
+  --capability exec --capability fs          # registers over KiandProto v3; capabilities
+                                            # are cached for list_workers / kian workers
+kian workers                   # read-only operator view: id, state, capabilities, bound session
 ```
 
 Joining makes the worker spawnable immediately (`list_workers` shows it `online`); leaving —
@@ -487,10 +502,12 @@ refused), and membership changes never touch a prompt or tool-schema byte.
 Reaching a server on another machine: the listener accepts only a private bind, so a laptop reaches
 a remote `kian serve` through an SSH tunnel (`ssh -N -L 7400:127.0.0.1:7400 <server>`, then
 `--register-to 127.0.0.1:7400`) or over Tailscale — its `100.64.0.0/10` addresses are in the
-private set. `workers.allow_public: true` exists as an explicit escape hatch, but it exposes a
-command-execution surface under one shared token; a tunnel is the supported shape. A worker on the
-server itself is an ordinary static `endpoints:` pin (kian dials it, so it needs no token), and the
-local worker's `--description` is what the Router sees in `list_workers` when it picks a machine.
+private set. The enrolled example above uses the per-worker variables instead of the shared
+`KIAN_WORKER_TOKEN`. `workers.allow_public: true` exists as an explicit escape hatch, but it exposes
+a command-execution surface under the shared token (or an enrolled worker's own token); a tunnel is
+the supported shape. A worker on the server itself is an ordinary static `endpoints:` pin (kian
+dials it, so it needs no token), and the local worker's `--description` is what the Router sees in
+`list_workers` when it picks a machine.
 
 ### Postgres and multi-replica
 
