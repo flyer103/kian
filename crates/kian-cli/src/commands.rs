@@ -1411,6 +1411,465 @@ pub(crate) async fn ticket_rows_from(
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// task board — the delegation task view's honest derivation (R17 C4,
+// MULTIAGENT-MODEL §4.2/§4.3, pin P3-3)
+// ---------------------------------------------------------------------------
+
+/// The completion-verification evidence pointer on one board row
+/// (§4.3:497-505): **derived** from the child's own committed
+/// `evidence/verdict` — `{gate, passed, seq}` where `seq` is the
+/// verdict's own seq on the child's stream. In P3 this is a pointer
+/// the board computed itself; the durable per-task link (`evidence_ref`,
+/// §7.2) does not exist until P4, so the row carries
+/// `evidence_provenance: "derived"` and **never** a fabricated
+/// `evidence_ref` key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskEvidence {
+    /// The gate that committed the verdict (`"worker"`).
+    pub gate: String,
+    pub passed: bool,
+    /// The verdict's seq on the child's stream.
+    pub seq: u64,
+}
+
+/// One row of the task board: **one row per task** (not per session),
+/// `BTreeMap`-ordered by `task_id` (pin P3-3). `task_id`/`spawn_uid`/
+/// `assignee` come from the child's committed delegation wrapper (the
+/// class-B bytes `WorkerSpawner::prepare` recorded at spawn time);
+/// `outcome` is [`kian_superagent::derive_outcome`] over the child's
+/// own stream plus the parent's durable report row (never typed by the
+/// child, never inferred from prose — §4.3:504-505, §6.3:705-708);
+/// `gate`/`evidence` read the child's last worker-gate verdict.
+///
+/// P3 constants: `group` is `null` and `depends_on` is `[]` — no event
+/// bytes carry them until P4 (§7.3:788-789); C7 fills them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TaskBoardRow {
+    pub task_id: String,
+    /// The parent (spawning) session, off the `thread/started` payload.
+    pub parent: String,
+    /// The child (worker) session that serves the thread.
+    pub child: String,
+    /// The delegated thread id.
+    pub thread: String,
+    /// The roster entry id the wrapper recorded (P2 class-B key;
+    /// absent — serialized `null` — while the P2 roster has not landed).
+    pub assignee: Option<String>,
+    /// 1 + the count of `thread/started` on the parent's stream
+    /// carrying the same `task_id` under a *different* thread (§1's
+    /// retry ordinal; always 1 while `task_id` is per-spawn).
+    pub attempt: u64,
+    /// [`kian_superagent::TaskOutcome::as_str`], or `"outstanding"`
+    /// when no outcome is derivable (a missing completion means
+    /// outstanding, never `failed` — §6.3).
+    pub outcome: String,
+    /// Latest `thread/completed` status, or `outstanding`.
+    pub thread_status: String,
+    /// `"pass"` | `"fail"` | `"absent"` — the child's last worker-gate
+    /// verdict (§4.3:497-505).
+    pub gate: String,
+    /// The derived evidence pointer, `null` when no verdict exists.
+    pub evidence: Option<TaskEvidence>,
+    /// `"derived"` in P3 (pin P3-4): the verdict is read off the
+    /// child's own stream; the durable link is P4's.
+    pub evidence_provenance: String,
+    /// `null` in P3 — no bytes carry a group yet.
+    pub group: Option<String>,
+    /// `[]` in P3 — no bytes carry dependencies yet.
+    pub depends_on: Vec<String>,
+}
+
+/// The task board's own change trigger (R17 C4): the kinds its folds
+/// read — a **separate** set from [`board_event_kind_names`]
+/// (`ticket_stage`'s trigger, whose byte behaviour must not shift).
+/// `input/admitted` is here because the parent's inbox report rows and
+/// the child's wrapper admission feed `input_required` and discovery.
+pub(crate) fn task_board_event_kind_names() -> [&'static str; 5] {
+    [
+        "thread/started",
+        "thread/completed",
+        "evidence/verdict",
+        "session/ended",
+        "input/admitted",
+    ]
+}
+
+/// Whether one event feeds the task board's folds — the change trigger
+/// for the `task_board` view (the companion of [`is_board_event`],
+/// kept separate on purpose).
+pub(crate) fn is_task_board_event(event: &Event) -> bool {
+    matches!(
+        event.kind,
+        EventKind::ThreadStarted
+            | EventKind::ThreadCompleted
+            | EventKind::EvidenceVerdict
+            | EventKind::SessionEnded { .. }
+            | EventKind::InputAdmitted
+    )
+}
+
+/// The `task_id` a `thread/started`'s task wrapper carries, if any
+/// (the discovery key; `None` on legacy wrappers — no identity, no
+/// task row in v0).
+fn started_task_id(event: &Event) -> Option<&str> {
+    event
+        .bytes
+        .get("task")
+        .and_then(|t| t.get("content"))
+        .and_then(|w| w.get("task_id"))
+        .and_then(Value::as_str)
+}
+
+/// The honest full-stream task-board derivation: every stream rebuilt,
+/// one row per discovered task. This is both the fallback the operator
+/// surfaces use **and** the `task_board` view's build mechanism — one
+/// function, so view == full derivation by construction (READ-MODEL
+/// §6 rebuild-equivalence). Deterministic: rows in `task_id` order
+/// (the `BTreeMap`), which is also the published `view_rows` order.
+/// (`pub` for the integration tests that pin that equivalence.)
+pub async fn task_board_rows(store: &EventStore) -> CmdResult<Vec<TaskBoardRow>> {
+    let sessions = crate::cache_metrics::sessions_with_events(store)
+        .await
+        .map_err(|e| format!("session listing: {e}"))?;
+    let mut streams = std::collections::BTreeMap::new();
+    for session in &sessions {
+        let events = store
+            .rebuild(*session)
+            .await
+            .map_err(|e| format!("read events for {session:?}: {e}"))?;
+        streams.insert(*session, events);
+    }
+    task_board_rows_from(store, &streams).await
+}
+
+/// The pure-ish core of the task-board derivation over already-read
+/// streams (the `ticket_rows_from` shape): `streams` carries the full
+/// streams of the discovered children (the only streams whose non-
+/// task-board kinds — `turn/end` error classes, `control/interrupt` —
+/// the outcome fold reads) plus at least the `thread/started` events
+/// of every parent (discovery and the `attempt` ordinal read those
+/// only, so a kind-filtered parent subset is an equivalent input). The
+/// only store access left is the parents' durable inbox report rows
+/// (pin P3-5, read live through [`EventStore::input_rows`] — consumed
+/// rows included).
+pub(crate) async fn task_board_rows_from(
+    store: &EventStore,
+    streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
+) -> CmdResult<Vec<TaskBoardRow>> {
+    /// The discovery facts of one spawn of a task, off its committed
+    /// wrapper.
+    struct TaskSpawn {
+        spawn_uid: uuid::Uuid,
+        parent: SessionId,
+        child: SessionId,
+        thread: uuid::Uuid,
+        assignee: Option<String>,
+        /// The seq of the parent-side `thread/started` for THIS spawn
+        /// (`None` when only the child side was read) — the ordering
+        /// authority for which spawn is the current attempt.
+        parent_seq: Option<u64>,
+    }
+    // Discovery: every thread/started whose task message content
+    // parses as a wrapper carrying the derived identity. Both sides
+    // of one spawn carry identical task bytes, so spawns dedupe by
+    // thread; a task (one `task_id`) may carry several spawns — the
+    // P2 retry shape — of which the latest parent-side one is the
+    // current attempt (§1:177-179).
+    let mut tasks: std::collections::BTreeMap<String, Vec<TaskSpawn>> =
+        std::collections::BTreeMap::new();
+    for (session, events) in streams {
+        for event in events.iter().filter(|e| e.kind == EventKind::ThreadStarted) {
+            let Some(wrapper) = event.bytes.get("task").and_then(|t| t.get("content")) else {
+                continue;
+            };
+            let Some(identity) = kian_superagent::worker::spawn_identity_of(wrapper) else {
+                continue; // legacy delegation: no identity, no task row (v0)
+            };
+            let (Some(parent), Some(child), Some(thread)) = (
+                event
+                    .bytes
+                    .get("parent")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| uuid::Uuid::parse_str(raw).ok()),
+                event
+                    .bytes
+                    .get("worker")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| uuid::Uuid::parse_str(raw).ok()),
+                event
+                    .bytes
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| uuid::Uuid::parse_str(raw).ok()),
+            ) else {
+                continue; // malformed lineage: never guessed
+            };
+            let parent = SessionId(parent);
+            let spawns = tasks.entry(identity.task_id_str()).or_default();
+            if let Some(existing) = spawns.iter_mut().find(|s| s.thread == thread) {
+                // The other side of the same spawn: keep the facts,
+                // but record the parent-side seq when THIS is the
+                // parent's own event (the ordering authority for the
+                // current attempt — whichever stream iterates first).
+                if *session == parent {
+                    existing.parent_seq = Some(event.seq);
+                }
+                continue;
+            }
+            let assignee = wrapper
+                .get("assignee")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            spawns.push(TaskSpawn {
+                spawn_uid: identity.spawn_uid,
+                parent,
+                child: SessionId(child),
+                thread,
+                assignee,
+                parent_seq: (*session == parent).then_some(event.seq),
+            });
+        }
+    }
+
+    let mut rows = Vec::with_capacity(tasks.len());
+    for (task_id, mut spawns) in tasks {
+        // The current attempt: the latest parent-side spawn (§1's
+        // ordinal lives on the parent's stream; the thread id is the
+        // deterministic tie-break).
+        spawns.sort_by_key(|s| (s.parent_seq.unwrap_or(0), s.thread));
+        let current = spawns
+            .last()
+            .expect("a discovered task carries at least one spawn");
+        let parent_session = current.parent;
+        let child_events = streams.get(&current.child).cloned().unwrap_or_default();
+        // The retry ordinal (§1): 1 + the parent's thread/started
+        // carrying the same task_id under a DIFFERENT thread (each
+        // attempt is its own derived thread; the parent-side events
+        // are one per spawn, so the count is the prior-attempt count).
+        let thread_str = current.thread.to_string();
+        let prior_attempts = streams
+            .get(&parent_session)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|e| e.kind == EventKind::ThreadStarted)
+                    .filter(|e| started_task_id(e) == Some(task_id.as_str()))
+                    .filter(|e| {
+                        e.bytes.get("thread_id").and_then(Value::as_str)
+                            != Some(thread_str.as_str())
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        // The one non-event input (pin P3-5): the parent's durable
+        // report row for THIS spawn, read by idempotency key — the
+        // row's structured `state:"waiting"` is the `input_required`
+        // carrier; prose is never parsed.
+        let report_key = format!("spawn:{}", current.spawn_uid);
+        let own_report = store
+            .input_rows(parent_session)
+            .await
+            .map_err(|e| format!("task board inbox read: {e}"))?
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some(report_key.as_str()))
+            .and_then(|row| kian_superagent::worker::parse_thread_report(&row.payload));
+        let outcome = kian_superagent::derive_outcome(&child_events, own_report.as_ref())
+            .map_or_else(|| "outstanding".to_string(), |o| o.as_str().to_string());
+        let thread_status = child_events
+            .iter()
+            .rev()
+            .find(|e| e.kind == EventKind::ThreadCompleted)
+            .and_then(|e| e.bytes.get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "outstanding".to_string());
+        // Completion verification (§4.3:497-505): the child's last
+        // worker-gate verdict, labeled DERIVED — never a fabricated
+        // durable link, never inferred from the report's prose.
+        let verdict = child_events.iter().rev().find(|e| {
+            e.kind == EventKind::EvidenceVerdict
+                && e.bytes.get("gate").and_then(Value::as_str)
+                    == Some(kian_superagent::worker::WORKER_GATE_NAME)
+        });
+        let (gate, evidence) = match verdict {
+            Some(v) => {
+                let passed = v
+                    .bytes
+                    .get("passed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                (
+                    if passed { "pass" } else { "fail" }.to_string(),
+                    Some(TaskEvidence {
+                        gate: kian_superagent::worker::WORKER_GATE_NAME.to_string(),
+                        passed,
+                        seq: v.seq,
+                    }),
+                )
+            }
+            None => ("absent".to_string(), None),
+        };
+        rows.push(TaskBoardRow {
+            parent: parent_session.0.to_string(),
+            child: current.child.0.to_string(),
+            thread: current.thread.to_string(),
+            assignee: current.assignee.clone(),
+            attempt: 1 + prior_attempts,
+            task_id,
+            outcome,
+            thread_status,
+            gate,
+            evidence,
+            evidence_provenance: "derived".to_string(),
+            group: None,
+            depends_on: Vec::new(),
+        });
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// board / tasks — the task board's read-only operator surface (R17 C5,
+// MULTIAGENT-MODEL §4.2, pins P3-1/P3-2/P3-3)
+// ---------------------------------------------------------------------------
+
+/// The refusal both P3 verbs share (pin P3-2): the board switch is
+/// off, so nothing is served — no view read, no stream scan, no rows.
+const BOARD_DISABLED: &str = "board is disabled: superagent.board.enabled is false \
+     (set superagent.board.enabled: true in kian.yaml to serve the task board)";
+
+/// The two switches the verbs compose (pin P3-1):
+/// `superagent.board.enabled` (the feature switch — it alone allows
+/// any board output) and `read_model.views.enabled` (the view
+/// machinery switch READ-MODEL owns; it only picks the serving path).
+/// Fail-closed: a config that cannot load is an honest error, never a
+/// silent default — the board cannot be on without it.
+fn board_switches(config_path: &Path) -> CmdResult<(bool, bool)> {
+    let cfg = ServeConfig::load(config_path)
+        .map_err(|e| format!("cannot load config `{}`: {e}", config_path.display()))?;
+    let board_on = cfg
+        .superagent
+        .as_ref()
+        .map(|sa| sa.board_config().map(|b| b.enabled).unwrap_or(false))
+        .unwrap_or(false);
+    Ok((board_on, cfg.read_model.views.enabled))
+}
+
+/// The rows both verbs serve (the READ-MODEL §6/§8 rule): the fresh
+/// `task_board` view when the composed gate is on and the view is
+/// fresh; the honest full-stream derivation otherwise. On any doubt
+/// (stale store key, digest mismatch, an undecodable row) the stream
+/// answers — the operator never learns which path served.
+async fn served_task_rows(store: &EventStore, views_gate: bool) -> CmdResult<Vec<TaskBoardRow>> {
+    if views_gate {
+        let served = crate::views::fresh_task_board(store)
+            .await
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .map(|e| e.to_row())
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            });
+        if let Some(rows) = served {
+            return Ok(rows);
+        }
+    }
+    task_board_rows(store).await
+}
+
+/// `kian board [--db <sqlite>] [--config <path>] [--json]` — the
+/// read-only delegation task board (MULTIAGENT-MODEL §4.2/§4.3, R17
+/// C5): one row per task in `task_id` order (pin P3-3). Refuses with
+/// exit 2 naming `superagent.board.enabled` while the switch is off —
+/// **before** any store path is touched (pin P3-1: a nonexistent
+/// `--db` still gets the refusal, never a store error). Served from
+/// the fresh `task_board` view when `read_model.views.enabled` is also
+/// on (the declared staleness bound is then the rebuild interval,
+/// READ-MODEL §6); the honest full-stream derivation is the
+/// always-allowed fallback (§8). Read-only discipline
+/// (`open_read_only`): no writes, no wakes, no ops RPC.
+pub async fn run_board(config_path: &Path, db: Option<&Path>, json: bool) -> CmdResult<String> {
+    let (board_on, views_on) = board_switches(config_path)?;
+    if !board_on {
+        return Err(BOARD_DISABLED.to_string());
+    }
+    let db = resolve_db(db, config_path)?;
+    let store = open_reader(&db).await?;
+    let rows = served_task_rows(&store, views_on).await?;
+    store.close().await;
+    render_task_surface(&rows, json, true)
+}
+
+/// `kian tasks --all [--db <sqlite>] [--config <path>] [--json]` — the
+/// same rows, flat: one line per task, no header (pin P3-2; the bare
+/// `kian tasks` form is refused with usage by the verb itself). Same
+/// board gate (refusal before the store), same read-only discipline,
+/// same view-first/stream-fallback rule as [`run_board`].
+pub async fn run_tasks(config_path: &Path, db: Option<&Path>, json: bool) -> CmdResult<String> {
+    let (board_on, views_on) = board_switches(config_path)?;
+    if !board_on {
+        return Err(BOARD_DISABLED.to_string());
+    }
+    let db = resolve_db(db, config_path)?;
+    let store = open_reader(&db).await?;
+    let rows = served_task_rows(&store, views_on).await?;
+    store.close().await;
+    render_task_surface(&rows, json, false)
+}
+
+/// Renders the rows for both verbs: the shared line shape, with the
+/// board's header when `headered` (`kian tasks --all` prints the same
+/// lines flat, without it). Deterministic — a pure function of the
+/// rows, which are already in `task_id` order (the `BTreeMap`, pin
+/// P3-3). `--json` emits the frozen document `{now_ms, version,
+/// tasks}` where `version` is the event schema version the rows were
+/// derived under (`SCHEMA_VERSION` — the same constant every stored
+/// event carries).
+fn render_task_surface(rows: &[TaskBoardRow], json: bool, headered: bool) -> CmdResult<String> {
+    if json {
+        let report = json!({
+            "now_ms": now_ms(),
+            "version": kian_core::events::SCHEMA_VERSION,
+            "tasks": rows,
+        });
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    if rows.is_empty() {
+        return Ok("no tasks (no thread/started lineage in this store)\n".into());
+    }
+    let mut out = String::new();
+    if headered {
+        out.push_str(&format!(
+            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24}\n",
+            "TASK_ID", "ASSIGNEE", "ATTEMPT", "OUTCOME", "STATUS", "GATE", "EVIDENCE"
+        ));
+    }
+    for row in rows {
+        let evidence = match &row.evidence {
+            Some(e) => format!(
+                "{}@{} ({})",
+                if e.passed { "pass" } else { "fail" },
+                e.seq,
+                row.evidence_provenance
+            ),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24}\n",
+            row.task_id,
+            row.assignee.as_deref().unwrap_or("-"),
+            row.attempt,
+            row.outcome,
+            row.thread_status,
+            row.gate,
+            evidence,
+        ));
+    }
+    Ok(out)
+}
+
 /// Human age from ms, deterministic formatting: the two most
 /// significant units (`2h13m`, `45s`, `0s`).
 fn format_age(age_ms: u64) -> String {

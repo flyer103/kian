@@ -20,6 +20,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
   Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
   [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
+- **Delegation task board — the read-only operator surface (round 17, kian-R17 C5)**. Two new
+  `kian` verbs over the fifth view's rows (R17 C4): `kian board [--db] [--config] [--json]`
+  renders one row per delegated task (`task_id`, `assignee`, `attempt`, `outcome`,
+  `thread_status`, `gate`, the derived evidence pointer) in deterministic `task_id` order, and
+  `kian tasks --all` prints the same rows flat (`--all` is required in v1; the bare form refuses
+  with usage). Both are strictly read-only (`open_read_only` — no events, no inbox writes, no
+  view updates, no ops RPC), served from the fresh `task_board` view when
+  `superagent.board.enabled` and `read_model.views.enabled` are both on (the declared staleness
+  bound is the rebuild interval) and from the honest full-stream derivation otherwise — identical
+  operator output on both paths. `--json` emits the frozen document `{now_ms, version, tasks}`
+  (pin P3-3's row key set exactly; absent facts are never fabricated — `evidence_provenance`
+  stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
+  refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
 
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,

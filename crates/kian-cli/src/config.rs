@@ -969,6 +969,16 @@ pub struct SuperAgentConfig {
     /// [`ServeConfig::roster_config`].
     #[serde(default)]
     pub roster: Vec<RosterEntryDef>,
+    /// (R17 C4) the task-board switch block
+    /// (`superagent.board`): `enabled`/`gating`, **both default
+    /// `false`**. Absent block = board off: no `task_board` view is
+    /// published or served and any rows from an earlier era are
+    /// deleted by the next rebuild (a disposable view,
+    /// `anchors.md` rule 4). Converted fail-closed by
+    /// [`SuperAgentConfig::board_config`] — `gating: true` is a P4
+    /// key and refuses to boot in P3.
+    #[serde(default)]
+    pub board: BoardConfigDef,
     /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
     /// surfaces in the Inline `neighbors` block (`thread_key`) as
@@ -1083,6 +1093,24 @@ impl SuperAgentConfig {
             .map_err(|message| invalid(format!("superagent.multiagent: {message}")))?;
         Ok(Some(converted))
     }
+
+    /// Converts the board section to the runtime switch, fail-closed
+    /// (R17 C4, pin P3-1). The block defaults to **off** (`enabled:
+    /// false`, `gating: false` — an absent block is the same shape),
+    /// so absence keeps P3 byte-identical: no `task_board` view, no
+    /// board output. `gating: true` is the P4 emission switch (§8.1)
+    /// and **refuses to boot in P3** — accepting it silently would
+    /// imply audit keys no phase emits yet.
+    pub fn board_config(&self) -> Result<BoardConfig, ConfigError> {
+        let converted = BoardConfig {
+            enabled: self.board.enabled,
+            gating: self.board.gating,
+        };
+        converted
+            .validate()
+            .map_err(|message| invalid(format!("superagent.board: {message}")))?;
+        Ok(converted)
+    }
 }
 
 /// The `superagent.outbox` section:
@@ -1175,6 +1203,50 @@ pub struct RosterMandateTemplateDef {
 #[serde(deny_unknown_fields)]
 pub struct RosterLimitsDef {
     pub max_children: Option<u32>,
+}
+
+/// The `superagent.board` section (R17 C4, MULTIAGENT-MODEL §7.1):
+/// `{enabled?, gating?}` — **both keys default `false`**, and an
+/// absent section is the same shape as an all-false one (feature-off,
+/// byte-identical, `anchors.md` rule 4). `enabled` gates publication
+/// of the `task_board` view and (with `read_model.views.enabled`) the
+/// P3 verbs; `gating` is P4's class-A emission switch and is refused
+/// in P3 by [`BoardConfig::validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BoardConfigDef {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gating: bool,
+}
+
+/// The converted runtime board switch (R17 C4, pin P3-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BoardConfig {
+    /// Whether the `task_board` view may be published/served (the
+    /// verbs' own gate composes this with `read_model.views.enabled`).
+    pub enabled: bool,
+    /// P4's class-A key-emission switch — never `true` in P3.
+    pub gating: bool,
+}
+
+impl BoardConfig {
+    /// Fail-closed validation: `gating: true` refuses to boot in P3,
+    /// naming the deferral (the key groups land with R17 C6/C7;
+    /// §8.1's rollback semantics do not exist before there is
+    /// anything to roll back).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.gating {
+            return Err(
+                "gating is not implemented until P4 (the multiagent audit key groups land in \
+                 R17 C6/C7); leave it false in P3 — `enabled` alone switches the task_board \
+                 view and the verbs"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The `superagent.intake` section (ADR-013):
@@ -3150,6 +3222,10 @@ impl ServeConfig {
             // the outbox schedule converts cleanly (fail-closed —
             // a broken retry bound or backoff refuses to start).
             sa.outbox_config()?;
+            // (R17 C4) the board block converts cleanly (fail-closed —
+            // `gating: true` is a P4 key and refuses to boot in P3,
+            // naming the deferral).
+            sa.board_config()?;
             // the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -4042,6 +4118,68 @@ recovery:
         );
         let err = ServeConfig::parse(&watchdog).expect_err("watchdog permissions must refuse boot");
         assert!(err.to_string().contains("watchdog"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // the task-board switch block (R17 C4, pin P3-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn board_block_defaults_off_and_parses_both_keys() {
+        // Absent block: both keys false — feature-off, byte-identical
+        // (`anchors.md` rule 4), and the conversion is simply off.
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(sa.board, BoardConfigDef::default());
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: false,
+                gating: false
+            }
+        );
+
+        // The block parses both keys; `enabled` alone is legal P3.
+        let on = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabled: true\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&on).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: true,
+                gating: false
+            }
+        );
+    }
+
+    #[test]
+    fn board_gating_true_refuses_boot_in_p3_naming_the_deferral() {
+        let gating = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    gating: true\n",
+            1,
+        );
+        let err = ServeConfig::parse(&gating).expect_err("board.gating must refuse to boot in P3");
+        let msg = err.to_string();
+        assert!(msg.contains("superagent.board"), "{msg}");
+        assert!(msg.contains("P4"), "{msg}");
+    }
+
+    #[test]
+    fn board_unknown_keys_refuse_boot() {
+        let typo = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabeld: true\n",
+            1,
+        );
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse a mistyped board key"
+        );
     }
 
     // -----------------------------------------------------------------------
