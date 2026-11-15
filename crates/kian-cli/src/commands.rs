@@ -1442,8 +1442,15 @@ pub struct TaskEvidence {
 /// child, never inferred from prose — §4.3:504-505, §6.3:705-708);
 /// `gate`/`evidence` read the child's last worker-gate verdict.
 ///
-/// P3 constants: `group` is `null` and `depends_on` is `[]` — no event
-/// bytes carry them until P4 (§7.3:788-789); C7 fills them.
+/// P4 columns (R17-C7): `group`/`depends_on` come from the **current
+/// attempt's parent-side** `thread/started` audit group
+/// (`multiagent.{group,depends_on}` — empty/absent before P4 or when
+/// gating was off); `ready` recomputes §4.4's readiness from the
+/// primary ([`kian_superagent::ready_deps`], strict success set —
+/// `empty_output` never releases); `evidence_provenance` is
+/// `"recorded"` iff the child's committed `thread/completed` carries
+/// the P4 `multiagent.evidence_ref` key, else `"derived"` (pin P3-4 —
+/// both states are honest, neither is fabricated).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskBoardRow {
     pub task_id: String,
@@ -1471,13 +1478,21 @@ pub struct TaskBoardRow {
     pub gate: String,
     /// The derived evidence pointer, `null` when no verdict exists.
     pub evidence: Option<TaskEvidence>,
-    /// `"derived"` in P3 (pin P3-4): the verdict is read off the
-    /// child's own stream; the durable link is P4's.
+    /// `"derived"` | `"recorded"` (pin P3-4): `"recorded"` iff the
+    /// child's committed `thread/completed` carries the P4
+    /// `multiagent.evidence_ref` key; the verdict facts themselves
+    /// are always read off the child's own stream.
     pub evidence_provenance: String,
-    /// `null` in P3 — no bytes carry a group yet.
+    /// The join group (P4, from the parent-side audit group); `null`
+    /// when the spawn declared none.
     pub group: Option<String>,
-    /// `[]` in P3 — no bytes carry dependencies yet.
+    /// The declared dependency keys (P4, from the parent-side audit
+    /// group); `[]` when the spawn declared none.
     pub depends_on: Vec<String>,
+    /// §4.4 readiness recomputed from the primary over the declared
+    /// `depends_on` (strict success set; `true` trivially when none
+    /// are declared). Observability only — never a control read.
+    pub ready: bool,
 }
 
 /// The task board's own change trigger (R17 C4): the kinds its folds
@@ -1569,6 +1584,12 @@ pub(crate) async fn task_board_rows_from(
         /// (`None` when only the child side was read) — the ordering
         /// authority for which spawn is the current attempt.
         parent_seq: Option<u64>,
+        /// (R17-C7) the P4 audit facts off the **parent-side** event's
+        /// `multiagent` group: the declared dependency keys and the
+        /// join group. Empty/absent on every pre-P4 or gated-off
+        /// spawn (the honest "declared none").
+        depends_on: Vec<String>,
+        group: Option<String>,
     }
     // Discovery: every thread/started whose task message content
     // parses as a wrapper carrying the derived identity. Both sides
@@ -1607,6 +1628,23 @@ pub(crate) async fn task_board_rows_from(
             };
             let parent = SessionId(parent);
             let spawns = tasks.entry(identity.task_id_str()).or_default();
+            // (R17-C7) the P4 audit facts — only the parent-side
+            // event's group carries them (pin P4-2).
+            let audit = event.bytes.get("multiagent");
+            let audit_depends_on: Vec<String> = audit
+                .and_then(|m| m.get("depends_on"))
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let audit_group = audit
+                .and_then(|m| m.get("group"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if let Some(existing) = spawns.iter_mut().find(|s| s.thread == thread) {
                 // The other side of the same spawn: keep the facts,
                 // but record the parent-side seq when THIS is the
@@ -1614,6 +1652,8 @@ pub(crate) async fn task_board_rows_from(
                 // current attempt — whichever stream iterates first).
                 if *session == parent {
                     existing.parent_seq = Some(event.seq);
+                    existing.depends_on = audit_depends_on;
+                    existing.group = audit_group;
                 }
                 continue;
             }
@@ -1628,6 +1668,12 @@ pub(crate) async fn task_board_rows_from(
                 thread,
                 assignee,
                 parent_seq: (*session == parent).then_some(event.seq),
+                depends_on: if *session == parent {
+                    audit_depends_on
+                } else {
+                    Vec::new()
+                },
+                group: (*session == parent).then_some(audit_group).flatten(),
             });
         }
     }
@@ -1710,6 +1756,45 @@ pub(crate) async fn task_board_rows_from(
             }
             None => ("absent".to_string(), None),
         };
+        // (R17-C7, pin P3-4) the provenance flip: `"recorded"` **iff**
+        // the child's committed `thread/completed` carries the P4
+        // `multiagent.evidence_ref` key (the durable per-task link,
+        // §7.2:771); `"derived"` otherwise — the verdict facts above
+        // are read off the child's own stream either way, and neither
+        // state is ever fabricated. Both states coexist in one store
+        // (a gated-on child beside a gated-off one).
+        let evidence_recorded = child_events
+            .iter()
+            .rev()
+            .find(|e| e.kind == EventKind::ThreadCompleted)
+            .is_some_and(|e| {
+                e.bytes
+                    .get("multiagent")
+                    .and_then(|m| m.get("evidence_ref"))
+                    .is_some()
+            });
+        // (R17-C7) §4.4 readiness recomputed from the primary over
+        // the declared keys — the same pure function the spawn's
+        // refusal uses ([`kian_superagent::ready_deps`]; the strict
+        // success set, matching the spawn site's v1 policy).
+        // Observability only: this column never authorizes anything.
+        let parent_events = streams.get(&parent_session).cloned().unwrap_or_default();
+        let own_task_id = uuid::Uuid::parse_str(&task_id).ok();
+        let ready = match own_task_id {
+            Some(own) => matches!(
+                kian_superagent::ready_deps(
+                    parent_session,
+                    &parent_events,
+                    own,
+                    None,
+                    &current.depends_on,
+                    false,
+                    &|session| streams.get(&session).cloned().unwrap_or_default(),
+                ),
+                kian_superagent::DepReadiness::Ready
+            ),
+            None => true,
+        };
         rows.push(TaskBoardRow {
             parent: parent_session.0.to_string(),
             child: current.child.0.to_string(),
@@ -1721,9 +1806,14 @@ pub(crate) async fn task_board_rows_from(
             thread_status,
             gate,
             evidence,
-            evidence_provenance: "derived".to_string(),
-            group: None,
-            depends_on: Vec::new(),
+            evidence_provenance: if evidence_recorded {
+                "recorded".to_string()
+            } else {
+                "derived".to_string()
+            },
+            group: current.group.clone(),
+            depends_on: current.depends_on.clone(),
+            ready,
         });
     }
     Ok(rows)
@@ -1842,8 +1932,8 @@ fn render_task_surface(rows: &[TaskBoardRow], json: bool, headered: bool) -> Cmd
     let mut out = String::new();
     if headered {
         out.push_str(&format!(
-            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24}\n",
-            "TASK_ID", "ASSIGNEE", "ATTEMPT", "OUTCOME", "STATUS", "GATE", "EVIDENCE"
+            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24} {:<6}\n",
+            "TASK_ID", "ASSIGNEE", "ATTEMPT", "OUTCOME", "STATUS", "GATE", "EVIDENCE", "READY"
         ));
     }
     for row in rows {
@@ -1856,8 +1946,12 @@ fn render_task_surface(rows: &[TaskBoardRow], json: bool, headered: bool) -> Cmd
             ),
             None => "-".to_string(),
         };
+        // (R17-C7) the P4 columns in text: `ready` is the §4.4
+        // recomputation; `depends_on`/`group` ride `--json` and the
+        // row struct (the line stays one terminal width).
+        let ready = if row.ready { "yes" } else { "no" }.to_string();
         out.push_str(&format!(
-            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24}\n",
+            "{:<38} {:<10} {:>7} {:<22} {:<12} {:<6} {:<24} {:<6}\n",
             row.task_id,
             row.assignee.as_deref().unwrap_or("-"),
             row.attempt,
@@ -1865,6 +1959,7 @@ fn render_task_surface(rows: &[TaskBoardRow], json: bool, headered: bool) -> Cmd
             row.thread_status,
             row.gate,
             evidence,
+            ready,
         ));
     }
     Ok(out)

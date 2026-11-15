@@ -664,6 +664,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         router,
         worker_version: 7,
         multiagent: None,
+        board_gating: kian_superagent::BoardGating::default(),
         gate: EvidenceGateConfig {
             enabled: true,
             checks: vec![CheckSpec::FinalMessagePresent],

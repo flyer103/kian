@@ -220,6 +220,9 @@ pub struct TaskBoardEntry {
     pub evidence_provenance: String,
     pub group: Option<String>,
     pub depends_on: Vec<String>,
+    /// (R17-C7) §4.4 readiness recomputed from the primary —
+    /// observability only.
+    pub ready: bool,
 }
 
 impl TaskBoardEntry {
@@ -241,6 +244,7 @@ impl TaskBoardEntry {
             evidence_provenance: row.evidence_provenance,
             group: row.group,
             depends_on: row.depends_on,
+            ready: row.ready,
         }
     }
 
@@ -265,9 +269,10 @@ impl TaskBoardEntry {
                 self.gate
             ));
         }
-        if self.evidence_provenance != "derived" {
+        if !matches!(self.evidence_provenance.as_str(), "derived" | "recorded") {
             return Err(format!(
-                "view task row evidence_provenance `{}` is not `derived` (P3)",
+                "view task row evidence_provenance `{}` is not `derived` | `recorded` \
+                 (pin P3-4: `recorded` iff the committed evidence_ref key exists)",
                 self.evidence_provenance
             ));
         }
@@ -285,6 +290,7 @@ impl TaskBoardEntry {
             evidence_provenance: self.evidence_provenance.clone(),
             group: self.group.clone(),
             depends_on: self.depends_on.clone(),
+            ready: self.ready,
         })
     }
 }

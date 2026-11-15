@@ -1004,6 +1004,10 @@ pub struct SuperAgentDriver {
     /// itself stays a pure function of (stream binding,
     /// configured ids).
     legacy_unbound_audited: Arc<Mutex<BTreeSet<SessionId>>>,
+    /// (R17-C6, pin P4-1): the `superagent.board.gating` class-A
+    /// emission switch — passed to the child-side `lineage_plan` so
+    /// a gated child emits its `thread/started` audit keys.
+    board_gating: kian_superagent::BoardGating,
 }
 
 impl SuperAgentDriver {
@@ -1031,6 +1035,7 @@ impl SuperAgentDriver {
             known_ids_port: None,
             refuse_side: None,
             legacy_unbound_audited: Arc::new(Mutex::new(BTreeSet::new())),
+            board_gating: kian_superagent::BoardGating::default(),
         }
     }
 
@@ -1076,6 +1081,16 @@ impl SuperAgentDriver {
     #[must_use]
     pub fn with_assignee_sides(mut self, assignee_side_factory: AssigneeSideFactory) -> Self {
         self.assignee_side_factory = Some(assignee_side_factory);
+        self
+    }
+
+    /// (R17-C6, pin P4-1) installs the `superagent.board.gating`
+    /// class-A emission switch — the child-side `lineage_plan` emits
+    /// its audit keys only when it is on; the absent call (the
+    /// default) keeps today's exact bytes.
+    #[must_use]
+    pub fn with_board_gating(mut self, gating: kian_superagent::BoardGating) -> Self {
+        self.board_gating = gating;
         self
     }
 }
@@ -1124,9 +1139,18 @@ impl LoopDriver for SuperAgentDriver {
         let port = self.known_ids_port.clone();
         let refuse_side = self.refuse_side.clone();
         let audited = Arc::clone(&self.legacy_unbound_audited);
+        // (R17-C6, pin P4-1): the class-A switch, copied into the
+        // async selection block below (the child-side keys).
+        let board_gating = self.board_gating;
         futures::stream::once(async move {
             let events = ctx.events().await.unwrap_or_default();
-            match lineage_plan(&events, session, router, worker_version) {
+            match lineage_plan(
+                &events,
+                session,
+                router,
+                worker_version,
+                board_gating,
+            ) {
                 LineagePlan::PassThrough => default.drive(ctx).boxed(),
                 plan @ (LineagePlan::Emit { .. } | LineagePlan::Resume { .. }) => {
                     // (R17-C3, pin P2-2) the assignee-keyed selection,
@@ -2971,6 +2995,7 @@ mod assignee_selection_tests {
                 worker_version: 1,
                 gate: kian_loop::EvidenceGateConfig::default(),
                 multiagent: None,
+                board_gating: kian_superagent::BoardGating::default(),
             },
             crate::superagent::port_for_ctx(),
         )

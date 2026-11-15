@@ -553,6 +553,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: None,
+            board_gating: kian_superagent::BoardGating::default(),
         },
         port_for_ctx(),
     );

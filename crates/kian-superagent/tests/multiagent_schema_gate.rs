@@ -291,6 +291,7 @@ fn assemble(child: &Child, events: Vec<Event>, answers: &[&'static str]) -> Rig 
         worker_version: 7,
         gate: EvidenceGateConfig::default(),
         multiagent: Some(limits()),
+        board_gating: kian_superagent::BoardGating::default(),
     };
     let driver = WorkerLoopDriver::new(
         inner,
@@ -558,6 +559,7 @@ async fn an_empty_final_answer_is_empty_output_and_never_a_schema_miss() {
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: Some(limits()),
+            board_gating: kian_superagent::BoardGating::default(),
         },
         port_for,
     );

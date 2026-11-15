@@ -306,6 +306,20 @@ impl TaskOutcome {
             _ => false,
         }
     }
+
+    /// (R17-C6, pin P4-3) Whether the value has a
+    /// `thread/completed` carrier — the six completion-borne values
+    /// of §6.1.1:623-633 (all but `stalled`, `interrupted` and
+    /// `input_required`). Exactly these are writable by
+    /// [`outcome_for_completion`]; the other three stay derived on
+    /// demand.
+    #[must_use]
+    pub fn is_completion_borne(self) -> bool {
+        !matches!(
+            self,
+            TaskOutcome::Stalled | TaskOutcome::Interrupted | TaskOutcome::InputRequired
+        )
+    }
 }
 
 /// The success set: exactly `CompletedVerified` (§6.1.1). Policy may
@@ -403,52 +417,10 @@ pub fn derive_outcome(
         .rev()
         .find(|ev| ev.kind == EventKind::ThreadCompleted)
     {
-        return match done.bytes.get("status").and_then(Value::as_str) {
-            Some("completed") => {
-                // Row 1 vs row 2: a *passed* worker-gate verdict that
-                // was committed on this stream.
-                let verified = last_worker_verdict(child_events)
-                    .and_then(|v| v.bytes.get("passed"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                Some(if verified {
-                    TaskOutcome::CompletedVerified
-                } else {
-                    TaskOutcome::CompletedUnverified
-                })
-            }
-            Some("failed") => {
-                // Row 4 (R17-C3, pin P2-5): a failed completion WITH a
-                // committed `output_schema` verdict is
-                // `invalid_output` — checked BEFORE the `turn/end`
-                // class rows, and reachable only through the committed
-                // verdict (never typed by the child, never inferred
-                // from prose).
-                let schema_failed = last_schema_verdict(child_events)
-                    .and_then(|v| v.bytes.get("passed"))
-                    .and_then(Value::as_bool)
-                    == Some(false);
-                if schema_failed {
-                    return Some(TaskOutcome::InvalidOutput);
-                }
-                Some(match last_error_class(child_events) {
-                    // Row 3: an empty final answer is a soft failure.
-                    Some(EMPTY_RESPONSE_CLASS) => TaskOutcome::EmptyOutput,
-                    // Row 5: an exhausted budget is honest non-success.
-                    Some(BUDGET_EXHAUSTED_CLASS) => TaskOutcome::BudgetExhausted,
-                    // No softer carrier names this failure: `failed`,
-                    // never a guess (plan §0.3 gap 3 — if the loop ever
-                    // stops recording the class, the derivation degrades
-                    // to `failed`, it does not invent `empty_output`).
-                    _ => TaskOutcome::Failed,
-                })
-            }
-            // The reserved `interrupted` completion (and any future
-            // spelling): the interrupt rows refine it when their
-            // carriers exist, else it is an honest failure — an abort
-            // is never mapped onto `completed` (constraint 7).
-            _ => interrupt_outcome(child_events).or(Some(TaskOutcome::Failed)),
-        };
+        return completion_outcome(
+            done.bytes.get("status").and_then(Value::as_str),
+            child_events,
+        );
     }
 
     // Rows 6-7 (no completion): control/interrupt + session/ended{
@@ -485,6 +457,292 @@ pub fn derive_outcome(
     None
 }
 
+/// The §6.2 table applied to ONE completion: the outcome a
+/// `thread/completed` with this `status` refines to, read off the
+/// events the completion rides beside (the verdicts and error classes
+/// are all committed before it). Shared by [`derive_outcome`] (the
+/// committed-stream reader) and [`outcome_for_completion`] (the
+/// at-write helper) so the two can never disagree.
+fn completion_outcome(status: Option<&str>, events: &[Event]) -> Option<TaskOutcome> {
+    match status {
+        Some("completed") => {
+            // Row 1 vs row 2: a *passed* worker-gate verdict that
+            // was committed on this stream.
+            let verified = last_worker_verdict(events)
+                .and_then(|v| v.bytes.get("passed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(if verified {
+                TaskOutcome::CompletedVerified
+            } else {
+                TaskOutcome::CompletedUnverified
+            })
+        }
+        Some("failed") => {
+            // Row 4 (R17-C3, pin P2-5): a failed completion WITH a
+            // committed `output_schema` verdict is `invalid_output` —
+            // checked BEFORE the `turn/end` class rows, and reachable
+            // only through the committed verdict (never typed by the
+            // child, never inferred from prose).
+            let schema_failed = last_schema_verdict(events)
+                .and_then(|v| v.bytes.get("passed"))
+                .and_then(Value::as_bool)
+                == Some(false);
+            if schema_failed {
+                return Some(TaskOutcome::InvalidOutput);
+            }
+            Some(match last_error_class(events) {
+                // Row 3: an empty final answer is a soft failure.
+                Some(EMPTY_RESPONSE_CLASS) => TaskOutcome::EmptyOutput,
+                // Row 5: an exhausted budget is honest non-success.
+                Some(BUDGET_EXHAUSTED_CLASS) => TaskOutcome::BudgetExhausted,
+                // No softer carrier names this failure: `failed`,
+                // never a guess (plan §0.3 gap 3 — if the loop ever
+                // stops recording the class, the derivation degrades
+                // to `failed`, it does not invent `empty_output`).
+                _ => TaskOutcome::Failed,
+            })
+        }
+        // The reserved `interrupted` completion (and any future
+        // spelling): the interrupt rows refine it when their carriers
+        // exist, else it is an honest failure — an abort is never
+        // mapped onto `completed` (constraint 7).
+        _ => interrupt_outcome(events).or(Some(TaskOutcome::Failed)),
+    }
+}
+
+/// (R17-C6, pin P4-3) The at-write helper behind the P4 `outcome` key:
+/// the §6.2 table applied to the completion the child is **about to
+/// append** — `status` is that completion's status, `events` the
+/// stream as it stands before the append (every verdict and error
+/// class the table reads is already committed). It agrees with
+/// [`derive_outcome`] on the committed stream by construction (both
+/// route through [`completion_outcome`]).
+///
+/// The three no-carrier values (§6.1.1:626-633) are **unwritable**:
+/// `stalled`, `interrupted` and `input_required` have no
+/// `thread/completed` carrier, so the helper filters them to `None` —
+/// they stay derived on demand (the board has them in P3; the key
+/// adds nothing there). `own_report` mirrors [`derive_outcome`]'s
+/// signature; the completion arm never reads it (a completion exists
+/// by hypothesis, so the waiting-report row is not consulted).
+#[must_use]
+pub fn outcome_for_completion(
+    status: &str,
+    events: &[Event],
+    own_report: Option<&ThreadReport>,
+) -> Option<TaskOutcome> {
+    let _ = own_report;
+    completion_outcome(Some(status), events).filter(|outcome| outcome.is_completion_borne())
+}
+
+/// (R17-C6, §7.2:771) The committed `evidence/verdict` an outcome was
+/// decided by, as a `{session, seq}` pointer — never a copy. Present
+/// iff a verdict decided the value: the passed worker-gate verdict
+/// behind `completed_verified`, the failed schema verdict behind
+/// `invalid_output`; every other value was decided by carriers the
+/// stream itself names (status, error class), so there is nothing to
+/// point at.
+#[must_use]
+pub fn outcome_evidence_ref(
+    events: &[Event],
+    session: SessionId,
+    outcome: TaskOutcome,
+) -> Option<crate::audit::EvidenceRef> {
+    let decided_by = match outcome {
+        TaskOutcome::CompletedVerified => last_worker_verdict(events)
+            .filter(|v| v.bytes.get("passed").and_then(Value::as_bool) == Some(true)),
+        TaskOutcome::InvalidOutput => last_schema_verdict(events)
+            .filter(|v| v.bytes.get("passed").and_then(Value::as_bool) == Some(false)),
+        _ => None,
+    };
+    decided_by.map(|verdict| crate::audit::EvidenceRef {
+        session,
+        seq: verdict.seq,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Readiness over `depends_on` (R17-C7, pin P4-4, §4.4)
+// ---------------------------------------------------------------------------
+
+/// The readiness verdict for one spawn's declared `depends_on`
+/// (pin P4-4, §4.4:512-527): evaluated **at the spawn**, as a pure
+/// function of the parent's own committed events plus an explicit
+/// child-stream lookup — never a view, never live config (M7 /
+/// READ-MODEL R8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepReadiness {
+    /// Every declared dependency has a completion whose derived task
+    /// outcome is in the success set — the spawn may proceed.
+    Ready,
+    /// The named task keys (every unmet one, not just the first) have
+    /// no successful completion yet: never spawned, still
+    /// outstanding, or completed outside the success set. A
+    /// not-yet-spawned referent is **not-ready, not an error**
+    /// (§5.4:607-608).
+    Unmet(Vec<String>),
+    /// The declaration closes a cycle over the parent's recorded
+    /// dependency graph (a self-reference included) — a refusal
+    /// naming the cycle's members in walk order (§7.3:791-793).
+    Cycle(Vec<String>),
+}
+
+/// The task ids one `thread/started`'s declared `depends_on` names,
+/// resolved in `parent`'s namespace — `None` when the event carries
+/// no P4 audit group (pre-P4 bytes, or gating was off).
+fn started_dep_ids(parent: SessionId, ev: &Event) -> Option<Vec<Uuid>> {
+    let keys = ev
+        .bytes
+        .get(crate::audit::MULTIAGENT_KEY)?
+        .get("depends_on")?
+        .as_array()?;
+    Some(
+        keys.iter()
+            .filter_map(|k| k.as_str())
+            .map(|k| task_id_for_key(parent, k))
+            .collect(),
+    )
+}
+
+/// (R17-C7, pin P4-4 / §4.4:512-516) Readiness as a pure function of
+/// the primary. A declared key releases its dependent iff the parent's
+/// stream carries a `thread/started` for that `task_id` whose child's
+/// derived outcome ([`derive_outcome`]) is in the success set
+/// ([`TaskOutcome::is_success`] — `completed_verified` always,
+/// `completed_unverified` iff `accept_unverified`, **`empty_output`
+/// never, at any policy setting**). A referent with no spawn at all is
+/// `Unmet`, not an error (§5.4:607-608); a declaration that closes a
+/// cycle over the parent's **recorded** graph (the `depends_on` arrays
+/// already committed on its `thread/started` events) is `Cycle`
+/// naming the members (§7.3:791-793).
+///
+/// `own_task_id`/`own_key` name the spawn being evaluated (its event
+/// is not yet on the stream — readiness runs before any side effect);
+/// `child_events` supplies one child's committed stream by worker
+/// session, and is only asked for sessions the parent's own lineage
+/// already names. The cycle walk follows **recorded** edges only: a
+/// task whose earlier attempts declared dependencies contributes those
+/// edges even when a later attempt declared none — the refusal is
+/// conservative and honest, never a silent accept.
+#[must_use]
+pub fn ready_deps(
+    parent: SessionId,
+    parent_events: &[Event],
+    own_task_id: Uuid,
+    own_key: Option<&str>,
+    keys: &[String],
+    accept_unverified: bool,
+    child_events: &dyn Fn(SessionId) -> Vec<Event>,
+) -> DepReadiness {
+    if keys.is_empty() {
+        return DepReadiness::Ready;
+    }
+    // The declared edges of this spawn, resolved in the parent's
+    // namespace (§1:169-176 — the same derivation `task_key` uses).
+    let own_deps: Vec<Uuid> = keys.iter().map(|k| task_id_for_key(parent, k)).collect();
+    // The parent's recorded dependency graph: task_id → dep task_ids,
+    // off the committed `multiagent.depends_on` audit groups. Only
+    // this spawn's own event is absent (it does not exist yet).
+    let mut graph: std::collections::BTreeMap<Uuid, Vec<Uuid>> = std::collections::BTreeMap::new();
+    // id → the key that named it, for honest cycle/refusal text.
+    let mut names: std::collections::BTreeMap<Uuid, String> = std::collections::BTreeMap::new();
+    for ev in parent_events
+        .iter()
+        .filter(|ev| ev.kind == EventKind::ThreadStarted)
+    {
+        let Some(recorded) = started_dep_ids(parent, ev) else {
+            continue;
+        };
+        let Some(task) = crate::audit::thread_started_task_id(&ev.bytes)
+            .and_then(|raw| Uuid::parse_str(&raw).ok())
+        else {
+            continue;
+        };
+        graph
+            .entry(task)
+            .or_default()
+            .extend(recorded.iter().copied());
+        if let Some(list) = ev
+            .bytes
+            .get(crate::audit::MULTIAGENT_KEY)
+            .and_then(|m| m.get("depends_on"))
+            .and_then(Value::as_array)
+        {
+            for key in list.iter().filter_map(Value::as_str) {
+                names
+                    .entry(task_id_for_key(parent, key))
+                    .or_insert_with(|| key.to_string());
+            }
+        }
+    }
+    for key in keys {
+        names
+            .entry(task_id_for_key(parent, key))
+            .or_insert_with(|| key.clone());
+    }
+    // Cycle (checked first — a graph-level defect outranks a timing
+    // fact): can any of this spawn's own deps reach the spawn's own
+    // task id over the recorded edges? A self-reference is the
+    // one-edge case.
+    let name_of = |id: Uuid| -> String {
+        if id == own_task_id {
+            own_key
+                .map(str::to_string)
+                .unwrap_or_else(|| id.to_string())
+        } else {
+            names.get(&id).cloned().unwrap_or_else(|| id.to_string())
+        }
+    };
+    let mut seen: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+    let mut stack: Vec<(Uuid, Vec<Uuid>)> = own_deps.iter().map(|&d| (d, vec![d])).collect();
+    while let Some((node, trail)) = stack.pop() {
+        if node == own_task_id {
+            let cycle: Vec<String> = trail.iter().map(|id| name_of(*id)).collect();
+            return DepReadiness::Cycle(cycle);
+        }
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Some(next) = graph.get(&node) {
+            for &succ in next {
+                let mut trail = trail.clone();
+                trail.push(succ);
+                stack.push((succ, trail));
+            }
+        }
+    }
+    // Unmet (§4.4:512-516): every declared key with no successful
+    // completion, named — never just the first.
+    let mut unmet: Vec<String> = Vec::new();
+    for key in keys {
+        let id = task_id_for_key(parent, key);
+        let expected = id.to_string();
+        let released = parent_events
+            .iter()
+            .filter(|ev| ev.kind == EventKind::ThreadStarted)
+            .any(|ev| {
+                crate::audit::thread_started_task_id(&ev.bytes).as_deref()
+                    == Some(expected.as_str())
+                    && event_worker_session(ev)
+                        .map(|worker| {
+                            let events = child_events(worker);
+                            derive_outcome(&events, None)
+                                .is_some_and(|outcome| outcome.is_success(accept_unverified))
+                        })
+                        .unwrap_or(false)
+            });
+        if !released {
+            unmet.push(key.clone());
+        }
+    }
+    if unmet.is_empty() {
+        DepReadiness::Ready
+    } else {
+        DepReadiness::Unmet(unmet)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Join target (F17, §3.2:409-413)
 // ---------------------------------------------------------------------------
@@ -508,6 +766,26 @@ pub fn join_target(child_events: &[Event], self_session: SessionId) -> Option<Se
 // ---------------------------------------------------------------------------
 // Limits and caps (§5.3)
 // ---------------------------------------------------------------------------
+
+/// (R17-C6, pin P4-1) The `superagent.board.gating` switch — the P4
+/// class-A key-emission flag, plumbed to every site that decides
+/// whether an audit key is written (the Router's parent-side
+/// `thread/started` builder, the worker loop's child-side builders).
+/// `false` (the default, and what an absent block produces) ⇒ **no
+/// class-A key is emitted at all** — P3 bytes exactly [anchors.md
+/// rule 4]. `true` ⇒ the two key groups are emitted (readiness
+/// evaluation itself is C7's). Rollback is flipping back to `false`:
+/// new emissions stop, history is never rewritten (§8.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardGating(pub bool);
+
+impl BoardGating {
+    /// Whether the gate is on.
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        self.0
+    }
+}
 
 /// The P1 delegation bounds (§5.3:585-589, §7.1). Projection-derived
 /// policy, validated fail-closed at config parse (C5).
@@ -562,7 +840,7 @@ impl MultiagentLimits {
 }
 
 /// `bytes.worker` as a session id, if present and well-formed.
-fn event_worker_session(ev: &Event) -> Option<SessionId> {
+pub(crate) fn event_worker_session(ev: &Event) -> Option<SessionId> {
     let raw = ev.bytes.get("worker").and_then(Value::as_str)?;
     Some(SessionId(Uuid::parse_str(raw).ok()?))
 }

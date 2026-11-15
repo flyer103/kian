@@ -244,11 +244,12 @@ async fn the_board_labels_completion_verification_as_derived_not_recorded() {
             "group",
             "outcome",
             "parent",
+            "ready",
             "task_id",
             "thread",
             "thread_status",
         ],
-        "pin P3-3's row shape, key for key"
+        "pin P3-3's row shape + the P4 `ready` column (R17-C7)"
     );
     assert_eq!(serialized["group"], Value::Null);
     assert_eq!(serialized["depends_on"], json!([]));
@@ -991,11 +992,12 @@ async fn the_json_shape_matches_the_documented_row() {
                 "group",
                 "outcome",
                 "parent",
+                "ready",
                 "task_id",
                 "thread",
                 "thread_status",
             ],
-            "pin P3-3's row key set, key for key — nothing extra, ever"
+            "pin P3-3's row key set + the P4 `ready` column (R17-C7) — nothing extra, ever"
         );
         assert_eq!(task["group"], Value::Null, "group is P4's key: null in P3");
         assert_eq!(task["depends_on"], json!([]), "no dependencies in P3");
@@ -1102,6 +1104,241 @@ async fn the_verbs_write_nothing() {
     }
     let after = snapshot(&path, &sessions).await;
     assert_eq!(before, after, "a read-only verb changed the store");
+    let _ = std::fs::remove_file(&cfg);
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// R17-C7 — the board's P4 columns: depends_on / group / ready, and the
+// evidence_provenance flip (pin P3-4)
+// ---------------------------------------------------------------------------
+
+/// One **keyed** delegation lineage (pin P2-8): the spawn declared a
+/// `task_key`, so `task_id = uuid5(parent, "kian:task:<key>")` while
+/// the thread id stays per-spawn. The P4 facts (`depends_on`, group)
+/// ride only the **parent-side** `thread/started` audit group (pin
+/// P4-2) — the helper returns the plain started payload; the caller
+/// stamps the audit group on the parent's copy.
+fn keyed_lineage(parent: SessionId, spawn_seq: u64, key: &str) -> Lineage {
+    let identity = SpawnIdentity::derive_delegated(parent, spawn_seq, "worker", 7, Some(key), None);
+    let child = kian_superagent::child_session_id(identity.thread_id);
+    let wrapper = json!({
+        "thread_id": identity.thread_id.to_string(),
+        "task": format!("task {key}"),
+        "spawn_uid": identity.spawn_uid.to_string(),
+        "task_id": identity.task_id_str(),
+        "agent_def": "worker",
+        "agent_def_version": 7,
+    });
+    let started = json!({
+        "thread_id": identity.thread_id.to_string(),
+        "parent": parent.0.to_string(),
+        "worker": child.0.to_string(),
+        "pinned_version": 7,
+        "task": {"role": "user", "content": wrapper},
+    });
+    Lineage {
+        identity,
+        child,
+        started,
+    }
+}
+
+/// The parent-side audit group a gated spawn emits (pin P4-2, minus
+/// the parts the board does not read): stamped on the parent's copy
+/// of the started payload only.
+fn with_parent_audit(started: Value, lin: &Lineage, depends_on: Value, group: Value) -> Value {
+    let mut started = started;
+    started["multiagent"] = json!({
+        "task_id": lin.identity.task_id_str(),
+        "attempt": 1,
+        "depends_on": depends_on,
+        "group": group,
+    });
+    started
+}
+
+/// 🔴 Pin P3-4 + the P4 columns: in ONE store, a task whose child's
+/// committed `thread/completed` carries the P4 `multiagent.evidence_ref`
+/// key reads `evidence_provenance: "recorded"` while a sibling without
+/// the key stays `"derived"`; `depends_on`/`group` appear from the
+/// parent-side audit group; `ready` recomputes §4.4 (a task whose only
+/// dependency is satisfied reads ready, one with an unsatisfied
+/// dependency does not — and `empty_output` never satisfies).
+#[tokio::test]
+async fn the_board_flips_evidence_provenance_only_where_the_key_exists() {
+    let path = temp_db("p4cols");
+    let store = EventStore::open(&path).await.unwrap();
+    let parent = SessionId::new();
+    push(
+        &store,
+        parent,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    push(
+        &store,
+        parent,
+        2,
+        Epoch(1),
+        EventKind::DrainClaimed,
+        json!({}),
+    )
+    .await;
+
+    // `a`: verified + the P4 evidence_ref key ⇒ `recorded`.
+    let lin_a = keyed_lineage(parent, 10, "a");
+    push(
+        &store,
+        parent,
+        3,
+        Epoch(1),
+        EventKind::ThreadStarted,
+        with_parent_audit(lin_a.started.clone(), &lin_a, json!([]), Value::Null),
+    )
+    .await;
+    seed_child_full(&store, &lin_a).await;
+    push(
+        &store,
+        lin_a.child,
+        5,
+        Epoch(1),
+        EventKind::TurnEnd,
+        json!({"iteration": 0, "outcome": "final_answer"}),
+    )
+    .await;
+    push(
+        &store,
+        lin_a.child,
+        6,
+        Epoch(1),
+        EventKind::EvidenceVerdict,
+        json!({"gate": "worker", "passed": true,
+               "checks": [{"name": "final_message_present", "passed": true}]}),
+    )
+    .await;
+    push(
+        &store,
+        lin_a.child,
+        7,
+        Epoch(1),
+        EventKind::ThreadCompleted,
+        json!({"thread_id": lin_a.identity.thread_id.to_string(), "status": "completed",
+               "summary": {"role": "assistant", "content": "done"},
+               "spawn_uid": lin_a.identity.spawn_uid.to_string(),
+               "multiagent": {"task_id": lin_a.identity.task_id_str(),
+                              "outcome": "completed_verified",
+                              "evidence_ref": {"session": lin_a.child.0.to_string(), "seq": 6}}}),
+    )
+    .await;
+
+    // `b`: depends on `a` (satisfied ⇒ ready) + group; its completion
+    // carries NO evidence_ref ⇒ stays `derived`.
+    let lin_b = keyed_lineage(parent, 20, "b");
+    push(
+        &store,
+        parent,
+        4,
+        Epoch(1),
+        EventKind::ThreadStarted,
+        with_parent_audit(lin_b.started.clone(), &lin_b, json!(["a"]), json!("ingest")),
+    )
+    .await;
+    seed_child_full(&store, &lin_b).await;
+    push(
+        &store,
+        lin_b.child,
+        5,
+        Epoch(1),
+        EventKind::TurnEnd,
+        json!({"iteration": 0, "outcome": "final_answer"}),
+    )
+    .await;
+    push(
+        &store,
+        lin_b.child,
+        6,
+        Epoch(1),
+        EventKind::ThreadCompleted,
+        json!({"thread_id": lin_b.identity.thread_id.to_string(), "status": "completed",
+               "summary": {"role": "assistant", "content": "an answer, unverified"}}),
+    )
+    .await;
+
+    // `c`: depends on `a` and on `zzz` (never spawned ⇒ unmet) — not
+    // ready, honest.
+    let lin_c = keyed_lineage(parent, 30, "c");
+    push(
+        &store,
+        parent,
+        5,
+        Epoch(1),
+        EventKind::ThreadStarted,
+        with_parent_audit(
+            lin_c.started.clone(),
+            &lin_c,
+            json!(["a", "zzz"]),
+            Value::Null,
+        ),
+    )
+    .await;
+    seed_child_full(&store, &lin_c).await;
+
+    let rows = kian_cli::commands::task_board_rows(&store)
+        .await
+        .expect("rows");
+    store.close().await;
+
+    let row_a = row_for(&rows, &lin_a.identity.task_id_str());
+    assert_eq!(
+        row_a.evidence_provenance, "recorded",
+        "pin P3-4: the key exists"
+    );
+    assert_eq!(row_a.depends_on, Vec::<String>::new());
+    assert!(row_a.group.is_none());
+    assert!(row_a.ready, "no declared dependencies");
+
+    let row_b = row_for(&rows, &lin_b.identity.task_id_str());
+    assert_eq!(
+        row_b.evidence_provenance, "derived",
+        "pin P3-4: no evidence_ref key ⇒ the label stays derived"
+    );
+    assert_eq!(row_b.depends_on, vec!["a".to_string()]);
+    assert_eq!(row_b.group.as_deref(), Some("ingest"));
+    assert!(row_b.ready, "its only dependency is completed_verified");
+
+    let row_c = row_for(&rows, &lin_c.identity.task_id_str());
+    assert_eq!(row_c.evidence_provenance, "derived");
+    assert_eq!(row_c.depends_on, vec!["a".to_string(), "zzz".to_string()]);
+    assert!(!row_c.ready, "zzz never spawned ⇒ §4.4 unmet");
+
+    // And the JSON surface carries the same three columns.
+    let cfg = board_config("p4cols", true, false, &path);
+    let doc: Value = serde_json::from_str(
+        &kian_cli::commands::run_board(&cfg, Some(&path), true)
+            .await
+            .expect("board json"),
+    )
+    .expect("parses");
+    let tasks = doc["tasks"].as_array().expect("tasks");
+    let find = |key: &str| {
+        tasks
+            .iter()
+            .find(|t| {
+                t["task_id"] == json!(kian_superagent::task_id_for_key(parent, key).to_string())
+            })
+            .unwrap_or_else(|| panic!("no json row for {key}"))
+            .clone()
+    };
+    assert_eq!(find("a")["evidence_provenance"], json!("recorded"));
+    assert_eq!(find("b")["evidence_provenance"], json!("derived"));
+    assert_eq!(find("b")["depends_on"], json!(["a"]));
+    assert_eq!(find("b")["group"], json!("ingest"));
+    assert_eq!(find("b")["ready"], json!(true));
+    assert_eq!(find("c")["ready"], json!(false));
     let _ = std::fs::remove_file(&cfg);
     cleanup(&path);
 }

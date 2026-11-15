@@ -231,3 +231,30 @@ seam, no core primitive, no new event kind, no second store.
   after a restart validates nothing.
 - **R13's hook/plugin surface** (`design/PLUGIN-SPEC.md` is in flight in a separate round): named as a
   forward pointer only, with no dependency, no link and no citation into it.
+
+## Addendum (R17, owner gate)
+
+P4's class-A audit key groups (§7.2) landed in R17 C6. This addendum records the three facts that
+make the landing an owner-gated decision rather than an ordinary phase (pin P4-6; nothing above
+this line is edited by it):
+
+- **Owner gate.** The owner authorised the additive payload keys in chat on 2026-11-15. The keys
+  are one-way: once emitted into streams, they are history, and the additions-only discipline
+  (EVENT-MODEL §6.3) forbids removing them from any reader or emitter. That irreversibility is
+  why the emission switch is config-gated by `superagent.board.gating` (default `false`) and why
+  `gating: true` requires the `superagent.multiagent` block (§7.1: neither board key can enable
+  anything multiagent has not already enabled).
+- **One-way-ness.** Exactly two key groups, on events that already exist, always outside
+  `content`: the parent's `thread/started` carries `"spawn_uid"` +
+  `"multiagent":{task_id, assignee, attempt, depends_on[], group?}`; the child's
+  `thread/started` carries the derivable subset `{task_id, assignee}` only; the child's
+  `thread/completed` carries `{task_id, outcome, evidence_ref?, contract?}`. No new event kind,
+  route, table or migration (anchors rule 5). `outcome` is written at the completion by
+  `outcome_for_completion` and persists only the six completion-borne §6.1.1 values —
+  `stalled`/`interrupted`/`input_required` stay derived on demand. `evidence_ref` is a
+  `{session, seq}` pointer at the committed verdict, never a copy.
+- **Rollback.** Flip `superagent.board.gating` back to `false`: new emissions stop, every
+  derivation that consumed the keys degrades to the P3 derivations (the keys are audit copies of
+  facts the stream already carries), and **history is never rewritten** — rows already emitted
+  keep their keys and keep parsing. The rollback cannot erase the key groups from existence;
+  that is the owner gate's price, accepted.

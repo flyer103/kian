@@ -337,6 +337,20 @@ impl Server {
             .transpose()
             .map_err(ServeError::Config)?
             .flatten();
+        // (R17-C6, pin P4-1): the class-A emission switch — converted
+        // once beside the bounds (the block is C4's; this is wiring
+        // only). `false` (absent block or absent key) keeps every
+        // event payload at its P3 bytes; `true` arms the two key
+        // groups (the config parse refuses `gating: true` without the
+        // `multiagent` block — §7.1:737-741).
+        let board_gating = superagent_cfg
+            .map(|sa| {
+                sa.board_config()
+                    .map(|board| kian_superagent::BoardGating(board.gating))
+            })
+            .transpose()
+            .map_err(ServeError::Config)?
+            .unwrap_or_default();
         // (R17-C1): the roster — converted once, fail-closed (an
         // entry naming no configured `agents:` id, a widening
         // `tools_allow` or an out-of-subset `output_schema` refuses
@@ -641,6 +655,9 @@ impl Server {
                 // (R15-C5): the delegation bounds; `None` (absent
                 // block) = feature off, byte-identical (M8, §8.1).
                 multiagent: multiagent_limits,
+                // (R17-C6, pin P4-1): the class-A key-emission
+                // switch (`superagent.board.gating`).
+                board_gating,
                 // (R17-C1): the roster; `None` (absent/empty) = the
                 // roster feature is off (pin P2-6).
                 roster,

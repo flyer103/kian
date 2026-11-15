@@ -409,6 +409,64 @@ fn qa_thread_started_payload_additive_and_both_sides_agree() {
         thread_started_worker_binding(&legacy),
         WorkerBinding::Unbound
     );
+
+    // (R17-C6, pin P4-2) re-pointed at WRAPPER equality: once the P4
+    // class-A keys land, the two sides' `thread/started` payloads are
+    // NO LONGER byte-identical to each other — the parent carries the
+    // bookkeeping (`attempt`, `depends_on[]`, `group?`) and the child
+    // the derivable subset — while the delegation wrapper (`task`)
+    // they embed stays byte-identical, and every frozen field keeps
+    // its value on both sides.
+    let uid = uuid::Uuid::new_v4();
+    let task_id = uuid::Uuid::new_v4();
+    let parent = kian_superagent::audit::parent_thread_started_payload(
+        bound.clone(),
+        &kian_superagent::audit::ParentThreadAudit {
+            spawn_uid: uid,
+            task_id,
+            assignee: Some("qa-entry".to_string()),
+            attempt: 2,
+            depends_on: vec!["upstream".to_string()],
+            group: None,
+        },
+    );
+    let child = kian_superagent::audit::child_thread_started_payload(
+        bound.clone(),
+        uid,
+        task_id,
+        Some("qa-entry"),
+    );
+    assert_eq!(parent["task"], child["task"], "wrapper identical (P4-2)");
+    assert_eq!(parent["task"], task_message, "wrapper untouched");
+    for key in ["thread_id", "parent", "worker", "pinned_version"] {
+        assert_eq!(parent[key], child[key], "frozen field {key} agrees");
+    }
+    let mut parent_group: Vec<String> = parent["multiagent"]
+        .as_object()
+        .expect("group object")
+        .keys()
+        .cloned()
+        .collect();
+    parent_group.sort();
+    let mut child_group: Vec<String> = child["multiagent"]
+        .as_object()
+        .expect("group object")
+        .keys()
+        .cloned()
+        .collect();
+    child_group.sort();
+    parent_group.retain(|k| !child_group.contains(k));
+    assert_eq!(
+        parent_group,
+        vec!["attempt".to_string(), "depends_on".to_string()],
+        "the parent-only keys are exactly the bookkeeping"
+    );
+    for key in ["depends_on", "group", "attempt"] {
+        assert!(
+            child["multiagent"].get(key).is_none(),
+            "`{key}` absent on the child, never null"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

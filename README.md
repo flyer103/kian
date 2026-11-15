@@ -441,13 +441,15 @@ and from the honest full-stream derivation otherwise (identical output either wa
 superagent:
   board:
     enabled: true      # default false: no view published, verbs refuse with exit 2
+    gating: true       # P4: the depends_on/group spawn arguments, readiness gating and the
+                       # multiagent audit key groups (default false: P3 bytes exactly)
 ```
 
 ```console
 $ kian board --db kian.sqlite
-TASK_ID                               ASSIGNEE   ATTEMPT                OUTCOME              STATUS       GATE   EVIDENCE
-8d810f2b-a34f-5188-81fb-3611c2489591  -                1     completed_verified         completed     pass   pass@6 (derived)
-4e69aaa3-4650-5b49-b37e-5b9a01ac212f  -                1           outstanding       outstanding   absent   -
+TASK_ID                               ASSIGNEE   ATTEMPT                OUTCOME              STATUS       GATE   EVIDENCE                  READY
+8d810f2b-a34f-5188-81fb-3611c2489591  -                1     completed_verified         completed     pass   pass@6 (derived)          yes
+4e69aaa3-4650-5b49-b37e-5b9a01ac212f  -                1           outstanding       outstanding   absent   -                          no
 
 $ kian tasks --all --db kian.sqlite --json   # the same rows, flat / as {now_ms, version, tasks}
 ```

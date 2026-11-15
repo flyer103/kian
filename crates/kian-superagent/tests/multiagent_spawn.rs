@@ -753,6 +753,15 @@ async fn no_roster_keeps_the_p1_schema_prompt_and_spawn_bytes_identical() {
     let emitted = rig.port.emitted.lock().unwrap().clone();
     assert_eq!(emitted.len(), 1);
     assert_eq!(emitted[0].0, EventKind::ThreadStarted);
+    // (R17-C6, pin P4-2) re-pointed at WRAPPER equality: this rig has
+    // `board.gating` off (the pin-P4-1 byte control), so the whole
+    // payload still equals the P3 golden — but the contract the two
+    // sides must keep once the class-A keys land is that the WRAPPER
+    // (`task`) is byte-identical between them, not the whole payload.
+    assert_eq!(
+        emitted[0].1["task"], golden_message,
+        "the wrapper is byte-identical (pin P4-2)"
+    );
     assert_eq!(
         emitted[0].1,
         thread_started_payload(&thread, worker_session, &golden_message)

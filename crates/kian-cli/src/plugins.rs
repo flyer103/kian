@@ -556,6 +556,13 @@ pub struct SuperAgentPlugin {
     /// (`superagent.multiagent`). `None` = the delegation feature is
     /// off — today's spawn bytes, byte-identical (M8, §8.1).
     pub multiagent: Option<kian_superagent::MultiagentLimits>,
+    /// (R17-C6, pin P4-1) the `superagent.board.gating` class-A
+    /// emission switch, converted once by `ServeConfig::board_config`
+    /// (the block itself is C4's — wiring only). `false` (the
+    /// default) keeps every event payload byte at its P3 form;
+    /// `true` adds the two class-A key groups
+    /// (`crates/kian-superagent/src/audit.rs`).
+    pub board_gating: kian_superagent::BoardGating,
     /// (R17-C1) the roster (`superagent.roster`), converted
     /// fail-closed by `ServeConfig::roster_config`. `None` (absent
     /// or empty) = the roster feature is off — no `list_agents`
@@ -863,7 +870,11 @@ impl Plugin for SuperAgentPlugin {
             ))
         });
         let mut router_tools = RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
-            .with_followup_registry(Arc::clone(&followup_registry));
+            .with_followup_registry(Arc::clone(&followup_registry))
+            // (R17-C6, pin P4-1): the class-A emission switch rides
+            // the tool surface — the parent-side `thread/started`
+            // keys are written only when it is on.
+            .with_board_gating(self.board_gating);
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }
@@ -1165,6 +1176,8 @@ impl Plugin for SuperAgentPlugin {
                 // `thread/started.parent` only when the driving side
                 // carries them; None = feature off, ambient today.
                 multiagent: self.multiagent,
+                // (R17-C6, pin P4-1): the child-side class-A switch.
+                board_gating: self.board_gating,
             },
             crate::superagent::port_for_ctx(),
         );
@@ -1213,6 +1226,7 @@ impl Plugin for SuperAgentPlugin {
             // configured-endpoint deployments — they carry the same
             // delegation bounds as the primary worker side.
             let side_multiagent = self.multiagent;
+            let side_board_gating = self.board_gating;
             side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
@@ -1252,6 +1266,7 @@ impl Plugin for SuperAgentPlugin {
                         worker_version: side_version,
                         gate: crate::superagent::clone_gate(&side_gate),
                         multiagent: side_multiagent,
+                        board_gating: side_board_gating,
                     },
                     crate::superagent::port_for_ctx(),
                 )
@@ -1272,6 +1287,7 @@ impl Plugin for SuperAgentPlugin {
             let refuse_session = self.router_session;
             let refuse_version = self.worker_agent.version;
             let refuse_multiagent = self.multiagent;
+            let refuse_board_gating = self.board_gating;
             refuse_side = Some(Arc::new(move |refusal: &crate::superagent::Refusal| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
@@ -1303,6 +1319,7 @@ impl Plugin for SuperAgentPlugin {
                         worker_version: refuse_version,
                         gate: crate::superagent::clone_gate(&refuse_gate),
                         multiagent: refuse_multiagent,
+                        board_gating: refuse_board_gating,
                     },
                     crate::superagent::port_for_ctx(),
                 )
@@ -1361,6 +1378,7 @@ impl Plugin for SuperAgentPlugin {
             let assignee_gate = crate::superagent::clone_gate(&self.worker_gate);
             let assignee_session = self.router_session;
             let assignee_multiagent = self.multiagent;
+            let assignee_board_gating = self.board_gating;
             // the refusing branch's loop def: the worker template (a
             // vanished assignee has no entry def to build from; the
             // side mounts no working tool either way).
@@ -1461,6 +1479,7 @@ impl Plugin for SuperAgentPlugin {
                                 worker_version: agent.version,
                                 gate: crate::superagent::clone_gate(&assignee_gate),
                                 multiagent: assignee_multiagent,
+                                board_gating: assignee_board_gating,
                             },
                             crate::superagent::port_for_ctx(),
                         )
@@ -1494,6 +1513,7 @@ impl Plugin for SuperAgentPlugin {
                                 worker_version: worker_refuse_version,
                                 gate: crate::superagent::clone_gate(&assignee_gate),
                                 multiagent: assignee_multiagent,
+                                board_gating: assignee_board_gating,
                             },
                             crate::superagent::port_for_ctx(),
                         )
@@ -1507,7 +1527,8 @@ impl Plugin for SuperAgentPlugin {
             router_side,
             worker_side,
             default_loop,
-        );
+        )
+        .with_board_gating(self.board_gating);
         if let Some(profile) = &self.watchdog {
             driver = driver.with_watchdog(
                 profile.session,

@@ -68,7 +68,9 @@ use uuid::Uuid;
 use crate::directory::{MemberState, MemberView, WorkerDirectoryPort};
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 use crate::metrics::{RouterTurnRecorder, SpeakMetrics};
-use crate::multiagent::{MultiagentLimits, SpawnIdentity, cap_refusal, depth_of, holding_children};
+use crate::multiagent::{
+    BoardGating, MultiagentLimits, SpawnIdentity, cap_refusal, depth_of, holding_children,
+};
 use crate::outbox::{
     Delivered, OutboxConfig, OutboxDriver, SystemRetryClock, conversation_key, intent_ticket,
     with_attempt_keys,
@@ -785,6 +787,13 @@ pub struct RouterTools {
     /// multiagent branch below `spawn_worker` is skipped and the
     /// tool keeps today's exact bytes (M8).
     multiagent: Option<MultiagentLimits>,
+    /// (R17-C6, pin P4-1): the `superagent.board.gating` class-A
+    /// emission switch, mirrored from the config block (C4's — this
+    /// is wiring only). `false` (the default) keeps the Router-side
+    /// `thread/started` bytes exactly as today; `true` adds
+    /// `spawn_uid` + the parent's `multiagent` audit group
+    /// (`crates/kian-superagent/src/audit.rs`).
+    board_gating: BoardGating,
     /// (R17-C1, §3.1): the configured roster, mounted **iff
     /// non-empty** (pin P2-6). `None` (the default, and what an
     /// absent/empty `superagent.roster` produces) keeps the tool set
@@ -852,6 +861,7 @@ impl RouterTools {
             directory: None,
             worker_streams: None,
             multiagent: profile.multiagent,
+            board_gating: BoardGating::default(),
             roster: None,
             worker_pinned_version,
             hold,
@@ -884,6 +894,17 @@ impl RouterTools {
     #[must_use]
     pub fn with_worker_streams(mut self, port: Arc<dyn WorkerStreamsPort>) -> Self {
         self.worker_streams = Some(port);
+        self
+    }
+
+    /// (R17-C6, pin P4-1): installs the `superagent.board.gating`
+    /// class-A emission switch — `true` adds the parent-side audit
+    /// keys (`spawn_uid` + the `multiagent` group) to the Router's
+    /// `thread/started` on multiagent spawns; `false` (the absent
+    /// call, the default) keeps today's exact bytes.
+    #[must_use]
+    pub fn with_board_gating(mut self, gating: BoardGating) -> Self {
+        self.board_gating = gating;
         self
     }
 
@@ -954,6 +975,24 @@ impl RouterTools {
                 "type": "object",
                 "description": "Optional JSON Schema the child's final answer is checked \
                  against (bounded size, closed keyword subset; malformed is refused)",
+            });
+        }
+        // (R17-C7, §7.3:808-809 / pin P4-1): the two P4 arguments ride
+        // the schema iff `board.gating` is on — appended properties
+        // only, never a renamed or reordered key. Gating off renders
+        // the P2 property set byte-identically (the class-D gate of
+        // anchors.md rule 4: no `depends_on`/`group` argument at all).
+        if self.board_gating.is_on() {
+            parameters["properties"]["depends_on"] = json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Task keys this task waits on — the spawn is refused until \
+                 every named task has a successful completion (empty_output never releases)",
+            });
+            parameters["properties"]["group"] = json!({
+                "type": "string",
+                "description": "Join group label — recorded in the audit group only (v1 \
+                 evaluates join: all)",
             });
         }
         if !self.membership {
@@ -1276,6 +1315,39 @@ impl RouterTools {
         }
     }
 
+    /// (R17-C7, §5.4 argument shape / §7.3:788-789) the optional
+    /// `depends_on` argument's structural leg: absent (or explicit
+    /// `null`) is `None`; an array of **non-empty** strings is
+    /// `Some`; anything else — an empty array item, a non-string
+    /// item, a non-array — is an honest refusal naming the argument.
+    /// Pure; called before every feature check and side effect.
+    fn opt_task_key_array_arg(
+        arguments: &Value,
+        key: &'static str,
+    ) -> Result<Option<Vec<String>>, ToolError> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Array(items)) => {
+                let mut keys = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::String(value) if !value.is_empty() => keys.push(value.clone()),
+                        other => {
+                            return Err(ToolError::InvalidCall(format!(
+                                "spawn_worker `{key}` must be an array of non-empty task-key \
+                                 strings (got item {other})"
+                            )));
+                        }
+                    }
+                }
+                Ok(Some(keys))
+            }
+            Some(other) => Err(ToolError::InvalidCall(format!(
+                "spawn_worker `{key}` must be an array of non-empty task-key strings (got {other})"
+            ))),
+        }
+    }
+
     async fn spawn_worker(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         // The port is checked before any side effect: a spawn whose
         // lineage event cannot be recorded must not happen at all.
@@ -1303,6 +1375,15 @@ impl RouterTools {
         let agent_arg = Self::opt_nonempty_string_arg(&call.arguments, "agent")?;
         let task_key_arg = Self::opt_nonempty_string_arg(&call.arguments, "task_key")?;
         let output_schema_arg = Self::opt_object_arg(&call.arguments, "output_schema")?;
+        // (R17-C7, §5.4:599-602 — argument shape, FIRST in the chain)
+        // the two P4 arguments shape-validate the moment they are
+        // present (pin P4-1 gates their *acceptance*, not their
+        // validation: a malformed `depends_on`/`group` is refused
+        // here, before the feature checks and before every side
+        // effect).
+        let depends_on_arg = Self::opt_task_key_array_arg(&call.arguments, "depends_on")?;
+        let group_arg = Self::opt_nonempty_string_arg(&call.arguments, "group")?;
+        let p4_args_present = depends_on_arg.is_some() || group_arg.is_some();
         let roster_args_present =
             agent_arg.is_some() || task_key_arg.is_some() || output_schema_arg.is_some();
         // (R15-C3, §5.4:599-602 — the P1 subset) the multiagent
@@ -1325,12 +1406,26 @@ impl RouterTools {
         // block (pin P2-6's refusal clause; a spawn the capability
         // cannot honour is never silently degraded).
         let mut declared_output_schema = None;
+        let mut declared_depends_on: Vec<String> = Vec::new();
+        let mut declared_group: Option<String> = None;
         let multiagent_identity = match self.multiagent {
             None => {
                 if roster_args_present {
                     return Err(ToolError::Execution(
                         "spawn refused: `agent`/`task_key`/`output_schema` require a \
                          superagent.multiagent block, which is not configured"
+                            .into(),
+                    ));
+                }
+                // (R17-C7, pin P4-1 / anchors.md rule 4): the P4
+                // arguments live under the same feature root — a
+                // call passing them against a config with no
+                // `superagent.multiagent` block names the absent
+                // block, never a silent degradation.
+                if p4_args_present {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `depends_on`/`group` require a superagent.multiagent \
+                         block, which is not configured"
                             .into(),
                     ));
                 }
@@ -1349,6 +1444,23 @@ impl RouterTools {
                             .into(),
                     ));
                 }
+                // (R17-C7, pin P4-1 / anchors.md rule 4): the two P4
+                // arguments exist iff `board.gating` is on — gating
+                // off keeps the P3 spawn bytes exactly, so a call
+                // passing `depends_on`/`group` while the gate is off
+                // is refused naming the switch (the P2-6 refusal
+                // clause applied to the P4 gate), and **no readiness
+                // is evaluated** on that path.
+                if p4_args_present && !self.board_gating.is_on() {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `depends_on`/`group` require superagent.board.gating: \
+                         true, which is false — with gating off the spawn keeps the P3 bytes \
+                         exactly (no P4 argument is accepted, no readiness is evaluated)"
+                            .into(),
+                    ));
+                }
+                declared_depends_on = depends_on_arg.clone().unwrap_or_default();
+                declared_group = group_arg.clone();
                 // §5.4 `output_schema shape` BEFORE `roster
                 // resolution`: a malformed schema must not consume a
                 // resolution attempt (§5.4:604-607). The full pin-P2-3
@@ -1425,6 +1537,90 @@ impl RouterTools {
                     task_key_arg.as_deref(),
                     assignee,
                 );
+                // (R17-C7, pin P4-4 / §4.4:507-527) readiness —
+                // evaluated AT the spawn, from the primary only (the
+                // parent's own committed stream + the children's
+                // streams through the read-only port), never a view
+                // (M7 / READ-MODEL R8). Placement: after identity
+                // derivation (readiness needs the task id), BEFORE
+                // `max_children` (§5.4's insert point). A refusal here
+                // creates no thread, no row, no lineage — only when
+                // `board.gating` is on is any readiness evaluated at
+                // all (pin P4-1). `accept_unverified` is `false` at
+                // this site: v1 has no policy surface for admitting
+                // unverified work (§5.3's `join` row), so the strict
+                // success set `{completed_verified}` is the honest
+                // default — `empty_output` never releases either way.
+                if self.board_gating.is_on() && !declared_depends_on.is_empty() {
+                    let parent_events = port.read_stream().await.map_err(|e| {
+                        ToolError::Execution(format!(
+                            "spawn refused: readiness stream read failed ({e})"
+                        ))
+                    })?;
+                    let dep_ids: std::collections::BTreeSet<uuid::Uuid> = declared_depends_on
+                        .iter()
+                        .map(|key| crate::multiagent::task_id_for_key(self.router, key))
+                        .collect();
+                    let streams = self.child_streams()?;
+                    let mut child_map: std::collections::HashMap<SessionId, Vec<Event>> =
+                        std::collections::HashMap::new();
+                    for ev in parent_events
+                        .iter()
+                        .filter(|ev| ev.kind == EventKind::ThreadStarted)
+                    {
+                        let Some(task) = crate::audit::thread_started_task_id(&ev.bytes)
+                            .and_then(|raw| uuid::Uuid::parse_str(&raw).ok())
+                        else {
+                            continue;
+                        };
+                        if !dep_ids.contains(&task) {
+                            continue;
+                        }
+                        let Some(worker) = crate::multiagent::event_worker_session(ev) else {
+                            continue;
+                        };
+                        if child_map.contains_key(&worker) {
+                            continue;
+                        }
+                        let events = streams.read_stream(worker).await.map_err(|e| {
+                            // Unreadable referent stream: fail-closed —
+                            // an unreadable dependency is never
+                            // silently released (§8.3:864).
+                            ToolError::Execution(format!(
+                                "spawn refused: readiness cannot read the child stream of a \
+                                 declared dependency ({e})"
+                            ))
+                        })?;
+                        child_map.insert(worker, events);
+                    }
+                    match crate::multiagent::ready_deps(
+                        self.router,
+                        &parent_events,
+                        identity.task_id,
+                        task_key_arg.as_deref(),
+                        &declared_depends_on,
+                        false,
+                        &|session| child_map.get(&session).cloned().unwrap_or_default(),
+                    ) {
+                        crate::multiagent::DepReadiness::Ready => {}
+                        crate::multiagent::DepReadiness::Unmet(keys) => {
+                            return Err(ToolError::Execution(format!(
+                                "spawn refused: depends_on not satisfied — unmet task key(s): \
+                                 {} (no successful completion yet; empty_output never releases a \
+                                 dependent; nothing was spawned)",
+                                keys.join(", ")
+                            )));
+                        }
+                        crate::multiagent::DepReadiness::Cycle(path) => {
+                            return Err(ToolError::Execution(format!(
+                                "spawn refused: depends_on cycle — {} — a self-reference or a \
+                                 cycle over the recorded task graph is refused before any side \
+                                 effect; nothing was spawned",
+                                path.join(" -> ")
+                            )));
+                        }
+                    }
+                }
                 // The child-streams port gates both caps walks;
                 // absent is a fail-closed refusal, never an uncapped
                 // spawn (§5.3, §8.3:864).
@@ -1608,7 +1804,7 @@ impl RouterTools {
             output_schema: declared_output_schema,
         };
         let spawned = self.spawner.prepare(&request);
-        let started_bytes = match &request.exec_worker {
+        let mut started_bytes = match &request.exec_worker {
             Some(id) => thread_started_payload_bound(
                 &spawned.thread,
                 spawned.worker_session,
@@ -1621,6 +1817,38 @@ impl RouterTools {
                 &spawned.task_message,
             ),
         };
+        // (R17-C6/C7, pin P4-2): the parent-side class-A keys — only when
+        // the gate is on AND the spawn carries the derived identity.
+        // The full group rides here (`task_id`, `assignee`, `attempt`,
+        // `depends_on[]`, `group?`): the attempt ordinal is derived
+        // from the parent's OWN committed stream (§1:177-179 — 1 + the
+        // prior `thread/started` carrying the same `task_id`), and
+        // `depends_on`/`group` carry the P4 spawn arguments when the
+        // gate accepted them (R17-C7; both stay empty/unset when the
+        // call declared none). The child's own `thread/started`
+        // carries only the derivable subset, so the two payloads'
+        // audit keys differ by design while the wrapper (`task`) stays
+        // byte-identical. Gating off: exactly today's bytes.
+        if self.board_gating.is_on()
+            && let Some(identity) = &request.identity
+        {
+            let parent_events = port.read_stream().await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "spawn refused: board gating attempt-ordinal stream read failed ({e})"
+                ))
+            })?;
+            started_bytes = crate::audit::parent_thread_started_payload(
+                started_bytes,
+                &crate::audit::ParentThreadAudit {
+                    spawn_uid: identity.spawn_uid,
+                    task_id: identity.task_id,
+                    assignee: identity.assignee.clone(),
+                    attempt: crate::audit::attempt_of(&parent_events, identity.task_id),
+                    depends_on: declared_depends_on.clone(),
+                    group: declared_group.clone(),
+                },
+            );
+        }
         port.emit(EventKind::ThreadStarted, started_bytes)
             .await
             .map_err(|e| ToolError::Execution(format!("thread/started write failed: {e}")))?;
@@ -2351,6 +2579,7 @@ impl Clone for RouterTools {
             directory: self.directory.clone(),
             worker_streams: self.worker_streams.clone(),
             multiagent: self.multiagent,
+            board_gating: self.board_gating,
             roster: self.roster.clone(),
             worker_pinned_version: self.worker_pinned_version,
             hold: Arc::clone(&self.hold),
@@ -4588,7 +4817,13 @@ mod tests {
         // Replay: the lineage plan over the same bytes re-derives the
         // thread (a takeover would Resume, not re-emit).
         assert_eq!(
-            crate::worker::lineage_plan(&worker_events, worker, sid(10), 7),
+            crate::worker::lineage_plan(
+                &worker_events,
+                worker,
+                sid(10),
+                7,
+                crate::multiagent::BoardGating::default(),
+            ),
             crate::worker::LineagePlan::Resume {
                 thread_id: tid(0xf1)
             }

@@ -10,6 +10,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Multiagent P4: `depends_on` + `group`, readiness gating (round 17, C7)**. With
+  `superagent.board.gating: true`, `spawn_worker` grows `depends_on` (task keys) and `group`: the
+  spawn is refused — before any side effect, from the primary only — until every named task has a
+  successful completion (`empty_output` never releases; `completed_unverified` only under a policy
+  that accepts it), and a self-reference or cycle over the recorded task graph is refused naming
+  the cycle. The parent's `thread/started` audit group carries the declared facts, and `kian
+  board` gains the `depends_on`/`group`/`ready` columns, flipping `evidence_provenance` to
+  `"recorded"` only where the committed `evidence_ref` key exists. `superagent.multiagent.join`
+  validates `all` | `any` | `quorum:<n>` and refuses to boot on `any`/`quorum:<n>` (no evaluation
+  site in v1 — deferred with fan-in). Gating off is byte-identical P3. Contract:
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §4.4/§7.3, [docs/SPEC.md](docs/SPEC.md) §5.
 - **Multiagent roster: the per-assignee child surface and the output-schema gate (round 17, C1–C3)**.
   `superagent.roster` names delegation entries over `agents:` definitions; `spawn_worker` grows
   `agent`/`task_key`/`output_schema` and `kian agents` lists the roster. A roster-spawned child runs

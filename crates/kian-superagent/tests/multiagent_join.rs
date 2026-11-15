@@ -388,6 +388,7 @@ fn assemble(
         worker_version: 7,
         gate: EvidenceGateConfig::default(),
         multiagent,
+        board_gating: kian_superagent::BoardGating::default(),
     };
     let driver = WorkerLoopDriver::new(
         Arc::new(ScriptedInner { outcome: inner }),

@@ -78,8 +78,9 @@ use uuid::Uuid;
 
 use crate::inbox::{InboxWriteError, InboxWriter};
 use crate::multiagent::{
-    MultiagentLimits, Reconcile, SpawnIdentity, child_session_id, derive_outcome, join_target,
-    reconcile_completion, report_key_for,
+    BoardGating, MultiagentLimits, Reconcile, SpawnIdentity, child_session_id, derive_outcome,
+    join_target, outcome_evidence_ref, outcome_for_completion, reconcile_completion,
+    report_key_for,
 };
 
 /// Gate name the worker wrapper stamps on its verdicts (distinct from
@@ -967,12 +968,21 @@ pub enum LineagePlan {
 /// resident state). A stream is a worker stream iff it already carries
 /// a `thread/started` naming this session, or its **first** input
 /// carries the delegation wrapper.
+///
+/// (R17-C6, pin P4-1/P4-2) `gating` is the `superagent.board.gating`
+/// class-A switch: off (the default) the emitted bytes are exactly
+/// today's; on, a wrapper carrying the spawn identity gains the
+/// child-side keys — `spawn_uid` + the derivable `multiagent` subset
+/// (`task_id`, `assignee`) — over the same base payload. A wrapper
+/// without a readable identity writes no key (never guessed), and the
+/// wrapper itself never changes: the keys ride outside `content`.
 #[must_use]
 pub fn lineage_plan(
     events: &[Event],
     self_session: SessionId,
     router: SessionId,
     worker_version: u64,
+    gating: BoardGating,
 ) -> LineagePlan {
     if let Some(existing) = events
         .iter()
@@ -1013,6 +1023,21 @@ pub fn lineage_plan(
         WorkerBinding::Unbound | WorkerBinding::Malformed => {
             thread_started_payload(&thread, self_session, &first_input.bytes)
         }
+    };
+    // (R17-C6, pin P4-2): the child-side class-A keys — only when the
+    // gate is on AND the wrapper carries a readable identity (all
+    // four pin-P6 class-B keys; a partial identity is malformed
+    // history and writes no key, never a guess). The keys compose
+    // over the base payload above, so the bound form keeps its
+    // `exec_worker` key and the wrapper bytes never move.
+    let started_bytes = match (gating.is_on(), spawn_identity_of(content)) {
+        (true, Some(identity)) => crate::audit::child_thread_started_payload(
+            started_bytes,
+            identity.spawn_uid,
+            identity.task_id,
+            identity.assignee.as_deref(),
+        ),
+        _ => started_bytes,
     };
     LineagePlan::Emit {
         thread_id: delegation.thread_id,
@@ -1527,6 +1552,14 @@ pub struct WorkerLoopConfig {
     /// byte-identically (M8): the ambient [`WorkerLoopConfig::router`]
     /// admits the legacy report under the legacy key.
     pub multiagent: Option<MultiagentLimits>,
+    /// (R17-C6, pin P4-1) The `superagent.board.gating` class-A
+    /// emission switch: `false` (the default) ⇒ the child-side
+    /// `thread/started` and `thread/completed` payloads keep their
+    /// P3 bytes exactly; `true` ⇒ each gains `spawn_uid` + the
+    /// `multiagent` audit group (the derivable subset on `started`,
+    /// the outcome group on `completed` — `crates/kian-superagent/
+    /// src/audit.rs`). Wiring only; the config block is C4's.
+    pub board_gating: BoardGating,
 }
 
 /// A decorator over any inner [`LoopDriver`] that adds Thread lineage
@@ -1716,6 +1749,7 @@ where
         port.session(),
         core.config.router,
         core.config.worker_version,
+        core.config.board_gating,
     ) {
         LineagePlan::PassThrough => Ok(None),
         LineagePlan::Resume { thread_id } => Ok(Some(thread_id)),
@@ -2032,11 +2066,37 @@ where
             }
         }
     }
+    // (R17-C6, pins P4-1/P4-3): the class-A completion keys —
+    // `spawn_uid` + the `multiagent` outcome group — ride only when
+    // the gate is on AND the wrapper carries a readable identity.
+    // `outcome` is written by the at-write helper (the six
+    // completion-borne values; `None` means the status refines to a
+    // no-carrier value, which stays derived on demand), `evidence_ref`
+    // points at the committed verdict that decided the outcome,
+    // `contract` is the pin-P6 twin of a committed worker-gate
+    // verdict. Gating off (or no identity): exactly today's bytes.
+    let wrapper = first_input_content(&events);
+    let completed_payload = match (
+        core.config.board_gating.is_on(),
+        spawn_identity_of(&wrapper),
+    ) {
+        (true, Some(identity)) => {
+            let outcome = outcome_for_completion(status, &events, None);
+            let evidence_ref =
+                outcome.and_then(|outcome| outcome_evidence_ref(&events, port.session(), outcome));
+            crate::audit::thread_completed_payload_keyed(
+                thread_completed_payload(thread_id, status, summary.clone()),
+                identity.spawn_uid,
+                identity.task_id,
+                outcome,
+                evidence_ref,
+                worker_contract(&events),
+            )
+        }
+        _ => thread_completed_payload(thread_id, status, summary.clone()),
+    };
     if let Err(e) = port
-        .emit(
-            EventKind::ThreadCompleted,
-            thread_completed_payload(thread_id, status, summary.clone()),
-        )
+        .emit(EventKind::ThreadCompleted, completed_payload)
         .await
     {
         return (
@@ -2052,7 +2112,6 @@ where
     // the pin-P3 key for the wrapper (`spawn:<spawn_uid>`, else the
     // legacy `thread-report:` key). Feature-off derives exactly the
     // legacy pair (M8).
-    let wrapper = first_input_content(&events);
     let key = report_key_for(&wrapper, thread_id);
     let report = match spawn_identity_of(&wrapper) {
         Some(identity) => {
@@ -2136,6 +2195,7 @@ mod tests {
         reported_outcome, revalidate_mandate, speculative_delegation_content,
         thread_completed_payload, thread_report_content, thread_started_payload,
     };
+    use crate::multiagent::BoardGating;
     use crate::templates::worker_template;
     use kian_core::events::{Event, EventKind};
     use kian_core::model::{SessionId, Thread};
@@ -2680,7 +2740,7 @@ mod tests {
         let router = sid(10);
         let worker = sid(20);
         let events = worker_stream_first_input(worker);
-        let plan = lineage_plan(&events, worker, router, 7);
+        let plan = lineage_plan(&events, worker, router, 7, BoardGating::default());
         let LineagePlan::Emit {
             thread_id,
             started_bytes,
@@ -2715,7 +2775,7 @@ mod tests {
             }),
         ));
         assert_eq!(
-            lineage_plan(&events, worker, router, 7),
+            lineage_plan(&events, worker, router, 7, BoardGating::default()),
             LineagePlan::Resume {
                 thread_id: tid(0xee)
             },
@@ -2743,7 +2803,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            lineage_plan(&events, router, router, 1),
+            lineage_plan(&events, router, router, 1, BoardGating::default()),
             LineagePlan::PassThrough
         );
         // A worker-side event naming another session is not our lineage.
@@ -2754,7 +2814,7 @@ mod tests {
             json!({"thread_id": tid(2).to_string(), "worker": sid(98).0.to_string()}),
         );
         assert_eq!(
-            lineage_plan(&[other], router, router, 1),
+            lineage_plan(&[other], router, router, 1, BoardGating::default()),
             LineagePlan::PassThrough
         );
     }
@@ -3210,7 +3270,7 @@ mod tests {
                 json!({"role": "user", "content": wrapper}),
             ),
         ];
-        let plan = lineage_plan(&events, worker, router, 7);
+        let plan = lineage_plan(&events, worker, router, 7, BoardGating::default());
         let LineagePlan::Emit { started_bytes, .. } = plan else {
             panic!("expected Emit, got {plan:?}");
         };

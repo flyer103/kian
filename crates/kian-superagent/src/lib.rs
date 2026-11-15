@@ -101,6 +101,7 @@
 //!   `read_progress` over `RecallPort`; `intervene` as a steer row via
 //!   `InboxWriter`; `escalate` under the IM policy)
 
+pub mod audit;
 pub mod directory;
 pub mod dsh;
 pub mod github;
@@ -131,6 +132,10 @@ pub mod watchdog;
 pub mod wechat;
 pub mod worker;
 
+pub use audit::{
+    EvidenceRef, MULTIAGENT_KEY, ParentThreadAudit, attempt_of, child_thread_started_payload,
+    parent_thread_started_payload, thread_completed_payload_keyed,
+};
 pub use directory::{MemberState, MemberView, WorkerDirectoryError, WorkerDirectoryPort};
 pub use dsh::{
     BRIDGE_CONTRACT_VERSION, ContractError, ControlFrame, DshEvent, DshMapper, MapCtx, Mapped,
@@ -158,10 +163,11 @@ pub use metrics::{
 };
 pub use mock::{CapturedDelivery, MockChannel};
 pub use multiagent::{
-    BUDGET_EXHAUSTED_CLASS, CHILD_TIMEOUT_REQUESTED_BY, CapRefusal, DEFAULT_CHILD_TIMEOUT_MS,
-    DEFAULT_MAX_CHILDREN, DEFAULT_MAX_DEPTH, EMPTY_RESPONSE_CLASS, MultiagentLimits, Reconcile,
-    SUCCESS_SET, SpawnIdentity, TaskOutcome, cap_refusal, child_session_id, child_thread_id,
-    depth_of, derive_outcome, holding_children, join_target, legacy_report_key,
+    BUDGET_EXHAUSTED_CLASS, BoardGating, CHILD_TIMEOUT_REQUESTED_BY, CapRefusal,
+    DEFAULT_CHILD_TIMEOUT_MS, DEFAULT_MAX_CHILDREN, DEFAULT_MAX_DEPTH, DepReadiness,
+    EMPTY_RESPONSE_CLASS, MultiagentLimits, Reconcile, SUCCESS_SET, SpawnIdentity, TaskOutcome,
+    cap_refusal, child_session_id, child_thread_id, depth_of, derive_outcome, holding_children,
+    join_target, legacy_report_key, outcome_evidence_ref, outcome_for_completion, ready_deps,
     reconcile_completion, report_key, report_key_for, spawn_uid, task_id_for_key, task_input_key,
 };
 pub use outbox::{
