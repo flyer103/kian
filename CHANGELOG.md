@@ -1359,3 +1359,75 @@ state; both are isolated from the resident-budget change on a separate branch.
   TTL across a real WeChat restart and a live post-restart cold catalog are unverified until this
   branch is deployed.
 
+## 2026-11-15 — per-phase exec waits + honest timeout result + budget stop is `interrupted` (ADR-028)
+
+A delegated worker ran a 23-minute external agent through the synchronous `exec` tool with
+`timeout_ms: 3000000`. The call returned `{"error":"execution timed out"}` after exactly 60 s
+(`queue_timeout`) while the command kept running; the model could not tell "killed" from "still
+running", invented a `sleep 55` polling loop (60 `exec` calls, 865 s of sleep, 32 iterations = the
+whole budget, ~890k prompt tokens, then `thread/completed{completed}` over an empty summary), and
+the user saw 14 minutes of silence. The real result was discarded
+(`late result for a settled command discarded`). Three defects, one decision record.
+
+- **Per-phase waits (1a)** — `RemoteExecBackend` now distinguishes the *dispatch* wait (row
+  `pending`, bound `queue_timeout`, expiry abandons — honest, nothing ran) from the *execution*
+  wait (row `inflight`, bound `2 * exec_bound + queue_timeout` where
+  `exec_bound = timeout_ms.unwrap_or(queue_timeout)`, expiry **never mutates the row**: the queue
+  keeps the truth and stays re-driveable, only the watcher stops). `exec_tracked` keeps its
+  signature and stays `WaitPolicy::Caller`; the new `exec_tracked_watched` takes the policy, and
+  the async `start` observer uses `WaitPolicy::Job` — so a job that outlives the dispatch bound
+  finally delivers its **real** result instead of `{"error":"queue timeout"}` at 60 s. Phase-A
+  expiry still abandons; phase-B expiry settles the job `abandoned` with the observed state and
+  leaves the live queue row untouched.
+- **Fail-closed `timeout_ms` (1b)** — the sync `exec` refuses a `timeout_ms` above its own wait
+  bound *before enqueueing* (no row, no dispatch), naming both bounds and pointing at `start`.
+  Previously such a call burned the full wait and then returned a timeout that read like a kill.
+- **Semantic timeout result (1c)** — a remote wait expiry now reports what it observed:
+  `row_state` (`pending`/`inflight`/`abandoned`), `still_running`, `row_abandoned`,
+  `wait_bound_ms`, `hint`. The four legacy keys and `is_error` are unchanged; the extra keys
+  appear only on a state the local executor cannot produce (it kills its own child, so a local
+  timeout stays unambiguous and claims nothing about a surviving grandchild).
+- **Steering (2/4a)** — the model-visible `exec` description states its bounded wait, the
+  discarded result and "never poll with `sleep`"; `start` states the completion arrives on its
+  own; `spawn_worker` asks the Router for a one-line acknowledgement right after dispatch.
+  Descriptions only — the parameter objects are untouched, so the exec/fs schema-parity tests
+  still pass byte-identically.
+- **Budget stop is `interrupted` (3)** — the loop's only intentional-stop producer is
+  iteration-budget exhaustion, where the last assistant turn is by construction a pending tool
+  call with empty text. `reported_outcome` (new, pure, unit-tested) records
+  `thread/completed{status:"interrupted"}` with the stop reason as the summary, so the Router's
+  report says why instead of handing it an empty success. `session/ended{completed}` is unchanged
+  in this change: `thread_liveness` then still reads `Released` (worker reusable), and making the
+  end reason `interrupted` would hold the worker until a designed resume/cancel exists — deferred
+  to its own ADR.
+- **Docs** — new ADR-028; WORKER-MODEL §4 rewritten (the old bullet claimed `queue_timeout` was a
+  "bound on an absent worker" while the code also bounded running commands); DESIGN crate map
+  updated. No EVENT-MODEL/API-CONTRACT change: `tool/result.output` is opaque JSON and no wire or
+  event kind moved.
+- **Verified** — L1: `kian-exec/tests/async_tools.rs` `job_outliving_the_dispatch_wait_delivers_the_real_result`
+  (a real `kian-endpoint` executor over TCP, a 1 s command under a 400 ms dispatch bound, real
+  stdout delivered) and `remote_tool.rs` `exec_refuses_timeout_ms_above_the_wait_bound` (no row
+  on refusal) + `exec_timeout_reports_the_worker_still_running` (row observed `inflight`);
+  `kian-superagent` unit tests for `reported_outcome`. L2:
+  `kian-cli/tests/async_tools_e2e.rs` `job_outliving_the_dispatch_bound_delivers_its_real_result`
+  — the real assembly plus a real `kiand` child, an 800 ms `queue_timeout_ms` endpoint against a
+  2 s command, the completion input carrying the command's real `late-result` stdout and the job
+  row settling `done` (with the drain gated throughout, so no polling turn can rescue it).
+  Regression: the existing 9 async-tools and 6 remote-tool tests, the assembled-server
+  `async_tools_e2e`/`superagent_serve` suites, and the full workspace run stay green.
+- **Deployed** — 2026-11-15 on the owner's router host: the cross-built
+  `x86_64-unknown-linux-gnu` binary of this change (previous binary and config kept as timestamped
+  backups) plus `superagent.async_tools: true` and the watchdog session; the mac-mini worker reaches
+  the router through a launchd-kept `ssh -L 7400` tunnel (the owner's hand-run tunnel had died).
+  Live: both workers `online`, the watchdog ticking (`list_threads` → no-op) every 5 min.
+- **Unverified (named)** — no live *long* job has run through the new execution phase yet: the
+  L3 observation needs a real dispatch through the Router's channel, which the owner triggers.
+  The dynamic-membership (`workers:`) per-side async pair is covered at L2 by the existing
+  `worker_membership_l2::async_tools_follow_the_dynamic_worker` (real serve + a registering
+  `kiand`, the worker calls `start`, the job row carries `dyn-1`); a *phase-B* variant is not
+  separately testable there because dynamic workers have no per-endpoint `queue_timeout_ms`
+  knob — the phase logic is backend-level and shared with the `endpoints:` case exercised above.
+  `session/ended{completed}` on a budget stop is a known, documented limitation.
+- **Gates on the final tree** — `cargo test --workspace` 123 suites green (1521 passed / 0 failed
+  / 7 ignored), clippy `--workspace --all-targets -D warnings`, fmt `--all --check`, `docs_map`
+  6/6.

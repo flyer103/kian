@@ -141,9 +141,37 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   again (mtime may move) — never a different payload.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
-- **Honest timeout.** `queue_timeout` (per static endpoint; the backend-level maximum for dynamic
-  workers) is the bound on an absent worker. Expiry marks the row abandoned and returns a timeout —
-  never a fabricated result, never a silent retry against another worker.
+- **Honest timeout, bounded per phase** (ADR-028). A wait is bounded by what is actually being
+  waited on, never by one knob for both:
+  - *Dispatch wait* — the row is `pending`: no route has taken it. `queue_timeout` (per static
+    endpoint; the backend-level maximum for dynamic workers) is the bound on an absent worker;
+    expiry marks the row `abandoned`, which is honest because nothing ran.
+  - *Execution wait* — the row is `inflight`: a worker is executing it. The command's own
+    `timeout_ms` (the worker-side kill bound) is what bounds it, so the wait bound is
+    `2 * exec_bound + queue_timeout` (`exec_bound = timeout_ms`, or `queue_timeout` when absent) —
+    one dispatch plus one at-least-once re-dispatch plus slack. Expiry **does not mutate the row**:
+    the caller stops waiting, the queue row keeps the truth and stays re-driveable. Never a
+    fabricated result, never a silent retry against another worker.
+  - The synchronous `exec` (`WaitPolicy::Caller`) takes only the dispatch wait, because it parks a
+    drain; the async `start` observer (`WaitPolicy::Job`) takes both, because nothing is parked.
+    `exec` refuses a `timeout_ms` larger than its own wait bound at call time (fail-closed, no row,
+    no dispatch) instead of running to a timeout that reads like a kill.
+  - A remote wait expiry surfaces what it observed: `row_state` (`pending` — never dispatched and
+    now abandoned; `inflight` — started and still running, result discarded by this call only;
+    `abandoned` — a prior abandonment answered from the row), `still_running`, `row_abandoned` and
+    the bound in force. The success shape stays identical to the local built-in's; the extra keys
+    describe a state only the remote half can be in (the local `exec` kills its own child, so its
+    timeout is already unambiguous and claims nothing about a surviving grandchild). A job observer settles its
+    `async_jobs` row instead of a tool result: phase-A expiry `abandoned` (never dispatched),
+    phase-B expiry `abandoned` ("worker silent past the command's own bound") with the live queue
+    row untouched; `stop` remains the escape hatch.
+- **A budget stop is `interrupted`** (ADR-028). The loop's only intentional-stop producer is
+  iteration-budget exhaustion; the worker records `thread/completed{status:"interrupted"}` with the
+  stop reason as the summary — never `completed`, whose summary would otherwise be the last
+  assistant turn (a pending tool call with empty text). The following `session/ended{completed}`
+  still decides liveness (`Released`), so the worker is reusable; `session/ended{interrupted}` for a
+  budget stop is deferred to its own ADR because it holds the worker until a designed resume/cancel
+  exists.
 - **Callers survive route swaps.** A caller's future is attached to the command id, not to a
   connection, so a detach/attach cycle (replace, restart, reconnect) never severs a live wait.
 

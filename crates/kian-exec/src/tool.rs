@@ -17,7 +17,7 @@ use uuid::Uuid;
 use kian_core::fs::FsCommand;
 use kian_core::seams::{ExecCommand, ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema};
 
-use crate::RemoteExecBackend;
+use crate::{ExecWaitError, RemoteExecBackend, WaitPolicy};
 
 /// Derives the durable command id from a tool-call id: deterministic, so a
 /// replayed tool call (session recovery, re-execution) maps onto the same
@@ -55,7 +55,12 @@ impl ToolProvider for RemoteExecTool {
     fn schemas(&self) -> Vec<ToolSchema> {
         vec![ToolSchema {
             name: "exec".into(),
-            description: "Run a command on the remote execution endpoint (argv vector, no shell)."
+            description: "Run a command on the remote execution endpoint (argv vector, no shell). \
+                The call waits only for the deployment's queue wait bound; when the command is \
+                still running at that bound the call gives up, the command's result is discarded, \
+                and the error reports row_state/still_running. Detach work that may outlive the \
+                bound (background it, or use an async job tool when the deployment mounts one) \
+                instead of blocking, and never poll with `sleep`."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -80,6 +85,33 @@ impl ToolProvider for RemoteExecTool {
         let endpoint_id = self.endpoint_id.clone();
         Box::pin(async move {
             let cmd = parsed?;
+            let wait_bound_ms =
+                u64::try_from(backend.queue_timeout().as_millis()).unwrap_or(u64::MAX);
+            // ADR-028: the sync call's wait is the deployment's queue wait
+            // bound, never the command's `timeout_ms`. A `timeout_ms` above
+            // it would be a promise this call cannot keep, so it is refused
+            // before anything is enqueued — no row, no dispatch, no
+            // 60-second wait that reads like a kill.
+            if let Some(ms) = cmd.timeout_ms
+                && ms > wait_bound_ms
+            {
+                return Ok(ToolResult {
+                    call_id,
+                    output: serde_json::json!({
+                        "error": format!(
+                            "timeout_ms {ms} exceeds the sync exec wait bound {wait_bound_ms} ms"
+                        ),
+                        "timed_out": false,
+                        "rejected": true,
+                        "wait_bound_ms": wait_bound_ms,
+                        "hint": "a command that may outlive the wait bound belongs in the async \
+                                 `start` tool, which returns a job id immediately and delivers \
+                                 the result as a later input; never poll with `sleep`",
+                    }),
+                    is_error: true,
+                    redactions: Vec::new(),
+                });
+            }
             // The derived id dedupes at the row level; the *original*
             // tool-call id stays the loop's correlation key (and is kept
             // on the row as `tool_call_ref` for audit).
@@ -89,9 +121,17 @@ impl ToolProvider for RemoteExecTool {
             // execution failures are honest `is_error` outputs, never fake
             // successes (constraint 7). The redaction provenance
             // report from the settlement pass rides the ToolResult; the
-            // `output` keeps the four legacy fields only.
+            // four legacy fields stay, and a wait expiry adds what it
+            // observed (ADR-028) so the model never has to guess whether
+            // the command is still running.
             let (value, is_error, redactions) = match backend
-                .exec_tracked(command_id, &endpoint_id, cmd, Some(tool_call_ref))
+                .exec_tracked_watched(
+                    command_id,
+                    &endpoint_id,
+                    cmd,
+                    Some(tool_call_ref),
+                    WaitPolicy::Caller,
+                )
                 .await
             {
                 Ok(r) => (
@@ -104,7 +144,20 @@ impl ToolProvider for RemoteExecTool {
                     r.exit_code != Some(0),
                     r.redactions,
                 ),
-                Err(e) => (
+                Err(ExecWaitError::Timeout { row, bound_ms }) => (
+                    serde_json::json!({
+                        "error": "execution timed out",
+                        "timed_out": true,
+                        "row_state": row.as_str(),
+                        "still_running": row.still_running(),
+                        "row_abandoned": true,
+                        "wait_bound_ms": bound_ms,
+                        "hint": "this call stopped waiting; a still_running command keeps                                  executing on the worker and its result is discarded — use                                  `start` for long work and never poll with `sleep`",
+                    }),
+                    true,
+                    Vec::new(),
+                ),
+                Err(ExecWaitError::Failure(e)) => (
                     serde_json::json!({"error": e.to_string()}),
                     true,
                     Vec::new(),

@@ -15,8 +15,10 @@
 //!   fast). The job id is the command id derived from the tool-call
 //!   id ([`crate::tool::command_id_for_tool_call`]), so recovery and
 //!   replay dedupe at the row level exactly like the sync tool.
-//! - A detached observer task awaits the correlated result (the
-//!   existing per-endpoint queue drivers do the dispatch), settles
+//! - A detached observer task awaits the correlated result with
+//!   [`WaitPolicy::Job`](crate::WaitPolicy) — the execution wait, so a job
+//!   that outlives `queue_timeout` still delivers its real result (ADR-028)
+//!   — (the existing per-endpoint queue drivers do the dispatch), settles
 //!   the `async_jobs` row, and hands the settled row to the
 //!   [`AsyncResultSink`] — the kian-cli completion bridge, which
 //!   admits it to the originating session's inbox as a
@@ -46,14 +48,14 @@ use std::sync::Mutex;
 
 use futures::future::BoxFuture;
 use kian_core::model::SessionId;
-use kian_core::seams::{ExecError, ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema};
+use kian_core::seams::{ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema};
 use serde_json::json;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::RemoteExecBackend;
 use crate::async_jobs::{AsyncEnqueueOutcome, AsyncJob, AsyncJobStatus};
 use crate::tool::command_id_for_tool_call;
+use crate::{ExecWaitError, ExpiredRow, RemoteExecBackend, WaitPolicy};
 
 /// The completion half of the bridge: hand one **settled** job row to
 /// the originating session's world. Implemented by the kian-cli
@@ -328,7 +330,16 @@ impl AsyncJobs {
         let endpoint_id = self.endpoint_id.clone();
         let backend = Arc::clone(&self.backend);
         tokio::select! {
-            result = backend.exec_tracked(job_id, &endpoint_id, cmd, tool_call_ref) => {
+            // ADR-028: the observer is not a parked drain, so it takes the
+            // execution wait as well — bounded by the command's own
+            // worker-side kill bound, and never row-mutating on expiry.
+            result = backend.exec_tracked_watched(
+                job_id,
+                &endpoint_id,
+                cmd,
+                tool_call_ref,
+                WaitPolicy::Job,
+            ) => {
                 let (status, value) = match result {
                     Ok(r) => (
                         AsyncJobStatus::Done,
@@ -339,11 +350,30 @@ impl AsyncJobs {
                             "timed_out": r.timed_out,
                         }),
                     ),
-                    // The queue's honest bound (config `queue_timeout_ms`).
-                    Err(ExecError::Timeout) => {
-                        (AsyncJobStatus::Abandoned, json!({"error": "queue timeout"}))
+                    // Two distinct honest bounds: nothing ever dispatched the
+                    // row (dispatch wait), or a worker ran it past its own
+                    // kill bound and stopped answering (execution wait). The
+                    // second case leaves the queue row live and re-driveable,
+                    // so only the watch ends.
+                    Err(ExecWaitError::Timeout { row, bound_ms }) => (
+                        AsyncJobStatus::Abandoned,
+                        json!({
+                            "error": match row {
+                                ExpiredRow::Pending => "queue timeout (never dispatched)",
+                                ExpiredRow::Inflight => {
+                                    "worker silent past the command's own bound"
+                                }
+                                ExpiredRow::Abandoned => "the command was already abandoned",
+                            },
+                            "row_state": row.as_str(),
+                            "still_running": row.still_running(),
+                            "row_abandoned": !row.still_running(),
+                            "wait_bound_ms": bound_ms,
+                        }),
+                    ),
+                    Err(ExecWaitError::Failure(e)) => {
+                        (AsyncJobStatus::Done, json!({"error": e.to_string()}))
                     }
-                    Err(e) => (AsyncJobStatus::Done, json!({"error": e.to_string()})),
                 };
                 let updated = match status {
                     AsyncJobStatus::Abandoned => store.mark_async_abandoned(job_id).await,
@@ -523,7 +553,8 @@ impl ToolProvider for AsyncExecTool {
             name: "start".into(),
             description: "Start a long-running command on the execution endpoint and return \
                 immediately with a job_id; the result arrives later as an input message \
-                (kian async_result)."
+                (kian async_result). Use this for anything that may outlive the sync `exec` wait \
+                bound; do not poll for it — the completion arrives on its own."
                 .into(),
             parameters: json!({
                 "type": "object",

@@ -159,6 +159,7 @@ fn write_async_config(
     router_provider: &str,
     worker_provider: &str,
     addr: &str,
+    queue_timeout_ms: u64,
 ) -> PathBuf {
     let sqlite = dir.join("kian.sqlite");
     let yaml = format!(
@@ -207,7 +208,7 @@ superagent:
 endpoints:
   - id: ep1
     addr: "{addr}"
-    queue_timeout_ms: 20000
+    queue_timeout_ms: {queue_timeout_ms}
     offline_after_ms: {OFFLINE_AFTER_MS}
 providers:
   router-mock:
@@ -285,6 +286,17 @@ async fn boot(
     worker_script: Vec<ScriptedResponse>,
     gate_at: usize,
 ) -> (Fixture, Daemon, Arc<MockProvider>, Arc<MockProvider>) {
+    boot_with_bound(tag, worker_script, gate_at, 20_000).await
+}
+
+/// Same boot with an explicit dispatch bound (ADR-028's execution phase needs
+/// the dispatch wait to expire while the worker is still executing).
+async fn boot_with_bound(
+    tag: &str,
+    worker_script: Vec<ScriptedResponse>,
+    gate_at: usize,
+    queue_timeout_ms: u64,
+) -> (Fixture, Daemon, Arc<MockProvider>, Arc<MockProvider>) {
     force_no_proxy();
     let dir = temp_dir(tag);
     std::fs::write(dir.join("note.txt"), "a file to read between turns").expect("note file");
@@ -299,7 +311,7 @@ async fn boot(
     let mut daemon = Daemon::spawn(&listen);
     daemon.wait_listening().await;
 
-    let config = write_async_config(&dir, &router_base, &worker_base, &listen);
+    let config = write_async_config(&dir, &router_base, &worker_base, &listen, queue_timeout_ms);
     let fixture = spawn_server(&config, &dir).await;
     (fixture, daemon, worker_mock, router_mock)
 }
@@ -567,6 +579,78 @@ async fn start_returns_fast_steer_interleaves_and_completion_lands() {
         "the completion input is consumed by the drain"
     );
     let _ = (events, fx.dir);
+}
+
+/// ADR-028: a `start` job that outlives the *dispatch* wait still delivers its
+/// real result. The observer takes the execution wait (bounded by the
+/// command's own `timeout_ms`) instead of giving up at `queue_timeout` and
+/// reporting an abandoned job honestly over work that was still running.
+#[tokio::test]
+async fn job_outliving_the_dispatch_bound_delivers_its_real_result() {
+    let worker_script = vec![
+        ScriptedResponse::ToolCall {
+            id: "call-long-start".into(),
+            name: "start".into(),
+            arguments: serde_json::json!({
+                "argv": ["bash", "-c", "sleep 2; echo late-result"],
+                "timeout_ms": 60_000
+            }),
+        },
+        // GATED (request 2): the drain parks here while the job runs, so the
+        // completion has to arrive on its own — no polling turn may rescue it.
+        ScriptedResponse::ToolCall {
+            id: "call-park-1".into(),
+            name: "fs_read".into(),
+            arguments: serde_json::json!({"path": "note.txt"}),
+        },
+        ScriptedResponse::Text("completion seen".into()),
+    ];
+    // 800 ms dispatch bound against a 2 s command: the dispatch wait MUST
+    // expire while the worker is still executing.
+    let (fx, _daemon, worker_mock, _router_mock) =
+        boot_with_bound("async-long-job", worker_script, 2, 800).await;
+    let client = reqwest::Client::new();
+    let worker = dispatch_worker(&client, &fx).await;
+
+    let events = wait_for_session(&fx, worker, "start tool result", |events| {
+        !tool_results(events).is_empty()
+    })
+    .await;
+    let output = tool_results(&events)[0]["content"]["output"].clone();
+    assert_eq!(output["status"], "started", "honest start ack: {output}");
+    let job_id = output["job_id"].as_str().expect("job id").to_string();
+
+    // The command outlives the dispatch bound; its completion still lands with
+    // the bytes it actually produced.
+    let payload = wait_completion_input(&fx, &job_id).await;
+    assert_eq!(payload["kian"]["type"], "async_result");
+    assert_eq!(
+        payload["kian"]["status"], "done",
+        "the observer must outlive the dispatch wait: {payload}"
+    );
+    let text = payload.to_string();
+    assert!(
+        text.contains("late-result"),
+        "the real output must be delivered, not a timeout note: {text}"
+    );
+    assert!(
+        !text.contains("queue timeout"),
+        "a running command must not be reported as an abandoned queue wait: {text}"
+    );
+
+    // The queue row settled with the same real outcome.
+    let (status, result) = async_job_row(&fx, &job_id)
+        .await
+        .expect("async job row exists");
+    assert_eq!(status, "done");
+    assert!(
+        result.contains("late-result"),
+        "real outcome recorded: {result}"
+    );
+
+    worker_mock
+        .released
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------

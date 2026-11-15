@@ -9,10 +9,12 @@
 //! restart re-drives `inflight` rows too — at-least-once to the endpoint,
 //! deduped by command id at the row level).
 //!
-//! The caller's future resolves from the correlated result; if
-//! `queue_timeout` expires first the caller gets an honest
-//! [`ExecError::Timeout`] and the row settles `abandoned` (terminal — a
-//! later duplicate command id gets the same honest Timeout).
+//! The caller's future resolves from the correlated result. How long it
+//! waits is per phase (ADR-028): the *dispatch* wait is `queue_timeout`, and
+//! expiry there abandons the row (terminal — a later duplicate command id
+//! gets the same honest Timeout); the *execution* wait is the command's own
+//! kill bound, and expiry there never mutates the row — only the watcher
+//! stops. [`WaitPolicy`] selects which waits a caller takes.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -43,6 +45,98 @@ fn store_error(e: QueueStoreError) -> ExecError {
 }
 
 type Waiter = oneshot::Sender<Result<CommandOutcome, ExecError>>;
+
+/// Which waits a caller takes over one durable queue row (ADR-028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// The synchronous `exec` tool: one *dispatch* wait, then abandon. A
+    /// parked drain must not stay parked, so the caller never waits for a
+    /// worker that is already executing.
+    Caller,
+    /// The async `start` observer: a dispatch wait, then an *execution*
+    /// wait bounded by the command's own worker-side timeout. Nothing is
+    /// parked, so waiting longer is free — and expiry never mutates the row.
+    Job,
+}
+
+/// What a queue row was doing when a wait expired (ADR-028). The value is
+/// observed, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredRow {
+    /// No route had taken the row: nothing ran, and the wait abandoned it.
+    Pending,
+    /// A worker is executing it: the caller stopped waiting; the row stays
+    /// live and re-driveable.
+    Inflight,
+    /// A previous wait already abandoned this command id.
+    Abandoned,
+}
+
+impl ExpiredRow {
+    /// The vocabulary reported to the model, one word per observed state.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Inflight => "inflight",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// Whether the command was (as far as the server knows) still running.
+    #[must_use]
+    pub fn still_running(self) -> bool {
+        matches!(self, Self::Inflight)
+    }
+}
+
+/// A watched wait's failures: the seam's own failures plus the honest
+/// timeout that carries what the row was doing (ADR-028).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExecWaitError {
+    /// The wait bound expired. `row` says what was observed; `bound_ms` is
+    /// the bound that was in force, so the caller can report it verbatim.
+    #[error("execution timed out")]
+    Timeout { row: ExpiredRow, bound_ms: u64 },
+    /// Everything else is the exec seam's own failure, unchanged.
+    #[error("{0}")]
+    Failure(ExecError),
+}
+
+impl ExecWaitError {
+    /// Collapses onto the seam's error shape: a timeout is the seam's
+    /// honest [`ExecError::Timeout`], so pre-ADR-028 callers stay identical.
+    #[must_use]
+    pub fn into_exec_error(self) -> ExecError {
+        match self {
+            Self::Timeout { .. } => ExecError::Timeout,
+            Self::Failure(error) => error,
+        }
+    }
+}
+
+/// The execution wait bound for one command (ADR-028):
+/// `2 * exec_bound + queue_timeout` — one dispatch, one at-least-once
+/// re-dispatch, and one dispatch-wait of slack.
+fn execution_bound(dispatch_bound: Duration, exec_bound_ms: Option<u64>) -> Duration {
+    let exec = exec_bound_ms
+        .map(Duration::from_millis)
+        .unwrap_or(dispatch_bound);
+    exec * 2 + dispatch_bound
+}
+
+/// The row projection one wait consults, never a second source of truth.
+enum RowNow {
+    Done(Box<CommandOutcome>),
+    Pending,
+    Inflight,
+    Abandoned,
+    Gone,
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Per-endpoint queue driver state. Static pins are born at boot with
 /// generation 0; dynamic routes carry the registration's generation so
@@ -492,14 +586,39 @@ impl RemoteExecBackend {
         cmd: ExecCommand,
         tool_call_ref: Option<String>,
     ) -> Result<ExecResult, ExecError> {
+        self.exec_tracked_watched(
+            command_id,
+            endpoint_id,
+            cmd,
+            tool_call_ref,
+            WaitPolicy::Caller,
+        )
+        .await
+        .map_err(ExecWaitError::into_exec_error)
+    }
+
+    /// Enqueue-first tracked execution with an explicit wait policy
+    /// (ADR-028). [`WaitPolicy::Caller`] keeps the historical single
+    /// dispatch wait; [`WaitPolicy::Job`] adds the execution wait bounded by
+    /// the command's own worker-side `timeout_ms` and never mutates the row.
+    pub async fn exec_tracked_watched(
+        &self,
+        command_id: CommandId,
+        endpoint_id: &str,
+        cmd: ExecCommand,
+        tool_call_ref: Option<String>,
+        policy: WaitPolicy,
+    ) -> Result<ExecResult, ExecWaitError> {
         self.tracked(
             command_id,
             endpoint_id,
             WorkerCommand::Exec(cmd),
             tool_call_ref,
+            policy,
         )
         .await?
         .to_exec()
+        .map_err(ExecWaitError::Failure)
     }
 
     /// Enqueue-first tracked filesystem execution (the
@@ -518,27 +637,38 @@ impl RemoteExecBackend {
             endpoint_id,
             WorkerCommand::Fs(cmd),
             tool_call_ref,
+            WaitPolicy::Caller,
         )
-        .await?
+        .await
+        .map_err(ExecWaitError::into_exec_error)?
         .to_fs()
     }
 
     /// The shared enqueue → park → correlate path for both command
-    /// families.
+    /// families. `policy` decides how long the caller waits after the row
+    /// stops being `pending` (ADR-028); the enqueue half is identical.
     async fn tracked(
         &self,
         command_id: CommandId,
         endpoint_id: &str,
         command: WorkerCommand,
         tool_call_ref: Option<String>,
-    ) -> Result<CommandOutcome, ExecError> {
+        policy: WaitPolicy,
+    ) -> Result<CommandOutcome, ExecWaitError> {
+        // The command's own worker-side kill bound, snapshotted before the
+        // command moves into the row: policy `Job` derives its execution
+        // wait from it.
+        let exec_bound_ms = match &command {
+            WorkerCommand::Exec(cmd) => cmd.timeout_ms,
+            WorkerCommand::Fs(_) => None,
+        };
         let route = self.core.route(endpoint_id);
         match self
             .core
             .store
             .enqueue(command_id, endpoint_id, &command, tool_call_ref.as_deref())
             .await
-            .map_err(store_error)?
+            .map_err(|e| ExecWaitError::Failure(store_error(e)))?
         {
             // Re-execution of a settled command id: answer from the row —
             // one row, one dispatch, ever (ADR-007 dedupe). Rows written
@@ -547,7 +677,7 @@ impl RemoteExecBackend {
             // bytes even against an old store.
             EnqueueOutcome::Existing(row) => match row.status {
                 QueueStatus::Done => {
-                    return match row.outcome.expect("done rows always carry an outcome") {
+                    let settled = match row.outcome.expect("done rows always carry an outcome") {
                         // The row was redacted at settlement (report
                         // rides the durable result); re-redacting is
                         // idempotent (scrubbed bytes yield an empty
@@ -576,8 +706,14 @@ impl RemoteExecBackend {
                         }
                         other => Ok(other),
                     };
+                    return settled.map_err(ExecWaitError::Failure);
                 }
-                QueueStatus::Abandoned => return Err(ExecError::Timeout),
+                QueueStatus::Abandoned => {
+                    return Err(ExecWaitError::Timeout {
+                        row: ExpiredRow::Abandoned,
+                        bound_ms: millis(self.core.config.queue_timeout),
+                    });
+                }
                 QueueStatus::Pending | QueueStatus::Inflight => {
                     // Someone is already driving this command id; attach.
                 }
@@ -590,7 +726,16 @@ impl RemoteExecBackend {
                 }
             }
         }
-        self.core.await_outcome(command_id).await
+        self.core
+            .await_outcome(command_id, policy, exec_bound_ms)
+            .await
+    }
+
+    /// The caller's wait bound: the dispatch wait, and (policy `Job` only)
+    /// the execution wait derived from the command's own kill bound.
+    #[must_use]
+    pub fn queue_timeout(&self) -> Duration {
+        self.core.config.queue_timeout
     }
 
     /// Stops every queue driver (static and runtime) and joins them.
@@ -660,36 +805,141 @@ impl QueueCore {
 
     /// Resolve the caller's future from the correlated result; race the
     /// queue timeout honestly.
-    async fn await_outcome(&self, command_id: CommandId) -> Result<CommandOutcome, ExecError> {
+    async fn await_outcome(
+        &self,
+        command_id: CommandId,
+        policy: WaitPolicy,
+        exec_bound_ms: Option<u64>,
+    ) -> Result<CommandOutcome, ExecWaitError> {
+        let dispatch_bound = self.config.queue_timeout;
+        // Phase A — the dispatch wait: the row may still be `pending`
+        // (nobody took it), so the bound is the absent-worker bound.
+        if let Some(outcome) = self.wait_settle(command_id, dispatch_bound).await? {
+            return Ok(outcome);
+        }
+        let now = self
+            .row_now(command_id)
+            .await
+            .map_err(ExecWaitError::Failure)?;
+        match policy {
+            WaitPolicy::Caller => {
+                // The historical contract: the parked drain gives up and the
+                // row is abandoned whatever it was doing.
+                match self.store.mark_abandoned(command_id).await {
+                    Ok(true) => Err(ExecWaitError::Timeout {
+                        row: match now {
+                            RowNow::Inflight => ExpiredRow::Inflight,
+                            RowNow::Abandoned => ExpiredRow::Abandoned,
+                            _ => ExpiredRow::Pending,
+                        },
+                        bound_ms: millis(dispatch_bound),
+                    }),
+                    // The row settled concurrently — the real result (or a
+                    // competing abandonment) won the race against the timer.
+                    Ok(false) => match self.settled_outcome(command_id).await {
+                        Ok(Some(outcome)) => Ok(outcome),
+                        Ok(None) => Err(ExecWaitError::Timeout {
+                            row: ExpiredRow::Abandoned,
+                            bound_ms: millis(dispatch_bound),
+                        }),
+                        Err(e) => Err(ExecWaitError::Failure(e)),
+                    },
+                    Err(e) => Err(ExecWaitError::Failure(store_error(e))),
+                }
+            }
+            WaitPolicy::Job => match now {
+                RowNow::Done(outcome) => Ok(*outcome),
+                RowNow::Abandoned => Err(ExecWaitError::Timeout {
+                    row: ExpiredRow::Abandoned,
+                    bound_ms: millis(dispatch_bound),
+                }),
+                RowNow::Gone => Err(ExecWaitError::Failure(ExecError::Io(
+                    "exec queue row vanished".into(),
+                ))),
+                RowNow::Pending => {
+                    // Nothing ran: abandoning destroys no result.
+                    match self.store.mark_abandoned(command_id).await {
+                        Ok(_) => Err(ExecWaitError::Timeout {
+                            row: ExpiredRow::Pending,
+                            bound_ms: millis(dispatch_bound),
+                        }),
+                        Err(e) => Err(ExecWaitError::Failure(store_error(e))),
+                    }
+                }
+                RowNow::Inflight => {
+                    // Phase B — the execution wait: a worker is running the
+                    // command, whose own kill bound terminates it. Expiry
+                    // NEVER mutates the row (the queue keeps the truth and
+                    // stays re-driveable); only the watcher stops.
+                    let bound = execution_bound(dispatch_bound, exec_bound_ms);
+                    if let Some(outcome) = self.wait_settle(command_id, bound).await? {
+                        return Ok(outcome);
+                    }
+                    match self
+                        .row_now(command_id)
+                        .await
+                        .map_err(ExecWaitError::Failure)?
+                    {
+                        RowNow::Done(outcome) => Ok(*outcome),
+                        _ => Err(ExecWaitError::Timeout {
+                            row: ExpiredRow::Inflight,
+                            bound_ms: millis(bound),
+                        }),
+                    }
+                }
+            },
+        }
+    }
+
+    /// Wait up to `bound` for the correlated result. `None` means the bound
+    /// expired with the row unsettled — the caller decides what to do.
+    async fn wait_settle(
+        &self,
+        command_id: CommandId,
+        bound: Duration,
+    ) -> Result<Option<CommandOutcome>, ExecWaitError> {
         let (token, receiver) = self.register_waiter(command_id);
         // Close the completion race: if the row settled between enqueue and
         // this registration, prefer the recorded outcome.
-        if let Some(outcome) = self.settled_outcome(command_id).await? {
-            self.drop_waiter(&command_id, token);
-            return Ok(outcome);
-        }
-        tokio::select! {
-            outcome = receiver => {
-                outcome.unwrap_or_else(|_| {
-                    Err(ExecError::Io("queue driver stopped without a result".into()))
-                })
-            }
-            _ = tokio::time::sleep(self.config.queue_timeout) => {
+        match self.settled_outcome(command_id).await {
+            Ok(Some(outcome)) => {
                 self.drop_waiter(&command_id, token);
-                match self.store.mark_abandoned(command_id).await {
-                    Ok(true) => Err(ExecError::Timeout),
-                    // The row settled concurrently — the real result (or a
-                    // competing abandonment) won the race against the timer.
-                    Ok(false) => {
-                        if let Some(outcome) = self.settled_outcome(command_id).await? {
-                            Ok(outcome)
-                        } else {
-                            Err(ExecError::Timeout)
-                        }
-                    }
-                    Err(e) => Err(store_error(e)),
-                }
+                return Ok(Some(outcome));
             }
+            Ok(None) => {}
+            Err(e) => {
+                self.drop_waiter(&command_id, token);
+                return Err(ExecWaitError::Failure(e));
+            }
+        }
+        let settled = tokio::select! {
+            outcome = receiver => Some(outcome.unwrap_or_else(|_| {
+                Err(ExecError::Io("queue driver stopped without a result".into()))
+            })),
+            _ = tokio::time::sleep(bound) => {
+                self.drop_waiter(&command_id, token);
+                None
+            }
+        };
+        match settled {
+            Some(result) => result.map(Some).map_err(ExecWaitError::Failure),
+            None => Ok(None),
+        }
+    }
+
+    /// The row's current phase, read from the durable row (never a cache).
+    async fn row_now(&self, command_id: CommandId) -> Result<RowNow, ExecError> {
+        match self.store.get(command_id).await.map_err(store_error)? {
+            Some(row) => Ok(match row.status {
+                QueueStatus::Done => match row.outcome {
+                    Some(outcome) => RowNow::Done(Box::new(outcome)),
+                    None => RowNow::Gone,
+                },
+                QueueStatus::Pending => RowNow::Pending,
+                QueueStatus::Inflight => RowNow::Inflight,
+                QueueStatus::Abandoned => RowNow::Abandoned,
+            }),
+            None => Ok(RowNow::Gone),
         }
     }
 

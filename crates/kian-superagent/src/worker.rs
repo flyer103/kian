@@ -902,6 +902,22 @@ fn event_thread_id(ev: &Event) -> Option<Uuid> {
     Uuid::parse_str(raw).ok()
 }
 
+/// The `(status, summary)` one worker outcome reports (ADR-028).
+///
+/// The loop's only intentional-stop producer is iteration-budget exhaustion,
+/// where the last assistant turn is by construction a pending tool call with
+/// no text: recording that as `completed` would hand the Router an empty
+/// success, so a stop reports `interrupted` and its reason *is* the summary
+/// (the full context stays on the stream).
+#[must_use]
+pub fn reported_outcome(outcome: &LoopOutcome, events: &[Event]) -> (&'static str, Value) {
+    match outcome {
+        LoopOutcome::SoftFailed { reason } => ("failed", completion_summary(events, reason)),
+        LoopOutcome::Stopped { reason } => ("interrupted", json!({ "text": reason })),
+        _ => ("completed", completion_summary(events, "")),
+    }
+}
+
 /// The summary payload for `thread/completed`: the last assistant
 /// message's content, or `{"text": fallback}` when the stream has none
 /// (a failed worker that never produced an assistant message still
@@ -1409,13 +1425,10 @@ where
     D: LoopDriver,
     D::Ctx: Clone + Send + Sync + 'static,
 {
-    let mut status = "completed";
     let mut final_outcome = outcome;
-
     if matches!(final_outcome, LoopOutcome::SoftFailed { .. }) {
         // Honest failure: no gate, no verdict — the thread records
         // `failed` (constraint 7: never completed).
-        status = "failed";
     } else if core.config.gate.enabled {
         let events = match port.read_stream().await {
             Ok(events) => events,
@@ -1464,7 +1477,6 @@ where
                     },
                 );
             }
-            status = "failed";
             final_outcome = LoopOutcome::SoftFailed {
                 reason: format!(
                     "evidence gate `{WORKER_GATE_NAME}` failed after {} attempt(s)",
@@ -1484,11 +1496,7 @@ where
     {
         return (final_outcome, Phase::Done);
     }
-    let fallback = match &final_outcome {
-        LoopOutcome::SoftFailed { reason } => reason.clone(),
-        _ => String::new(),
-    };
-    let summary = completion_summary(&events, &fallback);
+    let (status, summary) = reported_outcome(&final_outcome, &events);
     if let Err(e) = port
         .emit(
             EventKind::ThreadCompleted,
@@ -1527,6 +1535,7 @@ where
 #[cfg(test)]
 mod tests {
     use kian_core::model::Epoch;
+    use kian_core::seams::LoopOutcome;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1535,8 +1544,8 @@ mod tests {
         SPECULATIVE_MARKER, SpawnError, StreamPortError, WorkerSpawner, completion_summary,
         delegation_content, delegation_is_speculative, delegation_mandate, delegation_pairs,
         lineage_plan, mandate_delegation_content, parse_delegation, parse_thread_report,
-        revalidate_mandate, speculative_delegation_content, thread_completed_payload,
-        thread_report_content, thread_started_payload,
+        reported_outcome, revalidate_mandate, speculative_delegation_content,
+        thread_completed_payload, thread_report_content, thread_started_payload,
     };
     use crate::templates::worker_template;
     use kian_core::events::{Event, EventKind};
@@ -2164,6 +2173,66 @@ mod tests {
     // ------------------------------------------------------------------
     // Completion summary
     // ------------------------------------------------------------------
+
+    /// ADR-028: a budget stop is `interrupted` with its reason as the
+    /// summary — never `completed` over a pending tool call with no text.
+    #[test]
+    fn a_budget_stop_reports_interrupted_with_its_reason() {
+        let worker = sid(21);
+        // Exactly the observed shape: the last assistant turn carries a
+        // tool call and no text (the run was cut mid-tool).
+        let events = vec![
+            event(
+                worker,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "x"}),
+            ),
+            event(
+                worker,
+                2,
+                EventKind::AssistantMessage,
+                json!({"content": {"text": "", "tool_calls": [{"id": "c1"}]}}),
+            ),
+        ];
+        let (status, summary) = reported_outcome(
+            &LoopOutcome::Stopped {
+                reason: "iteration budget exhausted after 32 turns".into(),
+            },
+            &events,
+        );
+        assert_eq!(status, "interrupted");
+
+        assert_eq!(
+            summary,
+            json!({"text": "iteration budget exhausted after 32 turns"})
+        );
+    }
+
+    /// A soft failure is still `failed`, and a settle is still `completed`
+    /// with the last assistant message — the ADR only moves the budget stop.
+    #[test]
+    fn a_soft_failure_and_a_settle_keep_their_status() {
+        let worker = sid(22);
+        let events = vec![event(
+            worker,
+            2,
+            EventKind::AssistantMessage,
+            json!({"content": {"text": "final answer"}}),
+        )];
+        let (failed, failed_summary) = reported_outcome(
+            &LoopOutcome::SoftFailed {
+                reason: "empty model response".into(),
+            },
+            &events,
+        );
+        assert_eq!(failed, "failed");
+        assert_eq!(failed_summary, json!({"text": "final answer"}));
+
+        let (settled, settled_summary) = reported_outcome(&LoopOutcome::Settled, &events);
+        assert_eq!(settled, "completed");
+        assert_eq!(settled_summary, json!({"text": "final answer"}));
+    }
 
     #[test]
     fn completion_summary_uses_last_assistant_message_with_fallback() {
