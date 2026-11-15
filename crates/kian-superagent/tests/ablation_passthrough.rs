@@ -552,6 +552,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             router,
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
+            multiagent: None,
         },
         port_for_ctx(),
     );

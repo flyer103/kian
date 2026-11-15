@@ -528,6 +528,7 @@ fn build_harness(
         router,
         worker_version: 7,
         gate,
+        multiagent: None,
     };
     let router_side = WorkerLoopDriver::new(
         Arc::clone(&router_dispatch) as Arc<RouterDispatchDriver>,

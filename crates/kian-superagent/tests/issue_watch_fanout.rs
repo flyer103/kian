@@ -663,6 +663,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     let wrapper_config = WorkerLoopConfig {
         router,
         worker_version: 7,
+        multiagent: None,
         gate: EvidenceGateConfig {
             enabled: true,
             checks: vec![CheckSpec::FinalMessagePresent],

@@ -558,6 +558,7 @@ async fn build_harness(
             router,
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
+            multiagent: None,
         },
         port_for_ctx(),
     );

@@ -68,6 +68,7 @@ use uuid::Uuid;
 use crate::directory::{MemberState, MemberView, WorkerDirectoryPort};
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 use crate::metrics::{RouterTurnRecorder, SpeakMetrics};
+use crate::multiagent::{MultiagentLimits, SpawnIdentity, cap_refusal, depth_of, holding_children};
 use crate::outbox::{
     Delivered, OutboxConfig, OutboxDriver, SystemRetryClock, conversation_key, intent_ticket,
     with_attempt_keys,
@@ -81,9 +82,9 @@ use crate::provenance::{ChannelEventMarker, parse_channel_marker_lenient};
 use crate::registry::{PassthroughRegistry, spawn_topic};
 use crate::templates::SPAWN_WORKER_TOOL;
 use crate::worker::{
-    PortFor, SpawnError, SpawnRequest, StreamPort, WorkerSpawner, WorkerStreamsPort, busy_owner,
-    delegation_is_speculative, parse_thread_report, thread_started_payload,
-    thread_started_payload_bound,
+    PortFor, SpawnError, SpawnRequest, StreamPort, ThreadLiveness, WorkerSpawner,
+    WorkerStreamsPort, busy_owner, delegation_is_speculative, parse_thread_report, thread_liveness,
+    thread_started_payload, thread_started_payload_bound,
 };
 
 /// The `reply` tool name (Router-only).
@@ -300,6 +301,16 @@ pub struct RouterProfile {
     /// deliver through the [`OutboxDriver`] (bounded backoff, per-
     /// `(ticket, conversation)` ordering, park with a visible stage).
     pub outbox: Option<OutboxConfig>,
+    /// (R15, §7.1): the multiagent delegation bounds
+    /// (`superagent.multiagent`). `None` (the default, and what an
+    /// absent config block produces) is **off**: `spawn_worker`
+    /// keeps today's exact validation order, wrapper, lineage and
+    /// result bytes — the M8 feature-off guarantee. When set, the
+    /// §5.4 chain runs: the identity is derived from the requesting
+    /// `tool/call`'s own committed seq (pin P2), the `max_depth`
+    /// and `max_children` caps are enforced before every side
+    /// effect, and the ack gains the spawn-identity keys (pin P4).
+    pub multiagent: Option<MultiagentLimits>,
 }
 
 impl RouterProfile {
@@ -321,6 +332,7 @@ impl RouterProfile {
             mandate: None,
             worker_membership: false,
             outbox: None,
+            multiagent: None,
         }
     }
 
@@ -724,6 +736,19 @@ pub struct RouterTools {
     /// without the wiring) = no exclusivity check: `spawn_worker`
     /// behaves as before.
     worker_streams: Option<Arc<dyn WorkerStreamsPort>>,
+    /// (R15-C3, §7.1): the multiagent delegation bounds, mirrored
+    /// from the profile. `None` (the default) is off: every
+    /// multiagent branch below `spawn_worker` is skipped and the
+    /// tool keeps today's exact bytes (M8).
+    multiagent: Option<MultiagentLimits>,
+    /// The worker template's pinned `AgentDef` version (ADR-006),
+    /// read once at construction off a pure probe `prepare` — the
+    /// [`SpawnIdentity::derive`] input for `agent_def_version`.
+    /// `worker.rs` is not this module's path domain and the spawner
+    /// exposes the template id but not the version; a
+    /// `SpawnRequest::default()` prepare is a pure mint (no IO, no
+    /// side effect), so the probe is an honest read, not a workaround.
+    worker_pinned_version: u64,
     hold: Arc<RouterHold>,
 }
 
@@ -744,6 +769,14 @@ impl RouterTools {
                 channels.clone(),
             ))
         });
+        // The worker template's pinned version (ADR-006), read off a
+        // pure probe prepare before the literal moves `spawner` —
+        // see the field's doc for why the probe (not an accessor) is
+        // the honest read here.
+        let worker_pinned_version = spawner
+            .prepare(&SpawnRequest::default())
+            .thread
+            .pinned_version;
         Self {
             spawner,
             channels,
@@ -767,6 +800,8 @@ impl RouterTools {
             worker_queue_timeouts: BTreeMap::new(),
             directory: None,
             worker_streams: None,
+            multiagent: profile.multiagent,
+            worker_pinned_version,
             hold,
         }
     }
@@ -990,6 +1025,128 @@ impl RouterTools {
         })
     }
 
+    /// (R15-C3, §5.4 step 3 / pin P2): the committed seq of the
+    /// requesting `tool/call` — the one event in this session's
+    /// stream whose `bytes.content.id == call_id`. `tool/call` is
+    /// appended log-before-execute (EVENT-MODEL §4.4), so the event
+    /// is already committed when the tool runs; an absent event
+    /// means the call is undone history and the spawn is refused
+    /// before any mint, any emit, any admit.
+    async fn spawn_seq(&self, port: &Arc<dyn StreamPort>, call_id: &str) -> Result<u64, ToolError> {
+        let events = port.read_stream().await.map_err(|e| {
+            ToolError::Execution(format!("spawn refused: committed-stream read failed: {e}"))
+        })?;
+        events
+            .iter()
+            .find(|ev| {
+                ev.kind == EventKind::ToolCall
+                    && ev
+                        .bytes
+                        .get("content")
+                        .and_then(|c| c.get("id"))
+                        .and_then(Value::as_str)
+                        == Some(call_id)
+            })
+            .map(|ev| ev.seq)
+            .ok_or_else(|| {
+                ToolError::Execution(
+                    "spawn refused: the requesting tool/call is not committed in this stream; \
+                     nothing was spawned"
+                        .into(),
+                )
+            })
+    }
+
+    /// (R15-C3, §5.3): the child-streams port, fail-closed while
+    /// multiagent is on — the caps walk reads the children's (and,
+    /// for the depth walk, the ancestors') committed streams through
+    /// this seam and nothing else. An absent port can never mean
+    /// "assume no children": that would be a silent uncapped spawn.
+    fn child_streams(&self) -> Result<&Arc<dyn WorkerStreamsPort>, ToolError> {
+        self.worker_streams.as_ref().ok_or_else(|| {
+            ToolError::Execution(
+                "spawn refused: the child-stream port is not installed (multiagent is on, \
+                 assembly must wire it)"
+                    .into(),
+            )
+        })
+    }
+
+    /// (R15-C3, §5.3 `max_depth`): the requesting session's own
+    /// depth — hops from the root — by upward walk, one hop per
+    /// slice ([`depth_of`]'s per-slice shape; the caller composes
+    /// the walk, as C1 documents). A session's own hop is its
+    /// own-lineage event: the `thread/started` on its own stream
+    /// naming **it** as `worker` (the same reader
+    /// [`crate::multiagent::join_target`] uses) — not the children's
+    /// lineage events the stream also carries, so a root Router that
+    /// already spawned children still reads depth 0. The walk is
+    /// bounded by `max_depth`: only whether the bound is met matters,
+    /// and `cap_refusal` decides from there.
+    async fn session_depth(
+        &self,
+        own_events: &[Event],
+        self_session: SessionId,
+        limits: &MultiagentLimits,
+    ) -> Result<u32, ToolError> {
+        if own_lineage_hop(own_events, self_session) == 0 {
+            return Ok(0);
+        }
+        let mut parent = own_lineage_parent(own_events, self_session)
+            .expect("own_lineage_hop > 0 implies an own lineage parent");
+        let mut depth = 1u32;
+        while depth < limits.max_depth {
+            let streams = self.child_streams()?;
+            let events = streams.read_stream(parent).await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "spawn refused: the depth walk cannot read the parent stream ({e})"
+                ))
+            })?;
+            if own_lineage_hop(&events, parent) == 0 {
+                break;
+            }
+            parent = own_lineage_parent(&events, parent)
+                .expect("own_lineage_hop > 0 implies an own lineage parent");
+            depth += 1;
+        }
+        Ok(depth)
+    }
+
+    /// (R15-C3, §5.3 `max_children`): the children that still hold
+    /// this parent, counted by [`holding_children`] over **this
+    /// session's** stream, with each child's liveness read once
+    /// through the child-streams port. An unreadable child stream
+    /// keeps the slot **held** (warn + `Live`): an unknown liveness
+    /// may refuse one spawn too many, never one too few — the cap is
+    /// never silently dropped (§8.3:864).
+    async fn holding_children_count(&self, events: &[Event]) -> Result<usize, ToolError> {
+        let streams = self.child_streams()?;
+        let mut liveness: std::collections::HashMap<SessionId, ThreadLiveness> =
+            std::collections::HashMap::new();
+        for worker in lineage_worker_sessions(events) {
+            match streams.read_stream(worker).await {
+                Ok(child_events) => {
+                    liveness.insert(worker, thread_liveness(&child_events));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "kian::router",
+                        worker = %worker.0,
+                        error = %e,
+                        "multiagent cap walk: child stream unreadable — the slot stays held (unknown is not released)"
+                    );
+                    liveness.insert(worker, ThreadLiveness::Live);
+                }
+            }
+        }
+        Ok(holding_children(events, &|session| {
+            liveness
+                .get(&session)
+                .copied()
+                .unwrap_or(ThreadLiveness::Live)
+        }))
+    }
+
     async fn spawn_worker(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         // The port is checked before any side effect: a spawn whose
         // lineage event cannot be recorded must not happen at all.
@@ -1005,6 +1162,70 @@ impl RouterTools {
             .get("speculative")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // (R15-C3, §5.4:599-602 — the P1 subset) the multiagent
+        // validation chain, inserted BEFORE the existing worker
+        // checks below, every refusal preceding every side effect
+        // (no thread id is minted, no `thread/started` is written, no
+        // inbox row lands, no lineage exists on any refusal path):
+        // `argument shape` → `feature off` (return today's path) →
+        // `spawn_seq + SpawnIdentity::derive` (pure, no side effect)
+        // → `depth` → `max_children` → the existing worker checks
+        // (binding / busy / ownership / speculation) → mandate →
+        // mint/lineage/admit. Roster resolution and the
+        // `output_schema` shape checks are P2 insertions BEFORE
+        // `depth` (they bind the identity the caps then guard); this
+        // is the P1 subset of the chain.
+        //
+        // `None` (feature off, §7.1 / M8): the whole branch is
+        // skipped — today's validation order, wrapper, lineage and
+        // result bytes, byte-identically.
+        let multiagent_identity = match self.multiagent {
+            None => None,
+            Some(limits) => {
+                // Pin P2: the identity derives from the requesting
+                // `tool/call`'s own committed seq — never the live
+                // tail (constraint 13). Refused before any mint.
+                let seq = self.spawn_seq(&port, &call.id).await?;
+                let identity = SpawnIdentity::derive(
+                    self.router,
+                    seq,
+                    self.spawner.worker_template_id(),
+                    self.worker_pinned_version,
+                );
+                // The child-streams port gates both caps walks;
+                // absent is a fail-closed refusal, never an uncapped
+                // spawn (§5.3, §8.3:864).
+                self.child_streams()?;
+                // §5.4 order: depth BEFORE max_children — a spawn
+                // violating both names `max_depth`.
+                let events = port.read_stream().await.map_err(|e| {
+                    ToolError::Execution(format!(
+                        "spawn refused: committed-stream read failed: {e}"
+                    ))
+                })?;
+                let depth = self.session_depth(&events, port.session(), &limits).await?;
+                let holding = self.holding_children_count(&events).await?;
+                if let Some(refusal) =
+                    cap_refusal(&limits, u32::try_from(holding).unwrap_or(u32::MAX), depth)
+                {
+                    return Err(ToolError::Execution(match refusal.bound {
+                        "max_children" => format!(
+                            "spawn refused: max_children reached — this parent holds {} \
+                             holding child(ren), max_children is {}; wait for a child to \
+                             complete before spawning again",
+                            refusal.current, refusal.max
+                        ),
+                        _ => format!(
+                            "spawn refused: max_depth reached — this session sits {} hop(s) \
+                             from the root, max_depth is {}; the delegation chain cannot \
+                             grow deeper",
+                            refusal.current, refusal.max
+                        ),
+                    }));
+                }
+                Some(identity)
+            }
+        };
         // (R12, R5 — spec §6.3 steps 1–5) worker-binding validation —
         // shape → feature-off → unknown id, every refusal preceding
         // every side effect (no thread id is minted, no row lands, no
@@ -1141,6 +1362,12 @@ impl RouterTools {
             speculative,
             mandate,
             exec_worker,
+            // (R15-C3): the derived identity (pin P1) on the
+            // multiagent path — the thread id and worker session are
+            // taken from it in `prepare`, and the wrapper carries the
+            // four pin-P6 class-B keys. `None` is today's path,
+            // byte-identical.
+            identity: multiagent_identity,
         };
         let spawned = self.spawner.prepare(&request);
         let started_bytes = match &request.exec_worker {
@@ -1168,6 +1395,18 @@ impl RouterTools {
             "worker": spawned.worker_session.0.to_string(),
             "status": "dispatched",
         });
+        // (R15-C3, §3.2 spawn ack / pin P4): when multiagent is on the
+        // ack GAINS the spawn-identity keys — additive over today's
+        // shape; `status:"dispatched"` stays (P4). `spawn_outcome` is
+        // `"dispatched"` on every P1 success path: the honest
+        // `"unknown"` branch is reachable only through `spawn_seq`'s
+        // refusal, which is a refusal, not an outcome (§6.1.2:649-653)
+        // — and a spawn outcome is never a child outcome (F15).
+        if let Some(identity) = &request.identity {
+            output["spawn_uid"] = json!(identity.spawn_uid.to_string());
+            output["task_id"] = json!(identity.task_id_str());
+            output["spawn_outcome"] = json!("dispatched");
+        }
         if speculative {
             output["speculative"] = json!(true);
             debug_assert!(delegation_is_speculative(&spawned.task_message["content"]));
@@ -1664,6 +1903,68 @@ fn str_arg<'a>(args: &'a Value, key: &str, tool: &str) -> Result<&'a str, ToolEr
         .ok_or_else(|| ToolError::InvalidCall(format!("{tool} requires a string `{key}`")))
 }
 
+// ---------------------------------------------------------------------------
+// R15-C3: the multiagent lineage readers (own-lineage walk inputs)
+// ---------------------------------------------------------------------------
+
+/// `bytes.worker` as a session id, if present and well-formed (the
+/// same reader `bound_workers`/`delegation_pairs` use).
+fn event_worker_session(ev: &Event) -> Option<SessionId> {
+    let raw = ev.bytes.get("worker").and_then(Value::as_str)?;
+    Some(SessionId(Uuid::parse_str(raw).ok()?))
+}
+
+/// The parent a session's own lineage event names: the
+/// `thread/started` on `events` whose `worker` **is** `self_session`
+/// (its own lineage — the same reader `join_target` uses), read for
+/// the `parent` it carries. `None` for a root session (it is nobody's
+/// child) — children's lineage events on the same stream never match,
+/// so a root Router that already spawned still reads `None`.
+fn own_lineage_parent(events: &[Event], self_session: SessionId) -> Option<SessionId> {
+    let parent = events
+        .iter()
+        .find(|ev| {
+            ev.kind == EventKind::ThreadStarted && event_worker_session(ev) == Some(self_session)
+        })?
+        .bytes
+        .get("parent")?
+        .as_str()?;
+    Some(SessionId(Uuid::parse_str(parent).ok()?))
+}
+
+/// One depth hop over one slice: [`depth_of`] applied to the
+/// session's **own-lineage view** of its stream (the `thread/started`
+/// events naming it as `worker`). The raw stream also carries the
+/// children's lineage events, which are not this session's hop — the
+/// own-lineage filter is what makes the per-slice check correct.
+fn own_lineage_hop(events: &[Event], self_session: SessionId) -> u32 {
+    let own: Vec<&Event> = events
+        .iter()
+        .filter(|ev| {
+            ev.kind == EventKind::ThreadStarted && event_worker_session(ev) == Some(self_session)
+        })
+        .collect();
+    let owned: Vec<Event> = own.into_iter().cloned().collect();
+    depth_of(&owned)
+}
+
+/// The distinct worker sessions this stream's `thread/started`
+/// lineage names — the cap walk's per-child liveness read list.
+fn lineage_worker_sessions(events: &[Event]) -> Vec<SessionId> {
+    let mut out: Vec<SessionId> = Vec::new();
+    for ev in events {
+        if ev.kind != EventKind::ThreadStarted {
+            continue;
+        }
+        if let Some(worker) = event_worker_session(ev)
+            && !out.contains(&worker)
+        {
+            out.push(worker);
+        }
+    }
+    out
+}
+
 impl ToolProvider for RouterTools {
     fn schemas(&self) -> Vec<ToolSchema> {
         let mut schemas = vec![
@@ -1773,6 +2074,8 @@ impl Clone for RouterTools {
             worker_queue_timeouts: self.worker_queue_timeouts.clone(),
             directory: self.directory.clone(),
             worker_streams: self.worker_streams.clone(),
+            multiagent: self.multiagent,
+            worker_pinned_version: self.worker_pinned_version,
             hold: Arc::clone(&self.hold),
         }
     }
