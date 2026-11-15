@@ -1336,6 +1336,21 @@ capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-int
  `AgentDef.tools` schema filter (what the model *sees*) is untouched; permissions decide what
  *runs*.
 
+### 4.8 Multiagent bundle (R14, designed)
+
+The bundle's multiagent contract — a parent session delegating a **child session** via `Thread`, the
+named-agent roster, and the board ruling — is specified normatively in
+[`design/MULTIAGENT-MODEL.md`](MULTIAGENT-MODEL.md); the decision record is
+[ADR-029](decisions/ADR-029-multiagent-delegation-and-board.md). It reuses §4.1's Thread delegation,
+[ADR-012](decisions/ADR-012-delegation-mandate.md)'s Mandate and the §4.1 subscription registry
+unchanged; it adds one config block (`superagent.multiagent`), one read-surface switch
+(`superagent.board`), one config list (`superagent.roster`) and three read-only CLI verbs (`kian board`,
+`kian tasks --all`, `kian agents`), and **no** event kind, table, route, ops method, metrics key or core
+change. In the design the board is a disposable `task_board` view over existing bytes (READ-MODEL §6)
+whose control path is recomputed from the primary at decision time — never a board entity, and never a
+control read on the view; neither view nor CLI exists yet. Phases P1–P4 with per-phase rollback are
+recorded in its §8, and nothing there is implemented.
+
 ## 5. Control-plane protocol (P5 protocolized)
 
 Unified semantics (portable across harnesses/channels):
