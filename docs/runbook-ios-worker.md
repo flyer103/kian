@@ -38,7 +38,7 @@ kian serve (Rust)  ──TCP, JSON lines (KiandProto v3)──  Swift worker (iO
   list_workers(capabilities)                               fs   → workspace root
 ```
 
-- **Wire**: TCP, one JSON object per line, `PROTOCOL_VERSION = 2`; `register` → `welcome`, then
+- **Wire**: TCP, one JSON object per line, `PROTOCOL_VERSION = 3`; `register` → `welcome`, then
   `command`/`result`, `fs_command`/`fs_result`, `ping`/`heartbeat`/`bye`
   ([API-CONTRACT](../design/API-CONTRACT.md) §8).
 - **exec backend**: reuse an iSH/Alpine sandbox (the OpenMinis approach) for fork/exec; do not try
@@ -93,7 +93,7 @@ prefix byte.
 
 | Claim | Level | Status |
 |---|---|---|
-| Wire frames, register/heartbeat/exec/fs v2 | L1/L2 (Rust both halves, goldens, real TCP) | verified in kian |
+| Wire frames, register/heartbeat/exec + fs (v3) | L1/L2 (Rust both halves, goldens, real TCP) | verified in kian |
 | Per-worker token accept/refuse, strict enrollment, shared fallback | L1 over real loopback TCP + config validation | verified in kian |
 | `register.capabilities` sanitization + live directory | L1/L2 | verified in kian |
 | Cached capabilities on `list_workers` / `kian workers` | L1/L2 | verified in kian |
