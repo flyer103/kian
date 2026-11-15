@@ -77,6 +77,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::inbox::{InboxWriteError, InboxWriter};
+use crate::multiagent::{
+    MultiagentLimits, Reconcile, SpawnIdentity, child_session_id, derive_outcome, join_target,
+    reconcile_completion, report_key_for,
+};
 
 /// Gate name the worker wrapper stamps on its verdicts (distinct from
 /// the built-in loop's `builtin` so both can coexist on one stream).
@@ -86,12 +90,6 @@ pub const WORKER_GATE_NAME: &str = "worker";
 /// thread, never two).
 fn task_input_key(thread_id: Uuid) -> String {
     format!("thread:{thread_id}")
-}
-
-/// Idempotency key for the completion report row the worker admits to
-/// the Router's inbox.
-fn report_key(thread_id: Uuid) -> String {
-    format!("thread-report:{thread_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +214,34 @@ pub fn mandate_delegation_content(
 #[must_use]
 pub fn delegation_mandate(content: &Value) -> Option<&Value> {
     content.as_object().and_then(|obj| obj.get(MANDATE_KEY))
+}
+
+// ---------------------------------------------------------------------------
+// The derived task identity keys (R15 plan §4 C2, pin P6 class-B)
+// ---------------------------------------------------------------------------
+
+/// Reads the derived task identity off a delegation wrapper — the
+/// inverse of the four additive keys [`WorkerSpawner::prepare`]
+/// appends on the multiagent path (`spawn_uid`, `task_id`,
+/// `agent_def`, `agent_def_version`, pin P6). The child side and the
+/// completion reconciliation recover the identity from the wrapper
+/// bytes alone (the resolution is recorded, never re-resolved,
+/// §2.1.1), so a replay rehydrates rather than re-consults.
+///
+/// `None` on legacy wrappers (the keys are absent — the legacy path
+/// never writes them) and on partially-written or malformed ones: the
+/// identity is never guessed, never defaulted, never reconstructed
+/// from `thread_id` (a malformed writer is a bug to surface, not a
+/// value to paper over).
+#[must_use]
+pub fn spawn_identity_of(wrapper: &Value) -> Option<SpawnIdentity> {
+    let obj = wrapper.as_object()?;
+    Some(SpawnIdentity {
+        spawn_uid: Uuid::parse_str(obj.get("spawn_uid")?.as_str()?).ok()?,
+        task_id: Uuid::parse_str(obj.get("task_id")?.as_str()?).ok()?,
+        agent_def: obj.get("agent_def")?.as_str()?.to_string(),
+        agent_def_version: obj.get("agent_def_version")?.as_u64()?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +529,33 @@ pub fn thread_report_content_stated(
     report
 }
 
+/// The multiagent completion-report content (R15 plan §4 C2, pin P6
+/// class-C): exactly [`thread_report_content`] (whose frozen triple
+/// and bytes are golden-tested and **not** modified) plus the additive
+/// `spawn_uid` and `task_id` keys, and the `contract` object **iff**
+/// the child committed a gate verdict — `None` means no verdict was
+/// committed and the key is absent (never `null`). The `contract`
+/// shape is `{"passed": bool, "errors": [<failed check names>]}`.
+///
+/// Pure: the caller (the join, C4) supplies committed facts only, so
+/// the same events always re-derive the same bytes — the precondition
+/// for §2.2.1's re-admit being a genuine no-op.
+#[must_use]
+pub fn thread_report_content_ident(
+    identity: &SpawnIdentity,
+    status: &str,
+    summary: Value,
+    contract: Option<Value>,
+) -> Value {
+    let mut report = thread_report_content(identity.task_id, status, summary);
+    report["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
+    report["task_id"] = Value::String(identity.task_id_str());
+    if let Some(contract) = contract {
+        report["contract"] = contract;
+    }
+    report
+}
+
 /// A parsed completion report found inside a message `content`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadReport {
@@ -717,14 +770,33 @@ impl WorkerSpawner {
     /// fresh worker session, the delegation wrapper (every additive
     /// key included) and the task message. No IO, no side effects —
     /// the caller emits its Router-side lineage first, then admits.
+    ///
+    /// When `request.identity` is `Some` (the multiagent path, R15
+    /// plan §4 C2) both ids are **derived from the identity** (pin
+    /// P1): the thread id is the identity's `task_id` (the derived
+    /// thread id, pin P7 — equal to
+    /// `child_thread_id(parent, spawn_uid)` by construction) and the
+    /// worker session is `child_session_id(thread_id)`. Derived,
+    /// never minted: a replay of the same committed `tool/call`
+    /// recomputes the same child instead of minting a second one
+    /// (M4). When `None`, the two existing random mints below stay
+    /// byte-identically in place — the legacy path is untouched.
     #[must_use]
     pub fn prepare(&self, request: &SpawnRequest) -> SpawnedWorker {
+        let (thread_id, worker_session) = match &request.identity {
+            // Pin P1: the identity carries the resolution — the thread
+            // id is taken from it (never re-minted) and the worker
+            // session is derived from that thread id, so preparing the
+            // same identity twice yields identical ids and identical
+            // wrapper bytes.
+            Some(identity) => (identity.task_id, child_session_id(identity.task_id)),
+            None => (Uuid::new_v4(), SessionId::new()),
+        };
         let thread = Thread {
-            id: Uuid::new_v4(),
+            id: thread_id,
             parent_session: self.router,
             pinned_version: self.pinned_version,
         };
-        let worker_session = SessionId::new();
         // The wrapper composes the public builders: the mandate
         // key lands through mandate_delegation_content (exactly
         // delegation_content plus one key), the speculative marker
@@ -749,6 +821,17 @@ impl WorkerSpawner {
         // spawns stay byte-identical (absent, never null).
         if let Some(exec_worker) = &request.exec_worker {
             wrapper[EXEC_WORKER_KEY] = Value::String(exec_worker.clone());
+        }
+        // (R15 plan §4 C2, pin P6 class-B): on the multiagent path the
+        // derived task identity rides as four more additive keys,
+        // appended after the existing additive keys — new wrappers
+        // only; the legacy path writes none of them (absent, never
+        // null), so every landed wrapper's byte order is untouched.
+        if let Some(identity) = &request.identity {
+            wrapper["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
+            wrapper["task_id"] = Value::String(identity.task_id_str());
+            wrapper["agent_def"] = Value::String(identity.agent_def.clone());
+            wrapper["agent_def_version"] = json!(identity.agent_def_version);
         }
         let task_message = json!({"role": "user", "content": wrapper});
         SpawnedWorker {
@@ -788,6 +871,7 @@ impl WorkerSpawner {
             speculative,
             mandate,
             exec_worker: None,
+            identity: None,
         })
         .await
     }
@@ -810,6 +894,14 @@ pub struct SpawnRequest {
     /// The execution-worker binding (ADR-020, D1): the configured
     /// `endpoints[].id`. `None` = legacy unbound, byte-identical.
     pub exec_worker: Option<String>,
+    /// The derived task identity (R15 plan §4 C2): `Some` selects the
+    /// multiagent path — the thread id and worker session are derived
+    /// from it (pin P1) and the wrapper carries the four pin-P6
+    /// class-B keys. `None` (the `Default`) is today's path,
+    /// byte-identical in every respect. The single additive field is
+    /// the seam: every future spawn-side fact composes here, never as
+    /// loose fields.
+    pub identity: Option<SpawnIdentity>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1298,18 @@ pub struct WorkerLoopConfig {
     /// Default (disabled) appends no verdict and completes ungated —
     /// built-in inner behavior unchanged.
     pub gate: EvidenceGateConfig,
+    /// The P1 delegation gate (R15 plan §4 C4): `Some` turns the join
+    /// on — the completion report's admit target becomes the parent
+    /// read off the child's own `thread/started` (F17: never ambient
+    /// Router config), the §2.2. pair-of-writes reconciliation heals
+    /// the `thread/completed`-without-parent-row crash window (F2),
+    /// and the task outcome is derived and logged (never persisted —
+    /// §7.2 is P4). The limits themselves bound the *spawn* side
+    /// (C3); the join consumes no bound, but the one field keeps the
+    /// feature gate single-sourced. `None` is today's path
+    /// byte-identically (M8): the ambient [`WorkerLoopConfig::router`]
+    /// admits the legacy report under the legacy key.
+    pub multiagent: Option<MultiagentLimits>,
 }
 
 /// A decorator over any inner [`LoopDriver`] that adds Thread lineage
@@ -1490,13 +1594,119 @@ where
     // write must not produce a second thread/completed or a second
     // report row.
     let events = port.read_stream().await.unwrap_or_default();
+    // Join target (F17, §3.2:409-413): with the multiagent gate on,
+    // the parent is read off the child's OWN `thread/started` — never
+    // ambient Router config. Feature-off keeps the ambient `router`
+    // exactly as before (M8, byte-identical).
+    let join = match core.config.multiagent {
+        Some(_) => join_target(&events, port.session()),
+        None => None,
+    };
+    if core.config.multiagent.is_some() && join.is_none() {
+        // Refuse, never guess: a worker stream with no readable
+        // `thread/started.parent` has no join target, and falling back
+        // to the ambient Router would deliver the report to a session
+        // that never asked for it. No report is emitted and no
+        // completion is fabricated for an unknowable target — the
+        // child stays honestly in progress.
+        return (
+            LoopOutcome::SoftFailed {
+                reason: "worker completion: join target unknown \
+                         (child stream carries no thread/started.parent)"
+                    .into(),
+            },
+            Phase::Done,
+        );
+    }
+    let target = join.unwrap_or(core.config.router);
+    // Derived once, before the reconciliation block and the fresh path
+    // below, which both consume it (the reconciliation's unwrap_or
+    // fallback and the fresh emit read the same pair).
+    let (status, summary) = reported_outcome(&final_outcome, &events);
     if events
         .iter()
         .any(|ev| ev.kind == EventKind::ThreadCompleted && event_thread_id(ev) == Some(thread_id))
     {
-        return (final_outcome, Phase::Done);
+        // Feature-off keeps today's early return unchanged (M8): the
+        // legacy path never re-admits.
+        if core.config.multiagent.is_none() {
+            return (final_outcome, Phase::Done);
+        }
+        // §2.2.1 pair-of-writes reconciliation (F2): the crash window
+        // — `thread/completed` committed, the parent row unprovable —
+        // heals by re-deriving the report from the same committed
+        // events (byte-stable, so the re-admit is a genuine no-op
+        // when the row already landed) and re-admitting under the
+        // same idempotency key.
+        let wrapper = first_input_content(&events);
+        let committed = events
+            .iter()
+            .rev()
+            .find(|ev| {
+                ev.kind == EventKind::ThreadCompleted && event_thread_id(ev) == Some(thread_id)
+            })
+            .expect("presence checked above");
+        let committed_status = committed
+            .bytes
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(status);
+        let committed_summary = committed
+            .bytes
+            .get("summary")
+            .cloned()
+            .unwrap_or_else(|| completion_summary(&events, ""));
+        match reconcile_completion(
+            &events,
+            &wrapper,
+            thread_id,
+            committed_status,
+            &committed_summary,
+        ) {
+            Reconcile::Nothing => {
+                // A stream with no completion carrier after all: today's
+                // early return, unchanged.
+                return (final_outcome, Phase::Done);
+            }
+            Reconcile::ReAdmit { key, report } => {
+                if let Err(e) = core
+                    .inbox
+                    .admit(target, report.clone(), Some(key.clone()))
+                    .await
+                {
+                    // The honest signal: the completion is committed but
+                    // the parent row is still not durable. The settle is
+                    // monotone — `session/ended{failed}` returns the
+                    // child to `idle` (EVENT-MODEL:123), so the next
+                    // claim re-enters this branch and reconciles again.
+                    return (
+                        LoopOutcome::SoftFailed {
+                            reason: format!(
+                                "worker completion reconciliation: re-admit failed: {e}"
+                            ),
+                        },
+                        Phase::Done,
+                    );
+                }
+                // Durable row first, wake strictly after (invariant 1).
+                core.inbox.wake(target);
+                // The task outcome is DERIVED HERE, from the committed
+                // events alone, and is never persisted (§6.1.1:639-643;
+                // persisting is P4, §7.2). This audit line is its only
+                // observable channel — observable, not silent (§2.2.1).
+                let derived = derive_outcome(&events, parse_thread_report(&report).as_ref());
+                tracing::info!(
+                    target: "kian::worker",
+                    thread_id = %thread_id,
+                    key = %key,
+                    outcome = %derived.as_ref().map_or("outstanding", |o| o.as_str()),
+                    "worker completion reconciliation: report re-admitted \
+                     (thread/completed already committed)"
+                );
+                return (final_outcome, Phase::Done);
+            }
+        }
     }
-    let (status, summary) = reported_outcome(&final_outcome, &events);
     if let Err(e) = port
         .emit(
             EventKind::ThreadCompleted,
@@ -1511,12 +1721,21 @@ where
             Phase::Done,
         );
     }
-    let report = thread_report_content(thread_id, status, summary);
-    if let Err(e) = core
-        .inbox
-        .admit(core.config.router, report, Some(report_key(thread_id)))
-        .await
-    {
+    // Report content (pin P6): the C2 ident builder when the wrapper
+    // carries an identity (plus `contract` iff a worker-gate verdict
+    // was committed), the frozen legacy builder otherwise; the key is
+    // the pin-P3 key for the wrapper (`spawn:<spawn_uid>`, else the
+    // legacy `thread-report:` key). Feature-off derives exactly the
+    // legacy pair (M8).
+    let wrapper = first_input_content(&events);
+    let key = report_key_for(&wrapper, thread_id);
+    let report = match spawn_identity_of(&wrapper) {
+        Some(identity) => {
+            thread_report_content_ident(&identity, status, summary, worker_contract(&events))
+        }
+        None => thread_report_content(thread_id, status, summary),
+    };
+    if let Err(e) = core.inbox.admit(target, report, Some(key)).await {
         // The thread completed but the report is not durable: the
         // delegation contract is unmet — report honestly, never let
         // the session settle completed on a silent parent miss.
@@ -1528,8 +1747,53 @@ where
         );
     }
     // Durable row first, wake strictly after (invariant 1).
-    core.inbox.wake(core.config.router);
+    core.inbox.wake(target);
     (final_outcome, Phase::Done)
+}
+
+/// The stream's first `input/admitted` `content` — the same read
+/// `lineage_plan` performs, so the join and the lineage agree on
+/// which bytes are the delegation wrapper. `Null` when the stream
+/// carries no admitted input (readers treat it as "no wrapper").
+fn first_input_content(events: &[Event]) -> Value {
+    events
+        .iter()
+        .find(|ev| ev.kind == EventKind::InputAdmitted)
+        .and_then(|ev| ev.bytes.get("content"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The pin-P6 class-C `contract` payload off the last committed
+/// worker-gate verdict: `{"passed": bool, "errors": [<failed check
+/// names>]}`, `None` when no verdict was committed (the key is then
+/// absent, never `null`). Byte-identical to the pure core's builder
+/// (`multiagent.rs`'s private `contract_payload` — kept in lockstep by
+/// `fresh_report_builder_agrees_byte_for_byte_with_reconcile_completion`).
+fn worker_contract(events: &[Event]) -> Option<Value> {
+    let verdict = events.iter().rev().find(|ev| {
+        ev.kind == EventKind::EvidenceVerdict
+            && ev.bytes.get("gate").and_then(Value::as_str) == Some(WORKER_GATE_NAME)
+    })?;
+    let passed = verdict
+        .bytes
+        .get("passed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let errors: Vec<String> = verdict
+        .bytes
+        .get("checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .filter(|c| c.get("passed").and_then(Value::as_bool) == Some(false))
+                .filter_map(|c| c.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(json!({ "passed": passed, "errors": errors }))
 }
 
 #[cfg(test)]
@@ -2319,7 +2583,7 @@ mod tests {
     fn spawner_keys_and_errors_are_plain_data() {
         assert_eq!(super::task_input_key(tid(1)), format!("thread:{}", tid(1)));
         assert_eq!(
-            super::report_key(tid(1)),
+            crate::multiagent::legacy_report_key(tid(1)),
             format!("thread-report:{}", tid(1))
         );
         let e = SpawnError::from(crate::InboxWriteError::Write("boom".into()));
@@ -2356,6 +2620,7 @@ mod tests {
             speculative: false,
             mandate: None,
             exec_worker: None,
+            identity: None,
         });
         let bound = spawner.prepare(&super::SpawnRequest {
             task: json!("do the thing"),
@@ -2363,6 +2628,7 @@ mod tests {
             speculative: false,
             mandate: None,
             exec_worker: Some("mac-mini".into()),
+            identity: None,
         });
         // The same frozen fields over the BOUND spawn's own thread id
         // (two prepares mint two threads — the id is the only
@@ -2896,6 +3162,263 @@ mod tests {
                 .await
                 .expect("decidable")
                 .is_none()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The derived task identity (R15 plan §4 C2, pins P1/P6)
+    // ------------------------------------------------------------------
+
+    /// The identity wrapper composes additively over the fully-composed
+    /// legacy form: exactly four more keys (pin P6), every legacy /
+    /// mandate / speculative / binding byte identical.
+    #[test]
+    fn identity_wrapper_is_exactly_the_composed_form_plus_four_keys() {
+        let router = sid(11);
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            CapturingInbox::shared(),
+        );
+        let identity = crate::multiagent::SpawnIdentity::derive(router, 12, "mock-worker", 7);
+        let mandate = json!({"strength": "explicit", "scope": "qa"});
+        let spawned = spawner.prepare(&super::SpawnRequest {
+            task: json!("do the thing"),
+            correlation: Some(json!("evt-9")),
+            speculative: true,
+            mandate: Some(mandate.clone()),
+            exec_worker: Some("mac-mini".into()),
+            identity: Some(identity.clone()),
+        });
+        let wrapper = &spawned.task_message["content"];
+        // The composed legacy form over the SAME (derived) thread id.
+        let mut expected = super::mandate_delegation_content(
+            spawned.thread.id,
+            Some(json!("evt-9")),
+            json!("do the thing"),
+            &mandate,
+        );
+        expected[SPECULATIVE_MARKER] = serde_json::Value::Bool(true);
+        expected[super::EXEC_WORKER_KEY] = json!("mac-mini");
+        for (key, value) in expected.as_object().expect("composed object") {
+            assert_eq!(
+                wrapper.get(key),
+                Some(value),
+                "field `{key}` unchanged by the identity keys"
+            );
+        }
+        // Exactly the four pin-P6 keys added, with the identity values.
+        assert_eq!(
+            wrapper.as_object().map(serde_json::Map::len),
+            Some(expected.as_object().map(serde_json::Map::len).unwrap() + 4),
+            "exactly four additive identity keys"
+        );
+        assert_eq!(wrapper["spawn_uid"], json!(identity.spawn_uid.to_string()));
+        assert_eq!(wrapper["task_id"], json!(identity.task_id_str()));
+        assert_eq!(wrapper["agent_def"], json!("mock-worker"));
+        assert_eq!(wrapper["agent_def_version"], json!(7));
+        // `assignee` is P2 (roster) — meaningless before the roster
+        // exists, so the P1 wrapper never carries it.
+        assert!(wrapper.get("assignee").is_none());
+    }
+
+    /// The identity reader refuses partial or malformed identity bytes
+    /// — the identity is never guessed, never defaulted.
+    #[test]
+    fn spawn_identity_of_refuses_partial_or_malformed_identity_bytes() {
+        let router = sid(12);
+        let identity = crate::multiagent::SpawnIdentity::derive(router, 3, "mock-worker", 7);
+        let good = json!({
+            "spawn_uid": identity.spawn_uid.to_string(),
+            "task_id": identity.task_id.to_string(),
+            "agent_def": "mock-worker",
+            "agent_def_version": 7,
+        });
+        assert_eq!(super::spawn_identity_of(&good), Some(identity.clone()));
+        // Each missing key alone breaks the round trip.
+        for key in ["spawn_uid", "task_id", "agent_def", "agent_def_version"] {
+            let mut partial = good.clone();
+            partial.as_object_mut().unwrap().remove(key);
+            assert_eq!(super::spawn_identity_of(&partial), None, "missing `{key}`");
+        }
+        // Malformed values: non-uuid ids, non-string agent_def,
+        // fractional version, and null in any slot.
+        assert!(
+            super::spawn_identity_of(&json!({
+                "spawn_uid": "not-a-uuid",
+                "task_id": identity.task_id.to_string(),
+                "agent_def": "mock-worker",
+                "agent_def_version": 7,
+            }))
+            .is_none()
+        );
+        assert!(
+            super::spawn_identity_of(&json!({
+                "spawn_uid": identity.spawn_uid.to_string(),
+                "task_id": "not-a-uuid",
+                "agent_def": "mock-worker",
+                "agent_def_version": 7,
+            }))
+            .is_none()
+        );
+        assert!(
+            super::spawn_identity_of(&json!({
+                "spawn_uid": identity.spawn_uid.to_string(),
+                "task_id": identity.task_id.to_string(),
+                "agent_def": 42,
+                "agent_def_version": 7,
+            }))
+            .is_none()
+        );
+        assert!(
+            super::spawn_identity_of(&json!({
+                "spawn_uid": identity.spawn_uid.to_string(),
+                "task_id": identity.task_id.to_string(),
+                "agent_def": "mock-worker",
+                "agent_def_version": 7.5,
+            }))
+            .is_none()
+        );
+        assert!(
+            super::spawn_identity_of(&json!({
+                "spawn_uid": serde_json::Value::Null,
+                "task_id": identity.task_id.to_string(),
+                "agent_def": "mock-worker",
+                "agent_def_version": 7,
+            }))
+            .is_none()
+        );
+        // Not an object at all.
+        assert!(super::spawn_identity_of(&json!("plain text")).is_none());
+        assert!(super::spawn_identity_of(&serde_json::Value::Null).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The join (R15 plan §4 C4, pins P3/P6, F2)
+    // ------------------------------------------------------------------
+
+    /// The fresh-completion report (the C2 ident builder + this
+    /// module's `worker_contract`) is byte-for-byte what
+    /// `multiagent::reconcile_completion` re-derives from the same
+    /// committed events — the precondition for §2.2.1's re-admit being
+    /// a genuine no-op. This pins the two derivations together forever.
+    #[test]
+    fn fresh_report_builder_agrees_byte_for_byte_with_reconcile_completion() {
+        let router = sid(13);
+        let identity = crate::multiagent::SpawnIdentity::derive(router, 5, "mock-worker", 7);
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            CapturingInbox::shared(),
+        );
+        let spawned = spawner.prepare(&super::SpawnRequest {
+            task: json!("do the thing"),
+            identity: Some(identity.clone()),
+            ..super::SpawnRequest::default()
+        });
+        let wrapper = spawned.task_message["content"].clone();
+
+        let mk = |verdict: Option<bool>| {
+            let session = crate::multiagent::child_session_id(identity.task_id);
+            let mut events = vec![
+                event(session, 1, EventKind::SessionCreated, json!({})),
+                event(
+                    session,
+                    2,
+                    EventKind::InputAdmitted,
+                    json!({"content": wrapper.clone()}),
+                ),
+            ];
+            if let Some(passed) = verdict {
+                events.push(event(
+                    session,
+                    3,
+                    EventKind::EvidenceVerdict,
+                    json!({
+                        "gate": "worker",
+                        "passed": passed,
+                        "checks": [
+                            {"name": "final_message_present", "passed": true},
+                            {"name": "no_error_tool_result_tail", "passed": passed, "detail": "tail=2"},
+                        ],
+                        "attempt": 1,
+                    }),
+                ));
+            }
+            let seq = events.len() as u64 + 1;
+            events.push(event(
+                session,
+                seq,
+                EventKind::ThreadCompleted,
+                super::thread_completed_payload(
+                    identity.task_id,
+                    "completed",
+                    json!({"text": "all done"}),
+                ),
+            ));
+            events
+        };
+
+        for verdict in [None, Some(true), Some(false)] {
+            let events = mk(verdict);
+            let fresh = super::thread_report_content_ident(
+                &identity,
+                "completed",
+                json!({"text": "all done"}),
+                super::worker_contract(&events),
+            );
+            let crate::multiagent::Reconcile::ReAdmit { key, report } =
+                crate::multiagent::reconcile_completion(
+                    &events,
+                    &wrapper,
+                    identity.task_id,
+                    "completed",
+                    &json!({"text": "all done"}),
+                )
+            else {
+                panic!("a completion-bearing stream must re-admit");
+            };
+            assert_eq!(
+                key,
+                format!("spawn:{}", identity.spawn_uid),
+                "the pin-P3 key on both paths"
+            );
+            assert_eq!(
+                report, fresh,
+                "fresh admit and crash-window re-admit are byte-identical (verdict: {verdict:?})"
+            );
+        }
+    }
+
+    /// `worker_contract` is absent without a committed worker verdict
+    /// and ignores the built-in loop gate's verdicts.
+    #[test]
+    fn worker_contract_reads_only_the_worker_gate_verdict() {
+        assert_eq!(super::worker_contract(&[]), None);
+        let builtin = event(
+            sid(14),
+            1,
+            EventKind::EvidenceVerdict,
+            json!({"gate": "builtin", "passed": true, "checks": [], "attempt": 0}),
+        );
+        assert_eq!(super::worker_contract(&[builtin]), None);
+        let worker = event(
+            sid(14),
+            2,
+            EventKind::EvidenceVerdict,
+            json!({
+                "gate": "worker",
+                "passed": false,
+                "checks": [
+                    {"name": "final_message_present", "passed": true},
+                    {"name": "no_error_tool_result_tail", "passed": false},
+                ],
+                "attempt": 1,
+            }),
+        );
+        assert_eq!(
+            super::worker_contract(&[worker]),
+            Some(json!({"passed": false, "errors": ["no_error_tool_result_tail"]}))
         );
     }
 }

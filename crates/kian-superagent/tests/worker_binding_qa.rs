@@ -278,6 +278,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         speculative: false,
         mandate: None,
         exec_worker: None,
+        identity: None,
     });
     let wrapper = legacy.task_message["content"].clone();
     assert_eq!(
@@ -305,6 +306,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         speculative: false,
         mandate: None,
         exec_worker: Some("qa-two".to_string()),
+        identity: None,
     });
     let bound_wrapper = bound.task_message["content"].clone();
     let mut expected_keys = sorted_keys(&wrapper);
@@ -329,6 +331,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         speculative: true,
         mandate: Some(json!({"strength": "explicit", "scope": "qa"})),
         exec_worker: None,
+        identity: None,
     });
     let composed_bound = spawner.prepare(&SpawnRequest {
         task,
@@ -336,6 +339,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         speculative: true,
         mandate: Some(json!({"strength": "explicit", "scope": "qa"})),
         exec_worker: Some("qa-one".to_string()),
+        identity: None,
     });
     let mut composed_expected = sorted_keys(&composed_legacy.task_message["content"]);
     composed_expected.push(EXEC_WORKER_KEY.to_string());
@@ -366,6 +370,7 @@ fn qa_thread_started_payload_additive_and_both_sides_agree() {
         speculative: false,
         mandate: None,
         exec_worker: Some("qa-two".to_string()),
+        identity: None,
     });
     let task_message = spawned.task_message.clone();
 
