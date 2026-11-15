@@ -82,14 +82,15 @@ suffix.
 | -32007 | archived | The session's online range has been archived (READ-MODEL §7, P2b); use the archive package / `session import` | both RPC + SSE |
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
-new documented code.
+new documented code. The confirmation plane introduces **no** new code: its non-normal answers are
+`outcome` values (`not_pending`/`expired`), and its refusals reuse `-32001`/`-32007`/`-32602`.
 
 ### 2.3 Values
 
 | Field | Contract |
 |---|---|
 | `session` | UUID string (hyphenated, 36 chars) |
-| `content` | Any JSON value except a reserved row-envelope key set — an object whose keys are exactly `{content,dream}`, `{content,spill}` or `{synthetic,content}` is `-32602`: those shapes are admitted only by the server's internal planes (§4.2), never by public input. Typical use is a string or a structured message. Input semantics (synthetic markers, Inline/Spill shaping, provenance wrappers) are owned by DESIGN/EVENT-MODEL, not by this wire |
+| `content` | Any JSON value except a reserved row-envelope shape — an object whose keys are exactly `{content,dream}`, `{content,spill}`, `{synthetic,content}` or `{content,memory}`, or the reserved control envelope `{"kian":{"type":"control",...}}` (any action), is `-32602`: those shapes are admitted only by the server's internal planes (§3.2/§4.2), never by public input. Typical use is a string or a structured message. Input semantics (synthetic markers, Inline/Spill shaping, provenance wrappers) are owned by DESIGN/EVENT-MODEL, not by this wire |
 | `idempotency_key` | Optional string. Replaying it for the same session does not create a second durable row; the result reports `deduplicated: true` |
 | `projection.state` | `idle \| running \| completed \| cancelled` — the event-derived states. `recoverable` is a liveness overlay (DESIGN §2.2) and `archived` has no v0 event, so neither can appear in a pure projection |
 | `topic` | Optional string; JSON `null` when absent |
@@ -118,6 +119,8 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 | `steer` | same as `submit` | `{"deduplicated":<bool>}` |
 | `queue` | same as `submit` | `{"deduplicated":<bool>}` |
 | `interrupt` | `{"session":"<uuid>"}` | `{"outcome":"requested" \| "not_draining"}` |
+| `confirm` | `{"session":"<uuid>","call_id":"<str>","decision":"approve" \| "reject","reason":"<str>"?,"requested_by":"<str>"?}` | `{"outcome":"accepted" \| "not_pending" \| "expired"}` |
+| `pending` | `{"session":"<uuid>"}` | `{"pending":[{"call_id","tool","arguments","requested_at_ms","expired"}]}` |
 | `projection` | `{"session":"<uuid>","since":<u64>?}` | `{"version":<u64>,"state":"<see §2.3>"}` or `{"version":<u64>,"unchanged":true}` |
 
 ### 3.2 Semantics
@@ -136,6 +139,18 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   `control/interrupt` event, so the intent survives a drain crash and crosses replicas.
   `requested` = an abort may be settled; `not_draining` = nothing was in flight (an honest no-op).
   An interrupted result is never reported as `completed`.
+- `confirm` answers one pending ask (CONFIRMATION-MODEL §5): it validates the call against the
+  durable pending set, applies the configured TTL, admits ONE reserved confirmation row under the
+  derived key `confirm:<session>:<call_id>` and wakes. It writes nothing else and never touches
+  execution. Outcomes: `accepted` = the row is durable and the decision takes effect on the stream;
+  `not_pending` = no unanswered ask with that `call_id` (already answered — including a decision
+  already recorded but not yet applied — unknown, not an ask, or the session is terminal);
+  `expired` = the ask lapsed under `confirmation.ttl_ms` and a durable reject-with-`expired` row was
+  admitted so the session resumes (the caller's decision was **not** applied). An archived session
+  is `-32007`. A malformed `call_id`/`decision` is `-32602`.
+- `pending` is a pure read of one session's stream: the unanswered asks in call order with the TTL
+  overlay computed at read time (`expired` is a liveness overlay, never persisted). Unknown session
+  `-32001`, archived `-32007`.
 - `projection` reads the stream and returns the pure projection state plus `version` — the last
   committed seq (`head.next_seq - 1`, READ-MODEL §3). The optional `since` (u64) carries the
   caller's last version: `since == version` returns `{"version":V,"unchanged":true}` with **no**
@@ -230,9 +245,9 @@ session's durable stream, resumable per connection via `Last-Event-ID` (READ-MOD
 ### 5.2 Termination and resumption
 
 The stream closes after the first `session/ended` event, whatever its reason. Terminal ends
-(`completed`, `cancelled`) freeze the projection. An `interrupted`/`failed` end is state-preserving
-(`running → idle`), so a resumed session appends later events; those are observed on a **new
-connection**.
+(`completed`, `cancelled`) freeze the projection. An `interrupted`/`failed`/`awaiting_input` end is
+state-preserving (`running → idle`), so a resumed session appends later events; those are observed
+on a **new connection**.
 
 Resumption (READ-MODEL §4.1): a reconnect may send `Last-Event-ID: <seq>`; the server resumes at
 `seq + 1` and never re-emits frames at or before the resume point on that connection. A resume id

@@ -38,6 +38,6 @@ pub use error::{
 pub use sse::SseFrame;
 pub use transport::KianClient;
 pub use typed::{
-    CreateSessionResult, InputAck, InterruptResult, MockSendReceipt, ProjectionResult,
-    ProjectionVersioned, ResetReceipt, WakeOutcome,
+    ConfirmResult, CreateSessionResult, InputAck, InterruptResult, MockSendReceipt, PendingAsk,
+    PendingResult, ProjectionResult, ProjectionVersioned, ResetReceipt, WakeOutcome,
 };

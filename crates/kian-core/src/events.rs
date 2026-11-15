@@ -82,6 +82,12 @@ pub enum EndReason {
     Cancelled,
     Interrupted,
     Failed,
+    /// The drain stopped with a non-empty pending-confirmation set
+    /// (CONFIRMATION-MODEL, ADR-033): `running -> idle` (resumable), not
+    /// terminal. Deliberately distinct from `interrupted` (an owner
+    /// stopped the drain) and `failed` (a failure).
+    #[serde(rename = "awaiting_input")]
+    AwaitingInput,
 }
 
 /// The durable event set (DESIGN §3.1). Live events (streaming chunks,
@@ -239,6 +245,13 @@ pub enum EventKind {
     #[serde(rename = "memory/note")]
     MemoryNote,
 
+    /// A human decision on one pending ask, consumed from the reserved
+    /// confirm row (CONFIRMATION-MODEL §5, ADR-033): non-context drain
+    /// activity, the durable record that the answer arrived, before any
+    /// effect.
+    #[serde(rename = "control/confirm")]
+    ControlConfirm,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -271,6 +284,7 @@ impl EventKind {
             Self::InputSpilled => "input/spilled",
             Self::ControlInterrupt => "control/interrupt",
             Self::MemoryNote => "memory/note",
+            Self::ControlConfirm => "control/confirm",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -344,6 +358,7 @@ mod tests {
                 r#"{"kind":"control/interrupt"}"#,
             ),
             (EventKind::MemoryNote, r#"{"kind":"memory/note"}"#),
+            (EventKind::ControlConfirm, r#"{"kind":"control/confirm"}"#),
             (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
@@ -357,13 +372,13 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the twenty-two kinds above (the
+        // The durable set is exactly the twenty-three kinds above (the
         // fourteen v0-frozen kinds + the additive
         // `recovery/budget-reset` + the four additive bundle kinds
         // + the additive `input/spilled` + the additive
-        // `control/interrupt` + the additive `memory/note`;
-        // additions-only, no renames).
-        assert_eq!(cases.len(), 22);
+        // `control/interrupt` + the additive `memory/note` + the
+        // additive `control/confirm`; additions-only, no renames).
+        assert_eq!(cases.len(), 23);
     }
 
     /// Additions-only regression: every pre-existing kind's golden
@@ -751,6 +766,7 @@ mod tests {
             (EndReason::Cancelled, "cancelled"),
             (EndReason::Interrupted, "interrupted"),
             (EndReason::Failed, "failed"),
+            (EndReason::AwaitingInput, "awaiting_input"),
         ] {
             let kind = EventKind::SessionEnded { reason };
             let ser = serde_json::to_string(&kind).unwrap();

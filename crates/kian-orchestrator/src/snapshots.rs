@@ -130,6 +130,8 @@ enum EndReasonSerde {
     Cancelled,
     Interrupted,
     Failed,
+    #[serde(rename = "awaiting_input")]
+    AwaitingInput,
 }
 
 impl From<EndReason> for EndReasonSerde {
@@ -139,6 +141,7 @@ impl From<EndReason> for EndReasonSerde {
             EndReason::Cancelled => Self::Cancelled,
             EndReason::Interrupted => Self::Interrupted,
             EndReason::Failed => Self::Failed,
+            EndReason::AwaitingInput => Self::AwaitingInput,
         }
     }
 }
@@ -150,6 +153,7 @@ impl From<EndReasonSerde> for EndReason {
             EndReasonSerde::Cancelled => Self::Cancelled,
             EndReasonSerde::Interrupted => Self::Interrupted,
             EndReasonSerde::Failed => Self::Failed,
+            EndReasonSerde::AwaitingInput => Self::AwaitingInput,
         }
     }
 }

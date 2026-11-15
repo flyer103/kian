@@ -1469,6 +1469,118 @@ pub async fn run_wake_now(
     ))
 }
 
+/// `kian pending <uuid> [--url <base>] [--config <path>] [--json]`:
+/// the durable pending asks of one session (a pure read with the TTL
+/// overlay — CONFIRMATION-MODEL §9).
+pub async fn run_pending(
+    config_path: &Path,
+    url: Option<&str>,
+    session: SessionId,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let result = client
+        .rpc("pending", json!({"session": session.0.to_string()}))
+        .await
+        .map_err(|e| format!("pending: {e}"))?;
+    if json {
+        return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+    }
+    let calls = result
+        .get("pending")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if calls.is_empty() {
+        return Ok(format!(
+            "session {} — no pending confirmations\n",
+            session.0
+        ));
+    }
+    let mut out = format!("session {}\n", session.0);
+    for call in calls {
+        let expired = call
+            .get("expired")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "  call {}  tool {}  raised_at {}  {}\n",
+            call.get("call_id").and_then(Value::as_str).unwrap_or("?"),
+            call.get("tool").and_then(Value::as_str).unwrap_or("?"),
+            call.get("requested_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            if expired {
+                "expired"
+            } else {
+                "awaiting decision"
+            },
+        ));
+    }
+    out.push_str("  answer: kian confirm <uuid> <call-id> --approve|--reject\n");
+    Ok(out)
+}
+
+/// `kian confirm <uuid> <call-id> (--approve|--reject) [--reason <text>]
+/// [--requested-by <who>] [--url <base>] [--config <path>] [--json]`:
+/// admits one durable answer (CONFIRMATION-MODEL §5). The RPC result is
+/// the honest outcome — `accepted`, `not_pending` or `expired`; the
+/// effect is observed on the event stream.
+pub struct ConfirmRequest<'a> {
+    pub session: SessionId,
+    pub call_id: &'a str,
+    pub decision: &'a str,
+    pub reason: Option<&'a str>,
+    pub requested_by: Option<&'a str>,
+}
+
+pub async fn run_confirm(
+    config_path: &Path,
+    url: Option<&str>,
+    req: ConfirmRequest<'_>,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let mut params = json!({
+        "session": req.session.0.to_string(),
+        "call_id": req.call_id,
+        "decision": req.decision,
+    });
+    if let Some(reason) = req.reason {
+        params["reason"] = json!(reason);
+    }
+    if let Some(who) = req.requested_by {
+        params["requested_by"] = json!(who);
+    }
+    let result = client
+        .rpc("confirm", params)
+        .await
+        .map_err(|e| format!("confirm: {e}"))?;
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": req.session.0.to_string(),
+            "call_id": req.call_id,
+            "outcome": outcome,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let meaning = match outcome.as_str() {
+        "accepted" => "the answer is durable; the drain applies it",
+        "not_pending" => "no unanswered ask with that call_id (already answered or unknown)",
+        "expired" => "the ask lapsed; a durable reject-expired answer was recorded",
+        _ => "unknown outcome",
+    };
+    Ok(format!(
+        "session {}  call {}\noutcome             {}\n{}\n",
+        req.session.0, req.call_id, outcome, meaning,
+    ))
+}
+
 /// `kian mock-channel-send <channel> [--text S | --payload JSON]
 /// [--topic T] [--url <base>] [--json]`: the demo/ injection —
 /// one event onto a configured mock channel via `POST /ops/rpc`; the

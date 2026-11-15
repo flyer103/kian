@@ -1201,7 +1201,8 @@ pub fn thread_liveness(worker_events: &[Event]) -> ThreadLiveness {
                     kian_core::events::EndReason::Completed
                     | kian_core::events::EndReason::Cancelled => ThreadLiveness::Released,
                     kian_core::events::EndReason::Failed
-                    | kian_core::events::EndReason::Interrupted => ThreadLiveness::Live,
+                    | kian_core::events::EndReason::Interrupted
+                    | kian_core::events::EndReason::AwaitingInput => ThreadLiveness::Live,
                 };
             }
             _ => {}

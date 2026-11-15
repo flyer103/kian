@@ -10,6 +10,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Durable confirmation plane — `ask`, `awaiting_input`, `control/confirm` (CONFIRMATION-MODEL
+  phase 1, ADR-033)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
+  call (a widened `permission.evaluated` value), never invokes it, and the drain ends with a fifth
+  end reason `awaiting_input` (`running → idle`, resumable) instead of `completed`. The pending set
+  is a pure projection (`kian-core::confirmation::pending_calls`, no table, no inbox status column,
+  no held lease). The answer arrives as a reserved control-envelope row (refused by the public
+  `submit`/`steer`/`queue` wire — the guard now covers the whole `{"kian":{"type":"control",…}}`
+  family, closing an existing hole) and is consumed into the 23rd kind `control/confirm`
+  (non-context, `DrainActivity`); the loop then applies it in call order — approve invokes the
+  frozen call and appends the real `tool/result` with additive `confirmation` provenance, reject
+  appends the honest-error result with `policy:"ask"`, and an answer older than
+  `confirmation.ttl_ms` is admitted as a durable reject-expired. No provider request is issued while
+  a call is unanswered, and the answer appends at the tail, so the resume keeps the prefix bytes
+  (cache stability). New control-plane methods `confirm`/`pending` (+ SDK + `kian confirm` /
+  `kian pending`), no new error code. Fail-closed boundaries: unknown permission values refuse boot,
+  and `ask` on a superagent worker agent refuses boot until phase 2 (no worker waiting path).
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:

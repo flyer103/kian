@@ -1,6 +1,6 @@
 # ADR-033: The durable confirmation plane — `ask` as a deferred tool call, a fifth end reason, and the answer as an admitted control row
 
-- **Status**: proposed (owner gate pending; append-only — ADR-001…032 immutable)
+- **Status**: accepted (owner gate, 2026-11-15; append-only — ADR-001…032 immutable)
 - **Date**: 2026-11-15
 - **Related**: [design/CONFIRMATION-MODEL.md](../CONFIRMATION-MODEL.md) (normative semantics),
   [ADR-015](ADR-015-tool-permission-provenance.md) (§7: `ask` out of scope, "deferred, not
@@ -85,6 +85,15 @@ Two shapes were available and only one is kian-native.
 - **Make the answer an ordinary message and let the model re-issue the call.** The provider would
   see an unanswered tool call (invalid), and approval of a *specific frozen* action becomes an
   ambiguous re-request.
+
+## Landing note (2026-11-15)
+
+The implementation applies this decision unchanged: the core projection and its tests, the loop's
+ask arm and resumable apply step, the engine's settle derivation and `control/confirm` consumption,
+the control-plane methods, the CLI/SDK surface, and the EVENT-MODEL/API-CONTRACT catalog rows. The
+one design correction found in review — the pending fold has **no** "last end reason is
+`awaiting_input`" gate, because a drain that dies before its end write would evade it — is recorded
+in CONFIRMATION-MODEL F2.
 
 ## Consequences
 

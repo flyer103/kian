@@ -35,6 +35,30 @@ pub struct InterruptResult {
     pub outcome: String,
 }
 
+/// `confirm` → `{"outcome": "accepted" | "not_pending" | "expired"}`
+/// (CONFIRMATION-MODEL §9).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ConfirmResult {
+    pub outcome: String,
+}
+
+/// `pending` → one entry per unanswered ask (CONFIRMATION-MODEL §9).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingResult {
+    pub pending: Vec<PendingAsk>,
+}
+
+/// One pending ask as the `pending` read reports it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingAsk {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub requested_at_ms: u64,
+    /// TTL overlay at read time — never a stored state.
+    pub expired: bool,
+}
+
 /// `projection` → `{"state": <projection JSON>}`. The state is the
 /// server's projection object; the SDK keeps it as parsed JSON because
 /// the projection shape belongs to the server's version, not the wire
@@ -158,6 +182,40 @@ impl KianClient {
     /// and crosses replicas. No new wire method.
     pub async fn interrupt(&self, session: &str) -> Result<InterruptResult, ClientError> {
         let result = self.rpc("interrupt", json!({"session": session})).await?;
+        Self::parse(result)
+    }
+
+    /// Control plane: answer one pending ask (CONFIRMATION-MODEL §5).
+    /// `decision` is the closed `approve`/`reject` vocabulary; the
+    /// outcome is the server's honest receipt (`accepted` /
+    /// `not_pending` / `expired`).
+    pub async fn confirm(
+        &self,
+        session: &str,
+        call_id: &str,
+        decision: &str,
+        reason: Option<&str>,
+        requested_by: Option<&str>,
+    ) -> Result<ConfirmResult, ClientError> {
+        let mut params = json!({
+            "session": session,
+            "call_id": call_id,
+            "decision": decision,
+        });
+        if let Some(r) = reason {
+            params["reason"] = json!(r);
+        }
+        if let Some(who) = requested_by {
+            params["requested_by"] = json!(who);
+        }
+        let result = self.rpc("confirm", params).await?;
+        Self::parse(result)
+    }
+
+    /// Control plane: the session's pending asks (a pure read with the
+    /// TTL overlay).
+    pub async fn pending(&self, session: &str) -> Result<PendingResult, ClientError> {
+        let result = self.rpc("pending", json!({"session": session})).await?;
         Self::parse(result)
     }
 

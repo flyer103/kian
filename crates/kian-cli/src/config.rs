@@ -86,6 +86,10 @@ pub struct ServeConfig {
     /// existing behavior is unchanged.
     #[serde(default)]
     pub superagent: Option<SuperAgentConfig>,
+    /// The confirmation plane policy (CONFIRMATION-MODEL §8, ADR-033):
+    /// token-independent settings for `ask`. Absent = no expiry.
+    #[serde(default)]
+    pub confirmation: ConfirmationConfig,
     /// Remote execution endpoints (over the queue). Empty = no
     /// remote exec.
     #[serde(default)]
@@ -540,6 +544,19 @@ fn default_tools_root() -> String {
 }
 fn default_exec_timeout() -> u64 {
     DEFAULT_EXEC_TIMEOUT_MS
+}
+
+/// The confirmation plane (CONFIRMATION-MODEL §8, ADR-033): how long a
+/// pending ask may wait before an answer degrades honestly to `expired`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationConfig {
+    /// Maximum age of a pending ask, milliseconds. Absent or 0 = no
+    /// expiry (the operator answers whenever). A late answer is
+    /// admitted as a durable reject with `expired: true` so the
+    /// session resumes; it is never silently dropped.
+    #[serde(default)]
+    pub ttl_ms: u64,
 }
 
 /// The `sse:` section.
@@ -3022,6 +3039,23 @@ impl ServeConfig {
                     sa.worker.agent
                 ))
             })?;
+            // CONFIRMATION-MODEL C2 (ADR-033): phase 1 has no waiting
+            // path for a worker — ending one `awaiting_input` without
+            // `thread/completed` would strand its ticket, so `ask` on a
+            // worker agent refuses boot (fail-closed, never silently
+            // ignored). Phase 2 removes this refusal.
+            if worker_agent
+                .permissions
+                .values()
+                .any(|p| matches!(p, Permission::Ask))
+            {
+                return Err(invalid(format!(
+                    "agents.{}: `permissions: ask` is not supported on a superagent worker agent \
+                     in phase 1 (the worker has no waiting path yet — CONFIRMATION-MODEL C2); \
+                     use it on the default agent or wait for phase 2",
+                    sa.worker.agent
+                )));
+            }
             if let Some(pin) = sa.worker.pinned_version
                 && pin != worker_agent.version
             {
@@ -3802,7 +3836,7 @@ recovery:
     /// round (ADR-015).
     #[test]
     fn permissions_unknown_value_refuses_boot() {
-        for bad in ["ask", "maybe", "ALLOW"] {
+        for bad in ["maybe", "ALLOW", "ask_user"] {
             let yaml = valid_yaml().replacen(
                 "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
                 format!("  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    fs_read: {bad}\n").as_str(),
@@ -3814,6 +3848,29 @@ recovery:
                 "unexpected error: {err}"
             );
         }
+    }
+
+    /// The confirmation arm parses, but `ask` on a superagent worker
+    /// agent refuses boot in phase 1 (CONFIRMATION-MODEL C2) — the
+    /// worker has no waiting path yet.
+    #[test]
+    fn ask_on_a_worker_agent_refuses_boot() {
+        // The default agent accepts `ask` (plain sessions).
+        let sa = valid_yaml().replace(
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
+            "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    fs_read: ask\n",
+        );
+        ServeConfig::parse(&sa).expect("ask on the default agent parses");
+        // A superagent worker agent refuses it.
+        let worker = superagent_yaml().replace(
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    evidence_gate:",
+            "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    permissions:\n      fs_read: ask\n    evidence_gate:",
+        );
+        let err = ServeConfig::parse(&worker).expect_err("ask on a worker agent must refuse boot");
+        assert!(
+            err.to_string().contains("ask") && err.to_string().contains("worker"),
+            "unexpected error: {err}"
+        );
     }
 
     /// (fail-closed): a permission key not present in the agent's

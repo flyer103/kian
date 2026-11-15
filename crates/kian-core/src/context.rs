@@ -130,6 +130,10 @@ fn is_context_bearing(kind: &EventKind) -> bool {
         // drain and folded by `kian-core::memory`; it never re-enters
         // a model context (constraint 3).
         EventKind::MemoryNote => false,
+        // addition: the confirmation decision is drain-activity audit
+        // data (CONFIRMATION-MODEL §5) — the durable answer, never a
+        // message the model sees (constraint 3).
+        EventKind::ControlConfirm => false,
         _ => false,
     }
 }

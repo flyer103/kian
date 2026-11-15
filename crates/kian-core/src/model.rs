@@ -115,15 +115,17 @@ pub struct Budgets {
     pub wall_clock_ms: Option<u64>,
 }
 
-/// Per-call tool permission (ADR-015): a **closed** vocabulary —
-/// `allow` or `deny`, nothing else parses (fail-closed: an unknown value
-/// refuses boot). `ask` is deliberately absent this round; the closed
-/// shape lets a later confirmation plane add it additively.
+/// Per-call tool permission (ADR-015 + ADR-033): a **closed** vocabulary
+/// — `allow`, `deny` or `ask`, nothing else parses (fail-closed: an
+/// unknown value refuses boot). `ask` defers the call until a person
+/// decides (CONFIRMATION-MODEL): the call is logged, never invoked, and
+/// the drain ends `awaiting_input`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     Allow,
     Deny,
+    Ask,
 }
 
 /// Agent = versioned config (DESIGN §2.1). No runtime state lives here.
@@ -170,9 +172,9 @@ mod tests {
         SlotName, SlotSpec, SlotTarget, Thread,
     };
 
-    /// `Permission` is a closed vocabulary — `allow`/`deny` parse
-    /// and serialize lowercase, and any other value (notably `ask`,
-    /// deferred to a later round) refuses to parse (fail-closed).
+    /// `Permission` is a closed vocabulary — `allow`/`deny`/`ask` parse
+    /// and serialize lowercase, and any other value refuses to parse
+    /// (fail-closed). `ask` is the confirmation arm (ADR-033).
     #[test]
     fn permission_is_a_closed_vocabulary_fail_closed() {
         assert_eq!(
@@ -183,11 +185,14 @@ mod tests {
             serde_json::to_value(Permission::Deny).unwrap(),
             json!("deny")
         );
+        assert_eq!(serde_json::to_value(Permission::Ask).unwrap(), json!("ask"));
         let allow: Permission = serde_json::from_value(json!("allow")).unwrap();
         let deny: Permission = serde_json::from_value(json!("deny")).unwrap();
+        let ask: Permission = serde_json::from_value(json!("ask")).unwrap();
         assert_eq!(allow, Permission::Allow);
         assert_eq!(deny, Permission::Deny);
-        for unknown in ["ask", "Allow", "ALLOW", "maybe", ""] {
+        assert_eq!(ask, Permission::Ask);
+        for unknown in ["Allow", "ALLOW", "maybe", "", "ask_user"] {
             assert!(
                 serde_json::from_value::<Permission>(json!(unknown)).is_err(),
                 "`{unknown}` must refuse to parse (closed vocabulary, fail-closed)"

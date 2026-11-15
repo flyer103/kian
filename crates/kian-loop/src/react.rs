@@ -52,7 +52,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
+use kian_core::confirmation::{PendingCall, confirmable, confirmations, pending_calls};
 use kian_core::context::{Message, derive_model_context};
+use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{Event, EventKind};
 use kian_core::model::{AgentDef, Permission, SlotName};
 use kian_core::seams::{
@@ -252,7 +254,7 @@ impl LoopDriver for ReActLoop {
                     }
                     let outcome = match inner.iteration(&st.ctx, &mut st.drain_iterations).await {
                         Flow::TurnDone => LoopOutcome::TurnDone,
-                        Flow::Settled => LoopOutcome::Settled,
+                        Flow::Settled | Flow::Deferred => LoopOutcome::Settled,
                         Flow::Stopped(reason) => LoopOutcome::Stopped { reason },
                         Flow::Soft(reason) => LoopOutcome::SoftFailed { reason },
                     };
@@ -273,6 +275,11 @@ enum Flow {
     TurnDone,
     /// No eligible input remains and the model gave a final answer.
     Settled,
+    /// The turn stopped on a pending confirmation (CONFIRMATION-MODEL
+    /// §7): no provider request is allowed while a call is unanswered.
+    /// Reported as `LoopOutcome::Settled`; the engine derives the
+    /// `awaiting_input` end reason from the stream.
+    Deferred,
     /// An intentional stop condition fired.
     Stopped(String),
     /// Soft failure — routed to the recovery policy; never `completed`.
@@ -386,6 +393,29 @@ impl Inner {
 
         // 2. Rebuild the truth and derive the model context (A2/A3).
         let mut events = ctx.events().await?;
+
+        // (CONFIRMATION-MODEL §7) Durable answers are applied here — in
+        // call order — before any provider request. A pending ask with no
+        // decision ends the turn without a model call: the engine derives
+        // `awaiting_input` from the stream and the session waits.
+        let mut pending = pending_calls(&events);
+        if !pending.is_empty() {
+            let decisions = confirmations(&events);
+            for (call, decision) in confirmable(&pending, &decisions) {
+                self.apply_confirmation(ctx, &call, &decision).await?;
+            }
+            events = ctx.events().await?;
+            pending = pending_calls(&events);
+            if !pending.is_empty() {
+                tracing::debug!(
+                    session = %ctx.session().0,
+                    pending = pending.len(),
+                    "awaiting confirmation: settling without a provider call"
+                );
+                return Ok(Flow::Deferred);
+            }
+        }
+
         let binding = self.binding_for(ctx, &mut events).await?;
         let messages = derive_model_context(&events)?;
 
@@ -486,6 +516,67 @@ impl Inner {
         }
         ctx.end_turn_with(payload).await?;
         Ok(flow)
+    }
+
+    /// Applies one durable answer (CONFIRMATION-MODEL §5, ADR-033):
+    /// approve invokes the frozen call and appends its real result;
+    /// reject (or an expired answer, already transformed to a reject by
+    /// the server) appends the honest-error result. Both carry the
+    /// additive `confirmation` provenance **outside `content`** — the
+    /// model-visible wire shape is unchanged.
+    async fn apply_confirmation(
+        &self,
+        ctx: &DrainCtx,
+        call: &PendingCall,
+        decision: &ConfirmIntent,
+    ) -> Result<(), LoopError> {
+        let result = match decision.decision {
+            ConfirmDecision::Approve => {
+                let tool_call = ToolCall {
+                    id: call.call_id.clone(),
+                    name: call.tool.clone(),
+                    arguments: call.arguments.clone(),
+                };
+                match self.tools.invoke(tool_call).await {
+                    Ok(r) => r,
+                    // Tool-level failure is an honest error result, never
+                    // a loop abort (the deny arm's discipline).
+                    Err(e) => ToolResult {
+                        call_id: call.call_id.clone(),
+                        output: json!({"error": e.to_string()}),
+                        is_error: true,
+                        redactions: Vec::new(),
+                    },
+                }
+            }
+            ConfirmDecision::Reject => ToolResult {
+                call_id: call.call_id.clone(),
+                output: if decision.expired {
+                    json!({
+                        "error": "confirmation expired",
+                        "policy": "ask",
+                        "expired": true
+                    })
+                } else {
+                    match &decision.reason {
+                        Some(reason) => json!({
+                            "error": "permission denied by user",
+                            "policy": "ask",
+                            "reason": reason
+                        }),
+                        None => json!({
+                            "error": "permission denied by user",
+                            "policy": "ask"
+                        }),
+                    }
+                },
+                is_error: true,
+                redactions: Vec::new(),
+            },
+        };
+        let payload = tool_result_payload_confirmed(&result, decision);
+        ctx.append(EventKind::ToolResult, payload).await?;
+        Ok(())
     }
 
     /// Resolves the session's slot binding, appending `slot/binding`
@@ -682,6 +773,12 @@ impl Inner {
                     result: Err(TurnError::fatal(e, self.policy.as_ref())),
                     usage,
                 };
+            }
+            // Ask (ADR-033): never invoked here. The call stays pending
+            // until a control row answers it; the drain ends
+            // `awaiting_input` and the answer path below applies it.
+            if matches!(decision, Some(PermissionDecision::Ask)) {
+                continue;
             }
             // Deny: no tool side effect. The model sees an honest error
             // result next turn and reacts — a denied call is a tool
@@ -925,6 +1022,9 @@ pub(crate) enum PermissionDecision {
     AllowDefault,
     /// Explicitly denied by the configured table: no invocation.
     Deny,
+    /// Deferred to a person (ADR-033): logged, never invoked; the drain
+    /// ends `awaiting_input` and the answer arrives as a control row.
+    Ask,
 }
 
 /// The deny `reason` string on the provenance object (closed).
@@ -949,6 +1049,7 @@ fn evaluate_permission(
     match permissions.get(tool) {
         Some(Permission::Allow) => Some(PermissionDecision::AllowConfigured),
         Some(Permission::Deny) => Some(PermissionDecision::Deny),
+        Some(Permission::Ask) => Some(PermissionDecision::Ask),
         None => Some(PermissionDecision::AllowDefault),
     }
 }
@@ -977,6 +1078,11 @@ fn tool_call_payload(call: &ToolCall, decision: Option<PermissionDecision>) -> V
                 "matched": call.name,
                 "reason": PERMISSION_DENY_REASON
             }),
+            PermissionDecision::Ask => json!({
+                "evaluated": "ask",
+                "policy": "configured",
+                "matched": call.name
+            }),
         };
     }
     payload
@@ -1004,6 +1110,24 @@ fn tool_result_payload(result: &ToolResult) -> Value {
             payload["redactions"] = report;
         }
     }
+    payload
+}
+
+/// [`tool_result_payload`] plus the additive `confirmation` provenance
+/// (CONFIRMATION-MODEL A5) recording which decision produced this result
+/// — outside `content`, audit-only.
+fn tool_result_payload_confirmed(result: &ToolResult, decision: &ConfirmIntent) -> Value {
+    let mut payload = tool_result_payload(result);
+    let mut provenance = json!({
+        "call_id": result.call_id,
+        "decision": decision.decision.as_str(),
+        "requested_by": decision.requested_by,
+        "answered_at_ms": decision.answered_at_ms,
+    });
+    if decision.expired {
+        provenance["expired"] = json!(true);
+    }
+    payload["confirmation"] = provenance;
     payload
 }
 

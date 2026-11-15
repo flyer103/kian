@@ -29,7 +29,7 @@ use kian_orchestrator::{Engine, EngineConfig, EngineError, InterruptOutcome};
 use kian_plugin::{Ctx as PluginCtx, Disposer, PluginError};
 use kian_store::EventStore;
 
-use crate::api::{ControlError, ControlPlane, EventStreamMetrics};
+use crate::api::{ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics, PendingView};
 use crate::config::{DshHarnessConfig, ServeConfig};
 use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
 use crate::ops::{
@@ -114,6 +114,10 @@ pub struct Server {
     /// `api.event_stream.enabled`, default true. Disabled mounts no
     /// route: the path 404s.
     event_stream_enabled: bool,
+    /// `confirmation.ttl_ms` (CONFIRMATION-MODEL §8): 0 = no expiry. The
+    /// TTL is a liveness overlay computed at read/answer time — never
+    /// stored.
+    confirmation_ttl_ms: u64,
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
@@ -832,6 +836,7 @@ impl Server {
             views_enabled,
             event_stream: Arc::new(EventStreamMetrics::new()),
             event_stream_enabled,
+            confirmation_ttl_ms: config.confirmation.ttl_ms,
             _plugin_disposer: plugin_disposer,
         };
         // (R15-C5): arm the child inactivity ticker with the same
@@ -1343,6 +1348,61 @@ impl ControlPlane for Server {
                 }
                 Err(e) => Err(internal("interrupt")(e)),
             }
+        })
+    }
+
+    fn confirm(
+        &self,
+        session: SessionId,
+        call_id: String,
+        decision: kian_core::control::ConfirmDecision,
+        reason: Option<String>,
+        requested_by: Option<String>,
+    ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>> {
+        Box::pin(async move {
+            self.refuse_archived(session).await?;
+            let outcome = self
+                .engine
+                .confirm(
+                    session,
+                    &call_id,
+                    decision,
+                    reason,
+                    requested_by,
+                    self.confirmation_ttl_ms,
+                )
+                .await
+                .map_err(internal("confirm"))?;
+            match outcome {
+                kian_orchestrator::ConfirmOutcome::Accepted => Ok(ConfirmWireOutcome::Accepted),
+                kian_orchestrator::ConfirmOutcome::NotPending => Ok(ConfirmWireOutcome::NotPending),
+                kian_orchestrator::ConfirmOutcome::Expired => Ok(ConfirmWireOutcome::Expired),
+                kian_orchestrator::ConfirmOutcome::UnknownSession => {
+                    Err(ControlError::UnknownSession { session })
+                }
+            }
+        })
+    }
+
+    fn pending(&self, session: SessionId) -> BoxFuture<'_, Result<Vec<PendingView>, ControlError>> {
+        Box::pin(async move {
+            self.refuse_archived(session).await?;
+            let pending = self
+                .engine
+                .pending_confirmations(session, self.confirmation_ttl_ms)
+                .await
+                .map_err(internal("pending"))?
+                .ok_or(ControlError::UnknownSession { session })?;
+            Ok(pending
+                .into_iter()
+                .map(|p| PendingView {
+                    call_id: p.call.call_id,
+                    tool: p.call.tool,
+                    arguments: p.call.arguments,
+                    requested_at_ms: p.call.requested_at_ms,
+                    expired: p.expired,
+                })
+                .collect())
         })
     }
 

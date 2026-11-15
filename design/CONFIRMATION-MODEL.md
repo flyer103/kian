@@ -1,14 +1,13 @@
 # Kian — Confirmation Model (normative design, phase 1)
 
-> **Status: designed, not landed (owner gate pending).** This file owns the confirmation-plane
+> **Status: phase 1 landed (owner gate 2026-11-15).** This file owns the confirmation-plane
 > semantics: what an `ask` is, how a pending tool call is derived, how the answer is admitted, and
-> when a session ends into a resumable wait. Rationale: [ADR-033](decisions/ADR-033-durable-confirmation-plane.md).
-> The two catalog deltas — one new event kind (`control/confirm`) and two widened closed value sets
-> (`tool/call.permission.evaluated`, `session/ended.reason`) — are specified in §10 but **not yet
-> applied** to [EVENT-MODEL.md](EVENT-MODEL.md) or [API-CONTRACT.md](API-CONTRACT.md): both catalogs
-> are drift-tested against code (`crates/kian-cli/tests/docs_map.rs`), so their rows land in the
-> implementing change, not ahead of it. §9/§10 are the reviewable contract; they are normative once
-> the implementation lands.
+> when a session ends into a resumable wait. Rationale:
+> [ADR-033](decisions/ADR-033-durable-confirmation-plane.md). The catalog deltas — the new kind
+> `control/confirm` and the two widened closed value sets (`tool/call.permission.evaluated`,
+> `session/ended.reason`) — are applied in [EVENT-MODEL.md](EVENT-MODEL.md); the wire is applied in
+> [API-CONTRACT.md](API-CONTRACT.md) §3.1/§3.2 (the source of truth for shapes). §9/§10 restate the
+> deltas for review; if they ever disagree with those two files, those files win.
 >
 > Input: Anthropic, "Building always-on agents" (2026-11-13), §Permissions "deferred tool calls" —
 > synthesis in [the design notes §8](../the design notes).
@@ -112,13 +111,13 @@ The core invariant already treats an open call as a legal stream state
 (`durable_before_execute`: "resolution (a call with no result yet) is not a violation"), so an ask
 does not widen the stream's legality; it names the reason a stream may rest in that shape.
 
-**F2 — Two reads, one definition.** *Claim-time* (the engine deciding whether a claimed session may
-be driven): a non-empty pending set implies the last `session/ended` reason is `awaiting_input`, so
-the fold is gated on the already-loaded state projection — a long-lived session that never asked
-pays nothing, and a waiting session pays one scan per claim. *Settle-time* (the engine choosing the
-end reason of the episode it just ran): the fold is windowed to the episode `(claim seq, head]`,
-which is bounded by the drain's own writes and needs no gate. The two reads use the same
-`pending_calls`; only the window differs.
+**F2 — One definition, no gate.** `pending_calls` is a full fold of the durable stream and is
+called exactly where a decision needs it: the loop's turn start (which already reads the stream for
+`derive_model_context`), the engine's settle (one extra read on the would-be `completed` arm), and
+the `pending`/`confirm` reads. There is deliberately **no** "only if the last end is
+`awaiting_input`" gate: a drain that died after appending the `tool/call` but before its end write
+leaves a pending call with no `awaiting_input` end, so such a gate would miss precisely the crash
+window the projection exists for. Cost is the same order as the reads those callers already do.
 
 **F3 — Batching, in call order.** Several calls of one assistant batch may be pending at once.
 Non-ask calls in the same batch still execute (they were allowed; their results are independent).
@@ -134,10 +133,10 @@ sees a partial set.
 `pending_calls` correct across compression without reading into a summarized prefix.
 
 **F5 — Resume cost.** The built-in loop already reads the durable events once per turn
-(`LoopDriver::Ctx::events`), so the settle-time fold adds no new read path and the claim-time fold is
-gated (F2). Carrying the pending set on the read-model snapshot is a phase-2 optimization, recorded
-as an open question (§15), not a correctness prerequisite: the stream is the truth and the
-projection is rebuildable.
+(`LoopDriver::Ctx::events`), so the loop's fold adds no new read path; the engine's settle fold is
+one extra read, taken only when the end reason would otherwise be `completed`. Carrying the pending
+set on the read-model snapshot is a phase-2 optimization (open question §15), not a correctness
+prerequisite: the stream is the truth and the projection is rebuildable.
 
 **F6 — No persistence, no table.** There is no pending-state table, no inbox status column and no
 in-memory wait: a process restart loses nothing because a new drain re-derives the set from the
@@ -174,10 +173,13 @@ decision.
 approve, the invocation goes through the normal pre-tool path, so a hook veto after approval is a
 normal hook denial on that result; the hook's own `ask` verdict is phase 3, not this plane.
 
-**A4 — Idempotency.** `(session, call_id)` has at most one answer applied: the drain appends a
-`tool/result` only if none exists for that `call_id`, under the drain's expectedSeq CAS. A duplicate
-or conflicting answer that arrives after the first is `not_pending`. Two answers racing for one call
-resolve at the store (one append wins), never by in-process timing.
+**A4 — Idempotency.** `(session, call_id)` has at most one answer **admitted**: the control plane
+derives the row's idempotency key from that pair, so retries and racing duplicates dedupe onto one
+durable row at the store, and a call with a durable decision on the stream is `not_pending` even
+before its result lands. The drain then appends a `tool/result` only if none exists for that
+`call_id`, under the drain's expectedSeq CAS. A duplicate or conflicting answer that arrives after
+the first is `not_pending`; two answers racing for one call resolve at the store (one row, one
+append), never by in-process timing.
 
 **A5 — Audit keys, outside `content`.** The decision provenance rides the payload, never the message:
 
@@ -196,10 +198,11 @@ after the TTL (a liveness overlay). No timer exists in phase 1: expiry only mate
 someone answers. An abandoned wait is therefore a visible idle session, never a busy one, and never
 a lease held forever.
 
-**A7 — Terminal races.** An answer for a session that is terminal (`completed`/`cancelled`) or
-archived is refused with `not_pending` at admission time. A row that loses a race to a terminal end
-stays unconsumed and visible; the session is frozen and no result is fabricated. Recorded bound:
-phase 1 does not sweep such rows (a later ops sweep).
+**A7 — Terminal races.** An answer for a session that is terminal (`completed`/`cancelled`) is
+refused with `not_pending` at admission time; an archived session is refused with the established
+explicit `-32007` (the same refusal every control read gives), never a silent `not_pending`. A row
+that loses a race to a terminal end stays unconsumed and visible; the session is frozen and no
+result is fabricated. Recorded bound: phase 1 does not sweep such rows (a later ops sweep).
 
 ## 6. End-reason derivation
 
@@ -231,8 +234,10 @@ provider (it would be rejected, and it would be a lie).
 
 **R2 — Claim → consume answers → decide.**
 
-1. On claim of an `awaiting_input` session (F2 true), consume every eligible confirm row first,
-   appending `control/confirm` + its `tool/result` per §5.
+1. On claim of an `awaiting_input` session, consume every eligible confirm row first, appending
+   `control/confirm` + its `tool/result` per §5. A wake that carried only a decision is still real
+   work: the drain drives the loop even though the consumed row yields no message (the engine's
+   "empty inbox" settle must not win over an applied answer).
 2. If the pending set is now empty: continue the turn normally. The new request carries the same
    prefix plus the appended results — **byte-identical prefix, cache preserved** (constraint 3).
 3. If not empty: settle `awaiting_input` again (a normal claim→end episode; the wait is re-asserted,
@@ -268,23 +273,20 @@ worker loop or a resident loop (Router, watchdog): those drivers have no waiting
 silently ending a worker session `awaiting_input` would strand its ticket. The refusal names the
 phase. Phase 2 removes it.
 
-## 9. Wire delta (normative once §Status says landed)
+## 9. Wire delta (normative — owned by API-CONTRACT)
 
-**W1 — Two control-plane methods** (additions to the §3.1 catalog; no new error codes):
-
-| Method | Params | Result |
-|---|---|---|
-| `confirm` | `{"session":<uuid>,"call_id":<str>,"decision":"approve"\|"reject","reason":<str>?,"requested_by":<str>?,"idempotency_key":<str>?}` | `{"outcome":"accepted"\|"not_pending"\|"expired"}` |
-| `pending` | `{"session":<uuid>}` | `{"pending":[{"call_id","tool","arguments":<json verbatim>,"requested_at_ms":<u64>,"expired":<bool>}]}` |
+**W1 — Two control-plane methods.** The exact params/results are normative in
+[API-CONTRACT.md](API-CONTRACT.md) §3.1/§3.2 (`confirm`, `pending`); this file owns only the outcome
+semantics:
 
 - `accepted` — the row is durable; the decision takes effect on the stream (observe `control/confirm`
   then `tool/result`).
-- `not_pending` — no unanswered ask with that `call_id` (already answered, unknown id, not an ask,
-  or the session is terminal/archived). No row is written.
+- `not_pending` — no unanswered ask with that `call_id`, or the ask already carries a durable
+  decision (applied or in flight), or the session is terminal. No row is written.
 - `expired` — the call lapsed (§5 A6); a reject-with-expired row was admitted so the session
   resumes; the caller's decision was not applied.
-- `pending` is a pure read of the session stream (it needs no snapshot support in phase 1) and
-  reports the TTL overlay; `expired` there is computed against `confirmation.ttl_ms` at read time.
+- An archived session is `-32007` (the established explicit refusal); unknown session `-32001`;
+  malformed params `-32602`. No new error code exists.
 
 **W2 — One reserved inbox-row envelope** (the §4.5 family; refused by the public
 `submit`/`steer`/`queue` wire with `-32602`):
@@ -295,7 +297,8 @@ phase. Phase 2 removes it.
          "requested_by":"<str>|null","answered_at_ms":<u64>}}
 ```
 
-`answered_at_ms` is server-stamped at admission (never client-supplied).
+`answered_at_ms` is server-stamped at admission (never client-supplied), and the row's
+idempotency key is derived from `(session, call_id)` — a caller cannot widen it.
 
 **W3 — SSE.** Holding a connection is not part of the answer path: the stream closes on the first
 `session/ended` whatever its reason (existing rule), so a watcher of an `awaiting_input` session
@@ -304,7 +307,7 @@ reconnects for the resume; `pending` is the cheap read for a fresh client. No ne
 **W4 — No new metrics keys in phase 1**; counts ride existing audit lines and the stream. Metrics
 keys, if any, are added to the contract with the implementation.
 
-## 10. Event-model delta (normative once landed)
+## 10. Event-model delta (landed)
 
 Three additions, no schema version bump (no existing byte shape changes; the widened sets are
 additive values, the precedent being the `permission.policy` widening):
@@ -391,7 +394,9 @@ State → behavior; each row names its expected level.
 | 14 | real server, `kill -9` after `control/confirm` | restart | takeover appends exactly one result and resumes | L2 |
 | 15 | real server, duplicate `confirm` | two RPCs | one result; second `not_pending` | L2 |
 | 16 | real server, TTL expired | late `confirm` | `expired`; reject-expired result; session resumes; model sees the error | L2 |
-| 17 | real server, cancel while awaiting | `confirm` | `not_pending`; frozen stream unchanged | L2 |
+| 17 | real server, a terminal end while awaiting | `confirm` | `not_pending`; frozen stream unchanged | L2 |
+| 17b | real server, a durable decision exists but its result has not landed | a second `confirm` | `not_pending` (already answered); the first effect still applies | L2 |
+| 17c | real server, archived session | `confirm` / `pending` | `-32007` (explicit refusal), never a silent `not_pending` | L2 |
 | 18 | CLI `kian confirm` / `kian pending` | operator use | same outcomes as the RPC; no client-side state | L2 |
 
 L3 (a UI card) is out of phase 1; the `pending` read is its seam.
@@ -424,5 +429,12 @@ the request (the request is the stream; a delivery row is the bundle's business)
 5. **Effect ordering vs. out-of-order answers.** F3 chooses call-ordered effects at the cost of a
    delayed execution for an approved-but-not-yet-releasable call. Is that the right product
    behavior, or should the UI warn "waiting for an earlier decision"? (Phase 1: the rule only.)
-6. **Worker waiting path.** Does the completion gate's `waiting` report become the durable marker,
+6. **Pre-existing tool-batch crash window (not introduced here).** The loop appends the assistant
+   message (carrying `tool_calls`) and then one `tool/call` per call. A drain that dies between the
+   two leaves a context ending in assistant `tool_calls` with no logged call — the next resume
+   would send a malformed request. This window exists for every tool batch, ask or not; the
+   confirmation plane neither widens nor closes it. Candidate fix (its own change): on resume, a
+   missing logged call for a carried `tool_calls` entry gets an honest synthetic error result, in
+   call order. Recorded so the crash-recovery claim is not overstated.
+7. **Worker waiting path.** Does the completion gate's `waiting` report become the durable marker,
    or does the stage derive it from the end reason directly? (Phase 2.)

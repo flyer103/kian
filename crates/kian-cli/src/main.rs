@@ -53,6 +53,11 @@ const USAGE: &str = "usage:
                                          verify a session's archive package (hashes, replay, counts)
   kian wake-now <uuid> [--url <base>] [--config <path>] [--json]
                                          operator wake via the running server
+  kian pending <uuid> [--url <base>] [--config <path>] [--json]
+                                         the session's pending confirmation asks
+  kian confirm <uuid> <call-id> (--approve|--reject) [--reason <text>]
+               [--requested-by <who>] [--url <base>] [--config <path>] [--json]
+                                         answer a pending ask (durable control row)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -104,6 +109,8 @@ fn main() -> ExitCode {
         Some("wake-now") => wake_now(&args[2..]),
         Some("mock-channel-send") => mock_channel_send(&args[2..]),
         Some("memory") => memory(&args[2..]),
+        Some("pending") => pending(&args[2..]),
+        Some("confirm") => confirm(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("workers") => workers(&args[2..]),
@@ -619,6 +626,113 @@ fn wake_now(args: &[String]) -> ExitCode {
             parsed.json,
         ),
         "wake-now",
+    )
+}
+
+/// `kian pending <uuid> [--url <base>] [--config <path>] [--json]`
+fn pending(args: &[String]) -> ExitCode {
+    let parsed = match parse_session_args(args, "kian pending") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kian: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(session) = parsed.session else {
+        eprintln!("kian: pending requires a session uuid\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    run_command(
+        kian_cli::commands::run_pending(
+            &parsed.config,
+            parsed.url.as_deref(),
+            session,
+            parsed.json,
+        ),
+        "pending",
+    )
+}
+
+/// `kian confirm <uuid> <call-id> (--approve|--reject) [--reason <text>]
+/// [--requested-by <who>] [--url <base>] [--config <path>] [--json]`
+fn confirm(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut url: Option<String> = None;
+    let mut json = false;
+    let mut reason: Option<String> = None;
+    let mut requested_by: Option<String> = None;
+    let mut decision: Option<&'static str> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--url" => match iter.next() {
+                Some(u) => url = Some(u.clone()),
+                None => {
+                    eprintln!("kian: --url requires a base URL\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--reason" => match iter.next() {
+                Some(r) => reason = Some(r.clone()),
+                None => {
+                    eprintln!("kian: --reason requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--requested-by" => match iter.next() {
+                Some(w) => requested_by = Some(w.clone()),
+                None => {
+                    eprintln!("kian: --requested-by requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--approve" => decision = Some("approve"),
+            "--reject" => decision = Some("reject"),
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown flag `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other => positionals.push(other.to_string()),
+        }
+    }
+    let (Some(session), Some(call_id)) = (positionals.first(), positionals.get(1)) else {
+        eprintln!("kian: confirm requires <session-uuid> <call-id>\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let session = match kian_cli::commands::parse_session(session) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kian: invalid session uuid `{session}`: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(decision) = decision else {
+        eprintln!("kian: confirm requires --approve or --reject\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    run_command(
+        kian_cli::commands::run_confirm(
+            &config,
+            url.as_deref(),
+            kian_cli::commands::ConfirmRequest {
+                session,
+                call_id,
+                decision,
+                reason: reason.as_deref(),
+                requested_by: requested_by.as_deref(),
+            },
+            json,
+        ),
+        "confirm",
     )
 }
 

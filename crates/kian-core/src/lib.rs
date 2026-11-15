@@ -21,6 +21,7 @@
 //! - [`invariants`] — the six semantic invariants + NoHalfTerminated as assertion predicates
 //! - [`seams`] — seam trait definitions (DESIGN §6.2); impl crates re-export
 
+pub mod confirmation;
 pub mod context;
 pub mod control;
 pub mod events;

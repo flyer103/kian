@@ -104,6 +104,10 @@ impl TransitionTrigger {
             // dreamer drain while `running`, rejected elsewhere by the
             // table, not by a row of its own).
             EventKind::MemoryNote => Self::DrainActivity,
+            // the confirmation intent is drain activity too: the answer
+            // is consumed while `running` and owns no state transition
+            // of its own (the end write settles the wait).
+            EventKind::ControlConfirm => Self::DrainActivity,
             _ => Self::DrainActivity,
         }
     }
@@ -186,6 +190,9 @@ pub fn transition(
         (Some(S::Running), T::Ended(R::Completed)) => Ok(S::Completed),
         (Some(S::Running), T::Ended(R::Cancelled)) => Ok(S::Cancelled),
         (Some(S::Running), T::Ended(R::Interrupted) | T::Ended(R::Failed)) => Ok(S::Idle),
+        // CONFIRMATION-MODEL / ADR-033: a drain that stopped on a pending
+        // ask is resumable — the answer's arrival re-opens the turn.
+        (Some(S::Running), T::Ended(R::AwaitingInput)) => Ok(S::Idle),
         (Some(S::Running), T::LeaseExpired) => Ok(S::Recoverable),
         (Some(S::Running), T::Archived) => Ok(S::Archived),
         (from, on) => Err(IllegalTransition { from, on }),
@@ -366,11 +373,12 @@ pub(crate) mod test_support {
         &[EventKind::ToolCall, EventKind::ToolResult],
     ];
 
-    const END_REASONS: [EndReason; 4] = [
+    const END_REASONS: [EndReason; 5] = [
         EndReason::Completed,
         EndReason::Cancelled,
         EndReason::Interrupted,
         EndReason::Failed,
+        EndReason::AwaitingInput,
     ];
 
     /// Generates a random *legal* stream by rejection-sampling triggers

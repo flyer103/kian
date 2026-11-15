@@ -36,6 +36,10 @@ The same runtime also ships:
   rewritten, and cache-prefix stability is observable (`compact` is the only deliberate break).
 - **Bounded recovery** — pure error classification plus a caller-owned policy table, with one-shot
   guards and token/wall-clock budgets.
+- **Human-in-the-loop by design** — a tool call can be deferred for approval (`permissions: ask`):
+  the drain ends `awaiting_input` without holding a lease, the pending call is derived from the
+  stream, and the answer is a durable control row that resumes the same turn — same prefix bytes,
+  no lost work if the answer arrives after a restart.
 - **Multi-replica safety** — epoch fencing + `expectedSeq` CAS reject stale writes; sqlite by
   default, postgres for replicas (`KIAN_PG_URL`).
 - **Super-agent bundle** — Router/Worker over Thread delegation, event subscriptions,
@@ -586,6 +590,24 @@ The decision is evaluated **before** the call is logged and recorded as provenan
 ([ADR-015](design/decisions/ADR-015-tool-permission-provenance.md)); a deny never invokes the tool —
 the model receives an honest error result and reacts. Unknown values and keys outside `tools:`
 refuse to start. Absent table = empty = allow-all, byte-identical to a server without the feature.
+
+`ask` defers instead of deciding:
+
+```yaml
+agent:
+  tools: ["send_email", "read_issue"]
+  permissions:
+    send_email: ask
+confirmation:
+  ttl_ms: 86400000        # absent/0 = answer whenever
+```
+
+The session goes `idle` with end reason `awaiting_input`; `kian pending <uuid>` lists the call and
+`kian confirm <uuid> <call-id> --approve|--reject` answers it (or the `confirm`/`pending` RPCs).
+Approving invokes the frozen call and appends its result; rejecting appends the honest error.
+Contract: [CONFIRMATION-MODEL](design/CONFIRMATION-MODEL.md)
+([ADR-033](design/decisions/ADR-033-durable-confirmation-plane.md)). Phase 1 supports plain
+sessions — `ask` on a superagent worker agent refuses to start until phase 2.
 
 ### Agent memory (notes + dreaming)
 

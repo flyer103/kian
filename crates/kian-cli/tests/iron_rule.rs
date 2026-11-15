@@ -79,12 +79,14 @@ fn handlers_dispatch_only_the_baseline_method_set() {
         "\"steer\"",
         "\"interrupt\"",
         "\"queue\"",
+        "\"confirm\"",
+        "\"pending\"",
         "\"projection\"",
     ] {
         assert!(src.contains(method), "rpc dispatch missing {method}");
     }
     // No bundle+ endpoints smuggled in.
-    for banned in ["confirm", "auth", "tenant", "channel", "router"] {
+    for banned in ["auth", "tenant", "channel", "router"] {
         assert!(
             !src.contains(&format!("\"{banned}\"")),
             "api.rs dispatches a non-baseline method `{banned}`"

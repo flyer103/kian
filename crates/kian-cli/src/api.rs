@@ -1,8 +1,9 @@
 //! Control-plane API (DESIGN §5 "Control-plane protocol").
 //!
 //! axum JSON-RPC-over-HTTP + SSE exposing the built-in set:
-//! `create_session`, `submit`, `steer`, `interrupt`, `queue`, `events`
-//! (SSE interval polling of the event store), `projection` read.
+//! `create_session`, `submit`, `steer`, `interrupt`, `queue`,
+//! `confirm`/`pending` (CONFIRMATION-MODEL, ADR-033), `events` (SSE
+//! interval polling of the event store), `projection` read.
 //!
 //! # Layered iron rule (AGENTS.md constraint 9)
 //!
@@ -60,6 +61,18 @@ pub trait ControlPlane: Send + Sync {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<bool, ControlError>>;
     fn interrupt(&self, session: SessionId) -> BoxFuture<'_, Result<String, ControlError>>;
+    /// Answers one pending ask (CONFIRMATION-MODEL §5/§9): a durable
+    /// reserved control row plus a wake. Never touches execution.
+    fn confirm(
+        &self,
+        session: SessionId,
+        call_id: String,
+        decision: kian_core::control::ConfirmDecision,
+        reason: Option<String>,
+        requested_by: Option<String>,
+    ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>>;
+    /// The pending asks of one session with the TTL overlay: a pure read.
+    fn pending(&self, session: SessionId) -> BoxFuture<'_, Result<Vec<PendingView>, ControlError>>;
     fn projection(&self, session: SessionId) -> BoxFuture<'_, Result<SessionState, ControlError>>;
     fn session_events(&self, session: SessionId)
     -> BoxFuture<'_, Result<Vec<Event>, ControlError>>;
@@ -110,6 +123,42 @@ pub struct EventTailRead {
     /// The stream's last committed event is `session/ended` — the
     /// SSE `done` condition.
     pub terminal: bool,
+}
+
+/// The `confirm` wire outcome (CONFIRMATION-MODEL §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmWireOutcome {
+    /// The row is durable; the decision takes effect on the stream.
+    Accepted,
+    /// No unanswered ask with that `call_id`.
+    NotPending,
+    /// The call lapsed under `confirmation.ttl_ms`; a reject-expired
+    /// row was admitted so the session resumes (the decision was not
+    /// applied).
+    Expired,
+}
+
+impl ConfirmWireOutcome {
+    /// The wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::NotPending => "not_pending",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// One pending confirmation as the `pending` read reports it
+/// (CONFIRMATION-MODEL §9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingView {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub requested_at_ms: u64,
+    pub expired: bool,
 }
 
 /// Control-plane failures.
@@ -312,6 +361,55 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
             let outcome = state.plane.interrupt(session).await.map_err(control_err)?;
             Ok(json!({"outcome": outcome}))
         }
+        "confirm" => {
+            let session = session_params(params)?;
+            let call_id = params
+                .get("call_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    (
+                        CODE_INVALID_PARAMS,
+                        "missing/non-string `call_id`".to_string(),
+                    )
+                })?
+                .to_owned();
+            let decision = params
+                .get("decision")
+                .and_then(Value::as_str)
+                .and_then(kian_core::control::ConfirmDecision::parse)
+                .ok_or_else(|| {
+                    (
+                        CODE_INVALID_PARAMS,
+                        "`decision` must be \"approve\" or \"reject\"".to_string(),
+                    )
+                })?;
+            let reason = optional_string(params, "reason")?;
+            let requested_by = optional_string(params, "requested_by")?;
+            let outcome = state
+                .plane
+                .confirm(session, call_id, decision, reason, requested_by)
+                .await
+                .map_err(control_err)?;
+            Ok(json!({"outcome": outcome.as_str()}))
+        }
+        "pending" => {
+            let session = session_params(params)?;
+            let pending = state.plane.pending(session).await.map_err(control_err)?;
+            let items: Vec<Value> = pending
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "call_id": p.call_id,
+                        "tool": p.tool,
+                        "arguments": p.arguments,
+                        "requested_at_ms": p.requested_at_ms,
+                        "expired": p.expired,
+                    })
+                })
+                .collect();
+            Ok(json!({"pending": items}))
+        }
         "projection" => {
             let session = session_params(params)?;
             let since = since_param(params)?;
@@ -379,6 +477,13 @@ fn session_of(params: &Value) -> Result<SessionId, (i64, String)> {
 /// marker the server is documented to set itself (kian-94, review
 /// B-2′; kian-99), so the wire refuses them (`-32602`).
 fn is_reserved_envelope(content: &Value) -> bool {
+    // CONFIRMATION-MODEL §5: the reserved control envelope
+    // (`{"kian":{"type":"control",...}}`, any action) is a server-plane
+    // shape — a public input carrying it would let client content mint a
+    // control row (an interrupt or an approval).
+    if kian_core::control::is_reserved_control_shape(content) {
+        return true;
+    }
     let Some(obj) = content.as_object() else {
         return false;
     };
@@ -399,8 +504,8 @@ fn input_params(params: &Value) -> Result<(SessionId, Value, Option<String>), (i
         return Err((
             CODE_INVALID_PARAMS,
             "`content` is a reserved row-envelope key set ({content,dream} / {content,spill} \
-             / {synthetic,content} / {content,memory}); only the server's internal planes \
-             admit those rows"
+             / {synthetic,content} / {content,memory} / the control envelope); only the \
+             server's internal planes admit those rows"
                 .to_string(),
         ));
     }
@@ -413,6 +518,19 @@ fn input_params(params: &Value) -> Result<(SessionId, Value, Option<String>), (i
 
 fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
     session_of(params)
+}
+
+/// An optional string param: absent/null → `None`; any other non-string
+/// type is `-32602` (never silently ignored).
+fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (i64, String)> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err((
+            CODE_INVALID_PARAMS,
+            format!("`{name}` must be a string when present"),
+        )),
+    }
 }
 
 /// The optional `projection.since` (READ-MODEL §3): absent → `None`;
@@ -966,6 +1084,30 @@ mod tests {
             json!({"dream": 1, "spill": 2}),
             json!({"synthetic": true}),
             json!({"content": "x", "unrelated": {"dream": 1}}),
+        ] {
+            assert!(!is_reserved_envelope(&ordinary), "{ordinary}");
+        }
+    }
+
+    /// CONFIRMATION-MODEL §5: the reserved control envelope (any action)
+    /// is refused by the public wire — a client must not mint an
+    /// interrupt or an approval — while a non-control `kian` object and
+    /// a control envelope smuggled inside `content` stay ordinary.
+    #[test]
+    fn reserved_control_envelope_detection_is_exact() {
+        for reserved in [
+            json!({"kian": {"type": "control", "action": "interrupt"}}),
+            json!({"kian": {"type": "control", "action": "confirm",
+                            "call_id": "c", "decision": "approve"}}),
+            json!({"kian": {"type": "control", "action": "future_action"}}),
+        ] {
+            assert!(is_reserved_envelope(&reserved), "{reserved}");
+        }
+        for ordinary in [
+            json!({"kian": {"type": "async_result", "job_id": "j"}}),
+            json!({"kian": {"type": "control", "action": "confirm"}, "extra": 1}),
+            json!({"content": {"kian": {"type": "control", "action": "confirm"}}}),
+            json!({"kian": "not an object"}),
         ] {
             assert!(!is_reserved_envelope(&ordinary), "{ordinary}");
         }

@@ -183,6 +183,7 @@ fn terminal_state(reason: &EndReason) -> &'static str {
         EndReason::Cancelled => "cancelled",
         EndReason::Interrupted => "interrupted",
         EndReason::Failed => "failed",
+        EndReason::AwaitingInput => "awaiting_input",
     }
 }
 

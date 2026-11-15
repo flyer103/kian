@@ -64,6 +64,8 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+use kian_core::confirmation::{PendingCall, effective_decision, is_expired, pending_calls};
+use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::seams::{LoopDriver, LoopOutcome};
@@ -192,6 +194,31 @@ pub enum InterruptOutcome {
     NotDraining { state: SessionState },
     /// No such session (empty event stream).
     UnknownSession,
+}
+
+/// What an [`Engine::confirm`] call did (CONFIRMATION-MODEL §9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// The answer row is durable; the decision takes effect on the stream.
+    Accepted,
+    /// No unanswered ask with that `call_id` (already answered, unknown,
+    /// not an ask, or the session is terminal).
+    NotPending,
+    /// The call lapsed under the TTL: a reject-with-`expired` row was
+    /// admitted so the session resumes; the caller's decision was **not**
+    /// applied.
+    Expired,
+    /// No such session (empty event stream).
+    UnknownSession,
+}
+
+/// One pending confirmation as the `pending` read reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConfirmation {
+    /// The unanswered ask.
+    pub call: PendingCall,
+    /// TTL overlay at read time (never persisted; like `recoverable`).
+    pub expired: bool,
 }
 
 /// The in-map handle for one draining session. Presence in
@@ -580,6 +607,14 @@ impl DrainCtx {
         Ok(self.consume_inputs(false).await?.messages)
     }
 
+    /// [`DrainCtx::take_eligible_inputs`] with the control flags kept:
+    /// the drain uses it to tell "nothing to do" from "a decision was
+    /// consumed" (an answer is applied by the loop, so it is real work
+    /// even though it yields no message row).
+    async fn take_eligible_inputs_report(&self) -> Result<TakeReport, EngineError> {
+        self.consume_inputs(false).await
+    }
+
     /// The final take before the end write: consumes ONLY pending
     /// control rows (regular inputs stay eligible for the resumer) and
     /// returns whether a current-epoch control row fired the interrupt.
@@ -631,6 +666,23 @@ impl DrainCtx {
                     }
                     self.bind_consumed(&r, ev.seq).await?;
                 }
+                Consumption::Confirm(intent) => {
+                    // The durable decision first, then the binding (the
+                    // same admit-before-consume ordering as everything
+                    // else). The final pre-end-write take leaves confirm
+                    // rows eligible: only the loop's apply step turns a
+                    // decision into an effect, so consuming one without
+                    // driving the loop would strand it.
+                    if control_only {
+                        continue;
+                    }
+                    let ev = self
+                        .core
+                        .append_event(EventKind::ControlConfirm, intent.event_payload())
+                        .await?;
+                    self.bind_consumed(&r, ev.seq).await?;
+                    report.control_confirm = true;
+                }
                 plan => {
                     if control_only {
                         continue; // the final take leaves message rows eligible
@@ -648,7 +700,9 @@ impl DrainCtx {
                                 self.core.append_input_pair(admitted, spill).await?;
                             admitted_ev.seq
                         }
-                        Consumption::Control(_) => unreachable!("matched above"),
+                        Consumption::Control(_) | Consumption::Confirm(_) => {
+                            unreachable!("matched above")
+                        }
                     };
                     if self.bind_consumed(&r, admitted_seq).await? {
                         report.messages.push(r);
@@ -1188,6 +1242,84 @@ where
         Ok(())
     }
 
+    /// Answers one pending ask (CONFIRMATION-MODEL §5/§9): validates
+    /// against the durable pending set, applies the TTL transform, admits
+    /// the reserved confirmation row and wakes. The control plane writes
+    /// nothing else; the drain applies the decision.
+    pub async fn confirm(
+        &self,
+        session: SessionId,
+        call_id: &str,
+        decision: ConfirmDecision,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        ttl_ms: u64,
+    ) -> Result<ConfirmOutcome, EngineError> {
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(ConfirmOutcome::UnknownSession);
+        }
+        if project(&events)?.is_terminal() {
+            return Ok(ConfirmOutcome::NotPending);
+        }
+        let Some(call) = pending_calls(&events)
+            .into_iter()
+            .find(|c| c.call_id == call_id)
+        else {
+            return Ok(ConfirmOutcome::NotPending);
+        };
+        // A durable decision already on the stream means the ask is
+        // answered (the effect may still be in flight): a second answer
+        // is `not_pending`, never an override.
+        if kian_core::confirmation::confirmations(&events).contains_key(call_id) {
+            return Ok(ConfirmOutcome::NotPending);
+        }
+        let now = self.clock.now_ms();
+        let intent = ConfirmIntent {
+            call_id: call_id.to_owned(),
+            decision,
+            reason,
+            requested_by,
+            answered_at_ms: now,
+            expired: false,
+        };
+        let effective = effective_decision(&call, ttl_ms, now, &intent);
+        let expired = effective.expired;
+        // The key is derived from (session, call_id) — the natural
+        // identity of the ask — so retries and racing duplicates dedupe
+        // onto ONE durable row; a caller cannot widen it.
+        let key = ConfirmIntent::idempotency_key(&session, call_id);
+        self.admit(session, effective.envelope(), Some(key)).await?;
+        Ok(if expired {
+            ConfirmOutcome::Expired
+        } else {
+            ConfirmOutcome::Accepted
+        })
+    }
+
+    /// The session's pending confirmations with the TTL overlay
+    /// (CONFIRMATION-MODEL §9). `None` = no such session.
+    pub async fn pending_confirmations(
+        &self,
+        session: SessionId,
+        ttl_ms: u64,
+    ) -> Result<Option<Vec<PendingConfirmation>>, EngineError> {
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let now = self.clock.now_ms();
+        Ok(Some(
+            pending_calls(&events)
+                .into_iter()
+                .map(|call| PendingConfirmation {
+                    expired: is_expired(&call, ttl_ms, now),
+                    call,
+                })
+                .collect(),
+        ))
+    }
+
     /// Startup NoLostWork rebuild: registers a pending wake for every
     /// session the inbox scan reports with eligible-but-unconsumed
     /// input, then drains them. Returns the number of sessions found.
@@ -1405,7 +1537,9 @@ where
                     break 'episodes;
                 }
             }
-            let taken = ctx.take_eligible_inputs().await?;
+            let report = ctx.take_eligible_inputs_report().await?;
+            let took_confirm = report.control_confirm;
+            let taken = report.messages;
             // a current-epoch control row consumed by that take
             // flips the shared flag — honor it now, before the
             // empty-inbox branch below can settle `completed` past it.
@@ -1413,7 +1547,7 @@ where
                 end_reason = EndReason::Interrupted;
                 break 'episodes;
             }
-            if taken.is_empty() && !takeover {
+            if taken.is_empty() && !takeover && !took_confirm {
                 if !claimed {
                     return Ok(DrainOutcome::ReleasedClean);
                 }
@@ -1484,6 +1618,17 @@ where
             }
             Err(EngineError::NotAtSafeBoundary { .. }) => {}
             Err(e) => return Err(e),
+        }
+        // CONFIRMATION-MODEL §6 (ADR-033): a settle whose pending set is
+        // non-empty ends `awaiting_input` (resumable) — never
+        // `completed`. Interrupt/cancel/failure endings are untouched;
+        // only the would-be `completed` arm is replaced, because "we
+        // stopped with a call unanswered" is neither of those.
+        if end_reason == EndReason::Completed {
+            let events = ctx.events().await?;
+            if !pending_calls(&events).is_empty() {
+                end_reason = EndReason::AwaitingInput;
+            }
         }
         ctx.end_session(end_reason).await?;
         Ok(DrainOutcome::Ended { reason: end_reason })
@@ -1566,6 +1711,11 @@ async fn heartbeat_loop(
 struct TakeReport {
     messages: Vec<InputRow>,
     control_interrupt: bool,
+    /// A confirmation answer was consumed into `control/confirm`. The
+    /// drain must still drive the loop: the answer's effect is applied by
+    /// the loop, so a wake that only carried a decision is real work
+    /// (CONFIRMATION-MODEL §7).
+    control_confirm: bool,
 }
 
 /// The engine's input-row convention: what one row consumes to. A plain
@@ -1604,11 +1754,19 @@ enum Consumption {
     /// event, never a message. The row is bound to the event's seq like
     /// any other consumption.
     Control(kian_core::control::InterruptIntent),
+    /// The reserved confirmation envelope (CONFIRMATION-MODEL §5): a
+    /// `control/confirm` audit event, never a message. The loop applies
+    /// the decision at its next turn start; the row is bound to the
+    /// event's seq like any other consumption.
+    Confirm(ConfirmIntent),
 }
 
 fn consumption_plan(row: &InputRow) -> Consumption {
     if let Some(intent) = kian_core::control::InterruptIntent::parse(&row.payload) {
         return Consumption::Control(intent);
+    }
+    if let Some(intent) = ConfirmIntent::parse(&row.payload) {
+        return Consumption::Confirm(intent);
     }
     if let Some(obj) = row.payload.as_object() {
         // kian-96 (kian-95 review N-1): the steer wrapper is exactly

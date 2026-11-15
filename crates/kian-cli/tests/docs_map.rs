@@ -282,9 +282,20 @@ fn event_model_catalog_matches_core_kinds() {
     }
 
     // Executable form: the `#[serde(rename = "kind/name")]` tags on
-    // `EventKind` (the golden tests pin them to `as_str`).
+    // `EventKind` (the golden tests pin them to `as_str`). The scan is
+    // scoped to the enum body: other enums in the file carry their own
+    // serde renames (e.g. `EndReason::AwaitingInput` →
+    // `"awaiting_input"`), which are not kinds.
+    let enum_start = events_rs
+        .find("pub enum EventKind {")
+        .expect("EventKind enum");
+    let enum_body = &events_rs[enum_start..];
+    let enum_end = enum_body
+        .find("\n}\n")
+        .map(|i| &enum_body[..i])
+        .unwrap_or(enum_body);
     let mut coded: BTreeSet<String> = BTreeSet::new();
-    for line in events_rs.lines() {
+    for line in enum_end.lines() {
         let Some(pos) = line.find("#[serde(rename = \"") else {
             continue;
         };
@@ -298,8 +309,8 @@ fn event_model_catalog_matches_core_kinds() {
 
     assert_eq!(
         coded.len(),
-        22,
-        "expected 22 EventKind variants, got {coded:?}"
+        23,
+        "expected 23 EventKind variants, got {coded:?}"
     );
     assert_eq!(
         documented.len(),
@@ -349,8 +360,8 @@ fn api_contract_method_catalog_matches_dispatch() {
 
     assert_eq!(
         coded.len(),
-        10,
-        "expected 10 JSON-RPC methods (6 control + 4 ops), got {coded:?}"
+        12,
+        "expected 12 JSON-RPC methods (8 control + 4 ops), got {coded:?}"
     );
     assert_eq!(
         documented,

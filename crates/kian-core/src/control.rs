@@ -37,6 +37,8 @@ const ENVELOPE_KEY: &str = "kian";
 const CONTROL_TYPE: &str = "control";
 /// The interrupt action discriminator.
 const INTERRUPT_ACTION: &str = "interrupt";
+/// The confirmation action discriminator.
+const CONFIRM_ACTION: &str = "confirm";
 
 /// A parsed interrupt intent from a reserved control-envelope row.
 ///
@@ -165,12 +167,222 @@ impl InterruptIntent {
     }
 }
 
+/// Whether `payload` is **any** reserved control envelope shape
+/// (`{"kian": {"type": "control", ...}}`, any action). The public wire
+/// refuses it: clients may never mint a control row, even one carrying
+/// an action this build does not know.
+#[must_use]
+pub fn is_reserved_control_shape(payload: &Value) -> bool {
+    let Some(obj) = payload.as_object() else {
+        return false;
+    };
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some(inner) = obj.get(ENVELOPE_KEY).and_then(Value::as_object) else {
+        return false;
+    };
+    inner.get("type").and_then(Value::as_str) == Some(CONTROL_TYPE)
+}
+
+/// A parsed confirmation intent from a reserved control-envelope row
+/// (CONFIRMATION-MODEL §5, ADR-033): one human decision on one pending
+/// ask. Pure data — the same intent serializes to the inbox row
+/// (envelope), to the `control/confirm` audit event (event payload), and
+/// to the `tool/result` provenance that records the applied decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmIntent {
+    /// The pending call this decision answers (`tool/call.content.id`).
+    pub call_id: String,
+    /// The decision.
+    pub decision: ConfirmDecision,
+    /// Free-form human reason, or `null`.
+    pub reason: Option<String>,
+    /// Who answered (operator label), or `null`.
+    pub requested_by: Option<String>,
+    /// Unix epoch milliseconds at admit time (server-stamped).
+    pub answered_at_ms: u64,
+    /// The pending call had lapsed under `confirmation.ttl_ms`; the
+    /// server transformed the answer into a durable reject so the
+    /// session resumes honestly.
+    pub expired: bool,
+}
+
+/// The closed decision vocabulary of the confirmation plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmDecision {
+    Approve,
+    Reject,
+}
+
+impl ConfirmDecision {
+    /// The wire/event spelling (`approve` | `reject`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+        }
+    }
+
+    /// Parses the closed vocabulary; anything else is `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(Self::Approve),
+            "reject" => Some(Self::Reject),
+            _ => None,
+        }
+    }
+}
+
+impl ConfirmIntent {
+    /// Whether `payload` is the reserved confirmation envelope (a single
+    /// `{"kian": {"type": "control", "action": "confirm", ...}}` key).
+    #[must_use]
+    pub fn is_control_envelope(payload: &Value) -> bool {
+        Self::parse(payload).is_some()
+    }
+
+    /// Whether `payload` is **any** reserved control envelope shape
+    /// (`{"kian": {"type": "control", ...}}`, any action). Used by the
+    /// public wire guard: clients may never mint a control row, even one
+    /// carrying an action this build does not know.
+    #[must_use]
+    pub fn is_reserved_shape(payload: &Value) -> bool {
+        is_reserved_control_shape(payload)
+    }
+
+    /// Parses the reserved confirmation envelope, or `None` for any
+    /// payload that is not exactly it. A missing/empty `call_id` or an
+    /// unknown decision is not an envelope (it stays plain content).
+    #[must_use]
+    pub fn parse(payload: &Value) -> Option<Self> {
+        let obj = payload.as_object()?;
+        if obj.len() != 1 {
+            return None;
+        }
+        let inner = obj.get(ENVELOPE_KEY)?.as_object()?;
+        if inner.get("type").and_then(Value::as_str) != Some(CONTROL_TYPE)
+            || inner.get("action").and_then(Value::as_str) != Some(CONFIRM_ACTION)
+        {
+            return None;
+        }
+        let call_id = inner
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?
+            .to_owned();
+        let decision = inner
+            .get("decision")
+            .and_then(Value::as_str)
+            .and_then(ConfirmDecision::parse)?;
+        Some(Self {
+            call_id,
+            decision,
+            reason: inner
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            requested_by: inner
+                .get("requested_by")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            answered_at_ms: inner
+                .get("answered_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            expired: inner.get("expired").and_then(Value::as_bool) == Some(true),
+        })
+    }
+
+    /// Parses the `control/confirm` **event** payload (the inner object,
+    /// without the row envelope wrapper) — the audit record the drain
+    /// appends on consumption.
+    #[must_use]
+    pub fn from_event_payload(payload: &Value) -> Option<Self> {
+        let inner = payload.as_object()?;
+        if inner.get("action").and_then(Value::as_str) != Some(CONFIRM_ACTION) {
+            return None;
+        }
+        let call_id = inner
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?
+            .to_owned();
+        let decision = inner
+            .get("decision")
+            .and_then(Value::as_str)
+            .and_then(ConfirmDecision::parse)?;
+        Some(Self {
+            call_id,
+            decision,
+            reason: inner
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            requested_by: inner
+                .get("requested_by")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            answered_at_ms: inner
+                .get("answered_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            expired: inner.get("expired").and_then(Value::as_bool) == Some(true),
+        })
+    }
+
+    /// The reserved envelope payload for this intent (the inbox row's
+    /// `payload`).
+    #[must_use]
+    pub fn envelope(&self) -> Value {
+        let mut inner = json!({
+            "type": CONTROL_TYPE,
+            "action": CONFIRM_ACTION,
+            "call_id": self.call_id,
+            "decision": self.decision.as_str(),
+            "reason": self.reason,
+            "requested_by": self.requested_by,
+            "answered_at_ms": self.answered_at_ms,
+        });
+        if self.expired {
+            inner["expired"] = json!(true);
+        }
+        json!({ ENVELOPE_KEY: inner })
+    }
+
+    /// The `control/confirm` event payload for this intent.
+    #[must_use]
+    pub fn event_payload(&self) -> Value {
+        let mut payload = json!({
+            "action": CONFIRM_ACTION,
+            "call_id": self.call_id,
+            "decision": self.decision.as_str(),
+            "reason": self.reason,
+            "requested_by": self.requested_by,
+            "answered_at_ms": self.answered_at_ms,
+        });
+        if self.expired {
+            payload["expired"] = json!(true);
+        }
+        payload
+    }
+
+    /// The inbox idempotency key: repeated answers for the same call
+    /// dedupe to exactly one row.
+    #[must_use]
+    pub fn idempotency_key(session: &SessionId, call_id: &str) -> String {
+        format!("confirm:{}:{}", session.0, call_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::InterruptIntent;
+    use super::{ConfirmDecision, ConfirmIntent, InterruptIntent};
     use crate::model::SessionId;
 
     fn intent() -> InterruptIntent {
@@ -293,6 +505,82 @@ mod tests {
         assert_eq!(
             InterruptIntent::idempotency_key(&sid, None),
             format!("interrupt:{}:null", sid.0)
+        );
+    }
+
+    /// The confirmation envelope round-trips; the reserved-shape guard
+    /// also recognizes the interrupt shape and refuses nothing else.
+    #[test]
+    fn confirm_envelope_round_trips_and_reserved_shape_covers_both_actions() {
+        let i = ConfirmIntent {
+            call_id: "call-1".into(),
+            decision: ConfirmDecision::Approve,
+            reason: Some("looks right".into()),
+            requested_by: Some("alice".into()),
+            answered_at_ms: 1_762_000_000_000,
+            expired: false,
+        };
+        let envelope = i.envelope();
+        assert_eq!(
+            envelope,
+            json!({"kian": {"type": "control", "action": "confirm", "call_id": "call-1",
+                            "decision": "approve", "reason": "looks right",
+                            "requested_by": "alice", "answered_at_ms": 1_762_000_000_000_u64}})
+        );
+        assert_eq!(ConfirmIntent::parse(&envelope), Some(i));
+        assert!(ConfirmIntent::is_control_envelope(&envelope));
+        assert!(ConfirmIntent::is_reserved_shape(&envelope));
+
+        let expired = ConfirmIntent {
+            expired: true,
+            decision: ConfirmDecision::Reject,
+            reason: None,
+            requested_by: None,
+            answered_at_ms: 5,
+            call_id: "call-2".into(),
+        };
+        assert_eq!(
+            ConfirmIntent::parse(&expired.envelope()),
+            Some(expired.clone())
+        );
+        assert_eq!(expired.event_payload()["expired"], json!(true));
+        assert_eq!(expired.event_payload()["decision"], json!("reject"));
+
+        // The interrupt envelope is a reserved control shape too (the
+        // wire guard is action-agnostic), but not a confirmation.
+        let interrupt = InterruptIntent {
+            reason: None,
+            requested_by: None,
+            requested_at_ms: 1,
+            target_epoch: None,
+        }
+        .envelope();
+        assert!(ConfirmIntent::is_reserved_shape(&interrupt));
+        assert!(!ConfirmIntent::is_control_envelope(&interrupt));
+
+        for plain in [
+            json!({"kian": {"type": "control", "action": "confirm"}}),
+            json!({"kian": {"type": "control", "action": "confirm", "call_id": "c",
+                            "decision": "maybe"}}),
+            json!({"kian": {"type": "async_result", "job_id": "j"}}),
+            json!({"kian": {"type": "control", "action": "confirm"}, "extra": 1}),
+            json!({"kian": "string"}),
+        ] {
+            assert!(!ConfirmIntent::is_control_envelope(&plain), "{plain}");
+        }
+        assert!(!ConfirmIntent::is_reserved_shape(
+            &json!({"kian": {"type": "async_result"}})
+        ));
+        assert!(!ConfirmIntent::is_reserved_shape(&json!("plain")));
+    }
+
+    /// The idempotency key is stable per (session, call).
+    #[test]
+    fn confirm_idempotency_key_is_deterministic() {
+        let sid = SessionId(Uuid::nil());
+        assert_eq!(
+            ConfirmIntent::idempotency_key(&sid, "call-1"),
+            format!("confirm:{}:call-1", sid.0)
         );
     }
 }

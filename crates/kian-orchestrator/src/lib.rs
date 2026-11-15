@@ -26,8 +26,8 @@ pub mod snapshots;
 pub mod wake;
 
 pub use engine::{
-    Clock, DrainCtx, DrainHandle, Engine, EngineConfig, EngineError, InterruptOutcome, ManualClock,
-    SystemClock, WakeOutcome,
+    Clock, ConfirmOutcome, DrainCtx, DrainHandle, Engine, EngineConfig, EngineError,
+    InterruptOutcome, ManualClock, PendingConfirmation, SystemClock, WakeOutcome,
 };
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use read::{EventTail, VersionedProjection};

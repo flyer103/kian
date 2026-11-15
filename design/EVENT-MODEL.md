@@ -84,14 +84,14 @@ constraint 3: cache-byte stability).
 |---|---|---|
 | Created | `session/created` | `None → idle` |
 | Claimed | `drain/claimed` | `idle/recoverable → running` (running stays running) |
-| Ended | `session/ended{reason}` | `running → completed/cancelled` (terminal) for `completed`/`cancelled`; `running → idle` (resumable) for `interrupted`/`failed` |
+| Ended | `session/ended{reason}` | `running → completed/cancelled` (terminal) for `completed`/`cancelled`; `running → idle` (resumable) for `interrupted`/`failed`/`awaiting_input` |
 | State-preserving | `input/admitted` (Input trigger), `thread/started` (Thread trigger) | preserves `idle`/`running`/`recoverable` |
 | DrainActivity | all other kinds | legal only while `running` (or `archived` where the table allows) |
 
 State is **read only from the projection** (`project(events)`), never from a column or cached
 field. `recoverable` and `archived` are liveness/ops overlays, not event-sourced transitions.
 
-## 3. Kind catalog (22, additions-only)
+## 3. Kind catalog (23, additions-only)
 
 Payload schemas below are the **frozen** shape at schema v0 unless marked additive. "Additive"
 keys are optional, omitted when unset, and leave legacy event bytes byte-identical. Emitters name
@@ -106,8 +106,8 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
 | `step/request` | — | DrainActivity | `{"slot":<str>,"provider":<str>,"model":<str>,"iteration":<u64>,"body":<exact request bytes>}` | loop / provider persist hook | **A2**: persisted before the request flies; replay is byte-identical. |
 | `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...],"reasoning_content"?:<str>}}` | loop | The sent bytes are the truth; never rewritten. `reasoning_content` is the provider's thinking-mode reasoning, part of context (replayed on the wire); absent for non-thinking providers and legacy events ([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). |
-| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). |
-| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]` | loop / exec | Redaction provenance never carries secret values. |
+| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny"\|"ask","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). `ask` never invokes either: the call stays pending until a `control/confirm` answers it and the drain ends `awaiting_input` (ADR-033, [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md)). |
+| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]`, `"confirmation":{"call_id","decision":"approve"\|"reject","requested_by":<str\|null>,"answered_at_ms":<u64>,"expired"?:true}` | loop / exec | Redaction provenance never carries secret values. `confirmation` records which human decision produced the result (§4.2); omitted on ordinary results. |
 | `compact` | c | DrainActivity | `{"from_seq":<u64>,"to_seq":<u64>,"summary":{"role":<str>,"content":<json>}}` | recovery reactor | The only deliberate prefix-invalidation point; ranges pairwise-disjoint, `a < b <= seq`. |
 | `slot/binding` | — | DrainActivity | `{"slot":<str>,"spec":{"provider","model","fallback":[...]}}` | loop at first use | Slot → provider/model fixed for the session's lifetime (ADR-006). |
 | `slot/fallback` | — | DrainActivity | `{"slot":<str>,"from":{"provider","model"},"to":{"provider","model"}}` | provider turn | One fallback-chain switch, persisted before the fallback call. |
@@ -119,6 +119,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `channel/delivered` | — | DrainActivity | `{"channel":<str>,"target":<json>,"policy":<str>,"words"?<u64>,"truncated":<bool>}`; additive: `"attempt"`,`"first_attempt_ms"`,`"detail"` (present and `true` only on a details-request full delivery) | superagent/channel | Honest delivery receipt; no receipt means no delivery. |
 | `input/spilled` | — | DrainActivity | `{"event_id":<str>,"channel":<str>,"topic":<str\|null>,"raw":<verbatim channel payload>}` | orchestrator (consumption) | Non-context sibling of the Inline `input/admitted`; recall reads the raw from here. |
 | `control/interrupt` | — | DrainActivity | `{"action":"interrupt","reason":<str\|null>,"requested_by":<str\|null>,"requested_at_ms":<u64>,"target_epoch":<u64\|null>,"stale"?:true}` | orchestrator (consumption) | Durable interrupt intent audit (ADR-014). Never a message, never context. |
+| `control/confirm` | — | DrainActivity | `{"action":"confirm","call_id":<str>,"decision":"approve"\|"reject","reason":<str\|null>,"requested_by":<str\|null>,"answered_at_ms":<u64>,"expired"?:true}` | orchestrator (consumption) | Durable confirmation intent audit (ADR-033): the human's answer to a pending `ask`, recorded before any effect. The loop applies it in call order and appends the answered `tool/result`. Never a message, never context. |
 | `memory/note` | — | DrainActivity | `{"subject":<non-empty str>,"text":<str>,"status":"candidate"\|"verified"\|"stale","derived_from":[{"session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>}],"verified_by"?:{"method":"transcript"\|"evidence_gate"\|"human","ref":<str>}}`; additive: `"redactions":[{"kind","name","count"}]` | memory dreamer drain | A note is a claim (MEMORY-MODEL): non-context, append-only, latest-per-subject; the fold lives in `kian-core::memory`. `text` passes the secret redactor before append (§4.2). |
 | `session/ended` | — | Ended | envelope-level `"reason":"completed"\|"cancelled"\|"interrupted"\|"failed"`; `bytes: {}` | orchestrator | **One atomic append** with the transition (`NoHalfTerminated`). `interrupted`/`failed` return the session to `idle` (resumable); only `completed`/`cancelled` are terminal. |
 
@@ -144,7 +145,9 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
 - `turn/end`: `"usage"` (provider `usage` object verbatim; no normalization/pricing in core),
   `"error": {"class","action"}`.
 - `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (ADR-015).
-- `tool/result`: `"redactions": [{"kind","name","count"}]`.
+- `tool/result`: `"redactions": [{"kind","name","count"}]`; `"confirmation":
+  {"call_id","decision","requested_by","answered_at_ms","expired"?}` — the applied human
+  decision, present only on a result produced by answering an `ask` (ADR-033).
 - `input/admitted`: `"dream": {"source_session","start_seq","end_seq","scope"}` — the trusted
   dream marker, set only by the ops plane's `memory_dream` admit (the public wire refuses the
   reserved envelope key sets with `-32602`, so client content cannot land one; kian-94, review
@@ -207,7 +210,7 @@ only `compact` may invalidate the prefix (`unexpected_prefix_change` must stay z
 
 ### 4.5 Reserved inbox-row envelopes (pre-event, NOT event kinds)
 
-The control plane writes only inbox rows; the drain consumes them into events. Five reserved
+The control plane writes only inbox rows; the drain consumes them into events. Six reserved
 row-payload shapes must not be confused with event payloads:
 
 | Row payload | Consumed into |
@@ -217,6 +220,7 @@ row-payload shapes must not be confused with event payloads:
 | `{"content":X,"dream":M}` | ONE `input/admitted` `{role:"user",content:X,dream:M}` (M is the trusted dream marker, §4.2) |
 | `{"content":X,"memory":M}` | ONE `input/admitted` `{role:"system",content:X,synthetic:true,memory:M}` (M is the creation-time injection marker, §4.2) |
 | `{"kian":{"type":"control","action":"interrupt",...}}` | `control/interrupt` (never a message) |
+| `{"kian":{"type":"control","action":"confirm",...}}` | `control/confirm` (never a message; the loop applies the decision) |
 
 Every envelope is an **exact key-set match**: a row payload with extra keys is ordinary content —
 the `synthetic` arm consumes only at exactly `{synthetic,content}` (kian-96, review N-1), so a public
@@ -235,8 +239,8 @@ strippable marker.
    changes are constraint-3 events.
 5. **Fencing**: epoch + expectedSeq CAS; lease is liveness only.
 6. **Atomic end**: one append for `session/ended` + transition.
-7. **Honesty**: `interrupted` ≠ `failed`; an empty model response is a soft failure; a stop passes
-   the evidence gate; a denied tool call is an honest error result.
+7. **Honesty**: `interrupted` ≠ `failed` ≠ `awaiting_input`; an empty model response is a soft
+   failure; a stop passes the evidence gate; a denied tool call is an honest error result.
 8. **Narrow waist**: core kinds carry no provider/channel/harness-specific schema.
 
 ## 6. Change protocol (required for every event change)
@@ -271,6 +275,12 @@ A new kind is the **last** resort (config → plugin → seam → core primitive
 
 - **Additive payload key**: allowed; omit when unset; legacy event bytes parse/replay byte-identical;
   no context change; document in §3/§4 and test the legacy shape.
+- **Widened envelope value**: a closed value set of an envelope-level enum (`session/ended.reason`)
+  may widen exactly like an additive payload value — the *shape* is unchanged, legacy streams
+  replay unchanged, and the new value carries a golden plus a frozen regression for every existing
+  value (`awaiting_input` is the precedent, ADR-033). Recorded cost: a binary older than the
+  widening cannot read a stream containing the new value — the same forward-compatibility posture
+  the additions-only kind discipline already accepts.
 - **Envelope change**: a new schema `version` plus an adjacent migration; committed generations are
   never rewritten; old streams must reopen cleanly.
 - **Rename/removal/reformat**: forbidden. Express the new semantics with a new additive kind/payload
