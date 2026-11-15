@@ -96,6 +96,12 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
+    /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
+    /// plan pin P5): present iff the superagent bundle configures
+    /// `superagent.multiagent` limits. [`Server::serve`] spawns its
+    /// ticker — interrupt-only, outside every drain; absent arms no
+    /// timer at all (M8: feature-off changes nothing).
+    child_timeout_maintenance: Option<ChildTimeoutMaintenance>,
     /// Whether observability reads on this server (/metrics aggregates)
     /// may consult fresh materialized views (READ-MODEL §6; a disabled
     /// gate hides every view).
@@ -126,6 +132,16 @@ struct SnapshotMaintenance {
 struct ViewsMaintenance {
     interval_ms: u64,
     holder: String,
+}
+
+/// The serve-side child inactivity plan (MULTIAGENT-MODEL §5.3, pin
+/// P5): the walk root (the resident Router session) and the delegation
+/// bounds. [`Server::serve`] derives the tick period from
+/// `child_timeout_ms` (a quarter of the bound, clamped to [1s, 60s]).
+#[derive(Clone)]
+struct ChildTimeoutMaintenance {
+    root: kian_core::model::SessionId,
+    limits: kian_superagent::MultiagentLimits,
 }
 
 /// Reads one lark credential from the environment, treating blank as
@@ -305,6 +321,23 @@ impl Server {
             Some(pool) => EventStore::from_pg_pool(pool.clone()).await?,
             None => EventStore::open(&config.storage.sqlite).await?,
         };
+        // (R15-C5): the delegation bounds — converted once,
+        // fail-closed (a zero bound or a wrong key spelling refuses
+        // to boot), consumed by the bundle assembly below and the
+        // child inactivity plan arming after the Server builds.
+        // `None` (absent block) = the delegation feature is off (M8).
+        let multiagent_limits = superagent_cfg
+            .map(|sa| sa.multiagent_config())
+            .transpose()
+            .map_err(ServeError::Config)?
+            .flatten();
+        // the child inactivity plan (C6's ticker): filled inside the
+        // superagent arm once the re-arm walk resolves the live
+        // Router session (pin P5's walk root).
+        let mut child_timeout_plan: Option<(
+            kian_core::model::SessionId,
+            kian_superagent::MultiagentLimits,
+        )> = None;
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
             // Super-agent mode: the bundle plugin builds all three
             // loops (router/worker/plain); `react-loop` is absent.
@@ -356,6 +389,12 @@ impl Server {
                 ))
             })?;
             let router_session = router_re_arm.live;
+            // (R15-C5): with the block present, the child inactivity
+            // plan carries the live Router session (pin P5's walk
+            // root) and the converted bounds.
+            if let Some(limits) = multiagent_limits {
+                child_timeout_plan = Some((router_session, limits));
+            }
             if router_re_arm.is_succession() {
                 tracing::info!(
                     pinned = %sa.router.session_id,
@@ -584,6 +623,9 @@ impl Server {
                 policy_notify_live: sa.policy.notify_live,
                 mandate: sa.mandate_policy(),
                 outbox: sa.outbox_config().map_err(ServeError::Config)?,
+                // (R15-C5): the delegation bounds; `None` (absent
+                // block) = feature off, byte-identical (M8, §8.1).
+                multiagent: multiagent_limits,
                 // /ADR-013: the thread-key derivations (validated at
                 // parse; converted again here — one shape, both gates).
                 thread_keys: sa
@@ -780,10 +822,25 @@ impl Server {
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
             views_maintenance,
+            // The child inactivity plan is armed only when the
+            // superagent bundle configures `superagent.multiagent`
+            // limits — C5's config surface feeds this via
+            // [`Server::with_child_timeout`]; while that surface is
+            // absent the ticker stays unarmed (M8: feature-off arms
+            // nothing).
+            child_timeout_maintenance: None,
             views_enabled,
             event_stream: Arc::new(EventStreamMetrics::new()),
             event_stream_enabled,
             _plugin_disposer: plugin_disposer,
+        };
+        // (R15-C5): arm the child inactivity ticker with the same
+        // converted limits the bundle carries — the plan's root is
+        // the live Router session (pin P5's walk root). An absent
+        // block arms nothing (M8).
+        let server = match child_timeout_plan {
+            Some((root, limits)) => server.with_child_timeout(root, limits),
+            None => server,
         };
 
         // -- 5. NoLostWork: inbox rebuild BEFORE anything else runs ------
@@ -866,6 +923,22 @@ impl Server {
             }
             None => router,
         }
+    }
+
+    /// Arms the child inactivity maintenance ticker (MULTIAGENT-MODEL
+    /// §5.3:587, pin P5): `root` is the walk root (the resident Router
+    /// session), `limits` the delegation bounds. Called by assembly
+    /// when the superagent bundle configures `superagent.multiagent`;
+    /// while that config surface is absent the ticker stays unarmed —
+    /// feature-off arms no timer, admits no interrupt, reads no stream
+    /// (M8).
+    pub fn with_child_timeout(
+        mut self,
+        root: kian_core::model::SessionId,
+        limits: kian_superagent::MultiagentLimits,
+    ) -> Self {
+        self.child_timeout_maintenance = Some(ChildTimeoutMaintenance { root, limits });
+        self
     }
 
     /// Serves on `addr` until the process is stopped.
@@ -969,6 +1042,37 @@ impl Server {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     crate::views::views_maintenance_tick(&store, &plan.holder, now_ms).await;
+                }
+            });
+        }
+        // Child inactivity bound (MULTIAGENT-MODEL §5.3:587, plan pin
+        // P5): a ticker whose each beat walks the root→child stream
+        // graph and interrupts children silent past `child_timeout_ms`
+        // — strictly outside every drain, interrupt-only (no promotion,
+        // no spawn; the tick's only write is the idempotent
+        // control/interrupt inbox row, so a kill -9 mid-tick leaves
+        // nothing partial). Armed only when the superagent bundle
+        // configures multiagent limits; absent arms nothing (M8).
+        if let Some(plan) = self.child_timeout_maintenance.clone() {
+            let engine = Arc::clone(&self.engine);
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                // Detection granularity: a quarter of the bound,
+                // clamped to [1s, 60s] — the bound is inactivity, not a
+                // deadline, so a coarse beat only delays detection.
+                let period = (plan.limits.child_timeout_ms / 4).clamp(1_000, 60_000);
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(period));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let port = crate::superagent::StoreWorkerStreams::new(store);
+                let port: &dyn kian_superagent::WorkerStreamsPort = port.as_ref();
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    crate::multiagent_tick::tick(&*engine, port, plan.root, &plan.limits, now_ms)
+                        .await;
                 }
             });
         }
@@ -1868,4 +1972,86 @@ async fn metrics_handler(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The feature-off gate for the child inactivity ticker (R15 C6,
+    //! acceptance `feature_off_arms_no_ticker`): no `superagent:` (or
+    //! no multiagent limits) ⇒ no ticker plan ⇒ [`Server::serve`]'s
+    //! spawn block is inside `if let Some(plan)` and arms no timer
+    //! task, admits no interrupt, and reads no stream — the plan field
+    //! is the ticker's only arm input.
+
+    use uuid::Uuid;
+
+    use super::Server;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kian-server-c6-{tag}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal bootable config (the archive_e2e base shape — the
+    /// provider points at a dead localhost port; no server is ever
+    /// contacted) with `extra` appended. No `superagent:` section.
+    fn write_config(
+        dir: &std::path::Path,
+        sqlite: &std::path::Path,
+        extra: &str,
+    ) -> std::path::PathBuf {
+        let yaml = format!(
+            r#"listen: "127.0.0.1:0"
+storage:
+  sqlite: "{}"
+agent:
+  id: arch-agent
+  model_slots:
+    main:
+      provider: mock
+      model: mock-model
+providers:
+  mock:
+    base_url: "http://127.0.0.1:9"
+    api_key_env: KIAN_E2E_UNUSED
+drain:
+  max_iterations: 8
+recovery:
+  budget:
+    tokens: 16
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+{extra}
+"#,
+            sqlite.display(),
+        );
+        let path = dir.join("kian.yaml");
+        std::fs::write(&path, yaml).expect("write kian.yaml");
+        path
+    }
+
+    #[tokio::test]
+    async fn feature_off_arms_no_ticker() {
+        // The provider's api_key_env must merely exist (assembly is
+        // fail-closed on missing credentials; no server is contacted).
+        // SAFETY: process-global test env, set before any parallel
+        // assertion can read it; archive_e2e uses the same variable.
+        unsafe { std::env::set_var("KIAN_E2E_UNUSED", "unused") };
+        let dir = temp_dir("feature-off");
+        let sqlite = dir.join("kian.sqlite");
+        let config = write_config(&dir, &sqlite, "");
+        let (server, _cfg) = Server::from_config_file(&config).await.expect("assemble");
+
+        // No superagent (and no multiagent limits): the plan is the
+        // spawn block's only input, so serve() arms no timer task —
+        // no interrupt, no store access.
+        assert!(
+            server.child_timeout_maintenance.is_none(),
+            "feature-off must arm no child inactivity ticker"
+        );
+    }
 }

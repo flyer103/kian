@@ -63,6 +63,7 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod memory;
+pub mod multiagent_tick;
 pub mod ops;
 pub mod plugins;
 pub mod server;

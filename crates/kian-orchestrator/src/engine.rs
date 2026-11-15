@@ -1076,6 +1076,25 @@ where
     /// startup scan). Idle/terminal sessions keep the exact
     /// `NotDraining`/`UnknownSession` behavior and admit nothing.
     pub async fn interrupt(&self, session: SessionId) -> Result<InterruptOutcome, EngineError> {
+        self.interrupt_as(session, &self.config.holder).await
+    }
+
+    /// [`Engine::interrupt`] with a caller-supplied requester identity:
+    /// the durable intent row — and the `control/interrupt` audit event
+    /// it consumes into — carries `requested_by` verbatim instead of
+    /// `EngineConfig::holder`. The child inactivity bound names
+    /// `requested_by:"child_timeout"` so the join derives `stalled`
+    /// (MULTIAGENT-MODEL §5.3:587, §6.2 row 6). Idempotency is
+    /// structural and unchanged: the row keys on
+    /// `interrupt:<session>:<target_epoch>` (EVENT-MODEL:203-205), so a
+    /// second request for the same episode commits nothing. Additive:
+    /// [`Engine::interrupt`] keeps its signature and behavior (the
+    /// holder remains its requester).
+    pub async fn interrupt_as(
+        &self,
+        session: SessionId,
+        requested_by: &str,
+    ) -> Result<InterruptOutcome, EngineError> {
         let has_handle = if let Some(handle) = self.drains.get(&session) {
             handle.interrupt();
             true
@@ -1099,7 +1118,8 @@ where
             Err(e) => return Err(e.into()),
         };
         let Some(events) = events else {
-            self.admit_interrupt_row(session, None).await?;
+            self.admit_interrupt_row(session, None, requested_by)
+                .await?;
             return Ok(InterruptOutcome::Requested);
         };
         if events.is_empty() {
@@ -1111,7 +1131,8 @@ where
             // is a finishing drain — the flag path settles it; no row.
             let terminal = project(&events).map(|s| s.is_terminal()).unwrap_or(false);
             if !terminal {
-                self.admit_interrupt_row(session, target_epoch).await?;
+                self.admit_interrupt_row(session, target_epoch, requested_by)
+                    .await?;
             }
             return Ok(InterruptOutcome::Requested);
         }
@@ -1122,22 +1143,26 @@ where
         // Running/Recoverable with no local drain: the owner is another
         // replica or dead. The durable row IS the interrupt — the
         // consuming drain (takeover or remote owner) honors it.
-        self.admit_interrupt_row(session, target_epoch).await?;
+        self.admit_interrupt_row(session, target_epoch, requested_by)
+            .await?;
         Ok(InterruptOutcome::Requested)
     }
 
     /// Admits the durable interrupt-intent row. Durable-first
     /// (constraint 6): the row exists before this returns; no wake —
-    /// see [`Engine::interrupt`].
+    /// see [`Engine::interrupt`]. `requested_by` names the requester
+    /// written into the row (the holder for [`Engine::interrupt`], the
+    /// caller's identity for [`Engine::interrupt_as`]).
     async fn admit_interrupt_row(
         &self,
         session: SessionId,
         target_epoch: Option<u64>,
+        requested_by: &str,
     ) -> Result<(), EngineError> {
         let now = self.clock.now_ms();
         let intent = kian_core::control::InterruptIntent {
             reason: None,
-            requested_by: Some(self.config.holder.clone()),
+            requested_by: Some(requested_by.to_string()),
             requested_at_ms: now,
             target_epoch,
         };
