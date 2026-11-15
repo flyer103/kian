@@ -7,10 +7,24 @@
   [ADR-028](decisions/ADR-028-harness-hook-plugins.md) and a pointer in [DESIGN §6.4](DESIGN.md)
   are the whole change.
 - **Date**: 2026-11-15
+- **Revisions**: v2.1 (R13-04d, 2026-11-15) closes the ten MUST-FIX items of the codex FINAL
+  cross-review — F1 (fallback dispatch), F2 (dsh request/response ports), F3 (out-of-grant speech),
+  F4 (multi-target preflight), F5 (`required` + frame overflow), F6 (`binding.harness`/`profile`),
+  F7 (digest coverage), F8 (handshake identity + admission epoch), F9 (settle-gate append failure),
+  F10 (dependency claim + SHA-256). The closure table is
+  [ADR-028 Appendix B](decisions/ADR-028-harness-hook-plugins.md). No item widened the contract;
+  three narrowed it (F2, F5, F6) and the narrowings are recorded as limitations (§16.17, §16.18);
+  **v2.2 (R13-04e, 2026-11-15)** closes the two blockers of the codex CONFIRMATION review, both as
+  corrections rather than narrowings — F11 (the §8.1 worked example contradicted its own narrowing
+  rule: `scopes.server` now lists both instances, `worker.node-zulu` narrows through `use:`, and §8.2
+  pins `use:` as a **filter** over `scopes.server`) and F12 (one multi-target `admit/pre` **evaluation**
+  fans out to one `hook` frame **per target session**, each carrying that target's `session`/`worker`/
+  `seq` and post-narrowing `deadline_ms`; the first deny refuses the event for every target). The
+  closure table is [ADR-028 Appendix C](decisions/ADR-028-harness-hook-plugins.md).
 - **Replaces**: the untracked v1 draft (three-tier: compile-time / stdio sidecar / wasm-gated). v2
   specifies **two** tiers; wasm is non-normative future work (owner D8, §16).
 - **Owns**: hook-plugin semantics — the tier model (compile-time / stdio sidecar), the hook-point
-  vocabulary and its payload catalog, the six interception ports and where they attach, the
+  vocabulary and its payload catalog, the seven interception port methods and where they attach, the
   capability-grant set, the sidecar manifest and its validation, the stdio ABI, per-worker plugin-set
   resolution and its digest, session consistency, the failure/quarantine policy, the security and
   trust model, and the migration/rollback rules for all of the above.
@@ -66,26 +80,42 @@ and no new metrics key** (owner D3). Every model-visible hook effect rides an ex
   A view is **read-only by construction**: it carries no `&mut` handle to anything the drain owns.
 - **Verdict** — the answer to a veto-capable hook: `Allow` (the default when no handler denies) or
   `Deny { reason }`. There is no `ask` and no `allow`-as-opinion (§3.3).
-- **Class default** — the outcome a hook falls back to when its handlers are unavailable, too slow,
-  malformed or quarantined. The class default is *normative per hook class* and asymmetric by
-  design (§11.1, R9), and for `admit/pre` also **per origin**, because only the channel-borne port is
+- **Class default** — the outcome a hook falls back to when its handlers are **unreachable**: dead
+  (crash), too slow (`deadline_ms` expiry), quarantined, busy (§7.5), or unable to answer at all. The
+  class default is *normative per hook class* and asymmetric by design (§11.1, R9), and for
+  `admit/pre` also **per origin**, because only the channel-borne port is
   veto-capable in v1: an unavailable handler refuses a channel-borne input and merely loses the
-  observation of an API-borne one (§3.4.3, §4.1).
-- **Dispatch** — one bus consultation of one hook for one event, carrying a fresh `dispatch` id, the
-  session id, the worker id, the session `seq` and the fencing `epoch` at consultation time (§7.3).
+  observation of an API-borne one (§3.4.3, §4.1). It is **only** an unreachability default: a reply
+  that is out of grant, illegal for the hook's mode, or otherwise malformed is *speech*, and speech is
+  discarded rather than resolved to a default (§5.2, §11.1).
+- **Veto-capable subscriber** — the only entity a fail-closed class default can belong to: a handler
+  whose grants include the `veto:*` grant for the hook being dispatched (§5.1). An observe-only
+  subscriber that is unreachable costs its observation and nothing else; it can neither answer a
+  denial nor cause one by silence or by speech (§5.2, §11.1).
+- **Dispatch** — one bus consultation of one hook for one event **and one target session**, carrying a
+  fresh `dispatch` id, that target's session id and worker id, that target's `seq` and — for
+  **drain-phase hooks only** — the fencing `epoch` at consultation time (§7.3). For a drain-phase hook
+  the target is the one drain's session. `admit/pre` is the one hook whose evaluation spans several
+  sessions: it is **one evaluation** of the event but **one dispatch per (subscriber, target
+  session)**, so a plugin in three targets' sets receives three frames, with three ids, for one
+  inbound event (§4.1, §7.2). `admit/pre` and `admit/post` run before a drain exists, so their frames
+  carry no `epoch` at all (§7.2, §7.3).
 - **Session scope vs server scope** — a tier-0 registration made at process start is **server
   scope** (applies to every session); a registration made through the session-scoped registration
   API (§5.3) applies only to sessions whose effective set contains it (R13).
-- **Effective set** — the set of plugin instances resolved for one session from the four config
-  scopes (§8), each with its narrowed limits. It is a **pure function of (config, durable worker
-  binding)** and nothing else (R1).
+- **Effective set** — the set of plugin instances resolved for one session from the two config
+  scopes of v1 (§8), each with its narrowed limits. It is a **pure function of (config snapshot,
+  the durable `exec_worker` binding)** and nothing else (R1). No harness- or profile-scoped set
+  exists in v1: neither value is durable, so neither may be a resolution input (§8.2, §16.18).
 - **Set digest** — the `sha256:` string defined in §8.5, computed over the canonical form of the
   effective set. It is the identity of "which plugins were in force", recorded at session open in one
   audit line and recomputed at claim **by the same process** (§9.2). It is not a durable baseline: its
   coverage is one process lifetime, and a cross-process restart cannot compare against it (§9.1).
-- **Quarantine (process)** — a plugin instance that crossed its failure window is skipped at the bus
-  for the **remaining lifetime of the server process**; its hooks take their class defaults. No live
-  reload exists (§6.5, R12).
+- **Quarantine (process)** — a plugin instance that crossed its failure window (or committed an
+  immediate-trigger violation) is skipped at the bus for the **remaining lifetime of the server
+  process**; each of its subscriptions takes that hook's class default per §11.1 (fail-closed where it
+  held `veto:tool`/`veto:admit`, abstain where it held `veto:settle`, a lost observation where it held
+  only `observe:*`). No live reload exists (§6.5, §12).
 - **Quarantine (session)** — the sidecar hooks of one session whose recomputed set digest no longer
   matches the digest recorded at open are skipped **for that session's lifetime**; their hooks take
   class defaults (§9, R1). The two quarantines are different counters with different lifetimes and
@@ -107,15 +137,35 @@ and no new metrics key** (owner D3). Every model-visible hook effect rides an ex
 | **0 — compile-time** | in-process crate | `kian_plugins![...]` at build | **yes — the only tier** (`ctx.provide::<dyn ModelProvider>` …) | yes | **no** (v1; see §3.3) | trusted — same binary, same authority as built-ins |
 | **1 — sidecar** | child process, stdio JSON-lines | `sidecars:` config at boot | **no, ever** (D2) | yes (observe / veto only) | **no, ever** (D2 as amended) | **operator-trusted extension** — the same trust class as an `endpoints:` address (R10, §10.1) |
 
-Tier 1 adds **zero dependency-tree entries**. Spawning a process and speaking JSON lines needs only
+Tier 1 adds **no new third-party crate**. Spawning a process and speaking JSON lines needs only
 `std` (`process`, `io`, `thread`, `time`) plus crates `kian-plugin` already links (`serde`,
-`serde_json`, `futures`, `tracing`). [`crates/kian-plugin/tests/static_only.rs`](../crates/kian-plugin/tests/static_only.rs)
+`serde_json`, `futures`, `tracing`, `thiserror`), **plus one workspace dependency edge that is already
+pinned and already compiled**: `sha2 = "0.10"` (`Cargo.toml`, `[workspace.dependencies]`) for the
+manifest, payload and set digests of §8.5 — the same crate `kian-store` (view-set digest),
+`kian-orchestrator` (snapshot digest), `kian-llm`, `kian-superagent` and `kian-cli` already use. The
+implementation round therefore adds exactly one line to
+[`crates/kian-plugin/Cargo.toml`](../crates/kian-plugin/Cargo.toml) (`sha2.workspace = true`) and the
+lockfile does not grow a package. [`crates/kian-plugin/tests/static_only.rs`](../crates/kian-plugin/tests/static_only.rs)
 — which greps `cargo tree -p kian-plugin -e normal` for `libloading`, `dylib` and `wasm*` — keeps
-passing **untouched** (§13.2). There is no tier 2 (§16, owner D8).
+passing **untouched**: `sha2` matches none of its refusal patterns (§13.2). There is no tier 2 (§16,
+owner D8).
+
+The other two edges the ports require, stated exactly (§4, ADR-028 D11):
+
+- **`kian-loop` grows a dependency edge on `kian-plugin`.** Its port sites must *construct* the views
+  (`RequestMeta`, `ToolCallView`, `ResponseView`, `RecoveryView`) and name the port trait, so an
+  injected trait object alone would not remove the edge; the edge is acyclic (`kian-plugin` depends on
+  `kian-core` only) and the **instance** is still injected at construction — the loop never builds a
+  bus (§4).
+- **`kian-dsh` gains no edge.** It stays `kian-core`-only, which
+  [`crates/kian-dsh/tests/narrow_waist.rs`](../crates/kian-dsh/tests/narrow_waist.rs) asserts, so its
+  one v1 port (`tool/post`) is a **crate-local trait over a locally declared view struct** whose
+  serialization is byte-identical to §3.2.6, adapted to the real bus in assembly — the same shape as
+  the crate-local `DshCtx` port ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)).
 
 ```mermaid
 graph TB
-  E["drain engine + WorkerLoopDriver<br/>(existing control flow)"] --> P["six port methods<br/>admit / request / response / tool_pre / recover / settle"]
+  E["drain engine + WorkerLoopDriver<br/>(existing control flow)"] --> P["seven port methods<br/>admit / request / response / tool_pre / tool_post / recover / settle"]
   P --> B["HookBus<br/>kian-plugin::hooks"]
   B --> T0["tier-0 handlers<br/>Ctx registry, topological order"]
   B --> R1["sidecar runner A<br/>dedicated std thread"]
@@ -138,10 +188,10 @@ arrow above is a function call inside the server process except the two stdio pi
 
 | Hook id | Fires at the port | Mode | Sidecar (v1) | Answer | Payload | Durable trace |
 |---|---|---|---|---|---|---|
-| `admit/pre` | §4.1, before an external input's inbox row is written | `flow` | yes (channel-borne: observe + veto; API-borne: observe only) | `next` = no opinion; `stop` = **veto** → the row is never written (requires `veto:admit`) | §3.2.1 | one audit line; no row ever existed |
-| `admit/post` | §4.1, after the row is durable | `emit` | yes | `ack` only | §3.2.2 | the inbox row itself |
-| `turn/request` | §4.2, request **already** assembled and persisted | `emit` | yes | `ack` only | §3.2.3 | the `step/request` event (already appended) |
-| `turn/response` | §4.3, provider turn settled | `emit` | yes | `ack` only | §3.2.4 | existing step / `turn/end` events |
+| `admit/pre` | §4.1, **once per inbound event** (one evaluation; one `hook` frame per target session, §4.1), after Inline/Spill shaping and before **any** target's inbox row is written | `flow` | yes (channel-borne: observe + veto; API-borne: observe only) | `next` = no opinion; `stop` = **veto** → no row is written for **any** target (requires `veto:admit`) | §3.2.1 | one audit line; no row ever existed |
+| `admit/post` | §4.1, after a target's row is durable | `emit` | yes | `ack` only | §3.2.2 | the inbox row itself |
+| `turn/request` | §4.2, the **primary** request already assembled and persisted, before the first provider call | `emit` | yes — ReAct only in v1 (no dsh site, §16.17) | `ack` only | §3.2.3 | the `step/request` event (already appended) |
+| `turn/response` | §4.3, provider turn settled | `emit` | yes — ReAct only in v1 (no dsh site, §16.17) | `ack` only | §3.2.4 | existing step / `turn/end` events |
 | `tool/pre` | §4.4, after the declarative permission gate, before `tool/call` is appended | `bail` | yes where kian mediates the call (never under dsh, §3.5) | `null` = abstain; `deny` = **veto** (requires `veto:tool`) | §3.2.5 | attempted `tool/call` + honest-error `tool/result` |
 | `tool/post` | §4.4, after `tool/result` is appended | `emit` | yes | `ack` only | §3.2.6 | the `tool/result` event |
 | `recover/decided` | §4.5, a class → action resolution happens | `emit` | yes | `ack` only — **no veto, ever** | §3.2.7 | existing `turn/end.error` audit |
@@ -168,12 +218,17 @@ before it is serialized for a sidecar, and redaction is defense-in-depth, never 
 (§10.4). Tier-0 handlers receive the **unredacted** view (same process, same authority).
 
 Ordering metadata present on **every** dispatch (added by the frame, §7.3): `dispatch`, `session`,
-`worker`, `seq`, `epoch`, `deadline_ms`. It is not repeated in the per-hook tables below.
+`worker`, `seq`, `deadline_ms` — plus `epoch` for **drain-phase hooks only** (`turn/*`, `tool/*`,
+`recover/decided`, `settle/pre`). The identity triple names the frame's **target**: for a drain-phase
+hook that is the one drain's session, and for `admit/pre` it is the one target session that frame
+belongs to (§4.1, §7.2, §7.3). `admit/pre` and `admit/post` are consulted **before a drain exists**,
+so their frames carry no `epoch` key at all — not `null`, not `0`, absent (§7.2). It is not repeated
+in the per-hook tables below.
 
 #### 3.2.1 `admit/pre`
 
 ```json
-{"origin":"channel","target":{"session":"<uuid>","router":false},
+{"origin":"channel","targets":[{"session":"<uuid>","router":false},{"session":"<uuid>","router":true}],
  "input":{"role":"user","synthetic":false,"content_preview":"<≤4096 bytes>","content_bytes":91234,
           "content_sha256":"<hex>","content_truncated":true,"inline_view":false},
  "channel":{"name":"lark","event_id":"<opaque>","topic":"<str|null>"},
@@ -183,8 +238,7 @@ Ordering metadata present on **every** dispatch (added by the frame, §7.3): `di
 | Field | Type | Meaning |
 |---|---|---|
 | `origin` | `"channel" \| "api"` | which ingress produced the input; decides veto availability (§3.4) |
-| `target.session` | uuid string | the session the row would be written to |
-| `target.router` | bool | whether this admission targets the Router session |
+| `targets` | array of `{session, router}` | **the complete fan-out set this one evaluation covers** — exactly the target list the write loop will visit, sorted by session id (§4.1). It is never "the first target" or a representative: one evaluation is one verdict for the whole event |
 | `input.role` | string | the role the row would carry |
 | `input.synthetic` | bool | true for steer-injected content (strippable, EVENT-MODEL A6) |
 | `input.content_preview` | string ≤4096 | redacted, possibly truncated head of the content |
@@ -194,6 +248,16 @@ Ordering metadata present on **every** dispatch (added by the frame, §7.3): `di
 | `input.inline_view` | bool | true when the row will carry only an Inline view (over-cap spill) |
 | `channel` | object \| null | channel provenance for `origin:"channel"`, `null` for `"api"` |
 | `admission` | object | the shaping that will be applied (`policy`, `spilled`) |
+
+**One event, one evaluation, every target — and one frame per target.** The view above is produced
+**once** per inbound event, from the post-shaping payload, and covers the whole fan-out set in
+`targets`. There is no per-target *evaluation*: the subscriber fan-out is computed for the event as a
+whole and there is exactly one verdict, so two targets can never end up with different verdicts for
+the same event, and a `stop` is a veto of *the event* — no row is written for any target (§4.1). The
+*frames*, however, are per target: each `(subscriber, target session)` pair gets its own `hook` frame
+carrying that target's `session`/`worker`/`seq` and that target's post-narrowing `deadline_ms`,
+because effective sets, limits and quarantine are per session (§1, §8.2). §4.1 states the full
+fan-out rule.
 
 #### 3.2.2 `admit/post`
 
@@ -220,8 +284,20 @@ Ordering metadata present on **every** dispatch (added by the frame, §7.3): `di
 | `message_count` | u64 | number of messages in the body |
 | `tool_names` | string[] | sorted tool names in the body's `tools` array |
 | `tool_schema_sha256` | hex | digest of the serialized tool array (the prefix-cache identity) |
-| `timing` | `"pre_send" \| "post_attempt"` | `pre_send` = observed **before** the provider is called (ReAct); `post_attempt` = observed after the harness observed the request it did not mediate (dsh) |
+| `timing` | `"pre_send"` | the only value **ever dispatched in v1**: the observation happens before the provider is called (ReAct). `post_attempt` is **reserved** for the deferred dsh site (§16.17) and no v1 dispatch carries it |
 | `step_request_seq` | u64 | seq of the `step/request` this view describes |
+
+**Fires once per provider turn, on the persisted primary body — never per fallback attempt.**
+`provider_turn` builds one body, appends it as `step/request` (A2), and only then calls the provider
+([`react.rs:537`](../crates/kian-loop/src/react.rs) is that append; the port fires immediately after
+it returns). The slot's fallback chain is traversed **inside** `complete_turn`, which rebuilds the
+body per fallback target "so the model name always matches the provider actually called"
+([`react.rs:557`](../crates/kian-loop/src/react.rs)) — those rebuilt bodies are provider-layer
+internals, they are not persisted as a second `step/request`, and they are **not** re-dispatched to
+`turn/request`. A fallback switch is already its own durable audit (`slot/fallback`, EVENT-MODEL), so
+nothing is lost: a plugin sees exactly the bytes the session persisted as its primary request, exactly
+once, before the first provider call. A reader must not read this hook as "one dispatch per HTTP
+attempt" — it is one dispatch per provider *turn*.
 
 **The request body itself is never shipped** in v1. A body-bearing observe right would be a new
 grant with its own privacy and size argument; it is deferred (§16.7).
@@ -336,10 +412,15 @@ not name them.
 | `emit` | `ack{note?}` | none (subscription's `observe:<class>`) |
 | `flow` (`admit/pre`) | `flow:"next"` / `flow:"stop", reason` | `next`: none · `stop`: `veto:admit` |
 | `bail` (`tool/pre`, `settle/pre`) | `bail:null` (abstain) / `bail:{decision:"deny", reason}` | `null`: none · `deny`: `veto:tool` / `veto:settle` |
-| any | `err{code,message}` | none — an error is always a class default (§11) |
+| any | `err{code,message}` | none — and the codes split by §11.1: `deadline` and `crashed` are **self-declared unreachability** (→ the class default), while `malformed`, `unauthorized`, `unsupported_hook` and `protocol_violation` are **speech defects** (the reply is discarded and the outcome is as if the handler were absent) |
 
-Three refusals that are normative:
+Four refusals that are normative:
 
+- **No denial by proxy.** A subscriber that lacks the `veto:*` grant for a hook can never change that
+  hook's outcome — not by answering out of grant (discarded, §5.2), and not by silence (its
+  unreachability costs its observation, never the action, §11.1). Otherwise an `observe:tool`-only
+  audit plugin could deny a tool call by sending an unauthorized `deny` or by hanging, which is
+  privilege escalation through a failure mode.
 - **No `ask`/escalate.** A drain has no attached human; an "ask" verdict has no addressee and cannot
   be modelled without a new wire surface (D3). Industry systems that expose `ask` pair it with an
   interactive approver — kian does not have one inside a drain.
@@ -362,20 +443,23 @@ but the view does not.
 
 | Hook | ReAct (`kian-loop`) | dsh bridge (`kian-dsh`) | Note |
 |---|---|---|---|
-| `admit/pre`, `admit/post` | yes | yes | harness-independent: they fire before the drain, at the admission boundary (§4.1) |
-| `turn/request` | yes — `timing:"pre_send"` | yes — `timing:"post_attempt"` | dsh observes the child's request **after** the child sent it (the bridge maps an `assistant/attempt` frame); it cannot precede or alter it |
-| `turn/response` | yes | yes | dsh maps the child's assistant record |
+| `admit/pre`, `admit/post` | yes | yes | harness-independent: they fire before the drain, at the admission boundary in the bundle (§4.1) |
+| `turn/request` | yes — `timing:"pre_send"` | **no** | the bridge's only request-shaped site is a mapping function that runs *before* the driver appends `step/request` (`mapping.rs:411` → append at `driver.rs:650`), and three of §3.2.3's normative fields (`message_count`, `tool_names`, `tool_schema_sha256`) cannot be derived from an opaque child body. Removed from v1 rather than approximated (§16.17) |
+| `turn/response` | yes | **no** | there is no settled-response site that can fill §3.2.4: the bridge never sees provider `usage` or an `error{class,action}` pair (no classifier on that path, §16.5). `mapping.rs:447` is `map_tool_call`, not a settled assistant turn. Removed from v1 (§16.17) |
 | `tool/pre` | yes (`surface:"react"`) | **no** | every tool under dsh runs inside the child; no pre-effect port exists (§4.4, §16.4) |
-| `tool/post` | yes | yes — retrospective | dsh maps the child's tool record after the effect; observe-only, honest about sequencing |
+| `tool/post` | yes | yes — retrospective, via a crate-local port at the driver's post-append site (§3.5) | dsh maps the child's tool record after the effect; observe-only, honest about sequencing |
 | `recover/decided` | yes | **no in v1** | the only registered resolution site today is the ReAct path (§4.5); a bridge-side site is a future owner task (§16.5) |
 | `settle/pre` | yes — worker lineage only (§3.4.4) | yes — worker lineage only (§3.4.4) | the gate sits in `WorkerLoopDriver`, which wraps the inner `LoopDriver` **of a worker-lineage session**; which sessions those are is a separate dimension with its own matrix (§3.4.4) |
 | `harness/<name>/*` | registry | registry | no harness declares a point in v1 (§3.6) |
 
 **Goal 3 restated honestly**: a plugin that subscribes only to points marked `yes` in **both**
-columns is one binary serving both harnesses with one vocabulary and one payload shape. It is not a
-promise that both harnesses offer the same *powers* — `tool/pre` and `recover/decided` are
-ReAct-only in v1, and a manifest that requires them should set `required = false` (or accept a
-boot refusal under a dsh-only deployment).
+columns is one binary serving both harnesses with one vocabulary and one payload shape. In v1 that
+shared subset is `admit/pre`, `admit/post` and `tool/post`; everything else is ReAct-only
+(`turn/request`, `turn/response`, `tool/pre`, `recover/decided`) or harness-independent-but-narrow
+(`settle/pre`). This is not a promise that both harnesses offer the same *powers*, and a manifest that
+requires a ReAct-only point should set `required = false` (or accept a boot refusal under a dsh-only
+deployment). The two removed rows are removed because the bridge cannot populate their normative
+payloads — an honest narrowing, not a missing port (§16.17).
 
 #### 3.4.2 End reasons (`settle/pre`)
 
@@ -398,19 +482,26 @@ a wedged or absent plugin cannot delay them (R2).
 
 | Producer | Passes `admit/pre`? | Veto in v1 |
 |---|---|---|
-| channel-borne input (subscriptions fan-out) | yes | **yes**, but audit-only — no inbox row is written, so the drop is real; in v1 **no** receipt, NACK or error code reaches the sender, because no inbound refusal wire exists (§4.1, §16.15) |
-| API-borne input (`submit`) | yes — observe only | **no** — there is no wire to express a refusal; extending the receipt or adding an error code is deferred (§16.3). On a dead/quarantined/timed-out/malformed sidecar the observation lapses and the input is admitted unchanged, with one audit line (§11.1: the default is per origin) |
+| channel-borne input (subscriptions fan-out) | yes — **one evaluation per inbound event**, covering the whole target set (§4.1) | **yes**, but audit-only — no inbox row is written for any target, so the drop is real; in v1 **no** receipt, NACK or error code reaches the sender, because no inbound refusal wire exists (§4.1, §16.15) |
+| API-borne input (`submit`) | yes — observe only | **no** — there is no wire to express a refusal; extending the receipt or adding an error code is deferred (§16.3). On a dead/quarantined/timed-out sidecar the observation lapses and the input is admitted unchanged, with one audit line (§11.1: the default is per origin, and an observe-only subscriber has no verdict to lose) |
 | queue/steer (`queue`, `steer`) | yes — observe only | no — same reason (deferral §16.3) and the same failure default: the observation lapses, the input proceeds |
 | internal producers: watchdog timers, async completion, memory injection, subscription pings | **no** | n/a — recorded limitation (§17): these write rows through paths that do not pass the admission port |
 
 **The failure default follows the veto column, not the hook name.** Only the channel row is
 veto-capable, so only the channel row can fail closed; on the observe-only rows a handler that is
-dead, quarantined, over `deadline_ms` or malformed costs the plugin its observation and nothing else
-— the input is admitted unchanged with one audit line. This is R9's class default applied to a
-*verdict-capable port*, not an exception to it: R3 makes the channel port the only veto-capable one
-in v1, and refusing an API-borne input would discard a caller's work with a caller-visible outcome
-the contract has no wire to express — exactly the silent skip §1's honest-error rule refuses (§4.1,
-§11.1 state the same rule).
+dead, quarantined or over `deadline_ms` costs its observation and nothing else — the input is admitted
+unchanged with one audit line. This is R9's class default applied to a *verdict-capable port*, not an
+exception to it: R3 makes the channel port the only veto-capable one in v1, and refusing an API-borne
+input would discard a caller's work with a caller-visible outcome the contract has no wire to express
+— exactly the silent skip §1's honest-error rule refuses (§4.1, §11.1 state the same rule).
+
+The same rule generalises, and §11.1 states it as the governing one: **a class default belongs to a
+`veto:*` grant, not to a hook id and not to a subscription.** Concretely, an observe-only subscriber
+to a veto-capable hook — say an audit plugin that subscribes `tool/pre` with `observe:tool` only —
+takes the *observation* default (lapse + audit) whether it is unreachable **or** answers out of grant;
+it can never produce a denial by failing or by speaking. Only a subscriber holding the matching
+`veto:*` grant can take the fail-closed default, and its unreachability is a fail-closed denial
+(§5.2, §11.1).
 
 This matrix is the honest scope of "admit" in v1. A plugin that must gate *all* work, including
 internal completions, cannot be written against v1's admission point — no fallback, no half truth.
@@ -456,7 +547,22 @@ already-emitted tool records, and `kian-dsh` has no tool provider and no invocat
 - `tool/pre` never fires under dsh — not even as a no-op — so a plugin's audit line never claims a
   pre-effect check that did not happen;
 - `tool/post` fires retrospectively with the honest `timing` implication: the effect already
-  occurred.
+  occurred, and it reaches the bus through a **crate-local** dsh port (a trait over a locally declared
+  struct whose serialization is byte-identical to §3.2.6) injected at driver construction — `kian-dsh`
+  names no `kian-plugin` type and keeps its `kian-core`-only waist (§2,
+  [`narrow_waist.rs`](../crates/kian-dsh/tests/narrow_waist.rs)). Its call site is the driver's
+  post-append branch, after `ctx.append(EventKind::ToolResult, …)` returns `Ok`
+  ([`driver.rs:650`](../crates/kian-dsh/src/driver.rs)). `name` is taken from the step's mapped
+  `tool/call` for that `call_id`; if the child emitted a result with no matching mapped call, the
+  observation is **skipped with one audit line** rather than dispatched with a fabricated name.
+
+`turn/request` and `turn/response` do **not** fire under dsh in v1 (§3.4.1, §16.17). The reason is not
+timing but payload honesty: `mapping.rs:411` is a pure mapping function that runs before the driver's
+append, so a post-persist site exists — but §3.2.3 requires `message_count`, `tool_names` and
+`tool_schema_sha256` from the body, which kian cannot read out of an opaque child request; and no
+bridge site can fill §3.2.4's `usage` and `error{class,action}`, because the bridge has no provider
+usage and no classifier (§16.5). A row that cannot populate its own normative fields is removed, not
+approximated.
 
 Tools executed by kian itself while a dsh session runs are not a v1 case (there are none: the
 bridge's tool surface is the child's).
@@ -481,22 +587,26 @@ bridge's tool surface is the child's).
 
 ## 4. The interception ports
 
-This contract specifies **six port methods at nine call sites**. R4 named four; v2 adds two observe
+This contract specifies **seven port methods at nine call sites**. R4 named four; v2 adds two observe
 points that require no new edge (the admission port sits where shaping already happens, and
-`recover/decided` observes a consultation the loop already performs), and two of the six methods attach
-at a second site under dsh (`request`, `response`). Each is a call the existing control flow already
-makes, wrapped so the bus is consulted once. All are **called from** the owning crate and
-**implemented in** `kian-plugin::hooks`; no harness type crosses the boundary. Shapes are defined in
-`crates/kian-plugin/src/hooks/ports.rs` (implementation round) over plain serde structs:
+`recover/decided` observes a consultation the loop already performs) plus `tool_post`, which §3.1 and
+§4.4 already required but which the v2 sketch omitted from the trait. One method (`tool_post`)
+attaches at a second site under dsh through a crate-local port (§3.5); the two dsh `turn/*` sites the
+earlier draft claimed were **removed** because no bridge site can populate their normative payloads
+(§16.17). Each row below is a call the existing control flow already makes, wrapped so the bus is
+consulted once. All are **called from** the owning crate and **implemented in** `kian-plugin::hooks`;
+no harness type crosses the boundary. Shapes are defined in `crates/kian-plugin/src/hooks/ports.rs`
+(implementation round) over plain serde structs:
 
 ```rust
 pub trait HookPorts: Send + Sync {
     fn admit(&self, draft: &AdmitDraft) -> BoxFuture<'static, AdmitVerdict>;
     fn request(&self, meta: &RequestMeta) -> BoxFuture<'static, ()>;      // observe
-    fn tool_pre(&self, call: &ToolCallView) -> BoxFuture<'static, ToolVerdict>;
     fn response(&self, view: &ResponseView) -> BoxFuture<'static, ()>;    // observe
-    fn settle(&self, view: &SettleView, ctx: &SettleCtl) -> BoxFuture<'static, SettleVerdict>;
+    fn tool_pre(&self, call: &ToolCallView) -> BoxFuture<'static, ToolVerdict>;
+    fn tool_post(&self, view: &ToolPostView) -> BoxFuture<'static, ()>;   // observe
     fn recover(&self, view: &RecoveryView) -> BoxFuture<'static, ()>;     // observe
+    fn settle(&self, view: &SettleView, ctx: &SettleCtl) -> BoxFuture<'static, SettleVerdict>;
 }
 ```
 
@@ -504,40 +614,121 @@ pub trait HookPorts: Send + Sync {
 one synthetic input, and read the veto count — implemented by the caller (kian-superagent) with the
 `InboxWriter` it already holds. No port receives a `DrainCtx`, no port may append an event.
 
+`kian-orchestrator`, `kian-core` and `kian-store` gain **nothing** (D4): no trait, no trait object, no
+field. Today `kian-superagent` and `kian-cli` depend on `kian-plugin`; after the implementation round
+`kian-loop` does too (row (b)) — that is the only new edge, it is acyclic, and `kian-dsh` stays
+`kian-core`-only (§2). No crate gains a dependency on `kian-loop`.
+
 | Port | Owner crate (caller) | Trait method | Today's call site | Dependency edge required |
 |---|---|---|---|---|
 | (a) admission | `kian-superagent` | `admit` | [`subscriptions.rs:477`](../crates/kian-superagent/src/subscriptions.rs) (`shape_channel_input_marked`, before any inbox row) | already present (`kian-superagent → kian-plugin`) |
 | (a′) admission, API-borne | `kian-cli` | `admit` (observe) | [`server.rs:1183`](../crates/kian-cli/src/server.rs) (`ControlPlane::submit` → `engine.admit`) | already present (`kian-cli → kian-plugin`) |
-| (b) request | `kian-loop` | `request` | [`react.rs:537`](../crates/kian-loop/src/react.rs) (the assembled body, before `append(StepRequest)`) | **new**: `kian-loop → kian-plugin` (allowed, R4) |
-| (b′) request, dsh | `kian-dsh` | `request` | [`mapping.rs:411`](../crates/kian-dsh/src/mapping.rs) (`map_attempt`: the child's request frame) | **none** — the port is injected at driver construction; `kian-dsh` stays core-only |
+| (b) request | `kian-loop` | `request` | [`react.rs:537`](../crates/kian-loop/src/react.rs) (the assembled primary body, immediately after `append(StepRequest)`) | **new**: `kian-loop → kian-plugin` (allowed, R4), with the bus instance injected at construction |
 | (c) response | `kian-loop` | `response` | [`react.rs:520`](../crates/kian-loop/src/react.rs) (`provider_turn`, the settled `TurnResult`) | as (b) |
-| (c′) response, dsh | `kian-dsh` | `response` | [`mapping.rs:447`](../crates/kian-dsh/src/mapping.rs) (mapped assistant / tool record) | as (b′) |
 | (d) tool pre | `kian-loop` | `tool_pre` | [`react.rs:676`](../crates/kian-loop/src/react.rs) — **after** `evaluate_permission`, **before** `append(ToolCall)` / `invoke` at `:710` | as (b) |
+| (d′) tool post, ReAct | `kian-loop` | `tool_post` | [`react.rs:710`](../crates/kian-loop/src/react.rs) — after the `tool/result` append, executed and declared-denial arms alike (§4.4) | as (b) |
+| (d″) tool post, dsh | `kian-dsh` | `tool_post` (crate-local trait) | [`driver.rs:650`](../crates/kian-dsh/src/driver.rs) — the post-append branch after `ctx.append(EventKind::ToolResult, …)` returns `Ok` | **none**: the port is injected at driver construction and its view struct is declared crate-locally (§2, §3.5); `narrow_waist.rs` keeps `kian-dsh` on `kian-core` only |
 | (e) settle | `kian-superagent` | `settle` | [`worker.rs:1276`](../crates/kian-superagent/src/worker.rs) — the `Phase` machine that yields `LoopOutcome` | already present |
 | (f) recovery | `kian-loop` | `recover` | [`react.rs:787`](../crates/kian-loop/src/react.rs) (`recovery_audit` → `consult_policy`) | as (b) |
 
 `kian-orchestrator`, `kian-core` and `kian-store` gain **nothing** (D4): no trait, no trait object,
-no field. Only `kian-superagent` and `kian-cli` depend on `kian-plugin` today, and that stays true.
+no field. Today `kian-superagent` and `kian-cli` depend on `kian-plugin`; after the implementation round
+`kian-loop` does too (row (b)) — that is the only new edge, it is acyclic, and `kian-dsh` stays
+`kian-core`-only (§2). No crate gains a dependency on `kian-loop`.
 
 ### 4.1 Admission port (`admit/pre`, `admit/post`)
 
-Called in the subscriptions fan-out **after** the shaping decision and **before** the first inbox
-write, i.e. at the one point where the bundle knows the payload, the targets and the provenance
+Called in the subscriptions fan-out **after** the shaping decision and **before the first inbox
+write**, i.e. at the one point where the bundle knows the payload, the targets and the provenance
 (`subscriptions.rs:477`). It wraps the existing shaping: the view carries the payload the write
-*would* produce. Verdicts:
+*would* produce.
+
+**Normative ordering for a multi-target admission** (the fan-out admits to several sessions — a rule
+route, a passthrough fallback, the Router):
+
+1. **Inline/Spill shaping** runs first and once (`shape_channel_input_marked`, `:477`), producing the
+   single payload every target would receive.
+2. **`admit/pre` is evaluated once**, at that same channel-policy boundary, over the complete target
+   set (§3.2.1 `targets`). It is **one evaluation, not one per target**, so there is exactly one
+   verdict per inbound event and no ordering ambiguity between targets — but that one evaluation fans
+   out to **one `hook` frame per target session** (next paragraph), because the subscriber set, the
+   deadline and the frame identity are per target.
+3. **The inbox writes** then happen exactly as they do today — the per-target loop at
+   [`subscriptions.rs:499`](../crates/kian-superagent/src/subscriptions.rs), each `inbox.admit` +
+   `inbox.wake`.
+4. **`admit/post`** fires per target that was actually admitted, with that target's receipt — it is
+   single-target by construction, so its frame identity is already that target's.
+
+**Per-target frames (one evaluation, N frames).** Effective sets, narrowed limits and quarantine are
+per **session** (§1, §8.2), so a sidecar in one target's set need not be in another's. The dispatch is
+therefore a grid over (target session × that target's resolved subscribers):
+
+- **One `hook` frame per (subscriber, target) pair**, carrying that **target's** identity in the frame
+  fields — `session` = the target session's uuid, `worker` = that target's durable `exec_worker` (the
+  empty string when it has no binding), `seq` = *that* target's last observed seq (`0` when that
+  session has no event yet) — each with **its own `id`**, and with no `epoch` (§7.2, §7.3).
+  `payload.targets` still lists the complete set, so the plugin sees the whole fan-out it is answering
+  for while the frame identity says which target this frame belongs to. No frame ever mixes identities
+  (one session's `worker` with another's `seq`).
+- **Replies correlate per target**, by `id` (§7.4), so a per-target `stop` is unambiguous. A plugin may
+  answer `next` at one target and `stop` at another; a `stop` on **any** frame refuses the admission
+  **for all targets** — no inbox row is written anywhere — because the event is one decision (§3.2.1).
+- **The first deny in the grid wins.** `[order]` ranks subscribers exactly as in §8.3, per-sidecar
+  serialization (§7.5) means one plugin's own frames arrive one at a time, and the order inside a
+  plugin is `[order]` then target session id. Once a valid `stop` has arrived, frames for that event
+  that have not been sent are not sent, and replies already in flight are discarded as moot (`skipped`
+  in the audit line, §8.3). Nothing is retried (§7.5).
+- **A target whose resolution has no subscriber for the hook gets no frame — that is not an error.** Its
+  effective set simply contains no sidecar subscribing `admit/pre` (or no sidecar at all); the event's
+  single verdict still covers it, and that verdict is `next` unless some other target's frame vetoed.
+  An absent frame is never read as a verdict, and never as an abstention that could be upgraded.
+- **Each frame carries its own `deadline_ms`**, from that target's resolved, post-narrowing limits
+  (§8.2) — one target's worker-specific deadline never applies to another target's frame.
+- **The class default is per subscribed target; the outcome is still global.** An unreachable (crashed,
+  overdue, busy or quarantined) sidecar holding `veto:admit` in *its own* target's set refuses the
+  event for *every* target (§11.1); an `observe:*`-only subscriber's unreachability costs only that
+  observation. Where no subscriber exists for any target, no default fires.
+- **The write loop starts only after the grid resolves** — after the last reply, or at the first deny —
+  so no inbox row can exist for an event that a later frame vetoes. Item 3's per-target
+  `inbox.admit` / `inbox.wake` loop and its partial-write semantics are untouched, because a `next`
+  verdict means no hook was able to withhold a write.
+
+A plugin in three targets' sets therefore sees three frames for one inbound event, and a target with no
+subscribing sidecar sees none. The count is bounded by (targets × subscribers for that hook). Admission
+therefore waits longer than a single dispatch: each sidecar serializes its own frames — the same
+serialization that keeps a multi-target event off the busy-fail-fast path (§7.5) — so the worst case is
+`max over sidecars (the sum of that sidecar's per-frame deadline_ms)` — each frame's own
+post-narrowing deadline (§4.1), summed over the frames that sidecar serializes — with sidecars running
+concurrently: the cost of
+one evaluation over N durable sessions, paid at the admission boundary and never inside a drain.
+
+Hooks never write: the port returns a verdict, and the bundle's own loop does every write. **A partial
+write is unchanged fan-out behavior, not a hook behavior** — today the loop logs a failed target with
+`warn!`, keeps the rows already written, remembers the first error and returns it after the loop
+([`subscriptions.rs:520-541`](../crates/kian-superagent/src/subscriptions.rs)), leaving the failed
+subscriber to the adapter's idempotent retry (`:568-575`). v1 adds nothing to that: a veto is the only
+way a hook prevents a write, and a veto prevents *all* of them; a storage failure after a `next`
+verdict behaves exactly as it does without any plugin, so the semantics cannot be mistaken for a
+plugin-induced drop. (The alternative — two-phase "write none if any fails" — would be a new
+transactional guarantee over N sessions and is not part of this contract.)
+
+Then, per verdict:
 
 - `next` → proceed unchanged;
 - **the class default is per origin** (§11.1), because only one origin has a verdict to lose. At
-  `origin:"channel"` the port is veto-capable, so deadline/crash/quarantine/malformed fail **closed**
-  — the admission is refused, no row is written, one audit line, sender not told (next bullet). At
-  `origin:"api"` (`submit`, `queue`, `steer`) the port is **observe-only** in v1 (§3.4.3, R3: an
-  API-borne veto has no wire, §16.3), so there is no verdict to fail closed: the observation lapses,
-  the input is **admitted unchanged**, and one audit line records the lapse. An `admit/pre` failure
-  never drops an API-borne input in v1 — dropping it would be the silent skip §1 forbids, with no
-  wire left to say so;
-- `stop` → **no inbox row is written for any target**; one audit line names the plugin, hook id,
-  reason and the channel. **The sender is not told in v1**, and this section does not pretend
-  otherwise: there is no inbound refusal wire to carry a refusal. The channel seam has inbound
+  `origin:"channel"` the port is veto-capable, so deadline/crash/quarantine **of a `veto:admit`-holding
+  subscriber** fail **closed** — the admission is refused for every target, no row is written, one
+  audit line, sender not told (next bullet). An observe-only subscriber's unreachability, and any
+  out-of-grant or malformed **reply**, never refuses anything (§5.2, §11.1). At `origin:"api"`
+  (`submit`, `queue`, `steer`) the port is **observe-only** in v1 (§3.4.3, R3: an API-borne veto has no
+  wire, §16.3), so there is no verdict to fail closed: the observation lapses, the input is **admitted
+  unchanged**, and one audit line records the lapse. An `admit/pre` failure never drops an API-borne
+  input in v1 — dropping it would be the silent skip §1 forbids, with no wire left to say so;
+- `stop` → **no inbox row is written for any target**; one audit line names the denying plugin, the
+  hook id, the reason, the channel, the denying target (the line's `session`) and the size of the set it
+  refused (`targets=<n>` from the view, §3.2.1, §10.6). **The sender is not told in v1**, and this
+  section does not pretend otherwise: there is no inbound refusal
+  wire to carry a refusal. The channel seam has inbound
   `subscribe()` and outbound `send()` only ([`seams.rs:344-351`](../crates/kian-core/src/seams.rs)); the
   fan-out's failure path is a `warn!` that leaves the drop to the adapter's idempotent retry
   ([`subscriptions.rs:520-534`](../crates/kian-superagent/src/subscriptions.rs)), and
@@ -558,15 +749,27 @@ inbox and reads projections; nothing about admission moves into the engine.
 
 Observe-only. It fires **after** the request body is persisted as `step/request` and **before** the
 provider call, so the observed request is by construction the one recorded (persist-what-you-send:
-the hook cannot see bytes that were not persisted, because there are none). Under dsh the port is
-injected into the driver and fires after the child's attempt frame is mapped, with
-`timing:"post_attempt"` — the bridge cannot offer more, and the payload says so rather than implying
-a pre-send check.
+the hook cannot see bytes that were not persisted, because there are none).
+
+**Exactly once per provider turn, and only for the persisted primary body** (§3.2.3): the body that
+was appended at `react.rs:537`. The fallback chain is traversed inside `complete_turn`, which rebuilds
+the body per fallback target (`react.rs:557`); those rebuilt bodies are provider-layer internals, are
+not persisted as a second `step/request`, and are **not** dispatched here. So the hook's semantics are
+one dispatch per turn — never one per HTTP attempt — and a `slot/fallback` switch is observed through
+its own durable event, not through this port.
+
+There is **no dsh site** in v1 (§16.17): the bridge's post-persist append exists
+(`driver.rs:650`), but the view's normative fields cannot be filled from an opaque child body, so the
+row was removed rather than approximated. `timing` therefore only ever carries `"pre_send"` in v1.
 
 ### 4.3 Response port (`turn/response`)
 
 Observe-only, fires once per settled provider turn with the assembled `ResponseView` — never per
-chunk (§3.1 closure 1).
+chunk (§3.1 closure 1). There is **no dsh site** in v1 (§16.17): a settled bridge step can fill
+`outcome`, but not `usage` (the child's step never carries a provider usage object into the mapping)
+and not `error{class,action}` (the bridge runs no classifier, §16.5), and `mapping.rs:447` is
+`map_tool_call` rather than a settled assistant turn. Two of the view's normative fields with no
+source is a phantom port, so the row is removed.
 
 ### 4.4 Tool port (`tool/pre`, `tool/post`)
 
@@ -580,8 +783,10 @@ Ordering is normative and matches the existing permission discipline
 4. a denied call **never** reaches `self.tools.invoke` (`react.rs:710`); the model receives an
    honest-error `tool/result` whose content is
    `{"error":"denied by plugin <name>: <reason>","policy":"hook"}`;
-5. `tool/post` fires after the `tool/result` append (executed calls; also for the honest-error
-   result of a declared-permission denial, so the surface is uniform).
+5. `tool/post` fires after the `tool/result` append (rows (d′) and (d″) in §4) — executed calls, and
+   also the honest-error result of a declared-permission denial, so the surface is uniform. Under dsh
+   the same hook fires retrospectively from the bridge's post-append branch (§3.5), which is the only
+   form the bridge can honestly offer.
 
 **The one required EVENT-MODEL amendment** (§16.1): `tool/call.permission.policy` is the closed set
 `"default" | "configured"` today (EVENT-MODEL §4.2). A hook denial adds the value `"hook"` and uses
@@ -636,10 +841,36 @@ orchestrator would violate D4. v2 resolves this at the seam the outcome actually
    Nothing renders a `system`-role marker: step 3 admits through that same steer wrapper, whose
    consumption plan hard-codes `role:"user"` (`engine.rs:1595-1602`, asserted at `:2612-2616`), and
    the budget predicate below never reads `role` at all.
+
+   **When that append itself fails, the veto is not swallowed** — the failure path is normative and
+   three steps long:
+
+   1. **The gate does not settle.** The append error is returned to `WorkerLoopDriver` and propagates
+      through the **existing append-failure route** of the drain — the same mapping every append
+      failure in that path gets (the outcome becomes the driver's honest failure, never
+      `LoopOutcome::Settled`, so the engine writes `failed`/`interrupted` and the session stays
+      **recoverable and resumable**). No `completed` is written, so the plugin's veto did have its
+      effect; what failed is persistence, and the failure is reported as a failure.
+   2. **The veto budget is consumed anyway.** The marker row does not exist, so the stream-derived
+      count cannot see it — the gate therefore counts this veto in an **in-process counter** for the
+      drain lifetime and treats `vetoes_used = max(rows_naming_this_plugin, this_gate's_attempts)`.
+      Without that, a persistently failing inbox could be re-spent on every re-arm; with it, one veto
+      is one veto, and the session's next drain re-derives the count from the stream as usual (§4.6
+      budget rule). The bound stays bounded: the drain ends, and nothing loops.
+   3. **One audit line** (`hook-veto-admit-failed`, §10.6), plus whatever the drain's own failure path
+      emits: `hook=settle/pre plugin=<name> vetoes=<n> error=<append error> reason=<reason>`. The line
+      says *applied and unpersistable* — it never claims the model saw a steer message that no row
+      carries.
+
+   The alternative — treating a failed append as "veto not applied, proceed to settle" — is exactly
+   the swallow this rule forbids: the model would never wake, the session would end `completed`, and no
+   durable artifact would record that a gate said no.
 4. On `deny` with budget exhausted it propagates the outcome **without** admitting anything and emits
    one audit line: `hook=settle/pre plugin=<name> override=true vetoes=3 reason=<reason>`.
-5. On `timeout`/`crash`/`malformed`/`quarantined` it **fails open** (§11.1, R9): settlement proceeds,
-   one audit line records the abstain.
+5. On `timeout`/`crash`/`quarantined` — **unreachability** — it **fails open** (§11.1, R9):
+   settlement proceeds, one audit line records the abstain. A reply that is out of grant or illegal
+   for the mode is a **speech defect**: it is discarded as an opinion (§5.2), which for this hook
+   happens to land on the same outcome (settle) but is audited as a defection, not as a lapse.
 
 **Budget — per plugin, per session.** `vetoes_used` = the number of `[kian:hook-veto …]` synthetic
 inputs **naming this plugin** already in this session's stream. The marker carries `plugin=<name>`
@@ -699,17 +930,37 @@ are **reserved** — a manifest naming one is refused with `unknown_capability` 
 transform grammar cannot silently inherit today's configurations. A `veto:*` grant implies the
 matching `observe:*` and is refused without it (a handler cannot veto what it does not receive).
 
+A `veto:*` grant is therefore the **only** thing that lets a subscriber change an outcome, and it is
+the only thing a fail-closed default may belong to (§11.1). An `observe:*`-only subscriber gets its
+observations and nothing else — no denial by reply, no denial by silence, no denial by crash.
+
 ### 5.2 Enforcement is at dispatch, not only at load
 
 - Boot: every capability must be in the closed set, and every subscribed hook must be covered by its
   `observe:*` grant.
-- Dispatch: a reply variant whose grant is absent is **not** an opinion. It is refused as
-  `err:unauthorized`, treated as the hook's class default, and audited (`hook`, `plugin`, `code`).
-  A `deny` from an observe-only plugin is never silently honoured — the fail-closed direction for an
-  action hook means the *class default* (deny for `tool/pre`; for `admit/pre`, the per-origin default
-  of §11.1), which is what the plugin asked for anyway; the audit records that the grant was missing.
+- Dispatch: a reply variant whose grant is absent is **not an opinion**. It is refused as
+  `err:unauthorized`, and — this is the normative part — it is **discarded**: the outcome is exactly
+  what it would have been if that plugin had never answered at all. It is **not** resolved to the
+  hook's fail-closed class default (an earlier draft said it was, which handed an `observe:tool`-only
+  plugin the power to deny a tool call by replying `deny` out of grant — privilege escalation through
+  a reply the contract had already rejected).
+  - Only subscriber, `tool/pre`: the call proceeds on the **declarative permission gate's** decision —
+    a hook denial cannot exist without the grant, so nothing denies.
+  - Only subscriber, `admit/pre` (channel): the input is **admitted** (one audit line; no row is
+    withheld).
+  - Only subscriber, `settle/pre`: the hook abstains and the session settles.
+  - Several subscribers: the other verdicts decide exactly as if the defector were absent; the audit
+    line records that it answered out of grant.
+  - One `hook-discard` audit line always (§10.6): `hook=<id> plugin=<name> code=unauthorized
+    grant=<reply-required-grant> outcome=discarded`.
+- **Unreachability and speech are different classes and never resolve into each other** (§11.1): the
+  class default is taken only when a **veto-capable** subscriber cannot answer (deadline, crash,
+  quarantine, busy); a reply that the bus refuses is not the subscriber being unavailable — it is
+  present and speaking without authority.
 - Wrong-mode reply (an `ack` at a `bail` hook, a `flow` at an `emit` hook, a duplicate frame id) is
-  `err:malformed` and counts toward the failure window (§6.5).
+  `err:malformed` and, like the above, is a **speech defect**: the reply is discarded, the outcome is
+  as-if-absent. It also counts toward the failure window (§6.4) — health accounting and outcome
+  accounting are separate questions, and conflating them is what produced the escalation above.
 
 ### 5.3 Tier-0 registration is hook-scoped
 
@@ -739,7 +990,7 @@ name = "approval-gate"          # must equal the instance key in `sidecars.plugi
 version = "0.1.0"               # semver, reported in `hello`/`ready`
 abi = 1                         # protocol generation (accepted set grows additively)
 order = 0                       # dispatch order within a hook (i32, default 0; tiebreak: name)
-required = true                 # boot refusal policy (default true)
+required = true                 # per-instance boot policy: this plugin's refusal is fatal iff true (§6.2)
 
 [process]
 argv = ["/usr/local/lib/kian/plugins/approval-gate"]   # argv[0] absolute; no shell ever
@@ -766,10 +1017,13 @@ stderr_rate_kib_per_min = 1024  # retained stderr per minute, clamp 64..=65536
 before any unbounded buffering or JSON parse (§7.6). 256 KiB is a kian policy value, not an industry
 constant, and the server clamp is authoritative.
 
-### 6.2 Validation (fail-closed, no repair)
+### 6.2 Validation (per instance, fail-closed, no repair)
 
-Boot refuses the whole `sidecars` section, naming the offender and the code, when **any** of these
-holds — there is no partly-mounted state and no default that fixes a manifest:
+Validation is **per instance**: each `sidecars.plugins` entry is checked on its own, and a failure
+refuses **that instance**, naming the offender and the code. There is no partly-mounted instance and
+no default that repairs a manifest; and there is **no whole-section refusal** — one broken plugin does
+not unmount the others (the earlier draft's "boot refuses the whole `sidecars` section" contradicted
+its own `required = false` rule and is withdrawn). An instance is refused when **any** of these holds:
 
 | # | Rule | `plugin/refuse` code |
 |---|---|---|
@@ -784,7 +1038,7 @@ holds — there is no partly-mounted state and no default that fixes a manifest:
 | 9 | any `capabilities` entry outside §5.1 (including `mutate:*`) | `unknown_capability` |
 | 10 | a subscribed hook whose class `observe:*` grant is absent, or a `veto:*` grant with no subscribing veto-capable hook | `grant_mismatch` |
 | 11 | any `[limits]` value outside its clamp | `malformed_manifest` |
-| 12 | the plugin's `ready` frame ≠ the manifest's `hooks`/`capabilities` (set equality, order-insensitive) | `ready_mismatch` |
+| 12 | the plugin's `ready` frame restates anything other than the manifest identity: `plugin.name`, `plugin.version`, `abi` or the canonical `manifest` path differ (§7.3), or `hooks`/`capabilities` are not the manifest's set (order-insensitive) | `ready_mismatch` (a differing `abi` → `abi_mismatch`) |
 | 13 | `hello`→`ready` exceeds `startup_timeout_ms` | `spawn_failed` |
 | 14 | `cwd` present but not absolute, not an existing directory, or not readable and writable by the server's user | `malformed_manifest` |
 
@@ -794,9 +1048,23 @@ operator-supplied path (a configured `cwd` is the operator's to provision), so a
 absent there is nothing to check — the server creates a fresh empty directory under its own runtime
 directory for that instance (§10.3 step 3).
 
-`required = true` (default) makes every refusal above fatal to `kian serve`. `required = false`
-makes the plugin absent with one `plugin/refuse` audit line and startup continuing — the only
-downgrade the contract allows, and it is opt-in per instance.
+**`required` is per plugin instance, never per section.** Each `sidecars.plugins` entry carries its
+own `[plugin].required` value in its own manifest, and it decides exactly one thing: whether **that
+instance's** refusal is fatal. `required = true` → `kian serve` refuses to start (fail-closed boot: the
+operator asked for a gate and the gate cannot be there). `required = false` → that instance is absent
+with one `plugin/refuse` audit line, and every other instance mounts normally. It is not a section-wide
+switch and there is no way to declare "optional" for the whole `sidecars:` block.
+
+Two boundary cases, stated because they are where a per-instance policy can be under-specified:
+
+- a manifest that cannot be **parsed** (rule 1, or a rule-4 type error) cannot declare `required =
+  false` either — the unknown key or the wrong type is exactly what prevents reading the field. Such
+  an instance is **fatal** (fail-closed) and the audit line says
+  `code=malformed_manifest required=unknown`;
+- a `sidecars.plugins` or `sidecars.scopes` **grammar** error (an unknown scope key, a set entry that
+  is not a declared instance, a `limits:` key naming an undeclared instance) is a config error with no
+  owning instance, so it refuses boot as config validation does everywhere else in `kian-cli` — no
+  plugin-level downgrade applies to it.
 
 ### 6.3 Lifecycle
 
@@ -817,12 +1085,19 @@ ready|busy → crashed → (respawn, digest re-verified) → handshaking
 
 ### 6.4 Counters (the state machine, precisely)
 
-Two failure kinds feed one window; a *success* is any well-formed reply (`ack`, `flow`, `bail`).
+One window plus two immediate triggers. A *success* is any well-formed reply (`ack`, `flow`, `bail`).
 
 - `failures`: a deque of monotonic timestamps of **consecutive** failures — a reply clears it.
-  Failures are: `err:deadline`, a crash (process exit while a dispatch or handshake was pending),
-  `err:malformed`, `err:unauthorized` (wrong-mode/ungranted reply), `frame_overflow`,
-  `stderr_overflow`.
+  Window-counted failures are: `err:deadline`, a crash (process exit while a dispatch or handshake was
+  pending), `err:malformed`, `err:unauthorized` (wrong-mode/ungranted reply) and `stderr_overflow`
+  (the retained-rate bound, §10.5).
+- **`frame_overflow` is not window-counted.** A frame over `max_payload_kib`, in either direction, is a
+  structural violation — the child sent, or failed to accept, a line that cannot exist under this
+  contract — and it quarantines that plugin **immediately** (one strike, §6.5). The earlier draft
+  counted it both ways (window increment *and* direct quarantine), which is not a rule; the
+  distinction is now principled: a resource signal is rate-bounded, a protocol violation is not
+  tolerated at all. `protocol_violation` (unknown/duplicate/unsolicited frame id) is immediate for the
+  same reason.
 - On each failure: push `now()`, drop entries older than `restart_window_ms`, then
   `if len(failures) >= restarts_per_window → quarantine(restarts_exhausted)`.
 - `restarts` (a separate counter) counts actual respawns and is **reported**, not thresholded; the
@@ -834,10 +1109,21 @@ Two failure kinds feed one window; a *success* is any well-formed reply (`ack`, 
 
 ### 6.5 Quarantine
 
-- **Trigger**: `restarts_exhausted` (the window above), `protocol_violation` (unknown/duplicate/
-  unsolicited frame id, unbounded backlog attempt), `frame_overflow` (a line over
-  `max_payload_kib` in either direction), `stderr_overflow` (violating the stderr bounds).
-- **Effect**: the instance is skipped at the bus — every one of its hooks takes its class default —
+- **Trigger** — exactly two mechanisms, and each reason names which one produced it:
+  - **Window trip** (`restarts_exhausted`, or `stderr_overflow` when the tripping window contains only
+    stderr-rate entries — the deque is kind-tagged for exactly this report): from §6.4's counter.
+  - **Immediate, one strike** (`protocol_violation`: unknown/duplicate/unsolicited frame id or an
+    unbounded-backlog attempt; `frame_overflow`: a line over `max_payload_kib` in **either**
+    direction; `digest_mismatch`: the binary's digest no longer matches the manifest at **respawn** —
+    at boot the same condition is a `plugin/refuse` with code `digest_mismatch`, §6.2 rule 6). None of
+    these is ever window-counted, and none is ever forgiven by a later well-formed reply.
+- **Effect**: the instance is skipped at the bus. That is **two different outcomes per subscription**,
+  because a default belongs to a grant and not to a plugin (§5.1, §11.1):
+  - every hook where the instance held the matching `veto:*` grant takes that hook's class default per
+    §11.1 — **fail-closed** for `tool/pre` and channel-borne `admit/pre` (a quarantined approval gate
+    denies; it does not quietly start approving), **fail-open** for `settle/pre` (a quarantined quality
+    gate abstains, it does not hold a session hostage);
+  - every hook where it held only `observe:*` simply loses the observation, one audit line each;
   and one `plugin/quarantine` audit line records name, reason, failure count and window.
 - **Lifetime**: the remaining lifetime of the server process. There is **no live reload and no
   un-quarantine surface** in v1 (a new ops method is forbidden by D3). Operators recover by
@@ -859,17 +1145,33 @@ stderr is never parsed (§10.5).
 
 | Frame | Direction | Closed shape |
 |---|---|---|
-| `hello` | S→P | `{"v":1,"plugin":{"name","version"},"abi":1,"hooks":[…],"capabilities":[…],"deadline_default_ms":500,"max_frame_bytes":262144}` |
-| `ready` | P→S | `{"v":1,"plugin":{"name","version"},"abi":1,"hooks":[…],"capabilities":[…]}` |
-| `hook` | S→P | `{"id","hook","session","worker","seq","epoch","deadline_ms","mode","payload"}` |
+| `hello` | S→P | `{"v":1,"manifest":"<canonical absolute path>","plugin":{"name","version"},"abi":1,"hooks":[…],"capabilities":[…],"deadline_default_ms":500,"max_frame_bytes":262144}` |
+| `ready` | P→S | `{"v":1,"manifest":"<canonical absolute path>","plugin":{"name","version"},"abi":1,"hooks":[…],"capabilities":[…]}` |
+| `hook` | S→P | `{"id","hook","session","worker","seq","epoch"?,"deadline_ms","mode","payload"}` |
 | `ack` | P→S | `{"id","ack":true,"note"?:<str ≤256>}` |
 | `flow` | P→S | `{"id","flow":"next"}` or `{"id","flow":"stop","reason":<str ≤512>}` |
 | `bail` | P→S | `{"id","bail":null}` or `{"id","bail":{"decision":"deny","reason":<str ≤512>}}` |
 | `err` | both | `{"id"?:<str>,"code","message":<str ≤512>}` |
 | `bye` | S→P | `{}` |
 
+**`session`, `worker` and `seq` name the frame's target — never a representative.** For a drain-phase
+hook the target is the one drain's session, so the triple is that session's identity. For `admit/pre`
+one inbound event produces one frame **per target session** (§4.1): each frame carries that target's
+`session` uuid, that target's durable `worker` id (the empty string when it has no binding) and **that
+target's** last observed `seq` (`0` when it has no event yet). Each frame has its own `id`, so a reply
+is attributable to exactly one target; a plugin answering for several targets answers several frames.
+A frame never mixes identities, and a plugin must not infer the target set from the frames it happens
+to receive — `payload.targets` (§3.2.1) is the complete set.
+
 Closed `err.code` set: `deadline`, `malformed`, `unsupported_hook`, `unauthorized`, `crashed`,
 `protocol_violation`. A code outside the set is itself `malformed`.
+
+**`epoch` is present only on frames for drain-phase hooks.** The `epoch` field of a `hook` frame is
+the fencing epoch of the drain that consulted (§7.3), so it exists for `turn/*`, `tool/*`,
+`recover/decided` and `settle/pre`. `admit/pre` and `admit/post` are consulted **before a drain
+exists**, so their frames omit the key entirely — no `null`, no sentinel, no `0`. A plugin must not
+require `epoch` on an admission frame, and the bus never sends one; a reply is unaffected either way
+(an admission hook's legal replies carry no epoch).
 
 `reason`/`note` are **audit strings**: they are logged and (for vetoes) become model-visible text
 inside the honest error or the synthetic input. They must never contain secrets — the server
@@ -878,10 +1180,19 @@ to redact).
 
 ### 7.3 Handshake and identity
 
-1. Spawn → `hello` with the manifest's identity, `hooks`, `capabilities`, `deadline_default_ms` and
-   `max_frame_bytes`.
-2. The child answers `ready`. **Set equality** with the manifest `hooks`/`capabilities` is required;
-   any difference is `ready_mismatch` (refused, audited, and fatal iff `required`).
+**The sidecar identity is the tuple `(manifest canonical path, [plugin] name, version, abi)`.** The
+canonical path is the absolute, symlink-resolved path of the manifest file the server loaded; the
+other three are the manifest's own declared values. That tuple — not the instance key alone, and not
+whatever the child believes about itself — is the identity every later step compares.
+
+1. Spawn → `hello` carrying that identity (`manifest`, `plugin.name`, `plugin.version`, `abi`) plus
+   `hooks`, `capabilities`, `deadline_default_ms` and `max_frame_bytes`.
+2. The child answers `ready`, which **must restate the identity exactly** — `manifest`,
+   `plugin.name`, `plugin.version` and `abi` equal to the `hello` values — and restate `hooks` /
+   `capabilities` with **set equality** (order-insensitive). Any mismatch is a typed refusal:
+   `abi_mismatch` when the `abi` differs, `ready_mismatch` for a differing path, name, version or
+   hook/capability set. Refused, audited, and fatal iff `required` (§6.2). Without this rule the
+   manifest digest would identify one artifact while the running child claimed another.
 3. `abi` is the single version identity: the `abi` integer in the manifest **is** the `v`/`abi` on
    the wire — there is no second numbering and no negotiated downgrade. An `abi` outside the accepted
    set is a typed refusal at boot (never a shim, never a half-compatible mount); the accepted set
@@ -891,31 +1202,43 @@ to redact).
 5. No dispatch is sent before `ready`. A hook for a point the plugin did not declare is never sent:
    dispatch is filtered by the declared hook set at the bus.
 
-Every dispatch carries full identity — `session` (session uuid), `worker` (`exec_worker` id, or the
-empty string for a session with no worker binding), `seq` (the session's last observed seq at
-consultation), `epoch` (the fencing epoch of the drain that consulted), and a fresh `dispatch` uuid.
-No plugin may infer identity from state; a plugin that needs "the same session as last time" must
-compare the ids it was given (R11).
+Every dispatch carries full identity — `session` (the **target** session's uuid), `worker` (that
+target's `exec_worker` id, or the empty string for a session with no worker binding), `seq` (that
+target's last observed seq at consultation — `0` when it has no event yet), a fresh `dispatch` uuid,
+and `epoch` (the fencing epoch of the drain that consulted) **for drain-phase hooks only**:
+`admit/pre` and `admit/post` run before a drain exists and their frames omit `epoch` (§7.2). At
+`admit/pre` the identity is per target because the evaluation is not: one event, N frames, each
+naming its own target (§4.1, §7.2), and no frame presents one target's identity as the event's. No plugin may infer
+identity from state; a plugin that needs "the same session as last time" must compare the ids it was
+given (R11), and a plugin that needs a drain fence must read `epoch` only where the contract says one
+exists.
 
 ### 7.4 Reply legality per hook
 
 Exactly as §3.3. A reply that is legal but carries an ungranted power is `err:unauthorized`; a reply
-that is illegal for the hook's mode is `err:malformed`; a second reply for the same `id` is
-`protocol_violation`.
+that is illegal for the hook's mode is `err:malformed`. **Both are speech defects: the reply is
+discarded and the outcome is as if the handler had been absent** (§5.2 — never the fail-closed class
+default). A second reply for the same `id` is `protocol_violation`, which is immediate quarantine
+(§6.5) and, for that dispatch, also as-if-absent.
 
 ### 7.5 Ordering, idempotency, retries
 
 - **Order per sidecar**: dispatches are serialized by the single in-flight rule. No ordering promise
   exists *across* plugins for `emit` hooks, and none is needed: each handler sees an immutable view.
+  The frames of **one** `admit/pre` event aimed at one sidecar are that rule's own sequence, not a
+  collision: the bus sends the next target's frame when the previous one is answered (order:
+  `[plugin].order` then target session id, §4.1), so a two-target event never trips the busy path below.
 - **No retry.** The bus never re-sends a dispatch id. A deadline reply is final for that dispatch.
   (A drain replay after a crash re-drives the loop, which produces *new* dispatches; a payload-pure
   veto therefore yields the same verdict, which is precisely why purity is a contract obligation
   (§8.6) rather than a style note.)
 - **Busy fail-fast** (R11): while a sidecar has one dispatch in flight, any further dispatch to that
-  sidecar takes the hook's class default immediately and emits an audit line
-  `hook=<id> plugin=<name> busy=true default=<deny|abstain>`. It is never queued, so one slow plugin
-  cannot create head-of-line blocking across workers, and the class default keeps the direction
-  honest (an action hook defaults to deny, a settlement gate to abstain).
+  sidecar is resolved immediately at the bus by the same grant-keyed rule as any other
+  unreachability (§11.1) — fail-closed where it holds the matching `veto:*` grant, a lost observation
+  where it holds only `observe:*` — and emits an audit line
+  `hook=<id> plugin=<name> busy=true default=<deny|abstain|lapse>`. It is never queued, so one slow
+  plugin cannot create head-of-line blocking across workers, and the default keeps the direction
+  honest (an action hook defaults to deny, a settlement gate to abstain, an observer to silence).
 - **Graceful stop**: `bye`, close stdin (half-close), wait a bounded grace period, then kill the
   whole process group. EOF without the expected reply is a crash, never an empty allow.
 
@@ -923,7 +1246,7 @@ that is illegal for the hook's mode is `err:malformed`; a second reply for the s
 
 | Bound | Default | On violation |
 |---|---|---|
-| line bytes, either direction | `max_payload_kib` (256 KiB) | `frame_overflow` → class default + failure counter |
+| line bytes, either direction | `max_payload_kib` (256 KiB) | `frame_overflow` → the class default for that dispatch **and immediate quarantine** of that plugin (not a window increment, §6.4, §6.5) |
 | buffered bytes while scanning for `\n` | same bound, enforced **before** buffering | as above |
 | stderr line | `max_stderr_line_kib` (8 KiB) | line dropped, `stderr_overflow` counted once per drop-burst |
 | stderr retained | `stderr_rate_kib_per_min` (1024) | excess dropped, one audit line per minute, `stderr_overflow` |
@@ -935,7 +1258,7 @@ is tagged with the plugin name, is never parsed, and is never logged with payloa
 
 ## 8. Per-worker resolution
 
-### 8.1 The four scopes (closed YAML grammar)
+### 8.1 The two scopes (closed YAML grammar)
 
 ```yaml
 sidecars:
@@ -946,64 +1269,77 @@ sidecars:
       manifest: "/etc/kian/plugins/cost-audit.toml"
 
   scopes:                                    # "who gets which instance"
-    server: ["approval-gate"]                # every session
-    harness:                                 # per harness
-      react: []                              # (react is the built-in; usually empty)
-      dsh: ["cost-audit"]
-    profile:                                 # per compiled agent
-      router: []
-      worker: ["approval-gate"]
-      default: []
-      watchdog: []
-    worker:                                  # per execution-worker id — narrows only
-      node-zulu:
-        use: ["approval-gate"]
+    server: ["approval-gate", "cost-audit"]  # every session — the widest set any worker may hold
+    worker:                                  # per execution-worker id — narrows only, never adds
+      node-zulu:                             # keeps the gate, tightens it, drops the auditor
+        use: ["approval-gate"]               # ⊆ scopes.server: the only name this worker gets
         limits:
-          approval-gate: { deadline_ms: 200 }
+          approval-gate: { deadline_ms: 200 } # 500 → 200 (§7.6); widening refuses boot (§8.2)
+      node-yankee:                           # keeps both instances, tightens only the auditor
+        limits:
+          cost-audit: { max_payload_kib: 64 } # 256 → 64 KiB
 ```
+
+**v1 has exactly two scopes, and that is a narrowing with a reason.** Harness- and profile-scoped
+sets (`scopes.harness.<react|dsh>`, `scopes.profile.<router|worker|default|watchdog>`) are **not in
+the grammar**: neither value is recorded durably anywhere in the event model — `session/created`
+carries `{}` and no kind carries a harness or profile field (EVENT-MODEL §3) — so a resolution that
+depended on them could not be recomputed at claim from durable state, which is what §9.2 requires and
+what R1 asked for. The narrowing is recorded as a limitation with its reopening trigger (§16.18); D3
+forbids closing it this round with a new event or payload field.
 
 Rules that make the grammar closed:
 - `plugins` keys must equal their manifest `[plugin].name` (§6.2 rule 2).
 - A set entry anywhere must be a declared `plugins` key (a typo cannot silently do nothing).
+- `scopes` accepts exactly the keys `server` and `worker`; `harness:` or `profile:` is an unknown key
+  and refuses boot (§6.2, boundary case 2) — a silently ignored scope is exactly the failure mode this
+  closure forbids.
 - `worker.<id>` entries carry `use:` (a subset) and/or `limits:` (per-instance narrowing); an unknown
   key refuses boot (rule 1).
-- `limits:` is expressible **only** under `worker.<id>` in v1. Server-, harness- and profile-scope
-  narrowing is not in this grammar and is refused by rule 1, so there is exactly one narrowing source;
-  a value that widens a manifest limit is refused at boot (§8.2 invariant 2).
-- Every `limits:` key must name an instance declared in the union of the *earlier-layer* scopes
-  (`server ∪ harness ∪ profile`), checked at boot exactly like `use:` — a narrowing for a plugin that
-  can never be in that worker's set is a config error, not a silent no-op.
-- `worker.<id>.use` must be a subset of the union of `server ∪ all harness scopes ∪ all profile
-  scopes` at boot (§8.4) — checked statically, so a typo is a boot failure, not an invisible no-op.
+- `limits:` is expressible **only** under `worker.<id>` in v1. Server-scope narrowing is not in this
+  grammar and is refused by rule 1, so there is exactly one narrowing source; a value that widens a
+  manifest limit is refused at boot (§8.2 invariant 2).
+- Every `limits:` key must name an instance **that worker can actually receive** — in its `use:` when
+  it declares one, otherwise in `scopes.server` — checked at boot exactly like `use:`. A narrowing for
+  a plugin this worker can never hold is a config error, not a silent no-op (it would be a limit
+  nobody ever sees applied).
+- `worker.<id>.use` must be a subset of `scopes.server` at boot (§8.4) — checked statically, so a typo
+  is a boot failure, not an invisible no-op. **That subset rule is what makes `use:` a filter and not a
+  second source**: at resolution time the worker layer can only remove names from the server set
+  (§8.2), and a name it restates is *declared* at the worker layer, so `use:` narrows and never adds.
+- An **empty** `use: []` is legal and is *not* the same as omitting the key: it resolves that worker to
+  an empty set — the per-worker form of §13.3 — while an absent `use:` keeps the whole server set
+  (§8.2). An empty server list is likewise legal and means "no sidecars for anyone".
 - Deleting the whole `sidecars` section is valid and means "no sidecars" (§13.3).
 
 ### 8.2 Resolution (pure pseudocode)
 
-`resolve` is a pure function of (boot config, the session's durable binding). No wall clock, no I/O,
-no registry cache:
+`resolve` is a pure function of (boot config, the session's durable binding). No wall clock, no I/O, no
+registry cache, and **no assembly or harness knowledge** — the binding is the durable `exec_worker` id
+from [ADR-020](decisions/ADR-020-durable-worker-binding.md) and nothing else:
 
 ```
 resolve(cfg, binding) -> EffectiveSet:
-  layers = [ ("server",  cfg.scopes.server),
-             ("harness", cfg.scopes.harness[binding.harness]  ?? []),
-             ("profile", cfg.scopes.profile[binding.profile]  ?? []),
-             ("worker",  cfg.scopes.worker[binding.exec_worker]?.use ?? []) ]
+  server = cfg.scopes.server                    # every name is a declared instance (boot check)
+  w      = cfg.scopes.worker[binding.exec_worker]    # absent → no narrowing layer at all
 
-  chosen = {}                                  # name -> innermost declaring layer
-  dropped_worker_only = []
-  for (layer_name, names) in layers:           # strict order: server < harness < profile < worker
-      for name in sorted(names):               # sorted iteration, never config-file order
-          # narrowing: the worker layer may never ADD (§8.1). A name that only the worker
-          # layer names is a boot error when statically detectable, and is dropped with an
-          # audit line when it is not, because the worker layer is resolution-time data.
-          if layer_name == "worker" and name not in chosen:
-              dropped_worker_only.append(name)
-              continue
-          chosen[name] = layer_name
+  chosen  = {}                                  # name -> declaring layer ("server" | "worker")
+  dropped = []                                  # server names this worker narrowed away
+  for name in sorted(server):                   # sorted iteration, never config-file order
+      # narrowing: the worker layer may never ADD (§8.1) — `use:` is a FILTER over the server
+      # set, not a second source. `use ⊆ scopes.server` is a static boot check, so resolution
+      # can never see a name the server scope did not declare.
+      if w?.use is present and name not in w.use:
+          dropped.append(name)                  # one audit line; the name is simply absent here
+          continue
+      # A name the worker's `use:` restates is declared BY the worker layer, so it takes that
+      # scope (the layer the set digest records, §8.5). With no `use:`, the worker layer
+      # declares nothing and every name stays server-scope.
+      chosen[name] = ("worker" if w?.use is present else "server")
 
   # `limits:` exists only at the worker scope (§8.1), so there is exactly one narrowing
   # source and it applies to every name in that worker's set.
-  narrow = cfg.scopes.worker[binding.exec_worker]?.limits ?? {}
+  narrow = w?.limits ?? {}
 
   effective = []
   for name in sort_by(chosen.keys):
@@ -1013,15 +1349,54 @@ resolve(cfg, binding) -> EffectiveSet:
   return EffectiveSet(effective)
 ```
 
+A session with **no** durable worker binding (`exec_worker` absent — a legacy or local session) resolves
+the server scope only; that is a deterministic answer, not a fallback, and it is what makes the router
+session's set reproducible without inventing a profile.
+
 Three invariants the pseudocode enforces:
 
 1. **Innermost declaration wins by name** and a replaced name never appears twice — there is no
-   shadow copy and no double subscription (a name is unique in `chosen`).
+   shadow copy and no double subscription (a name is unique in `chosen`). The worker layer is a
+   **filter** over the server set, so "innermost" can only relabel or remove: `use:` never introduces
+   a name, and a name it omits is absent from that worker's set (one audit line, no error).
 2. **Narrowing only.** `min_keys` takes the smaller of two limits for every bounded key, and
    `limits:` has exactly one source (the worker scope), so a widen can only come from config and
-   refuses boot (values are static, so this is always detectable).
+   refuses boot (values are static, so this is always detectable). A `limits:` key for a name the
+   worker cannot receive is refused at boot (§8.1), so `narrow[name]` never names an instance outside
+   `effective` and no limit is silently dropped.
 3. **Determinism.** Iteration is sorted by name; there is no dependence on YAML key order, on
    plugin-spawn completion order, or on which worker registered first.
+
+**The §8.1 example, walked through `resolve`.** `plugins` declares two instances, so every set entry
+names a real instance; the boot checks pass because `node-zulu.use = ["approval-gate"]` is a subset of
+`scopes.server`, every `limits:` key names an instance that worker can receive, and both narrowed
+values (200 ms < 500 ms, 64 KiB < 256 KiB) shrink a manifest bound (§7.6, §8.2 invariant 2). `server`
+iterated sorted is `["approval-gate", "cost-audit"]`.
+
+- **`node-zulu`**: `w?.use` is present, so `approval-gate` is chosen at layer `worker` while
+  `cost-audit` is not in `use` and goes to `dropped` (one audit line, not an error), and
+  `narrow = {approval-gate: {deadline_ms: 200}}` shrinks that one bound. **Effective set:
+  `{approval-gate}` only** — scope `worker`, `deadline_ms` 200, every other limit at its manifest
+  value. The cost auditor never runs for a session bound to `node-zulu`, so its `turn/request`
+  observation is simply absent (never a lapse, because the instance is not in the set).
+- **`node-yankee`**: the same sorted `server` list is walked with `w?.use` absent, so both names are
+  chosen at layer `server` and nothing is dropped, while `narrow = {cost-audit: {max_payload_kib: 64}}`
+  shrinks that one bound. **Effective set: `{approval-gate, cost-audit}`** — both scope `server`,
+  `cost-audit` at `max_payload_kib` 64, `approval-gate` at its manifest `deadline_ms`.
+- **Any other worker id, and a session with no durable binding**: `w` is absent, so the server set is
+  returned unchanged — the deterministic answer of the paragraph below, not a fallback.
+
+**Limitation (F6, §16.18).** v1 cannot express "this plugin runs only under dsh" or "only in the router
+profile", because neither value is durable. The nearest honest expressions are (a) **worker-id
+scoping**: list the plugin in `scopes.server` and give every *other* worker an explicit `use:` list
+that omits it — which really removes it, because `use:` is a filter (§8.1); `node-zulu` above is
+exactly this shape — per-worker sets are still fully expressible, at the cost of enumerating the
+workers that must not have it, and the set a session sees is still a function of its durable binding;
+or (b)
+`required = false` plus a manifest that subscribes only points the target assembly has (§3.4.1).
+Reopening needs a **durable harness/profile record** — a BEGIN-only payload field on `session/created`
+(the same class of change as §16.2) — and then the two middle layers return to `resolve`; it does not
+need a new resolution rule.
 
 ### 8.3 Dispatch order inside one hook
 
@@ -1029,8 +1404,18 @@ Three invariants the pseudocode enforces:
    tiebreak) — unchanged ADR-004 semantics.
 2. Then sidecars, ascending by `[plugin].order`, tiebroken by name.
 3. For `bail`/`flow` hooks: **the first `deny`/`stop` wins**, remaining subscribers are skipped for
-   that dispatch, and one audit line records `winner`, `skipped` count and the reason. Quarantined,
-   absent or busy plugins are skipped before they can win.
+   that dispatch, and one audit line records `winner`, `skipped` count and the reason. Skipped means
+   *not consulted because a verdict already exists*. A subscriber that cannot answer is **not** skipped:
+   if it holds the matching `veto:*` grant its unreachability is itself a fail-closed denial (§11.1) —
+   this is the one case whose outcome does not depend on position, because "not reachable" cannot be
+   read as "abstained" — while an `observe:*`-only subscriber's unreachability is a lost observation
+   with one audit line. A speech defect (out-of-grant or wrong-mode reply) is discarded and treated as
+   as-if-absent (§5.2), never as a denial.
+4. At `admit/pre` one event is a **grid** of frames — target session × that target's subscribers
+   (§4.1). `order` ranks subscribers inside a target exactly as above, and the one rule that survives
+   the grid is the veto: **the first `stop` anywhere in it ends the event for every target**, and
+   frames for that event not yet sent are not sent. Per-sidecar serialization (§7.5) means a plugin's
+   own frames arrive one at a time, ordered by `order` then target session id.
 
 ### 8.4 Worker ids and the lazy path
 
@@ -1046,17 +1431,61 @@ snapshot), and §9's digest is computed per session. The two must not be conflat
 ### 8.5 The set digest
 
 ```
-canonical = json_compact_keys_sorted({
-   "plugins": [ {"name","version","abi","sha256","order","hooks":[…sorted],
-                "capabilities":[…sorted],
-                "limits":{"deadline_ms","max_payload_kib","max_settle_vetoes"}} … sorted by name ],
-   "schema": 1 })
-digest = "sha256:" + hex(sha256(utf8(canonical)))
+canonical = json_compact_keys_sorted({                     # schema 2
+  "schema": 2,
+  "plugins": [ {                                           # sorted by name, ascending bytes
+      "name":            <str>,
+      "version":         <str>,
+      "abi":             <u32>,
+      "scope":           "server" | "worker",              # the layer resolve() chose
+      "order":           <i32>,
+      "required":        <bool>,
+      "binary_sha256":   "<64 lowercase hex>",             # the manifest's [process].sha256
+      "process_sha256":  "<64 lowercase hex>",             # see below: argv+env_allow+cwd+startup
+      "hooks":           [<str> …sorted],
+      "capabilities":    [<str> …sorted],
+      "limits":          { "deadline_ms", "max_payload_kib", "restarts_per_window",
+                           "restart_window_ms", "max_settle_vetoes", "max_stderr_line_kib",
+                           "stderr_rate_kib_per_min" }    # every key, post-narrowing
+  } … ] })
+
+process_sha256 = hex(sha256(utf8(json_compact_keys_sorted({
+    "argv":              [<str> …in order],                # argv[0] + arguments
+    "env_allow":         [<str> …sorted],                  # NAMES only, never values
+    "cwd":               <str|null>,
+    "startup_timeout_ms":<u64> }))))
+
+digest = "sha256:" + hex(sha256(utf8(canonical)))          # sha2 0.10 `Sha256` (§2)
 ```
 
-Only behavior-bearing fields are included — a reordered YAML, a comment edit or a per-scope key move
-that resolves to the same effective set yields the same digest. A changed binary (`sha256`), a
-changed grant, a changed clamp or a changed declaring layer does not.
+**The field list above is the whole input, and it is closed.** Each entry is there because a change to
+it can change what a plugin *does* or whether it is there at all:
+
+| Field | Why it is behaviour-bearing |
+|---|---|
+| `name`, `version`, `abi` | which artifact, which generation of the wire contract (§7.3) |
+| `scope` | what `resolve` produced for this session; a differing scope with an equal set means resolution changed, which is the one thing §9.2's guard exists to catch |
+| `order` | dispatch position inside a hook for `bail`/`flow` (first deny wins, §8.3) |
+| `required` | whether a refusal of this instance is fatal to boot (§6.2) |
+| `binary_sha256` | a different binary is a different plugin even with the same name |
+| `process_sha256` | different arguments, environment allowlist, working directory or startup budget is different behaviour; the env **values** never enter the digest (they are secrets and they change without a config edit) |
+| `hooks`, `capabilities` | what it receives and what it may do (§5.1) |
+| every `limits` key | deadline, frame bound, restart window, completion-veto budget, stderr bounds — each changes observable behaviour, and each is the post-narrowing value, so a worker override is captured |
+
+A behaviour-bearing field that is not on this list is a **spec bug**: adding a field to §6.1 means
+adding it here in the same change (a manifest field that cannot change behaviour does not belong in
+§6.1 at all). Conversely, three things are deliberately *outside* the input: the manifest **path**
+(identity at handshake, §7.3 — the contents are the behaviour, and moving a file changes nothing), the
+YAML's textual layout (comments, key order, a per-scope key move that resolves to the same effective
+set) and anything a session cannot observe.
+
+Two lists, so the rule cannot be read backwards:
+
+- **Changes the digest**: a different binary, version or `abi`; a changed grant or hook set; a changed
+  clamp, window or veto budget; a changed `argv`/`env_allow`/`cwd`/startup budget; `order`,
+  `required`; a different resolved `scope`; adding or removing a plugin from the effective set.
+- **Does not change the digest**: a reordered YAML, a comment edit, a moved key that resolves the same,
+  an env var's *value*, and the manifest's file path.
 
 ### 8.6 Purity obligation for verdicts
 
@@ -1098,8 +1527,9 @@ closes it is durable pinning (§9.4).
    row, no payload change — and, deliberately, no durable record (§9.1).
 2. At every claim served **by the process that recorded it** — a takeover of the lease, or a resume
    after a drain crash inside this process — recompute the digest from the *current* config snapshot
-   and the *durable* binding. Both inputs are fixed for the process lifetime: there is no live config
-   reload (§6.5, §13.1) and the binding is durable (ADR-020).
+   and the *durable* binding. Those two are the whole input: the config snapshot is fixed for the
+   process lifetime (there is no live config reload, §6.5, §13.1) and the binding is the durable
+   `exec_worker` id (ADR-020); no harness, profile or assembly value participates (§8.2, §16.18).
 3. Equal → proceed; the hooks in force are the ones the audit line names.
 4. **Not equal → session-lifetime quarantine of the sidecar hooks** (§9.3). Inside one process this can
    only fire if resolution stops being a pure function of those two inputs (a future reload path, or a
@@ -1157,8 +1587,12 @@ untrusted sandbox and not "an untrusted process" (R10). Concretely:
 
 A sidecar's only powers are the grants in its manifest (§5): observe classes and, where the hook
 allows, a denial. It cannot provide a seam service, cannot mutate a view, cannot write an event,
-cannot touch a projection and cannot veto recovery. A grant that a reply does not have is refused at
-dispatch (§5.2), so a buggy or malicious plugin cannot escalate by answering more than it was given.
+cannot touch a projection and cannot veto recovery. A grant that a reply does not have is refused **and
+discarded** at dispatch (§5.2): the plugin's answer is ignored, the outcome is what it would have been
+without that plugin, and the attempt is audited — so a buggy or malicious plugin cannot escalate by
+answering more than it was given, and cannot obtain a denial it lacks the grant for by answering out of
+grant or by going silent, because silence belongs to the same rule only when the grant is `veto:*`
+(§11.1).
 
 ### 10.3 Spawn hardening (v1 baseline, normative)
 
@@ -1202,8 +1636,10 @@ Every line is a `tracing` event on the existing sinks — no new file, no new ta
 | `hook-set` | `session, digest, plugins, names` |
 | `hook-set-mismatch` | `session, recorded, current, added, removed, changed` |
 | `hook-dispatch` | `hook, plugin, session, worker, seq, epoch, dispatch, outcome, elapsed_ms` |
-| `hook-veto` | `hook, plugin, session, dispatch, reason, skipped, winner` |
+| `hook-veto` | `hook, plugin, session, dispatch, reason, skipped, winner, targets` — `session` is the target whose frame denied; `targets` is the size of the refused fan-out set (`1` for every hook except `admit/pre`, §4.1) |
 | `hook-default` | `hook, plugin, reason(class default cause), busy?` |
+| `hook-discard` | `hook, plugin, code, grant, outcome=discarded` (a speech defect: the reply was refused and the outcome is the as-if-absent one, §5.2) |
+| `hook-veto-admit-failed` | `hook, plugin, session, vetoes, error, reason` (the settle gate's synthetic input could not be appended, §4.6) |
 | `hook-override` | `hook, plugin, session, vetoes, reason` (settle budget exhaustion) |
 | `hook-quarantine` | `plugin, reason, failures, window_ms, lifetime` |
 | `hook-refuse` | `plugin, code, message` |
@@ -1225,21 +1661,42 @@ bus re-attaches and nothing is re-derived from the plugin. Truth never leaves th
 
 ### 11.1 Class defaults (the asymmetry is normative)
 
-A default is a property of a **port that can act**, not of the hook id alone: where a hook is
-observe-only at one origin (§3.4.3), an unavailable handler costs the observation, never the input.
-The `admit/pre` rows are therefore split by origin, and §4.1 and §3.4.3 state the same rule.
+**Two failure classes, and they are disjoint.** Every failure is first classified, and only one of the
+two classes has a default at all:
 
-| Hook class | Deadline / crash / quarantined / malformed | Rationale |
+| Class | Members | Outcome |
 |---|---|---|
-| **Action** (`tool/pre`) | **fail CLOSED** — `deny`, honest error `{"error":"denied by plugin <name>: hook unavailable (<cause>)","policy":"hook"}`, one audit line | an approval gate that admits when unavailable is not a gate. Deny is honest, reversible (the model sees why and can retry or rephrase) and never a silent skip |
-| **Action** (`admit/pre`, `origin:"channel"` — the only veto-capable admission port in v1) | **fail CLOSED** — the admission is refused: no inbox row is written, so the input is not admitted, and one audit line records it. **The sender is not notified** in v1 (no inbound refusal wire, §4.1, §16.15) | same argument at the ingress boundary — minus a notification v1 cannot deliver, which is stated rather than implied |
-| **Action default at an observe-only origin** (`admit/pre` for `origin:"api"` — `submit`, `queue`, `steer`) | **proceed** — there is no verdict to lose, because the port cannot veto there in v1 (R3; the API-borne veto is deferred, §16.3). The observation lapses, one audit line records it, and the input is admitted unchanged | "fail closed" here would discard a caller's input with a caller-visible outcome the contract has no wire to express — the silent skip §1 forbids. R9's fail-closed default belongs to the veto-capable port; on an observe-only port the honest default is to admit and audit |
-| **Settlement** (`settle/pre`) | **fail OPEN** — abstain, settlement proceeds, one audit line | a wedged quality gate must not hold a session hostage (constraint 8: recovery is bounded), and terminal outcomes are protected (R2). Fail-closed here would convert a plugin outage into a session that can never end |
-| **Observation** (`turn/*`, `tool/post`, `admit/post`, `recover/decided`) | abstain silently (audit only) | an observer has no decision to lose; nothing is claimed that did not happen |
+| **Unreachability** — the handler cannot answer | `deadline_ms` expiry, process crash, quarantine (§6.5), busy fail-fast (§7.5), handshake never completed, EOF without a reply | the hook's **class default**, per the table below |
+| **Speech defect** — the handler answered wrongly | a reply whose grant is absent (`err:unauthorized`), a reply illegal for the hook's mode (`err:malformed`), an `err` whose code is `malformed`/`unauthorized`/`unsupported_hook`/`protocol_violation`, an unparseable reply | the reply is **discarded as an opinion**; the outcome is exactly the as-if-absent outcome (§5.2). Never the class default |
+
+A handler that sends `err{code:"deadline"|"crashed"}` is **declaring itself unreachable**, so that
+reply lands in the first class. That grants it nothing it did not already have — it could always force
+the default by not answering — and it fixes a real asymmetry: an honest plugin that knows it cannot
+decide must not be mistaken for one that is speaking out of turn.
+
+**A class default is a property of a `veto:*` grant, not of a hook id.** This is the general rule; the
+per-origin split of §4.1 and §3.4.3 is one instance of it, and all three sections state the same thing:
+
+| Subscription on the dispatched hook | Unreachability default | Rationale |
+|---|---|---|
+| holds `veto:tool` (only `tool/pre` has this hook) | **fail CLOSED** — deny, honest error `{"error":"denied by plugin <name>: hook unavailable (<cause>)","policy":"hook"}`, one audit line | an approval gate that admits when unavailable is not a gate. Deny is honest, reversible (the model sees why and can retry or rephrase) and never a silent skip |
+| holds `veto:admit` (`admit/pre`, `origin:"channel"` — the only veto-capable admission port in v1) | **fail CLOSED** — the admission is refused for every target: no inbox row is written, one audit line. The unreachable subscriber sits in **one** target's set, but the refusal is the event's, so it covers the whole set (§4.1). **The sender is not notified** in v1 (no inbound refusal wire, §4.1, §16.15) | same argument at the ingress boundary — minus a notification v1 cannot deliver, which is stated rather than implied |
+| holds `veto:settle` (`settle/pre`) | **fail OPEN** — abstain, settlement proceeds, one audit line | a wedged quality gate must not hold a session hostage (constraint 8: recovery is bounded), and terminal outcomes are protected (R2). Fail-closed here would convert a plugin outage into a session that can never end |
+| holds only `observe:*` — at **any** hook, including a veto-capable one, and at an observe-only port (`admit/pre` for `origin:"api"` — `submit`, `queue`, `steer`; `turn/*`, `tool/post`, `admit/post`, `recover/decided`) | **lapse** — the observation is lost, one audit line; the action proceeds exactly as if the plugin were absent | an observer has no decision to lose, so nothing may be denied on its behalf. "Fail closed" here would let an `observe:tool`-only audit plugin deny tool calls by crashing, and at an API origin it would discard a caller's input with no wire to say so (R3, §16.3). R9's fail-closed default belongs to the veto-capable port, and a default belongs to the grant that makes the port veto-capable |
+
+Two consequences worth stating because they are where implementers guess:
+
+- **With several subscribers, an unreachable `veto:*` holder is a denial, at any position.** "First
+  deny wins" (§8.3) is about ordering of *answers*; a subscriber that cannot answer cannot be assumed
+  to have abstained, so a hook with an unreachable veto-capable subscriber fails closed even if the
+  subscriber ordered last — a deny is a deny, and the outcome must not depend on where the gate sits
+  in `[plugin].order`.
+- **A hook with no `veto:*` subscriber cannot fail closed at all.** There is no unreachable gate to
+  miss; every default in that configuration is a lapse.
 
 This asymmetry is the point: the *same* failure has opposite correct answers depending on whether the
 hook's verdict gates a side effect. Envoy reaches the same conclusion per filter (`failure_mode_allow`
-is a per-filter choice, not a global rule); kian states it once, per hook class.
+is a per-filter choice, not a global rule); kian states it once, per hook class and per grant.
 
 ### 11.2 The rest of the failure contract
 
@@ -1248,7 +1705,7 @@ is a per-filter choice, not a global rule); kian states it once, per hook class.
 | How long do we wait? | `deadline_ms` per dispatch (default 500, clamp 50..=5000), measured from write to reply |
 | What decision follows expiry? | the class default (§11.1) — never a fabricated opinion, never a late answer applied to another dispatch |
 | Is outstanding work cancelled? | the child is killed for a timeout and respawned per §6.4; late replies for a dead dispatch id are refused as `protocol_violation` |
-| When do repeated failures quarantine? | §6.4 (window + consecutive counter) — one mechanism, two numbers reported |
+| When do repeated failures quarantine? | §6.4 (window + consecutive counter) — one mechanism, two numbers reported — **except** `frame_overflow` and `protocol_violation`, which quarantine immediately on the first occurrence (§6.4, §6.5) |
 | Which honest degradation remains? | class defaults + audit lines + quarantine status; nothing degrades into "pretend the plugin agreed" |
 
 ## 12. Model-visible bytes (the honest guarantee)
@@ -1289,6 +1746,14 @@ and `wasm*` package names. What that proves is exactly: **kian-plugin's normal d
 contains no dynamic-loading crate**. It does **not** prove process isolation, behavioral
 compatibility, or safety of a sidecar — this contract never claims it does (S09).
 
+The one dependency the implementation round adds — `sha2.workspace = true` (§2) — is **not** in that
+refusal list and must not be added to it: `sha2` is a pure-Rust digest with no loading, linking or
+runtime-code surface, and it is already a normal dependency of `kian-store`, `kian-orchestrator`,
+`kian-llm`, `kian-superagent` and `kian-cli`. Adding a refusal pattern for it would break the gate's
+stated purpose (no dynamic loading) and would make the digest unimplementable. If a future reviewer
+wants a keep-list rather than a deny-list, that is a change to the test with its own ADR, not a
+side effect of this contract.
+
 ### 13.3 Rollback
 
 - **Fresh deployment / feature never enabled**: deleting the `sidecars:` section returns behavior
@@ -1312,7 +1777,7 @@ its own review:
 | Phase | Deliverable | Owner crate(s) | Depends on |
 |---|---|---|---|
 | P1 | `kian-plugin::hooks`: `HookId`, views, `GrantSet`, `HandlerId`, registry, `Disposer`, tier-0 dispatch, `HookBus` façade with no sidecars | `kian-plugin` | this file §3, §5 |
-| P2 | The six port methods wired into their existing call sites (observers + `tool/pre` + settle gate with `SettleCtl`; worker-lineage sessions first, §3.4.4), tier-0 handlers only | `kian-loop`, `kian-superagent`, `kian-cli` (assembly) | P1, §4, §9 |
+| P2 | The seven port methods wired into their nine call sites (observers + `tool_pre` + `tool_post` + settle gate with `SettleCtl`; worker-lineage sessions first, §3.4.4), tier-0 handlers only, plus the `kian-loop → kian-plugin` edge and the crate-local dsh `tool_post` port | `kian-loop`, `kian-superagent`, `kian-dsh` (port trait only), `kian-cli` (assembly) | P1, §4, §9 |
 | P3 | Sidecar runner: spawn hardening, stdio ABI, deadlines, quarantine, per-worker resolution, `sidecars:` config + validation, digest + session quarantine | `kian-plugin`, `kian-cli` | P1, §6–§9 |
 | P4 | The one EVENT-MODEL amendment for `permission.policy:"hook"` (§4.4), plus its goldens | `EVENT-MODEL`, `kian-loop` | P2 |
 | P5 | One in-tree reference sidecar (a `tool/pre` approval gate) + the ABI goldens | a new example crate / `docs` | P3 |
@@ -1333,6 +1798,10 @@ discovers it needs one stops and asks the owner.
 - Not a completion gate on the Router (resident) session or on the built-in/memory assembly in v1:
   `settle/pre` exists only where `WorkerLoopDriver` is mounted and the stream is a worker stream
   (§3.4.4). A gate there needs a second mount site in `kian-superagent`; it is a named deferral (§16.16).
+- Not a dsh request/response observer in v1: `turn/request` and `turn/response` fire under the ReAct
+  loop only, because no bridge site can fill their normative payloads (§16.17).
+- Not a harness- or profile-scoped plugin set in v1: the effective set is a function of the config
+  snapshot and the durable `exec_worker` id only (§8.2, §16.18).
 - Not a sender-visible admission refusal in v1: a channel-borne veto writes no row but tells the sender
   nothing, because no inbound refusal wire exists (§4.1, §16.15).
 
@@ -1340,7 +1809,7 @@ discovers it needs one stops and asks the owner.
 
 Every deferral carries the ruling that deferred it and the artefact that would reopen it. Nothing here
 may be promised in prose elsewhere. **Row ids are stable citations** — the rest of this document (and
-ADR-028) refers to them as §16.1 … §16.16.
+ADR-028) refers to them as §16.1 … §16.18.
 
 | # | Deferred | Why | Owner / trigger |
 |---|---|---|---|
@@ -1360,6 +1829,8 @@ ADR-028) refers to them as §16.1 … §16.16.
 | 16.14 | Per-session sidecar processes | R11 fixes one process per plugin per server; cost/isolation trade is unmeasured | measurement + owner decision |
 | 16.15 | Sender-visible admission refusal (a channel NACK/delivery-failure, or an API error code) | no inbound refusal wire exists — `ChannelAdapter` has `subscribe()` + `send()` only — so a vetoed admission is audit-only and its sender is never told (§4.1, §11.1) | API-CONTRACT / channel round, together with §16.3's API-borne veto |
 | 16.16 | `settle/pre` on the Router (resident) session and on the built-in/memory assembly | `WorkerLoopDriver` is mounted only on worker sides; `RouterDriver` and `ServeLoopDriver` own their end boundaries, so a completion gate guards worker-lineage sessions only in v1 (§3.4.4) | `kian-superagent` (a phase in `RouterDriver`); supervisor round |
+| 16.17 | `turn/request` and `turn/response` under the dsh bridge (owner ruling F2) | no bridge site can populate the normative payloads: the request view needs `message_count`/`tool_names`/`tool_schema_sha256` from a body kian cannot parse (`mapping.rs:411` runs *before* the driver append, so the site itself exists), and the response view needs provider `usage` and an `error{class,action}` pair the bridge never sees (§3.4.1, §3.5, §4.2, §4.3) | `kian-dsh` + a payload amendment that makes those fields optional for that harness (its own ADR); the rows return in the same change |
+| 16.18 | Harness- and profile-scoped plugin sets (`scopes.harness`, `scopes.profile`) — **the removal that narrows goal 2** (owner ruling F6) | neither value is durable: `session/created` carries `{}` and no kind records a harness or profile (EVENT-MODEL §3), so an effective set that depended on them could not be recomputed at claim from durable state (§8.2, §9.2). v1 resolves `server` + durable `exec_worker` only, and expresses "only under dsh / only for the router profile" by worker-id scoping or `required = false` (§8.2) | a **durable harness/profile record** — a BEGIN-only field on `session/created`, the same class of change as §16.2 (D3) — then both middle layers return to `resolve` |
 
 ## 17. UNVERIFIED (must stay visible)
 
@@ -1371,9 +1842,12 @@ ADR-028) refers to them as §16.1 … §16.16.
   on which producers call `shape_channel_input_marked`/`InboxWriter::admit` directly. The
   implementation round must assert the exclusions with a test that fails if a new internal producer
   starts bypassing the port.
-- **dsh request observation timing** (`post_attempt`) is read from
-  [`mapping.rs`](../crates/kian-dsh/src/mapping.rs)'s consumption of the child's attempt frame; its
-  exact lag behind the child's provider call is unmeasured.
+- **The dsh `tool/post` correlation is read from code, not exercised.** The bridge port fires after the
+  driver's `ToolResult` append, but §3.5 requires a `call_id → name` record for the open step that the
+  mapper does not keep today; the implementation round must add it and test that a result arriving with
+  no mapped call is skipped with an audit line rather than dispatched with a fabricated name. The same
+  test should pin the append-branch site (`driver.rs:650`): the dedupe path appends nothing, so it must
+  dispatch nothing.
 - **The settle-gate re-arm path** (§4.6 step 3) is specified against the engine's current
   `Supervised::Settled` arm ([`engine.rs:1411-1419`](../crates/kian-orchestrator/src/engine.rs):
   `has_eligible_inputs` at `:1412`, `continue 'episodes` at `:1415`). It is not yet exercised
@@ -1424,7 +1898,7 @@ ADR-028) refers to them as §16.1 … §16.16.
 
 | Goal | Where it is answered |
 |---|---|
-| (1) harness-lifecycle hooks | §3 catalog (§3.1), payload catalog (§3.2), reply modes (§3.3), the six port methods at their nine call sites (§4) |
-| (2) per-worker plugin sets | §8 (grammar, pseudocode, narrowing, digest), §9 (session consistency and its guard) |
-| (3) one plugin reusable across harnesses (kian-loop ReAct / kian-dsh bridge) | §3.4.1 hook × harness matrix, §3.5 the dsh boundary and its exclusions, §4 the per-harness port edges, §8.6 purity (what makes replayable reuse possible) |
+| (1) harness-lifecycle hooks | §3 catalog (§3.1), payload catalog (§3.2), reply modes (§3.3), the seven port methods at their nine call sites (§4) |
+| (2) per-worker plugin sets | §8 (grammar, pseudocode, narrowing, digest), §9 (session consistency and its guard) — **narrowed by F6**: two scopes (`server` + durable `exec_worker`), no harness/profile sets (§16.18) |
+| (3) one plugin reusable across harnesses (kian-loop ReAct / kian-dsh bridge) | §3.4.1 hook × harness matrix — the shared v1 subset is `admit/pre`, `admit/post`, `tool/post` — §3.5 the dsh boundary and its exclusions (including the removed `turn/*` rows, §16.17), §4 the per-harness port edges, §8.6 purity (what makes replayable reuse possible) |
 | (4) safe execution | §6 manifest/lifecycle/counters/quarantine, §7 the ABI and its bounds, §10 trust and spawn hardening, §11 the failure policy matrix, §12 the byte guarantee |

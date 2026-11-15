@@ -1530,23 +1530,29 @@ A new capability is attempted in order of core footprint, smallest first:
 ### 6.4 Hook plugins (lifecycle hooks and the stdio sidecar tier)
 
 `kian-plugin` also carries a hook bus — a small, closed vocabulary of execution-lifecycle points
-(admission, request, response, tool, recovery, settlement) that both harnesses reach through
-named ports, so one plugin serves the ReAct loop and the dsh bridge without harness-specific code.
-Two tiers only: **tier 0** compile-time handlers (the same static registration as §6.1, hook-scoped
-in `kian-plugin::hooks`) and **tier 1** operator-trusted child processes speaking JSON lines over
-stdio, which may observe and veto but may never provide a seam, mutate a request, or write an event.
-Hooks add no event kind, no table, no route and no ops method: a `tool/pre` denial is an honest error
-`tool/result`, an `admit/pre` veto is an audit line plus an inbox row that is **never written** (no
+(admission, request, response, tool, recovery, settlement) that the harnesses reach through named ports
+so one plugin can serve more than one harness without harness-specific code. The shared v1 subset is
+admission and retrospective `tool/post`; the ReAct loop additionally offers `turn/request`,
+`turn/response`, `tool/pre` and `recover/decided` (§3.4.1 of the contract), and the dsh bridge does
+**not** offer the `turn/*` pair — no bridge site can fill their normative payloads
+(PLUGIN-SPEC §16.17). Two tiers only: **tier 0** compile-time handlers (the same static registration as
+§6.1, hook-scoped in `kian-plugin::hooks`) and **tier 1** operator-trusted child processes speaking JSON
+lines over stdio, which may observe and veto but may never provide a seam, mutate a request, or write an
+event. Hooks add no event kind, no table, no route and no ops method: a `tool/pre` denial is an honest
+error `tool/result`, an `admit/pre` veto is an audit line plus an inbox row that is **never written** (no
 `tool/result`, no notification — v1 has no inbound refusal wire, PLUGIN-SPEC §4.1), a blocked
 settlement is one synthetic `input/admitted`, and everything else is a `tracing` audit line. A third,
 sandboxed tier (wasm) is **not** part of the contract — it is gated on a distinct
-untrusted-third-party isolation trigger. The contract (hook points and payloads, the six
-interception ports, capability grants, the manifest and stdio ABI, per-worker resolution, session
-consistency, failure/quarantine policy and the trust model) is
-[PLUGIN-SPEC.md](PLUGIN-SPEC.md); the rationale, alternatives and the review ledger are
-[ADR-028](decisions/ADR-028-harness-hook-plugins.md). No crate in this section's crate map changes
-outside `kian-plugin`, `kian-loop`, `kian-dsh` (injection only), `kian-superagent` and `kian-cli`;
-`kian-core`, `kian-store` and `kian-orchestrator` gain nothing.
+untrusted-third-party isolation trigger. The contract (hook points and payloads, the seven port methods
+at their nine call sites, capability grants, the manifest and stdio ABI, per-worker resolution and its
+two-scope v1 grammar, session consistency, failure/quarantine policy and the trust model) is
+[PLUGIN-SPEC.md](PLUGIN-SPEC.md); the rationale, alternatives and the review ledger (including the
+FINAL review's F1–F10 closure) are [ADR-028](decisions/ADR-028-harness-hook-plugins.md). Dependency
+shape: `kian-loop` gains an edge on `kian-plugin` (the port views live there) **and** receives the bus
+by injection; `kian-plugin` gains one **workspace** dependency edge, `sha2` (already pinned, no new
+package); `kian-dsh` gains **none** — its single v1 port is crate-local, keeping its `kian-core`-only
+waist. No crate in this section's crate map changes otherwise: `kian-superagent` and `kian-cli` keep the
+edges they have, and `kian-core`, `kian-store` and `kian-orchestrator` gain nothing.
 
 ## 7. Module layout (crate structure)
 

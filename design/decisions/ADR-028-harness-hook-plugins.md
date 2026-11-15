@@ -3,9 +3,26 @@
 - **Status**: accepted (owner decisions, 2026-11-15; Round 13 — docs-only: the contract is
   normative, the implementation is a later round per `design/PLUGIN-SPEC.md` §14)
 - **Date**: 2026-11-15
-- **Scope**: `kian-plugin` (new `hooks` module: bus, ports, registry, sidecar runner), `kian-loop`
-  (request/response/tool/recovery ports; **new dependency edge** on `kian-plugin`), `kian-dsh`
-  (port injected at driver construction; **no new edge**), `kian-superagent` (admission and settle
+- **Revised**: 2026-11-15 (R13-04d, before publication) — the ten MUST-FIX items of the codex FINAL
+  cross-review are closed in place: F1 fallback dispatch, F2 dsh request/response ports, F3
+  out-of-grant speech, F4 multi-target admission preflight, F5 `required` + frame overflow, F6
+  `binding.harness`/`profile`, F7 digest coverage, F8 handshake identity + admission epoch, F9
+  settle-gate synthetic-input failure, F10 dependency claim + SHA-256. **F2, F5 and F6 narrowed the
+  design** (two dsh rows removed, quarantine made single-mechanism, harness/profile scopes removed);
+  none widened it. The row-by-row closure is *Appendix B*. Append-only discipline is intact: ADR-004
+  is untouched, and this file was still pre-publication when it was corrected.
+- **Further revised**: 2026-11-15 (R13-04e, still before publication) — the codex **CONFIRMATION**
+  review accepted all ten FINAL rows above and opened two blockers, both closed here as **corrections**
+  that narrow nothing: **F11** (the §8.1 worked example contradicted the narrowing rule it illustrates —
+  the example now lists both instances in `scopes.server` and narrows through `worker.<id>.use:`, and D26
+  pins `use:` as a *filter* over `scopes.server`) and **F12** (one multi-target `admit/pre` *evaluation*
+  fans out to per-target *frames* carrying each target's own identity — D24). The row-by-row closure is
+  *Appendix C*; Appendix B is left exactly as accepted.
+- **Scope**: `kian-plugin` (new `hooks` module: bus, ports, registry, sidecar runner; one new
+  **workspace** dependency edge, `sha2`), `kian-loop` (request/response/tool/recovery ports; **new
+  dependency edge** on `kian-plugin`, with the bus instance injected at construction), `kian-dsh`
+  (`tool_post` through a **crate-local** port trait injected at driver construction; **no new edge** —
+  its narrow-waist test forbids one), `kian-superagent` (admission and settle
   ports; edge already exists), `kian-cli` (config `sidecars:`, assembly, `KNOWN_PLUGINS` collision
   check), `design/PLUGIN-SPEC.md` (WHAT), `design/DESIGN.md` §6.4 (pointer). **No `kian-core`, no
   `kian-store`, no `kian-orchestrator`, no new event kind, no new table, no new HTTP route, no new
@@ -60,6 +77,11 @@ self-review added 11 more. The failures were not stylistic. In summary:
 The owner then locked rulings D2-amended, D8 and R1–R16 (Kanban `t_41bfc314`, 2026-11-15) which
 bindingly resolve the architectural questions and are adopted here as decisions D2, D8 and the
 mechanism choices in D14–D26.
+
+A second, FINAL cross-review (codex, 2026-11-15) closed baseline findings 1 and 3–21, left **#2**
+unfixed and raised seven new ones, producing **ten MUST-FIX items** (F1–F10) with owner rulings on each.
+They were closed in place before publication; *Appendix B* is the row-by-row table, and three of them
+(F2, F5, F6) narrowed the design rather than correcting prose.
 
 ### Why a sidecar before wasm
 
@@ -143,15 +165,22 @@ Cost of the alternative (see *Alternatives A*) is a permanent in-process ABI com
 a capability that a child process already delivers. → SPEC §2, §13.2.
 
 **D11 — The ports are injected callables at named, existing call sites — not decorators around
-concrete types (resolves findings C05/S08).** The specification names six port methods over
-plain-data views, each with its owning crate and its *today's* call site: admission
-(`subscriptions.rs:477`), request (`react.rs:537`; dsh `mapping.rs:411`), response
-(`react.rs:520`; dsh `mapping.rs:447`), tool-pre (`react.rs:676`, after the declarative permission
-gate and before the `tool/call` append / `invoke` at `:710`), settle (`worker.rs:1276`), recovery
-(`react.rs:787`). `kian-loop` gains an edge on `kian-plugin`; `kian-dsh` does not (the port is
-injected at construction), preserving its core-only narrow waist. Rationale: an abstraction that does
-not name a real call site is a promise, not a design — and three of the draft's promises had no call
-site at all.
+concrete types (resolves findings C05/S08; corrected by F2).** The specification names seven port
+methods over plain-data views, each with its owning crate and its *today's* call site: admission
+(`subscriptions.rs:477`, API side `server.rs:1183`), request (`react.rs:537`), response
+(`react.rs:520`), tool-pre (`react.rs:676`, after the declarative permission gate and before the
+`tool/call` append / `invoke` at `:710`), tool-post (`react.rs:710`; under dsh `driver.rs:650`),
+settle (`worker.rs:1276`), recovery (`react.rs:787`). Dependency shape, stated as it will land:
+`kian-loop` gains an edge on `kian-plugin` **and** receives the bus by injection at construction — the
+edge is unavoidable because the loop must construct the views, so "injection only" would be a fiction;
+`kian-dsh` gains **no** edge and reaches `tool_post` through a crate-local trait over a locally declared
+struct, adapted in assembly, because `tests/narrow_waist.rs` asserts `kian-core` as its only kian
+dependency. The two **dsh `turn/*` rows are removed** by F2: `mapping.rs:411` is a mapping function
+that runs before the driver's append (`driver.rs:650`), and no bridge site can fill
+`message_count`/`tool_names`/`tool_schema_sha256` from an opaque child body or `usage`/`error` for the
+response view, so those rows were phantom ports rather than narrow ones (SPEC §3.4.1, §3.5, §16.17).
+Rationale: an abstraction that does not name a real call site is a promise, not a design — and three of
+the draft's promises had no call site at all.
 
 **D12 — The settle gate lives at the loop-outcome boundary and acts by admitting one synthetic input
 (resolves S08, the draft's hardest finding).** The engine derives `end_reason = Completed` from
@@ -172,6 +201,12 @@ inside `kian-orchestrator` (`engine.rs:1463`, `:728`). Therefore:
 - a denial is expressed by **admitting one synthetic `input/admitted`** (the existing steer path,
   `synthetic:true`, strippable, persisted before the model sees it). The engine's own "settle on an
   empty inbox" logic then re-arms the episode — no new mechanism, no event kind, no engine change;
+- **if that admission itself fails, the veto is not swallowed (F9)**: the gate propagates the append
+  error instead of `Settled`, so the drain takes the ordinary append-failure route and the session ends
+  recoverably (`failed`/`interrupted`) rather than `completed`; the veto counts as consumed in the
+  gate's in-process counter (the stream cannot see a row that does not exist), and one audit line says
+  *applied and unpersistable*. "Veto silently dropped, settle anyway" is precisely the dishonest
+  outcome this rule forbids (SPEC §4.6);
 - the atomic end write is never split (constraint 4): the gate decides *whether* an end happens this
   episode, not *how* it is written.
 
@@ -184,17 +219,29 @@ Rationale: a verdict vocabulary is a security surface; each extra verb is a new 
 `ask` in particular would quietly reintroduce the interactive-approval assumption kian's drain model
 does not have. → SPEC §3.3, §5.
 
-**D14 — Failure policy is asymmetric by hook class, and the asymmetry is the contract (owner R9).**
-Action hooks (`tool/pre`, `admit/pre`) **fail closed** on deadline/crash/quarantine — an approval
-gate that admits when it is unavailable is not a gate. "Fail closed" is the default of a
-**veto-capable port**, and in v1 `admit/pre` is veto-capable only for channel-borne input (D24, R3):
-at an observe-only origin (API `submit`/`queue`/`steer`) an unavailable handler costs the observation
-and the input is admitted unchanged — refusing it would drop a caller's work with no wire to say so
+**D14 — Failure policy is asymmetric by hook class, the asymmetry is the contract (owner R9), and it
+applies to *unreachability only* (F3).** Action hooks **fail closed** on deadline/crash/quarantine — an
+approval gate that admits when it is unavailable is not a gate. "Fail closed" is the default of a
+**veto-capable** subscription, and in v1 `admit/pre` is veto-capable only for channel-borne input
+(D24, R3): at an observe-only origin (API `submit`/`queue`/`steer`) — and for an observe-only
+subscriber at *any* hook — an unavailable handler costs the observation and the input/action proceeds
 (SPEC §11.1, §3.4.3). The settlement gate **fails open** — a wedged quality gate must not hold a
-session hostage, and terminal outcomes are protected (D15, constraint 8).
-Observers abstain. Rationale: Envoy reaches the same conclusion per filter (`failure_mode_allow` is a
-per-filter choice, never a global default); a global rule in either direction would be wrong for one
-of the two classes. → SPEC §11.1.
+session hostage, and terminal outcomes are protected (D15, constraint 8). Observers lapse.
+
+**Speech is a different class and never resolves into a default.** A reply that is out of grant
+(`err:unauthorized`), illegal for the hook's mode, or otherwise malformed is **discarded**: the outcome
+is exactly the as-if-absent outcome, never the fail-closed class default (F3, resolving the final
+review's NEW-1). The v2 draft resolved these to the class default, which meant a manifest holding only
+`observe:tool` could have a tool call denied by sending a `deny` it had no grant for, or by hanging —
+privilege escalation through a failure mode, contradicting D2/§10.2's non-escalation claim. The two
+classes are now disjoint by rule: unreachability → class default (per grant); speech defect → discarded
+opinion + audit, with health accounting (§6.4's failure window) kept deliberately separate from outcome
+accounting. A handler that *says* it is unreachable (`err{deadline|crashed}`) lands in the first class
+and gains nothing, since it could always force the default by silence.
+
+Rationale for the asymmetry itself: Envoy reaches the same conclusion per filter (`failure_mode_allow`
+is a per-filter choice, never a global default); a global rule in either direction would be wrong for
+one of the two classes. → SPEC §5.2, §8.3, §11.1.
 
 **D15 — The completion veto is bounded, re-armable, and re-derivable from the stream (owner R2).** A
 veto applies to `completed` only — concretely, to `LoopOutcome::Settled`, the loop's own completion
@@ -215,18 +262,30 @@ head-of-line blocking across every worker on the server; failing fast to the cla
 degradation local and honest. → SPEC §7.5, §8.6.
 
 **D17 — Set identity is deterministic re-derivation plus a digest guard whose coverage is one process
-lifetime (owner R1), not durable pinning.** The effective set is a pure function of (config snapshot,
-durable worker binding — already durable per ADR-020). A canonical digest is recorded in one audit line
-at session open and recomputed at every claim that *same* process serves; a mismatch quarantines that
-session's sidecar hooks for the process's lifetime, with the diff audited. Durable pinning would need an
-additive payload on a session-start event, which D3 forbids this round. The honest limit, stated
-because the v2 draft drew the wrong conclusion here: a `tracing` line is not a store, so after a
-cross-process restart nothing is compared — the new process re-resolves from the current config and
-**v1 cannot detect that the config changed**, which is exactly R1's case. The guard's real value is as a
-fail-closed invariant check *inside* one process lifetime (an operator's config edit changes nothing
-until `kian serve` restarts, since there is no live reload). Closing the restart case is durable
-pinning, owned and deferred as SPEC §16.2 / §9.4 — it is not something the guard may silently imply.
-→ SPEC §9.1, §9.2.
+lifetime (owner R1), not durable pinning; and the derivation inputs are narrowed to what is durable
+(F6), with the digest covering the whole behaviour-bearing set (F7).** The effective set is a pure
+function of exactly two things — the config snapshot and the durable worker binding (`exec_worker`,
+already durable per ADR-020) — and **nothing else**: the four-scope grammar's middle layers
+(`scopes.harness`, `scopes.profile`) are removed in v1 because `session/created` carries `{}` and no
+kind records a harness or profile (EVENT-MODEL §3), so a set that depended on them could not be
+recomputed at claim from durable state. Per-worker sets survive through the worker scope's `use:` list
+and per-instance `limits:` narrowing; "only under dsh / only for the router profile" is expressible
+only via worker-id scoping or `required = false`, and closing that gap needs a durable harness/profile
+record (SPEC §16.18), not a new resolution rule. A canonical digest is recorded in one audit line at
+session open and recomputed at every claim that *same* process serves; a mismatch quarantines that
+session's sidecar hooks for the process's lifetime, with the diff audited. The digest's field list is
+**closed and complete** — identity (name/version/abi), the resolved scope, `order`, `required`, the
+binary digest, a hash over `argv`+`env_allow`+`cwd`+startup budget, the grant/hook sets and every
+limit key — so a plugin with different arguments, environment or restart behaviour can never share an
+identity with another (SPEC §8.5). Durable pinning would need an additive payload on a session-start
+event, which D3 forbids this round. The honest limit, stated because the v2 draft drew the wrong
+conclusion here: a `tracing` line is not a store, so after a cross-process restart nothing is compared
+— the new process re-resolves from the current config and **v1 cannot detect that the config
+changed**, which is exactly R1's case. The guard's real value is as a fail-closed invariant check
+*inside* one process lifetime (an operator's config edit changes nothing until `kian serve` restarts,
+since there is no live reload). Closing the restart case is durable pinning, owned and deferred as
+SPEC §16.2 / §9.4 — it is not something the guard may silently imply. → SPEC §8.1, §8.2, §8.5, §9.1,
+§9.2.
 
 **D18 — Tier 1 is an operator-trusted extension; its artifacts are digest-pinned.** The trust class is
 that of an `endpoints:` address: same OS user, full reach, no sandbox claim (D9). Proportionate
@@ -239,13 +298,23 @@ artifacts cross a publisher boundary and is deferred. Stating the trust class pl
 control: it stops reviewers and operators from treating the sidecar as confinement. → SPEC §10.
 
 **D19 — No executor in `kian-plugin`: one dedicated std thread per sidecar, `futures` oneshot for the
-async side (resolves S10).** `kian-plugin` has no normal `tokio` dependency (tokio is dev-only) and
-drain tasks must never block. So the runner is a plain `std::thread` per plugin doing blocking
-`std::process` + `std::io`, enforcing deadlines itself with `Instant`; the awaiting bus side holds a
-`futures::channel::oneshot` and needs **no timer at all**, because the runner guarantees the oneshot
-resolves (reply, deadline, crash or stop). The zero-new-dependency claim therefore holds — `futures`,
-`serde`, `serde_json`, `tracing` and `thiserror` are already normal dependencies — and no tokio worker
-thread ever blocks on a pipe. → SPEC §2, §7.6.
+async side (resolves S10), and exactly one added dependency edge for digests (F10).** `kian-plugin`
+has no normal `tokio` dependency (tokio is dev-only) and drain tasks must never block. So the runner is
+a plain `std::thread` per plugin doing blocking `std::process` + `std::io`, enforcing deadlines itself
+with `Instant`; the awaiting bus side holds a `futures::channel::oneshot` and needs **no timer at all**,
+because the runner guarantees the oneshot resolves (reply, deadline, crash or stop). No tokio worker
+thread ever blocks on a pipe.
+
+SHA-256 is **not** implementable from `std` here, and this ADR does not pretend otherwise (F10): the
+manifest digest, the payload digests and the §8.5 set digest use the workspace's already-pinned
+`sha2 = "0.10"` (`Cargo.toml`, `[workspace.dependencies]`) — the same crate `kian-store`,
+`kian-orchestrator`, `kian-llm`, `kian-superagent` and `kian-cli` already link, so the lockfile gains
+no package and the implementation adds exactly one line (`sha2.workspace = true`) to
+`crates/kian-plugin/Cargo.toml`. `tests/static_only.rs` refuses `libloading`/`dylib*`/`wasm*` only, so
+`sha2` is outside its refusal list **by design** (it is a pure-Rust digest with no loading or
+runtime-code surface) and that test stays untouched. The corrected claim is therefore: **zero new
+third-party crates, one new workspace dependency edge** — the earlier draft's "zero dependency-tree
+entries" was false as written. → SPEC §2, §7.6, §8.5, §13.2.
 
 **D20 — Tier-0 hook registration is hook-scoped, in `kian-plugin::hooks` (owner R13).** `HandlerId`
 carries plugin name, hook id, grants and an order key; registration returns a `Disposer`; process-start
@@ -254,13 +323,15 @@ registration is server scope and session-scoped registration participates only i
 kind and `TypeId` and carries no plugin/hook/session metadata, so reusing it would have forced harness
 metadata into the core registry. → SPEC §5.3.
 
-**D21 — Cross-harness reuse means the shared vocabulary subset, and the matrix says so (owner R14).**
-A plugin subscribing only points that fire under both harnesses is one binary with one payload shape.
-`tool/pre` is ReAct-only (`surface:"react"`) and `recover/decided` has no dsh site in v1; dsh-child
-tool calls are outside the contract entirely. Rationale: a bridge cannot lend a power its harness does
-not have — "loads everywhere" is not "behaves the same everywhere", and the honest matrix lets a
-manifest choose `required = false` instead of discovering the difference in production. → SPEC §3.4.1,
-§3.5.
+**D21 — Cross-harness reuse means the shared vocabulary subset, and the matrix says so (owner R14,
+narrowed by F2).** A plugin subscribing only points that fire under both harnesses is one binary with
+one payload shape — in v1 that subset is `admit/pre`, `admit/post` and `tool/post`. `tool/pre` is
+ReAct-only (`surface:"react"`) and `recover/decided` has no dsh site in v1; `turn/request` and
+`turn/response` are removed from the dsh column because the bridge cannot populate their normative
+payloads (F2, SPEC §16.17); dsh-child tool calls are outside the contract entirely. Rationale: a
+bridge cannot lend a power its harness does not have — "loads everywhere" is not "behaves the same
+everywhere", and the honest matrix lets a manifest choose `required = false` instead of discovering
+the difference in production. → SPEC §3.4.1, §3.5, §16.17.
 
 **D22 — The model-visible byte guarantee is "identical prefixes up to the first policy divergence"
 (owner R8).** Tool schemas, tool order and request bodies are identical across worker ids and plugin
@@ -295,23 +366,58 @@ wire, which D3 forbids this round, so it is deferred with its owner (SPEC §16.1
 (watchdog timers, async completion, memory injection, subscriptions) do not pass the port at all and are
 recorded as a limitation, not glossed over. → SPEC §3.4.3, §4.1, §11.1.
 
-**D25 — The manifest is a closed schema, and quarantine is for the process lifetime (owner R12/R16).**
-Unknown keys refuse; every limit has a clamp; `required` decides whether a refusal is fatal; the
-failure window (`restart_window_ms`, `restarts_per_window`) is one mechanism with two reported numbers
-(`failures`, `restarts`); a `ready` mismatch is a typed refusal; and quarantine lasts until the server
-restarts — there is no live reload and no un-quarantine ops method, because D3 forbids new ops surface.
-Stderr and frame bounds are symmetric and normative. Rationale: the draft had three inconsistent
-descriptions of one lifecycle (a restart counter, a "consecutive crashes" rule and "until an operator
-reloads" with no reload surface); one state machine, stated once, removes the class. → SPEC §6.
+**The multi-target case is per-target frames on one evaluation (F12).** `admit/pre` is the one hook
+whose evaluation spans several sessions, while effective sets, narrowed limits and quarantine are all
+per **session** — so the event's single evaluation fans out to **one `hook` frame per (subscriber,
+target session)**, each carrying that target's `session`, `worker`, `seq` and post-narrowing
+`deadline_ms`, with its own frame id for reply correlation, sent one at a time by that sidecar's
+single-in-flight rule so one event's frames are a sequence and never a busy-path collision (§7.5). The
+verdict stays global: the first `stop` on any frame refuses the admission for **every** target, no inbox
+row is written anywhere, and the audit line names the denying plugin, the denying target and the size of
+the refused set; a target whose resolution has no subscriber for the hook simply gets no frame, which is
+a resolution result and not an error. The alternative — one frame carrying a representative identity
+plus a target list the plugin must untangle — was rejected because it makes every plugin re-derive which
+target a verdict belongs to, i.e. infer identity from state, which R11 forbids; and routing the whole
+fan-out through one target's identity would have made one worker's deadline and one session's set
+silently govern another session's admission. → SPEC §1 (Dispatch), §3.1, §3.2.1, §4.1, §7.2, §7.3,
+§8.3, §10.6.
 
-**D26 — Resolution is four scopes, innermost-wins-by-name, narrowing only (owner R15).** Server <
-harness < profile < worker id; a name resolves to exactly one instance (no shadow copies, no double
-subscription); worker scope may only narrow (subset + smaller limits) and may never widen beyond
-manifest grants; ordering is by `[plugin].order` then name, never config-file order; worker-id scopes
-resolve lazily but their shape is validated at boot. Rationale: every industry precedent found
-(Codex first-match, Envoy most-specific, profiles/injection per instance) agrees on named scopes and
-deterministic resolution and disagrees on the algorithm — so kian states its own rule rather than
-claiming a standard. → SPEC §8.
+**D25 — The manifest is a closed schema; validation and refusal are per instance; quarantine is for the
+process lifetime and has one window plus two immediate triggers (owner R12/R16, corrected by F5).**
+Unknown keys refuse; every limit has a clamp; a `ready` mismatch is a typed refusal, and the `ready`
+frame must restate the full handshake identity (canonical manifest path + name + version + `abi`, F8);
+quarantine lasts until the server restarts — there is no live reload and no un-quarantine ops method,
+because D3 forbids new ops surface. Two corrections the final review forced:
+
+- **`required` is per plugin instance, never per section.** Each instance's own manifest decides
+  whether *its* refusal is fatal to `kian serve`; there is no whole-section refusal, so one broken
+  plugin never unmounts the others, and a manifest too malformed to declare `required = false` is
+  fatal (it cannot opt out of a rule it cannot parse).
+- **Frame overflow is immediate, not windowed.** `frame_overflow` (either direction) and
+  `protocol_violation` quarantine on the first occurrence; the failure *window* counts only
+  rate-shaped failures (deadline, crash, malformed reply, unauthorised reply, stderr-rate). The draft
+  had `frame_overflow` counted both ways, which is not a rule. Stderr and frame bounds are symmetric
+  and normative. Rationale: the draft had three inconsistent descriptions of one lifecycle (a restart
+  counter, a "consecutive crashes" rule and "until an operator reloads" with no reload surface); one
+  state machine, stated once, removes the class. → SPEC §6.1–§6.5, §7.2, §7.3.
+
+**D26 — Resolution is innermost-wins-by-name and narrowing only; v1 carries two scopes, because the two
+middle layers have no durable source (owner R15, narrowed by F6).** `server` < `worker` id in v1; a name
+resolves to exactly one instance (no shadow copies, no double subscription); worker scope may only
+narrow (subset + smaller limits) and may never widen beyond manifest grants — concretely, the worker
+layer is a **filter** over `scopes.server`: `worker.<id>.use:` can remove a name, and a name it
+restates is declared at the worker layer (that is the scope the set digest records), so a per-worker
+set is expressed by *omitting* names and never by adding them (F11); ordering is by
+`[plugin].order` then name, never config-file order; worker-id scopes resolve lazily but their shape is
+validated at boot. **`harness` and `profile` scopes are removed**: `session/created` carries `{}` and no
+event kind records either value, so a set that depended on them could not be recomputed at claim from
+durable state — which is exactly what D17's guard requires. Per-worker sets remain fully expressible
+(worker `use:` narrowing, per-instance `limits:`), "only under dsh / only for the router profile" needs
+worker-id scoping or `required = false`, and the narrow is recorded with its reopening trigger as SPEC
+§16.18. Rationale: every industry precedent found (Codex first-match, Envoy most-specific,
+profiles/injection per instance) agrees on named scopes and deterministic resolution and disagrees on
+the algorithm — so kian states its own rule rather than claiming a standard; and a scope whose key is
+not durable is a resolution input that cannot be audited after a restart. → SPEC §8.
 
 **D27 — The `harness/<name>/*` namespace ships empty in v1.** The namespace, its validation and its
 refusal rule exist; no harness declares a point, so a `harness/…` subscription is a boot refusal, not
@@ -356,10 +462,10 @@ guarantees, zero orchestrator surface, and one fewer place where an end write co
 
 **F — gRPC or HTTP transport for the sidecar instead of stdio JSON-lines.** Gives typed schemas,
 streaming and standard deadlines. Rejected for v1: it adds a network listener surface, TLS/auth
-questions and a dependency footprint to a component whose whole value is "no new dependency and no new
-surface"; and the dsh bridge already proves the stdio JSON-lines carrier in this codebase. Revisitable
-if a plugin ever needs multi-tenant remote deployment — which is also when D8's wasm/remote track
-opens.
+questions and a dependency footprint to a component whose whole value is "no new surface and, in
+dependency terms, no new package"; and the dsh bridge already proves the stdio JSON-lines carrier in
+this codebase. Revisitable if a plugin ever needs multi-tenant remote deployment — which is also when
+D8's wasm/remote track opens.
 
 **G — One sidecar process per session (or per worker).** Considered for isolation and state clarity.
 Rejected: process spawn cost and memory multiply by session count, and per-session state would invite
@@ -382,17 +488,24 @@ answers "not done yet, and here is why".
 - Per-session plugin sets with deterministic resolution and a fail-closed identity guard, without a new
   event, table or config semantics change for `plugins:`.
 - A trust and failure model that is stated once and honestly: operator-trusted sidecars, fail-closed
-  action hooks, fail-open settlement, bounded vetoes, process-lifetime quarantine, no fake sandbox.
-- Zero new dependencies, zero dynamic-loading crates, and `static_only.rs` untouched.
+  action hooks **for veto-capable subscribers only**, a discarded (never escalating) class for
+  out-of-grant speech, fail-open settlement, bounded vetoes, process-lifetime quarantine with two
+  immediate triggers, no fake sandbox.
+- No dynamic-loading crates and `static_only.rs` untouched; **zero new third-party packages**, because
+  the one added edge (`sha2`) is already a workspace dependency of five other crates.
 - Model-visible effects all ride existing honest paths: a denial is an honest error result, a blocked
   settlement is a synthetic steer input, a vetoed admission is a row that never existed.
 
 **Given up**
 
 - **Post-effect gaps that the contract now states instead of hiding**: no dsh-child tool veto, no dsh
-  recovery observation, no API-borne admission veto, no per-chunk interception, no transform. A user
-  who needs any of these must wait for the named deferral (SPEC §16) — the contract does not pretend
-  otherwise.
+  `turn/request`/`turn/response` observation (F2 removed both rows rather than approximating their
+  payloads), no dsh recovery observation, no API-borne admission veto, no per-chunk interception, no
+  transform. A user who needs any of these must wait for the named deferral (SPEC §16) — the contract
+  does not pretend otherwise.
+- **No harness- or profile-scoped plugin sets** (F6): the effective set is a function of the config
+  snapshot and the durable `exec_worker` id only, so "only under dsh" is expressed by worker-id scoping
+  or `required = false` (SPEC §8.2, §16.18).
 - **No sender-visible refusal on the admission path in v1**: a channel-borne veto is an audit line and a
   row that never existed; the sender is never told, because there is no inbound refusal wire (SPEC §4.1,
   §16.15).
@@ -400,8 +513,10 @@ answers "not done yet, and here is why".
   settle phase lives in `WorkerLoopDriver`, which those sessions do not run under (SPEC §3.4.4, §16.16).
 - **No durable set identity across a restart**: the §9 guard compares only within one process lifetime, so
   a config change made while the process was down is undetected (SPEC §9.2 step 5, §16.2).
-- **A `kian-loop → kian-plugin` dependency edge.** The loop is no longer plugin-free. Mitigation: the
-  port trait is plain data, and `kian-plugin` is already a leaf-side crate with no execution surface.
+- **A `kian-loop → kian-plugin` dependency edge, plus one workspace edge for digests.** The loop is no
+  longer plugin-free, and `kian-plugin` gains `sha2.workspace = true` (already in the lockfile).
+  Mitigation: the port trait is plain data, `kian-plugin` is already a leaf-side crate with no execution
+  surface, and the loop still receives the bus by injection — so a test can run it with a null bus.
 - **A required `sha256` per manifest.** More friction for plugin authors, deliberately: it is the one
   artifact-integrity control that costs an operator nothing at runtime.
 - **Hot reload / live un-quarantine** — operators restart the server. Acceptable at
@@ -465,8 +580,10 @@ state machine. The burden the contract carries is the burden of its closures: ad
 capability or a grant requires updating the document first.
 
 **Code** — not in this round (D6). Estimated shape for the implementation: a `hooks` module in
-`kian-plugin` (bus, registry, views, runner), port wiring at six call sites, a `sidecars:` section plus
-validation in `kian-cli`, and one EVENT-MODEL payload value. No crate gains a new external dependency.
+`kian-plugin` (bus, registry, views, runner), port wiring at nine call sites, a `sidecars:` section plus
+validation in `kian-cli`, and one EVENT-MODEL payload value. Dependency edges: `kian-loop → kian-plugin`
+(with the bus injected) and `kian-plugin → sha2` (a workspace edge, no new package); **no new external
+dependency anywhere**, and `kian-dsh` keeps its `kian-core`-only waist through a crate-local port.
 
 ## Appendix A — findings ledger (every finding: fixed or deferred)
 
@@ -481,7 +598,7 @@ dropped and none is silently re-scoped.
 | C02 | blocker | **Fixed** — no context mutation at any tier; `turn/request` is observe-only; `mutate:context` removed (reserved, refused); the purity-as-cache proof deleted; the request body is not even shipped | SPEC §3.3, §3.2.3, §5.1, §12; D2, D13 |
 | C03 | blocker | **Fixed** — per-reason matrix (`completed` only bailable; `interrupted`/`failed`/`cancelled` never reach the gate); veto is bounded by `max_settle_vetoes`, counted from the stream, exhaustion settles with an override audit | SPEC §3.4.2, §4.6; D15 |
 | C04 | blocker | **Fixed** — admission port at the existing pre-admission boundary (after shaping, before the first inbox write), control plane dumb, plus the coverage matrix including the internal-producer exclusions and the audit-only nature of a channel veto (no row written, sender not notified — §16.15) | SPEC §3.4.3, §4.1; D24 |
-| C05 | blocker | **Fixed** — six port methods, each with owning crate, exact today's call site, and required dependency edge; dsh stays core-only via construction-time injection | SPEC §4, §4.1–§4.6; D11, D12 |
+| C05 | blocker | **Fixed** — seven port methods at nine call sites, each with owning crate, exact today's call site, and required dependency edge; the dsh bridge keeps `kian-core`-only through a crate-local port (F2 removed its two unpopulatable `turn/*` rows) | SPEC §4, §4.1–§4.6; D11, D12; §16.17 |
 | C06 | blocker | **Fixed** — closed per-hook payload catalog with field-level types, per-variant capability requirements, dispatch/session/worker/seq/epoch identity, reply legality, ordering/idempotency, and the per-hook outcome matrix | SPEC §3.2, §7 |
 | C07 | major | **Fixed** — declarative permission first, then hook; `tool/call` appended in both arms with provenance; deny never invokes; honest-error `tool/result`; the one required EVENT-MODEL value named as a same-change implementation-round amendment | SPEC §4.4; D23; §16.1 |
 | C08 | major | **Fixed** — every reply variant names its capability; `flow.stop` at admit = veto requiring `veto:admit`; observe-only replies cannot carry a decision; no `mutate:admit` exists | SPEC §3.3, §5.1, §5.2; D13 |
@@ -493,7 +610,7 @@ dropped and none is silently re-scoped.
 | C14 | major | **Fixed** — admission veto limited to the channel boundary, and the refusal is audit-only (no inbox row is written; the sender is not notified in v1, because no inbound refusal wire exists); the API-level veto and any sender-visible refusal are separately deferred with owners; no silent *successful* admission is implied | SPEC §3.4.3, §4.1; D24; §16.3, §16.15 |
 | C15 | major | **Fixed** — hook-scoped registry (`HandlerId{plugin, hook, grants, order}` + `Disposer`), session-scope filtering, process-global registration = server scope; raw `Ctx::on*` unchanged | SPEC §5.3; D20 |
 | C16 | major | **Fixed** — normative hook × harness matrix; reuse defined as the shared vocabulary subset; dsh-child tools explicitly out of contract; request/response/recover dsh behavior stated per point | SPEC §3.4.1, §3.5; D21 |
-| C17 | major | **Fixed** — closed YAML grammar for the four scopes, pure resolution pseudocode, ordering/replacement rules, narrowing-only enforcement, worked limits example, boot validation | SPEC §8; D26 |
+| C17 | major | **Fixed** — closed YAML grammar (two scopes in v1: `server` + durable `worker`, the harness/profile layers removed by F6), pure resolution pseudocode, ordering/replacement rules, narrowing-only enforcement, worked limits example, boot validation | SPEC §8, §16.18; D26 |
 | C18 | major | **Fixed** — tier 2 removed from the normative contract; tiers 0 and 1 only; wasm recorded as non-normative with its own trigger and no v1 ABI/host-function promises | SPEC §2, §16.6; D8 |
 | C19 | minor | **Fixed** — bounded stderr (line size, retained rate, drop-and-audit, concurrent drain) and symmetric frame caps with quarantine on violation; failures folded into the lifecycle/outcome matrices | SPEC §7.6, §10.5, §6.4; D25 |
 | C20 | minor | **Fixed** — `WorkerLoopDriver` ownership corrected (lineage, evidence gate/verdict, `thread/completed`, Router completion report); mandate issuance named as spawn-path and not attributed to the wrapper | SPEC §4.6 step 1; D12 |
@@ -503,9 +620,41 @@ dropped and none is silently re-scoped.
 | S03 | major | **Fixed** — `abi` is the single version identity (`abi` ≡ wire `v`), `ready` set-equality rules defined, plugin `version` reported, audited and included in the set digest; refusal codes closed | SPEC §7.3, §8.5 |
 | S04 | major | **Fixed** — one lifecycle state machine, one failure window with two reported numbers (`failures`, `restarts`), explicit consecutive-reset rule, in-flight crash outcome, process-lifetime quarantine | SPEC §6.3, §6.4; D25 |
 | S05 | major | **Fixed** — the forever-cached per-id tool side (`WorkerSideFactory`, `superagent.rs:615`) is explicitly *not* the hook mechanism; hook resolution is per session over (session, binding, config snapshot) with the §9 digest guard | SPEC §8.4, §9; D17 |
-| S06 | major | **Fixed** — per-harness observation timing made explicit via `timing:"pre_send" \| "post_attempt"`; no claim that a dsh hook precedes or alters the child's provider request | SPEC §3.2.3, §3.4.1, §4.2; D21 |
+| S06 | major | **Fixed, then narrowed** — observation timing was made explicit via `timing:"pre_send" \| "post_attempt"` with no claim that a dsh hook precedes or alters the child's provider request; F2 then removed the dsh `turn/*` rows entirely, so `timing` dispatches `"pre_send"` only and `"post_attempt"` is reserved for the deferred site (SPEC §16.17) | SPEC §3.2.3, §3.4.1, §4.2; D21 |
 | S07 | blocker | **Fixed (by exclusion)** — dsh-child tool veto is unsupported in v1 and stated as such; `tool/pre` fires only where kian mediates the call (`surface:"react"`), and the matrix says `no` under dsh rather than converting a post-hoc mapped `tool/call` into a claimed pre-execution veto; the extension is a named deferral owned by `kian-dsh` | SPEC §3.4.1, §3.5, §4.4; §16.4; D21 |
 | S08 | blocker | **Fixed (by mechanism change)** — the settle gate is not a `DrainCtx` decorator (impossible: the engine calls `end_session` on the concrete ctx) but a `WorkerLoopDriver` phase at the outcome boundary whose denial is one synthetic admission; atomic-end preserved, orchestrator untouched; the deviation from R4's literal wording is recorded | SPEC §4.6; D12; *Alternatives E* |
 | S09 | minor | **Fixed** — `static_only.rs` untouched and its claim narrowed to "no dynamic-loading crate in kian-plugin's normal tree"; no process-isolation or behavioral-compatibility claim | SPEC §13.2; D6, D10 |
 | S10 | major | **Fixed** — runtime-neutral design: one dedicated `std` thread per sidecar, blocking `std::process`/`std::io`, runner-owned deadline via `Instant`, `futures::channel::oneshot` on the async side, no tokio in `kian-plugin`; no drain task ever blocks | SPEC §2, §7.6; D19 |
 | S11 | major | **Fixed** — rollback split: fresh/never-enabled deployments get byte-identical behavior; an existing session's rollback is an edit plus a `kian serve` restart, after which that session runs under the re-resolved (here: empty) set with **no detection and no session quarantine** — the guard's coverage ends at the restart (SPEC §9.2 step 5), so the last `hook-set` audit line from the old process is the operator's only record, and no document calls the post-restart run byte-identical to an unextended one; inside one process, mismatch quarantine remains an invariant guard only (no v1 path produces that mismatch by editing the config) | SPEC §13.3, §9.2 step 5, §9.3; D17; §16.2 |
+
+## Appendix B — the FINAL review closure (F1–F10)
+
+The codex FINAL cross-review (`shared/round13/codex-final-review.md`) left ten MUST-FIX items: baseline
+finding **#2** (unfixed) plus nine new ones (its NEW-1…NEW-7 plus the two baseline items #5 and #13/#17
+it still counted). Each row is an owner ruling, implemented where the fourth column says. Three rows
+**narrow** the contract; the rest correct it.
+
+| # | Finding | Owner ruling | Where it landed | Decision |
+|---|---|---|---|---|
+| F1 | baseline #2: `turn/request` vs. fallback-rebuilt bodies is unspecified | fire **exactly once**, on the persisted primary `step/request` bytes, after the append and before the first provider call; fallback bodies are provider-layer internals and are **not** re-dispatched | SPEC §3.1 row, §3.2.3 (normative paragraph), §4.2 | D11 |
+| F2 | baseline #5 / NEW: the dsh request·response "ports" are not real post-persist / settled-response sites | verify; if a row cannot be populated, **remove it** (`mapping.rs:411` precedes the driver append; `mapping.rs:447` is `map_tool_call`) | SPEC §3.4.1 (both rows `no`), §3.5, §4 rows, §4.2, §4.3, **§16.17**; DESIGN §6.4 | D11, D21 — **narrowing** |
+| F3 | NEW-1: an out-of-grant reply resolved to the fail-closed default let an observe-only plugin induce a denial | out-of-grant / wrong-mode speech is **discarded as an opinion** (+ audit); outcome = as-if-absent; fail-closed belongs **only** to unreachability, and only to a `veto:*` holder | SPEC §1 (Class default, Veto-capable subscriber), §3.3, §3.4.3, §5.1, §5.2, §8.3, §10.2, §11.1 (two disjoint classes), §10.6 (`hook-discard`) | D14 — **corrects an escalation hole** |
+| F4 | NEW-2: admission is one payload but the fan-out writes per target | normative order: shaping → **one** `admit/pre` at the channel boundary → per-target writes → `admit/post`; hooks never write; partial-write semantics unchanged (`subscriptions.rs:499/520-541`) | SPEC §3.1 row, §3.2.1 (`targets`), §3.2.2, §4.1 (ordering block) | D24 |
+| F5 | baseline #13: whole-section vs per-instance `required`; `frame_overflow` counted and quarantining at once | `required` is **per instance**; refusals are per instance, no section refusal; **frame overflow = immediate quarantine**, not a window entry | SPEC §6.1, §6.2 (per-instance + two boundary cases), §6.4, §6.5, §7.6, §11.2 | D25 — **narrowing** |
+| F6 | baseline #17: `binding.harness`/`profile` have no durable source | EVENT-MODEL `session/created` carries `{}` → **remove both** from the inputs; set = (config snapshot, durable `exec_worker`); record the narrowing | SPEC §1 (Effective set), §8.1 (two scopes), §8.2 (pseudocode + limitation), §9.2 step 2, §15, **§16.18** | D17, D26 — **narrowing** |
+| F7 | NEW-3: the digest covered three limits and ignored `argv`/`env_allow`/restart/stderr/`order`/`required` | enumerate the **closed, complete** input list (identity, scope, order, required, binary digest, `process_sha256` over argv+env_allow+cwd+startup, grants, all seven limits); state the list is closed | SPEC §8.5 | D17 |
+| F8 | NEW-4 + NEW-7: the `ready` frame was not required to match the manifest identity, and the admission frame's `epoch` was undefined | identity = canonical manifest path + name + version + `abi`, restated exactly by `ready` (typed refusal otherwise); **admission frames carry no `epoch`** — present on drain-phase hooks only | SPEC §6.2 rule 12, §7.2 (frames + epoch rule), §7.3 (identity) | D25 |
+| F9 | NEW-5: no outcome when the settle gate's synthetic admission fails | three-step path: gate **does not settle** (ordinary append-failure route, session recoverable); veto **counted** in-process; one audit line (`hook-veto-admit-failed`) | SPEC §4.6 | D12 |
+| F10 | NEW-6: "zero dependency-tree entries" is false — SHA-256 is needed and absent | name the implementation: `sha2 = "0.10"`, already a workspace dependency → **zero new packages, one new edge**; `kian-loop` grows the `kian-plugin` edge *and* gets injection; `kian-dsh` neither (crate-local port); reconcile `static_only.rs` | SPEC §2, §4 (edge column), §8.5, §13.2; DESIGN §6.4 | D11, D19 |
+
+## Appendix C — the CONFIRMATION review closure (F11–F12)
+
+The codex CONFIRMATION review (`shared/round13/codex-confirm-review.md`) accepted all ten FINAL rows
+in Appendix B and opened two blockers. Both close as **corrections, not narrowings**: the first fixes
+an example so it obeys the rule it illustrates, the second states the frame identity the F4 ordering
+always implied.
+
+| # | Finding | Owner ruling | Where it landed | Decision |
+|---|---|---|---|---|
+| F11 | the §8.1 worked YAML contradicted its own narrowing rule: `scopes.server` omitted `approval-gate` while `worker.node-zulu` added it through `use:` + `limits:`, which the subset rule refuses at boot | keep the rule, **fix the example**: `scopes.server` lists **both** instances, `worker.node-zulu` narrows with `use:` + `limits:`, a second worker keeps both with one tightened bound; `resolve` is restated as a **filter** (it is what the subset rule always meant) and the example is walked through it with both effective sets stated; a `limits:` key for a name the worker cannot receive now refuses boot instead of becoming a silent no-op | SPEC §8.1 (YAML + subset/`limits:` bullets), §8.2 (pseudocode, invariants 1–2, the walk-through, the F6 limitation cross-ref) | D26 — **corrects the example and pins the filter** |
+| F12 | the remainder of F4: one multi-session `admit/pre` evaluation cannot populate the closed frame's singular `session`/`worker`/`seq`, and nothing said which target's set selects subscribers or which worker's deadline applies | one **evaluation**, one `hook` frame **per (subscriber, target session)** carrying that target's identity and post-narrowing `deadline_ms`; replies correlate by frame id; the first deny refuses the event for **all** targets (no row anywhere; audit names the denying plugin, the denying target and the set size); a target with no subscriber gets no frame, and that is not an error | SPEC §1 (Dispatch), §3.1 row, §3.2, §3.2.1, §4.1 (ordering block, per-target-frames paragraph, veto audit fields), §7.2, §7.3, §8.3, §10.6 | D24 — **states the identity F4's ordering implied** |

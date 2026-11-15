@@ -140,6 +140,11 @@ when the owner asks. Negative results commit documentation only — never broken
   lifecycle, binding/dispatch, catalog/discovery, security boundary, version policy and
   degradation. **Any worker-membership semantic change starts here**; wire shapes stay in
   API-CONTRACT, event kinds in EVENT-MODEL, placement in DESIGN.
+- `design/PLUGIN-SPEC.md` — the normative hook-plugin contract (source of truth): the two-tier
+  model (compile-time handlers + operator-trusted stdio sidecars), hook vocabulary and payload
+  catalog, interception ports, capability grants, manifest and stdio ABI, per-worker resolution,
+  session consistency, failure policy and trust model. **Any harness-hook plugin change starts
+  here**; event kinds stay in EVENT-MODEL, wire shapes in API-CONTRACT, placement in DESIGN.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.
