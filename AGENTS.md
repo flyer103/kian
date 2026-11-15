@@ -157,9 +157,9 @@ plus minimal usage of advanced capabilities. Keep this shape, top to bottom: one
 **Never add to README** — these live in their owning docs:
 
 - status tables, test counts, event-kind/ADR counts, acceptance checklists, four-gate records —
-  [CHANGELOG.md](CHANGELOG.md), [docs/SPEC.md](docs/SPEC.md), [docs/overview.md](docs/overview.md);
+  [docs/SPEC.md](docs/SPEC.md), [docs/overview.md](docs/overview.md), the pull request;
 - release history and internal work-plan narratives — [CHANGELOG.md](CHANGELOG.md), SPEC §5;
-- verbose live-run logs and benchmark methodology — runbooks, CHANGELOG, SPEC;
+- verbose live-run logs and benchmark methodology — runbooks, SPEC, the pull request;
 - semantic detail already owned by SPEC / DESIGN / EVENT-MODEL — link to it, never restate it.
 
 **When changing README**, in the same change:
@@ -174,4 +174,15 @@ plus minimal usage of advanced capabilities. Keep this shape, top to bottom: one
    output marked as abridged.
 5. Adding a capability = one line in `## Features` + one usage example in `## Advanced usage`; its
    semantics stay in SPEC / DESIGN / EVENT-MODEL.
+
+## CHANGELOG policy
+
+`CHANGELOG.md` records **what changed, when, and in which capability** — nothing else.
+
+- **Newest first.** The newest entry is at the top; the file reads as a reverse-chronological log.
+- **One bullet per functional change** — capability, contract, behavior — naming the owning
+  doc/ADR. A change with no functional delta (a verification-only round, a log edit) gets no entry.
+- **No acceptance results**: no gates, test counts, "verified / unverified / live-run / L2-L3
+  evidence" bullets, QA verdicts, or deployment status. Those belong to the pull request, the run
+  logs/runbooks, and the SPEC / overview status tables.
 
