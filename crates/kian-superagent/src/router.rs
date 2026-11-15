@@ -1663,7 +1663,10 @@ impl ToolProvider for RouterTools {
         let mut schemas = vec![
             ToolSchema {
                 name: SPAWN_WORKER_TOOL.to_string(),
-                description: "Dispatch a task to a fresh worker session; returns the thread id. "
+                description: "Dispatch a task to a fresh worker session; returns the thread id. \
+                    Reply one short acknowledgement on the requesting channel right after \
+                    dispatch, then wait for the thread report — never sit silent while a long \
+                    task runs."
                     .into(),
                 parameters: self.spawn_worker_parameters(),
             },

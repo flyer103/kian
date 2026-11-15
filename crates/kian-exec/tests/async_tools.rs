@@ -93,6 +93,12 @@ struct TestRig {
 
 /// Boots endpoint + queue + async engine over one sqlite file.
 async fn rig(db: &PathBuf) -> TestRig {
+    rig_with(db, Duration::from_secs(15)).await
+}
+
+/// Same rig with an explicit dispatch bound: the two-phase wait tests need
+/// the dispatch phase to expire while the worker is still executing.
+async fn rig_with(db: &PathBuf, queue_timeout: Duration) -> TestRig {
     let store = ExecStore::open(db).await.unwrap();
     let endpoint = Arc::new(Endpoint::new(
         "dev-box",
@@ -111,7 +117,7 @@ async fn rig(db: &PathBuf) -> TestRig {
             vec![("dev-box".into(), manager.clone())],
             "dev-box",
             RemoteExecConfig {
-                queue_timeout: Duration::from_secs(15),
+                queue_timeout,
                 poll_interval: Duration::from_millis(40),
             },
         )
@@ -546,6 +552,48 @@ async fn restart_redrives_pending_and_inflight_jobs() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
+
+    shutdown(rig).await;
+}
+
+/// ADR-028: a job that outlives the dispatch wait still delivers its real
+/// result. The execution wait is bounded by the command's own worker-side
+/// kill bound, not by `queue_timeout`.
+#[tokio::test]
+async fn job_outliving_the_dispatch_wait_delivers_the_real_result() {
+    no_proxy();
+    let db = temp_db();
+    let rig = rig_with(&db, Duration::from_millis(400)).await;
+
+    let started = rig
+        .pair
+        .invoke(call(
+            "call-long-job",
+            "start",
+            serde_json::json!({
+                "argv": ["bash", "-c", "sleep 1; echo job-done"],
+                "timeout_ms": 5_000
+            }),
+        ))
+        .await
+        .unwrap();
+    let job_id = Uuid::parse_str(started.output["job_id"].as_str().unwrap()).unwrap();
+
+    // The command outlives the 400 ms dispatch wait by 600 ms.
+    let row = wait_for_job(&rig.store, job_id, |r| r.status.is_terminal()).await;
+    assert_eq!(
+        row.status,
+        AsyncJobStatus::Done,
+        "the execution wait must outlive the dispatch wait: {row:?}"
+    );
+    let result = row.result.expect("a done job carries its result");
+    assert_eq!(result["exit_code"], serde_json::json!(0), "{result}");
+    assert_eq!(
+        result["stdout"],
+        serde_json::json!("job-done\n"),
+        "{result}"
+    );
+    assert_eq!(result["timed_out"], serde_json::json!(false), "{result}");
 
     shutdown(rig).await;
 }

@@ -76,6 +76,19 @@ async fn setup() -> (
     ExecStore,
     PathBuf,
 ) {
+    setup_with(Duration::from_secs(8)).await
+}
+
+/// Same rig with an explicit dispatch bound (ADR-028's phase tests).
+async fn setup_with(
+    queue_timeout: Duration,
+) -> (
+    Arc<ConnectionManager>,
+    Arc<RemoteExecBackend>,
+    Arc<RemoteExecTool>,
+    ExecStore,
+    PathBuf,
+) {
     let db = temp_db();
     let store = ExecStore::open(&db).await.unwrap();
     let endpoint = Arc::new(Endpoint::new(
@@ -95,7 +108,7 @@ async fn setup() -> (
             vec![("dev-box".into(), manager.clone())],
             "dev-box",
             RemoteExecConfig {
-                queue_timeout: Duration::from_secs(8),
+                queue_timeout,
                 poll_interval: Duration::from_millis(40),
             },
         )
@@ -129,6 +142,83 @@ async fn remote_tool_schema_matches_builtin_exec_shape() {
             "required": ["argv"]
         })
     );
+}
+
+/// ADR-028 (1b): a `timeout_ms` above the caller's own wait bound is refused
+/// before anything is enqueued — no row, no dispatch, and an error that names
+/// both bounds instead of a timeout that reads like a kill.
+#[tokio::test]
+async fn exec_refuses_timeout_ms_above_the_wait_bound() {
+    no_proxy();
+    let (_manager, backend, tool, store, _db) = setup_with(Duration::from_millis(500)).await;
+
+    let result = tool
+        .invoke(call(
+            "call-oversized",
+            serde_json::json!({"argv": ["echo", "x"], "timeout_ms": 60_000}),
+        ))
+        .await
+        .unwrap();
+    assert!(result.is_error, "a refusal is an honest error output");
+    assert_eq!(result.output["rejected"], serde_json::json!(true));
+    assert_eq!(result.output["wait_bound_ms"], serde_json::json!(500));
+    assert_eq!(result.output["timed_out"], serde_json::json!(false));
+    let text = result.output["error"].as_str().expect("error text");
+    assert!(text.contains("60000"), "names the requested bound: {text}");
+    assert!(text.contains("500"), "names the enforced bound: {text}");
+    assert!(
+        store
+            .get(kian_exec::tool::command_id_for_tool_call("call-oversized"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused call must not leave a queue row"
+    );
+
+    backend.shutdown().await;
+}
+
+/// ADR-028 (1c): when the dispatch wait expires while a worker is executing,
+/// the error says so — `row_state: "inflight"`, `still_running: true` — so the
+/// model never has to guess whether the command is still alive.
+#[tokio::test]
+async fn exec_timeout_reports_the_worker_still_running() {
+    no_proxy();
+    let (_manager, backend, tool, store, _db) = setup_with(Duration::from_millis(600)).await;
+    let invoking = tool.clone();
+    let handle = tokio::spawn(async move {
+        invoking
+            .invoke(call(
+                "call-blocked",
+                serde_json::json!({"argv": ["sleep", "3"]}),
+            ))
+            .await
+    });
+    let command_id = kian_exec::tool::command_id_for_tool_call("call-blocked");
+    // Let the row reach the worker first: the phase under test is the one
+    // that starts *after* dispatch.
+    let mut dispatched = false;
+    for _ in 0..250 {
+        if matches!(
+            store.get(command_id).await.unwrap().map(|row| row.status),
+            Some(kian_exec::QueueStatus::Inflight)
+        ) {
+            dispatched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dispatched, "the row must reach the worker before the bound");
+
+    let result = handle.await.unwrap().unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.output["timed_out"], serde_json::json!(true));
+    assert_eq!(result.output["row_state"], serde_json::json!("inflight"));
+    assert_eq!(result.output["still_running"], serde_json::json!(true));
+    assert_eq!(result.output["row_abandoned"], serde_json::json!(true));
+    assert_eq!(result.output["wait_bound_ms"], serde_json::json!(600));
+
+    backend.shutdown().await;
 }
 
 /// Happy path over real TCP: invoke resolves with the tool-call id echoed

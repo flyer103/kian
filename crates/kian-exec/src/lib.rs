@@ -22,9 +22,10 @@
 //!   dispatch, and results reach session events only via the normal
 //!   `tool/call`/`tool/result` loop path;
 //! - [`backend`] — [`RemoteExecBackend`] (enqueue-first `ExecBackend`:
-//!   park while offline, re-drive on connect/restart, honest
-//!   `ExecError::Timeout` → `abandoned` at `queue_timeout`, at-least-once
-//!   to the endpoint, deduped by command id);
+//!   park while offline, re-drive on connect/restart, honest waits bounded
+//!   per phase — a dispatch wait `queue_timeout` → `abandoned`, an
+//!   execution wait by the command's own kill bound and never row-mutating
+//!   (ADR-028) — at-least-once to the endpoint, deduped by command id);
 //! - [`tool`] — [`RemoteExecTool`] (the same `exec` tool schema as the
 //!   local built-in, routed through a configured endpoint);
 //! - [`watchdog`] — [`HeartbeatWatchdog`], the v1 [`kian_core::seams::
@@ -57,7 +58,10 @@ pub use async_jobs::{AsyncEnqueueOutcome, AsyncJob, AsyncJobStatus};
 pub use async_tool::{
     AsyncExecTool, AsyncJobs, AsyncResultSink, AsyncToolPair, SessionForCall, StopTool,
 };
-pub use backend::{DefaultRoute, MembershipConfig, RemoteExecBackend, RemoteExecConfig};
+pub use backend::{
+    DefaultRoute, ExecWaitError, ExpiredRow, MembershipConfig, RemoteExecBackend, RemoteExecConfig,
+    WaitPolicy,
+};
 pub use connection::{BackoffConfig, ConnectionConfig, ConnectionManager, EndpointStatus};
 pub use error::ConnectionError;
 pub use membership::{
