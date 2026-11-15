@@ -63,6 +63,15 @@ const USAGE: &str = "usage:
                                          last heartbeat, bound live session/thread
                                          (read-only; description and protocol version
                                          are runtime-only facts, absent by design)
+  kian board [--db <sqlite>] [--config <path>] [--json]
+                                         delegation task board: one row per task —
+                                         task_id, assignee, attempt, outcome, gate
+                                         (read-only; refuses with exit 2 while
+                                         superagent.board.enabled is false)
+  kian tasks --all [--db <sqlite>] [--config <path>] [--json]
+                                         the same task rows, flat, one line per task
+                                         (--all is required in v1; read-only, and the
+                                         same superagent.board.enabled gate)
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event
   kian wechat login [--config <path>] [--channel <name>] [--json]
@@ -107,6 +116,8 @@ fn main() -> ExitCode {
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("workers") => workers(&args[2..]),
+        Some("board") => board(&args[2..]),
+        Some("tasks") => tasks(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("wechat") => wechat(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
@@ -1129,6 +1140,86 @@ fn workers(args: &[String]) -> ExitCode {
     run_command(
         kian_cli::commands::run_workers(&config, db.as_deref(), json),
         "workers",
+    )
+}
+
+fn board(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!("kian: --db requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown board option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    run_command(
+        kian_cli::commands::run_board(&config, db.as_deref(), json),
+        "board",
+    )
+}
+
+fn tasks(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut json = false;
+    let mut all = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!("kian: --db requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            "--all" => all = true,
+            other => {
+                eprintln!("kian: unknown tasks option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // Pin P3-2: the bare `kian tasks` form is refused with usage —
+    // `--all` is required in v1 (there is no filtered task surface
+    // yet; printing everything must be an explicit choice).
+    if !all {
+        eprintln!(
+            "kian: `tasks` requires --all in v1 (every task, one line each — \
+             there is no filtered task surface yet)\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
+    run_command(
+        kian_cli::commands::run_tasks(&config, db.as_deref(), json),
+        "tasks",
     )
 }
 

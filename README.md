@@ -68,8 +68,8 @@ The same runtime also ships:
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
   the event stream stays the only truth.
-- **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats/workers, `/metrics`, and
-  a frozen wire-only `kian-sdk`.
+- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/workers,
+  `/metrics`, and a frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
   process plus embedded sqlite is the whole system, with no hosted service required.
 
@@ -411,6 +411,31 @@ superagent:
 - **Policy version** renders as a `[policy <label>]` header; boot-time drift is marked without
   rewriting live sessions.
 
+### Delegation task board (kian board / kian tasks --all)
+
+Every `spawn_worker` delegation is a task with a derived identity. The board is the read-only
+operator surface over those tasks — one row per task, derived from the committed wrapper plus the
+child's own stream (never from prose), served from the materialized `task_board` view when fresh
+and from the honest full-stream derivation otherwise (identical output either way):
+
+```yaml
+superagent:
+  board:
+    enabled: true      # default false: no view published, verbs refuse with exit 2
+```
+
+```console
+$ kian board --db kian.sqlite
+TASK_ID                               ASSIGNEE   ATTEMPT                OUTCOME              STATUS       GATE   EVIDENCE
+8d810f2b-a34f-5188-81fb-3611c2489591  -                1     completed_verified         completed     pass   pass@6 (derived)
+4e69aaa3-4650-5b49-b37e-5b9a01ac212f  -                1           outstanding       outstanding   absent   -
+
+$ kian tasks --all --db kian.sqlite --json   # the same rows, flat / as {now_ms, version, tasks}
+```
+
+`kian tasks` without `--all` refuses with usage (there is no filtered task surface in v1); both
+verbs write nothing — no events, no inbox rows, no view updates.
+
 ### BYOM execution endpoints
 
 The cloud loop can execute commands on a remote endpoint daemon (`kiand`) over a durable queue:
@@ -678,6 +703,7 @@ target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes +
 | Surface | What it does |
 |---------|--------------|
 | `kian tickets [--json]` | Read-only Ticket stage board: `queued`, `working`, `awaiting-answer`, `awaiting-review`, `delivery-retry`, `blocked-failed`, `idle` |
+| `kian board [--json]` / `kian tasks --all [--json]` | Read-only delegation task board: one row per task (task_id, assignee, attempt, outcome, gate); refuses with exit 2 while `superagent.board.enabled` is false |
 | `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
