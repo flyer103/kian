@@ -109,6 +109,7 @@ pub mod intake;
 pub mod lark;
 pub mod metrics;
 pub mod mock;
+pub mod multiagent;
 pub mod outbox;
 pub mod policy;
 pub mod policy_version;
@@ -122,6 +123,7 @@ pub mod rules;
 pub mod stage;
 pub mod subscriptions;
 pub mod templates;
+pub mod timeout;
 pub mod timer;
 pub mod toolpack;
 pub mod watchdog;
@@ -154,6 +156,13 @@ pub use metrics::{
     SystemTurnClock, TurnClock, TurnRecord,
 };
 pub use mock::{CapturedDelivery, MockChannel};
+pub use multiagent::{
+    BUDGET_EXHAUSTED_CLASS, CHILD_TIMEOUT_REQUESTED_BY, CapRefusal, DEFAULT_CHILD_TIMEOUT_MS,
+    DEFAULT_MAX_CHILDREN, DEFAULT_MAX_DEPTH, EMPTY_RESPONSE_CLASS, MultiagentLimits, Reconcile,
+    SUCCESS_SET, SpawnIdentity, TaskOutcome, cap_refusal, child_session_id, child_thread_id,
+    depth_of, derive_outcome, holding_children, join_target, legacy_report_key,
+    reconcile_completion, report_key, report_key_for, spawn_uid, task_input_key,
+};
 pub use outbox::{
     DEFAULT_BACKOFF_CAP_MS, DEFAULT_BACKOFF_START_MS, DEFAULT_MAX_ATTEMPTS, Delivered,
     ManualRetryClock, OutboxConfig, OutboxDriver, OutboxEntry, OutboxMetrics, OutboxPark,
@@ -202,6 +211,7 @@ pub use templates::{
     mount_async_tools, mount_recall_tools, mount_watchdog_tools, render_worker_prompt,
     router_template, worker_mandate_line, worker_template,
 };
+pub use timeout::{ChildTick, due_interrupts};
 pub use timer::{
     DEFAULT_TIMER_TOPIC, TIMER_CHANNEL, TIMER_QUEUE_CAPACITY, TimerChannel, TimerConfig,
 };
