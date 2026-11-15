@@ -1506,6 +1506,27 @@ A new capability is attempted in order of core footprint, smallest first:
 4. **Core primitive** (last resort): entering kian-core requires proof it cannot be expressed at
  the edge.
 
+### 6.4 Hook plugins (lifecycle hooks and the stdio sidecar tier)
+
+`kian-plugin` also carries a hook bus — a small, closed vocabulary of execution-lifecycle points
+(admission, request, response, tool, recovery, settlement) that both harnesses reach through
+named ports, so one plugin serves the ReAct loop and the dsh bridge without harness-specific code.
+Two tiers only: **tier 0** compile-time handlers (the same static registration as §6.1, hook-scoped
+in `kian-plugin::hooks`) and **tier 1** operator-trusted child processes speaking JSON lines over
+stdio, which may observe and veto but may never provide a seam, mutate a request, or write an event.
+Hooks add no event kind, no table, no route and no ops method: a `tool/pre` denial is an honest error
+`tool/result`, an `admit/pre` veto is an audit line plus an inbox row that is **never written** (no
+`tool/result`, no notification — v1 has no inbound refusal wire, PLUGIN-SPEC §4.1), a blocked
+settlement is one synthetic `input/admitted`, and everything else is a `tracing` audit line. A third,
+sandboxed tier (wasm) is **not** part of the contract — it is gated on a distinct
+untrusted-third-party isolation trigger. The contract (hook points and payloads, the six
+interception ports, capability grants, the manifest and stdio ABI, per-worker resolution, session
+consistency, failure/quarantine policy and the trust model) is
+[PLUGIN-SPEC.md](PLUGIN-SPEC.md); the rationale, alternatives and the review ledger are
+[ADR-028](decisions/ADR-028-harness-hook-plugins.md). No crate in this section's crate map changes
+outside `kian-plugin`, `kian-loop`, `kian-dsh` (injection only), `kian-superagent` and `kian-cli`;
+`kian-core`, `kian-store` and `kian-orchestrator` gain nothing.
+
 ## 7. Module layout (crate structure)
 
 ```mermaid
