@@ -1403,8 +1403,9 @@ each consecutive request pair within a session, the message prefix must be byte-
 provider-independent prefix-cache hit-rate proxy); the only counted invalidation cause is
 `compact` — any other prefix change surfaces under `unexpected_prefix_change` and is a
 constraint-3 violation. The same report is exposed by `kian cache-stats [--config <path>]
-[--session <uuid>] [--json]`; the live-provider run is env-gated (`KIAN_API_KEY`), excluded from
-CI, and recorded in the [CHANGELOG](../CHANGELOG.md) gated-surfaces table.
+[--session <uuid>] [--json]`; the live-provider run is env-gated (`KIAN_API_KEY`), excluded
+from CI, so it is recorded in the run log of whichever run performed it, never in the
+changelog.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session
