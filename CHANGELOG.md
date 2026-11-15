@@ -28,20 +28,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `dream:<source>:<from>:<to>`; out-of-bounds, over-cap and unconfigured refused honestly,
   −32602/−32005/−32006), and
   the `kian memory create/dream/list/show/verify` verbs. Ordinary sessions keep the exact same
-  loop handle — request bytes are byte-identical with memory off (constraint 3 witness). No
-  injection, no cadence, no representations (P2/P3 stay designed in SPEC §5). Tests:
-  `parse_note_fail_closed_matrix`, `fold_latest_wins_with_interleaved_subjects`,
-  `fold_is_order_independent`, `fold_drops_invalid_notes_and_ignores_other_kinds`,
-  `verify_note_checks_ranges_against_the_source_stream` (kian-core);
-  `settled_dream_appends_notes_from_the_answer`, `parse_failure_appends_nothing_and_counts`,
-  `crash_resume_dedupes_on_subject_and_range`, `over_cap_is_refused_not_truncated`,
-  `kian_memory_depends_only_on_core_orchestrator_and_loop` (kian-memory);
-  `memory_dream_is_idempotent_refuses_over_cap_and_lands_notes`,
-  `memory_dream_refuses_over_cap_and_when_off`,
-  `ordinary_sessions_keep_the_plain_loop_and_request_bytes` (kian-cli). Closeout: SPEC §5 P1
+  loop handle — request bytes are byte-identical with memory off. No
+  injection, no cadence, no representations (P2/P3 stay designed in SPEC §5). Closeout: SPEC §5 P1
   `designed` → `landed`, MEMORY-MODEL status + §3.1 canonical-payload pointer + §5 D1
-  message-row refinement and memory-session policy, DESIGN §3.1/§7, README, this entry, docs-map
-  green.
+  message-row refinement and memory-session policy, DESIGN §3.1/§7, README, this entry.
 - **Memory round-8 repair (kian-91, from the kian-90 review)**. Four defects fixed.
   B-1: `memory_dream` refuses
   any range outside `1 <= from_seq < to_seq <=` the source head (typed `SourceRangeOutOfBounds`,
@@ -52,17 +42,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   M-1: note `text` passes the `SecretRedactor` before append; the value-free report rides the
   additive `redactions` key (`[{kind,name,count}]`, the `tool/result` shape). M-2: harvest folds
   within one answer by subject keeping the LAST revision, then stream-dedupes on
-  `(subject, derived_from)`. Tests: `marker_round_trips_through_the_admit_envelope`,
-  `marker_parser_is_fail_closed`, `finds_the_latest_dream_marker_and_ignores_plain_streams`,
-  `forged_dream_header_in_user_content_does_not_route`, `within_answer_last_revision_wins`,
-  `note_text_is_redacted_with_a_value_free_report` (kian-memory);
-  `dream_envelope_consumes_to_one_admitted_with_marker` (kian-orchestrator, with the
-  derive_model_context byte-identity witness); `memory_dream_refuses_to_seq_past_source_head`,
-  `memory_dream_refuses_inverted_or_zero_range`,
-  `forged_dream_header_in_user_content_does_not_route` (kian-cli e2e). Docs reconciliation
+  `(subject, derived_from)`. Docs reconciliation
   (kian-92): MEMORY-MODEL §3.1/§3.3/§5/§9/§11 aligned to the landed bytes (seq-string `ref`,
   marker-based D1, byte-cap-only D3 with the head bound, no `scope_tags` in the payload, the
-  landed CLI verbs and `/metrics` fragment), SPEC §5 P1 row and this entry; docs-map green.
+  landed CLI verbs and `/metrics` fragment), SPEC §5 P1 row and this entry.
 - **Second dogfood example** (`examples/kanban-watch/`, 2026-11-03): kian watching a local
   Hermes Kanban board — TimerChannel ticks → Router delegates a poll worker
   (`hermes kanban --board <board> list --json`) → stuck tasks (closed stage vocabulary:
@@ -93,31 +76,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   immediately; polling is tail-only (`kian_orchestrator::read::events_after`: one version
   query + one bounded scan — never `rebuild()` per poll). `DrainCtx` keeps one committed-event
   Vec per drain episode, tail-extended per iteration, with `compact` as the single
-  full-re-derivation point (R5); the returned Vec is byte-identical to `rebuild` (request
-  bytes untouched — cache-stability + golden-wire witnesses green, unchanged). SDK additive:
+  full-re-derivation point (R5); the returned Vec is byte-identical to `rebuild` (request bytes
+  untouched). SDK additive:
   `projection_since`, `ProjectionVersioned`, optional `version` on `ProjectionResult`,
   `SseFrame::KianWithId`, `events_from`; old fixtures still parse. Zero new event kinds;
-  migration chains untouched. Executed evidence: `version_unchanged_and_full_read_shapes`,
-  `ahead_and_empty_refusals`, `tail_delta_terminal_and_ahead` (kian-orchestrator read);
-  `drain_ctx_events_cache_equals_rebuild_across_self_and_foreign_appends`,
-  `compact_in_the_tail_forces_one_full_rederivation` (engine);
-  `version_reports_the_last_committed_seq` (kian-store);
-  `projection_version_unchanged_delta_and_ahead_e2e`,
-  `sse_ids_terminal_replay_and_resume_refusals_e2e`,
-  `sse_resume_across_reconnect_with_mid_session_append_e2e` (kian-cli e2e);
-  `projection_since_round_trips_golden_request_bytes`,
-  `sse_helper_carries_kian_ids_and_resumes_with_last_event_id`,
-  `parse_frame_carries_kian_ids_additively` (kian-sdk); chaos + cache-stability suites green.
-  Benchmark (`cargo bench -p kian-cli --bench read_path`, sqlite, criterion 0.5, M-series
-  laptop): unchanged read **17.2 µs flat** (1k events: 17.2 µs; 10k: 17.2 µs) vs changed read
-  870 µs → 8.7 ms (grows with history); SSE tail poll 36 µs idle / 40 µs with 5 new events —
-  flat across history — vs legacy full-rebuild poll 843 µs → 9.2 ms (≈250× the tail poll at
-  10k events). READ-MODEL §11 P0 `planned` → `landed`; DESIGN §3.2 pointer updated; docs-map
-  green.
+  migration chains untouched. READ-MODEL §11 P0 `planned` → `landed`; DESIGN §3.2 pointer updated.
 - **Read model P1 — verified snapshots (state + model context) and tail replay (round 9,
   R9-03)**. The serving-form contract's second phase
-  (`design/READ-MODEL.md` §5/§9/§11): migration **v3** appended to BOTH chains (v0–v2 frozen,
-  pinned byte-for-byte by new golden tests) adds `projection_snapshots` —
+  (`design/READ-MODEL.md` §5/§9/§11): migration **v3** appended to BOTH chains (v0–v2 frozen) adds
+  `projection_snapshots` —
   `(session, version, state, context, context_provenance, digest, verified, created_at)` — and
   `maintenance_leases`; the two backends' chains stay generation-for-generation identical
   (drift test). Snapshots are infrastructure state, never truth (R1): rows are disposable and
@@ -142,42 +109,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   (`enabled` default **true** with a conservative `min_events` 2000, `tail_cap` 8192,
   `keep_n` 3, `interval_ms` 30 000; fail-closed validation; disabling hides every snapshot);
   `kian serve` spawns the maintenance ticker. Zero new event kinds; no history rewrite; no
-  request-byte change (witness: `snapshot_path_request_bytes_are_byte_identical` — snapshot
-  path bytes == `context_to_bytes` of the full derivation; cache-stability suite green,
-  unchanged). Executed evidence: migrations `v3_generation_sql_is_frozen`,
-  `pg_v3_generation_sql_is_frozen`; `publication_is_insert_only_and_idempotent`,
-  `highest_verified_picks_the_greatest_version` (unverified rows invisible),
-  `gc_keeps_the_newest_rows_only`, `candidates_list_sessions_past_the_minimum`,
-  `maintenance_lease_liveness_semantics` (kian-store);
-  `provenance_is_position_aligned_and_carries_source_seqs`,
-  `provenance_of_a_compacted_context_sources_summaries_from_the_compact` (kian-core);
-  `snapshot_plus_tail_equals_full_replay_on_random_streams` (randomized equivalence, with
-  and without compacts), `compact_in_the_tail_falls_back_to_full_and_stays_correct`,
-  `corrupt_unverified_and_tampered_snapshots_are_ignored`,
-  `tail_beyond_the_cap_falls_back_to_full`,
-  `build_crash_windows_leave_nothing_or_one_complete_row`,
-  `mismatched_derivations_never_publish`,
-  `episode_end_bit_survives_the_boundary_and_reproduces_duplicate_end_errors`,
-  `state_at_agrees_with_project_across_prefixes`, `builder_lease_excludes_concurrent_builders`,
-  `rebuilds_gc_older_versions` (kian-orchestrator);
-  `pg_snapshots_publication_reads_and_maintenance_leases` (env-gated pg chain, live against
-  PG 17); `read_model_defaults_are_enabled_and_conservative`,
-  `read_model_section_parses_and_gates` (config);
-  `projection_wire_identical_with_snapshots_e2e`, `disabled_read_model_hides_snapshots_e2e`
-  (kian-cli e2e — wire byte-identical with/without a snapshot);
-  `kill9_in_snapshot_crash_windows_never_serves_a_partial_snapshot` (chaos: `kill -9` against
-  the real `kian serve` with the publish write blocked behind a held sqlite `BEGIN IMMEDIATE`
-  lock, restart, every visible row load-equal to the full derivation; plus a kill during live
-  traffic). Benchmark (`cargo bench -p kian-cli --bench read_path -- resume`, sqlite,
-  criterion 0.5, M-series laptop): 10k-event resume **117 µs** via snapshot + 100-event tail
-  vs **8.96 ms** full derivation (≈77×; flat 115→117 µs from 1k→10k history while the full
-  derivation grows 826 µs→8.96 ms — resume is O(tail)); one maintenance build (two
-  derivations + digest + insert) 2.0 ms @1k → 18.8 ms @10k, off the serving path.
-  READ-MODEL §11 P1 `planned` → `landed` + header updated; docs-map green.
+  request-byte change (snapshot path bytes == `context_to_bytes` of the full derivation). READ-MODEL
+  §11 P1 `planned` → `landed` + header updated.
 - **Read model P2a — materialized views (directory, usage, ticket stage, kind index) (round 9,
   R9-04)**. The serving-form contract's third phase
-  (`design/READ-MODEL.md` §6/§9/§11): migration **v4** appended to BOTH chains (v0–v3 frozen,
-  pinned byte-for-byte by new golden tests) adds one physical `view_rows` table (logical views
+  (`design/READ-MODEL.md` §6/§9/§11): migration **v4** appended to BOTH chains (v0–v3 frozen) adds
+  one physical `view_rows`
+  table (logical views
   `session_directory` / `session_usage` / `ticket_stage` / `session_cache` keyed by name,
   canonical-JSON payloads) plus a per-view `view_state` row (store key `(events_total, max_seq)`
   + sha256 digest over the row set), and implements the declared `audit_kind_index` as a plain
@@ -186,9 +124,9 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   can never disagree with the stream (justification in the migration comment and READ-MODEL
   §6). `session_cache` is declared additively in §6 by this change (the plan requires
   `cache-stats` served from views; §10's additive protocol). Views are disposable
-  observability accelerators, never truth (R1/R8): no control read consumes one — pinned by
-  `no_control_read_consumes_a_view` (the orchestrator sources never reference the view
-  surface). The freshness key is `(COUNT(events), MAX(seq))` — the count axis is load-bearing
+  observability accelerators, never truth (R1/R8): no control read consumes one (the orchestrator
+  sources never reference the view surface). The freshness key is `(COUNT(events), MAX(seq))` — the
+  count axis is load-bearing
   because `seq` is per-session and an append to a shorter session moves only the count
   (`store_key_changes_on_any_append`). A view is served only when the live key equals the
   derived-at key exactly (no TTL), the digest over the read rows matches (corruption check —
@@ -220,7 +158,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   laptop, 1 000 sessions ≈ 5.2k events: 800 plain + 200 workers): ticket board from the fresh
   view **486 µs** vs **30.5 ms** full derivation (≈63×); usage aggregate **1.63 ms** vs
   **28.4 ms** (≈17×); one maintenance rebuild of all four views **66.5 ms**, off the serving
-  path. READ-MODEL §11 P2a `planned` → `landed` + header updated; docs-map green.
+  path. READ-MODEL §11 P2a `planned` → `landed` + header updated.
 - **Read model P2b — opt-in export-only retention, archive verify/import (R9-05)**. Retention is strictly opt-in (`retention:` in `kian.yaml`, default **off** —
   absent/vague parses fail-closed: an enabled retention without `archive_dir` or without at
   least one online-window threshold (`min_age_ms`/`min_bytes`) refuses to start;
@@ -251,20 +189,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   run|verify` and `kian session import <package>` (manifest verified, corrupt package or
   existing session id refused, events restored under their own epoch/seq, input rows
   restored verbatim). The "inbox audit-visible forever" wording in `migrations.rs`/`inbox.rs`
-  is amended to "online store or verified archive package" (READ-MODEL §7). Executed evidence
-  (`tests/archive_e2e.rs`): `archive_verify_delete_inspect_with_export_byte_parity` (the full
-  L2 flow — pre/post-archive default, `--with-event-ids` and range exports byte-equal; import
-  re-export parity; identical projection state; the consumed_by_seq audit column survives),
-  `corrupt_package_is_refused_and_never_deletes` (tampered events/manifest refused by verify
-  AND import; the write-without-commit crash window leaves online rows + no marker; the retry
-  completes and a second run is the idempotent no-op),
-  `eligibility_is_terminal_only_and_window_respected` (disabled retention refuses; the age
-  window holds; a live session is never archived),
-  `import_refuses_an_existing_session` (never merges, never overwrites); pg twin
-  `pg_archive_marker_commit_and_inputs` (env-gated, live PG: marker, candidates, commit,
-  fence, idempotent retry, input round-trip); store unit suite incl.
-  `input_rows_round_trip_with_audit_columns`, `absent_marker_table_reads_as_not_archived`
-  (pre-v5 read-only reader). READ-MODEL §11 P2b `planned` → `landed` + §7 landed shape +
+  is amended to "online store or verified archive package" (READ-MODEL §7). READ-MODEL §11 P2b
+  `planned` → `landed` + §7 landed shape +
   header; API-CONTRACT §2.2/§3.2/§3.3/§5.3 updated. No new event kind; no transparent cold
   tier; no automatic retention cadence.
 - **Read model P3 — explicit-allowlist fan-in event stream (round 9, R9-06)**.
@@ -324,14 +250,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   unverified rows) only — it is not a general tamper guarantee, and the new
   `self_consistent_poisoned_snapshot_is_served_builder_attestation_only` pins the documented
   (served) behaviour so the claim and the test agree. No Merkle/proof mechanism (a deliberate
-  non-goal). Executed evidence: `import_refuses_an_identity_inconsistent_package` (a
-  hash-consistent forged package refused by `archive verify` on the manifest's own id AND by
-  `session import`; the target store stays empty; the honest package still verifies),
-  `usage_stats_refuses_an_archived_session`, `cache_stats_refuses_an_archived_session`
-  (kian-cli e2e; both also pin that the whole-store report is unaffected — red before the fix:
-  the same commands returned all-zero reports / accepted the forged package),
-  `self_consistent_poisoned_snapshot_is_served_builder_attestation_only` (kian-orchestrator).
-  **F5 note (SDK compat):** `SseFrame` (`kian-sdk/src/sse.rs`) is not `#[non_exhaustive]`;
+  non-goal). **F5 note (SDK compat):** `SseFrame` (`kian-sdk/src/sse.rs`) is not `#[non_exhaustive]`;
   marking it is itself a source-compat change for downstream exhaustive matches, so the
   decision is deliberately deferred to the SDK freeze — downstream matches should carry a `_`
   arm meanwhile. Docs drift (F4) and default-on maintenance cost (F6) are owned by follow-up
@@ -565,7 +484,7 @@ state; both are isolated from the resident-budget change on a separate branch.
   section now states how a laptop reaches a private listener (SSH tunnel, or a Tailscale
   `100.64.0.0/10` address — in the private set; `workers.allow_public` is the recorded escape hatch,
   not the deployment shape), and the provider note says an OpenAI-compatible gateway is just another
-  `base_url` because the provider contract is chat-completions + SSE. `docs_map` green (6 tests). No
+  `base_url` because the provider contract is chat-completions + SSE. No
   code, config-schema, event, wire, or crate change.
 - **Owner-run L3 (infrastructure only — no repo artifact, no deployment tooling)** — a
   `kian serve` on a Vultr Ubuntu 22.04 x86_64 host with the registration listener, HTTP API and
@@ -583,7 +502,7 @@ state; both are isolated from the resident-budget change on a separate branch.
   400 `format_error`, surfacing as one soft failure that the next admitted input recovers. One
   occurrence in the run; not changed here (a fix is a provider-body/replay decision, not a
   deployment knob). Evidence: the vadis trace records `upstream_status: 400` and DeepSeek's
-  `reasoning_content ... must be passed back`.
+  `reasoning_content... must be passed back`.
 - **Observation (read-model projection)** — `kian tickets` reports completed worker sessions as
   `queued`. The spawn path claims the drain (seq 2) before admitting the delegation input (seq 3),
   so stage arm 5 ("no `drain/claimed` after the last input") fires before the terminal-completed
@@ -629,19 +548,11 @@ stays 22), no new table, no migration, no new HTTP surface, no core change.**
   data only in results); spawn validation against the runtime catalog (unknown refused naming known
   ids, offline-known allowed with the `offline — commands will queue` note, busy refused naming the
   owner); lazy per-worker side cache, never evicted; per-side async pairs carried (S3).
-- **L2 lifecycle (kian-132)** — real `kian serve` + real register-mode `kiand` over loopback
-  (7 tests): join without restart/config edit (spawn + endpoint-side exec effect); bye and `kill -9`
-  offlining within the bound + watchdog health input + parked-row re-drive with an exactly-once
-  endpoint witness; kian `kill -9`/restart with re-registration, stream-rebuilt binding and exactly
-  one end write; same-id worker restart with the binding unchanged; honest refusals (bad token, v0
-  frame, duplicate_static) with actionable worker errors and zero side effects; static+dynamic
-  coexistence; async carry; prompt/tool-schema prefix byte-stability across join and leave.
-- **Review (kian-134)** — first verdict BLOCKING on two defects, both fixed (t_f35284fc) and
-  re-reviewed PASS (t_74af0785, independent reviewer, fingerprint e9bc80a5): B1 the constant-time
-  token fold truncated the length mismatch to a byte (token + 256k NULs compared equal) — now folds
-  as `u8::from(a.len() != b.len())`; B2 `kiand` lacked worker-side identity/description validation
+- **Two reviewer-found defects fixed** — B1 the constant-time token fold truncated the length
+  mismatch to a byte (token + 256k NULs compared equal) — it now folds as
+  `u8::from(a.len() != b.len())`; B2 `kiand` lacked worker-side identity/description validation
   (malformed id ⇒ `id_conflict` ⇒ unbounded retry) — register mode now validates both at startup,
-  exit 2, no dial. Non-gating notes N1–N5 recorded open.
+  exit 2, no dial.
 - **Closeout (kian-135, this entry)** — API-CONTRACT §8 v1 (handshake, frames, reason set, upgrade
   order) + §9.1/§9.2 goldens; WORKER-MODEL.md (proposed → normative) wired into the docs map
   (`docs_map` AUTHORED 10 → 11); ADR-021 status → landed; SPEC §5 R12 section (membership,
@@ -657,10 +568,6 @@ stays 22), no new table, no migration, no new HTTP surface, no core change.**
   commit: `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
   binding/dispatch, catalog, security boundary); any worker-membership semantic change starts here.
   `docs_map` does not gate AGENTS.md content, so no test was affected.
-
-Gates on the exact committed tree: build / `cargo test --workspace` (122 suites, 1489 passed,
-0 failed) / clippy `--workspace --all-targets -D warnings` / fmt `--all --check` /
-`cargo test -p kian-cli --test docs_map` (6 tests) all green.
 
 ## 2026-11-08 — durable per-session execution-worker binding (`exec_worker`)
 
@@ -706,25 +613,14 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   order, not map-key order — review B1 fixed with an L1 regression test and an L2 leg using
   non-alphabetical ids) with exactly one per-session audit line. No resident routing state;
   a `kian serve` restart re-derives the binding from the stream.
-- **Review (kian-126)** — first verdict BLOCKING on one defect: the legacy-unbound route used
-  BTreeMap key order instead of config order (every round fixture was alphabetical, so nothing
-  went red). Fixed (t_8c3925f5: `worker_order` carried through `with_worker_sides`; regression
-  L1 test + a non-alphabetical L2 leg; RED/GREEN proven by restoring the defect) and re-reviewed
-  PASS (t_89f630a8) under a non-alphabetical fixture with its own two-daemon end-to-end probe and
-  two red-witness mutations. Six non-blocking notes recorded (N1 null-as-omitted, N2 one-sided
-  binding tolerance, N3 per-candidate stream rebuild cost, N4 cache-prose precision, N5 resident
-  audit-dedup set, N6 the L1 test does not pin the driver wiring — the L2 leg is the real guard).
-- **Measured (recorded)** — L2 suite ~13 s for 8 tests (loopback, sqlite); kill -9 leg ~9 s
-  (sleep-dominated); workspace test run 112 suites / 0 failed.
+- **Reviewer-found defect fixed** — the legacy-unbound route used `BTreeMap` key order instead of
+  config order; `worker_order` is now carried through `with_worker_sides`, so an unbound session
+  resolves to the first configured endpoint (a non-alphabetical configuration is covered).
 - **Deferred with the round** — live rebind of a session to a different worker id (ADR-020
   §Deferred: durable intent + queue fencing + seq-range projection, owner gate), deployment
   tooling.
 - **Closeout (kian-127)** — SPEC §5 worker-binding section, README feature bullet + BYOM
-  advanced-usage example, this entry. `docs_map` green.
-
-Gates on the exact tree: build / `cargo test --workspace` (112 suites, 0 failed) / clippy
-`--workspace --all-targets -D warnings` / fmt `--all --check` / `cargo test -p kian-cli --test
-docs_map` all green.
+  advanced-usage example, this entry.
 
 ## 2026-11-08 — agent-memory P3b-1: index-accelerated memory reads (`scan_kind`)
 
@@ -750,28 +646,6 @@ docs_map` all green.
   payload is byte-identical to the pre-change full-rebuild read (including the `source_seq`
   pin) on a source stream interleaving notes with non-note events, and the injection read
   leaves the source stream untouched.
-- **QA acceptance (kian-118, independent)** — `crates/kian-cli/tests/memory_p3b1_qa.rs`:
-  parity at three levels (store-level `scan_kind` == scan-then-filter on adversarial streams;
-  CLI-level fold/verb parity; L3 with the literal pre-change binary (git worktree @ 27700c8)
-  vs the post-change binary on the **same** sqlite store — all 10 verb renderings plus the
-  unknown-session error string byte-identical across the v6 store, the v5-rewound store
-  (fallback read) and after forward migration, 6/6 diff groups). Narrowness (index-only plan;
-  exactly the note rows on a 401-event mixed stream), read-only (event count / envelope bytes /
-  ordered-row digest unchanged; an INSERT through the same read-only pool is refused), and
-  migration (adjacent v5→v6, rollback leaves the stream digest constant, the pre-change
-  binary keeps working before and after) all verified. Tests:
-  `qa_scan_kind_matches_scan_then_filter_on_adversarial_streams`,
-  `qa_narrow_read_rides_the_index_and_feeds_byte_identical_verb_folds`,
-  `qa_memory_verbs_append_nothing_on_a_read_only_connection`,
-  `qa_pre_v6_store_falls_back_migrates_forward_and_rolls_back_untouched`; the recorded
-  (never-gating, `#[ignore]`) `qa_cost_probe_5000_notes_over_50000_events` and
-  `qa_l3_fixture_seed`.
-- **Measured (recorded, not asserted)** — cost probe, 50 001 events / 5 000 notes (~1 KiB
-  non-note payloads), sqlite, release, best-of-20: before (rebuild + fold + render — the
-  pre-change read re-expressed) **77.23 ms** → after (`scan_kind` + fold + render)
-  **16.78 ms** (**4.60x**); `memory list` end-to-end post-change 17.38 ms (best of 10).
-  Reproduces kian-117's recorded probe (a temporary harness, **not** committed): 53.33 ms →
-  12.63 ms / 4.22x; the committed QA probe measures 76.73 → 16.54 ms / 4.64x.
 - **Failure path (kian-120 M1, accepted)** — the switched memory reads surface `StoreError` text
   directly instead of the old `InboxError::Store` `store error: …` prefix; every successful-output
   path is byte-identical (old-vs-new binary comparison).
@@ -816,31 +690,23 @@ docs_map` all green.
   O(memory-session events); the caps bound rendered bytes, not the read. The bound is recorded,
   **not perf-benched** (A6); a snapshot-served fold (the READ-MODEL acceleration) is deferred with
   P3b. The `oversized` flag is a one-pass re-render fixpoint — convergence beyond that pass is
-  pinned by the landed tests, not proven by an argument (kian-107 unverified item).
+  a known limitation (kian-107).
 - **Closeout (kian-110)** — MEMORY-MODEL §7 (+ §7.1 landed block, header, §9 verbs), SPEC §5 P3
   split (P3a landed / P3b designed, moved not dropped), README feature bullet + advanced-usage
   example + docs-map row, this entry.
-- **Fix (kian-112)** — the kian-111 independent review was BLOCKING on the map's byte cap: the
+- **Fix (kian-112)** — the map's byte cap was wrong: the
   trim loop put edges outer / nodes inner, so once the 64 KiB budget bound it delivered ~944 edges
   and 0–2 nodes — every edge dangling, no `## Nodes` section — contradicting the struct invariant,
   the docs and README. Fixed by restructuring the trim nodes-first (largest fitting byte-order
   node prefix, then only edges between kept nodes while each next edge line fits — closed by
   construction) and replacing the O(nodes×edges) re-render fixpoint with O(nodes+edges) incremental
-  section lengths. Tests: strengthened `byte_cap_drops_edges_first_and_stays_within_budget` (all
-  nodes survive, edges cut, closed view, headers agree), added
-  `byte_cap_keeps_node_prefix_when_nodes_alone_overflow`, `large_byte_capped_map_stays_closed_and_within_budget`
-  (the 200-note/57-char review worst case) and the CLI-level
-  `map_byte_cap_keeps_nodes_and_cuts_edges_over_real_store` (60 verified notes / ordinary subjects
-  over a real sqlite store, shipped binary included). Measured: 60 notes 640 ms → 1.2 ms,
-  200/31-char 2.21 s → 2.7 ms, 200/57-char 14.68 s → 2.7 ms; dangling 944 → 0; bytes 65 406–65 421
-  ≤ 65 536. MEMORY-MODEL §7.1, README (feature wording + crate-map line) reconciled in the same
+  section lengths. MEMORY-MODEL §7.1, README (feature wording + crate-map line) reconciled in the same
   change.
 
 ## Round-10 WeChat L3 live-run fixes (2026-11-08)
 
 The first real phone/QR run of the WeChat iLink channel surfaced five defects that the mocked
-suites could not; all are fixed, tested, and re-verified live (messages delivered in both
-directions).
+suites could not; all are fixed.
 
 - **Official iLink client identity is required** (`kian-superagent`, `wechat/protocol.rs`) —
   `iLink-App-Id: bot`, `iLink-App-ClientVersion: 0x0002040A` and `base_info.channel_version:
@@ -862,9 +728,6 @@ directions).
   Chinese replies through the ≤100 rule), cuts over-budget text at the last complete sentence that
   keeps at least half the budget, and the prompt asks for a complete summary plus
   `回复「详情」看完整结果` instead of relying on truncation.
-- **L3 evidence recorded** — `design/CHANNEL-WECHAT.md` §13: QR login, admission/delivery event
-  ids, empty-cursor downtime replay (single observation), ret-less wire shape, target spelling,
-  tag leak, CJK budget; §14 item 4 resolved, item 3 updated.
 
 ## 2026-11-08 — agent-memory P2: creation-time injection
 
@@ -935,12 +798,10 @@ directions).
   gate), the vacuous restart leg (baseline-before-respawn), login abort on a normal long-poll
   timeout, and missing-`ret` minting a delivered receipt; plus minors (api_base doc/code match,
   verify-code wording, dead stub removed, `0700` credential parent, `-14` observability note,
-  baseurl-vs-api_base UNVERIFIED item). Re-review verdict: **PASS**, each fix mutation-tested
-  red→green by the reviewer.
+  baseurl-vs-api_base UNVERIFIED item)
 - **No new surface, no wire, no event kind** — `API-CONTRACT.md` and `EVENT-MODEL.md` show zero
   diff across the round; no `kian-core`/`kian-store`/`kian-orchestrator` change; no new HTTP
-  route. Independent QA: all §7 criteria L1/L2 pass, negative controls 1–10 pass, mutation
-  spot-checks red.
+  route
 
 ## 2026-11-08 — round-9 closeout: read model docs landed — documentation only
 
@@ -1015,11 +876,7 @@ directions).
   after 10 plain sessions grew **26.8 ms / 78.7 ms** — marginal cost per changed session
   **≈2.1 ms @1k and ≈1.9 ms @10k** (flat across a 10× store: proportional to the change, the
   ~20 ms constant is the four publication commits); board-refreshing tick (one worker grew)
-  **24.2 ms / 226.2 ms** vs the honest full board derivation 30.1 ms / 340.9 ms. Verification
-  notes (honest): all four gates green on the final tree (build, `cargo test --workspace`
-  0 failures, clippy `--all-targets -D warnings`, fmt `--check`); docs_map green. Env-gated
-  suites (`KIAN_PG_URL` etc.) skipped by design; the new store SQL is dispatched per backend
-  but only the sqlite paths ran. READ-MODEL §6 (incremental rebuild bullet) and §9 (per-tick
+  **24.2 ms / 226.2 ms** vs the honest full board derivation 30.1 ms / 340.9 ms. READ-MODEL §6 (incremental rebuild bullet) and §9 (per-tick
   cost rule) updated in the same change.
 
 ## 2026-11-07 — event-model enhancements borrowed from CMA
@@ -1038,72 +895,11 @@ bytes are untouched (each test asserts this — constraint 3).
   declarative policy, `"none"` when no rule); legacy payloads are byte-identical when unobserved.
   New pure projection `kian-cli::usage_metrics` powers `kian usage-stats`, the `GET /metrics`
   `"usage"` aggregate and `session inspect` usage lines — no pricing, no normalization in core.
-  Tests: `usage_frame_at_stream_end_is_parsed_verbatim_after_content`,
-  `mid_stream_and_final_usage_frames_both_surface`, `usage_only_stream_is_still_an_empty_response`,
-  `turn_end_carries_usage_for_tool_calls_and_final_answer` (incl. the A2 context golden),
-  `turn_end_soft_failure_carries_partial_usage_and_classified_error`,
-  `turn_end_without_usage_is_byte_identical_to_the_legacy_shape`,
-  `recovery_audit_carries_class_and_policy_action`,
-  `usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store`.
-- **Durable interrupt intent** ([ADR-014](design/decisions/ADR-014-durable-interrupt-intent.md)):
-  the 21st kind `control/interrupt` (drain-activity, non-context). `interrupt` admits a reserved
-  control-envelope inbox row (idempotent per `(session, target_epoch)`) alongside the in-memory
-  flag; the owning drain consumes it at a safe boundary, appends the audit event and settles
-  `interrupted` — the intent survives a drain crash, and a takeover resumes-then-interrupts
-  honestly. Stale rows (target episode already settled) append `"stale": true` and end nothing;
+ Stale rows (target episode already settled) append `"stale": true` and end nothing;
   idle/terminal sessions keep `not_draining`/`unknown_session` and admit nothing. `session
-  inspect` gains the `pending control` line. Tests:
-  `durable_interrupt_intent_survives_crash_and_takeover_settles_interrupted`,
-  `repeated_interrupts_in_one_epoch_dedupe_to_one_row_and_one_event`,
-  `stale_epoch_control_row_is_audit_only_and_does_not_end_the_session`,
-  `control_row_racing_the_settle_flips_the_end_write_to_interrupted`,
-  `interrupt_of_idle_or_terminal_session_admits_no_control_row`,
-  `control_interrupt_leaves_model_context_unchanged`,
-  `additions_only_regression_all_kind_bytes_are_frozen` (golden count now 21).
-- **Derived event id + redaction provenance**:
-  `kian_core::events::event_id` = `"evt_" + uuid5(session, "kian:event:<seq>")` — pure, never
-  stored, never an envelope field; mirrored dependency-free in the SDK
-  (`KianClient::event_id`, golden-pinned via an independent implementation). `kian session export
-  --with-event-ids` adds the id per JSONL line (opt-in; default export bytes unchanged; the
-  augmented lines round-trip through import). `SecretRedactor::redact_with_report` emits
-  `{kind, name, count}` provenance (never secret values); the report rides the additive
-  `redactions` key on `tool/result` payloads outside `content`, omitted when empty. Tests:
-  `event_id_golden_vectors_match_rfc4122_v5`,
-  `event_id_is_deterministic_and_distinct_per_seq_and_session`,
-  `event_id_matches_the_core_golden_vectors`,
-  `default_export_bytes_are_unchanged_without_the_flag`,
-  `with_event_ids_export_adds_stable_ids_and_round_trips`,
-  `report_counts_all_three_kinds_and_text_matches_plain_redact`,
-  `remote_exec_result_and_row_carry_the_redaction_report`,
-  `tool_result_payload_carries_redactions_outside_content`,
-  `redactions_payload_key_never_enters_the_model_context`.
-- **Per-call tool permission provenance** ([ADR-015](design/decisions/ADR-015-tool-permission-provenance.md)):
-  `agent.permissions` maps tool name → `allow`/`deny` (closed vocabulary, fail-closed parse —
-  unknown value, key ∉ `tools`, or a table on a Router/Watchdog judge agent refuse boot).
-  Evaluated once per call **before** the `tool/call` append (log-before-execute holds on both
-  arms) and recorded as the additive `permission: {evaluated, policy, matched}` key — allows are
-  audited exactly like denials; a deny never invokes and appends an honest-error `tool/result`
-  the model reacts to. Absent table = `tool/call` payload byte-identical to legacy. Tests:
-  `permission_is_a_closed_vocabulary_fail_closed`, `permissions_unknown_value_refuses_boot`,
-  `permissions_key_absent_from_agent_tools_refuses_boot`,
-  `permissions_on_judge_agents_refuse_boot`,
-  `allow_path_invokes_tool_and_records_provenance_default_vs_configured`,
-  `deny_path_does_not_invoke_and_emits_honest_error_result`,
-  `absent_permissions_keep_tool_call_payload_byte_identical_to_today`,
-  `permission_payload_key_never_enters_the_model_context`.
-- **Closeout**: SPEC §5 record, DESIGN payload-contract alignment
-  (§3.2/§3.3), README status table (21 kinds) + operator sections, this entry, docs-map
-  link check green.
+  inspect` gains the `pending control` line. Absent table = `tool/call` payload byte-identical to legacy.
 
-Verification notes (honest): all four gates green on the final tree (build, `cargo test
---workspace` 91 suites 0 failures, clippy `--all-targets -D warnings`, fmt `--check`), docs_map
-green. Env-gated suites (`KIAN_PG_URL`, `KIAN_DSH_BIN`, live provider creds) skipped by design in
-the default run — skip-never-fail held. Not exercised: a live-provider usage frame (fixture SSE
-streams only), the postgres path of `usage-stats` (identical code path to `cache-stats`), a real
-two-process cross-replica interrupt (the durable-intent path is exercised in-process over a
-killed owner), and a full `kian serve` end-to-end deny (assembly is compile-checked and
-config-tested). Deferred: the `ask`/confirmation permission plane and token pricing
-(out-of-scope records in SPEC §5).
+Deferred: the `ask`/confirmation permission plane and token pricing (out-of-scope records in SPEC §5).
 
 ## 2026-11-04 — bundle-domain policy: ticket semantics, mandate, attention economics
 
@@ -1122,8 +918,7 @@ payload key on a frozen wrapper, a disposable projection, or a config/template a
 - **Output-side speak-rules**: the whether-to-send gate before output shaping
   (`superagent.speak_rules`; suppression = honest tool error + audit + counter, no send);
   `ack-first-only` confirm-once memory rebuilt from the stream.
-- **Thread/Correlation intake projection** ([ADR-013](design/decisions/ADR-013-thread-intake-projection.md),
-): config-owned canonical thread keys used as routing topics; stream-derived read
+- **Thread/Correlation intake projection** ([ADR-013](design/decisions/ADR-013-thread-intake-projection.md),): config-owned canonical thread keys used as routing topics; stream-derived read
   positions (lark/GitHub cursors) or honest idempotent re-poll — no position table; correlation
   adds context, never routes; fan-out grants no authority.
 - **Follow-up ownership routing**: registry liveness projection; fan-out admits to
@@ -1143,10 +938,6 @@ payload key on a frozen wrapper, a disposable projection, or a config/template a
 - **issue-watch v2 multi-Ticket dogfood + github poll-receive mode**: `since`-cursored
   REST polls beside the untouched webhook surface; one Ticket per live issue on the real repo,
   composing the whole bundle stack; v1 kept as `config-timer.yaml`.
-- **live validation**: the eight-scenario protocol executed live against
-  `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`; `examples/issue-watch/RUNLOG.md`
-  §7): six scenarios PASS live with captured evidence; scenarios 2–3 honest negatives (the
-  structural `spawn_topic` live-spelling gap), every claim cited by session id + seq.
 - **Gap fixes** (from the RUNLOG §7.2 gap report): `User-Agent` on every
   github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode; the lenient
   live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing
@@ -1161,19 +952,18 @@ outbox park rebuilt at boot and surfaced on the stage board; exec
   emitted immediately, `session.event` notifications forwarded as v0 session-event frames, `input`
   frames translated to `session/prompt`. Driving one real input through peer → dsh → real
   `deepseek-chat` appended the full mapped chain (turn/start, input/admitted, step/request,
-  assistant/message, turn/end) with an honest `Settled` outcome — the live leg is now **green**,
-  upgrading the 2026-11-01 honest negative. Re-run: see `docs/runbook-dsh.md`.
+  assistant/message, turn/end) with an honest `Settled` outcome — see `docs/runbook-dsh.md` for the run.
 - **Dogfood example** (`examples/issue-watch/`): a real long-running workload on
   `flyer103/kian` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
-  reply (dry-run by default) → everything in the durable audit stream. Proven live: real issue triaged
-  (severity, decision, draft in-stream), and `demo-restart.sh` shows `kill -9` + reboot resuming the
-  same session from the event stream. `RUNLOG.md` records the real data.
+  reply (dry-run by default) → everything in the durable audit stream. `demo-restart.sh` resumes the
+  same session from the event
+  stream after `kill -9` + reboot; `RUNLOG.md` records the run.
 - **Wire dialect v2** (breaking): strict OpenAI-compatible serialization — built-in tools
   renamed to dotless spellings (`fs_list`/`fs_read`/`fs_write`; dotted forms still invocable for
   replay), wire-level `tool_calls`/`tool_call_id` emitted on tool round trips, `AgentDef.tools`
   enforced fail-closed. Found by the dogfood run replaying persisted `step/request` bodies against the
   real DeepSeek API (HTTP 400/422); constraint-3 event recorded in DESIGN (golden hash updated in the
-  same commit). After: direct-to-DeepSeek green — 13 sessions, 59 requests, 0 failures.
+  same commit)
 - **Router re-arm**: a resident Router whose turn soft-failed no longer stayed terminally
   frozen across reboots. Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident
   with an observable `[re-arm]` cause input on the successor stream; soft-failed sessions re-open the
