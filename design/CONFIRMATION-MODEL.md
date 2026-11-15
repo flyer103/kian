@@ -108,6 +108,9 @@ pub fn pending_calls(events: &[Event]) -> Vec<PendingCall>;
 `tool/call` whose `permission.evaluated == "ask"` and whose `content.id` has no answering
 `tool/result` (`content.call_id` equal). Calls are returned in append order. It reads `Event`s, not
 `Message`s: `permission` is a non-context provenance key, so `derive_model_context` cannot see it.
+The core invariant already treats an open call as a legal stream state
+(`durable_before_execute`: "resolution (a call with no result yet) is not a violation"), so an ask
+does not widen the stream's legality; it names the reason a stream may rest in that shape.
 
 **F2 — Two reads, one definition.** *Claim-time* (the engine deciding whether a claimed session may
 be driven): a non-empty pending set implies the last `session/ended` reason is `awaiting_input`, so
@@ -117,9 +120,14 @@ end reason of the episode it just ran): the fold is windowed to the episode `(cl
 which is bounded by the drain's own writes and needs no gate. The two reads use the same
 `pending_calls`; only the window differs.
 
-**F3 — Batching.** Several calls of one assistant batch may be pending at once. Non-ask calls in the
-same batch still execute (they were allowed; their results are independent). Answers may arrive in
-any order; the turn resumes only when the set is empty. A provider request never sees a partial set.
+**F3 — Batching, in call order.** Several calls of one assistant batch may be pending at once.
+Non-ask calls in the same batch still execute (they were allowed; their results are independent).
+Answers may *arrive* in any order, but effects follow the **call order**: a decided call executes
+(and its `tool/result` is appended) only when every earlier pending call of the batch already has
+its result. A later call's approval is therefore durable immediately (`control/confirm`) while its
+execution may wait for an earlier sibling — the human's decision is never lost, the provider's tool
+block stays in call order, and the turn resumes only when the set is empty. A provider request never
+sees a partial set.
 
 **F4 — Compact safety.** A `compact` range must not contain an unpaired ask call (an ask whose
 `tool/result` would land outside the range). The compact appender refuses such a range; this keeps
@@ -156,6 +164,11 @@ time; the answer does not re-serialize it), then appends `tool/result` with the 
 `{"call_id", "output":{"error":"permission denied by user","policy":"ask","reason"?},
 "is_error":true}` — the ADR-015 deny shape with `policy:"ask"`, because a person denied it, not a
 table. No invocation happens either way before the answer is durable.
+
+*Ordering.* A decision is applied in call order (F3): a drain that holds an approval for a later
+call but not for an earlier one appends the later `control/confirm` and settles `awaiting_input`
+again; the earlier answer's arrival releases both effects in order. No effect precedes its call's
+decision.
 
 *Hook interop.* At ask time the `tool/pre` port is not consulted (the call will not execute). On
 approve, the invocation goes through the normal pre-tool path, so a hook veto after approval is a
@@ -331,7 +344,9 @@ catalog count and the drift test move together.
 7. **Bounded wait**: the session holds no lease while waiting; a wait is visible (`pending`, the end
    reason) and answerable forever when no TTL is configured; with a TTL an answer degrades honestly
    to `expired`.
-8. **Fail-closed boundary**: `ask` is refused by config where no waiting path exists (C2).
+8. **Call-ordered effects**: a decided call's effect never precedes an earlier pending sibling's
+   result (F3); decisions are durable immediately, effects are ordered.
+9. **Fail-closed boundary**: `ask` is refused by config where no waiting path exists (C2).
 
 ## 12. Adversarial walk (crash, race, boundary)
 
@@ -346,7 +361,7 @@ catalog count and the drift test move together.
 | `confirm` for an unknown / already-answered `call_id` | `not_pending`; no row, no event, no side effect. |
 | `confirm` for a session that went terminal | `not_pending` at admission; a row losing the race stays unconsumed and visible; no fabricated result. |
 | Batch: one `ask`, one `allow` in the same iteration | The allowed call executes, the ask defers; the turn resumes only after the answer; the allowed result is not re-executed. |
-| Batch: two asks, answers out of order | Each answer applies to its own `call_id`; the session waits for the second; no provider request in between. |
+| Batch: two asks, the second is answered first | The second decision is durable (`control/confirm`); its effect waits; when the first is answered both effects land in call order; no provider request in between. |
 | User `interrupt` while awaiting | No drain is active (idle) → `not_draining` (existing contract); the pending call is untouched. |
 | A terminal `cancelled` end lands while a call is pending (an ops/bundle path, e.g. the watchdog's terminal cancel) | Terminal `cancelled`; later `confirm` → `not_pending`; the pending call is dead and audited as such. |
 | `compact` over an unpaired ask | Refused (F4); the ask stays visible until answered. |
@@ -368,6 +383,7 @@ State → behavior; each row names its expected level.
 | 7 | `control/confirm` approve | drain consumes | tool invoked once with the frozen arguments; one result with `confirmation` provenance | L1 |
 | 8 | `control/confirm` reject | drain consumes | honest-error result, `policy:"ask"`, no invocation | L1 |
 | 9 | two `control/confirm` for one call | drain consumes both | one result; the second row consumed as a no-op | L1 |
+| 9b | two pending calls, the second answered first | drain consumes the second answer | its `control/confirm` lands, no result yet; after the first answer both results are appended in call order | L1 |
 | 10 | unknown permission value / `ttl_ms` negative | boot | refused, fail-closed | L1 |
 | 11 | `ask` on a worker-template agent | boot | refused, phase-1 message | L1 |
 | 12 | real server, ask then approve | `pending` then `confirm` then resume | idle+awaiting_input observed; result appended; next request's prefix bytes unchanged; `completed` | L2 |
@@ -405,5 +421,8 @@ the request (the request is the stream; a delivery row is the bundle's business)
    denied) — the result carries the decision.
 4. **Multi-pending UX.** N simultaneous requests for one session is well-defined but noisy; should a
    batch ever be collapsed into one decision (all-or-none)? (Phase 1: per call, no collapse.)
-5. **Worker waiting path.** Does the completion gate's `waiting` report become the durable marker,
+5. **Effect ordering vs. out-of-order answers.** F3 chooses call-ordered effects at the cost of a
+   delayed execution for an approved-but-not-yet-releasable call. Is that the right product
+   behavior, or should the UI warn "waiting for an earlier decision"? (Phase 1: the rule only.)
+6. **Worker waiting path.** Does the completion gate's `waiting` report become the durable marker,
    or does the stage derive it from the end reason directly? (Phase 2.)
