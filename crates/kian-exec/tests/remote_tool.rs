@@ -79,7 +79,7 @@ async fn setup() -> (
     setup_with(Duration::from_secs(8)).await
 }
 
-/// Same rig with an explicit dispatch bound (ADR-028's phase tests).
+/// Same rig with an explicit dispatch bound (ADR-030's phase tests).
 async fn setup_with(
     queue_timeout: Duration,
 ) -> (
@@ -144,7 +144,7 @@ async fn remote_tool_schema_matches_builtin_exec_shape() {
     );
 }
 
-/// ADR-028 (1b): a `timeout_ms` above the caller's own wait bound is refused
+/// ADR-030 (1b): a `timeout_ms` above the caller's own wait bound is refused
 /// before anything is enqueued — no row, no dispatch, and an error that names
 /// both bounds instead of a timeout that reads like a kill.
 #[tokio::test]
@@ -178,7 +178,7 @@ async fn exec_refuses_timeout_ms_above_the_wait_bound() {
     backend.shutdown().await;
 }
 
-/// ADR-028 (1c): when the dispatch wait expires while a worker is executing,
+/// ADR-030 (1c): when the dispatch wait expires while a worker is executing,
 /// the error says so — `row_state: "inflight"`, `still_running: true` — so the
 /// model never has to guess whether the command is still alive.
 #[tokio::test]

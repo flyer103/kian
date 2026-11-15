@@ -25,7 +25,7 @@
 //!   park while offline, re-drive on connect/restart, honest waits bounded
 //!   per phase — a dispatch wait `queue_timeout` → `abandoned`, an
 //!   execution wait by the command's own kill bound and never row-mutating
-//!   (ADR-028) — at-least-once to the endpoint, deduped by command id);
+//!   (ADR-030) — at-least-once to the endpoint, deduped by command id);
 //! - [`tool`] — [`RemoteExecTool`] (the same `exec` tool schema as the
 //!   local built-in, routed through a configured endpoint);
 //! - [`watchdog`] — [`HeartbeatWatchdog`], the v1 [`kian_core::seams::

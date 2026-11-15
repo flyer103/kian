@@ -556,7 +556,7 @@ async fn restart_redrives_pending_and_inflight_jobs() {
     shutdown(rig).await;
 }
 
-/// ADR-028: a job that outlives the dispatch wait still delivers its real
+/// ADR-030: a job that outlives the dispatch wait still delivers its real
 /// result. The execution wait is bounded by the command's own worker-side
 /// kill bound, not by `queue_timeout`.
 #[tokio::test]

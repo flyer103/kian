@@ -141,7 +141,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   again (mtime may move) — never a different payload.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
-- **Honest timeout, bounded per phase** (ADR-028). A wait is bounded by what is actually being
+- **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being
   waited on, never by one knob for both:
   - *Dispatch wait* — the row is `pending`: no route has taken it. `queue_timeout` (per static
     endpoint; the backend-level maximum for dynamic workers) is the bound on an absent worker;
@@ -165,7 +165,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
     `async_jobs` row instead of a tool result: phase-A expiry `abandoned` (never dispatched),
     phase-B expiry `abandoned` ("worker silent past the command's own bound") with the live queue
     row untouched; `stop` remains the escape hatch.
-- **A budget stop is `interrupted`** (ADR-028). The loop's only intentional-stop producer is
+- **A budget stop is `interrupted`** (ADR-030). The loop's only intentional-stop producer is
   iteration-budget exhaustion; the worker records `thread/completed{status:"interrupted"}` with the
   stop reason as the summary — never `completed`, whose summary would otherwise be the last
   assistant turn (a pending tool call with empty text). The following `session/ended{completed}`

@@ -17,7 +17,7 @@
 //!   replay dedupe at the row level exactly like the sync tool.
 //! - A detached observer task awaits the correlated result with
 //!   [`WaitPolicy::Job`](crate::WaitPolicy) — the execution wait, so a job
-//!   that outlives `queue_timeout` still delivers its real result (ADR-028)
+//!   that outlives `queue_timeout` still delivers its real result (ADR-030)
 //!   — (the existing per-endpoint queue drivers do the dispatch), settles
 //!   the `async_jobs` row, and hands the settled row to the
 //!   [`AsyncResultSink`] — the kian-cli completion bridge, which
@@ -330,7 +330,7 @@ impl AsyncJobs {
         let endpoint_id = self.endpoint_id.clone();
         let backend = Arc::clone(&self.backend);
         tokio::select! {
-            // ADR-028: the observer is not a parked drain, so it takes the
+            // ADR-030: the observer is not a parked drain, so it takes the
             // execution wait as well — bounded by the command's own
             // worker-side kill bound, and never row-mutating on expiry.
             result = backend.exec_tracked_watched(
