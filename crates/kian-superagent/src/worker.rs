@@ -86,6 +86,11 @@ use crate::multiagent::{
 /// the built-in loop's `builtin` so both can coexist on one stream).
 pub const WORKER_GATE_NAME: &str = "worker";
 
+/// (R17-C3, pin P2-4) Gate name the roster's `output_schema` gate
+/// stamps on its verdicts — the only gate name that derives
+/// [`crate::multiagent::TaskOutcome::InvalidOutput`] (pin P2-5).
+pub const SCHEMA_GATE_NAME: &str = "output_schema";
+
 /// Idempotency key for a spawned worker's task input row (one row per
 /// thread, never two).
 fn task_input_key(thread_id: Uuid) -> String {
@@ -221,26 +226,36 @@ pub fn delegation_mandate(content: &Value) -> Option<&Value> {
 // ---------------------------------------------------------------------------
 
 /// Reads the derived task identity off a delegation wrapper — the
-/// inverse of the four additive keys [`WorkerSpawner::prepare`]
-/// appends on the multiagent path (`spawn_uid`, `task_id`,
-/// `agent_def`, `agent_def_version`, pin P6). The child side and the
-/// completion reconciliation recover the identity from the wrapper
-/// bytes alone (the resolution is recorded, never re-resolved,
-/// §2.1.1), so a replay rehydrates rather than re-consults.
+/// inverse of the additive keys [`WorkerSpawner::prepare`] appends on
+/// the multiagent path (`spawn_uid`, `task_id`, `agent_def`,
+/// `agent_def_version`, and — R17-C2 — `assignee`, pin P6/P2-8). The
+/// child side and the completion reconciliation recover the identity
+/// from the wrapper bytes alone (the resolution is recorded, never
+/// re-resolved, §2.1.1), so a replay rehydrates rather than
+/// re-consults.
 ///
-/// `None` on legacy wrappers (the keys are absent — the legacy path
-/// never writes them) and on partially-written or malformed ones: the
-/// identity is never guessed, never defaulted, never reconstructed
-/// from `thread_id` (a malformed writer is a bug to surface, not a
-/// value to paper over).
+/// `thread_id` is read from the wrapper's own frozen `thread_id` key
+/// (pin P2-8: it is no longer derivable from `task_id` once a
+/// `task_key` splits the two). `assignee` is `None` on wrappers
+/// written before the roster resolved one (the P1 form) — absent,
+/// never guessed. `None` on legacy wrappers (the keys are absent —
+/// the legacy path never writes them) and on partially-written or
+/// malformed ones: the identity is never guessed, never defaulted,
+/// never reconstructed from `thread_id` alone (a malformed writer is
+/// a bug to surface, not a value to paper over).
 #[must_use]
 pub fn spawn_identity_of(wrapper: &Value) -> Option<SpawnIdentity> {
     let obj = wrapper.as_object()?;
     Some(SpawnIdentity {
         spawn_uid: Uuid::parse_str(obj.get("spawn_uid")?.as_str()?).ok()?,
+        thread_id: Uuid::parse_str(obj.get("thread_id")?.as_str()?).ok()?,
         task_id: Uuid::parse_str(obj.get("task_id")?.as_str()?).ok()?,
         agent_def: obj.get("agent_def")?.as_str()?.to_string(),
         agent_def_version: obj.get("agent_def_version")?.as_u64()?,
+        assignee: obj
+            .get("assignee")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -547,7 +562,7 @@ pub fn thread_report_content_ident(
     summary: Value,
     contract: Option<Value>,
 ) -> Value {
-    let mut report = thread_report_content(identity.task_id, status, summary);
+    let mut report = thread_report_content(identity.thread_id, status, summary);
     report["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
     report["task_id"] = Value::String(identity.task_id_str());
     if let Some(contract) = contract {
@@ -773,9 +788,9 @@ impl WorkerSpawner {
     ///
     /// When `request.identity` is `Some` (the multiagent path, R15
     /// plan §4 C2) both ids are **derived from the identity** (pin
-    /// P1): the thread id is the identity's `task_id` (the derived
-    /// thread id, pin P7 — equal to
-    /// `child_thread_id(parent, spawn_uid)` by construction) and the
+    /// P1): the thread id is the identity's `thread_id` (pin P2-8 —
+    /// `child_thread_id(parent, spawn_uid)`, **never** `task_id`,
+    /// which a shared `task_key` would collide across spawns) and the
     /// worker session is `child_session_id(thread_id)`. Derived,
     /// never minted: a replay of the same committed `tool/call`
     /// recomputes the same child instead of minting a second one
@@ -784,12 +799,12 @@ impl WorkerSpawner {
     #[must_use]
     pub fn prepare(&self, request: &SpawnRequest) -> SpawnedWorker {
         let (thread_id, worker_session) = match &request.identity {
-            // Pin P1: the identity carries the resolution — the thread
-            // id is taken from it (never re-minted) and the worker
-            // session is derived from that thread id, so preparing the
-            // same identity twice yields identical ids and identical
-            // wrapper bytes.
-            Some(identity) => (identity.task_id, child_session_id(identity.task_id)),
+            // Pin P1/P2-8: the identity carries the resolution — the
+            // thread id is taken from it (never re-minted) and the
+            // worker session is derived from that thread id, so
+            // preparing the same identity twice yields identical ids
+            // and identical wrapper bytes.
+            Some(identity) => (identity.thread_id, child_session_id(identity.thread_id)),
             None => (Uuid::new_v4(), SessionId::new()),
         };
         let thread = Thread {
@@ -827,11 +842,24 @@ impl WorkerSpawner {
         // appended after the existing additive keys — new wrappers
         // only; the legacy path writes none of them (absent, never
         // null), so every landed wrapper's byte order is untouched.
+        // (R17-C2, §2.1.1:264-269) two more appended keys, in the
+        // same discipline: `assignee` (the roster entry id the spawn
+        // resolved through — present iff a resolution happened) and
+        // `output_schema` (the class-B copy of the declared
+        // expectation, §3.2.1:438-441 — present iff one was declared;
+        // the child is thereby "told about" it, so a restart
+        // reconstructs the gate from its own stream).
         if let Some(identity) = &request.identity {
             wrapper["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
             wrapper["task_id"] = Value::String(identity.task_id_str());
             wrapper["agent_def"] = Value::String(identity.agent_def.clone());
             wrapper["agent_def_version"] = json!(identity.agent_def_version);
+            if let Some(assignee) = &identity.assignee {
+                wrapper["assignee"] = Value::String(assignee.clone());
+            }
+            if let Some(schema) = &request.output_schema {
+                wrapper["output_schema"] = schema.clone();
+            }
         }
         let task_message = json!({"role": "user", "content": wrapper});
         SpawnedWorker {
@@ -872,6 +900,7 @@ impl WorkerSpawner {
             mandate,
             exec_worker: None,
             identity: None,
+            output_schema: None,
         })
         .await
     }
@@ -902,6 +931,15 @@ pub struct SpawnRequest {
     /// the seam: every future spawn-side fact composes here, never as
     /// loose fields.
     pub identity: Option<SpawnIdentity>,
+    /// (R17-C2, §3.2.1:438-441) the declared `output_schema` — the
+    /// call's, or the resolved roster entry's default when the call
+    /// declared none. Copied verbatim into the wrapper as the class-B
+    /// `output_schema` key **iff** one was declared: the child is
+    /// thereby "told about" the expectation, so a restart
+    /// reconstructs the gate from the child's own stream (constraint
+    /// 2). `None` (the `Default`) writes no key — absent, never
+    /// `null` — and the legacy path never sets it.
+    pub output_schema: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1062,185 @@ pub fn completion_summary(events: &[Event], fallback_text: &str) -> Value {
         }
     }
     json!({"text": fallback_text})
+}
+
+// ---------------------------------------------------------------------------
+// The output_schema gate (R17-C3, pin P2-4 — pure planning half)
+// ---------------------------------------------------------------------------
+
+/// The roster assignee of one committed stream (pin P2-2): the
+/// **first** `input/admitted` wrapper's additive `assignee` key — the
+/// recorded resolution (§2.1.1), never a live-config re-resolution.
+/// `None` on legacy wrappers and non-wrapper streams.
+#[must_use]
+pub fn stream_assignee_of(events: &[Event]) -> Option<String> {
+    let assignee = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::InputAdmitted)?
+        .bytes
+        .get("content")?
+        .get("assignee")
+        .and_then(Value::as_str)?;
+    if assignee.is_empty() {
+        return None;
+    }
+    Some(assignee.to_string())
+}
+
+/// The final assistant answer text, if the stream carries one (the
+/// same read [`completion_summary`] performs). `None` when there is no
+/// assistant message or its text is blank — an **empty** final answer
+/// never enters the schema gate (`empty_output` owns that case,
+/// §6.2 row 3).
+#[must_use]
+pub fn final_assistant_answer(events: &[Event]) -> Option<String> {
+    for ev in events.iter().rev() {
+        if ev.kind == EventKind::AssistantMessage
+            && let Some(text) = ev
+                .bytes
+                .get("content")
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+        {
+            return if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            };
+        }
+    }
+    None
+}
+
+/// The idempotency key of the schema-gate correction input (pin P2-4,
+/// §13 pattern): `schema-correction:<spawn_uid>:<attempt>` — derived
+/// from the committed wrapper's `spawn_uid` and the stream-derived
+/// attempt, so a replay of the same committed events re-derives the
+/// same key (byte-stable) and a retried drive never double-appends.
+#[must_use]
+pub fn schema_correction_key(spawn_uid: &str, attempt: u64) -> String {
+    format!("schema-correction:{spawn_uid}:{attempt}")
+}
+
+/// The correction input's committed bytes (pin P2-4): a synthetic
+/// input whose `kian_schema_check` object carries the failed checks
+/// with their honest detail lines, plus the attempt the key derives
+/// from. Pure: same failed checks, same bytes.
+#[must_use]
+pub fn schema_correction_content(attempt: u64, checks: &[kian_loop::CheckOutcome]) -> Value {
+    let errors: Vec<Value> = checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| {
+            let mut row = json!({"name": check.name});
+            if let Some(detail) = &check.detail {
+                row["detail"] = Value::String(detail.clone());
+            }
+            row
+        })
+        .collect();
+    json!({
+        "synthetic": true,
+        "content": {"kian_schema_check": {"attempt": attempt, "errors": errors}},
+    })
+}
+
+/// Counts the correction inputs already committed on the stream (the
+/// schema gate's stream-derived attempt counter — the same discipline
+/// as `evaluate_evidence_gate`'s verdict count: the budget survives
+/// episodes and takeover because it is read off the committed bytes).
+#[must_use]
+pub fn schema_correction_count(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .filter(|ev| {
+            ev.kind == EventKind::InputAdmitted
+                && ev.bytes.get("synthetic") == Some(&json!(true))
+                && ev.bytes.pointer("/content/kian_schema_check").is_some()
+        })
+        .count() as u64
+}
+
+/// One roster-subset keyword check rendered as a gate-verdict check
+/// row (the `{keyword, passed, detail?}` shape mapped onto the verdict
+/// payload's `{name, passed, detail?}`).
+fn check_row(check: &crate::roster::CheckOutcome) -> kian_loop::CheckOutcome {
+    kian_loop::CheckOutcome {
+        name: check.keyword.clone(),
+        passed: check.passed,
+        detail: check.detail.clone(),
+    }
+}
+
+/// Evaluates the final answer text against the declared subset schema
+/// (pin P2-3): an unparseable answer is the `json_parse` violation;
+/// a parseable one is validated keyword for keyword. Pure.
+#[must_use]
+pub fn schema_gate_checks(schema: &Value, answer: &str) -> Vec<kian_loop::CheckOutcome> {
+    match serde_json::from_str::<Value>(answer.trim()) {
+        Err(error) => vec![kian_loop::CheckOutcome {
+            name: "json_parse".to_string(),
+            passed: false,
+            detail: Some(format!("the final answer is not valid JSON: {error}")),
+        }],
+        Ok(instance) => crate::roster::validate_instance(schema, &instance)
+            .iter()
+            .map(check_row)
+            .collect(),
+    }
+}
+
+/// The schema gate's plan for one terminal outcome (pin P2-4), a pure
+/// function of the committed stream:
+///
+/// - [`SchemaGatePlan::Skip`] — no `output_schema` on the wrapper, or
+///   the final answer is empty (never a schema miss, §6.2 row 3);
+/// - [`SchemaGatePlan::Pass`] — every check passed (the gate stays
+///   silent: no verdict is committed, `completed_unverified` keeps the
+///   label unless the *worker* gate verifies it);
+/// - [`SchemaGatePlan::Miss`] — the failed checks, the stream-derived
+///   attempt (committed corrections), and the wrapper's `spawn_uid`
+///   (the correction-key derivation; `None` on a wrapper without one —
+///   no key can be derived, so the miss goes straight to the verdict).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaGatePlan {
+    /// No declared schema, or an empty final answer: the gate appends
+    /// nothing at all (M8 — a wrapper without `output_schema` keeps
+    /// today's bytes exactly).
+    Skip,
+    /// Every check passed: the honest silence — no verdict, no bytes.
+    Pass,
+    /// The failed checks, the stream-derived attempt, and the wrapper's
+    /// `spawn_uid` for the correction-key derivation.
+    Miss {
+        checks: Vec<kian_loop::CheckOutcome>,
+        attempt: u64,
+        spawn_uid: Option<String>,
+    },
+}
+
+/// Plans the schema gate for one drive off the committed events alone.
+#[must_use]
+pub fn schema_gate_plan(events: &[Event]) -> SchemaGatePlan {
+    let wrapper = first_input_content(events);
+    let Some(schema) = wrapper.get("output_schema") else {
+        return SchemaGatePlan::Skip;
+    };
+    let Some(answer) = final_assistant_answer(events) else {
+        return SchemaGatePlan::Skip;
+    };
+    let checks = schema_gate_checks(schema, &answer);
+    if checks.iter().all(|check| check.passed) {
+        return SchemaGatePlan::Pass;
+    }
+    SchemaGatePlan::Miss {
+        checks,
+        attempt: schema_correction_count(events),
+        spawn_uid: wrapper
+            .get("spawn_uid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1750,114 @@ where
     if matches!(final_outcome, LoopOutcome::SoftFailed { .. }) {
         // Honest failure: no gate, no verdict — the thread records
         // `failed` (constraint 7: never completed).
+    } else {
+        // (R17-C3, pin P2-4) the output_schema gate — BEFORE the
+        // worker evidence gate, off the committed stream alone: the
+        // wrapper's class-B `output_schema` key declares the
+        // expectation, the final assistant text is the instance.
+        // A pass stays silent (no verdict — `completed_unverified`
+        // keeps the label); miss #0 appends exactly one correction
+        // input and re-drives; miss #1 commits the verdict and fails
+        // the thread with the raw answer preserved. An empty final
+        // answer never enters the gate (`empty_output` owns it).
+        let events = match port.read_stream().await {
+            Ok(events) => events,
+            Err(e) => {
+                return (
+                    LoopOutcome::SoftFailed {
+                        reason: format!("schema gate: stream read failed: {e}"),
+                    },
+                    Phase::Done,
+                );
+            }
+        };
+        match schema_gate_plan(&events) {
+            SchemaGatePlan::Skip | SchemaGatePlan::Pass => {}
+            SchemaGatePlan::Miss {
+                checks,
+                attempt,
+                spawn_uid,
+            } if attempt == 0 && spawn_uid.is_some() => {
+                // The one correction (§3.2.1:442-445): an input/admitted
+                // event on the child's OWN stream (an inbox row would
+                // strand behind the engine's per-episode take), under
+                // the byte-stable idempotency key
+                // `schema-correction:<spawn_uid>:<attempt>` — a retried
+                // or takeover drive re-derives the same key from the
+                // same committed bytes, so the correction is exactly
+                // one per attempt.
+                let spawn_uid = spawn_uid.expect("checked by the guard");
+                if let Err(e) = port
+                    .emit(
+                        EventKind::InputAdmitted,
+                        schema_correction_content(attempt, &checks),
+                    )
+                    .await
+                {
+                    return (
+                        LoopOutcome::SoftFailed {
+                            reason: format!("schema gate: correction write failed: {e}"),
+                        },
+                        Phase::Done,
+                    );
+                }
+                tracing::info!(
+                    target: "kian::worker",
+                    key = %schema_correction_key(&spawn_uid, attempt),
+                    failed = checks.iter().filter(|c| !c.passed).count(),
+                    "schema gate: one correction admitted; re-driving the inner loop"
+                );
+                let stream = core.driver.drive(ctx.clone());
+                return (
+                    LoopOutcome::TurnDone,
+                    Phase::Inner {
+                        ctx: ctx.clone(),
+                        port,
+                        thread_id: Some(thread_id),
+                        stream,
+                    },
+                );
+            }
+            SchemaGatePlan::Miss {
+                checks, attempt, ..
+            } => {
+                // Miss #1 (or a miss with no derivable key): commit the
+                // verdict and fail the thread. The completion below
+                // preserves the RAW answer as the summary — the parent
+                // sees what the child actually said, never a summary of
+                // the failure alone (§3.2.1:445-451).
+                let verdict = kian_loop::GateVerdict {
+                    passed: false,
+                    checks,
+                    attempt,
+                };
+                if let Err(e) = port
+                    .emit(
+                        EventKind::EvidenceVerdict,
+                        verdict_payload(SCHEMA_GATE_NAME, &verdict),
+                    )
+                    .await
+                {
+                    return (
+                        LoopOutcome::SoftFailed {
+                            reason: format!("schema gate: verdict write failed: {e}"),
+                        },
+                        Phase::Done,
+                    );
+                }
+                final_outcome = LoopOutcome::SoftFailed {
+                    reason: format!(
+                        "output_schema gate `{SCHEMA_GATE_NAME}` failed after {} attempt(s)",
+                        attempt + 1
+                    ),
+                };
+            }
+        }
+    }
+    if matches!(final_outcome, LoopOutcome::SoftFailed { .. }) {
+        // The schema gate's terminal miss lands here too: no worker
+        // gate for an already-failed thread (one honest reason, not
+        // two competing verdicts).
     } else if core.config.gate.enabled {
         let events = match port.read_stream().await {
             Ok(events) => events,
@@ -2621,6 +2946,7 @@ mod tests {
             mandate: None,
             exec_worker: None,
             identity: None,
+            output_schema: None,
         });
         let bound = spawner.prepare(&super::SpawnRequest {
             task: json!("do the thing"),
@@ -2629,6 +2955,7 @@ mod tests {
             mandate: None,
             exec_worker: Some("mac-mini".into()),
             identity: None,
+            output_schema: None,
         });
         // The same frozen fields over the BOUND spawn's own thread id
         // (two prepares mint two threads — the id is the only
@@ -3189,6 +3516,7 @@ mod tests {
             mandate: Some(mandate.clone()),
             exec_worker: Some("mac-mini".into()),
             identity: Some(identity.clone()),
+            output_schema: None,
         });
         let wrapper = &spawned.task_message["content"];
         // The composed legacy form over the SAME (derived) thread id.
@@ -3230,13 +3558,20 @@ mod tests {
         let identity = crate::multiagent::SpawnIdentity::derive(router, 3, "mock-worker", 7);
         let good = json!({
             "spawn_uid": identity.spawn_uid.to_string(),
+            "thread_id": identity.thread_id.to_string(),
             "task_id": identity.task_id.to_string(),
             "agent_def": "mock-worker",
             "agent_def_version": 7,
         });
         assert_eq!(super::spawn_identity_of(&good), Some(identity.clone()));
         // Each missing key alone breaks the round trip.
-        for key in ["spawn_uid", "task_id", "agent_def", "agent_def_version"] {
+        for key in [
+            "spawn_uid",
+            "thread_id",
+            "task_id",
+            "agent_def",
+            "agent_def_version",
+        ] {
             let mut partial = good.clone();
             partial.as_object_mut().unwrap().remove(key);
             assert_eq!(super::spawn_identity_of(&partial), None, "missing `{key}`");

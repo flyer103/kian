@@ -118,6 +118,7 @@ pub mod rearm;
 pub mod reasons;
 pub mod recall;
 pub mod registry;
+pub mod roster;
 pub mod router;
 pub mod rules;
 pub mod stage;
@@ -161,7 +162,7 @@ pub use multiagent::{
     DEFAULT_MAX_CHILDREN, DEFAULT_MAX_DEPTH, EMPTY_RESPONSE_CLASS, MultiagentLimits, Reconcile,
     SUCCESS_SET, SpawnIdentity, TaskOutcome, cap_refusal, child_session_id, child_thread_id,
     depth_of, derive_outcome, holding_children, join_target, legacy_report_key,
-    reconcile_completion, report_key, report_key_for, spawn_uid, task_input_key,
+    reconcile_completion, report_key, report_key_for, spawn_uid, task_id_for_key, task_input_key,
 };
 pub use outbox::{
     DEFAULT_BACKOFF_CAP_MS, DEFAULT_BACKOFF_START_MS, DEFAULT_MAX_ATTEMPTS, Delivered,
@@ -191,13 +192,19 @@ pub use provenance::{
 pub use reasons::{DecisionKind, IntakeReason, outcome_reasons, routed_reason};
 pub use recall::{RecallPort, RecallPortError, SpillIndex, thread_bindings};
 pub use registry::{PassthroughRegistry, WorkerStatus, worker_sessions};
+pub use roster::{
+    AgentSurface, CheckOutcome, MandateStrength, MandateTemplate, OUTPUT_SCHEMA_MAX_BYTES,
+    ResolvedAgent, Roster, RosterEntry, RosterError, RosterLimits, SUPPORTED_SCHEMA_KEYWORDS,
+    SUPPORTED_TYPE_NAMES, SchemaError, default_roster_max_children, validate_instance,
+    validate_output_schema, validate_schema,
+};
 pub use router::{
     ChannelRegistry, DEFAULT_PARK_TICK_MS, DEFAULT_WORKER_QUEUE_TIMEOUT_MS,
-    DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, LIST_WORKERS_DESCRIPTION,
-    LIST_WORKERS_TOOL, MandatePolicy, REPLY_TOOL, ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold,
-    RouterInbox, RouterProfile, RouterTools, SILENT_REPRO_TEMPLATE, SpeculationPolicy,
-    WORKER_MEMBERSHIP_PROMPT_BLOCK, WorkerEntry, build_mandate, enforce_speculation_cap,
-    outstanding_threads,
+    DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt, LIST_AGENTS_DESCRIPTION,
+    LIST_AGENTS_TOOL, LIST_WORKERS_DESCRIPTION, LIST_WORKERS_TOOL, MandatePolicy, REPLY_TOOL,
+    ROUTER_BOOTSTRAP_KEY, RouterDriver, RouterHold, RouterInbox, RouterProfile, RouterTools,
+    SILENT_REPRO_TEMPLATE, SpeculationPolicy, WORKER_MEMBERSHIP_PROMPT_BLOCK, WorkerEntry,
+    build_mandate, enforce_speculation_cap, outstanding_threads,
 };
 pub use rules::{
     AdmissionClass, AdmissionClassRule, AdmissionClassTable, CorrelateBy, Route, RuleMatcher,
@@ -206,10 +213,11 @@ pub use rules::{
 pub use stage::{NoOutbox, OutboxView, TicketStage, project_stage};
 pub use subscriptions::{FanoutAdmission, RoutingOutcome, SubscriptionService};
 pub use templates::{
-    ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
-    WORKER_PROMPT_TEMPLATE, WORKER_TOOLS, empty_tool_parameters, is_channel_tool,
-    mount_async_tools, mount_recall_tools, mount_watchdog_tools, render_worker_prompt,
-    router_template, worker_mandate_line, worker_template,
+    ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROSTER_INSTRUCTION_PROMPT_LINE, ROUTER_SLOT,
+    SPAWN_WORKER_TOOL, SuperAgentProfile, WORKER_PROMPT_TEMPLATE, WORKER_TOOLS,
+    empty_tool_parameters, is_channel_tool, mount_async_tools, mount_recall_tools,
+    mount_watchdog_tools, render_worker_prompt, router_template, worker_mandate_line,
+    worker_template,
 };
 pub use timeout::{ChildTick, due_interrupts};
 pub use timer::{
@@ -231,13 +239,15 @@ pub use wechat::{
 };
 pub use worker::{
     BoundThread, BusyOwner, Delegation, DelegationPair, EXEC_WORKER_KEY, LineagePlan, MANDATE_KEY,
-    MandateRevalidation, PortFor, REPORT_STATE_KEY, ReportState, SpawnError, SpawnRequest,
-    SpawnedWorker, StreamPort, StreamPortError, ThreadLiveness, ThreadReport, WORKER_GATE_NAME,
-    WorkerBinding, WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner, WorkerStreamsError,
-    WorkerStreamsPort, bound_workers, busy_owner, completion_summary, delegation_content,
-    delegation_is_speculative, delegation_mandate, delegation_pairs, delegation_worker_binding,
-    lineage_plan, mandate_delegation_content, parse_delegation, parse_thread_report,
-    revalidate_mandate, speculative_delegation_content, thread_completed_payload, thread_liveness,
-    thread_report_content, thread_report_content_stated, thread_started_payload,
+    MandateRevalidation, PortFor, REPORT_STATE_KEY, ReportState, SCHEMA_GATE_NAME, SchemaGatePlan,
+    SpawnError, SpawnRequest, SpawnedWorker, StreamPort, StreamPortError, ThreadLiveness,
+    ThreadReport, WORKER_GATE_NAME, WorkerBinding, WorkerLoopConfig, WorkerLoopDriver,
+    WorkerSpawner, WorkerStreamsError, WorkerStreamsPort, bound_workers, busy_owner,
+    completion_summary, delegation_content, delegation_is_speculative, delegation_mandate,
+    delegation_pairs, delegation_worker_binding, final_assistant_answer, lineage_plan,
+    mandate_delegation_content, parse_delegation, parse_thread_report, revalidate_mandate,
+    schema_correction_content, schema_correction_count, schema_correction_key, schema_gate_checks,
+    schema_gate_plan, speculative_delegation_content, stream_assignee_of, thread_completed_payload,
+    thread_liveness, thread_report_content, thread_report_content_stated, thread_started_payload,
     thread_started_payload_bound, thread_started_worker_binding, worker_binding_of,
 };

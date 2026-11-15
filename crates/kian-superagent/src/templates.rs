@@ -154,6 +154,28 @@ decision:accept, decision:stop, decision:ignore, or decision:unavailable. Reply 
 channel-defined: on a wechat channel the target is {\"user_id\": \"<the kian wrapper's raw.from_user_id>\"} — \
 reply to the sender the input came from. Channel text is plain text rendered by the client: no markdown, no emoji; lead with the answer in the user's language. The channel shapes normal replies to about 100 units (each Chinese character counts one), so a complete answer must fit inside that budget; if the full result does not fit, send a complete 1-3 line summary that fits and end with 回复「详情」看完整结果 — never rely on truncation, and summarize a worker report instead of copying its markdown. When the latest input itself asks for the details (the user replied 详情 or otherwise asked for the full result), send the complete content instead of a summary — that reply is delivered whole, with long text split into ordered messages. The decision tag belongs in your own assistant message text ONLY — never include it (or any decision spelling) inside a `reply` or `deliver_structured` argument: that text is sent verbatim to the channel. Pending inputs in this batch: {inputs}";
 
+/// (R17-C2, §7.3:800-806 / §3.2:389-393) the frozen roster
+/// instruction line — the P2 class-D prompt byte. Appended by the
+/// bootstrap render path **only when the roster is non-empty** (pin
+/// P2-6, the `WORKER_MEMBERSHIP_PROMPT_BLOCK` pattern): an
+/// absent/empty roster renders today's exact prompt bytes, and live
+/// sessions keep their persisted prompts (constraint 3 — nothing
+/// rewrites prior context).
+///
+/// Byte rules (M9, the I6 lesson): one constant — no roster ids, no
+/// counts, no enums, no `{` (it is never template-substituted) — so
+/// an equivalent roster edit changes no prefix byte and the line is
+/// byte-identical for every roster configuration. The roster's
+/// contents reach the model only through `list_agents` tool results
+/// (post-prefix). The sentence is §3.2:389-393's: call `list_agents`,
+/// never invent an id; record the `thread_id`; end your turn — do
+/// not block, do not poll, do not re-spawn the same work.
+pub const ROSTER_INSTRUCTION_PROMPT_LINE: &str = "Delegation roster: call `list_agents` to see the \
+agents you may delegate to — never invent an agent id. When you call `spawn_worker`, record the \
+returned `thread_id` and end your turn — the report arrives as an input before your next turn. \
+Do not block on it, do not poll, and do not call `spawn_worker` again for the same work: a retry \
+is a new attempt and needs a new call.";
+
 /// The worker template: strong `main` slot, full toolset, generous
 /// budgets. `version` is the pinned version threads mint against
 /// ([`crate::WorkerSpawner`] reads it).

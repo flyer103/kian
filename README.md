@@ -345,6 +345,25 @@ cargo run -p kian-cli --bin kian -- mock-channel-send mock-im --text "deploy ple
 curl -s localhost:7433/metrics | jq .superagent   # evidence / subscription / channel counters
 ```
 
+To delegate to named agents, add a roster: each entry points at an `agents:` definition, and
+`tools_allow` narrows the child's tools to exactly the intersection with that definition's
+`tools:` (see DESIGN §4.8 and MULTIAGENT-MODEL §7.3). The Router's `spawn_worker` then accepts
+`agent`, `task_key` and `output_schema`:
+
+```yaml
+superagent:
+  roster:
+    - id: researcher
+      description: Finds and cites sources
+      agent: researcher            # an entry in agents: with its own model slots
+      mandate_template: { scope: read-only research }
+      tools_allow: ["fs_read"]     # the child sees only these tools
+```
+
+```bash
+cargo run -p kian-cli --bin kian -- agents   # list the delegation roster
+```
+
 ### Channels (GitHub, Lark, WeChat)
 
 Channels admit external events into subscriptions. `type: github` mounts the `POST /webhooks/github`

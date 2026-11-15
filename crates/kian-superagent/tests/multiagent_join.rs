@@ -1105,3 +1105,106 @@ async fn a_failed_re_admit_settles_soft_failed_and_the_next_claim_reconciles() {
     );
     assert_eq!(join.inbox.rows.lock().unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// (R17-C3, pin P2-5) invalid_output — reachable only through the
+// committed schema verdict, both ways
+// ---------------------------------------------------------------------------
+
+/// A failed completion WITH a committed
+/// `evidence/verdict{gate:"output_schema",passed:false}` derives
+/// `invalid_output` (§6.1.1:640-644, §6.2 row 4) — checked before the
+/// `turn/end` class rows: even a `turn/end{empty_response}` on the
+/// same stream cannot shadow the schema verdict (the gate never runs
+/// on an empty answer, so the two carriers are mutually exclusive in
+/// production; the row order is pinned anyway).
+#[test]
+fn a_task_with_a_schema_verdict_reads_invalid_output() {
+    let child = make_child(30, true);
+    let mut events = child_events(&child, None);
+    let (kind, bytes) = assistant("definitely not the declared schema");
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = (
+        kian_core::events::EventKind::EvidenceVerdict,
+        serde_json::json!({
+            "gate": "output_schema",
+            "passed": false,
+            "checks": [
+                {"name": "json_parse", "passed": false,
+                 "detail": "the final answer is not valid JSON"}
+            ],
+            "attempt": 1,
+        }),
+    );
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = completed("failed");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(
+        derive_outcome(&events, None),
+        Some(TaskOutcome::InvalidOutput)
+    );
+    // The row-4 precedence: an empty_response turn/end present beside
+    // the verdict still reads invalid_output (row 4 first).
+    let (kind, bytes) = turn_end_error("empty_response");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(
+        derive_outcome(&events, None),
+        Some(TaskOutcome::InvalidOutput)
+    );
+}
+
+/// Without the committed schema verdict the same failed completion
+/// never reads `invalid_output` — a bare failure stays `failed`, an
+/// empty answer stays `empty_output`, and a PASSED schema verdict
+/// (which production never commits) derives nothing either: only a
+/// committed `passed:false` carries the fact (pin P2-5 both ways).
+#[test]
+fn a_task_without_a_schema_verdict_never_reads_invalid_output() {
+    let child = make_child(31, true);
+    // Bare failure: no softer carrier.
+    let mut events = child_events(&child, None);
+    let (kind, bytes) = assistant("plain failure text");
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = completed("failed");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(derive_outcome(&events, None), Some(TaskOutcome::Failed));
+
+    // Empty answer: row 3 owns it.
+    let mut events = child_events(&child, None);
+    let (kind, bytes) = completed("failed");
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = turn_end_error("empty_response");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(
+        derive_outcome(&events, None),
+        Some(TaskOutcome::EmptyOutput)
+    );
+
+    // A WORKER-gate verdict (the only pre-P2 verdict writer) is not a
+    // schema verdict: the failure stays `failed`.
+    let mut events = child_events(&child, None);
+    let (kind, bytes) = worker_verdict(false);
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = completed("failed");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(derive_outcome(&events, None), Some(TaskOutcome::Failed));
+
+    // A passed schema verdict beside a completed thread reads
+    // completed_unverified — the outcome rows 1-2 are unaffected.
+    let mut events = child_events(&child, None);
+    let (kind, bytes) = assistant("{\"summary\": \"ok\"}");
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = (
+        kian_core::events::EventKind::EvidenceVerdict,
+        serde_json::json!({
+            "gate": "output_schema", "passed": true, "checks": [], "attempt": 0,
+        }),
+    );
+    push(&mut events, child.session, kind, bytes);
+    let (kind, bytes) = completed("completed");
+    push(&mut events, child.session, kind, bytes);
+    assert_eq!(
+        derive_outcome(&events, None),
+        Some(TaskOutcome::CompletedUnverified)
+    );
+}

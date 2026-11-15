@@ -47,8 +47,29 @@ fn write_config(
     worker_provider: &str,
     multiagent: Option<&str>,
 ) -> std::path::PathBuf {
+    write_config_full(dir, router_provider, worker_provider, multiagent, None)
+}
+
+/// The full writer (R17-C2): additionally splices a `research` agent
+/// (the roster's resolution target) and a `superagent.roster` block
+/// under `superagent:` when `roster` is `Some`.
+#[allow(clippy::too_many_arguments)]
+fn write_config_full(
+    dir: &std::path::Path,
+    router_provider: &str,
+    worker_provider: &str,
+    multiagent: Option<&str>,
+    roster: Option<&str>,
+) -> std::path::PathBuf {
     let sqlite = dir.join("kian.sqlite");
     let multiagent = multiagent.unwrap_or("");
+    let (research_agent, roster_block) = match roster {
+        Some(block) => (
+            "  research:\n    id: research\n    version: 1\n    model_slots:\n      main:\n        provider: worker-mock\n        model: mock-research\n    tools: [\"fs_read\"]\n",
+            block,
+        ),
+        None => ("", ""),
+    };
     let yaml = format!(
         r#"listen: "127.0.0.1:7342"
 storage:
@@ -76,14 +97,14 @@ agents:
         provider: worker-mock
         model: mock-worker
     tools: ["fs_read", "fs_write", "exec"]
-superagent:
+{research_agent}superagent:
   router:
     session_id: "{ROUTER_SESSION}"
     agent: router
     slot: router
   worker:
     agent: worker
-  subscriptions:
+{roster_block}  subscriptions:
     - channel: mock-im
       match: always
       route: router
@@ -278,6 +299,21 @@ async fn absent_multiagent_block_keeps_spawn_bytes_and_result_identical() {
     .await;
 
     let (router_events, worker, output) = drive_spawn(&server, &read_only).await;
+
+    // (R17-C2, pin P2-6 — the prompt half of the class-D gate): with
+    // no roster configured the bootstrap prompt carries NO roster
+    // instruction line — the wiring keys off the roster, not off
+    // `multiagent`.
+    for event in router_events
+        .iter()
+        .filter(|e| e.kind == EventKind::InputAdmitted)
+    {
+        let payload = event.bytes["content"].as_str().unwrap_or_default();
+        assert!(
+            !payload.contains(kian_superagent::ROSTER_INSTRUCTION_PROMPT_LINE),
+            "no roster line without a roster: {payload}"
+        );
+    }
 
     // The pre-P1 ack: exactly the landed three keys — no spawn_uid,
     // no task_id, no spawn_outcome.
@@ -600,5 +636,350 @@ async fn multiagent_off_installs_no_child_stream_port() {
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].bytes, expected_started);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 6. (R17-C2) the roster: the frozen prompt line through the real
+//    assembly, and the `kian agents` verb (pin P2-7)
+// ---------------------------------------------------------------------------
+
+/// The `superagent.roster` yaml fragment the R17-C2 legs splice: two
+/// entries over the `research` agent — one with an `output_schema`
+/// default, one a leaf.
+const ROSTER_BLOCK: &str = concat!(
+    "  roster:\n",
+    "    - id: researcher\n",
+    "      description: Finds and cites sources\n",
+    "      agent: research\n",
+    "      mandate_template:\n",
+    "        scope: read-only research\n",
+    "        strength: inferred\n",
+    "      tools_allow: [\"fs_read\"]\n",
+    "      limits: {max_children: 2}\n",
+    "      output_schema:\n",
+    "        type: object\n",
+    "        required: [summary]\n",
+    "        properties:\n",
+    "          summary: {type: string}\n",
+    "    - id: leaf\n",
+    "      description: A leaf entry\n",
+    "      agent: research\n",
+    "      mandate_template: {scope: s, strength: inferred}\n",
+    "      tools_allow: []\n",
+    "      limits: {max_children: 0}\n",
+);
+
+/// A roster boot renders the frozen instruction line in the bootstrap
+/// prompt — the class-D byte, through the real assembly wiring (the
+/// one-line `profile.roster_instruction` seam), exactly once, as the
+/// prompt's suffix. This is the production proof the flag is wired;
+/// the unit legs pin the render itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_roster_boot_renders_the_frozen_instruction_line_in_the_bootstrap_prompt() {
+    force_no_proxy();
+    let dir = temp_dir("c2-roster-prompt");
+
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![ScriptedResponse::Text("bootstrap acknowledged".into())],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+
+    let config = write_config_full(
+        &dir,
+        &router_base,
+        &worker_base,
+        Some("  multiagent: {}\n"),
+        Some(ROSTER_BLOCK),
+    );
+    let _server = boot(&config).await;
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+    let events = wait_for_router(&read_only, "bootstrap judge turn", |events| {
+        count_kind(events, EventKind::AssistantMessage) >= 1
+    })
+    .await;
+
+    let bootstrap = events
+        .iter()
+        .find(|e| e.kind == EventKind::InputAdmitted)
+        .expect("bootstrap input");
+    let payload = bootstrap.bytes["content"].as_str().expect("prompt payload");
+    assert_eq!(
+        payload
+            .matches(kian_superagent::ROSTER_INSTRUCTION_PROMPT_LINE)
+            .count(),
+        1,
+        "the frozen line renders exactly once"
+    );
+    assert!(
+        payload.ends_with(&format!(
+            "\n\n{}",
+            kian_superagent::ROSTER_INSTRUCTION_PROMPT_LINE
+        )),
+        "appended after the rendered prompt: {payload}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `kian agents` (pin P2-7): config-only render of the roster in both
+/// shapes, and a clean empty state (one honest line / `{"agents":[]}`,
+/// exit 0 — the `Ok` arm) when the roster is absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kian_agents_renders_the_roster_and_a_clean_empty_state() {
+    force_no_proxy();
+    let dir = temp_dir("c2-agents-verb");
+    let (router_base, _router_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+
+    // With a roster: the text render names every selection fact, in
+    // config order; `--json` is pin P2-7's shape.
+    let config = write_config_full(&dir, &router_base, &router_base, None, Some(ROSTER_BLOCK));
+    let text = kian_cli::commands::run_agents(&config, false)
+        .await
+        .expect("text render");
+    assert!(text.contains("researcher"), "{text}");
+    assert!(text.contains("Finds and cites sources"), "{text}");
+    assert!(text.contains("research"), "{text}");
+    assert!(text.contains("fs_read"), "{text}");
+    assert!(text.contains("output_schema"), "{text}");
+    assert!(text.contains("leaf"), "{text}");
+    let researcher_at = text.find("researcher").expect("researcher row");
+    let leaf_at = text.find("leaf").expect("leaf row");
+    assert!(researcher_at < leaf_at, "config order is preserved");
+
+    let json_out = kian_cli::commands::run_agents(&config, true)
+        .await
+        .expect("json render");
+    let parsed: Value = serde_json::from_str(&json_out).expect("valid json");
+    let agents = parsed["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 2);
+    assert_eq!(agents[0]["id"], json!("researcher"));
+    assert_eq!(agents[0]["agent"], json!("research"));
+    assert_eq!(agents[0]["tools_allow"], json!(["fs_read"]));
+    assert_eq!(agents[0]["limits"]["max_children"], json!(2));
+    assert_eq!(
+        agents[0]["output_schema"]["required"],
+        json!(["summary"]),
+        "the declared default rides the json row"
+    );
+    assert_eq!(agents[1]["id"], json!("leaf"));
+    assert_eq!(agents[1]["limits"]["max_children"], json!(0));
+    assert!(
+        agents[1].get("output_schema").is_none(),
+        "absent, never null"
+    );
+
+    // Without a roster: one honest line / `{"agents": []}`, exit 0.
+    let bare = write_config(&dir, &router_base, &router_base, None);
+    let empty_text = kian_cli::commands::run_agents(&bare, false)
+        .await
+        .expect("empty state is not an error");
+    assert_eq!(
+        empty_text,
+        "no agents (superagent.roster is absent or empty)\n"
+    );
+    let empty_json = kian_cli::commands::run_agents(&bare, true)
+        .await
+        .expect("empty json is not an error");
+    let parsed: Value = serde_json::from_str(&empty_json).expect("valid json");
+    assert_eq!(parsed, json!({"agents": []}));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 7. (R17-C3, pin P2-2) the per-assignee child side: the structural
+//    tools_allow narrowing, through the real assembly
+// ---------------------------------------------------------------------------
+
+/// The C3 roster fragment: one `researcher` entry over an agent whose
+/// `tools:` list is WIDER than the entry's `tools_allow` (the denied
+/// `fs_write`/`exec` are mounted on the parent's surface — the fence
+/// must remove them from the child's REQUEST, not merely refuse at
+/// call time).
+const NARROW_ROSTER_BLOCK: &str = concat!(
+    "  roster:\n",
+    "    - id: researcher\n",
+    "      description: Finds and cites sources\n",
+    "      agent: research\n",
+    "      mandate_template:\n",
+    "        scope: read-only research\n",
+    "        strength: inferred\n",
+    "      tools_allow: [\"fs_read\"]\n",
+    "      limits: {max_children: 2}\n",
+);
+
+/// The research agent with the wider surface (fs_read + fs_write +
+/// exec — a superset of the entry's allow-list, all mounted on the
+/// worker loop).
+#[allow(clippy::too_many_arguments)]
+fn write_narrow_config(
+    dir: &std::path::Path,
+    router_provider: &str,
+    worker_provider: &str,
+) -> std::path::PathBuf {
+    let sqlite = dir.join("kian.sqlite");
+    let yaml = format!(
+        r#"listen: "127.0.0.1:7342"
+storage:
+  sqlite: "{sqlite}"
+agent:
+  id: default
+  model_slots:
+    main:
+      provider: router-mock
+      model: mock-model
+agents:
+  router:
+    id: router
+    version: 3
+    model_slots:
+      router:
+        provider: router-mock
+        model: mock-router
+    tools: ["spawn_worker", "reply", "deliver_structured"]
+  worker:
+    id: worker
+    version: {WORKER_VERSION}
+    model_slots:
+      main:
+        provider: worker-mock
+        model: mock-worker
+    tools: ["fs_read", "fs_write", "exec"]
+  research:
+    id: research
+    version: 5
+    model_slots:
+      main:
+        provider: worker-mock
+        model: mock-research
+    tools: ["fs_read", "fs_write", "exec"]
+superagent:
+  router:
+    session_id: "{ROUTER_SESSION}"
+    agent: router
+    slot: router
+  worker:
+    agent: worker
+{NARROW_ROSTER_BLOCK}  multiagent: {{}}
+  subscriptions:
+    - channel: mock-im
+      match: always
+      route: router
+  channels:
+    mock-im:
+      type: mock-im
+providers:
+  router-mock:
+    base_url: "{router_provider}"
+    api_key_env: KIAN_E2E_API_KEY
+  worker-mock:
+    base_url: "{worker_provider}"
+    api_key_env: KIAN_E2E_API_KEY
+plugins: ["openai-compat", "local-tools", "superagent"]
+drain:
+  max_iterations: 8
+tools:
+  root: "{dir}"
+  exec_timeout_ms: 5000
+recovery:
+  budget:
+    tokens: 64
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+        sqlite = sqlite.display(),
+        dir = dir.display(),
+    );
+    let path = dir.join("kian.yaml");
+    std::fs::write(&path, yaml).expect("write config");
+    path
+}
+
+/// 🔴 §5.1:551-552, M3: the child spawned through a roster entry runs
+/// with EXACTLY `agent.tools ∩ tools_allow` — the denied tools are
+/// absent from the persisted `step/request` tool list (the request
+/// bytes the provider received), never merely refused at call time.
+/// The request also carries the entry's agent's model — the
+/// per-assignee side's slots (pin P2-1), not the worker template's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_entry_runs_with_exactly_the_intersected_tool_surface() {
+    force_no_proxy();
+    let dir = temp_dir("c3-narrowed-surface");
+
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        // Batch-independent: whether the first turn sweeps the
+        // bootstrap alone or bootstrap + the user input, the spawn is
+        // the first scripted response.
+        vec![
+            ScriptedResponse::ToolCall {
+                id: "call-spawn-1".into(),
+                name: "spawn_worker".into(),
+                arguments: json!({"task": TASK, "agent": "researcher"}),
+            },
+            ScriptedResponse::Text("dispatched".into()),
+        ],
+        0,
+    )
+    .await;
+    // The child (the research agent's slots): one final answer.
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("research done".into())], 0).await;
+
+    let config = write_narrow_config(&dir, &router_base, &worker_base);
+    let server = boot(&config).await;
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+    let (events, worker, _output) = drive_spawn(&server, &read_only).await;
+    assert!(
+        worker.0 != Uuid::nil(),
+        "the spawn must succeed (refusal would create nothing)"
+    );
+    let _ = events;
+
+    // The child's own committed stream: the persisted step/request
+    // tool list is exactly the intersection.
+    let child_events = wait_for_session(&read_only, worker, "child completion", |events| {
+        events.iter().any(|e| e.kind == EventKind::ThreadCompleted)
+    })
+    .await;
+    let request = child_events
+        .iter()
+        .find(|e| e.kind == EventKind::StepRequest)
+        .expect("the child's persisted request");
+    let body = &request.bytes["body"];
+    let tools: Vec<String> = body["tools"]
+        .as_array()
+        .expect("the request carries its tool list")
+        .iter()
+        .map(|t| {
+            t["function"]["name"]
+                .as_str()
+                .expect("tool name")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        vec!["fs_read".to_string()],
+        "the child's request tool list is exactly agent.tools ∩ tools_allow"
+    );
+    // The narrowed-away names are ABSENT from the schema — the
+    // structural fence (M3), not a call-time refusal.
+    let request_text = serde_json::to_string(&body["tools"]).expect("serialize");
+    assert!(!request_text.contains("fs_write"));
+    assert!(!request_text.contains("exec"));
+    // The per-assignee side's slots: the request went to the research
+    // agent's model, not the worker template's.
+    let model = body["model"].as_str().expect("model");
+    assert_eq!(model, "mock-research", "pin P2-1: the entry's agent serves");
     let _ = std::fs::remove_dir_all(&dir);
 }

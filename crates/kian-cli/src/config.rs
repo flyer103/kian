@@ -961,6 +961,14 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::multiagent_config`].
     #[serde(default)]
     pub multiagent: Option<MultiagentConfigDef>,
+    /// (R17-C1) the roster (`superagent.roster`, MULTIAGENT-MODEL
+    /// §3.1/§7.1): the named agents the Router may delegate to.
+    /// Absent/empty (the default) = the roster feature is **off** —
+    /// no `list_agents` tool, no roster validation, today's exact
+    /// bytes (pin P2-6, §3.1:366-367). Converted fail-closed by
+    /// [`ServeConfig::roster_config`].
+    #[serde(default)]
+    pub roster: Vec<RosterEntryDef>,
     /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
     /// surfaces in the Inline `neighbors` block (`thread_key`) as
@@ -1103,6 +1111,70 @@ pub struct MultiagentConfigDef {
     pub max_children: Option<u32>,
     pub max_depth: Option<u32>,
     pub child_timeout_ms: Option<u64>,
+}
+
+/// One `superagent.roster` entry (MULTIAGENT-MODEL §3.1:357-362,
+/// §7.1): `{id, description, agent, mandate_template, tools_allow,
+/// limits?, output_schema?}`. `id`/`description`/`agent`/
+/// `mandate_template`/`tools_allow` are required — a missing
+/// `tools_allow` must never silently mean "all tools" (that would be
+/// a widening). `limits` defaults to the §5.3 `max_children` (4);
+/// `output_schema` is the optional per-entry default expectation
+/// (§3.2.1) and must sit inside the closed subset (pin P2-3).
+///
+/// `agent` names an **`agents:` entry** (resolved by
+/// `ServeConfig::named_agent_def`, pin P2-1) — not the default
+/// `agent:` and never an invented id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterEntryDef {
+    /// The name the model uses; unique across the roster, non-empty.
+    pub id: String,
+    /// The one line used for selection (≤200 chars, no control
+    /// characters — the `WorkerEntry` precedent).
+    pub description: String,
+    /// An `agents:` entry id — the `AgentDef` reference and the
+    /// memory scope (pin P2-1).
+    pub agent: String,
+    /// The advisory mandate template: `{scope, strength}` with
+    /// `strength ∈ {explicit, inferred}` (ADR-012 vocabulary).
+    pub mandate_template: RosterMandateTemplateDef,
+    /// The tool fence: intersected with the agent's surface — an
+    /// entry listing a tool the `AgentDef` lacks **refuses boot**
+    /// (M3, §5.1:551-552; never a widening).
+    pub tools_allow: Vec<String>,
+    /// Per-entry limits; `max_children: 0` is a **leaf** — legal
+    /// (§3.1:360-361).
+    #[serde(default)]
+    pub limits: RosterLimitsDef,
+    /// The optional `output_schema` (pin P2-3 subset, ≤8192
+    /// canonical-JSON bytes). Absent = no schema gate for this
+    /// entry's children.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// The `mandate_template` block of a roster entry: the advisory
+/// scope text (recorded and audited, never a permission — §5.1) and
+/// the strength. `strength` is converted fail-closed so a typo
+/// refuses boot naming the key, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterMandateTemplateDef {
+    /// The advisory scope text (never blank — an empty authority
+    /// string is never issued).
+    pub scope: String,
+    /// `explicit` | `inferred` (ADR-012).
+    pub strength: String,
+}
+
+/// The `limits` block of a roster entry — the per-entry bound the
+/// contract defines (§3.1:360-361): `max_children` only, optional
+/// with the §5.3 default (4); `0` names a leaf and is legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RosterLimitsDef {
+    pub max_children: Option<u32>,
 }
 
 /// The `superagent.intake` section (ADR-013):
@@ -3244,6 +3316,98 @@ impl ServeConfig {
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
         self.agents.get(id).map(agent_def_of)
+    }
+
+    /// Converts the `superagent.roster` section to the bundle's
+    /// [`kian_superagent::Roster`], fail-closed. `Ok(None)` when the
+    /// section is absent **or empty** — the roster feature is off,
+    /// today's tool set byte-identical (pin P2-6, §3.1:366-367).
+    ///
+    /// Validation is the contract's (§3.1), errors naming the key:
+    /// duplicate ids; an `agent` naming no configured `agents:`
+    /// entry (the refusal names the known ids — pin P2-1, resolved
+    /// exactly through [`Self::named_agent_def`]); `tools_allow`
+    /// listing a tool the AgentDef lacks (a widening refuses boot —
+    /// M3/§5.1:551-552); an `output_schema` outside the closed
+    /// subset (pin P2-3, naming the keyword). `limits.max_children:
+    /// 0` is legal — a leaf (§3.1:360-361).
+    pub fn roster_config(&self) -> Result<Option<kian_superagent::Roster>, ConfigError> {
+        let Some(sa) = self.superagent.as_ref() else {
+            return Ok(None);
+        };
+        if sa.roster.is_empty() {
+            return Ok(None);
+        }
+        // Whole-set check first: duplicate ids (the per-entry pass
+        // below cannot see them).
+        let mut seen = std::collections::BTreeSet::new();
+        for def in &sa.roster {
+            if !seen.insert(def.id.as_str()) {
+                return Err(invalid(format!(
+                    "superagent.roster: duplicate id `{}` — roster ids are unique",
+                    def.id
+                )));
+            }
+        }
+        // The pin P2-1 resolution seam: exactly `named_agent_def`,
+        // and the known `agents:` ids for the refusal text.
+        let known: Vec<String> = self.agents.keys().cloned().collect();
+        let lookup = |id: &str| {
+            self.named_agent_def(id)
+                .map(|def| kian_superagent::AgentSurface {
+                    id: def.id,
+                    tools: def.tools,
+                })
+        };
+        let mut entries = Vec::with_capacity(sa.roster.len());
+        for (i, def) in sa.roster.iter().enumerate() {
+            let strength = match def.mandate_template.strength.as_str() {
+                "explicit" => kian_superagent::MandateStrength::Explicit,
+                "inferred" => kian_superagent::MandateStrength::Inferred,
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.roster[{i}].mandate_template.strength: unknown `{other}` \
+                         (explicit | inferred)"
+                    )));
+                }
+            };
+            let entry = kian_superagent::RosterEntry {
+                id: def.id.clone(),
+                description: def.description.clone(),
+                agent: def.agent.clone(),
+                mandate_template: kian_superagent::MandateTemplate {
+                    scope: def.mandate_template.scope.clone(),
+                    strength,
+                },
+                tools_allow: def.tools_allow.clone(),
+                limits: kian_superagent::RosterLimits {
+                    max_children: def
+                        .limits
+                        .max_children
+                        .unwrap_or_else(kian_superagent::default_roster_max_children),
+                },
+                output_schema: def.output_schema.clone(),
+                // (R17-C2, pin P2-1) the resolution is stamped here,
+                // once, at conversion — the spawn side reads this
+                // recorded fact and never re-consults live config
+                // (§2.1.1 constraint 13). `named_agent_def` resolved
+                // it for the surface check below; the same call
+                // supplies the identity the wrapper will carry.
+                resolved_agent: self.named_agent_def(&def.agent).map(|agent| {
+                    kian_superagent::ResolvedAgent {
+                        def_id: agent.id,
+                        version: agent.version,
+                    }
+                }),
+            };
+            kian_superagent::Roster {
+                entries: vec![entry.clone()],
+            }
+            .validate(&lookup, &known)
+            .map_err(|e| invalid(format!("superagent.roster[{i}]: {e}")))?;
+            entries.push(entry);
+        }
+        Ok(Some(kian_superagent::Roster { entries }))
     }
 
     /// The compiled definition an agent id the memory section may
@@ -5967,6 +6131,158 @@ recovery:
         assert!(
             ServeConfig::parse(&spliced).is_ok(),
             "zero-endpoints dsh config boots exactly as before"
+        );
+    }
+
+    // -- superagent.roster: (R17-C1) --------------------------------
+
+    /// The superagent fixture plus a `research` agent (the roster's
+    /// resolution target) — the base every roster case splices onto.
+    fn roster_base_yaml() -> String {
+        superagent_yaml().replace(
+            "superagent:\n  router:",
+            "  research:\n    id: research\n    version: 1\n    model_slots:\n      \
+             main:\n        provider: openai\n        model: gpt-research\n    tools: \
+             [\"fs_read\", \"recall_event\"]\nsuperagent:\n  router:",
+        )
+    }
+
+    /// The base fixture with `roster_block` spliced under
+    /// `superagent:` (the caller indents to the entry level).
+    fn roster_yaml(roster_block: &str) -> String {
+        roster_base_yaml().replace(
+            "  worker:\n    agent: worker\n    pinned_version: 7\n",
+            &format!("  worker:\n    agent: worker\n    pinned_version: 7\n{roster_block}"),
+        )
+    }
+
+    /// One valid roster entry yaml (agent `research`, a leaf).
+    const VALID_ENTRY: &str = "  roster:\n    - id: researcher\n      description: Finds and \
+         cites sources\n      agent: research\n      mandate_template:\n        scope: read-only \
+         research\n        strength: inferred\n      tools_allow: [\"fs_read\"]\n      limits: \
+         {max_children: 0}\n";
+
+    #[test]
+    fn roster_absent_or_empty_converts_to_none_feature_off() {
+        // Pin P2-6: absent/empty roster ⇒ `None` ⇒ no `list_agents`,
+        // no validation, today's bytes.
+        let base = ServeConfig::parse(&roster_base_yaml()).expect("base config");
+        assert_eq!(base.roster_config().expect("absent roster"), None);
+        let empty = roster_yaml("  roster: []\n");
+        let cfg = ServeConfig::parse(&empty).expect("empty roster config");
+        assert_eq!(cfg.roster_config().expect("empty roster"), None);
+    }
+
+    #[test]
+    fn an_entry_naming_no_configured_agent_refuses_boot_naming_the_known_ids() {
+        // Pin P2-1: discovery is exactly `named_agent_def` — an
+        // unknown `agent` refuses boot, naming the known `agents:`
+        // ids (not the default `agent:`).
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Ghost\n      agent: nope\n      \
+             mandate_template: {scope: s, strength: inferred}\n      tools_allow: []\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("unknown agent refuses");
+        let text = err.to_string();
+        assert!(text.contains("nope"), "names the unknown id: {text}");
+        assert!(
+            text.contains("router") && text.contains("worker") && text.contains("research"),
+            "names the known agents: ids: {text}"
+        );
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_roster_ids_refuse_boot_at_the_config_gate() {
+        let block = format!(
+            "{VALID_ENTRY}    - id: researcher\n      description: Again\n      agent: research\n      \
+             mandate_template: {{scope: s, strength: inferred}}\n      tools_allow: []\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let err = cfg.roster_config().expect_err("duplicate ids refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("duplicate") && text.contains("researcher"),
+            "{text}"
+        );
+        assert!(text.contains("superagent.roster"), "{text}");
+    }
+
+    #[test]
+    fn a_widening_tools_allow_refuses_boot_at_the_config_gate() {
+        // M3 / §5.1:551-552 — `exec` is not on the `research` agent's
+        // surface, so listing it refuses boot.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Widening\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: [\"fs_read\", \"exec\"]\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("widening refuses");
+        let text = err.to_string();
+        assert!(text.contains("exec"), "names the tool: {text}");
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_subset_output_schema_refuses_boot_naming_the_key_and_keyword() {
+        // Pin P2-3: `oneOf` is outside the closed subset — the
+        // refusal names the keyword and the key.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Scheming\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: []\n      output_schema:\n        oneOf:\n          - type: string\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("outside the subset refuses");
+        let text = err.to_string();
+        assert!(text.contains("oneOf"), "names the keyword: {text}");
+        assert!(
+            text.contains("superagent.roster[0].output_schema") || {
+                // the RosterError prefix composes as
+                // `superagent.roster[0]: … output_schema: …`
+                text.contains("superagent.roster[0]") && text.contains("output_schema")
+            },
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn a_valid_roster_converts_in_config_order_with_leaf_legal() {
+        // §3.1:360-361: `max_children: 0` is a legal leaf; a missing
+        // `limits` takes the §5.3 default (4); config order holds.
+        let block = format!(
+            "{VALID_ENTRY}    - id: recaller\n      description: Recalls events\n      agent: \
+             research\n      mandate_template: {{scope: s, strength: explicit}}\n      \
+             tools_allow: [\"fs_read\", \"recall_event\"]\n      output_schema:\n        \
+             type: object\n        required: [summary]\n        properties:\n          summary: \
+             {{type: string}}\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let roster = cfg
+            .roster_config()
+            .expect("valid roster converts")
+            .expect("some");
+        assert_eq!(roster.known_ids(), vec!["researcher", "recaller"]);
+        let leaf = roster.resolve("researcher").expect("leaf resolves");
+        assert_eq!(leaf.limits.max_children, 0, "the leaf fact");
+        assert_eq!(leaf.agent, "research");
+        let defaulted = roster.resolve("recaller").expect("defaulted resolves");
+        assert_eq!(defaulted.limits.max_children, 4, "the §5.3 default");
+        assert_eq!(
+            defaulted.mandate_template.strength,
+            kian_superagent::MandateStrength::Explicit
+        );
+        assert!(
+            defaulted.output_schema.is_some(),
+            "the schema rides the entry"
         );
     }
 }

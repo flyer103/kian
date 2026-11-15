@@ -10,6 +10,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Multiagent roster: the per-assignee child surface and the output-schema gate (round 17, C1–C3)**.
+  `superagent.roster` names delegation entries over `agents:` definitions; `spawn_worker` grows
+  `agent`/`task_key`/`output_schema` and `kian agents` lists the roster. A roster-spawned child runs
+  its entry's own slots/budgets with the structural `agent.tools ∩ tools_allow` surface (denied tools
+  never reach the request schema), resolved from the committed wrapper — a vanished assignee runs a
+  refusing side, never a wider one. The child's `output_schema` is enforced by a gate with one
+  correction attempt; a second miss commits `evidence/verdict{gate:"output_schema"}` and reads as
+  `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
+  Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
+
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:

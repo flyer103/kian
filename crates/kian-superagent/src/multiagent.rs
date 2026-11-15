@@ -85,34 +85,76 @@ pub fn child_session_id(thread_id: Uuid) -> SessionId {
 /// class-B bytes record the resolution so a replay rehydrates rather
 /// than re-consults live config).
 ///
-/// `task_id` equals the derived thread id in P1 (pin P7): `task_key`
-/// is a P2 roster argument (§7.3:786), so before the roster exists the
-/// single delegation *is* the unit of work.
+/// P2 (pin P2-8) splits the two ids that P1 conflated: `thread_id` is
+/// **always** `child_thread_id(parent, spawn_uid)` (the child's own
+/// event stream), while `task_id` is `uuid5(parent,
+/// "kian:task:<task_key>")` **when a `task_key` was given**, else it
+/// stays equal to `thread_id` (the P1 no-`task_key` case, pin P7).
+/// Without the split, two spawns sharing a `task_key` would collide on
+/// one thread id — a duplicate-child bug, not a style choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnIdentity {
     /// The derived spawn-request identity ([`spawn_uid`]).
     pub spawn_uid: Uuid,
-    /// The derived thread id (pin P7: equals `child_thread_id`).
+    /// The derived child thread id — the stream the child's own
+    /// events land on (pin P2-8: taken from here in `prepare`,
+    /// never from `task_id`).
+    pub thread_id: Uuid,
+    /// The durable task identity: `task_id_for_key(parent, task_key)`
+    /// when a `task_key` was given, else equal to `thread_id` (pin
+    /// P7) — the id that survives attempts (§1:169-176).
     pub task_id: Uuid,
     /// The `AgentDef` reference the spawn resolved to (recorded, never
-    /// re-resolved — §2.1.1).
+    /// re-resolved — §2.1.1). With the roster (pin P2-1) this is the
+    /// **resolved entry's** `AgentDef` id, not the worker template.
     pub agent_def: String,
     /// The version of `agent_def` at resolution time.
     pub agent_def_version: u64,
+    /// The roster entry id the spawn resolved through (§2.1.1:264-269,
+    /// the wrapper's `assignee` key). `None` on the P1 form — the
+    /// roster does not exist for that spawn.
+    pub assignee: Option<String>,
 }
 
 impl SpawnIdentity {
     /// Derives the identity from the parent session and the requesting
     /// `tool/call`'s own committed `seq` (pin P2 supplies that seq).
-    /// The spawn index is always `0` in P1 (§1:165-166).
+    /// The spawn index is always `0` in P1 (§1:165-166). This is the
+    /// P1 form: no `task_key` (so `task_id == thread_id`, pin P7) and
+    /// no roster resolution (`assignee` absent).
     #[must_use]
     pub fn derive(parent: SessionId, seq: u64, agent_def: &str, agent_def_version: u64) -> Self {
+        Self::derive_delegated(parent, seq, agent_def, agent_def_version, None, None)
+    }
+
+    /// (R17-C2, §7.3/pin P2-8) the roster form: the same derivation
+    /// plus the `task_key` (parent-scoped — the derivation itself is
+    /// what scopes it) and the resolved roster entry id that rides
+    /// the wrapper as `assignee` (pin P2-1: `agent_def` /
+    /// `agent_def_version` carry the **resolved entry's** `AgentDef`,
+    /// never the worker template, when an `agent` was passed).
+    #[must_use]
+    pub fn derive_delegated(
+        parent: SessionId,
+        seq: u64,
+        agent_def: &str,
+        agent_def_version: u64,
+        task_key: Option<&str>,
+        assignee: Option<String>,
+    ) -> Self {
         let uid = spawn_uid(parent, seq, 0);
+        let thread_id = child_thread_id(parent, uid);
+        let task_id = match task_key {
+            Some(key) => task_id_for_key(parent, key),
+            None => thread_id,
+        };
         Self {
             spawn_uid: uid,
-            task_id: child_thread_id(parent, uid),
+            thread_id,
+            task_id,
             agent_def: agent_def.to_string(),
             agent_def_version,
+            assignee,
         }
     }
 
@@ -121,6 +163,17 @@ impl SpawnIdentity {
     pub fn task_id_str(&self) -> String {
         self.task_id.to_string()
     }
+}
+
+/// The durable task identity of a `task_key` (pin P2-8 / §1:169-176):
+/// `uuid5(parent_session, "kian:task:<task_key>")` — parent-scoped by
+/// construction (two parents using the same key derive different
+/// tasks), and stable across attempts (the same key re-derives the
+/// same task id, so a retry is a new attempt of one task, not a new
+/// task). P4's readiness resolution uses the same derivation.
+#[must_use]
+pub fn task_id_for_key(parent: SessionId, task_key: &str) -> Uuid {
+    Uuid::new_v5(&parent.0, format!("kian:task:{task_key}").as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +230,12 @@ pub enum TaskOutcome {
     CompletedVerified,
     /// Normal end with no gate verdict (§6.2 row 2).
     CompletedUnverified,
-    /// Contract miss against a declared `output_schema` — **unreachable
-    /// in P1**: there is no schema before P2 (§3.2.1:432-437) and
-    /// [`derive_outcome`] structurally never returns it.
+    /// Contract miss against a declared `output_schema` — reachable
+    /// from R17-C3 (P2) **only** through a committed
+    /// `evidence/verdict{gate:"output_schema",passed:false}` beside a
+    /// `thread/completed{failed}` (pin P2-5); before that verdict
+    /// existed the value was structurally unreachable, and it is
+    /// still never typed by the child nor inferred from prose.
     InvalidOutput,
     /// Empty final answer despite tool work — a soft failure, never a
     /// success at any policy setting (M6, §6.1.1:635-638).
@@ -283,6 +339,16 @@ fn last_worker_verdict(events: &[Event]) -> Option<&Event> {
     })
 }
 
+/// The last `evidence/verdict` committed by the roster's
+/// `output_schema` gate (R17-C3, pin P2-5), if any — the only carrier
+/// that derives [`TaskOutcome::InvalidOutput`].
+fn last_schema_verdict(events: &[Event]) -> Option<&Event> {
+    events.iter().rev().find(|ev| {
+        ev.kind == EventKind::EvidenceVerdict
+            && ev.bytes.get("gate").and_then(Value::as_str) == Some(crate::worker::SCHEMA_GATE_NAME)
+    })
+}
+
 /// The interrupt-derived outcome (§6.2 rows 6-7): present only when the
 /// session actually ended `interrupted`. The **last** non-stale
 /// `control/interrupt` names the requester; `child_timeout` derives
@@ -319,9 +385,12 @@ fn interrupt_outcome(events: &[Event]) -> Option<TaskOutcome> {
 /// `input_required`. Returns `None` for *outstanding*: no outcome is
 /// ever synthesized from absence (§6.3:705-708).
 ///
-/// [`TaskOutcome::InvalidOutput`] is **unreachable at P1** — there is
-/// no `output_schema` to violate before P2 (§3.2.1:432-437) — and this
-/// function structurally never returns it.
+/// [`TaskOutcome::InvalidOutput`] (row 4, R17-C3 pin P2-5) is derived
+/// **only** from a committed `evidence/verdict{gate:"output_schema",
+/// passed:false}` beside a `thread/completed{failed}` — checked before
+/// the `turn/end` class rows. Without that verdict it is never
+/// returned: the P1 unreachability held until the schema gate existed
+/// to commit one (§3.2.1:432-437, §6.1.1:640-644).
 #[must_use]
 pub fn derive_outcome(
     child_events: &[Event],
@@ -348,17 +417,32 @@ pub fn derive_outcome(
                     TaskOutcome::CompletedUnverified
                 })
             }
-            Some("failed") => Some(match last_error_class(child_events) {
-                // Row 3: an empty final answer is a soft failure.
-                Some(EMPTY_RESPONSE_CLASS) => TaskOutcome::EmptyOutput,
-                // Row 5: an exhausted budget is honest non-success.
-                Some(BUDGET_EXHAUSTED_CLASS) => TaskOutcome::BudgetExhausted,
-                // No softer carrier names this failure: `failed`,
-                // never a guess (plan §0.3 gap 3 — if the loop ever
-                // stops recording the class, the derivation degrades
-                // to `failed`, it does not invent `empty_output`).
-                _ => TaskOutcome::Failed,
-            }),
+            Some("failed") => {
+                // Row 4 (R17-C3, pin P2-5): a failed completion WITH a
+                // committed `output_schema` verdict is
+                // `invalid_output` — checked BEFORE the `turn/end`
+                // class rows, and reachable only through the committed
+                // verdict (never typed by the child, never inferred
+                // from prose).
+                let schema_failed = last_schema_verdict(child_events)
+                    .and_then(|v| v.bytes.get("passed"))
+                    .and_then(Value::as_bool)
+                    == Some(false);
+                if schema_failed {
+                    return Some(TaskOutcome::InvalidOutput);
+                }
+                Some(match last_error_class(child_events) {
+                    // Row 3: an empty final answer is a soft failure.
+                    Some(EMPTY_RESPONSE_CLASS) => TaskOutcome::EmptyOutput,
+                    // Row 5: an exhausted budget is honest non-success.
+                    Some(BUDGET_EXHAUSTED_CLASS) => TaskOutcome::BudgetExhausted,
+                    // No softer carrier names this failure: `failed`,
+                    // never a guess (plan §0.3 gap 3 — if the loop ever
+                    // stops recording the class, the derivation degrades
+                    // to `failed`, it does not invent `empty_output`).
+                    _ => TaskOutcome::Failed,
+                })
+            }
             // The reserved `interrupted` completion (and any future
             // spelling): the interrupt rows refine it when their
             // carriers exist, else it is an honest failure — an abort

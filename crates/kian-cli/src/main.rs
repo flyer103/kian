@@ -63,6 +63,10 @@ const USAGE: &str = "usage:
                                          last heartbeat, bound live session/thread
                                          (read-only; description and protocol version
                                          are runtime-only facts, absent by design)
+  kian agents [--config <path>] [--json]
+                                         the configured delegation roster (read-only,
+                                         config-only): id, description, agent,
+                                         tools_allow, child cap, output_schema presence
   kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--config <path>] [--json]
                                          explicit recovery/budget-reset event
   kian wechat login [--config <path>] [--channel <name>] [--json]
@@ -107,6 +111,7 @@ fn main() -> ExitCode {
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("workers") => workers(&args[2..]),
+        Some("agents") => agents(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("wechat") => wechat(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
@@ -1130,6 +1135,33 @@ fn workers(args: &[String]) -> ExitCode {
         kian_cli::commands::run_workers(&config, db.as_deref(), json),
         "workers",
     )
+}
+
+/// `kian agents [--config <path>] [--json]` — the configured
+/// delegation roster (read-only, config-only — pin P2-7: no `--db`,
+/// the roster is config). An empty roster prints one honest line and
+/// exits 0.
+fn agents(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown agents option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    run_command(kian_cli::commands::run_agents(&config, json), "agents")
 }
 
 /// `kian recovery budget reset <uuid> [--reason <text>] [--url <base>] [--json]`

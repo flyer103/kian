@@ -331,6 +331,15 @@ impl Server {
             .transpose()
             .map_err(ServeError::Config)?
             .flatten();
+        // (R17-C1): the roster — converted once, fail-closed (an
+        // entry naming no configured `agents:` id, a widening
+        // `tools_allow` or an out-of-subset `output_schema` refuses
+        // to boot, naming the key). `None` (absent/empty) = the
+        // roster feature is off (pin P2-6).
+        let roster = config.roster_config().map_err(ServeError::Config)?;
+        // (R17-C3) a snapshot for the per-entry AgentDef resolution
+        // below (the plugin consumes `roster` by value).
+        let roster_snapshot = roster.clone();
         // the child inactivity plan (C6's ticker): filled inside the
         // superagent arm once the re-arm walk resolves the live
         // Router session (pin P5's walk root).
@@ -626,6 +635,25 @@ impl Server {
                 // (R15-C5): the delegation bounds; `None` (absent
                 // block) = feature off, byte-identical (M8, §8.1).
                 multiagent: multiagent_limits,
+                // (R17-C1): the roster; `None` (absent/empty) = the
+                // roster feature is off (pin P2-6).
+                roster,
+                // (R17-C3, pin P2-1 — wiring only): the per-entry
+                // resolved AgentDefs the per-assignee sides are built
+                // from (`named_agent_def`, never the default agent).
+                roster_agent_defs: roster_snapshot
+                    .as_ref()
+                    .map(|r| {
+                        r.entries
+                            .iter()
+                            .filter_map(|entry| {
+                                config
+                                    .named_agent_def(&entry.agent)
+                                    .map(|def| (entry.id.clone(), def))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 // /ADR-013: the thread-key derivations (validated at
                 // parse; converted again here — one shape, both gates).
                 thread_keys: sa

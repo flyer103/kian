@@ -1431,6 +1431,99 @@ fn format_age(age_ms: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// agents — the configured roster board (R17-C2, pin P2-7)
+// ---------------------------------------------------------------------------
+
+/// `kian agents [--config <path>] [--json]` — the read-only render of
+/// the configured delegation roster (`superagent.roster`,
+/// MULTIAGENT-MODEL §3.1). **Config-only** (no `--db`): the roster is
+/// config, so this verb is a pure render of it — `id`, `description`,
+/// `agent`, `tools_allow`, `limits`, and `output_schema` presence
+/// (pin P2-7). Live-child annotation is deliberately NOT here: the
+/// P3 board is that surface. An absent/empty roster prints one
+/// honest empty-state line and exits 0 (the `kian tickets` empty-state
+/// precedent); a config whose roster does not validate refuses (the
+/// same fail-closed conversion boot uses). Writes nothing, opens no
+/// store.
+pub async fn run_agents(config_path: &Path, json: bool) -> CmdResult<String> {
+    let config = ServeConfig::load(config_path).map_err(|e| e.to_string())?;
+    let roster = config.roster_config().map_err(|e| e.to_string())?;
+    let Some(roster) = roster else {
+        // Pin P2-7: one honest line, exit 0 — an empty roster is a
+        // legal configuration (the feature is off), not an error.
+        return Ok(if json {
+            serde_json::to_string_pretty(&serde_json::json!({"agents": []}))
+                .map_err(|e| e.to_string())?
+        } else {
+            "no agents (superagent.roster is absent or empty)\n".to_string()
+        });
+    };
+    if json {
+        // Pin P2-7's shape: {"agents":[…]} — the roster's config facts
+        // plus `output_schema` presence (the M9 selection row the
+        // `list_agents` TOOL serves stays C1's constant shape; this
+        // operator surface may say more).
+        let rows: Vec<serde_json::Value> = roster
+            .entries
+            .iter()
+            .map(|entry| {
+                let mut row = serde_json::json!({
+                    "id": entry.id,
+                    "description": entry.description,
+                    "agent": entry.agent,
+                    "tools_allow": entry.tools_allow,
+                    "limits": {"max_children": entry.limits.max_children},
+                });
+                if let Some(schema) = &entry.output_schema {
+                    row["output_schema"] = schema.clone();
+                }
+                row
+            })
+            .collect();
+        let report = serde_json::json!({"agents": rows});
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    Ok(render_agents(&roster))
+}
+
+/// Renders the roster board (deterministic: config order, a pure
+/// function of the roster).
+fn render_agents(roster: &kian_superagent::Roster) -> String {
+    let mut out = format!(
+        "{:<16} {:<34} {:<12} {:<28} {:>6}\n",
+        "ID", "DESCRIPTION", "AGENT", "TOOLS_ALLOW", "MAX_SUB"
+    );
+    for entry in &roster.entries {
+        out.push_str(&format!(
+            "{:<16} {:<34} {:<12} {:<28} {:>6}\n",
+            entry.id,
+            truncate_line(&entry.description, 34),
+            entry.agent,
+            entry.tools_allow.join(","),
+            entry.limits.max_children,
+        ));
+        if entry.output_schema.is_some() {
+            out.push_str(&format!(
+                "    {}: {}\n",
+                entry.id, "declares an output_schema (children's answers are gated)"
+            ));
+        }
+    }
+    out
+}
+
+/// One-line clamp for the description column (config already
+/// validates ≤200 chars; the column just fits it).
+fn truncate_line(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // wake-now / recovery budget reset (via the running server)
 // ---------------------------------------------------------------------------
 
