@@ -476,6 +476,35 @@ later channel inputs were admitted but never consumed.
 | Empty episode | A resident iteration with no eligible input and a context ending on an assistant message settles without a provider call (ADR-027); tool-result continuations and newly taken inputs proceed; non-resident loops unchanged. This removes the empty-batch `reasoning_content` 400 that could follow a no-reasoning assistant turn | landed |
 | Explicit terminal ends | cancel/fatal still end terminally; the boot-time re-arm remains the recovery. Runtime re-arm for explicit ends is a recorded deferred follow-up (needs a runtime-rebindable Router binding across subscriptions, driver, tools and worker reports) | landed (boundary) |
 
+### Durable confirmation plane (designed, phase 1)
+
+Scope: a tool call the agent may *request* but a person must decide (`permissions.<tool>: ask`).
+The wait is a resumable end, not a held lease; the request is the event stream, not an outbox row;
+the answer is an admitted control row, never a direct event write. This closes the gap ADR-015 §7
+recorded ("a durable pending-confirmation state, a human/control-plane response path into the
+inbox, and hold semantics") and the superagent `awaiting-answer` stage's read-side-only deviation.
+
+The normative contract is [design/CONFIRMATION-MODEL.md](../design/CONFIRMATION-MODEL.md); the
+decision record is [ADR-033](../design/decisions/ADR-033-durable-confirmation-plane.md). The two
+catalog deltas (the 23rd kind `control/confirm`; the widened `tool/call.permission.evaluated` and
+`session/ended.reason`) are specified there and land — with the code — in EVENT-MODEL and
+API-CONTRACT together, because both catalogs are drift-tested against the implementation.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P1 | kian-core, kian-loop, kian-orchestrator, kian-cli | `ask` permission arm (a widened closed value, never invokes); `pending_calls` projection in `kian-core::confirmation`; the fifth end reason `awaiting_input` (`running → idle`); the `control/confirm` kind + reserved confirm row envelope; `confirm`/`pending` control-plane methods + CLI pair; lazy TTL expiry; the no-provider-request-while-pending resume rule; fail-closed config (unknown values, and `ask` refused on worker/resident agents) | designed |
+| P2 | kian-superagent | Worker integration: a deferred turn ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | not started |
+| P3 | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening); channel-side answers (an IM reply mapped to a `confirm`) | not started |
+| P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
+
+Acceptance criteria are named in CONFIRMATION-MODEL §13 (L1 contract tests; L2 on a real server
+covering `kill -9` at both crash points, duplicate/conflicting answers, TTL expiry and cancel). No
+L3 claim in phase 1 (no UI card; the `pending` read is its seam).
+
+Non-goals recorded with phase 1: no hook `ask`, no channel answering, no automatic expiry, no
+`ask` on worker/resident agents, no new session state, no `LoopDriver`/`LoopOutcome` change, no
+outbox row for the request.
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

@@ -128,6 +128,11 @@ when the owner asks. Negative results commit documentation only — never broken
   non-context events, the dreaming drain, creation-time injection, representations as projections.
   **Any memory semantic change starts here**; the kind bytes stay in EVENT-MODEL, the wire in
   API-CONTRACT, the placement in DESIGN.
+- `design/CONFIRMATION-MODEL.md` — the normative confirmation-plane contract (source of truth,
+  phase 1 designed / not yet landed): what an `ask` is, the pending-call projection, the
+  `awaiting_input` resumable end, the answer as an admitted control row and the resume rule.
+  **Any `ask`/confirmation semantic change starts here**; the kind bytes and wire tables land in
+  EVENT-MODEL / API-CONTRACT with the implementation (both are drift-tested against code).
 - `design/READ-MODEL.md` — the normative serving-form contract (source of truth): versions,
   unchanged/delta reads, resumable streams, verified snapshots, materialized views, opt-in
   export-only retention and bounded-staleness reads. Truth stays the event stream; wire shapes
