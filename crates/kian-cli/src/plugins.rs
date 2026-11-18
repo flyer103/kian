@@ -1784,6 +1784,7 @@ mod backend_queue_timeout_tests {
             allow_public: false,
             queue_timeout_ms: timeout,
             queue_max_redrives: 1,
+            release_after_ms: crate::config::DEFAULT_WORKER_RELEASE_AFTER_MS,
             enrolled_only: false,
             tokens: Default::default(),
         }

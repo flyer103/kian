@@ -2071,3 +2071,331 @@ async fn busy_worker_refusal_names_owner_then_other_worker_takes_over() {
     kill_serve(&mut serve).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// ADR-035: release_worker over the real server
+// ---------------------------------------------------------------------------
+
+/// Seeds one bound worker thread directly into the pre-boot store:
+/// the Router-side lineage + the worker session in the requested shape.
+async fn seed_bound_thread(
+    store: &EventStore,
+    root: SessionId,
+    worker_session: SessionId,
+    thread_id: uuid::Uuid,
+    worker: &str,
+    running: bool,
+    ts_ms: u64,
+) {
+    use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
+    use kian_core::model::Epoch;
+    use kian_store::AppendGuard;
+    use serde_json::json;
+
+    async fn append(
+        store: &EventStore,
+        session: SessionId,
+        seq: u64,
+        epoch: u64,
+        ts: u64,
+        kind: EventKind,
+        bytes: serde_json::Value,
+    ) {
+        store
+            .append(
+                session,
+                Event {
+                    seq,
+                    session,
+                    epoch: Epoch(epoch),
+                    ts,
+                    kind,
+                    bytes,
+                    version: SCHEMA_VERSION,
+                },
+                AppendGuard {
+                    epoch: Epoch(epoch),
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("seed append");
+    }
+
+    append(
+        store,
+        root,
+        1,
+        0,
+        ts_ms,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    append(
+        store,
+        root,
+        2,
+        0,
+        ts_ms,
+        EventKind::ThreadStarted,
+        json!({
+            "thread_id": thread_id.to_string(),
+            "parent": root.0.to_string(),
+            "worker": worker_session.0.to_string(),
+            "pinned_version": 1,
+            "task": {"role": "user", "content": format!("job-{worker}")},
+            "exec_worker": worker,
+        }),
+    )
+    .await;
+    append(
+        store,
+        worker_session,
+        1,
+        0,
+        ts_ms,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    append(
+        store,
+        worker_session,
+        2,
+        1,
+        ts_ms,
+        EventKind::DrainClaimed,
+        json!({"holder": "seed"}),
+    )
+    .await;
+    append(
+        store,
+        worker_session,
+        3,
+        1,
+        ts_ms,
+        EventKind::InputAdmitted,
+        json!({"role": "user", "content": "delegated task"}),
+    )
+    .await;
+    if !running {
+        append(
+            store,
+            worker_session,
+            4,
+            1,
+            ts_ms,
+            EventKind::SessionEnded {
+                reason: EndReason::Interrupted,
+            },
+            json!({}),
+        )
+        .await;
+    }
+}
+
+/// ADR-035 L2: a stuck (interrupted, idle) bound thread is closed through
+/// the real `POST /ops/rpc release_worker`; the real store shows the
+/// terminal `cancelled` close, a second call is the idempotent
+/// `already_released`, a running thread is refused `-32002`, and an
+/// unknown id is refused `-32008`. No Router model call is involved —
+/// the binding is the committed stream, exactly as the resolver reads it.
+#[tokio::test]
+async fn release_worker_ops_closes_a_stuck_binding_and_frees_it() {
+    use kian_core::events::EventKind as EK;
+    use serde_json::json;
+    force_no_proxy();
+    let dir = temp_dir("release-worker");
+    let serve_port = free_port();
+    let db = dir.join("kian.sqlite");
+    let config = dir.join("kian.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"listen: "127.0.0.1:{serve_port}"
+storage:
+  sqlite: "{db}"
+agent:
+  id: default
+  model_slots:
+    main:
+      provider: mock
+      model: mock-model
+  tools: []
+providers:
+  mock:
+    base_url: "http://127.0.0.1:1"
+    api_key_env: KIAN_E2E_API_KEY
+plugins: ["openai-compat", "local-tools", "remote-exec"]
+endpoints:
+  - id: w-alpha
+    addr: "127.0.0.1:1"
+    description: "the stuck worker"
+    queue_timeout_ms: 60000
+    offline_after_ms: 30000
+  - id: w-beta
+    addr: "127.0.0.1:2"
+    description: "the running worker"
+    queue_timeout_ms: 60000
+    offline_after_ms: 30000
+drain:
+  max_iterations: 2
+tools:
+  root: "{dir}"
+recovery:
+  budget:
+    tokens: 64
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+            db = db.display(),
+            dir = dir.display(),
+        ),
+    )
+    .expect("write l2 config");
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    let stuck_session = SessionId::new();
+    let running_session = SessionId::new();
+    let stuck_thread = uuid::Uuid::new_v4();
+    let running_thread = uuid::Uuid::new_v4();
+    {
+        let store = EventStore::open(&db).await.expect("pre-boot store");
+        seed_bound_thread(
+            &store,
+            SessionId::new(),
+            stuck_session,
+            stuck_thread,
+            "w-alpha",
+            false,
+            now_ms,
+        )
+        .await;
+        seed_bound_thread(
+            &store,
+            SessionId::new(),
+            running_session,
+            running_thread,
+            "w-beta",
+            true,
+            now_ms,
+        )
+        .await;
+        store.close().await;
+    }
+
+    let (mut serve, base) = boot_serve(&config, serve_port).await;
+    let client = reqwest::Client::new();
+
+    let released = rpc(
+        &client,
+        &base,
+        "/ops/rpc",
+        "release_worker",
+        json!({"worker": "w-alpha", "reason": "stuck after interrupt"}),
+    )
+    .await;
+    let result = released
+        .get("result")
+        .unwrap_or_else(|| panic!("release failed: {released}"));
+    assert_eq!(result["outcome"], "released", "{released}");
+    assert_eq!(
+        result["session"].as_str(),
+        Some(stuck_session.0.to_string().as_str())
+    );
+    assert_eq!(
+        result["thread_id"].as_str(),
+        Some(stuck_thread.to_string().as_str())
+    );
+
+    // The real store shows one terminal cancelled close that preserves
+    // the earlier honest interrupted end.
+    let store = EventStore::open_read_only(&db)
+        .await
+        .expect("read-only store");
+    let events = store.rebuild(stuck_session).await.expect("rebuild");
+    assert!(matches!(
+        events.last().unwrap().kind,
+        EK::SessionEnded {
+            reason: kian_core::events::EndReason::Cancelled
+        }
+    ));
+    assert_eq!(
+        events.last().unwrap().bytes["released"]["worker"],
+        json!("w-alpha")
+    );
+    assert_eq!(
+        events.last().unwrap().bytes["released"]["by"],
+        json!("operator")
+    );
+    assert!(events.iter().any(|e| matches!(
+        e.kind,
+        EK::SessionEnded {
+            reason: kian_core::events::EndReason::Interrupted
+        }
+    )));
+    assert_eq!(
+        store.rebuild(running_session).await.expect("rebuild").len(),
+        3,
+        "the running thread was not touched"
+    );
+    store.close().await;
+
+    // Idempotent: the slot is already free.
+    let again = rpc(
+        &client,
+        &base,
+        "/ops/rpc",
+        "release_worker",
+        json!({"worker": "w-alpha"}),
+    )
+    .await;
+    assert_eq!(again["result"]["outcome"], "already_released", "{again}");
+
+    // The operator verb is the same call through the client: a second
+    // release reads `already_released` (the SDK + CLI leg).
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_kian"))
+        .args(["workers", "release", "w-alpha", "--url", &base, "--json"])
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("run kian workers release");
+    assert!(
+        cli.status.success(),
+        "kian workers release failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json: serde_json::Value = serde_json::from_slice(&cli.stdout).expect("cli json");
+    assert_eq!(cli_json["outcome"], "already_released", "{cli_json}");
+
+    // A running thread is never force-closed.
+    let busy = rpc(
+        &client,
+        &base,
+        "/ops/rpc",
+        "release_worker",
+        json!({"worker": "w-beta"}),
+    )
+    .await;
+    assert_eq!(busy["error"]["code"], -32002, "{busy}");
+
+    // An unknown worker id is the honest not-bound refusal.
+    let unknown = rpc(
+        &client,
+        &base,
+        "/ops/rpc",
+        "release_worker",
+        json!({"worker": "nope"}),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], -32008, "{unknown}");
+
+    kill_serve(&mut serve).await;
+}

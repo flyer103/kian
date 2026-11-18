@@ -51,7 +51,9 @@ The same runtime also ships:
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
-  binding; a busy or unknown worker refuses honestly.
+  binding; a busy or unknown worker refuses honestly, and `kian workers release <id>` closes a
+  thread that ended `interrupted`/`failed` (or the bounded reclaim does) so a dead thread can
+  never leak the slot ([ADR-035](design/decisions/ADR-035-worker-release-and-idle-reclaim.md)).
 - **Runtime worker membership** — workers join and leave a running server without config edits
   or restarts: `kiand --register-to` authenticates on a private listener (shared token or
   per-worker enrollment) and the connection becomes the command route; commands queue durably per
@@ -515,6 +517,20 @@ would change bytes when one joins), and with no workers configured the feature i
 argument is refused ([ADR-020](design/decisions/ADR-020-durable-worker-binding.md),
 [WORKER-MODEL.md](design/WORKER-MODEL.md)).
 
+A thread that ended `interrupted`/`failed` is resumable and keeps holding the worker — so it is
+closed explicitly or after a bounded grace, never leaked forever. `kian workers release <id>` does
+it now: one atomic claim + `session/ended{cancelled}` batch preserves the earlier honest end,
+frees the slot, and makes the thread terminal (it can never resume into the slot a newer thread
+holds). The same close runs automatically when the thread has been idle-ended for
+`workers.release_after_ms` (default five minutes, `0` disables). A running thread, a thread with
+eligible input, or a worker still owing a queued command refuses the release honestly
+([ADR-035](design/decisions/ADR-035-worker-release-and-idle-reclaim.md)).
+
+```bash
+kian workers release mac-mini --reason "interrupted task, freeing the slot"
+kian workers release mac-mini --json     # {"worker": ..., "outcome": "released"|"already_released", ...}
+```
+
 #### Runtime worker membership (workers join/leave without a restart)
 
 Workers can also register themselves at runtime — no `kian.yaml` edit, no `kian serve` restart
@@ -538,6 +554,7 @@ workers:
     mac-mini: KIAN_MAC_MINI_TOKEN
   queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
   queue_max_redrives: 1        # re-drive retries before an unacknowledgeable row is abandoned
+  release_after_ms: 300000     # idle-ended thread freed after 5 min; 0 = explicit release only
 ```
 
 ```bash

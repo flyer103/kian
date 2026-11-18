@@ -10,6 +10,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Worker binding release + idle reclaim (R18)**. A worker thread that ended `interrupted`/`failed`
+  no longer holds its 1:1 slot forever: `release_worker` / `kian workers release <id>` closes it with
+  one atomic `drain/claimed` + `session/ended{cancelled}` batch (fresh claim epoch; additive
+  `released` end payload), and a `kian serve` maintenance tick reclaims stale idle-ended threads
+  after `workers.release_after_ms` (default 300 000, `0` disables). Release is refused while the
+  thread is running, has eligible input, or has a live `pending`/`inflight` command for its worker;
+  the close is terminal, so it can never be resumed or rebound. Contract:
+  [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §3, [design/API-CONTRACT.md](design/API-CONTRACT.md)
+  §4, [ADR-035](design/decisions/ADR-035-worker-release-and-idle-reclaim.md).
 - **Cron scheduler: declarative wall-clock turns (P0/P1)**. `superagent.cron.schedules` declares
   five-field or `@`-alias expressions in an IANA zone; each due slot is claimed once in
   `cron_firings` (migration v7, sqlite + postgres) and runs as an ordinary turn — on the resident

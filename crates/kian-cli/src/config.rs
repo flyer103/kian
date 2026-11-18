@@ -2445,6 +2445,15 @@ pub struct WorkersConfig {
     /// construction, like the queue timeout: no per-endpoint override.
     #[serde(default = "default_workers_queue_max_redrives")]
     pub queue_max_redrives: u32,
+    /// How long a worker thread that already ended `interrupted`/`failed`
+    /// keeps holding its 1:1 worker slot before the maintenance tick closes
+    /// it (`session/ended{cancelled}`, ADR-035). The explicit
+    /// `kian workers release <id>` verb frees the slot immediately; `0`
+    /// disables the automatic reclaim (the thread then holds the slot until
+    /// an operator releases it). The grace exists so an ended thread can
+    /// still be inspected/resumed through the API before it is closed.
+    #[serde(default = "default_workers_release_after_ms")]
+    pub release_after_ms: u64,
     /// Admission mode (phase 1 of the per-worker-identity work): when
     /// true, only ids in `tokens` may register. Requires a non-empty
     /// `tokens` map and forbids `token_env` (no shared fallback — a
@@ -2469,6 +2478,14 @@ fn default_workers_queue_timeout_ms() -> u64 {
 
 fn default_workers_queue_max_redrives() -> u32 {
     1
+}
+
+/// The default `workers.release_after_ms` (ADR-035): an idle-ended worker
+/// thread is closed after five minutes. `0` disables the automatic reclaim.
+pub const DEFAULT_WORKER_RELEASE_AFTER_MS: u64 = 300_000;
+
+fn default_workers_release_after_ms() -> u64 {
+    DEFAULT_WORKER_RELEASE_AFTER_MS
 }
 
 /// The ceiling on `workers.queue_max_redrives`: the knob bounds a recovery
@@ -4633,6 +4650,8 @@ recovery:
         assert_eq!(workers.offline_after_ms, 30_000, "default");
         assert_eq!(workers.queue_timeout_ms, 60_000, "default");
         assert_eq!(workers.queue_max_redrives, 1, "default");
+        assert_eq!(workers.release_after_ms, DEFAULT_WORKER_RELEASE_AFTER_MS);
+        assert_eq!(workers.release_after_ms, 300_000, "5-minute default");
         assert!(!workers.allow_public, "default");
         assert!(!workers.enrolled_only, "default");
         assert!(workers.tokens.is_empty(), "default");
@@ -4641,6 +4660,37 @@ recovery:
 
         let plain = ServeConfig::parse(&base).expect("valid config");
         assert!(plain.workers.is_none(), "absent section = feature off");
+    }
+
+    /// ADR-035: `workers.release_after_ms` parses; `0` is an explicit
+    /// "disabled", never a typo-refused value.
+    #[test]
+    fn workers_release_after_ms_parses_including_disabled() {
+        let base = valid_yaml();
+        let with = |value: u64| {
+            format!(
+                "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+                 workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n  \
+                 release_after_ms: {value}\n"
+            )
+        };
+        let cfg = ServeConfig::parse(&with(600_000)).expect("explicit release_after_ms parses");
+        assert_eq!(
+            cfg.workers
+                .clone()
+                .expect("section present")
+                .release_after_ms,
+            600_000
+        );
+        let off = ServeConfig::parse(&with(0)).expect("0 = disabled parses");
+        assert_eq!(
+            off.workers
+                .clone()
+                .expect("section present")
+                .release_after_ms,
+            0
+        );
+        assert!(off.validate().is_ok());
     }
 
     /// The enrolled form parses: per-worker token env names, the
@@ -4698,6 +4748,7 @@ recovery:
                 allow_public: false,
                 queue_timeout_ms: queue,
                 queue_max_redrives: 1,
+                release_after_ms: DEFAULT_WORKER_RELEASE_AFTER_MS,
                 enrolled_only: false,
                 tokens: BTreeMap::new(),
             }

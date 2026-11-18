@@ -194,6 +194,25 @@ pub enum InterruptOutcome {
     UnknownSession,
 }
 
+/// What an [`Engine::release_idle`] call did (ADR-035).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// The idle, already-ended session was closed: the claim + terminal
+    /// `cancelled` end landed atomically.
+    Released { seq: u64, epoch: u64 },
+    /// The session is already terminal — nothing was written
+    /// (idempotent).
+    AlreadyTerminal,
+    /// A drain holds the session, or a fresh lease on another replica
+    /// blocked the claim — nothing was written; retry later.
+    Busy,
+    /// The session is not an idle, already-ended session (running,
+    /// never ended, or holding eligible work) — nothing was written.
+    NotEligible,
+    /// No event stream exists for the session.
+    Unknown,
+}
+
 /// The in-map handle for one draining session. Presence in
 /// `DashMap<SessionId, DrainHandle>` *is* "a drain is in flight".
 #[derive(Debug)]
@@ -896,6 +915,128 @@ where
             .await?;
         self.metrics.on_state_transition();
         Ok(sid)
+    }
+
+    /// Closes an **idle, already-ended** session terminally (ADR-035):
+    /// one claim + `drain/claimed` + `session/ended{cancelled}` in one
+    /// atomic batch, under a fresh claim epoch. This is what frees a
+    /// worker's 1:1 slot after its thread ended `interrupted`/`failed`:
+    /// the state machine has no `idle → terminal` edge, so the close
+    /// must take ownership first, and `cancelled` is what makes the
+    /// release safe (a terminal session can never resume into the slot
+    /// a newer thread now holds).
+    ///
+    /// Fail-closed gates, all before the claim: the projection is
+    /// `idle`, the last event is `session/ended{interrupted|failed}`
+    /// (a session that never ended is not releasable), no eligible
+    /// inbox row exists (queued/resumable work is never discarded), and
+    /// no drain is in flight. The claim then fences a live holder on
+    /// another replica. The batch is one transaction: a crash before it
+    /// leaves the projection `idle` (retryable), never a half-close.
+    ///
+    /// The caller owns the domain meaning of `end_bytes` (the worker
+    /// release payload); the engine only needs a JSON object.
+    pub async fn release_idle(
+        &self,
+        session: SessionId,
+        end_bytes: Value,
+    ) -> Result<ReleaseOutcome, EngineError> {
+        match self.drains.entry(session) {
+            Entry::Occupied(_) => return Ok(ReleaseOutcome::Busy),
+            Entry::Vacant(v) => {
+                v.insert(DrainHandle::new(session, self.clock.now_ms()));
+            }
+        }
+        let outcome = self.release_idle_inner(session, end_bytes).await;
+        self.drains.remove(&session);
+        if !matches!(outcome, Ok(ReleaseOutcome::Released { .. })) && self.wakes.take(&session) {
+            // A wake folded onto this release (e.g. a submit raced it):
+            // the session is still open, so re-drive it — a folded wake
+            // must never be lost (constraint 6).
+            self.wake(session);
+        }
+        outcome
+    }
+
+    async fn release_idle_inner(
+        &self,
+        session: SessionId,
+        end_bytes: Value,
+    ) -> Result<ReleaseOutcome, EngineError> {
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(ReleaseOutcome::Unknown);
+        }
+        let state = project(&events)?;
+        if state.is_terminal() {
+            return Ok(ReleaseOutcome::AlreadyTerminal);
+        }
+        if state != SessionState::Idle {
+            return Ok(ReleaseOutcome::Busy);
+        }
+        let ended = matches!(
+            events.last().map(|e| &e.kind),
+            Some(EventKind::SessionEnded {
+                reason: EndReason::Interrupted | EndReason::Failed
+            })
+        );
+        if !ended {
+            return Ok(ReleaseOutcome::NotEligible);
+        }
+        let now = self.clock.now_ms();
+        if !self.store.eligible_inputs(session, now).await?.is_empty() {
+            return Ok(ReleaseOutcome::NotEligible);
+        }
+        let lease = match self
+            .store
+            .claim(session, &self.config.holder, self.config.lease_ttl_ms, now)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(kian_store::InboxError::ClaimRejected { .. }) => return Ok(ReleaseOutcome::Busy),
+            Err(e) => return Err(e.into()),
+        };
+        let head = self.store.head(session).await?;
+        let claim = Event {
+            seq: head.next_seq,
+            session,
+            epoch: lease.epoch,
+            ts: now,
+            kind: EventKind::DrainClaimed,
+            bytes: json!({"holder": self.config.holder, "epoch": lease.epoch.0}),
+            version: SCHEMA_VERSION,
+        };
+        let end = Event {
+            seq: head.next_seq + 1,
+            session,
+            epoch: lease.epoch,
+            ts: now,
+            kind: EventKind::SessionEnded {
+                reason: EndReason::Cancelled,
+            },
+            bytes: end_bytes,
+            version: SCHEMA_VERSION,
+        };
+        self.store
+            .append_batch(
+                session,
+                &[claim, end],
+                AppendGuard {
+                    epoch: lease.epoch,
+                    expected_seq: head.next_seq,
+                },
+            )
+            .await?;
+        // Mirror the drain's accounting for the two events in the batch:
+        // the claim and the terminal end are two state transitions, and
+        // the end is one end write.
+        self.metrics.on_state_transition();
+        self.metrics.on_state_transition();
+        self.metrics.on_end_write();
+        Ok(ReleaseOutcome::Released {
+            seq: head.next_seq + 1,
+            epoch: lease.epoch.0,
+        })
     }
 
     /// Projects the session from its event stream (constraint 1: state
@@ -1687,7 +1828,7 @@ mod tests {
 
     use super::{
         Clock, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome, ManualClock,
-        WakeOutcome,
+        ReleaseOutcome, WakeOutcome,
     };
     use crate::metrics::Metrics;
     use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
@@ -3609,6 +3750,278 @@ mod tests {
         );
         assert_eq!(store.head(idle).await.unwrap().next_seq, 2, "no new events");
         assert!(!eng.is_draining(&idle));
+        cleanup(&path);
+    }
+
+    // -- ADR-035: the release of an idle-ended session ----------------------
+
+    /// Seeds a session in the worker-release shape: claimed once, an
+    /// input admitted, then `session/ended{interrupted}` — projection
+    /// `idle`, resumable, no drain.
+    async fn seed_interrupted_idle(store: &EventStore, eng: &Engine<ScriptedDriver>) -> SessionId {
+        let sid = eng.create_session().await.unwrap();
+        let lease = store
+            .claim(sid, "test-holder", 5_000, T0)
+            .await
+            .expect("claim");
+        let events = [
+            (
+                EventKind::DrainClaimed,
+                json!({"holder": "test-holder", "epoch": lease.epoch.0}),
+            ),
+            (
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "task"}),
+            ),
+            (
+                EventKind::SessionEnded {
+                    reason: EndReason::Interrupted,
+                },
+                json!({}),
+            ),
+        ];
+        for (i, (kind, bytes)) in events.into_iter().enumerate() {
+            let seq = 2 + i as u64;
+            store
+                .append(
+                    sid,
+                    Event {
+                        seq,
+                        session: sid,
+                        epoch: lease.epoch,
+                        ts: T0,
+                        kind,
+                        bytes,
+                        version: SCHEMA_VERSION,
+                    },
+                    AppendGuard {
+                        epoch: lease.epoch,
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("append seed event");
+        }
+        assert_eq!(projection_of(store, sid).await, SessionState::Idle);
+        sid
+    }
+
+    /// (ADR-035) An idle-ended session is closed by ONE atomic batch: a
+    /// fresh claim + `drain/claimed` + `session/ended{cancelled}` with
+    /// the caller's release payload. The result projects `cancelled`
+    /// (terminal), satisfies NoHalfTerminated and invariant 5, and a
+    /// second call is the idempotent `already_terminal`.
+    #[tokio::test]
+    async fn release_idle_closes_an_interrupted_session_with_one_atomic_batch() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = seed_interrupted_idle(&store, &eng).await;
+        let before = store.head(sid).await.unwrap();
+        let payload = json!({
+            "released": {
+                "worker": "mac-mini",
+                "thread": Uuid::new_v4().to_string(),
+                "by": "operator",
+                "reason": "stuck",
+            }
+        });
+
+        let out = eng.release_idle(sid, payload.clone()).await.unwrap();
+        let ReleaseOutcome::Released { seq, epoch } = out else {
+            panic!("expected Released, got {out:?}");
+        };
+        assert_eq!(seq, before.next_seq + 1, "the end is the batch's last seq");
+        assert!(
+            epoch > before.epoch.0,
+            "the close takes a fresh claim epoch"
+        );
+
+        let events = events_of(&store, sid).await;
+        assert_eq!(projection_of(&store, sid).await, SessionState::Cancelled);
+        assert!(
+            matches!(events[events.len() - 2].kind, EventKind::DrainClaimed),
+            "the close claims before it ends"
+        );
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: EndReason::Cancelled
+            }
+        ));
+        assert_eq!(events.last().unwrap().bytes, payload);
+        assert_eq!(events.last().unwrap().seq, seq);
+        assert_eq!(events.last().unwrap().epoch.0, epoch);
+        kian_core::invariants::no_half_terminated(&events).expect("one terminal end");
+        kian_core::invariants::interrupt_targets_active_chain(&events).expect("invariant 5");
+
+        assert_eq!(
+            eng.release_idle(sid, json!({})).await.unwrap(),
+            ReleaseOutcome::AlreadyTerminal,
+            "idempotent: a released thread stays closed"
+        );
+        assert_eq!(
+            events_of(&store, sid).await.len(),
+            events.len(),
+            "no extra write"
+        );
+        cleanup(&path);
+    }
+
+    /// (ADR-035) The gates refuse everything that is not an idle, ended,
+    /// drain-free, work-free session — before any claim or append.
+    #[tokio::test]
+    async fn release_idle_refuses_non_eligible_sessions() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+
+        assert_eq!(
+            eng.release_idle(SessionId::new(), json!({})).await.unwrap(),
+            ReleaseOutcome::Unknown
+        );
+
+        let created = eng.create_session().await.unwrap();
+        assert_eq!(
+            eng.release_idle(created, json!({})).await.unwrap(),
+            ReleaseOutcome::NotEligible,
+            "a session that never ended is not releasable"
+        );
+
+        let running = eng.create_session().await.unwrap();
+        let lease = store
+            .claim(running, "test-holder", 5_000, T0)
+            .await
+            .unwrap();
+        store
+            .append(
+                running,
+                Event {
+                    seq: 2,
+                    session: running,
+                    epoch: lease.epoch,
+                    ts: T0,
+                    kind: EventKind::DrainClaimed,
+                    bytes: json!({"holder": "test-holder", "epoch": lease.epoch.0}),
+                    version: SCHEMA_VERSION,
+                },
+                AppendGuard {
+                    epoch: lease.epoch,
+                    expected_seq: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            eng.release_idle(running, json!({})).await.unwrap(),
+            ReleaseOutcome::Busy,
+            "a running projection is never force-closed"
+        );
+
+        let done = eng.create_session().await.unwrap();
+        let lease = store.claim(done, "test-holder", 5_000, T0).await.unwrap();
+        for (seq, kind) in [
+            (2, EventKind::DrainClaimed),
+            (
+                3,
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+            ),
+        ] {
+            store
+                .append(
+                    done,
+                    Event {
+                        seq,
+                        session: done,
+                        epoch: lease.epoch,
+                        ts: T0,
+                        kind,
+                        bytes: json!({}),
+                        version: SCHEMA_VERSION,
+                    },
+                    AppendGuard {
+                        epoch: lease.epoch,
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            eng.release_idle(done, json!({})).await.unwrap(),
+            ReleaseOutcome::AlreadyTerminal
+        );
+        cleanup(&path);
+    }
+
+    /// (ADR-035) Eligible work is never discarded: an inbox row makes
+    /// the release refuse and write nothing.
+    #[tokio::test]
+    async fn release_idle_never_discards_eligible_work() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = seed_interrupted_idle(&store, &eng).await;
+        eng.admit_quiet(sid, json!("resume me"), None)
+            .await
+            .unwrap();
+        let before = store.head(sid).await.unwrap();
+
+        assert_eq!(
+            eng.release_idle(sid, json!({})).await.unwrap(),
+            ReleaseOutcome::NotEligible
+        );
+        assert_eq!(
+            store.head(sid).await.unwrap().next_seq,
+            before.next_seq,
+            "nothing was appended"
+        );
+        assert_eq!(projection_of(&store, sid).await, SessionState::Idle);
+        cleanup(&path);
+    }
+
+    /// (ADR-035) A live drain is never raced: the release is refused
+    /// while the drain holds the session, and the drain finishes
+    /// untouched afterwards.
+    #[tokio::test]
+    async fn release_idle_never_touches_a_live_drain() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![vec![
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::TurnDone),
+                Step::Outcome(LoopOutcome::Settled),
+            ]])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("work"), None).await.unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await,
+            "the drain is mid-turn"
+        );
+
+        assert_eq!(
+            eng.release_idle(sid, json!({})).await.unwrap(),
+            ReleaseOutcome::Busy
+        );
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid)
+                    && projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the untouched drain settles"
+        );
         cleanup(&path);
     }
 

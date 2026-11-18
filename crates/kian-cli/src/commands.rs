@@ -2116,6 +2116,45 @@ pub async fn run_wake_now(
     ))
 }
 
+/// `kian workers release <id> [--reason <text>] [--url <base>]
+/// [--config <path>] [--json]`: close the worker's live bound thread and
+/// free its 1:1 slot (ADR-035). Refused honestly while the thread is
+/// running, not ended, holding eligible input, or owing a live command;
+/// the running server resolves the binding (the caller never supplies a
+/// session id).
+pub async fn run_workers_release(
+    config_path: &Path,
+    url: Option<&str>,
+    worker: &str,
+    reason: Option<&str>,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let receipt = client
+        .release_worker(worker, reason)
+        .await
+        .map_err(|e| format!("workers release `{worker}`: {e}"))?;
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "worker": receipt.worker,
+            "outcome": receipt.outcome,
+            "session": receipt.session,
+            "thread_id": receipt.thread_id,
+            "seq": receipt.seq,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let meaning = match receipt.outcome.as_str() {
+        "released" => "closed the ended thread; the worker is free",
+        "already_released" => "the thread was already closed (no-op)",
+        _ => "unknown outcome",
+    };
+    Ok(format!(
+        "worker              {}\noutcome             {} ({meaning})\nsession             {}\nthread              {}\nseq                 {}\n",
+        receipt.worker, receipt.outcome, receipt.session, receipt.thread_id, receipt.seq
+    ))
+}
+
 /// `kian mock-channel-send <channel> [--text S | --payload JSON]
 /// [--topic T] [--url <base>] [--json]`: the demo/ injection —
 /// one event onto a configured mock channel via `POST /ops/rpc`; the

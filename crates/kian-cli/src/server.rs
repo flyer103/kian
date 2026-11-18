@@ -40,6 +40,7 @@ use crate::plugins::{
 };
 use crate::superagent::{ServeLoopDriver, SuperAgentRuntime, SuperAgentServices};
 use crate::webhook::{WebhookError, WebhookLimits, WebhookPlane};
+use crate::worker_release::ReleaseWorkerReceipt;
 
 /// Everything assembling `kian serve` can fail with. All of them refuse
 /// to start — none degrade to defaults.
@@ -134,6 +135,12 @@ pub struct Server {
     /// ticker — interrupt-only, outside every drain; absent arms no
     /// timer at all (M8: feature-off changes nothing).
     child_timeout_maintenance: Option<ChildTimeoutMaintenance>,
+    /// The worker binding release plan (ADR-035): present iff worker
+    /// binding is configured (an `endpoints:`/`workers:` section opens
+    /// the durable command queue). The `release_worker` ops method needs
+    /// the queue gate; [`Server::serve`] arms the reclaim ticker only
+    /// when `after_ms > 0` (feature-off arms no timer).
+    worker_release: Option<WorkerReleaseMaintenance>,
     /// Whether observability reads on this server (/metrics aggregates)
     /// may consult fresh materialized views (READ-MODEL §6; a disabled
     /// gate hides every view).
@@ -193,6 +200,16 @@ struct ViewsMaintenance {
 struct ChildTimeoutMaintenance {
     root: kian_core::model::SessionId,
     limits: kian_superagent::MultiagentLimits,
+}
+
+/// The serve-side worker release plan (ADR-035): the durable command
+/// queue (the "machine still working" gate) and the reclaim grace. A
+/// zero grace disables only the automatic reclaim; the explicit
+/// `release_worker` verb stays available.
+#[derive(Clone)]
+struct WorkerReleaseMaintenance {
+    exec_store: ExecStore,
+    after_ms: u64,
 }
 
 /// Reads one lark credential from the environment, treating blank as
@@ -367,6 +384,10 @@ impl Server {
                 redactor: exec_redactor.clone(),
             },
         ];
+        // ADR-035: the release path (ops verb + reclaim tick) reads the
+        // same durable queue to gate on live command rows, so keep one
+        // clone before the remote-exec plugin takes ownership.
+        let release_exec_store = exec_store.clone();
         if let Some(store) = exec_store {
             plugins.register(RemoteExecPlugin {
                 store,
@@ -963,6 +984,15 @@ impl Server {
             // absent the ticker stays unarmed (M8: feature-off arms
             // nothing).
             child_timeout_maintenance: None,
+            worker_release: release_exec_store.map(|exec_store| WorkerReleaseMaintenance {
+                exec_store,
+                after_ms: config
+                    .workers
+                    .as_ref()
+                    .map_or(crate::config::DEFAULT_WORKER_RELEASE_AFTER_MS, |w| {
+                        w.release_after_ms
+                    }),
+            }),
             views_enabled,
             event_stream: Arc::new(EventStreamMetrics::new()),
             event_stream_enabled,
@@ -1038,7 +1068,7 @@ impl Server {
     /// this module, not `api`: it reads counters and derives the cache
     /// report from the store, which the iron-rule handler module must
     /// not even name. The `/ops/rpc` plane (operator actions:
-    /// `wake_now`, `recovery_budget_reset`) is merged here too, behind
+    /// `wake_now`, `recovery_budget_reset`, `release_worker`) is merged here too, behind
     /// its own [`OpsPlane`] trait — the control plane's built-in wire
     /// surface stays untouched.
     pub fn router(self: &Arc<Self>) -> axum::Router {
@@ -1305,6 +1335,39 @@ impl Server {
                         .unwrap_or(0);
                     crate::multiagent_tick::tick(&*engine, port, plan.root, &plan.limits, now_ms)
                         .await;
+                }
+            });
+        }
+        // Worker binding release (ADR-035): a ticker whose each beat
+        // reclaims idle-ended worker threads past `workers.release_after_ms`
+        // — strictly outside every drain; the tick's only write is the
+        // engine's atomic claim + cancelled end, so a kill -9 mid-tick
+        // leaves nothing partial. The first beat fires immediately, so a
+        // restart reclaims threads that went stale while the process was
+        // down. `after_ms: 0` arms nothing (the explicit verb remains).
+        if let Some(plan) = self.worker_release.clone()
+            && plan.after_ms > 0
+        {
+            let engine = Arc::clone(&self.engine);
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let period = plan.after_ms.clamp(1_000, 60_000);
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(period));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    crate::worker_release_tick::tick(
+                        &*engine,
+                        &store,
+                        &plan.exec_store,
+                        plan.after_ms,
+                        now_ms,
+                    )
+                    .await;
                 }
             });
         }
@@ -1890,6 +1953,30 @@ impl OpsPlane for Server {
                 .map_err(|e| OpsError::Internal(format!("budget reset append: {e}")))?;
             tracing::info!(session = %session.0, seq, "recovery budget reset appended");
             Ok(ResetReceipt { seq, epoch, ts })
+        })
+    }
+
+    fn release_worker(
+        &self,
+        worker: String,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<ReleaseWorkerReceipt, OpsError>> {
+        Box::pin(async move {
+            let Some(plan) = self.worker_release.as_ref() else {
+                return Err(OpsError::WorkerNotBound {
+                    worker,
+                    detail: "worker binding is not configured on this server                              (no `endpoints:`/`workers:` section)"
+                        .to_string(),
+                });
+            };
+            crate::worker_release::release_worker(
+                &self.engine,
+                &self.store,
+                &plan.exec_store,
+                &worker,
+                reason,
+            )
+            .await
         })
     }
 

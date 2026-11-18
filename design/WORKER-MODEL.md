@@ -2,6 +2,8 @@
 
 - **Status**: normative (landed with Round 12; ADR-021 implemented and reviewed — acceptance and
   review evidence in the board's `shared/round12/` and the CHANGELOG R12 entry).
+  **Amended 2026-11-18**: binding release by thread close, the explicit release verb and the
+  bounded idle reclaim ([ADR-035](decisions/ADR-035-worker-release-and-idle-reclaim.md)).
 - **Date**: 2026-11-08
 - **Owns**: worker-domain *semantics* — identity, membership lifecycle, binding and dispatch rules,
   catalog/discovery, security boundary, version/upgrade policy, degradation, boundaries, UNVERIFIED,
@@ -25,9 +27,10 @@
 | The 1:1 live-session exclusivity and the single drain it leans on | [ADR-009](decisions/ADR-009-multi-replica-claim-admission.md) |
 | Crate placement, assembly, config surface, CLI verb shape | [DESIGN](DESIGN.md) §4.3/§4.7 |
 
-This contract introduces **no** new event kind, **no** new table, **no** new HTTP route, **no** new
-ops method, and **no** new metrics key. It fixes one wire version (KiandProto v3, owned by
-API-CONTRACT §8) and one additive config section (`workers:`).
+This contract introduces **no** new event kind, **no** new table, **no** new HTTP route and **no**
+new metrics key. It fixes one wire version (KiandProto v3, owned by API-CONTRACT §8) and one
+additive config section (`workers:`). ADR-035 adds one ops method (`release_worker`) and one
+`workers:` key (`release_after_ms`) on the same terms: no new kind, table or route.
 
 ```mermaid
 graph LR
@@ -114,8 +117,23 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   is no binding map, no routing table. Restart rebuild therefore equals replay by construction.
 - **1:1 over live sessions.** One worker has at most one live bound worker session. "Busy" is
   live-session based, not connection based: `completed`/`cancelled` release the worker,
-  `failed`/`interrupted` are resumable and still hold it, and a never-started reservation holds it
-  only until its lease timeout. An **offline** worker with a live bound session is still busy.
+  `failed`/`interrupted` hold it until a **release** (the next bullet), and a never-started
+  reservation holds it only until its lease timeout. An **offline** worker with a live bound
+  session is still busy.
+- **Release is a terminal close, never a reinterpretation.** A thread whose last event is
+  `session/ended{interrupted|failed}` keeps holding the worker — it is resumable — until a release
+  closes it with one atomic `drain/claimed` + `session/ended{cancelled}` batch under a fresh claim
+  epoch (ADR-035). `cancelled` is terminal, so the binding can never be resumed, rebound, rerouted
+  or handed to another id; the 1:1 rule survives because a released thread cannot execute again.
+  A release is refused unless the projection is `idle`, the last end is non-terminal, the inbox has
+  no eligible row, no drain is live, and the worker's durable queue has no `pending`/`inflight`
+  row (a machine still executing or owing a command from the thread is not idle). Two triggers:
+  the `release_worker` ops method / `kian workers release <id>` verb, and the bounded
+  `workers.release_after_ms` reclaim (`0` disables) run by a `kian serve` maintenance tick from the
+  thread's terminal-end timestamp. Every release is audited (one tracing line; an additive
+  `released` object on the end event). No-ops and refusals are honest: `already_released` for a
+  terminal thread, `session_busy` for a running one, `worker_not_bound` for an unknown id or no
+  live binding.
 - **Offline is a valid binding state.** A spawn may bind a known-but-offline worker: the command is
   enqueued durably, parks, and runs when the worker returns or ends in the honest queue timeout. The
   spawn result and one audit line say `offline — commands will queue`.
@@ -193,9 +211,9 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   iteration-budget exhaustion; the worker records `thread/completed{status:"interrupted"}` with the
   stop reason as the summary — never `completed`, whose summary would otherwise be the last
   assistant turn (a pending tool call with empty text). The following `session/ended{completed}`
-  still decides liveness (`Released`), so the worker is reusable; `session/ended{interrupted}` for a
-  budget stop is deferred to its own ADR because it holds the worker until a designed resume/cancel
-  exists.
+  still decides liveness (`Released`), so the worker is reusable. An interrupted worker session
+  that ends without a releasing end holds the worker until §3's release/reclaim (ADR-035); it is
+  never silently released while resumable.
 - **Callers survive route swaps.** A caller's future is attached to the command id, not to a
   connection, so a detach/attach cycle (replace, restart, reconnect) never severs a live wait.
 
@@ -287,6 +305,8 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 | Fs path escapes the root (`..`) | server-side lexical check before enqueue; worker-side re-check | honest `InvalidCall` (no row) or a typed `io` error result — never a write outside the intended path | that call |
 | Fs body over 1 MiB / non-UTF-8 read | worker-side bound / decode | typed `io` error surfaced as the local `{"error": …}` tool result; no truncation, no partial write | that call |
 | Queue timeout | timer | row abandoned honestly, caller gets a timeout; a duplicate command id answers with the same timeout | that command |
+| Bound thread ended `interrupted`/`failed` | projection `idle` + last end non-terminal + no live queue row | holds the worker until `release_worker` / the `workers.release_after_ms` tick closes it (`cancelled` after a claim; audited) | that thread; the worker is freed, no command moves |
+| Release refused (running / eligible input / live queue row) | the release gates | honest refusal (`session_busy`), no append; the operator interrupts/waits and retries; the tick skips this beat | that thread |
 
 No degradation path maps onto a `completed` session, invents a result, silently swallows a command, or
 fails a command over to another worker. Every row above is an audit line plus an honest error at the
@@ -301,6 +321,12 @@ seam.
   back reattaches to its binding. A permanently lost worker ends in the honest timeout. The rebind
   design (durable intent, fencing for the old worker's queued rows, a seq-range projection rule) is
   recorded in ADR-020 §Deferred and ADR-021 §Deferred and is an owner gate, not a spec detail.
+  Release (ADR-035) is *not* rebind: it terminates the old thread and mints nothing; it never moves
+  a session or a command to another worker.
+- **Release is not a force-kill.** A `running`/`recoverable` thread cannot be released; `interrupt`
+  is the stop surface and must settle first. No released thread can be resumed
+  (`cancelled` is terminal). The old thread's command rows are never cancelled by a release — the
+  release gate requires the queue to have no live row, so there is nothing to cancel.
 - **No mTLS and no per-worker certificates; no token rotation without restart.** Per-worker bearer
   tokens (ADR-031) narrow the shared-token hole but are not an identity proof; the R13 fix remains
   mTLS. Rotation today is "set a new env value and restart".
@@ -320,8 +346,9 @@ seam.
   cache is non-authoritative: the live directory wins, a cached row is labeled `declaration_stale`,
   and no membership decision (identity, state, bindability, routing, spawn legality) reads it.
 - **No public listener**; no hosted multi-tenant concerns.
-- **No new event kind, table, HTTP route or ops method.** One additive registry-column migration
-  (v5, the capability cache) is part of ADR-032.
+- **No new event kind, table or HTTP route.** One additive registry-column migration (v5, the
+  capability cache) is part of ADR-032; one additive ops method (`release_worker`) and one
+  `workers:` key (`release_after_ms`) are ADR-035's.
 - Deployment (Vultr, WeChat) remains the owner's later discussion.
 
 ## 10. UNVERIFIED (must stay visible)
@@ -348,6 +375,9 @@ seam.
 - The v1 → v2 upgrade window has not been exercised with a real old worker binary in this round; the
   typed refusal is L1 and the queue's legacy-row decode is tested, but the cross-version deployment
   window stays unverified until measured.
+- Binding release/reclaim (ADR-035) is exercised at L1/L2 (state gates, claim+batch, tick, CLI/RPC);
+  no real two-machine interrupt→release run exists, and the check→append window against a
+  concurrent public `submit` is reasoned rather than race-tested.
 
 ## 11. Change protocol
 
@@ -355,7 +385,8 @@ seam.
 |---|---|---|
 | Membership semantics (lifecycle, states, pruning, bind policy) | **yes** | `design/WORKER-MODEL.md` first; then code + tests; ADR if the *why* changes |
 | A wire frame/field/error/reason, `PROTOCOL_VERSION` | no — [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 | both halves' goldens, SDK fixtures if any, this file's §7 pointer if the policy changes |
-| A `workers:` config field (`tokens`, `enrolled_only`, `queue_timeout_ms`) | **yes** — this file | `kian-cli` config validation + assembly, `list_workers`/`kian workers` surfaces, ADR when the security or timeout *why* changes |
+| A `workers:` config field (`tokens`, `enrolled_only`, `queue_timeout_ms`, `release_after_ms`) | **yes** — this file | `kian-cli` config validation + assembly, `list_workers`/`kian workers` surfaces, ADR when the security or timeout *why* changes |
+| Binding release / idle reclaim (the terminal close, its gates, the triggers) | **yes** — this file | ADR + `kian-orchestrator` claim+batch + `kian-cli` ops method/tick; API-CONTRACT §4 for the wire, EVENT-MODEL for the end payload key |
 | An event payload key (`exec_worker`, `thread/started`) | no — [EVENT-MODEL](EVENT-MODEL.md) §3/§4.2 | code, tests, DESIGN §4.1 |
 | The worker command families (exec, fs) / dispatch semantics | **yes** — this file | API-CONTRACT §8 for frames; code + L2 tests; ADR when the family set changes |
 | A durable registry column / last-declared cache change | **yes** — this file | ADR + kian-exec migration; code + store tests; `list_workers`/CLI surfaces |
