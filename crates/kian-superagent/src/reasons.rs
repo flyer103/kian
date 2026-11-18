@@ -188,6 +188,11 @@ pub fn outcome_reasons(outcome: &RoutingOutcome, router: SessionId) -> Vec<Intak
         RoutingOutcome::DroppedNoRule => vec![IntakeReason::NoRule],
         RoutingOutcome::DroppedIgnored => vec![IntakeReason::ClassIgnored],
         RoutingOutcome::DroppedNotExplicit => vec![IntakeReason::NotExplicit],
+        // A hook veto refuses the event for every target before any
+        // admission decision exists — there is no per-decision reason
+        // to count (the veto's own audit line on `kian::subscriptions`
+        // and the bus's `hook-veto` line on `kian::hook` carry it).
+        RoutingOutcome::RefusedByHook { .. } => Vec::new(),
         RoutingOutcome::Routed {
             session,
             deduplicated,

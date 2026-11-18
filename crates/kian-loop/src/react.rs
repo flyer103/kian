@@ -145,6 +145,17 @@ struct Inner {
     /// evidence gate on the stop path; default (disabled) leaves
     /// built-in behavior untouched.
     gate: EvidenceGateConfig,
+    /// The injected hook ports (PLUGIN-SPEC §4 rows (b)–(f)); `None`
+    /// mounts no consultation and is byte-identical to the pre-plugin
+    /// loop. The loop never builds a bus — assembly injects it.
+    hooks: Option<Arc<dyn kian_plugin::hooks::HookPorts>>,
+    /// The §9.2 session-consistency guard, called once per drive (one
+    /// drain begin = one claim boundary): record the set digest at
+    /// first sight, recompute and compare after. `None` (every legacy
+    /// constructor) is a no-op — byte-identical (§13.3). This is not
+    /// an eighth interception port (§4's seven are frozen); it is the
+    /// guard's own seam.
+    set_guard: Option<Arc<dyn kian_plugin::hooks::SessionSetGuard>>,
 }
 
 /// The built-in async ReAct [`LoopDriver`] (DESIGN §6.2). Cheap to clone.
@@ -194,6 +205,45 @@ impl ReActLoop {
         config: ReActConfig,
         gate: EvidenceGateConfig,
     ) -> Self {
+        Self::with_hooks(agent, registry, tools, policy, config, gate, None)
+    }
+
+    /// [`ReActLoop::with_evidence_gate`] plus the injected hook ports
+    /// (PLUGIN-SPEC §4): the bus instance assembly owns, consulted at
+    /// this loop's five ReAct sites — `turn/request`, `turn/response`,
+    /// `tool/pre`, `tool/post`, `recover/decided`. `None` (every
+    /// legacy constructor) mounts no consultation at all.
+    pub fn with_hooks(
+        agent: AgentDef,
+        registry: Arc<ProviderRegistry>,
+        tools: Arc<dyn ToolProvider>,
+        policy: Arc<dyn RecoveryPolicySource>,
+        config: ReActConfig,
+        gate: EvidenceGateConfig,
+        hooks: Option<Arc<dyn kian_plugin::hooks::HookPorts>>,
+    ) -> Self {
+        Self::with_hooks_and_guard(agent, registry, tools, policy, config, gate, hooks, None)
+    }
+
+    /// [`ReActLoop::with_hooks`] plus the §9.2 session-set guard — the
+    /// assembly mounts both from the same bus instance. The guard runs
+    /// once per drive (the drain/claim boundary), before the first
+    /// iteration; the frame carries this drain's session and epoch with
+    /// the honest floor binding (the loop holds no worker binding,
+    /// §7.3 — an unbound session resolves the server scope, §8.2).
+    /// Eight named arguments, same shape as the sibling constructors —
+    /// a bundle struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_hooks_and_guard(
+        agent: AgentDef,
+        registry: Arc<ProviderRegistry>,
+        tools: Arc<dyn ToolProvider>,
+        policy: Arc<dyn RecoveryPolicySource>,
+        config: ReActConfig,
+        gate: EvidenceGateConfig,
+        hooks: Option<Arc<dyn kian_plugin::hooks::HookPorts>>,
+        set_guard: Option<Arc<dyn kian_plugin::hooks::SessionSetGuard>>,
+    ) -> Self {
         Self(Arc::new(Inner {
             registry,
             tools,
@@ -201,6 +251,8 @@ impl ReActLoop {
             agent,
             config,
             gate,
+            hooks,
+            set_guard,
         }))
     }
 
@@ -224,10 +276,12 @@ impl ReActLoop {
 
 /// unfold state: one step == one full provider turn (with its tool
 /// dispatches). `done` ends the stream after the terminal outcome was
-/// yielded.
+/// yielded; `begun` fires the drain-boundary §9.2 guard once, on the
+/// first poll.
 struct LoopState {
     ctx: DrainCtx,
     done: bool,
+    begun: bool,
     /// Per-episode turn count for [`BudgetScope::PerEpisode`]; reset per
     /// drive stream (ADR-024).
     drain_iterations: usize,
@@ -242,6 +296,7 @@ impl LoopDriver for ReActLoop {
             LoopState {
                 ctx,
                 done: false,
+                begun: false,
                 drain_iterations: 0,
             },
             move |mut st| {
@@ -249,6 +304,38 @@ impl LoopDriver for ReActLoop {
                 async move {
                     if st.done {
                         return None;
+                    }
+                    // §9.2 steps 1–4 at the drain/claim boundary: the
+                    // guard records the set digest at first sight and
+                    // re-checks it on every claim this process serves.
+                    // A no-op without a mounted guard. The frame's
+                    // `worker` is the session's durable `exec_worker`
+                    // binding (§7.3/§8.2) derived from its own stream —
+                    // a bound worker session records its narrowed set's
+                    // digest, never the server scope's. Fired on the
+                    // first poll (the drain's first step) because the
+                    // stream read is async.
+                    if !st.begun {
+                        st.begun = true;
+                        if let Some(guard) = inner.set_guard.as_ref() {
+                            let worker = match st.ctx.events().await {
+                                Ok(events) => kian_plugin::hooks::durable_worker_binding(
+                                    &events,
+                                    &st.ctx.session(),
+                                )
+                                .unwrap_or_default(),
+                                // An unreadable stream cannot prove a
+                                // binding; the honest floor is §7.3's
+                                // empty string, never a guess.
+                                Err(_) => String::new(),
+                            };
+                            guard.session_begin(kian_plugin::hooks::FrameInfo {
+                                session: st.ctx.session(),
+                                worker,
+                                seq: 0,
+                                epoch: Some(st.ctx.epoch().0),
+                            });
+                        }
                     }
                     let outcome = match inner.iteration(&st.ctx, &mut st.drain_iterations).await {
                         Flow::TurnDone => LoopOutcome::TurnDone,
@@ -372,6 +459,241 @@ impl Inner {
                 ))
             }
         }
+    }
+
+    // -- hook-port dispatch (PLUGIN-SPEC §4 rows (b)–(f)) ------------------
+    //
+    // Every helper is a no-op without an injected bus, and every view
+    // is built from the exact facts the site already holds — no extra
+    // store reads, no re-serialization of model-visible bytes (the
+    // digest fields describe the persisted bytes; nothing is rebuilt).
+
+    /// The frame identity of a drain-phase dispatch (§7.3): this
+    /// drain's session and fencing epoch, `seq` is the last append
+    /// this drain observed, and `worker` is the session's durable
+    /// `exec_worker` binding derived from its own stream — the loop
+    /// holds no resident binding, so a bound worker session narrows
+    /// its plugin set (§8.2) while an unbound session keeps the honest
+    /// floor (§7.3's empty string). The events read is the engine's
+    /// cached one, and the model-visible request bytes are untouched —
+    /// frame identity is `#[serde(skip)]`d metadata (§12.1).
+    async fn hook_frame(ctx: &DrainCtx, seq: u64) -> Option<kian_plugin::hooks::FrameInfo> {
+        let worker = match ctx.events().await {
+            Ok(events) => kian_plugin::hooks::durable_worker_binding(&events, &ctx.session())
+                .unwrap_or_default(),
+            // An unreadable stream cannot prove a binding; the honest
+            // floor is §7.3's empty string, never a guess.
+            Err(_) => String::new(),
+        };
+        Some(kian_plugin::hooks::FrameInfo {
+            session: ctx.session(),
+            worker,
+            seq,
+            epoch: Some(ctx.epoch().0),
+        })
+    }
+
+    /// Row (b) — `turn/request` (§4.2): observe-only, exactly once per
+    /// provider turn, on the persisted primary body, immediately after
+    /// the `step/request` append returns `Ok`.
+    // The view's normative fields arrive as separate borrowed parts of
+    // the turn's state; a tuple struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
+    async fn observe_request(
+        &self,
+        ctx: &DrainCtx,
+        binding: &SlotBinding,
+        chat_len: usize,
+        schemas: &[kian_core::seams::ToolSchema],
+        iteration: usize,
+        body: &Value,
+        step_request_seq: u64,
+    ) {
+        use kian_plugin::hooks::{RequestMeta, serialized, sha256_hex};
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let bytes = serialized(body);
+        let meta = RequestMeta {
+            slot: self.config.slot.0.clone(),
+            provider: binding.target.provider.clone(),
+            model: binding.target.model.clone(),
+            iteration: iteration as u64,
+            request_bytes: bytes.len() as u64,
+            request_sha256: sha256_hex(&bytes),
+            message_count: chat_len as u64,
+            tool_names: schemas.iter().map(|s| s.name.clone()).collect(),
+            tool_schema_sha256: sha256_hex(&serialized(&Value::Array(
+                schemas
+                    .iter()
+                    .map(|s| serde_json::to_value(s).unwrap_or(Value::Null))
+                    .collect(),
+            ))),
+            timing: "pre_send".to_string(),
+            step_request_seq,
+            frame: Self::hook_frame(ctx, step_request_seq).await,
+        };
+        hooks.request(&meta).await;
+    }
+
+    /// Row (c) — `turn/response` (§4.3): observe-only, once per settled
+    /// provider turn, never per chunk. `error_audit` is the
+    /// `turn/end`-vocabulary `{class, action}` object the same path
+    /// already builds, when the outcome is a failure.
+    #[allow(clippy::too_many_arguments)] // settled-turn state, borrowed in parts
+    async fn observe_response(
+        &self,
+        ctx: &DrainCtx,
+        iteration: usize,
+        seq: u64,
+        outcome: &str,
+        tool_calls: u64,
+        text_bytes: u64,
+        reasoning_bytes: u64,
+        usage: Option<&Value>,
+        error_audit: Option<&Value>,
+    ) {
+        use kian_plugin::hooks::{ResponseView, TurnErrorAudit};
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let error = error_audit.and_then(|audit| {
+            Some(TurnErrorAudit {
+                class: audit.get("class")?.as_str()?.to_string(),
+                action: audit.get("action")?.as_str()?.to_string(),
+            })
+        });
+        let view = ResponseView {
+            iteration: iteration as u64,
+            outcome: outcome.to_string(),
+            tool_calls,
+            text_bytes,
+            reasoning_bytes,
+            usage: usage.cloned().unwrap_or(Value::Null),
+            error,
+            timing: "settled".to_string(),
+            frame: Self::hook_frame(ctx, seq).await,
+        };
+        hooks.response(&view).await;
+    }
+
+    /// Row (d) — `tool/pre` (§4.4 step 2): consulted after the
+    /// declarative gate has decided and before the `tool/call` append /
+    /// `invoke`. Only a verdict from a `veto:tool` holder (or its
+    /// fail-closed default) denies; otherwise the declarative gate's
+    /// decision stands.
+    async fn consult_tool_pre(
+        &self,
+        ctx: &DrainCtx,
+        call: &ToolCall,
+        iteration: usize,
+        seq: u64,
+        decision: Option<PermissionDecision>,
+    ) -> kian_plugin::hooks::ToolVerdict {
+        use kian_plugin::hooks::{ToolCallView, bounded_value, serialized, sha256_hex};
+        let Some(hooks) = self.hooks.as_ref() else {
+            return kian_plugin::hooks::ToolVerdict::Allow;
+        };
+        let bytes = serialized(&call.arguments);
+        let (arguments, arguments_truncated) = bounded_value(&call.arguments);
+        let view = ToolCallView {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            iteration: iteration as u64,
+            arguments,
+            arguments_bytes: bytes.len() as u64,
+            arguments_sha256: sha256_hex(&bytes),
+            arguments_truncated,
+            permission: permission_view(call, decision),
+            surface: "react".to_string(),
+            frame: Self::hook_frame(ctx, seq).await,
+        };
+        hooks.tool_pre(&view).await
+    }
+
+    /// Row (d′) — `tool/post` (§4.4 step 5): observe-only after the
+    /// `tool/result` append, on the executed, declared-denied and
+    /// hook-denied arms alike (the uniform surface).
+    async fn observe_tool_post(&self, ctx: &DrainCtx, result: &ToolResult, name: &str, seq: u64) {
+        use kian_plugin::hooks::{RedactionReport, ToolPostView, serialized, sha256_hex};
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let bytes = serialized(&result.output);
+        let view = ToolPostView {
+            call_id: result.call_id.clone(),
+            name: name.to_string(),
+            is_error: result.is_error,
+            output_bytes: bytes.len() as u64,
+            output_sha256: sha256_hex(&bytes),
+            redactions: result
+                .redactions
+                .iter()
+                .map(|r| RedactionReport {
+                    kind: serde_json::to_value(r.kind)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default(),
+                    name: r.name.clone(),
+                    count: r.count,
+                })
+                .collect(),
+            frame: Self::hook_frame(ctx, seq).await,
+        };
+        hooks.tool_post(&view).await;
+    }
+
+    /// Row (f) — `recover/decided` (§4.5): observe-only at each
+    /// class → action resolution this loop performs; the audit object
+    /// is the one the `turn/end` payload already carries.
+    async fn observe_recover(&self, ctx: &DrainCtx, iteration: usize, seq: u64, audit: &Value) {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let view = kian_plugin::hooks::RecoveryView {
+            error_class: audit
+                .get("class")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            action: audit
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .to_string(),
+            iteration: iteration as u64,
+            frame: Self::hook_frame(ctx, seq).await,
+        };
+        hooks.recover(&view).await;
+    }
+
+    /// The fatal-turn observation pair (rows (c) + (f)): an
+    /// append-failure turn settles as `error` and its recovery audit
+    /// observes like any other resolution.
+    #[allow(clippy::too_many_arguments)] // fatal-turn state, borrowed in parts
+    async fn observe_fatal(
+        &self,
+        ctx: &DrainCtx,
+        iteration: usize,
+        seq: u64,
+        audit: &Value,
+        text_bytes: u64,
+        reasoning_bytes: u64,
+        usage: Option<&Value>,
+    ) {
+        self.observe_recover(ctx, iteration, seq, audit).await;
+        self.observe_response(
+            ctx,
+            iteration,
+            seq,
+            "error",
+            0,
+            text_bytes,
+            reasoning_bytes,
+            usage,
+            Some(audit),
+        )
+        .await;
     }
 
     async fn run_iteration(
@@ -535,7 +857,7 @@ impl Inner {
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called.
         let body = build_chat_body(&target.model, &chat, &schemas);
-        if let Err(e) = ctx
+        let step_request = ctx
             .append(
                 EventKind::StepRequest,
                 json!({
@@ -546,13 +868,36 @@ impl Inner {
                     "body": body,
                 }),
             )
-            .await
-        {
-            return TurnResult {
-                result: Err(TurnError::fatal(e, self.policy.as_ref())),
-                usage: None,
-            };
-        }
+            .await;
+        let step_request_seq = match step_request {
+            Ok(ev) => ev.seq,
+            Err(e) => {
+                let fatal = TurnError::fatal(e, self.policy.as_ref());
+                // Rows (c)+(f): the turn settles `error` with its audit.
+                if let TurnError::Fatal { audit, .. } = &fatal {
+                    self.observe_fatal(ctx, iteration, 0, audit, 0, 0, None)
+                        .await;
+                }
+                return TurnResult {
+                    result: Err(fatal),
+                    usage: None,
+                };
+            }
+        };
+        // Port (b) — `turn/request` (§4.2): fires immediately after the
+        // persisted primary body exists, exactly once per provider turn
+        // (never per fallback attempt — `complete_turn`'s rebuilt bodies
+        // are provider-layer internals, not second `step/request`s).
+        self.observe_request(
+            ctx,
+            binding,
+            chat.len(),
+            &schemas,
+            iteration,
+            &body,
+            step_request_seq,
+        )
+        .await;
 
         // complete_turn rebuilds the body per (fallback) target so the
         // model name always matches the provider actually called.
@@ -596,11 +941,31 @@ impl Inner {
                 }
             }
         }
+        // Byte counts for the §3.2.4 view fields — captured before the
+        // content assembly moves the strings.
+        let text_bytes = text.len() as u64;
+        let reasoning_bytes = reasoning.len() as u64;
         if let Some(e) = stream_error {
             let class = error_class(&e);
             let action = consult_policy(self.policy.as_ref(), class);
             let note = action_note(action);
             let audit = recovery_audit(self.policy.as_ref(), provider_error_class(&e));
+            // Rows (f)+(c): the resolution observes, the settled turn
+            // reports `soft_failure` with the same audit object.
+            self.observe_recover(ctx, iteration, step_request_seq, &audit)
+                .await;
+            self.observe_response(
+                ctx,
+                iteration,
+                step_request_seq,
+                "soft_failure",
+                0,
+                text_bytes,
+                reasoning_bytes,
+                usage.as_ref(),
+                Some(&audit),
+            )
+            .await;
             return TurnResult {
                 result: Err(TurnError::Soft {
                     reason: format!("provider error ({class}): {e}{note}"),
@@ -618,6 +983,20 @@ impl Inner {
                 self.policy.as_ref(),
                 kian_orchestrator::recovery::ErrorClass::EmptyResponse,
             );
+            self.observe_recover(ctx, iteration, step_request_seq, &audit)
+                .await;
+            self.observe_response(
+                ctx,
+                iteration,
+                step_request_seq,
+                "soft_failure",
+                0,
+                0,
+                0,
+                usage.as_ref(),
+                Some(&audit),
+            )
+            .await;
             return TurnResult {
                 result: Err(TurnError::Soft {
                     reason: format!("empty model response{note}"),
@@ -649,13 +1028,39 @@ impl Inner {
             )
             .await
         {
+            let fatal = TurnError::fatal(e, self.policy.as_ref());
+            if let TurnError::Fatal { audit, .. } = &fatal {
+                self.observe_fatal(
+                    ctx,
+                    iteration,
+                    step_request_seq,
+                    audit,
+                    text_bytes,
+                    reasoning_bytes,
+                    usage.as_ref(),
+                )
+                .await;
+            }
             return TurnResult {
-                result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                result: Err(fatal),
                 usage,
             };
         }
 
         if tool_calls.is_empty() {
+            // Row (c) — the settled final-answer turn (§4.3).
+            self.observe_response(
+                ctx,
+                iteration,
+                step_request_seq,
+                "final_answer",
+                0,
+                text_bytes,
+                reasoning_bytes,
+                usage.as_ref(),
+                None,
+            )
+            .await;
             return TurnResult {
                 result: Ok(TurnOutcome::FinalAnswer),
                 usage,
@@ -674,24 +1079,82 @@ impl Inner {
             // configured → the legacy byte-identical payload, invoke
             // as today.
             let decision = evaluate_permission(&self.config.permissions, &call.name);
-            if let Err(e) = ctx
-                .append(EventKind::ToolCall, tool_call_payload(&call, decision))
-                .await
+            // Port (d) — `tool/pre` (§4.4 step 2): consulted
+            // **unconditionally**, after the declarative table is
+            // evaluated and before the `tool/call` append / `invoke` —
+            // a policy-denied call is still a call the port is defined
+            // over, and the payload already carries the declarative
+            // verdict (`permission.evaluated/policy`). A hook denial
+            // wins over the declarative one by the existing
+            // first-deny order — end-to-end: the hook-denied log AND
+            // the honest-error result both name the plugin (§4.4
+            // steps 3–4); an abstaining hook leaves the declarative
+            // decision standing.
+            let hook_verdict = self
+                .consult_tool_pre(ctx, &call, iteration, step_request_seq, decision)
+                .await;
+            let appended = match hook_verdict {
+                kian_plugin::hooks::ToolVerdict::Deny {
+                    ref plugin,
+                    ref reason,
+                } => {
+                    // §4.4 step 3: the hook denial is logged before any
+                    // effect, with `policy:"hook"` provenance naming the
+                    // denying plugin (§16.1's payload value — P4 owns
+                    // the EVENT-MODEL row).
+                    ctx.append(
+                        EventKind::ToolCall,
+                        tool_call_payload_hook_denied(&call, plugin, reason),
+                    )
+                    .await
+                }
+                _ => {
+                    ctx.append(EventKind::ToolCall, tool_call_payload(&call, decision))
+                        .await
+                }
+            };
+            let call_seq = match appended {
+                Ok(ev) => ev.seq,
+                Err(e) => {
+                    let fatal = TurnError::fatal(e, self.policy.as_ref());
+                    if let TurnError::Fatal { audit, .. } = &fatal {
+                        self.observe_fatal(
+                            ctx,
+                            iteration,
+                            step_request_seq,
+                            audit,
+                            text_bytes,
+                            reasoning_bytes,
+                            usage.as_ref(),
+                        )
+                        .await;
+                    }
+                    return TurnResult {
+                        result: Err(fatal),
+                        usage,
+                    };
+                }
+            };
+            // §4.4 step 4: a hook-denied call never reaches
+            // `self.tools.invoke`; the model receives the honest-error
+            // `tool/result` naming the plugin and its reason. The hook
+            // denial also wins the RESULT on the coincident arm (a
+            // call the declarative table denies AND a `veto:tool`
+            // plugin denies): first-deny order means the plugin's
+            // denial is the one the pair records end-to-end — the
+            // `tool/call` above (`policy:"hook"`, the plugin's
+            // reason) and this `tool/result` name the same denier,
+            // never one each.
+            if let kian_plugin::hooks::ToolVerdict::Deny {
+                ref plugin,
+                ref reason,
+            } = hook_verdict
             {
-                return TurnResult {
-                    result: Err(TurnError::fatal(e, self.policy.as_ref())),
-                    usage,
-                };
-            }
-            // Deny: no tool side effect. The model sees an honest error
-            // result next turn and reacts — a denied call is a tool
-            // failure, never a loop abort.
-            if matches!(decision, Some(PermissionDecision::Deny)) {
                 let denied = ToolResult {
                     call_id: call.id.clone(),
                     output: json!({
-                        "error": format!("permission denied by policy: {}", call.name),
-                        "policy": "deny"
+                        "error": format!("denied by plugin {plugin}: {reason}"),
+                        "policy": "hook"
                     }),
                     is_error: true,
                     redactions: Vec::new(),
@@ -700,11 +1163,59 @@ impl Inner {
                     .append(EventKind::ToolResult, tool_result_payload(&denied))
                     .await
                 {
+                    let fatal = TurnError::fatal(e, self.policy.as_ref());
+                    if let TurnError::Fatal { audit, .. } = &fatal {
+                        self.observe_fatal(
+                            ctx,
+                            iteration,
+                            call_seq,
+                            audit,
+                            text_bytes,
+                            reasoning_bytes,
+                            usage.as_ref(),
+                        )
+                        .await;
+                    }
                     return TurnResult {
-                        result: Err(TurnError::fatal(e, self.policy.as_ref())),
+                        result: Err(fatal),
                         usage,
                     };
                 }
+                self.observe_tool_post(ctx, &denied, &call.name, call_seq)
+                    .await;
+                continue;
+            }
+            // Declarative deny (the table alone denied the call): no
+            // tool side effect either. The model sees an honest error
+            // result next turn and reacts — a denied call is a tool
+            // failure, never a loop abort.
+            if let Some(denied) = declared_denial(&call, decision) {
+                if let Err(e) = ctx
+                    .append(EventKind::ToolResult, tool_result_payload(&denied))
+                    .await
+                {
+                    let fatal = TurnError::fatal(e, self.policy.as_ref());
+                    if let TurnError::Fatal { audit, .. } = &fatal {
+                        self.observe_fatal(
+                            ctx,
+                            iteration,
+                            call_seq,
+                            audit,
+                            text_bytes,
+                            reasoning_bytes,
+                            usage.as_ref(),
+                        )
+                        .await;
+                    }
+                    return TurnResult {
+                        result: Err(fatal),
+                        usage,
+                    };
+                }
+                // Port (d′) — `tool/post` fires on the declared-denial
+                // arm too (§4.4 step 5: the uniform surface).
+                self.observe_tool_post(ctx, &denied, &call.name, call_seq)
+                    .await;
                 continue;
             }
             let result = match self.tools.invoke(call.clone()).await {
@@ -724,16 +1235,50 @@ impl Inner {
             // `content` — the model-visible wire shape (and therefore
             // request bytes and prefix cache) never sees it; the key is
             // omitted entirely when nothing was redacted.
-            if let Err(e) = ctx
+            let result_seq = match ctx
                 .append(EventKind::ToolResult, tool_result_payload(&result))
                 .await
             {
-                return TurnResult {
-                    result: Err(TurnError::fatal(e, self.policy.as_ref())),
-                    usage,
-                };
-            }
+                Ok(ev) => ev.seq,
+                Err(e) => {
+                    let fatal = TurnError::fatal(e, self.policy.as_ref());
+                    if let TurnError::Fatal { audit, .. } = &fatal {
+                        self.observe_fatal(
+                            ctx,
+                            iteration,
+                            call_seq,
+                            audit,
+                            text_bytes,
+                            reasoning_bytes,
+                            usage.as_ref(),
+                        )
+                        .await;
+                    }
+                    return TurnResult {
+                        result: Err(fatal),
+                        usage,
+                    };
+                }
+            };
+            // Port (d′) — `tool/post` after the executed call's
+            // `tool/result` append (§4.4 step 5).
+            self.observe_tool_post(ctx, &result, &call.name, result_seq)
+                .await;
         }
+        // Row (c) — the settled tool-calls turn (§4.3): dispatched once
+        // per settled provider turn, after its tool dispatches.
+        self.observe_response(
+            ctx,
+            iteration,
+            step_request_seq,
+            "tool_calls",
+            n as u64,
+            text_bytes,
+            reasoning_bytes,
+            usage.as_ref(),
+            None,
+        )
+        .await;
         TurnResult {
             result: Ok(TurnOutcome::ToolCalls(n)),
             usage,
@@ -953,6 +1498,22 @@ fn evaluate_permission(
     }
 }
 
+/// The declared-permission deny arm's honest-error result (ADR-015):
+/// `Some` only when the declarative table denied this call — the
+/// payload shape the model reacts to, unchanged from the pre-plugin
+/// loop.
+fn declared_denial(call: &ToolCall, decision: Option<PermissionDecision>) -> Option<ToolResult> {
+    matches!(decision, Some(PermissionDecision::Deny)).then(|| ToolResult {
+        call_id: call.id.clone(),
+        output: json!({
+            "error": format!("permission denied by policy: {}", call.name),
+            "policy": "deny"
+        }),
+        is_error: true,
+        redactions: Vec::new(),
+    })
+}
+
 /// The `tool/call` event payload: the frozen `{role, content}` shape
 /// plus, only when a permission table is configured, the additive
 /// top-level `permission` provenance key **outside `content`** — the
@@ -980,6 +1541,57 @@ fn tool_call_payload(call: &ToolCall, decision: Option<PermissionDecision>) -> V
         };
     }
     payload
+}
+
+/// The `tool/call` payload of a **hook-denied** call (§4.4 step 3 +
+/// §16.1): log-before-execute holds for hook denials too — the call is
+/// logged, with `permission.policy = "hook"` and `matched` naming the
+/// denying `<plugin>:<hook>`, before the honest-error result is
+/// appended and **before any effect** (the invoke never runs). The
+/// `policy: "hook"` payload value is the one EVENT-MODEL amendment of
+/// this round (P4's card owns the doc + goldens).
+fn tool_call_payload_hook_denied(call: &ToolCall, plugin: &str, reason: &str) -> Value {
+    let mut payload = json!({
+        "role": "assistant",
+        "content": {"id": call.id, "name": call.name, "arguments": call.arguments}
+    });
+    payload["permission"] = json!({
+        "evaluated": "deny",
+        "policy": "hook",
+        "matched": format!("{plugin}:tool/pre"),
+        "reason": reason,
+    });
+    payload
+}
+
+/// The declarative gate's decision rendered as the §3.2.5
+/// `permission` view object (ADR-015 provenance shape; `reason` rides
+/// only a deny). `None` (no table configured) renders the default-allow
+/// row — the decision the call actually runs under.
+fn permission_view(
+    call: &ToolCall,
+    decision: Option<PermissionDecision>,
+) -> kian_plugin::hooks::PermissionView {
+    match decision {
+        Some(PermissionDecision::AllowConfigured) => kian_plugin::hooks::PermissionView {
+            evaluated: "allow".to_string(),
+            policy: "configured".to_string(),
+            matched: call.name.clone(),
+            reason: None,
+        },
+        Some(PermissionDecision::Deny) => kian_plugin::hooks::PermissionView {
+            evaluated: "deny".to_string(),
+            policy: "configured".to_string(),
+            matched: call.name.clone(),
+            reason: Some(PERMISSION_DENY_REASON.to_string()),
+        },
+        Some(PermissionDecision::AllowDefault) | None => kian_plugin::hooks::PermissionView {
+            evaluated: "allow".to_string(),
+            policy: "default".to_string(),
+            matched: call.name.clone(),
+            reason: None,
+        },
+    }
 }
 
 /// The `tool/result` event payload: `{role, content}` plus, only when
@@ -1436,6 +2048,104 @@ mod tests {
             })
         );
         assert_eq!(denied["content"], legacy["content"]);
+    }
+
+    /// P4 (PLUGIN-SPEC §4.4 + §16.1): the one EVENT-MODEL amendment of
+    /// the hook round — the additive payload VALUE `policy:"hook"` on
+    /// the existing `permission` key (never a new key, never a new
+    /// kind). This is the golden pair, frozen to the exact serialized
+    /// bytes: (a) the hook-denied `tool/call` payload (log-before-
+    /// execute provenance naming the denying `<plugin>:<hook>`) and
+    /// (b) the honest-error `tool/result` the model reacts to. Object
+    /// keys serialize in canonical (sorted) order — `serde_json`
+    /// without `preserve_order` — so the strings below are the durable
+    /// audit bytes, not just structural equality.
+    #[test]
+    fn hook_denied_permission_payload_goldens_are_frozen_bytes() {
+        use crate::react::{evaluate_permission, tool_call_payload, tool_call_payload_hook_denied};
+        use kian_core::model::Permission;
+
+        let call = ToolCall {
+            id: "call-7".into(),
+            name: "exec".into(),
+            arguments: json!({"cmd": ["ls"]}),
+        };
+
+        // (a) tool/call, hook-denied arm (§4.4 step 3).
+        let hook_denied =
+            tool_call_payload_hook_denied(&call, "approval-gate", "exec not on the allowlist");
+        assert_eq!(
+            serde_json::to_string(&hook_denied).unwrap(),
+            "{\"content\":{\"arguments\":{\"cmd\":[\"ls\"]},\"id\":\"call-7\",\"name\":\"exec\"},\
+             \"permission\":{\"evaluated\":\"deny\",\"matched\":\"approval-gate:tool/pre\",\
+             \"policy\":\"hook\",\"reason\":\"exec not on the allowlist\"},\"role\":\"assistant\"}"
+        );
+
+        // (b) tool/result, the honest error of the same denial
+        // (§4.4 step 4) — exactly the bytes the loop appends on the
+        // deny arm (no redactions key: the report is empty there).
+        let denied_result = ToolResult {
+            call_id: call.id.clone(),
+            output: json!({
+                "error": "denied by plugin approval-gate: exec not on the allowlist",
+                "policy": "hook"
+            }),
+            is_error: true,
+            redactions: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&tool_result_payload(&denied_result)).unwrap(),
+            "{\"content\":{\"call_id\":\"call-7\",\"is_error\":true,\
+             \"output\":{\"error\":\"denied by plugin approval-gate: exec not on the allowlist\",\
+             \"policy\":\"hook\"}},\"role\":\"tool\"}"
+        );
+
+        // Frozen regression — the amendment touches no other payload
+        // shape: every pre-existing `permission` arm (and the legacy
+        // key-less arm) serializes to exactly its pre-amendment bytes.
+        let empty: BTreeMap<String, Permission> = BTreeMap::new();
+        assert_eq!(
+            serde_json::to_string(&tool_call_payload(
+                &call,
+                evaluate_permission(&empty, &call.name)
+            ))
+            .unwrap(),
+            "{\"content\":{\"arguments\":{\"cmd\":[\"ls\"]},\"id\":\"call-7\",\"name\":\"exec\"},\
+             \"role\":\"assistant\"}"
+        );
+        let default_table = BTreeMap::from([("fs_read".to_string(), Permission::Allow)]);
+        assert_eq!(
+            serde_json::to_string(&tool_call_payload(
+                &call,
+                evaluate_permission(&default_table, &call.name)
+            ))
+            .unwrap(),
+            "{\"content\":{\"arguments\":{\"cmd\":[\"ls\"]},\"id\":\"call-7\",\"name\":\"exec\"},\
+             \"permission\":{\"evaluated\":\"allow\",\"matched\":\"exec\",\"policy\":\"default\"},\
+             \"role\":\"assistant\"}"
+        );
+        let allow_table = BTreeMap::from([("exec".to_string(), Permission::Allow)]);
+        assert_eq!(
+            serde_json::to_string(&tool_call_payload(
+                &call,
+                evaluate_permission(&allow_table, &call.name)
+            ))
+            .unwrap(),
+            "{\"content\":{\"arguments\":{\"cmd\":[\"ls\"]},\"id\":\"call-7\",\"name\":\"exec\"},\
+             \"permission\":{\"evaluated\":\"allow\",\"matched\":\"exec\",\"policy\":\"configured\"},\
+             \"role\":\"assistant\"}"
+        );
+        let deny_table = BTreeMap::from([("exec".to_string(), Permission::Deny)]);
+        assert_eq!(
+            serde_json::to_string(&tool_call_payload(
+                &call,
+                evaluate_permission(&deny_table, &call.name)
+            ))
+            .unwrap(),
+            "{\"content\":{\"arguments\":{\"cmd\":[\"ls\"]},\"id\":\"call-7\",\"name\":\"exec\"},\
+             \"permission\":{\"evaluated\":\"deny\",\"matched\":\"exec\",\"policy\":\"configured\",\
+             \"reason\":\"tool_denied_by_policy\"},\"role\":\"assistant\"}"
+        );
     }
 
     /// (constraint 3): the additive `permission` payload key never

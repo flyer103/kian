@@ -45,6 +45,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
   refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
 
+- **Hook plugins — the two-tier harness-extension contract (round 16, [PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
+  [ADR-028](../design/decisions/ADR-028-harness-hook-plugins.md))**. A closed hook vocabulary over seven
+  interception ports (admission, turn, tool, recovery, settlement) with a tier-0 compile-time registry
+  (`kian-plugin::hooks`) and a tier-1 sidecar tier: operator-trusted child processes over a stdio
+  JSON-lines ABI with digest-pinned spawns, `env_allow`-only environments, per-dispatch deadlines, a
+  failure window with one-strike quarantine, and grant-keyed fail-closed/fail-open class defaults. New
+  `sidecars:` config section (instance manifests + server/worker scopes, set digest + session-consistency
+  quarantine); `tool/pre` denials surface as honest-error `tool/result`s with the additive
+  `tool/call.permission.policy:"hook"` value naming `<plugin>:<hook>` (the round's one EVENT-MODEL
+  amendment). Ships with an in-tree reference sidecar — a Python stdlib `tool/pre` approval gate under
+  `examples/hook-approval-gate/` — and no `sidecars:` section leaves behavior byte-identical.
+
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:

@@ -117,6 +117,19 @@ pub struct Server {
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
+    /// The mounted sidecars (PLUGIN-SPEC §13.1, P3b): the runners (one
+    /// process per instance, for the server lifetime — R11) and their
+    /// handler registrations. `None` (the `sidecars:` section absent)
+    /// mounts nothing and changes nothing — byte-identical (§13.3).
+    /// Dropping it stops every runner (`bye`, bounded grace, group
+    /// kill — §7.5).
+    sidecars: Option<crate::sidecars::SidecarMount>,
+    /// Port (a′) — the API-borne `admit/pre` observation (PLUGIN-SPEC
+    /// §4 row (a′), observe-only by construction at `origin:"api"`):
+    /// the bus `submit`/`queue`/`steer` consult before
+    /// `engine.admit`. A stop answered here is discarded by the bus
+    /// (§3.4.3 — no refusal wire exists); only the observation lands.
+    hooks: kian_plugin::hooks::HookBus,
 }
 
 /// The serve-side snapshot builder plan (READ-MODEL §5/§9).
@@ -262,6 +275,17 @@ impl Server {
         };
 
         let mut ctx = PluginCtx::new();
+        // The hook bus (PLUGIN-SPEC §1/§4): one instance for the whole
+        // process, created before the plugins activate so the loop
+        // plugins can resolve it and mount their ports (§13.1: "the
+        // bus registers its ports when the driver/wrapper is
+        // constructed"). The same instance is the Server's port (a)
+        // and carries the §8/§9 sidecar runtime, installed after the
+        // inbox rebuild.
+        let hooks = kian_plugin::hooks::HookBus::new();
+        let _bus_provide = ctx
+            .provide::<kian_plugin::hooks::HookBus>(Arc::new(hooks.clone()))
+            .map_err(|e| ServeError::Assembly(format!("hook bus provide: {e}")))?;
         // the exec secret hygiene pair, built once and shared
         // by the local tool surface and the remote-exec queue:
         //
@@ -883,6 +907,10 @@ impl Server {
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
             views_maintenance,
+            // The one process-wide hook bus (provided to the plugin ctx
+            // above; the §8/§9 sidecar runtime mounts on it after the
+            // inbox rebuild).
+            hooks,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -894,6 +922,7 @@ impl Server {
             event_stream: Arc::new(EventStreamMetrics::new()),
             event_stream_enabled,
             _plugin_disposer: plugin_disposer,
+            sidecars: None,
         };
         // (R15-C5): arm the child inactivity ticker with the same
         // converted limits the bundle carries — the plan's root is
@@ -908,6 +937,16 @@ impl Server {
         let sessions = server.engine.startup_rebuild().await?;
         tracing::info!(sessions, "startup inbox rebuild complete");
         crate::superagent::record_rebuild_done(&startup_order);
+
+        // -- 5.5 sidecars mount (PLUGIN-SPEC §13.1): strictly after the
+        //       inbox rebuild, never in a plugin's synchronous apply.
+        //       Per-instance fail-closed validation (§6.2), the widening
+        //       boot check (§8.2), runner spawn + handler registration,
+        //       and the §8/§9 runtime on the bus. Absent section = no
+        //       mount, byte-identical (§13.3).
+        let sidecars = crate::sidecars::mount(&config, &server.hooks, &secret_env_names)?;
+        let mut server = server;
+        server.sidecars = sidecars;
 
         // -- 6. superagent services start (registry → subscriptions →
         //       watchdog → router bootstrap), strictly AFTER the rebuild.
@@ -1220,6 +1259,61 @@ impl Server {
 // ---------------------------------------------------------------------------
 
 impl Server {
+    /// Port (a′) — the API-borne admission observation (§4 row (a′),
+    /// §3.4.3's observe-only rows): one `admit/pre` evaluation over
+    /// the single target before `engine.admit`. The verdict is
+    /// discarded by construction — at `origin:"api"` a `stop` is
+    /// out-of-origin speech (§5.2), and no refusal wire exists (§16.3)
+    /// — so the input is admitted unchanged whatever a plugin says;
+    /// only the observation (and the bus's audit lines) land.
+    async fn observe_api_admission(
+        &self,
+        session: SessionId,
+        content: &serde_json::Value,
+        synthetic: bool,
+    ) {
+        use kian_plugin::hooks::{AdmissionInfo, AdmitInput, AdmitTarget};
+        let serialized = serde_json::to_string(content).unwrap_or_default();
+        let (content_preview, content_truncated) = kian_plugin::hooks::preview(&serialized);
+        let draft = kian_plugin::hooks::AdmitDraft {
+            origin: kian_plugin::hooks::Origin::Api,
+            targets: vec![AdmitTarget {
+                session,
+                router: false,
+            }],
+            input: AdmitInput {
+                role: "user".to_string(),
+                synthetic,
+                content_preview,
+                content_bytes: serialized.len() as u64,
+                content_sha256: kian_plugin::hooks::sha256_hex(serialized.as_bytes()),
+                content_truncated,
+                // API-borne input is never shaped at this boundary.
+                inline_view: false,
+            },
+            // No channel behind an API call, and no Inline/Spill policy
+            // applies here — the honest "no shaping" row.
+            channel: None,
+            admission: AdmissionInfo {
+                policy: "none".to_string(),
+                spilled: false,
+            },
+            // Declared limitation (n3, §7.3's floor): the frame is
+            // unconditionally the floor frame (no worker binding), so
+            // this API-borne admission resolves against the SERVER
+            // scope even when `session` is worker-bound. Observe-only
+            // (§3.4.3): no veto can leak at `origin:"api"`, but a
+            // sidecar narrowed away from that worker's scope can still
+            // observe API submits here. Making this boundary read the
+            // session's durable binding (a §7.3/§13 note, or a
+            // `StreamPort` injection) is later-round work — PLUGIN-SPEC
+            // is frozen this round, so the floor is declared here, not
+            // silently narrowed.
+            frames: vec![kian_plugin::hooks::FrameInfo::new(session)],
+        };
+        let _ = self.hooks.admit(&draft).await;
+    }
+
     /// The creation-time memory injection (MEMORY-MODEL §6, kian-101):
     /// read the source memory session's `memory/note` events (narrow
     /// `scan_kind` since P3b-1 — the fold ignores non-note events), fold
@@ -1359,6 +1453,8 @@ impl ControlPlane for Server {
     ) -> BoxFuture<'_, Result<bool, ControlError>> {
         Box::pin(async move {
             // Inbox write first (constraint 6); the engine folds the wake.
+            // Port (a′): observe-only admission (§3.4.3 — the API row).
+            self.observe_api_admission(session, &content, false).await;
             self.engine
                 .admit(session, content, idempotency_key)
                 .await
@@ -1374,6 +1470,9 @@ impl ControlPlane for Server {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<bool, ControlError>> {
         Box::pin(async move {
+            // Port (a′): observe-only admission; `steer` lands as the
+            // synthetic (strippable) row the engine wraps engine-side.
+            self.observe_api_admission(session, &content, true).await;
             self.engine
                 .steer(session, content, idempotency_key)
                 .await
@@ -1392,6 +1491,9 @@ impl ControlPlane for Server {
         // same durable inbox; a drain in flight folds the wake and
         // consumes it in the same sweep (batch semantics).
         Box::pin(async move {
+            // Port (a′): observe-only admission (§3.4.3 — the queue row
+            // shares submit's ingress).
+            self.observe_api_admission(session, &content, false).await;
             self.engine
                 .admit(session, content, idempotency_key)
                 .await

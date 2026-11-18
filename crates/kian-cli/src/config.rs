@@ -119,6 +119,18 @@ pub struct ServeConfig {
     /// archive directory and at least one online-window threshold.
     #[serde(default)]
     pub retention: RetentionSection,
+    /// The `sidecars:` section (PLUGIN-SPEC §8.1/§13.1). `None` (the
+    /// section absent) is sidecars **off**: no runner spawns, no bus
+    /// runtime installs, no ports gain a subscriber — byte-identical
+    /// behavior (§13.3). Present parses the closed two-scope grammar
+    /// fail-closed (an unknown scope key — `harness:`, `profile:` —
+    /// refuses boot naming the key, §8.1/§6.2 boundary case 2) and gates
+    /// the boot checks: every set entry a declared instance, `use ⊆
+    /// scopes.server`, limits naming receivable instances and narrowing
+    /// only (§8.2; the widening check runs in the serve assembly, where
+    /// the manifests are loaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecars: Option<kian_plugin::hooks::resolve::SidecarConfig>,
     /// The `api:` section (READ-MODEL §4.2, P3). Absent = the defaults:
     /// the fan-in event stream enabled, explicit session allowlists
     /// only (no wildcard in OSS).
@@ -2754,6 +2766,31 @@ impl ServeConfig {
                 )));
             }
         }
+
+        // The `sidecars:` section (PLUGIN-SPEC §8.1/§13.1): `plugins:`
+        // stays KNOWN_PLUGINS-only (D7) — an instance key colliding
+        // with a known plugin name refuses boot (§6.2 rule 3), and the
+        // closed two-scope grammar's name-only boot checks run here so
+        // a read-only verb catches a typo. The widening check needs the
+        // manifests and runs in the serve assembly.
+        if let Some(sidecars) = &self.sidecars {
+            for name in sidecars.plugins.keys() {
+                if KNOWN_PLUGINS.contains(&name.as_str()) {
+                    return Err(invalid(format!(
+                        "sidecars.plugins key `{name}` collides with a known plugin name \
+                         (code: name_collision, §6.2 rule 3)"
+                    )));
+                }
+            }
+            if let Err(errors) = kian_plugin::hooks::resolve::validate_shape(sidecars) {
+                let rendered: Vec<String> = errors
+                    .iter()
+                    .map(|e| format!("{} (code: {})", e.message, e.code.as_str()))
+                    .collect();
+                return Err(invalid(format!("sidecars: {}", rendered.join("; "))));
+            }
+        }
+
         if self.plugins.iter().any(|p| p == "react-loop") {
             for dep in ["openai-compat", "local-tools"] {
                 if !self.plugins.iter().any(|p| p == dep) {
@@ -6601,5 +6638,124 @@ recovery:
             defaulted.output_schema.is_some(),
             "the schema rides the entry"
         );
+    }
+
+    // -- sidecars: the §8.1 config surface -------------------------
+
+    const SIDECAR_SECTION: &str = r#"sidecars:
+  plugins:
+    approval-gate:
+      manifest: "/etc/kian/plugins/approval-gate.toml"
+    cost-audit:
+      manifest: "/etc/kian/plugins/cost-audit.toml"
+  scopes:
+    server: ["approval-gate", "cost-audit"]
+    worker:
+      node-zulu:
+        use: ["approval-gate"]
+        limits:
+          approval-gate: {deadline_ms: 200}
+      node-yankee:
+        limits:
+          cost-audit: {max_payload_kib: 64}
+"#;
+
+    /// §8.1's example grammar parses and validates (the shape checks —
+    /// the widening check runs in the assembly, where the manifests
+    /// are loaded).
+    #[test]
+    fn sidecars_two_scope_grammar_parses() {
+        let base = valid_yaml();
+        let cfg = ServeConfig::parse(&format!("{base}{SIDECAR_SECTION}"))
+            .expect("the §8.1 example is valid");
+        let sidecars = cfg.sidecars.as_ref().expect("section present");
+        assert_eq!(sidecars.scopes.server.len(), 2);
+        let zulu = sidecars.scopes.worker.get("node-zulu").expect("zulu");
+        assert_eq!(
+            zulu.use_.as_deref(),
+            Some(&["approval-gate".to_string()][..])
+        );
+        assert_eq!(
+            zulu.limits["approval-gate"].deadline_ms,
+            Some(200),
+            "the worker-scope narrowing key"
+        );
+    }
+
+    /// §13.3: an absent section is `None` — no sidecars, byte-identical.
+    #[test]
+    fn sidecars_absent_section_means_no_sidecars() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid");
+        assert!(cfg.sidecars.is_none());
+    }
+
+    /// §8.1's closed grammar: `harness:` (or `profile:`) inside
+    /// `scopes:` is an unknown key and refuses boot naming the key.
+    #[test]
+    fn sidecars_unknown_scope_key_refuses_naming_the_key() {
+        let text = format!(
+            "{base}sidecars:\n  scopes:\n    harness:\n      react: [\"x\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("harness"), "names the offender: {err}");
+        let text = format!(
+            "{base}sidecars:\n  scopes:\n    profile:\n      router: [\"x\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("profile"), "names the offender: {err}");
+    }
+
+    /// §8.1/§8.4: `use ⊆ scopes.server` is a static boot check — a
+    /// subset violation names the worker and the name.
+    #[test]
+    fn sidecars_subset_violation_refuses_naming_worker_and_name() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n    b:\n      manifest: \"/etc/b.toml\"\n  scopes:\n    server: [\"a\"]\n    worker:\n      node-bad:\n        use: [\"b\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("node-bad") && err.contains("`b`"), "{err}");
+        assert!(err.contains("subset_violation"), "carries the code: {err}");
+    }
+
+    /// §8.1: a set entry that is not a declared instance refuses boot
+    /// (a typo cannot silently do nothing).
+    #[test]
+    fn sidecars_undeclared_instance_refuses() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n  scopes:\n    server: [\"a\", \"typo-name\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("typo-name"), "{err}");
+        assert!(err.contains("undeclared_instance"), "{err}");
+    }
+
+    /// §6.2 rule 3 via §13.1: an instance key colliding with a
+    /// KNOWN_PLUGINS name refuses boot.
+    #[test]
+    fn sidecars_known_plugin_name_collision_refuses() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    react-loop:\n      manifest: \"/etc/evil.toml\"\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("react-loop"), "{err}");
+        assert!(err.contains("name_collision"), "{err}");
+    }
+
+    /// §8.1: an empty server list is legal ("no sidecars for anyone"),
+    /// and so is an empty `use: []` at a worker.
+    #[test]
+    fn sidecars_empty_sets_are_legal() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n  scopes:\n    server: []\n    worker:\n      w:\n        use: []\n",
+            base = valid_yaml()
+        );
+        let cfg = ServeConfig::parse(&text).expect("empty sets are legal");
+        let sidecars = cfg.sidecars.expect("present");
+        assert!(sidecars.scopes.server.is_empty());
     }
 }

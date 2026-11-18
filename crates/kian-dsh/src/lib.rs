@@ -47,6 +47,7 @@ pub mod ctx;
 pub mod driver;
 pub mod fixture_peer;
 pub mod mapping;
+pub mod toolpost;
 
 pub use ctx::{DshCtx, DshCtxError};
 pub use driver::{DshDriver, DshDriverConfig};

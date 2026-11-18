@@ -58,6 +58,12 @@ The same runtime also ships:
   machine (its `--workspace-root`, a lexical path guard, 1 MiB bounds) with the same schemas and
   result shapes as the local built-ins; the durable queue, 1:1 binding and no-failover rules are
   unchanged (KiandProto v2, [ADR-023](design/decisions/ADR-023-worker-fs-tools.md)).
+- **Hook plugins** — operator-trusted sidecars extend the harness at the admission, tool and
+  settlement boundaries ([PLUGIN-SPEC](design/PLUGIN-SPEC.md), [ADR-028](design/decisions/ADR-028-harness-hook-plugins.md)):
+  observe every port, deny a side effect before it happens (`tool/pre`), gate `completed`, with
+  per-dispatch deadlines, digest-pinned spawns, quarantine and fail-closed defaults — in any
+  language that speaks newline-delimited JSON on stdio (see the
+  [reference approval gate](examples/hook-approval-gate/README.md)).
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
@@ -632,6 +638,25 @@ The decision is evaluated **before** the call is logged and recorded as provenan
 ([ADR-015](design/decisions/ADR-015-tool-permission-provenance.md)); a deny never invokes the tool —
 the model receives an honest error result and reacts. Unknown values and keys outside `tools:`
 refuse to start. Absent table = empty = allow-all, byte-identical to a server without the feature.
+
+### Hook plugins (`sidecars:`)
+
+Operator-trusted sidecar processes subscribe to harness hooks over a stdio JSON-lines ABI
+([PLUGIN-SPEC](design/PLUGIN-SPEC.md)): `tool/pre` can deny a side effect before it happens (the
+honest error says which plugin and why), and every port is observable. Deadlines, digest-pinned
+spawns, quarantine and fail-closed defaults are the contract's own. Any language works — the
+in-tree [approval-gate reference](examples/hook-approval-gate/README.md) is a Python stdlib script:
+
+```yaml
+sidecars:
+  plugins:
+    approval-gate:
+      manifest: "/etc/kian/plugins/approval-gate.toml"
+  scopes:
+    server: ["approval-gate"]   # every session
+```
+
+Absent the `sidecars:` section, behavior is byte-identical — no bus, no spawns.
 
 ### Agent memory (notes + dreaming)
 

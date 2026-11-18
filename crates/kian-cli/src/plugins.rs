@@ -205,14 +205,31 @@ impl Plugin for ReActPlugin {
             )));
         }
         let tools = Arc::new(FilteredTools::new(tools, &self.agent.tools));
-        let react = ReActLoop::with_evidence_gate(
-            self.agent,
-            registry,
-            tools,
-            self.policy as Arc<dyn RecoveryPolicySource>,
-            self.config,
-            self.gate,
-        );
+        // The assembly-provided hook bus (PLUGIN-SPEC §13.1: "the bus
+        // registers its ports when the driver/wrapper is constructed").
+        // Present in the serve assembly; absent (a bare embedding) keeps
+        // the pre-plugin loop, byte-identical.
+        let hook_bus = ctx.resolve::<kian_plugin::hooks::HookBus>();
+        let react = match hook_bus.clone() {
+            Some(bus) => ReActLoop::with_hooks_and_guard(
+                self.agent,
+                registry,
+                tools,
+                self.policy as Arc<dyn RecoveryPolicySource>,
+                self.config,
+                self.gate,
+                Some(bus.clone()),
+                Some(bus),
+            ),
+            None => ReActLoop::with_evidence_gate(
+                self.agent,
+                registry,
+                tools,
+                self.policy as Arc<dyn RecoveryPolicySource>,
+                self.config,
+                self.gate,
+            ),
+        };
         ctx.provide::<ReActLoop>(Arc::new(react))
     }
 }
@@ -1044,18 +1061,44 @@ impl Plugin for SuperAgentPlugin {
             local_tools.clone(),
             &self.worker_agent.tools,
         )));
-        let worker_loop = Arc::new(ReActLoop::with_config(
-            self.worker_agent.clone(),
-            registry.clone(),
-            Arc::new(crate::superagent::CombinedTools::new(worker_tools)),
-            Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
-            ReActConfig {
-                slot: kian_core::model::SlotName("main".into()),
-                max_iterations: self.max_iterations,
-                budget_scope: kian_loop::BudgetScope::Lifetime,
-                permissions: self.worker_permissions.clone(),
-            },
-        ));
+        // The assembly-owned hook bus (PLUGIN-SPEC §13.1): the same
+        // instance mounts on EVERY worker-side driver this assembly
+        // builds — the worker template's inner loop (§3.4.1's turn/*,
+        // tool/*, recover rows for worker-lineage sessions), the static
+        // side's wrapper (§3.4.4's settle/pre), and both per-worker-id
+        // side factories below. Absent (a bare embedding) keeps the
+        // pre-plugin constructors, byte-identical.
+        let hook_bus = ctx
+            .resolve::<kian_plugin::hooks::HookBus>()
+            .map(|bus| bus.as_ref().clone());
+        let worker_loop = match &hook_bus {
+            Some(bus) => Arc::new(ReActLoop::with_hooks(
+                self.worker_agent.clone(),
+                registry.clone(),
+                Arc::new(crate::superagent::CombinedTools::new(worker_tools)),
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+                ReActConfig {
+                    slot: kian_core::model::SlotName("main".into()),
+                    max_iterations: self.max_iterations,
+                    budget_scope: kian_loop::BudgetScope::Lifetime,
+                    permissions: self.worker_permissions.clone(),
+                },
+                EvidenceGateConfig::default(),
+                Some(Arc::new(bus.clone()) as Arc<dyn kian_plugin::hooks::HookPorts>),
+            )),
+            None => Arc::new(ReActLoop::with_config(
+                self.worker_agent.clone(),
+                registry.clone(),
+                Arc::new(crate::superagent::CombinedTools::new(worker_tools)),
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+                ReActConfig {
+                    slot: kian_core::model::SlotName("main".into()),
+                    max_iterations: self.max_iterations,
+                    budget_scope: kian_loop::BudgetScope::Lifetime,
+                    permissions: self.worker_permissions.clone(),
+                },
+            )),
+        };
         // the worker template's inner loop is config-gated — the
         // dsh bridge replaces the built-in ReAct loop when
         // `superagent.harness.dsh` is on (default off; the decorator,
@@ -1164,23 +1207,44 @@ impl Plugin for SuperAgentPlugin {
                 Arc::new(kian_superagent::SystemTurnClock),
             ),
         );
-        let worker_side = kian_superagent::WorkerLoopDriver::new(
-            Arc::new(worker_inner),
-            Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
-            kian_superagent::WorkerLoopConfig {
-                router: self.router_session,
-                worker_version: self.worker_agent.version,
-                gate: crate::superagent::clone_gate(&self.worker_gate),
-                // (R15-C5): the delegation bounds ride the worker
-                // loop — the join (C4) reads the child's own
-                // `thread/started.parent` only when the driving side
-                // carries them; None = feature off, ambient today.
-                multiagent: self.multiagent,
-                // (R17-C6, pin P4-1): the child-side class-A switch.
-                board_gating: self.board_gating,
-            },
-            crate::superagent::port_for_ctx(),
-        );
+        let worker_side = {
+            // Port (e) mount (PLUGIN-SPEC §4.6/§13.1): the settle gate +
+            // the §9.2 drain-boundary guard ride the bus the assembly
+            // provided. Absent (a bare embedding) keeps `::new` — no
+            // gate, no guard, byte-identical.
+            match ctx.resolve::<kian_plugin::hooks::HookBus>() {
+                Some(bus) => kian_superagent::WorkerLoopDriver::with_hooks(
+                    Arc::new(worker_inner),
+                    Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                    kian_superagent::WorkerLoopConfig {
+                        router: self.router_session,
+                        worker_version: self.worker_agent.version,
+                        gate: crate::superagent::clone_gate(&self.worker_gate),
+                        // (R15-C5): the delegation bounds ride the worker
+                        // loop — the join (C4) reads the child's own
+                        // `thread/started.parent` only when the driving side
+                        // carries them; None = feature off, ambient today.
+                        multiagent: self.multiagent,
+                        // (R17-C6, pin P4-1): the child-side class-A switch.
+                        board_gating: self.board_gating,
+                    },
+                    crate::superagent::port_for_ctx(),
+                    Some(bus.as_ref().clone()),
+                ),
+                None => kian_superagent::WorkerLoopDriver::new(
+                    Arc::new(worker_inner),
+                    Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+                    kian_superagent::WorkerLoopConfig {
+                        router: self.router_session,
+                        worker_version: self.worker_agent.version,
+                        gate: crate::superagent::clone_gate(&self.worker_gate),
+                        multiagent: self.multiagent,
+                        board_gating: self.board_gating,
+                    },
+                    crate::superagent::port_for_ctx(),
+                ),
+            }
+        };
 
         // (R12, S1/S3/S5 — supersedes ADR-020 D8's boot-prebuilt
         // loop): the lazy per-worker-id side factory. Each id's side
@@ -1227,6 +1291,10 @@ impl Plugin for SuperAgentPlugin {
             // delegation bounds as the primary worker side.
             let side_multiagent = self.multiagent;
             let side_board_gating = self.board_gating;
+            // (B2/§3.4.4): the same assembly bus mounts on the lazy
+            // per-worker-id sides — inner loop (turn/*, tool/*,
+            // recover) and wrapper (settle/pre) alike.
+            let side_hooks = hook_bus.clone();
             side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
@@ -1251,25 +1319,52 @@ impl Plugin for SuperAgentPlugin {
                     side_local.clone(),
                     &side_agent.tools,
                 )));
-                let side_loop = Arc::new(ReActLoop::with_config(
-                    side_agent.clone(),
-                    side_registry.clone(),
-                    Arc::new(crate::superagent::CombinedTools::new(tools)),
-                    Arc::clone(&side_policy),
-                    side_config.clone(),
-                ));
-                kian_superagent::WorkerLoopDriver::new(
-                    Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
-                    Arc::clone(&side_inbox),
-                    kian_superagent::WorkerLoopConfig {
-                        router: side_session,
-                        worker_version: side_version,
-                        gate: crate::superagent::clone_gate(&side_gate),
-                        multiagent: side_multiagent,
-                        board_gating: side_board_gating,
-                    },
-                    crate::superagent::port_for_ctx(),
-                )
+                let side_loop = match &side_hooks {
+                    Some(bus) => Arc::new(ReActLoop::with_hooks(
+                        side_agent.clone(),
+                        side_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&side_policy),
+                        side_config.clone(),
+                        EvidenceGateConfig::default(),
+                        Some(Arc::new(bus.clone()) as Arc<dyn kian_plugin::hooks::HookPorts>),
+                    )),
+                    None => Arc::new(ReActLoop::with_config(
+                        side_agent.clone(),
+                        side_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&side_policy),
+                        side_config.clone(),
+                    )),
+                };
+                let inner = Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop));
+                match &side_hooks {
+                    Some(bus) => kian_superagent::WorkerLoopDriver::with_hooks(
+                        inner,
+                        Arc::clone(&side_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: side_session,
+                            worker_version: side_version,
+                            gate: crate::superagent::clone_gate(&side_gate),
+                            multiagent: side_multiagent,
+                            board_gating: side_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                        Some(bus.clone()),
+                    ),
+                    None => kian_superagent::WorkerLoopDriver::new(
+                        inner,
+                        Arc::clone(&side_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: side_session,
+                            worker_version: side_version,
+                            gate: crate::superagent::clone_gate(&side_gate),
+                            multiagent: side_multiagent,
+                            board_gating: side_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                    ),
+                }
             }));
             // The refusing-side factory (built per drive — the refusal
             // rows are rare and never on the hot path; a fresh loop per
@@ -1288,6 +1383,10 @@ impl Plugin for SuperAgentPlugin {
             let refuse_version = self.worker_agent.version;
             let refuse_multiagent = self.multiagent;
             let refuse_board_gating = self.board_gating;
+            // (B2/§3.4.4): the refuse-side factory mounts the same bus —
+            // a refusing worker side is still a worker side, and its
+            // sessions are worker-lineage for §3.4.4.
+            let refuse_hooks = hook_bus.clone();
             refuse_side = Some(Arc::new(move |refusal: &crate::superagent::Refusal| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
@@ -1304,25 +1403,52 @@ impl Plugin for SuperAgentPlugin {
                     refuse_local.clone(),
                     &refuse_agent.tools,
                 )));
-                let refuse_loop = Arc::new(ReActLoop::with_config(
-                    refuse_agent.clone(),
-                    refuse_registry.clone(),
-                    Arc::new(crate::superagent::CombinedTools::new(tools)),
-                    Arc::clone(&refuse_policy),
-                    refuse_config.clone(),
-                ));
-                kian_superagent::WorkerLoopDriver::new(
-                    Arc::new(crate::superagent::WorkerInnerDriver::React(refuse_loop)),
-                    Arc::clone(&refuse_inbox),
-                    kian_superagent::WorkerLoopConfig {
-                        router: refuse_session,
-                        worker_version: refuse_version,
-                        gate: crate::superagent::clone_gate(&refuse_gate),
-                        multiagent: refuse_multiagent,
-                        board_gating: refuse_board_gating,
-                    },
-                    crate::superagent::port_for_ctx(),
-                )
+                let refuse_loop = match &refuse_hooks {
+                    Some(bus) => Arc::new(ReActLoop::with_hooks(
+                        refuse_agent.clone(),
+                        refuse_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&refuse_policy),
+                        refuse_config.clone(),
+                        EvidenceGateConfig::default(),
+                        Some(Arc::new(bus.clone()) as Arc<dyn kian_plugin::hooks::HookPorts>),
+                    )),
+                    None => Arc::new(ReActLoop::with_config(
+                        refuse_agent.clone(),
+                        refuse_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&refuse_policy),
+                        refuse_config.clone(),
+                    )),
+                };
+                let inner = Arc::new(crate::superagent::WorkerInnerDriver::React(refuse_loop));
+                match &refuse_hooks {
+                    Some(bus) => kian_superagent::WorkerLoopDriver::with_hooks(
+                        inner,
+                        Arc::clone(&refuse_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: refuse_session,
+                            worker_version: refuse_version,
+                            gate: crate::superagent::clone_gate(&refuse_gate),
+                            multiagent: refuse_multiagent,
+                            board_gating: refuse_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                        Some(bus.clone()),
+                    ),
+                    None => kian_superagent::WorkerLoopDriver::new(
+                        inner,
+                        Arc::clone(&refuse_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: refuse_session,
+                            worker_version: refuse_version,
+                            gate: crate::superagent::clone_gate(&refuse_gate),
+                            multiagent: refuse_multiagent,
+                            board_gating: refuse_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                    ),
+                }
             }));
             // The driver's known-ids source: the same read-only
             // directory port the Router tools read (static ∪ live

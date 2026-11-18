@@ -11,6 +11,28 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 futures.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# The fixture feature is enabled for this package's own test builds
+# only (the self dev-dependency is the documented dev-only-feature
+# pattern): `cargo build` skips the fixture bin entirely, `cargo test`
+# builds it so CARGO_BIN_EXE_kian_sidecar_child is set for
+# tests/sidecar_runner.rs.
+kian-plugin = { path = ".", features = ["sidecar-fixture"] }
+
+[features]
+sidecar-fixture = []
+
+# The reference sidecar child: a test fixture for the runner's live
+# process tests (crates/kian-plugin/tests/sidecar_runner.rs reaches it
+# through CARGO_BIN_EXE_kian_sidecar_child). It is a bin of this crate
+# so the fixture and the ABI decoder cannot drift — but it is NOT part
+# of the default build/release surface (required-features keeps it out
+# of `cargo build --workspace`; only the package's own test builds
+# enable the feature).
+[[bin]]
+name = "kian_sidecar_child"
+path = "src/bin/kian_sidecar_child.rs"
+required-features = ["sidecar-fixture"]

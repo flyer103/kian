@@ -106,7 +106,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `turn/end` | — | DrainActivity | `{"iteration":<u64>,"outcome"?:"final_answer"\|"tool_calls"\|"soft_failure"\|"error","tool_calls"?:<u64>}`; additive: `"usage":<provider usage verbatim>`, `"error":{"class":<class>,"action":<policy disposition\|"none">}` | loop | Usage/error are audit-only. |
 | `step/request` | — | DrainActivity | `{"slot":<str>,"provider":<str>,"model":<str>,"iteration":<u64>,"body":<exact request bytes>}` | loop / provider persist hook | **A2**: persisted before the request flies; replay is byte-identical. |
 | `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...],"reasoning_content"?:<str>}}` | loop | The sent bytes are the truth; never rewritten. `reasoning_content` is the provider's thinking-mode reasoning, part of context (replayed on the wire); absent for non-thinking providers and legacy events ([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). |
-| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). |
+| `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny","policy":"default"\|"configured"\|"hook","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). `policy:"hook"` is a `tool/pre` veto denial; `matched` then carries `"<plugin>:<hook>"` ([PLUGIN-SPEC](PLUGIN-SPEC.md) §4.4, [ADR-028](decisions/ADR-028-harness-hook-plugins.md)). |
 | `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]` | loop / exec | Redaction provenance never carries secret values. |
 | `compact` | c | DrainActivity | `{"from_seq":<u64>,"to_seq":<u64>,"summary":{"role":<str>,"content":<json>}}` | recovery reactor | The only deliberate prefix-invalidation point; ranges pairwise-disjoint, `a < b <= seq`. |
 | `slot/binding` | — | DrainActivity | `{"slot":<str>,"spec":{"provider","model","fallback":[...]}}` | loop at first use | Slot → provider/model fixed for the session's lifetime (ADR-006). |
@@ -143,7 +143,10 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
 
 - `turn/end`: `"usage"` (provider `usage` object verbatim; no normalization/pricing in core),
   `"error": {"class","action"}`.
-- `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (ADR-015).
+- `tool/call`: `"permission": {"evaluated","policy","matched","reason"?}` (ADR-015). `policy` is the closed
+  set `"default" | "configured" | "hook"`; `"hook"` rides a `tool/pre` veto denial and pairs with
+  `matched = "<plugin>:<hook>"` ([PLUGIN-SPEC](PLUGIN-SPEC.md) §4.4, [ADR-028](decisions/ADR-028-harness-hook-plugins.md))
+  — an additive payload **value**, not a new key.
 - `tool/result`: `"redactions": [{"kind","name","count"}]`.
 - `input/admitted`: `"dream": {"source_session","start_seq","end_seq","scope"}` — the trusted
   dream marker, set only by the ops plane's `memory_dream` admit (the public wire refuses the
@@ -289,6 +292,11 @@ A new kind is the **last** resort (config → plugin → seam → core primitive
 
 - **Additive payload key**: allowed; omit when unset; legacy event bytes parse/replay byte-identical;
   no context change; document in §3/§4 and test the legacy shape.
+- **Additive payload value**: a closed value set of an existing key may widen — no new key, no kind
+  change, legacy streams replay unchanged (they never carry the new value). The widening change
+  updates the §3 row and carries byte goldens for the new value plus a frozen regression for every
+  pre-existing value (the `permission.policy:"hook"` widening is the precedent,
+  [ADR-028](decisions/ADR-028-harness-hook-plugins.md)).
 - **Envelope change**: a new schema `version` plus an adjacent migration; committed generations are
   never rewritten; old streams must reopen cleanly.
 - **Rename/removal/reformat**: forbidden. Express the new semantics with a new additive kind/payload

@@ -1160,6 +1160,7 @@ dependencies = [
  "kian-core",
  "kian-llm",
  "kian-orchestrator",
+ "kian-plugin",
  "kian-store",
  "serde",
  "serde_json",
@@ -1212,8 +1213,10 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "kian-core",
+ "kian-plugin",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",

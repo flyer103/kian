@@ -1226,3 +1226,558 @@ async fn absent_permissions_keep_tool_call_payload_byte_identical_to_today() {
     );
     cleanup_db(&h.db_path);
 }
+
+// -- acceptance: the five ReAct hook ports (PLUGIN-SPEC §4 rows b-f) -------
+
+use futures::FutureExt;
+use kian_plugin::hooks::{HandlerId, HookBus, HookId, HookPayload, HookPorts, HookReply, Registry};
+
+/// [`harness`] with hook ports injected (the bus over a private
+/// registry, so tier-0 registrations are isolated per test).
+async fn harness_hooks(
+    turns: Vec<Vec<Result<kian_core::seams::ModelChunk, kian_core::seams::ProviderError>>>,
+    tools: Arc<dyn kian_core::seams::ToolProvider>,
+    policy: Arc<dyn kian_core::seams::RecoveryPolicySource>,
+    config: ReActConfig,
+    registry: Arc<Registry>,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut providers = ProviderRegistry::new();
+    providers.register("mock", provider.clone());
+    let react = ReActLoop::with_hooks(
+        agent_def(),
+        Arc::new(providers),
+        tools,
+        policy,
+        config,
+        crate::evidence::EvidenceGateConfig::default(),
+        Some(Arc::new(HookBus::with_registry(registry)) as Arc<dyn HookPorts>),
+    );
+    let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+/// A recording tier-0 handler: appends `label` to `log` per dispatch
+/// and answers `reply`.
+fn recording_handler(
+    registry: &Arc<Registry>,
+    plugin: &'static str,
+    hook: HookId,
+    grants: &[&str],
+    reply: HookReply,
+    label: &'static str,
+    log: Arc<Mutex<Vec<&'static str>>>,
+) -> kian_plugin::Disposer {
+    registry.register(
+        HandlerId {
+            plugin,
+            hook,
+            grants: kian_plugin::hooks::GrantSet::from_names(grants).unwrap(),
+            order: 0,
+        },
+        Arc::new(move |_payload: &HookPayload| {
+            let log = Arc::clone(&log);
+            let reply = reply.clone();
+            async move {
+                log.lock().unwrap().push(label);
+                reply
+            }
+            .boxed()
+        }),
+    )
+}
+
+/// The P2 acceptance: a tier-0 deny at `tool/pre` yields an
+/// honest-error `tool/result`, the call is logged before any effect
+/// with `policy:"hook"` provenance naming the denying plugin, and the
+/// invoke never runs — while every observe port still sees its
+/// dispatch exactly once per its own unit (§4.2/§4.3/§4.4 step 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier0_deny_at_tool_pre_yields_honest_error_result() {
+    let registry = Arc::new(Registry::new());
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let _keep_gate = recording_handler(
+        &registry,
+        "approval-gate",
+        HookId::ToolPre,
+        &["observe:tool", "veto:tool"],
+        HookReply::BailDeny {
+            reason: "exec not on the allowlist".to_string(),
+        },
+        "tool_pre",
+        Arc::clone(&log),
+    );
+    let _keep_req = recording_handler(
+        &registry,
+        "auditor",
+        HookId::TurnRequest,
+        &["observe:turn"],
+        HookReply::Ack { note: None },
+        "request",
+        Arc::clone(&log),
+    );
+    let _keep_resp = recording_handler(
+        &registry,
+        "auditor",
+        HookId::TurnResponse,
+        &["observe:turn"],
+        HookReply::Ack { note: None },
+        "response",
+        Arc::clone(&log),
+    );
+    let _keep_post = recording_handler(
+        &registry,
+        "auditor",
+        HookId::ToolPost,
+        &["observe:tool"],
+        HookReply::Ack { note: None },
+        "tool_post",
+        Arc::clone(&log),
+    );
+
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "exec", json!({"cmd": ["ls"]}))],
+        vec![text_chunk("done")],
+    ];
+    let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let (h, _p) = harness_hooks(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+        registry,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    // The invoke never ran — only the honest-error result exists.
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a hook-denied call never reaches tools.invoke"
+    );
+    let events = events_of(&h.store, sid).await;
+    let calls = tool_call_payloads(&events);
+    assert_eq!(calls.len(), 1, "the denied call is still logged");
+    assert_eq!(
+        calls[0]["permission"],
+        json!({
+            "evaluated": "deny",
+            "policy": "hook",
+            "matched": "approval-gate:tool/pre",
+            "reason": "exec not on the allowlist",
+        }),
+        "§4.4 step 3 + §16.1: hook provenance names the plugin:hook"
+    );
+    let results: Vec<Value> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolResult))
+        .map(|e| e.bytes["content"].clone())
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0],
+        json!({
+            "call_id": "call-1",
+            "output": {
+                "error": "denied by plugin approval-gate: exec not on the allowlist",
+                "policy": "hook",
+            },
+            "is_error": true,
+        }),
+        "§4.4 step 4: the model receives the honest-error tool/result"
+    );
+
+    // The ports fired in the §4.2/§4.3 cadence: one request and one
+    // response per provider turn (two turns), one tool/pre and one
+    // tool/post for the denied call.
+    let fired = log.lock().unwrap().clone();
+    assert_eq!(
+        fired.iter().filter(|l| **l == "request").count(),
+        2,
+        "turn/request fires exactly once per provider turn"
+    );
+    assert_eq!(
+        fired.iter().filter(|l| **l == "response").count(),
+        2,
+        "turn/response fires exactly once per settled provider turn"
+    );
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_pre").count(),
+        1,
+        "tool/pre consulted once for the call"
+    );
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_post").count(),
+        1,
+        "tool/post observes the hook-denied arm too (uniform surface)"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// Row (f): a soft failure's class → action resolution observes
+/// `recover/decided` with the same `{class, action}` pair the
+/// `turn/end` audit carries, and the session still ends honestly
+/// `failed` (constraint 7 — the observation changes nothing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_decided_observes_the_resolution_of_a_soft_failure() {
+    let registry = Arc::new(Registry::new());
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let _keep = recording_handler(
+        &registry,
+        "auditor",
+        HookId::RecoverDecided,
+        &["observe:recover"],
+        HookReply::Ack { note: None },
+        "recover",
+        Arc::clone(&log),
+    );
+
+    // An empty scripted turn: the empty-response soft failure.
+    let turns = vec![Vec::new()];
+    let (tools, _seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let policy = crate::test_support::RecordingPolicy::with_empty_response_rule();
+    let (h, _p) = harness_hooks(
+        turns,
+        Arc::new(tools),
+        Arc::new(policy),
+        ReActConfig::default(),
+        registry,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Failed, "honest failure, unchanged");
+
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| **l == "recover")
+            .count(),
+        1,
+        "the empty_response resolution observed exactly once"
+    );
+    let events = events_of(&h.store, sid).await;
+    let turn_end = events
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::TurnEnd))
+        .expect("turn/end exists");
+    assert_eq!(
+        turn_end.bytes["error"],
+        json!({"class": "empty_response", "action": "interrupt_ask"}),
+        "the audit object the view mirrors"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// §12.1 (M4-b): the persisted `step/request` bytes are identical with
+/// a hook **mounted and observing** and with no hooks at all — the
+/// interception ports are metadata-only, never a request-body input.
+/// (§13.3's `plugin_absent_is_byte_identical` compares section-absent
+/// builds; this compares the same build with a mounted, observing
+/// subscriber set.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_bytes_identical_with_hook_mounted_observing_vs_absent() {
+    async fn scenario(hooks: bool) -> (PathBuf, Vec<String>, Vec<SessionId>) {
+        let turns = vec![
+            vec![tool_call_chunk("call-1", "exec", json!({"cmd": ["ls"]}))],
+            vec![text_chunk("done")],
+        ];
+        let registry = Arc::new(Registry::new());
+        if hooks {
+            let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            for (hook, grants) in [
+                (HookId::TurnRequest, &["observe:turn"][..]),
+                (HookId::TurnResponse, &["observe:turn"][..]),
+                (HookId::ToolPre, &["observe:tool"][..]),
+                (HookId::ToolPost, &["observe:tool"][..]),
+                (HookId::RecoverDecided, &["observe:recover"][..]),
+            ] {
+                let _keep = recording_handler(
+                    &registry,
+                    "auditor",
+                    hook,
+                    grants,
+                    HookReply::Ack { note: None },
+                    "observe",
+                    Arc::clone(&log),
+                );
+            }
+        }
+        let (tools, _seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+        let config = ReActConfig {
+            permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
+            ..ReActConfig::default()
+        };
+        let (h, _p) = if hooks {
+            harness_hooks(
+                turns,
+                Arc::new(tools),
+                Arc::new(crate::test_support::NoopPolicy),
+                config,
+                registry,
+            )
+            .await
+        } else {
+            harness(
+                turns,
+                Arc::new(tools),
+                Arc::new(crate::test_support::NoopPolicy),
+                config,
+            )
+            .await
+        };
+        let sid = h.engine.create_session().await.expect("create");
+        let reason = submit_and_wait(&h, sid, json!("go")).await;
+        assert_eq!(reason, EndReason::Completed);
+        let events = events_of(&h.store, sid).await;
+        let bodies: Vec<String> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::StepRequest))
+            .map(|e| serde_json::to_string(&e.bytes).unwrap())
+            .collect();
+        let db_path = h.db_path.clone();
+        // keep the harness's store alive until the bodies are read
+        drop(h);
+        (db_path, bodies, vec![sid])
+    }
+
+    let (_db_with, with_hooks, _) = scenario(true).await;
+    let (_db_without, without, _) = scenario(false).await;
+    assert_eq!(
+        with_hooks, without,
+        "§12.1: a mounted, observing subscriber set changes zero request bytes"
+    );
+}
+
+/// §4.4 step 5 (M4-e) + §4.4 step 2 (M3): `tool/pre` is consulted and
+/// `tool/post` observes on **every** arm — the executed call, the
+/// declared-deny call (consulted unconditionally, its payload carrying
+/// the declarative verdict) and the hook-denied call alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_pre_and_post_cover_executed_and_declared_denied_arms() {
+    let registry = Arc::new(Registry::new());
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    // Observing-only subscribers on both tool ports; the abstaining
+    // tool/pre leaves the declarative decision standing.
+    let _keep_pre = recording_handler(
+        &registry,
+        "auditor",
+        HookId::ToolPre,
+        &["observe:tool"],
+        HookReply::BailNone,
+        "tool_pre",
+        Arc::clone(&log),
+    );
+    let _keep_post = recording_handler(
+        &registry,
+        "auditor",
+        HookId::ToolPost,
+        &["observe:tool"],
+        HookReply::Ack { note: None },
+        "tool_post",
+        Arc::clone(&log),
+    );
+
+    let turns = vec![
+        // Turn 1: an executed call (fs_read allowed by the table).
+        vec![tool_call_chunk(
+            "call-ok",
+            "fs_read",
+            json!({"path": "a.txt"}),
+        )],
+        // Turn 2: a declared-deny call (fs_write denied by the table).
+        vec![tool_call_chunk(
+            "call-deny",
+            "fs_write",
+            json!({"path": "a.txt", "content": "x"}),
+        )],
+        vec![text_chunk("done")],
+    ];
+    let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let config = ReActConfig {
+        permissions: BTreeMap::from([
+            ("fs_read".to_string(), Permission::Allow),
+            ("fs_write".to_string(), Permission::Deny),
+        ]),
+        ..ReActConfig::default()
+    };
+    let (h, _p) = harness_hooks(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        config,
+        registry,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    // Exactly the allowed call executed.
+    assert_eq!(seen.lock().unwrap().len(), 1, "only the allowed call ran");
+    let fired = log.lock().unwrap().clone();
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_pre").count(),
+        2,
+        "§4.4 step 2: tool/pre fires on the declared-deny arm too, not just would-execute"
+    );
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_post").count(),
+        2,
+        "§4.4 step 5: tool/post observes the executed and declared-denied arms alike"
+    );
+
+    // The declared-deny arm's logged call keeps its declarative
+    // provenance (an abstaining hook changes nothing).
+    let events = events_of(&h.store, sid).await;
+    let denied: Vec<Value> = tool_call_payloads(&events)
+        .into_iter()
+        .filter(|c| c["content"]["id"] == json!("call-deny"))
+        .collect();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        denied[0]["permission"],
+        json!({
+            "evaluated": "deny",
+            "policy": "configured",
+            "matched": "fs_write",
+            "reason": "tool_denied_by_policy"
+        }),
+        "the declared-deny provenance stands under an abstaining hook"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// §4.4 steps 3–4 (NEW-1): on the **coincident** arm — the declarative
+/// table denies the call AND a `veto:tool` plugin denies it — the
+/// audit pair names ONE denier: first-deny order makes the hook
+/// denial win end-to-end, so the `tool/call` provenance
+/// (`policy:"hook"`, the plugin's reason) and the adjacent
+/// `tool/result` (the plugin's honest error, `policy:"hook"`) agree;
+/// the declarative honest error never lands, the invoke never runs,
+/// and the uniform surface still observes the arm via `tool/post`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coincident_declared_and_hook_deny_name_one_denier() {
+    let registry = Arc::new(Registry::new());
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    // A DENYING tool/pre subscriber (veto:tool) — not the abstaining
+    // one the M3 test uses.
+    let _keep_pre = recording_handler(
+        &registry,
+        "approval-gate",
+        HookId::ToolPre,
+        &["observe:tool", "veto:tool"],
+        HookReply::BailDeny {
+            reason: "outside business hours".to_string(),
+        },
+        "tool_pre",
+        Arc::clone(&log),
+    );
+    let _keep_post = recording_handler(
+        &registry,
+        "auditor",
+        HookId::ToolPost,
+        &["observe:tool"],
+        HookReply::Ack { note: None },
+        "tool_post",
+        Arc::clone(&log),
+    );
+
+    // The declarative table denies the SAME call the plugin denies.
+    let turns = vec![
+        vec![tool_call_chunk(
+            "call-both",
+            "fs_write",
+            json!({"path": "a.txt", "content": "x"}),
+        )],
+        vec![text_chunk("done")],
+    ];
+    let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
+    let config = ReActConfig {
+        permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
+        ..ReActConfig::default()
+    };
+    let (h, _p) = harness_hooks(
+        turns,
+        Arc::new(tools),
+        Arc::new(crate::test_support::NoopPolicy),
+        config,
+        registry,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("go")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    // Never invoked, whatever denied it.
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the coincident-deny call never reaches tools.invoke"
+    );
+
+    // tool/call: the hook provenance — NOT the declarative one.
+    let events = events_of(&h.store, sid).await;
+    let calls: Vec<Value> = tool_call_payloads(&events)
+        .into_iter()
+        .filter(|c| c["content"]["id"] == json!("call-both"))
+        .collect();
+    assert_eq!(calls.len(), 1, "the attempted call is logged exactly once");
+    assert_eq!(
+        calls[0]["permission"],
+        json!({
+            "evaluated": "deny",
+            "policy": "hook",
+            "matched": "approval-gate:tool/pre",
+            "reason": "outside business hours",
+        }),
+        "§4.4 step 3: the hook denial is logged with its own provenance"
+    );
+
+    // tool/result: the plugin's honest error — the SAME denier the
+    // call names, never the declarative `permission denied by policy`.
+    let results: Vec<Value> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolResult))
+        .map(|e| e.bytes["content"].clone())
+        .collect();
+    assert_eq!(results.len(), 1, "exactly one honest-error result");
+    assert_eq!(
+        results[0],
+        json!({
+            "call_id": "call-both",
+            "output": {
+                "error": "denied by plugin approval-gate: outside business hours",
+                "policy": "hook",
+            },
+            "is_error": true,
+        }),
+        "§4.4 step 4: the pair agrees — the hook denier, end-to-end"
+    );
+
+    // The uniform surface still observed the arm.
+    let fired = log.lock().unwrap().clone();
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_pre").count(),
+        1,
+        "tool/pre consulted once for the coincident-deny call"
+    );
+    assert_eq!(
+        fired.iter().filter(|l| **l == "tool_post").count(),
+        1,
+        "tool/post observes the coincident-deny arm too (uniform surface)"
+    );
+    cleanup_db(&h.db_path);
+}

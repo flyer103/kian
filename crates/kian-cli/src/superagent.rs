@@ -1477,6 +1477,11 @@ impl SubscriptionMetrics {
             kian_superagent::RoutingOutcome::DroppedNotExplicit => {
                 Self::bump(&self.dropped_not_explicit);
             }
+            // A hook veto at `admit/pre` (PLUGIN-SPEC §4.1): no admission
+            // decision exists to count — the veto's own audit lines
+            // (the service's and the bus's `hook-veto`) carry it, and
+            // no legacy counter drifts.
+            kian_superagent::RoutingOutcome::RefusedByHook { .. } => {}
         }
         for reason in kian_superagent::outcome_reasons(outcome, router) {
             self.by_reason.bump(reason);

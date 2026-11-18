@@ -67,6 +67,7 @@ pub mod multiagent_tick;
 pub mod ops;
 pub mod plugins;
 pub mod server;
+pub mod sidecars;
 pub mod superagent;
 pub mod usage_metrics;
 pub mod views;
