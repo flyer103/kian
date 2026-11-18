@@ -44,6 +44,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   (pin P3-3's row key set exactly; absent facts are never fabricated — `evidence_provenance`
   stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
   refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
+- **Bounded queue re-drive (ADR-033)** — `exec_queue` rows carry `dispatch_attempts` (exec migration
+  v6, additive, sqlite + postgres); the claim statement counts a dispatch and refuses an `inflight`
+  re-drive at `1 + workers.queue_max_redrives` (new config knob in `kian.yaml` under `workers:`,
+  default `1`, `0` = first dispatch only, validated ceiling `16`), and a spent bound converges the
+  row `inflight → abandoned` once no live lease is held — one audit line naming command id, endpoint,
+  attempts and `tool_call_ref`, no fabricated result. This fixes an unbounded replay observed live:
+  a command whose own side effect destroys its ack path (`systemctl restart kian`, `pkill kiand`)
+  was re-dispatched on every reconnect forever, because the caller-applied `queue_timeout` bounds
+  only rows someone is waiting on. No new status, event kind, wire frame or prompt byte; a caller
+  re-attaching after convergence reads `abandoned` and gets the existing honest timeout. Semantics:
+  [WORKER-MODEL §4](design/WORKER-MODEL.md), placement [DESIGN](design/DESIGN.md),
+  decision [ADR-033](design/decisions/ADR-033-bounded-queue-redrive.md).
 
 - **Hook plugins — the two-tier harness-extension contract (round 16, [PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
   [ADR-028](../design/decisions/ADR-028-harness-hook-plugins.md))**. A closed hook vocabulary over seven

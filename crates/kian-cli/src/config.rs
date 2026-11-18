@@ -2427,6 +2427,16 @@ pub struct WorkersConfig {
     /// the honest timeout of every queued command.
     #[serde(default = "default_workers_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
+    /// How many times a queued command whose result was lost may be
+    /// **re-driven** before the row is abandoned (ADR-033). The re-drive is
+    /// at-least-once, and this bound is what makes it terminate: a command
+    /// that destroys its own ack path (a `systemctl restart kian`, a
+    /// `pkill kiand`) can never deliver a result, so the server stops
+    /// replaying it after `1 + queue_max_redrives` dispatches and records one
+    /// audit line. `0` disables re-drive (first dispatch only). Global by
+    /// construction, like the queue timeout: no per-endpoint override.
+    #[serde(default = "default_workers_queue_max_redrives")]
+    pub queue_max_redrives: u32,
     /// Admission mode (phase 1 of the per-worker-identity work): when
     /// true, only ids in `tokens` may register. Requires a non-empty
     /// `tokens` map and forbids `token_env` (no shared fallback — a
@@ -2448,6 +2458,14 @@ fn default_workers_offline_after_ms() -> u64 {
 fn default_workers_queue_timeout_ms() -> u64 {
     60_000
 }
+
+fn default_workers_queue_max_redrives() -> u32 {
+    1
+}
+
+/// The ceiling on `workers.queue_max_redrives`: the knob bounds a recovery
+/// loop, so a typo must not quietly restore unbounded replay.
+const MAX_QUEUE_REDRIVES: u32 = 16;
 
 impl WorkersConfig {
     /// The parsed listener bind (validated fail-closed).
@@ -2473,6 +2491,11 @@ impl WorkersConfig {
         }
         if self.queue_timeout_ms == 0 {
             return Err(invalid("workers.queue_timeout_ms must be > 0"));
+        }
+        if self.queue_max_redrives > MAX_QUEUE_REDRIVES {
+            return Err(invalid(format!(
+                "workers.queue_max_redrives must be <= {MAX_QUEUE_REDRIVES} (it bounds a re-drive loop; a larger value is unbounded replay in practice)"
+            )));
         }
         if let Some(name) = &self.token_env
             && name.trim().is_empty()
@@ -3737,6 +3760,46 @@ recovery:
 
     // -- workers: (R12, C1–C6) -------------------------------------
 
+    /// ADR-033: `workers.queue_max_redrives` is the bounded re-drive knob —
+    /// explicit values parse, `0` is meaningful (no re-drive), and the
+    /// fail-closed ceiling refuses a value that would restore unbounded
+    /// replay in practice.
+    #[test]
+    fn workers_queue_max_redrives_parses_and_is_fail_closed() {
+        let base = valid_yaml();
+        let with = |max: u32| {
+            format!(
+                "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+                 workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n  \
+                 queue_max_redrives: {max}\n"
+            )
+        };
+
+        let cfg = ServeConfig::parse(&with(0)).expect("explicit zero parses");
+        assert_eq!(
+            cfg.workers
+                .clone()
+                .expect("section present")
+                .queue_max_redrives,
+            0
+        );
+        assert!(cfg.validate().is_ok(), "zero = first dispatch only");
+
+        let cfg = ServeConfig::parse(&with(3)).expect("explicit bound parses");
+        assert_eq!(
+            cfg.workers
+                .clone()
+                .expect("section present")
+                .queue_max_redrives,
+            3
+        );
+        assert!(cfg.validate().is_ok());
+
+        // `parse` validates: the ceiling refuses at load time, not later.
+        let err = ServeConfig::parse(&with(17)).expect_err("ceiling must fail closed");
+        assert!(err.to_string().contains("queue_max_redrives"), "was: {err}");
+    }
+
     /// A config with a `workers:` section and zero `endpoints:` boots
     /// (C6): the remote-exec plugin's presence lock covers the dynamic
     /// half. Absent section parses to `None` (feature off).
@@ -3753,6 +3816,7 @@ recovery:
         assert_eq!(workers.token_env.as_deref(), Some("KIAN_WORKER_TOKEN"));
         assert_eq!(workers.offline_after_ms, 30_000, "default");
         assert_eq!(workers.queue_timeout_ms, 60_000, "default");
+        assert_eq!(workers.queue_max_redrives, 1, "default");
         assert!(!workers.allow_public, "default");
         assert!(!workers.enrolled_only, "default");
         assert!(workers.tokens.is_empty(), "default");
@@ -3779,6 +3843,7 @@ recovery:
         assert!(workers.token_env.is_none());
         assert!(workers.enrolled_only);
         assert_eq!(workers.queue_timeout_ms, 600_000);
+        assert_eq!(workers.queue_max_redrives, 1, "default when omitted");
         assert_eq!(workers.offline_after_ms, 120_000);
         assert_eq!(
             workers.tokens.get("iphone").map(String::as_str),
@@ -3816,6 +3881,7 @@ recovery:
                 offline_after_ms: offline,
                 allow_public: false,
                 queue_timeout_ms: queue,
+                queue_max_redrives: 1,
                 enrolled_only: false,
                 tokens: BTreeMap::new(),
             }

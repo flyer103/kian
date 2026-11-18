@@ -42,7 +42,7 @@ pub(crate) async fn enqueue(
 
 pub(crate) async fn get(pool: &PgPool, command_id: Uuid) -> Result<Option<QueueRow>, sqlx::Error> {
     sqlx::query_as::<_, QueueRow>(
-        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE command_id = $1::text",
+        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at, dispatch_attempts FROM exec_queue WHERE command_id = $1::text",
     )
     .bind(command_id.to_string())
     .fetch_optional(pool)
@@ -104,7 +104,7 @@ pub(crate) async fn drivable(
     endpoint_id: &str,
 ) -> Result<Vec<QueueRow>, sqlx::Error> {
     sqlx::query_as::<_, QueueRow>(
-        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at FROM exec_queue WHERE endpoint_id = $1::text AND status IN ('pending', 'inflight') ORDER BY created_at ASC, command_id ASC",
+        "SELECT command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at, dispatch_attempts FROM exec_queue WHERE endpoint_id = $1::text AND status IN ('pending', 'inflight') ORDER BY created_at ASC, command_id ASC",
     )
     .bind(endpoint_id)
     .fetch_all(pool)
@@ -119,17 +119,39 @@ pub(crate) async fn claim_queue_row(
     holder: &str,
     ttl_ms: i64,
     now: i64,
+    max_dispatches: i64,
 ) -> Result<bool, sqlx::Error> {
     let claimed: Option<String> = sqlx::query_scalar(
-        "UPDATE exec_queue SET claimed_by = $1::text, claimed_until_ms = $2::bigint WHERE command_id = $3::text AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < $4::bigint OR claimed_by = $1::text) RETURNING command_id",
+        "UPDATE exec_queue SET claimed_by = $1::text, claimed_until_ms = $2::bigint, dispatch_attempts = dispatch_attempts + 1 WHERE command_id = $3::text AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < $4::bigint OR claimed_by = $1::text) AND (status = 'pending' OR dispatch_attempts < $5::bigint) RETURNING command_id",
     )
     .bind(holder)
     .bind(now + ttl_ms)
     .bind(command_id.to_string())
     .bind(now)
+    .bind(max_dispatches)
     .fetch_optional(pool)
     .await?;
     Ok(claimed.is_some())
+}
+
+/// Converges an exhausted re-drive (ADR-033): the pg twin of the sqlite
+/// statement — abandoned iff the dispatch count is spent and no live lease
+/// exists.
+pub(crate) async fn abandon_exhausted(
+    pool: &PgPool,
+    command_id: Uuid,
+    max_dispatches: i64,
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE exec_queue SET status = 'abandoned', updated_at = $1::bigint WHERE command_id = $2::text AND status = 'inflight' AND dispatch_attempts >= $3::bigint AND (claimed_by IS NULL OR claimed_until_ms < $1::bigint)",
+    )
+    .bind(now)
+    .bind(command_id.to_string())
+    .bind(max_dispatches)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub(crate) async fn heartbeat_queue_row(

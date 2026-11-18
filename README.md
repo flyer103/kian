@@ -533,6 +533,7 @@ workers:
     iphone: KIAN_IPHONE_TOKEN
     mac-mini: KIAN_MAC_MINI_TOKEN
   queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
+  queue_max_redrives: 1        # re-drive retries before an unacknowledgeable row is abandoned
 ```
 
 ```bash

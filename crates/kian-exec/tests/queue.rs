@@ -93,6 +93,7 @@ fn queue_config(queue_timeout_ms: u64) -> RemoteExecConfig {
     RemoteExecConfig {
         queue_timeout: Duration::from_millis(queue_timeout_ms),
         poll_interval: Duration::from_millis(40),
+        max_redrives: 1,
     }
 }
 
@@ -684,6 +685,8 @@ async fn fs_rows_round_trip_and_legacy_rows_decode_as_exec() {
     let row = store.get(legacy).await.unwrap().unwrap();
     assert_eq!(row.command.kind(), CommandKind::Exec);
     assert!(matches!(row.command, WorkerCommand::Exec(_)));
+    // A pre-v6 row reads as "never dispatched" (v6's additive DEFAULT 0).
+    assert_eq!(row.dispatch_attempts, 0);
 
     store.close().await;
     let _ = std::fs::remove_file(&db);
@@ -798,14 +801,14 @@ async fn row_lease_claims_expire_and_redrive_on_sqlite() {
     // Unclaimed row: the first claimant takes ownership.
     assert!(
         store
-            .claim_queue_row(id, "replica-a", 1_000, 0)
+            .claim_queue_row(id, "replica-a", 1_000, 0, 8)
             .await
             .unwrap()
     );
     // Fresh lease, different holder: refused, nothing written.
     assert!(
         !store
-            .claim_queue_row(id, "replica-b", 1_000, 500)
+            .claim_queue_row(id, "replica-b", 1_000, 500, 8)
             .await
             .unwrap()
     );
@@ -819,21 +822,21 @@ async fn row_lease_claims_expire_and_redrive_on_sqlite() {
     // …so the foreign claim at 1500 is still inside (800+1000).
     assert!(
         !store
-            .claim_queue_row(id, "replica-b", 1_000, 1_500)
+            .claim_queue_row(id, "replica-b", 1_000, 1_500, 8)
             .await
             .unwrap()
     );
     // Past expiry (1801 > 1800) any replica takes over honestly.
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 1_000, 1_801)
+            .claim_queue_row(id, "replica-b", 1_000, 1_801, 8)
             .await
             .unwrap()
     );
     // Same-holder re-claim always lands (single-replica re-drive).
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 1_000, 1_900)
+            .claim_queue_row(id, "replica-b", 1_000, 1_900, 8)
             .await
             .unwrap()
     );
@@ -858,7 +861,7 @@ async fn row_lease_claims_expire_and_redrive_on_sqlite() {
     assert!(store.mark_done(id, &outcome).await.unwrap());
     assert!(
         !store
-            .claim_queue_row(id, "replica-c", 1_000, 5_000)
+            .claim_queue_row(id, "replica-c", 1_000, 5_000, 8)
             .await
             .unwrap()
     );
@@ -970,7 +973,7 @@ async fn foreign_row_lease_blocks_dispatch_until_expiry() {
     // with the "must not dispatch" observation below.
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 10_000, kian_exec::store::now_ms())
+            .claim_queue_row(id, "replica-b", 10_000, kian_exec::store::now_ms(), 8)
             .await
             .unwrap()
     );
@@ -1004,7 +1007,7 @@ async fn foreign_row_lease_blocks_dispatch_until_expiry() {
     // to a real result.
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 300, kian_exec::store::now_ms())
+            .claim_queue_row(id, "replica-b", 300, kian_exec::store::now_ms(), 8)
             .await
             .unwrap(),
         "same-holder re-claim must land"
@@ -1025,6 +1028,70 @@ async fn foreign_row_lease_blocks_dispatch_until_expiry() {
 
     backend.shutdown().await;
     manager.shutdown().await;
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+// -- bounded re-drive (ADR-033) -----------------------------------------
+
+/// Store-level bound: every claim counts a dispatch attempt; an `inflight`
+/// row is re-drivable only while `dispatch_attempts < max_dispatches`; the
+/// convergence transition refuses to race a live lease and is terminal once
+/// taken.
+#[tokio::test]
+async fn dispatch_attempts_count_and_the_redrive_bound_converges() {
+    no_proxy();
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let id: CommandId = Uuid::new_v4();
+    store
+        .enqueue(id, "box", &cmd(&["echo", "bound"]), Some("call-bound"))
+        .await
+        .unwrap();
+
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 0);
+    // First dispatch: a `pending` row is always admitted (the guard is for
+    // re-drives), and the attempt is counted.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-a", 1_000, 0, 2)
+            .await
+            .unwrap()
+    );
+    store.mark_inflight(id).await.unwrap();
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 1);
+
+    // The result was lost: one re-drive is still within `1 + max_redrives`.
+    assert!(
+        store
+            .claim_queue_row(id, "replica-a", 1_000, 10, 2)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 2);
+
+    // Bound spent. The claim refuses, and convergence is blocked while the
+    // fresh lease could still be a live driver.
+    assert!(
+        !store
+            .claim_queue_row(id, "replica-a", 1_000, 20, 2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store.abandon_exhausted(id, 2, 20).await.unwrap(),
+        "a live lease must never be converged out from under its driver"
+    );
+    // Lease expired: the row converges, exactly once.
+    assert!(store.abandon_exhausted(id, 2, 20 + 1_001).await.unwrap());
+    let row = store.get(id).await.unwrap().unwrap();
+    assert_eq!(row.status, QueueStatus::Abandoned);
+    assert!(
+        !store.abandon_exhausted(id, 2, 20 + 2_000).await.unwrap(),
+        "abandoned is terminal"
+    );
+    assert!(store.drivable("box").await.unwrap().is_empty());
+
     store.close().await;
     let _ = std::fs::remove_file(&db);
 }

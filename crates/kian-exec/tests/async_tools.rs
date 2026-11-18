@@ -119,6 +119,7 @@ async fn rig_with(db: &PathBuf, queue_timeout: Duration) -> TestRig {
             RemoteExecConfig {
                 queue_timeout,
                 poll_interval: Duration::from_millis(40),
+                max_redrives: 1,
             },
         )
         .unwrap(),
@@ -619,6 +620,7 @@ async fn queue_timeout_settles_abandoned_and_delivers_honestly() {
             RemoteExecConfig {
                 queue_timeout: Duration::from_millis(400),
                 poll_interval: Duration::from_millis(40),
+                max_redrives: 1,
             },
         )
         .unwrap(),

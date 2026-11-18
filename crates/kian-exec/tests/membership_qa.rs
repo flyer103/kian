@@ -860,6 +860,7 @@ async fn qa_queue_first_park_drain_dedupe_no_cross_honest_timeout() {
         RemoteExecConfig {
             queue_timeout: Duration::from_millis(600),
             poll_interval: Duration::from_millis(40),
+            max_redrives: 1,
         },
         "qa-holder",
         Duration::from_secs(60),
@@ -976,6 +977,7 @@ async fn qa_timeout_abandons_the_row() {
         RemoteExecConfig {
             queue_timeout: Duration::from_millis(200),
             poll_interval: Duration::from_millis(20),
+            max_redrives: 1,
         },
         "qa-holder",
         Duration::from_secs(60),
