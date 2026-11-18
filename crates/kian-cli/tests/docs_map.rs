@@ -361,8 +361,8 @@ fn api_contract_method_catalog_matches_dispatch() {
 
     assert_eq!(
         coded.len(),
-        12,
-        "expected 12 JSON-RPC methods (8 control + 4 ops), got {coded:?}"
+        13,
+        "expected 13 JSON-RPC methods (8 control + 5 ops), got {coded:?}"
     );
     assert_eq!(
         documented,

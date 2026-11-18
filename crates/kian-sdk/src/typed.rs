@@ -4,7 +4,7 @@
 //! - control plane (`POST /rpc`): `create_session`, `submit`, `steer`,
 //!   `queue`, `interrupt`, `projection`;
 //! - ops plane (`POST /ops/rpc`): `wake_now`, `recovery_budget_reset`,
-//!   `mock_channel_send`.
+//!   `mock_channel_send`, `release_worker`.
 //!
 //! The SSE `events` helper lives in [`crate::sse`]. Every method here
 //! round-trips against a scripted server with golden request bytes in
@@ -106,6 +106,18 @@ pub struct ResetReceipt {
     pub seq: u64,
     pub epoch: u64,
     pub ts: u64,
+}
+
+/// `release_worker` → which bound thread was closed and where (ADR-035).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReleaseWorkerReceipt {
+    pub worker: String,
+    /// `"released"` (this call closed the thread) or `"already_released"`.
+    pub outcome: String,
+    pub session: String,
+    pub thread_id: String,
+    /// The terminal end write's seq.
+    pub seq: u64,
 }
 
 /// `mock_channel_send` → `{"event_id", "channel", "topic"}` (demo /
@@ -268,6 +280,22 @@ impl KianClient {
             params["reason"] = json!(r);
         }
         let result = self.ops("recovery_budget_reset", params).await?;
+        Self::parse(result)
+    }
+
+    /// Ops plane: close the live thread bound to `worker` and free its
+    /// 1:1 slot (ADR-035). A refused release is the server's honest
+    /// `-32002`/`-32008` with the reason in the message.
+    pub async fn release_worker(
+        &self,
+        worker: &str,
+        reason: Option<&str>,
+    ) -> Result<ReleaseWorkerReceipt, ClientError> {
+        let mut params = json!({"worker": worker});
+        if let Some(r) = reason {
+            params["reason"] = json!(r);
+        }
+        let result = self.ops("release_worker", params).await?;
         Self::parse(result)
     }
 

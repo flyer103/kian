@@ -5,7 +5,7 @@
 //! Two endpoints:
 //! - `POST /rpc` — the control plane (`projection`, …);
 //! - `POST /ops/rpc` — the operational plane (`wake_now`,
-//!   `recovery_budget_reset`, `mock_channel_send`).
+//!   `recovery_budget_reset`, `mock_channel_send`, `release_worker`).
 //!
 //! The request envelope (`jsonrpc`/`id`/`method`/`params`) is byte-stable
 //! by the serialization-freeze discipline; golden wire fixtures pin it.

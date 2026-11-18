@@ -68,6 +68,9 @@ const USAGE: &str = "usage:
                                          last heartbeat, bound live session/thread
                                          (read-only; description and protocol version
                                          are runtime-only facts, absent by design)
+  kian workers release <id> [--reason <text>] [--url <base>] [--config <path>] [--json]
+                                         close an interrupted/failed bound thread and
+                                         free the worker's 1:1 slot (ADR-035)
   kian agents [--config <path>] [--json]
                                          the configured delegation roster (read-only,
                                          config-only): id, description, agent,
@@ -1250,7 +1253,12 @@ fn tickets(args: &[String]) -> ExitCode {
 
 /// `kian workers [--db <sqlite>] [--config <path>] [--json]` — the
 /// worker membership board (read-only embedded; never refuses).
+/// `kian workers release <id>` is the release verb (ADR-035) and talks
+/// to the running server.
 fn workers(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) == Some("release") {
+        return workers_release(&args[1..]);
+    }
     let mut config = std::path::PathBuf::from("kian.yaml");
     let mut db: Option<std::path::PathBuf> = None;
     let mut json = false;
@@ -1281,6 +1289,68 @@ fn workers(args: &[String]) -> ExitCode {
     run_command(
         kian_cli::commands::run_workers(&config, db.as_deref(), json),
         "workers",
+    )
+}
+
+/// `kian workers release <id> [--reason <text>] [--url <base>]
+/// [--config <path>] [--json]`.
+fn workers_release(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut url: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut json = false;
+    let mut worker: Option<String> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--url" => match iter.next() {
+                Some(u) => url = Some(u.clone()),
+                None => {
+                    eprintln!("kian: --url requires a base URL\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--reason" => match iter.next() {
+                Some(r) => reason = Some(r.clone()),
+                None => {
+                    eprintln!("kian: --reason requires a text\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                eprintln!("kian: unknown workers release option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            id => {
+                if worker.is_some() {
+                    eprintln!("kian: workers release takes exactly one worker id\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                worker = Some(id.to_string());
+            }
+        }
+    }
+    let Some(worker) = worker else {
+        eprintln!("kian: workers release requires a worker id\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    run_command(
+        kian_cli::commands::run_workers_release(
+            &config,
+            url.as_deref(),
+            &worker,
+            reason.as_deref(),
+            json,
+        ),
+        "workers release",
     )
 }
 

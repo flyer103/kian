@@ -32,6 +32,9 @@ pub const CODE_SESSION_TERMINAL: i64 = -32003;
 /// JSON-RPC error code for an idle session where the action makes no
 /// sense (ops plane, -32004).
 pub const CODE_SESSION_IDLE: i64 = -32004;
+/// JSON-RPC error code for `release_worker` on an unknown/unbound worker
+/// id (ops plane, -32008, ADR-035).
+pub const CODE_WORKER_NOT_BOUND: i64 = -32008;
 
 impl ClientError {
     /// The JSON-RPC error code when the server returned a structured
@@ -68,13 +71,18 @@ impl ClientError {
     pub fn is_internal(&self) -> bool {
         self.rpc_code() == Some(CODE_INTERNAL)
     }
+
+    /// `release_worker` named a worker with no live binding (-32008).
+    pub fn is_worker_not_bound(&self) -> bool {
+        self.rpc_code() == Some(CODE_WORKER_NOT_BOUND)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         CODE_INTERNAL, CODE_SESSION_BUSY, CODE_SESSION_IDLE, CODE_SESSION_TERMINAL,
-        CODE_UNKNOWN_SESSION, ClientError,
+        CODE_UNKNOWN_SESSION, CODE_WORKER_NOT_BOUND, ClientError,
     };
 
     /// The frozen code table is exactly the table.
@@ -85,6 +93,7 @@ mod tests {
         assert_eq!(CODE_SESSION_BUSY, -32002);
         assert_eq!(CODE_SESSION_TERMINAL, -32003);
         assert_eq!(CODE_SESSION_IDLE, -32004);
+        assert_eq!(CODE_WORKER_NOT_BOUND, -32008);
     }
 
     /// Helpers classify by code — never by message text.

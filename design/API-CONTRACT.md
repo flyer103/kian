@@ -74,12 +74,13 @@ suffix.
 | -32602 | invalid_params | Missing/ill-typed required param; non-UUID `session`; non-empty params for `create_session` | both RPC |
 | -32000 | internal | Server-side failure. For ops, the message may carry diagnostics (e.g. the configured mock channels) | both RPC |
 | -32001 | unknown_session | No event stream / inbox row for the UUID | both RPC |
-| -32002 | session_busy | An ops action requires an idle session; a drain holds it | ops |
+| -32002 | session_busy | An ops action requires an idle session; a drain holds it. `release_worker` also answers it for a thread still holding eligible input or a live command row (the message says which) | ops |
 | -32003 | session_terminal | The session is terminal (completed/cancelled/archived) | ops |
 | -32004 | session_idle | `recovery_budget_reset` on a session whose recovery budget was never consumed | ops |
 | -32005 | memory_not_configured | `memory_dream` on a server without a `memory:` section — a closed refusal, never a silent no-op | ops |
 | -32006 | dream_range_too_large | `memory_dream` over a source range whose transcript exceeds `memory.dreamer.max_bytes_read` — refused, not truncated | ops |
 | -32007 | archived | The session's online range has been archived (READ-MODEL §7, P2b); use the archive package / `session import` | both RPC + SSE |
+| -32008 | worker_not_bound | `release_worker` for an unknown worker id, no live bound session, or a never-started reservation — nothing was closed | ops |
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
 new documented code. The confirmation plane introduces **no** new code: its non-normal answers are
@@ -180,6 +181,7 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 | `recovery_budget_reset` | `{"session":"<uuid>","reason":"<string>"?}` | `{"seq":<u64>,"epoch":<u64>,"ts":<u64>}` |
 | `mock_channel_send` | `{"channel":"<string>","topic":"<string>"?,"payload":<any>}` | `{"event_id":"<string>","channel":"<string>","topic":"<string>" \| null}` |
 | `memory_dream` | `{"session":"<uuid>","source":"<uuid>","from_seq":<u64>,"to_seq":<u64>}` | `{"session":<uuid>,"source":<uuid>,"from_seq":<u64>,"to_seq":<u64>,"deduplicated":<bool>,"bytes_read":<u64>,"prompt_bytes":<u64>}` |
+| `release_worker` | `{"worker":"<string>","reason":"<string>"?}` | `{"worker":"<string>","outcome":"released" \| "already_released","session":"<uuid>","thread_id":"<uuid>","seq":<u64>}` |
 
 ### 4.2 Semantics
 
@@ -214,11 +216,25 @@ mounted outside the control-plane handler module and obeys the same iron rule.
   terminal memory session refuses a NEW range (`-32003`); a dream settles its memory session
   (notes land, then the end write), so a new range goes on a fresh memory session. An unknown
   `session` is `-32001`; an unknown or empty `source` range is `-32001` / `-32602`.
+- `release_worker` (ADR-035) closes the live thread bound to one worker id and thereby frees the
+  1:1 slot. The server resolves the binding from the committed streams (the caller never supplies a
+  session id) and requires all of: the owner's projection is `idle`, its last event is
+  `session/ended{interrupted|failed}`, its inbox has no eligible row, no drain holds it, and the
+  worker's durable queue has no `pending`/`inflight` row. It then appends one atomic
+  `drain/claimed` + `session/ended{cancelled}` batch (claim epoch, one transaction) — the end
+  payload carries the additive `released` object (`worker`, `thread`, `by`, `reason`) —
+  and answers `released` with the end's `seq`. A thread that is already terminal answers
+  `already_released` (idempotent; `seq` is the existing terminal end's). A running/recoverable
+  owner, an owner still holding eligible inbox input, and a worker still owing a `pending`/
+  `inflight` command row are all refused with `-32002` (the message says which; a claim lost to a
+  live lease is the same retryable code); an unknown id, no live binding, or a never-started
+  reservation is `-32008`. It never rebinds, reroutes or moves a command, and never touches a
+  running drain.
 
 ### 4.3 Errors
 
 `-32600`, `-32601`, `-32602`, `-32000`, `-32001`, `-32002`, `-32003`, `-32004`, `-32005`,
-`-32006` (§2.2).
+`-32006`, `-32008` (§2.2).
 
 ## 5. Event stream — `GET /sessions/{id}/events`
 

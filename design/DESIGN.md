@@ -639,7 +639,7 @@ graph TB
   types. **1:1 exclusivity** is checked at `spawn_worker` before any side effect: candidates are the
   Router stream's `thread/started` events grouped by `exec_worker`, liveness is the existing worker
   vocabulary (`thread/completed` + `session/ended` on the *worker's* stream — `completed`/`cancelled`
-  release, `failed`/`interrupted` are resumable and stay live), read through a bundle-owned
+  release, `failed`/`interrupted` are resumable and stay live until released), read through a bundle-owned
   read-only port (the `RecallPort` precedent; no store symbol enters the bundle). To make the check
   honest across a crash, the Router-side `thread/started` is written **before** the task row is
   admitted: a spawn that dies in between leaves a reserved-but-never-started thread (refused to
@@ -651,7 +651,18 @@ graph TB
   bound. Worker lifecycle is "same id, new incarnation": a daemon crash/restart/migration keeps the
   binding and the durable queue re-drives on reconnect (ADR-007); a worker that never returns
   produces the honest queue timeout, never a failover to another worker id, and **rebinding a live
-  session is deferred** (ADR-020 "Deferred"). Tests: L1 byte-identical legacy wrapper/payload/schema/
+  session is deferred** (ADR-020 "Deferred"). **Release** (ADR-035) is the other way out of a held
+  slot and the only one: a thread whose last end is `interrupted`/`failed` is closed by one atomic
+  `drain/claimed` + `session/ended{cancelled}` batch under a fresh claim epoch, which the existing
+  liveness table reads as `Released` and which, being terminal, can never be resumed. The
+  engine owns the claim and the append (`Engine::release_idle`, the `recovery_budget_reset`
+  append precedent); the `release_worker` ops method and the `kian workers release <id>` verb are
+  the explicit trigger, and a `kian serve` maintenance tick (`workers.release_after_ms`, default
+  `300_000`, `0` disables) reclaims stale idle-ended threads through the same primitive. Gates:
+  idle projection, non-terminal last end, no eligible inbox row, no live drain, no live
+  `pending`/`inflight` queue row for the worker. The bundle is untouched (no tool, no prompt byte);
+  a spawn-time fast path is deferred.
+  Tests: L1 byte-identical legacy wrapper/payload/schema/
   prompt, the spawn matrix (unknown/busy/missing/defaulted/feature-off) with no side effects on
   refusal, routing as a pure function of (stream, catalog), and the release table; L2 two real
   `kiand` daemons route independently, `kill -9` re-drives, a server restart re-derives the binding,

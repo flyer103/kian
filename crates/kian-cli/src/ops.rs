@@ -1,7 +1,7 @@
 //! Operational plane (+ the `mock_channel_send` demo
 //! injection): the server surface behind `kian wake-now`,
-//! `kian recovery budget reset`, `kian mock-channel-send` and
-//! `kian memory dream`.
+//! `kian recovery budget reset`, `kian mock-channel-send`,
+//! `kian memory dream` and `kian workers release`.
 //!
 //! This module is deliberately **separate** from [`crate::api`] (the
 //! control plane): the control plane obeys the layered iron rule —
@@ -36,6 +36,12 @@
 //!   idempotency key `dream:<source>:<from>:<to>` — repeating the
 //!   same range is a no-op. Memory must be configured (`memory:`
 //!   section); otherwise `-32005`.
+//! - `release_worker {worker, reason?}` → `{"worker", "outcome":
+//!   "released" | "already_released", "session", "thread_id", "seq"}` —
+//!   closes the live bound thread of a worker whose task already ended
+//!   `interrupted`/`failed`, freeing the 1:1 slot (ADR-035). Refused
+//!   `-32002` while the thread is running, holds eligible input or owes
+//!   a live command; `-32008` for an unknown/unbound id.
 
 use std::sync::Arc;
 
@@ -47,6 +53,8 @@ use axum::{Json, Router};
 use futures::future::BoxFuture;
 use kian_core::model::SessionId;
 use serde_json::{Value, json};
+
+use crate::worker_release::ReleaseWorkerReceipt;
 
 // ---------------------------------------------------------------------------
 // The operational surface (the ONLY thing ops handlers may touch)
@@ -91,6 +99,15 @@ pub trait OpsPlane: Send + Sync {
         from_seq: u64,
         to_seq: u64,
     ) -> BoxFuture<'_, Result<DreamAdmitReceipt, OpsError>>;
+
+    /// Closes the live thread bound to one worker id and frees its 1:1
+    /// slot (ADR-035). Refused while the thread is running, not ended,
+    /// holding eligible input, or owing a live command row.
+    fn release_worker(
+        &self,
+        worker: String,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<ReleaseWorkerReceipt, OpsError>>;
 }
 
 /// Outcome of an operator wake.
@@ -199,6 +216,18 @@ pub enum OpsError {
         to_seq: u64,
         head_next_seq: u64,
     },
+    /// `release_worker` for an unknown worker id, no live binding or a
+    /// never-started reservation (ADR-035, -32008).
+    #[error("worker `{worker}` is not bound: {detail}")]
+    WorkerNotBound { worker: String, detail: String },
+    /// `release_worker` on a bound thread that cannot be closed right now
+    /// (running, still holding eligible input, or owing a live command).
+    #[error("worker `{worker}` (session {session:?}) cannot be released: {detail}")]
+    WorkerBusy {
+        worker: String,
+        session: SessionId,
+        detail: String,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -213,6 +242,8 @@ const CODE_MEMORY_NOT_CONFIGURED: i64 = -32005;
 /// A dream source range over the configured `max_bytes_read` cap
 /// (refused honestly, never truncated).
 const CODE_DREAM_RANGE_TOO_LARGE: i64 = -32006;
+/// `release_worker` for an unknown/unbound worker id (ADR-035).
+const CODE_WORKER_NOT_BOUND: i64 = -32008;
 const CODE_INTERNAL: i64 = -32000;
 const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
@@ -332,6 +363,21 @@ fn ops_err(e: OpsError) -> (i64, String) {
                 source_session.0
             ),
         ),
+        OpsError::WorkerNotBound { worker, detail } => (
+            CODE_WORKER_NOT_BOUND,
+            format!("worker `{worker}` is not bound: {detail}"),
+        ),
+        OpsError::WorkerBusy {
+            worker,
+            session,
+            detail,
+        } => (
+            CODE_SESSION_BUSY,
+            format!(
+                "worker `{worker}` (session {:?}) cannot be released: {detail}",
+                session.0
+            ),
+        ),
         OpsError::Internal(msg) => (CODE_INTERNAL, msg),
     }
 }
@@ -405,10 +451,40 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
                 "prompt_bytes": receipt.prompt_bytes,
             }))
         }
+        "release_worker" => {
+            let worker = params
+                .get("worker")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .ok_or_else(|| {
+                    (
+                        CODE_INVALID_PARAMS,
+                        "missing `worker` (non-empty worker id string)".to_string(),
+                    )
+                })?
+                .to_owned();
+            let reason = params
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let receipt = state
+                .plane
+                .release_worker(worker, reason)
+                .await
+                .map_err(ops_err)?;
+            Ok(json!({
+                "worker": receipt.worker,
+                "outcome": receipt.outcome.as_str(),
+                "session": receipt.session.0,
+                "thread_id": receipt.thread_id.to_string(),
+                "seq": receipt.seq,
+            }))
+        }
         other => Err((
             CODE_METHOD_NOT_FOUND,
             format!(
-                "unknown method `{other}` (ops set: wake_now, recovery_budget_reset, mock_channel_send, memory_dream)"
+                "unknown method `{other}` (ops set: wake_now, recovery_budget_reset, mock_channel_send, memory_dream, release_worker)"
             ),
         )),
     }
@@ -487,6 +563,7 @@ mod tests {
 
     use super::{OpsError, OpsPlane, ResetReceipt, WakeReceipt, dispatch};
     use crate::ops::AppState;
+    use crate::worker_release::{ReleaseWorkerOutcome, ReleaseWorkerReceipt};
 
     #[tokio::test]
     async fn ops_dispatch_wakes_through_the_trait() {
@@ -606,6 +683,39 @@ mod tests {
         assert_eq!(code, -32602);
     }
 
+    /// `release_worker` dispatches through the trait and reports the
+    /// receipt; a malformed/empty worker id never reaches the plane.
+    #[tokio::test]
+    async fn ops_dispatch_releases_a_worker_through_the_trait() {
+        let plane = Arc::new(FakePlane::default());
+        let state = AppState {
+            plane: plane.clone(),
+        };
+
+        let out = dispatch(
+            &state,
+            "release_worker",
+            &json!({"worker": "mac-mini", "reason": "stuck"}),
+        )
+        .await
+        .expect("release dispatch");
+        assert_eq!(out["worker"], "mac-mini");
+        assert_eq!(out["outcome"], "released");
+        assert_eq!(
+            *plane.release_calls.lock().unwrap(),
+            vec![("mac-mini".to_string(), Some("stuck".to_string()))]
+        );
+
+        let (code, _) = dispatch(&state, "release_worker", &json!({"worker": " "}))
+            .await
+            .expect_err("empty worker id");
+        assert_eq!(code, -32602);
+        let (code, _) = dispatch(&state, "release_worker", &json!({}))
+            .await
+            .expect_err("missing worker id");
+        assert_eq!(code, -32602);
+    }
+
     /// Error codes stay distinguishable (fail-closed, honest errors).
     #[test]
     fn ops_error_codes_are_distinct() {
@@ -615,6 +725,21 @@ mod tests {
             (OpsError::SessionBusy { session: sid }, -32002),
             (OpsError::SessionTerminal { session: sid }, -32003),
             (OpsError::SessionIdle { session: sid }, -32004),
+            (
+                OpsError::WorkerNotBound {
+                    worker: "w".into(),
+                    detail: "no binding".into(),
+                },
+                -32008,
+            ),
+            (
+                OpsError::WorkerBusy {
+                    worker: "w".into(),
+                    session: sid,
+                    detail: "running".into(),
+                },
+                -32002,
+            ),
             (OpsError::Internal("boom".into()), -32000),
         ];
         for (err, code) in cases {
@@ -675,6 +800,7 @@ mod tests {
         pub reset_calls: Mutex<Vec<(SessionId, Option<String>)>>,
         pub mock_sends: Mutex<Vec<(String, Option<String>, serde_json::Value)>>,
         pub dream_calls: Mutex<Vec<(SessionId, SessionId, u64, u64)>>,
+        pub release_calls: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl OpsPlane for FakePlane {
@@ -713,6 +839,26 @@ mod tests {
                     event_id: "evt-1".into(),
                     channel,
                     topic,
+                })
+            })
+        }
+
+        fn release_worker(
+            &self,
+            worker: String,
+            reason: Option<String>,
+        ) -> BoxFuture<'static, Result<ReleaseWorkerReceipt, OpsError>> {
+            self.release_calls
+                .lock()
+                .unwrap()
+                .push((worker.clone(), reason));
+            Box::pin(async move {
+                Ok(ReleaseWorkerReceipt {
+                    worker,
+                    outcome: ReleaseWorkerOutcome::Released,
+                    session: SessionId::new(),
+                    thread_id: uuid::Uuid::nil(),
+                    seq: 9,
                 })
             })
         }

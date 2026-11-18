@@ -141,7 +141,17 @@ async fn rewind_to_v5(store: &EventStore) {
         .execute(store.pool())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM _kian_migrations WHERE version = 6")
+    // The v5 chain predates the cron tables too (v7): drop them so the
+    // forward open re-applies the whole adjacent tail, not just v6.
+    sqlx::query("DROP TABLE IF EXISTS cron_firings")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS cron_schedules")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _kian_migrations WHERE version > 5")
         .execute(store.pool())
         .await
         .unwrap();
@@ -702,7 +712,8 @@ async fn qa_pre_v6_store_falls_back_migrates_forward_and_rolls_back_untouched() 
             .unwrap();
         assert_eq!(
             versions,
-            (0..=6u32).collect::<Vec<_>>(),
+            (0..=u32::try_from(kian_store::migrations::chain().len() - 1).unwrap())
+                .collect::<Vec<_>>(),
             "adjacent walk to head"
         );
         let idx: i64 = sqlx::query_scalar(

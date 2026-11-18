@@ -38,8 +38,9 @@
 //!   rendering behind the `memory_dream` ops method and the
 //!   `kian memory` verbs
 //! - [`ops`] — the operational plane (`POST /ops/rpc`: `wake_now`,
-//!   `recovery_budget_reset`, `memory_dream` and the demo injection
-//!   `mock_channel_send`), trait-isolated like the control plane
+//!   `recovery_budget_reset`, `memory_dream`, the demo injection
+//!   `mock_channel_send` and the worker binding `release_worker`),
+//!   trait-isolated like the control plane
 //! - [`plugins`] — built-in static plugins (openai-compat, local-tools,
 //!   react-loop; adds superagent and remote-exec) registered via
 //!   `kian_plugins![...]`
@@ -77,6 +78,8 @@ pub mod usage_metrics;
 pub mod views;
 pub mod webhook;
 pub mod wechat_login;
+pub mod worker_release;
+pub mod worker_release_tick;
 
 #[cfg(test)]
 mod tests {
