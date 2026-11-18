@@ -170,8 +170,12 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 0,
     },
     ProducerFile {
+        // Three API-borne producers plus the cron resident dispatcher
+        // (CRON-MODEL §6.1): a scheduled firing is an internal producer
+        // (operator config, same class as a watchdog timer), so it bypasses
+        // `admit/pre` by the §3.4.3 matrix — recorded there and here.
         file: "kian-cli/src/server.rs",
-        admits: 3,
+        admits: 4,
     },
     ProducerFile {
         file: "kian-cli/src/superagent.rs",

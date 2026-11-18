@@ -1657,6 +1657,16 @@ fn consumption_plan(row: &InputRow) -> Consumption {
                 json!({"role": "system", "content": content, "synthetic": true, "memory": memory}),
             );
         }
+        if obj.len() == 2
+            && let (Some(content), Some(cron)) = (obj.get("content"), obj.get("cron"))
+        {
+            // CRON-MODEL §6.1: the scheduler's admit — ONE `input/admitted`
+            // with the prompt as the message and the firing proof riding as
+            // an additive, non-context key (derive_model_context reads
+            // role/content only, so every firing sends the same prompt
+            // bytes).
+            return Consumption::Single(json!({"role": "user", "content": content, "cron": cron}));
+        }
     }
     Consumption::Single(json!({"role": "user", "content": row.payload}))
 }
@@ -2327,6 +2337,69 @@ mod tests {
         assert!(
             !with_marker.contains("source_session"),
             "the marker must never enter model context"
+        );
+        cleanup(&path);
+    }
+
+    /// CRON-MODEL §6.1: the cron envelope row — exactly
+    /// `{"content": X, "cron": M}` — consumes to ONE `input/admitted`
+    /// carrying `role`+`content`+the firing marker verbatim, and the
+    /// additive marker leaves the projected model context byte-identical
+    /// to the same stream without it (constraint 3).
+    #[tokio::test]
+    async fn cron_envelope_consumes_to_one_admitted_with_marker() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let marker = json!({
+            "schedule_id": "night-audit",
+            "firing_id": "night-audit@2026-11-18T03:30:00Z",
+            "fire_time": "2026-11-18T03:30:00Z",
+            "target": {"channel": "cron-jobs", "topic": "audit"},
+        });
+        let prompt = "audit .state/";
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": prompt, "cron": marker.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "exactly one input/admitted event");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": prompt, "cron": marker}),
+            "the firing proof rides the admitted payload verbatim"
+        );
+        // Constraint-3 witness: the additive, non-context marker leaves
+        // derive_model_context byte-identical (the same stream without
+        // the key derives the same context).
+        let mut bare = events.clone();
+        for ev in &mut bare {
+            if ev.kind == EventKind::InputAdmitted {
+                ev.bytes.as_object_mut().unwrap().remove("cron");
+            }
+        }
+        let with_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&events).unwrap())
+                .unwrap();
+        let without_marker =
+            serde_json::to_string(&kian_core::context::derive_model_context(&bare).unwrap())
+                .unwrap();
+        assert_eq!(with_marker, without_marker);
+        assert!(with_marker.contains("audit .state/"));
+        assert!(
+            !with_marker.contains("night-audit@"),
+            "the firing marker must never enter model context"
         );
         cleanup(&path);
     }

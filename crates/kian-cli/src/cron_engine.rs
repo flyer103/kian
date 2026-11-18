@@ -285,9 +285,10 @@ impl CronDispatcher for ResidentDispatcher {
         let session = target_session(schedule)?;
         let cron: Value = serde_json::from_str(payload)
             .map_err(|e| format!("dispatch payload is not JSON: {e}"))?;
-        // `text` is the turn's user message; `cron` carries the routing proof
-        // (schedule_id / firing_id / fire_time / target) alongside it.
-        let content = serde_json::json!({ "text": schedule.prompt, "cron": cron });
+        // `content` is the turn's user message; `cron` carries the routing
+        // proof (schedule_id / firing_id / fire_time / target) as an additive
+        // non-context key, so the model request is the prompt alone.
+        let content = serde_json::json!({ "content": schedule.prompt, "cron": cron });
         self.turn
             .deliver(session, content, Some(format!("cron:{firing_id}")))
     }
