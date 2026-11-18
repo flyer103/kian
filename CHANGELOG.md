@@ -11,7 +11,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 ## Unreleased
 
 - **Durable confirmation plane — `ask`, `awaiting_input`, `control/confirm` (CONFIRMATION-MODEL
-  phase 1, ADR-035)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
+  phase 1, ADR-036)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
   call (a widened `permission.evaluated` value), never invokes it, and the drain ends with a fifth
   end reason `awaiting_input` (`running → idle`, resumable) instead of `completed`. The pending set
   is a pure projection (`kian-core::confirmation::pending_calls`, no table, no inbox status column,

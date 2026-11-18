@@ -486,7 +486,7 @@ recorded ("a durable pending-confirmation state, a human/control-plane response 
 inbox, and hold semantics") and the superagent `awaiting-answer` stage's read-side-only deviation.
 
 The normative contract is [design/CONFIRMATION-MODEL.md](../design/CONFIRMATION-MODEL.md); the
-decision record is [ADR-035](../design/decisions/ADR-035-durable-confirmation-plane.md). The catalog
+decision record is [ADR-036](../design/decisions/ADR-036-durable-confirmation-plane.md). The catalog
 deltas (the 23rd kind `control/confirm`; the widened `tool/call.permission.evaluated` and
 `session/ended.reason`) landed with the code in EVENT-MODEL and API-CONTRACT, and the drift tests
 pin them together.

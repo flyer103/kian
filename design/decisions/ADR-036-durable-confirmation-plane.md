@@ -1,6 +1,6 @@
-# ADR-035: The durable confirmation plane — `ask` as a deferred tool call, a fifth end reason, and the answer as an admitted control row
+# ADR-036: The durable confirmation plane — `ask` as a deferred tool call, a fifth end reason, and the answer as an admitted control row
 
-- **Status**: accepted (owner gate, 2026-11-15; append-only — ADR-001…034 immutable)
+- **Status**: accepted (owner gate, 2026-11-15; append-only — ADR-001…035 immutable)
 - **Date**: 2026-11-15
 - **Related**: [design/CONFIRMATION-MODEL.md](../CONFIRMATION-MODEL.md) (normative semantics),
   [ADR-015](ADR-015-tool-permission-provenance.md) (§7: `ask` out of scope, "deferred, not

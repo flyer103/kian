@@ -3,7 +3,7 @@
 > **Status: phase 1 landed (owner gate 2026-11-15).** This file owns the confirmation-plane
 > semantics: what an `ask` is, how a pending tool call is derived, how the answer is admitted, and
 > when a session ends into a resumable wait. Rationale:
-> [ADR-035](decisions/ADR-035-durable-confirmation-plane.md). The catalog deltas — the new kind
+> [ADR-036](decisions/ADR-036-durable-confirmation-plane.md). The catalog deltas — the new kind
 > `control/confirm` and the two widened closed value sets (`tool/call.permission.evaluated`,
 > `session/ended.reason`) — are applied in [EVENT-MODEL.md](EVENT-MODEL.md); the wire is applied in
 > [API-CONTRACT.md](API-CONTRACT.md) §3.1/§3.2 (the source of truth for shapes). §9/§10 restate the
@@ -20,7 +20,7 @@
 | Exact kind bytes, context classification, state triggers | [EVENT-MODEL.md](EVENT-MODEL.md) (delta in §10 lands with code) |
 | Exact RPC params/results/errors, reserved row envelopes, SSE behavior | [API-CONTRACT.md](API-CONTRACT.md) (delta in §9 lands with code) |
 | Placement in the execution model (admit/wake/drain/promote, recovery, control plane) | [DESIGN.md](DESIGN.md) §2.3, §5 |
-| Why this shape and what was rejected | [ADR-035](decisions/ADR-035-durable-confirmation-plane.md) |
+| Why this shape and what was rejected | [ADR-036](decisions/ADR-036-durable-confirmation-plane.md) |
 | Scope, phases, acceptance record | [docs/SPEC.md](../docs/SPEC.md) §5 |
 | Permission provenance as it exists today (the `allow|deny` arms) | [ADR-015](decisions/ADR-015-tool-permission-provenance.md) |
 

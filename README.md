@@ -664,7 +664,7 @@ The session goes `idle` with end reason `awaiting_input`; `kian pending <uuid>` 
 `kian confirm <uuid> <call-id> --approve|--reject` answers it (or the `confirm`/`pending` RPCs).
 Approving invokes the frozen call and appends its result; rejecting appends the honest error.
 Contract: [CONFIRMATION-MODEL](design/CONFIRMATION-MODEL.md)
-([ADR-035](design/decisions/ADR-035-durable-confirmation-plane.md)). Phase 1 supports plain
+([ADR-036](design/decisions/ADR-036-durable-confirmation-plane.md)). Phase 1 supports plain
 sessions — `ask` on a superagent worker agent refuses to start until phase 2.
 ### Hook plugins (`sidecars:`)
 

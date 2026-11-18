@@ -1400,7 +1400,7 @@ Unified semantics (portable across harnesses/channels):
 | `steer(text, scope)` | Inject a direction change; advisory; takes effect only at provider-turn safe boundaries; resets the allowance |
 | `interrupt(reason)` | Abort the active drain; settle on abort (re-evaluate inbox); partial completion labeled interrupted |
 | `queue(msg)` | Queue an input without interrupting the current drain |
-| `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-035](decisions/ADR-035-durable-confirmation-plane.md)) |
+| `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-036](decisions/ADR-036-durable-confirmation-plane.md)) |
 | `pending(session)` | The session's unanswered asks with the TTL overlay — a pure read, no writes |
 
 Implementation: JSON-RPC over HTTP (axum) + SSE event stream. All control-plane operations **only
@@ -1419,7 +1419,7 @@ event stream, strictly increasing seq), `event: done` after `session/ended`, `ev
 unknown session. `confirm`/`pending` are implemented since the confirmation plane landed
 ([design/CONFIRMATION-MODEL.md](CONFIRMATION-MODEL.md)): `ask` = a deferred tool call, the answer =
 an admitted control row, the wait = the fifth end reason `awaiting_input`
-([ADR-035](decisions/ADR-035-durable-confirmation-plane.md)). The iron rule is enforced
+([ADR-036](decisions/ADR-036-durable-confirmation-plane.md)). The iron rule is enforced
 structurally: the HTTP module sees only a `ControlPlane` trait (`create_session` / `submit` /
 `steer` / `queue` / `interrupt` / `projection` / `session_events` — inbox writes and reads only);
 `kian-cli::server` implements it over the engine, and a resident test greps the handler module for
