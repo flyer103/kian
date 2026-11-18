@@ -135,6 +135,32 @@ const V5_ARCHIVED_SESSIONS: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS archived_sessions (\n    session TEXT PRIMARY KEY,\n    last_seq INTEGER NOT NULL,\n    event_count INTEGER NOT NULL,\n    input_count INTEGER NOT NULL,\n    package_path TEXT NOT NULL,\n    events_sha256 TEXT NOT NULL,\n    inputs_sha256 TEXT NOT NULL,\n    manifest_sha256 TEXT NOT NULL,\n    archived_at INTEGER NOT NULL\n)",
 };
 
+/// v7 — durable cron state (CRON-MODEL §4/§9). Two tables, both the
+/// scheduler's own bookkeeping — never event truth (a firing is an
+/// ordinary admitted turn whose record is an ordinary event row).
+///
+/// `cron_schedules` — one row per declared schedule: the normalized
+/// declaration (`expr`, `tz`, `declaration_digest`), the durable cursor
+/// (`cursor_fire_at` = last *admitted* fire time, `next_fire_at`;
+/// `NULL` before the first computation and after a redeclaration, §12.3)
+/// and `enabled`. Fire times are TEXT in the canonical UTC RFC 3339
+/// `Z`/whole-seconds form, so lexicographic order is chronological order
+/// and the monotonic cursor guard is a plain string comparison.
+///
+/// `cron_firings` — one row per slot `(schedule_id, fire_time)` with
+/// `firing_id = "{schedule_id}@{fire_time}"` as the PK: the primary key
+/// *is* the idempotency mechanism (§4.3), so a raced claim is one
+/// `INSERT … ON CONFLICT DO NOTHING` and exactly one caller wins. The
+/// extra `UNIQUE (schedule_id, fire_time)` states the slot invariant
+/// independently of the id format. Indexes: by slot time (per-schedule
+/// `cron logs`), by `(state, finished_at)` (the overlap lookup of §5.1
+/// and the terminal-row GC of §6.4).
+const V7_CRON_STATE: Migration = Migration {
+    version: 7,
+    name: "v7_cron_state",
+    up: "CREATE TABLE IF NOT EXISTS cron_schedules (\n    id TEXT PRIMARY KEY,\n    expr TEXT NOT NULL,\n    tz TEXT NOT NULL,\n    declaration_digest TEXT NOT NULL,\n    cursor_fire_at TEXT,\n    next_fire_at TEXT,\n    enabled INTEGER NOT NULL,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_cron_schedules_next_fire ON cron_schedules (enabled, next_fire_at);\nCREATE TABLE IF NOT EXISTS cron_firings (\n    firing_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    fire_time TEXT NOT NULL,\n    admitted_at INTEGER NOT NULL,\n    state TEXT NOT NULL,\n    skip_reason TEXT,\n    worktree_path TEXT,\n    finished_at INTEGER,\n    error TEXT,\n    UNIQUE (schedule_id, fire_time)\n);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_schedule_time ON cron_firings (schedule_id, fire_time);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_state ON cron_firings (state, finished_at)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -146,6 +172,7 @@ pub fn chain() -> &'static [Migration] {
         V4_VIEWS,
         V5_ARCHIVED_SESSIONS,
         V6_SESSION_KIND_INDEX,
+        V7_CRON_STATE,
     ]
 }
 
@@ -256,6 +283,17 @@ const PG_V6_SESSION_KIND_INDEX: Migration = Migration {
     up: "CREATE INDEX IF NOT EXISTS idx_events_session_kind_seq ON events (session, kind, seq)",
 };
 
+/// v7 (postgres chain) — the durable cron tables, pg DDL (same version,
+/// name and shape as the sqlite generation, CRON-MODEL §4/§9): integers
+/// widen to BIGINT, fire times stay TEXT in the same canonical UTC
+/// RFC 3339 form so a cursor written by either backend orders — and
+/// compares — identically.
+const PG_V7_CRON_STATE: Migration = Migration {
+    version: 7,
+    name: "v7_cron_state",
+    up: "CREATE TABLE IF NOT EXISTS cron_schedules (\n    id TEXT PRIMARY KEY,\n    expr TEXT NOT NULL,\n    tz TEXT NOT NULL,\n    declaration_digest TEXT NOT NULL,\n    cursor_fire_at TEXT,\n    next_fire_at TEXT,\n    enabled BIGINT NOT NULL,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_cron_schedules_next_fire ON cron_schedules (enabled, next_fire_at);\nCREATE TABLE IF NOT EXISTS cron_firings (\n    firing_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    fire_time TEXT NOT NULL,\n    admitted_at BIGINT NOT NULL,\n    state TEXT NOT NULL,\n    skip_reason TEXT,\n    worktree_path TEXT,\n    finished_at BIGINT,\n    error TEXT,\n    UNIQUE (schedule_id, fire_time)\n);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_schedule_time ON cron_firings (schedule_id, fire_time);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_state ON cron_firings (state, finished_at)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -269,6 +307,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V4_VIEWS,
         PG_V5_ARCHIVED_SESSIONS,
         PG_V6_SESSION_KIND_INDEX,
+        PG_V7_CRON_STATE,
     ]
 }
 

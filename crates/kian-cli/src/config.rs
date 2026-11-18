@@ -1000,6 +1000,14 @@ pub struct SuperAgentConfig {
     /// Absent = no derivation, byte-identical wrappers.
     #[serde(default)]
     pub intake: IntakeConfig,
+    /// (CRON-MODEL §3) the declared cron schedules (`superagent.cron`).
+    /// Absent (the default) = no cron schedules declared, nothing to
+    /// fire; the tick loop, the durable cursor and the CLI are later
+    /// increments. Validated fail-closed at load by
+    /// [`CronSection::validate`] (expression, timezone, id uniqueness,
+    /// target cross-reference, bounds).
+    #[serde(default)]
+    pub cron: CronSection,
 }
 
 /// 's default: follow-up ownership is **on** — the honest default
@@ -3243,6 +3251,11 @@ impl ServeConfig {
                      (phase 1 is single-account: one credential file, one bot token)",
                 ));
             }
+            // (CRON-MODEL §3.3) the cron declarations validate
+            // fail-closed at load: expression + horizon, timezone, id
+            // shape/uniqueness, target cross-reference, bounds. No loop
+            // is mounted in this increment.
+            sa.cron.validate(&sa.channels)?;
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -3652,6 +3665,813 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
             wall_clock_ms: agent.budgets.wall_clock_ms,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// superagent.cron (CRON-MODEL §3)
+// ---------------------------------------------------------------------------
+
+/// Default `coalesce_ms` (CRON-MODEL §3.1): 15 minutes of lateness honored
+/// by `catch_up: latest`.
+pub const DEFAULT_CRON_COALESCE_MS: u64 = 900_000;
+/// Default `max_concurrent` (CRON-MODEL §3.1): one firing at a time.
+pub const DEFAULT_CRON_MAX_CONCURRENT: u32 = 1;
+/// Default `timeout_ms` (CRON-MODEL §3.1): a 30-minute per-firing ceiling.
+pub const DEFAULT_CRON_TIMEOUT_MS: u64 = 1_800_000;
+/// The longest schedule `id` (§3.1: `[a-z0-9][a-z0-9_-]{0,63}`).
+pub const CRON_SCHEDULE_ID_MAX_LEN: usize = 64;
+
+/// The `superagent.cron:` section (CRON-MODEL §3.1): the declared
+/// schedules, validated fail-closed at load and resolved into
+/// [`CronRuntimeSchedule`]s by [`CronSection::to_runtime`].
+///
+/// Absent (the default) = no cron schedules declared, nothing to fire.
+/// The tick loop (§7.3), the durable cursor (§4), the dsh execution path
+/// (§6) and the CLI (§10) are later increments — this section only
+/// declares and validates. `sandbox` (§8.2) and `worktree` (§6) are listed
+/// in §3.1 but land with those sections' increments: an unknown key still
+/// refuses boot here (`deny_unknown_fields`), never a silently ignored
+/// policy field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronSection {
+    /// The declared schedules, in declaration order. Order is the
+    /// `kian cron list` order and nothing else — firing order is the
+    /// schedule's own fire time (§2.5).
+    #[serde(default)]
+    pub schedules: Vec<CronScheduleDef>,
+
+    /// The §6.4 disk guards: cron must never fill the host disk. Absent = the
+    /// documented defaults; an explicit `0` refuses boot rather than silently
+    /// disabling a guard.
+    #[serde(default)]
+    pub disk: CronDiskSection,
+
+    /// The §6/§7 harness invocation: *how* a firing's payload is handed
+    /// to `dsh`. Absent = the documented default (the shipped `headless`
+    /// profile, the payload as that app's one positional task argument).
+    #[serde(default)]
+    pub harness: CronHarnessSection,
+}
+
+/// Default `superagent.cron.disk.min_free_gib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MIN_FREE_GIB: u64 = 80;
+/// Default `superagent.cron.disk.min_free_percent` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MIN_FREE_PERCENT: u64 = 25;
+/// Default `superagent.cron.disk.max_worktree_mib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MAX_WORKTREE_MIB: u64 = 2048;
+/// Default `superagent.cron.disk.total_cap_mib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_TOTAL_CAP_MIB: u64 = 20480;
+/// Default `superagent.cron.disk.max_output_kib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MAX_OUTPUT_KIB: u64 = 256;
+
+/// The `superagent.cron.disk:` section (CRON-MODEL §6.4): the guards that keep
+/// cron from filling the host disk. Every field is `Option` — absent means the
+/// documented default, an explicit `0` refuses boot
+/// ([`CronDiskSection::collect_errors`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronDiskSection {
+    /// Free-space preflight floor, GiB. Default 80, sized for Rust build artefacts
+    /// (a `target/` tree is GiB, not MiB). The floor actually enforced
+    /// is the larger of this and `min_free_percent` of the filesystem.
+    #[serde(default)]
+    pub min_free_gib: Option<u64>,
+    /// Free-space preflight floor, percent of the filesystem. Default 25.
+    #[serde(default)]
+    pub min_free_percent: Option<u64>,
+    /// Cap on a *single* worktree, MiB. Default 2048.
+    #[serde(default)]
+    pub max_worktree_mib: Option<u64>,
+    /// Cap across *all* cron worktrees, MiB. Default 20480. `max_total_worktree_mib`
+    /// is accepted as a synonym (the same knob under the longer name).
+    #[serde(default, alias = "max_total_worktree_mib")]
+    pub total_cap_mib: Option<u64>,
+    /// Bound on each stored stdout/stderr/diff of a firing, KiB. Default 256.
+    #[serde(default)]
+    pub max_output_kib: Option<u64>,
+}
+
+impl CronDiskSection {
+    /// The section with §6.4's defaults applied — what
+    /// [`crate::cron_worktree::WorktreePolicy`] is built from.
+    pub fn resolved(&self) -> CronDiskLimits {
+        CronDiskLimits {
+            min_free_gib: self.min_free_gib.unwrap_or(CRON_DEFAULT_MIN_FREE_GIB),
+            min_free_percent: self
+                .min_free_percent
+                .unwrap_or(CRON_DEFAULT_MIN_FREE_PERCENT),
+            max_worktree_mib: self
+                .max_worktree_mib
+                .unwrap_or(CRON_DEFAULT_MAX_WORKTREE_MIB),
+            total_cap_mib: self.total_cap_mib.unwrap_or(CRON_DEFAULT_TOTAL_CAP_MIB),
+            max_output_kib: self.max_output_kib.unwrap_or(CRON_DEFAULT_MAX_OUTPUT_KIB),
+        }
+    }
+
+    /// §3.3 fail-closed: a knob set to `0` (or a percent outside `1..=100`)
+    /// refuses boot rather than silently disabling a disk guard.
+    pub fn collect_errors(&self, errors: &mut Vec<String>) {
+        let sized = [
+            ("min_free_gib", self.min_free_gib),
+            ("max_worktree_mib", self.max_worktree_mib),
+            ("total_cap_mib", self.total_cap_mib),
+            ("max_output_kib", self.max_output_kib),
+        ];
+        for (name, value) in sized {
+            if value == Some(0) {
+                errors.push(format!(
+                    "superagent.cron.disk.{name} must be > 0 (omit it for the default)"
+                ));
+            }
+        }
+        if let Some(percent) = self.min_free_percent
+            && !(1..=100).contains(&percent)
+        {
+            errors.push(
+                "superagent.cron.disk.min_free_percent must be 1..=100 (omit it for the default 25)"
+                    .to_owned(),
+            );
+        }
+        // §6.4: the total cap bounds all worktrees, so a per-worktree cap larger
+        // than it can never be reached — the config is contradictory, refuse it.
+        let limits = self.resolved();
+        if limits.min_free_gib > 0
+            && limits.max_worktree_mib > 0
+            && limits.total_cap_mib > 0
+            && limits.max_worktree_mib > limits.total_cap_mib
+        {
+            errors.push(format!(
+                "superagent.cron.disk.total_cap_mib ({}) must be >= max_worktree_mib ({})",
+                limits.total_cap_mib, limits.max_worktree_mib
+            ));
+        }
+    }
+}
+
+/// [`CronDiskSection`] with §6.4's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CronDiskLimits {
+    /// Free-space preflight floor, GiB.
+    pub min_free_gib: u64,
+    /// Free-space preflight floor, percent of the filesystem.
+    pub min_free_percent: u64,
+    /// Cap on a single worktree, MiB.
+    pub max_worktree_mib: u64,
+    /// Cap across all cron worktrees, MiB.
+    pub total_cap_mib: u64,
+    /// Bound on each stored stdout/stderr/diff, KiB.
+    pub max_output_kib: u64,
+}
+/// Default `superagent.cron.harness.profile` (CRON-MODEL §6.2): the shipped
+/// `headless` dsh profile — `dsh headless "run the tests"` answers one task,
+/// prints the result and exits, which is exactly one cron firing's turn.
+pub const CRON_DEFAULT_DSH_PROFILE: &str = "headless";
+
+/// The `superagent.cron.harness:` section (CRON-MODEL §6.2): how a firing's turn
+/// is handed to the harness.
+///
+/// dsh's own contract is `dsh [--profile] <name> [options] [app-args...]`:
+/// the profile selects the app, and the scheduled payload is that app's one
+/// positional task argument (`dsh headless "run the tests"`). An argv with no
+/// `--profile` makes dsh parse the payload *as the profile name* and refuse
+/// (`profile "say hello" does not exist`), which is the bug this section fixes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronHarnessSection {
+    /// The dsh profile to boot — `dsh --profile <name>`. Default `headless`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The dsh binary. Absent = `KIAN_DSH_BIN`, then `dsh` on `PATH`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra environment for the harness child: peer/model/session selects and
+    /// credential *references*. Values come from config or the environment and
+    /// are never echoed into a firing, a log line or an error.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl CronHarnessSection {
+    /// The section with the documented defaults applied — what
+    /// [`crate::cron_worktree::DshTurnRunner`] is built from.
+    pub fn resolved(&self) -> CronHarnessSettings {
+        let profile = self
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(CRON_DEFAULT_DSH_PROFILE)
+            .to_owned();
+        let command = self
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("KIAN_DSH_BIN")
+                    .ok()
+                    .map(|cmd| cmd.trim().to_owned())
+                    .filter(|cmd| !cmd.is_empty())
+            })
+            .unwrap_or_else(|| "dsh".to_owned());
+        CronHarnessSettings {
+            profile,
+            command,
+            env: self.env.clone(),
+        }
+    }
+
+    /// §3.3 fail-closed: a whitespace-only knob refuses boot rather than
+    /// silently falling back to a default the operator did not choose.
+    pub fn collect_errors(&self, errors: &mut Vec<String>) {
+        if self
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile.trim().is_empty())
+        {
+            errors.push(
+                "superagent.cron.harness.profile must be non-empty (omit it for `headless`)"
+                    .to_owned(),
+            );
+        }
+        if self
+            .command
+            .as_deref()
+            .is_some_and(|command| command.trim().is_empty())
+        {
+            errors.push(
+                "superagent.cron.harness.command must be non-empty (omit it for                  `KIAN_DSH_BIN` or `dsh` on PATH)"
+                    .to_owned(),
+            );
+        }
+        for name in self.env.keys() {
+            if name.trim().is_empty() {
+                errors.push("superagent.cron.harness.env keys must be non-empty".to_owned());
+            }
+        }
+    }
+}
+
+/// [`CronHarnessSection`] with the documented defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronHarnessSettings {
+    /// The dsh profile to boot.
+    pub profile: String,
+    /// The dsh binary.
+    pub command: String,
+    /// Extra environment for the harness child (never logged).
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for CronHarnessSettings {
+    fn default() -> Self {
+        CronHarnessSection::default().resolved()
+    }
+}
+
+/// One declared cron schedule (CRON-MODEL §3.1), wire form.
+///
+/// `Option<_>` marks every field with a §3.1 default: absent means the
+/// documented default, an explicit value is validated (`0` where the spec
+/// requires `> 0` refuses boot rather than silently defaulting).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronScheduleDef {
+    /// Stable identity — the cursor key and log namespace (§3.1). Shape
+    /// and uniqueness are validated in [`CronSection::to_runtime`].
+    pub id: String,
+    /// Five-field expression or `@`-alias (§2.1, §2.2).
+    pub expr: String,
+    /// IANA timezone (§2.3). Omitted = the host timezone, resolved once
+    /// at load and frozen into the resolved schedule.
+    #[serde(default)]
+    pub tz: Option<String>,
+    /// Declared-but-off schedules are validated and listed, never fired.
+    /// Default `true`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Where the firing's turn lands (§3.2): exactly one of
+    /// `{session: <uuid>}` or `{channel: <name>, topic: <topic>}`.
+    pub target: CronTargetDef,
+    /// The firing turn's user message (§3.4). `payload` is accepted as a
+    /// synonym (the same string under either name).
+    #[serde(alias = "payload")]
+    pub prompt: String,
+    /// Overlap policy (§5.1). Default `skip`.
+    #[serde(default)]
+    pub overlap: Option<CronOverlap>,
+    /// Missed-slot policy (§5.3). Default `latest`.
+    #[serde(default)]
+    pub catch_up: Option<CronCatchUpDef>,
+    /// Lateness honored by `latest`, milliseconds (§5.3). Default 15 min.
+    #[serde(default)]
+    pub coalesce_ms: Option<u64>,
+    /// Ceiling for this schedule (§5.4). Default `1`.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    /// Per-firing ceiling, milliseconds (§5.5). Default 30 min.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Worktree isolation (§6). Absent = the firing runs on the resident
+    /// engine; present = the schedule's firings are dispatched to the
+    /// worktree-backed `WorktreeDispatcher` (a bare `true` takes §6's
+    /// defaults, an object sets `repo`/`root`/`base`/`keep_on_failure`).
+    #[serde(default)]
+    pub worktree: Option<CronWorktreeDef>,
+}
+
+/// Wire form of a schedule's `worktree:` policy (§6): `true` for §6's
+/// defaults, or an object with the fields below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CronWorktreeDef {
+    /// `worktree: true` / `worktree: false`.
+    Flag(bool),
+    /// `worktree: {repo, root, base, keep_on_failure}`.
+    Policy(CronWorktreePolicyDef),
+}
+
+/// `worktree: {...}` (§6.2/§6.3); every field optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronWorktreePolicyDef {
+    /// The repo the per-firing trees are cut from. Default: the process cwd.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// `worktree.root`: where the trees live. Default
+    /// `<git-common-dir>/kian-worktrees` (resolved by git, so a linked
+    /// worktree's gitfile still lands in the shared git dir).
+    #[serde(default)]
+    pub root: Option<String>,
+    /// `worktree.base`: the git rev a tree starts from. Default `HEAD`.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Leave a failed firing's tree behind for inspection (§6.2). Default true.
+    #[serde(default)]
+    pub keep_on_failure: Option<bool>,
+}
+
+/// One schedule's resolved isolation plan (§6): the repo to cut from and the
+/// policy (whose disk knobs come from `superagent.cron.disk`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronWorktreePlan {
+    /// `worktree.repo`; `None` = the process's working directory.
+    pub repo: Option<std::path::PathBuf>,
+    /// The resolved §6.2/§6.4 policy.
+    pub policy: crate::cron_worktree::WorktreePolicy,
+}
+
+/// Wire form of a schedule's `target` (CRON-MODEL §3.2): the untagged pair
+/// of the two legal shapes. The inner structs carry `deny_unknown_fields`
+/// so a stray key is a parse error, and `topic` is `Option` so a channel
+/// target missing its topic fails with a named §3.2 message rather than
+/// serde's untagged "did not match any variant".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CronTargetDef {
+    /// `{session: <uuid>}` — fire into a fixed session.
+    Session(CronSessionTargetDef),
+    /// `{channel: <name>, topic: <topic>}` — fire as a channel event.
+    Channel(CronChannelTargetDef),
+}
+
+/// `target: {session: <uuid>}` (§3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronSessionTargetDef {
+    /// The fixed session id (a uuid, validated).
+    pub session: String,
+}
+
+/// `target: {channel: <name>, topic: <topic>}` (§3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronChannelTargetDef {
+    /// A channel declared in `superagent.channels` (fail-closed
+    /// cross-reference).
+    pub channel: String,
+    /// The routing topic the firing carries.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+/// A resolved target (CRON-MODEL §3.2), every field validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronTarget {
+    /// Fire into this session.
+    Session {
+        /// A validated uuid.
+        session: String,
+    },
+    /// Fire as a channel event on this declared channel/topic.
+    Channel {
+        /// A declared channel name.
+        channel: String,
+        /// A non-empty routing topic.
+        topic: String,
+    },
+}
+
+/// The overlap policy (§5.1), wire and resolved form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronOverlap {
+    /// Do not fire while the previous firing still runs (the default).
+    #[default]
+    Skip,
+    /// Queue the slot behind the running firing.
+    Queue,
+    /// Kill the running firing, then run this one.
+    #[serde(alias = "kill_previous")]
+    KillPrevious,
+}
+
+/// The `catch_up` policy (§5.3), wire form. Converted to the scheduling
+/// core's [`kian_cron::CatchUp`] in [`CronSection::to_runtime`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronCatchUpDef {
+    /// Fire at most once for the most recent missed slot (the default).
+    #[default]
+    Latest,
+    /// Never fire for a slot that is already past.
+    Skip,
+}
+
+/// One fully resolved schedule: everything a tick loop needs to compute the
+/// next fire time and to describe the firing, and nothing that still needs
+/// validation.
+///
+/// The next-fire *inputs* are the parsed [`kian_cron::CronExpr`] and the
+/// frozen [`kian_cron::Tz`]; [`CronRuntimeSchedule::next_fire_after`] is the
+/// pure §2.5 computation over them. There is no clock read and no store
+/// access here — the cursor, the tick loop and the firing path are later
+/// increments.
+#[derive(Debug, Clone)]
+pub struct CronRuntimeSchedule {
+    /// The declared id (cursor key, §4.1).
+    pub id: String,
+    /// The parsed expression (aliases already expanded, §2.2).
+    pub expr: kian_cron::CronExpr,
+    /// The effective timezone: explicit, or the host timezone frozen at
+    /// load (§2.3).
+    pub tz: kian_cron::Tz,
+    /// The effective timezone's IANA name, for `kian cron list` to echo.
+    pub tz_name: String,
+    /// Declared-but-off schedules are listed, never fired.
+    pub enabled: bool,
+    /// The resolved target (§3.2).
+    pub target: CronTarget,
+    /// The firing turn's user message.
+    pub prompt: String,
+    /// The overlap policy (§5.1).
+    pub overlap: CronOverlap,
+    /// The missed-slot policy (§5.3).
+    pub catch_up: kian_cron::CatchUp,
+    /// Lateness honored by `latest`, milliseconds.
+    pub coalesce_ms: u64,
+    /// This schedule's concurrency ceiling.
+    pub max_concurrent: u32,
+    /// The per-firing ceiling, milliseconds.
+    pub timeout_ms: u64,
+    /// The §6 worktree isolation plan; `None` = resident-engine dispatch.
+    pub worktree: Option<CronWorktreePlan>,
+}
+
+impl CronRuntimeSchedule {
+    /// The earliest fire time strictly after `from` (§2.5) — pure: no
+    /// clock read, no store access, DST gaps skipped and overlaps
+    /// collapsed (§2.4). The tick loop is the only caller-to-be.
+    pub fn next_fire_after(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, kian_cron::CronError> {
+        self.expr.next_fire_after(&self.tz, from)
+    }
+}
+
+/// The host's IANA timezone, resolved **once at load** (CRON-MODEL §2.3):
+/// `TZ` first, then the `/etc/localtime` symlink, then UTC.
+///
+/// The name is returned beside the zone so the effective value can be
+/// frozen into the resolved schedule and echoed by `kian cron list`; a
+/// later host timezone change never moves an existing schedule. An
+/// explicit `tz:` that does not resolve is still a config error (§2.3) —
+/// this fallback only applies to the *omitted* default.
+pub fn host_timezone() -> (kian_cron::Tz, String) {
+    if let Ok(raw) = std::env::var("TZ") {
+        let name = raw.trim().trim_start_matches(':');
+        if !name.is_empty()
+            && let Ok(tz) = kian_cron::parse_timezone(name)
+        {
+            return (tz, name.to_string());
+        }
+    }
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let text = link.to_string_lossy().into_owned();
+        if let Some(pos) = text.find("zoneinfo/") {
+            let name = text[pos + "zoneinfo/".len()..].trim_end_matches('/');
+            if !name.is_empty()
+                && let Ok(tz) = kian_cron::parse_timezone(name)
+            {
+                return (tz, name.to_string());
+            }
+        }
+    }
+    (kian_cron::Tz::UTC, "UTC".to_string())
+}
+
+/// Is `id` a legal schedule id (§3.1: `[a-z0-9][a-z0-9_-]{0,63}`)?
+fn is_valid_cron_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && id.len() <= CRON_SCHEDULE_ID_MAX_LEN
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+impl CronSection {
+    /// The load-time gate (§3.3): performs the full conversion and
+    /// discards the result. Every rejection is fail-closed and names the
+    /// schedule id.
+    pub fn validate(
+        &self,
+        channels: &std::collections::BTreeMap<String, ChannelConfig>,
+    ) -> Result<(), ConfigError> {
+        self.to_runtime(channels, chrono::Utc::now()).map(|_| ())
+    }
+
+    /// Converts the declarations into resolved schedules (the timer's
+    /// `to_runtime` pattern), fail-closed on every degenerate field
+    /// (§3.3): a malformed expression, an unresolvable timezone, a
+    /// duplicate or malformed id, a target that does not resolve, an
+    /// empty prompt, a zero bound or a contradictory overlap policy is a
+    /// config error — never a silent skip and never a silent default.
+    ///
+    /// All *declaration* errors are collected (each naming its schedule
+    /// id) and reported together, so an operator fixes one load rather
+    /// than one error per restart.
+    ///
+    /// §3.3 rule 7 (`cron_targets_watchdog`) is not enforced here yet: the
+    /// watchdog session is a `superagent.watchdog` cross-reference that
+    /// lands with the assembly increment.
+    pub fn to_runtime(
+        &self,
+        channels: &std::collections::BTreeMap<String, ChannelConfig>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CronRuntimeSchedule>, ConfigError> {
+        let (host_tz, host_name) = host_timezone();
+        let mut errors: Vec<String> = Vec::new();
+        self.disk.collect_errors(&mut errors);
+        self.harness.collect_errors(&mut errors);
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut resolved = Vec::with_capacity(self.schedules.len());
+
+        for (i, def) in self.schedules.iter().enumerate() {
+            let before = errors.len();
+            let mut fail = |message: String| {
+                errors.push(format!(
+                    "superagent.cron.schedules[{i}] `{}`: {message}",
+                    def.id
+                ));
+            };
+
+            // §3.1 id shape + §3.3 rule 2 (unique, and not a channel name).
+            if def.id.trim() != def.id || !is_valid_cron_id(&def.id) {
+                fail(
+                    "id must match [a-z0-9][a-z0-9_-]{0,63} (lowercase, at most 64 \
+                     characters)"
+                        .to_string(),
+                );
+            } else if let Some(first) = seen.insert(def.id.clone(), i) {
+                fail(format!(
+                    "duplicate id (already declared at superagent.cron.schedules[{first}]; \
+                     the id is the cursor key and must be unique)"
+                ));
+            } else if channels.contains_key(&def.id) {
+                fail(format!(
+                    "id `{}` collides with a declared channel name (§3.3 rule 2)",
+                    def.id
+                ));
+            }
+
+            // §2.3 timezone: explicit, or the host timezone frozen at load.
+            let (tz, tz_name) = match def.tz.as_deref() {
+                None => (host_tz, host_name.clone()),
+                Some(raw) => {
+                    let name = raw.trim();
+                    if name.is_empty() {
+                        fail(
+                            "tz must be non-empty when set (omit the key to freeze the host \
+                             timezone)"
+                                .to_string(),
+                        );
+                        (host_tz, host_name.clone())
+                    } else {
+                        match kian_cron::parse_timezone(name) {
+                            Ok(tz) => (tz, name.to_string()),
+                            Err(e) => {
+                                fail(format!("tz `{name}` does not resolve: {e}"));
+                                (host_tz, host_name.clone())
+                            }
+                        }
+                    }
+                }
+            };
+
+            // §3.3 rule 1: the expression parses and has a fire time inside
+            // the §2.5 horizon (a valid-but-never-matching shape refuses).
+            let expr = match kian_cron::CronExpr::parse(&def.expr) {
+                Ok(expr) => match expr.next_fire_after(&tz, now) {
+                    Ok(_) => Some(expr),
+                    Err(e) => {
+                        fail(format!(
+                            "expr `{}` yields no fire time within the {} day horizon: {e}",
+                            def.expr.trim(),
+                            kian_cron::MAX_SCAN_DAYS
+                        ));
+                        None
+                    }
+                },
+                Err(e) => {
+                    fail(format!("expr `{}` is invalid: {e}", def.expr.trim()));
+                    None
+                }
+            };
+
+            // §3.2 target: exactly one of session | channel.
+            let target = match &def.target {
+                CronTargetDef::Session(session) => {
+                    let value = session.session.trim();
+                    if value.is_empty() {
+                        fail("target.session must be non-empty".to_string());
+                        None
+                    } else if let Err(e) = uuid::Uuid::parse_str(value) {
+                        fail(format!("target.session `{value}` is not a uuid ({e})"));
+                        None
+                    } else {
+                        Some(CronTarget::Session {
+                            session: value.to_string(),
+                        })
+                    }
+                }
+                CronTargetDef::Channel(channel) => {
+                    let name = channel.channel.trim();
+                    let topic = channel.topic.as_deref().map(str::trim).unwrap_or("");
+                    if name.is_empty() {
+                        fail("target.channel must be non-empty".to_string());
+                        None
+                    } else if topic.is_empty() {
+                        fail(
+                            "target.topic must be non-empty for a channel target (§3.2 \
+                             {channel: <name>, topic: <topic>})"
+                                .to_string(),
+                        );
+                        None
+                    } else if !channels.contains_key(name) {
+                        fail(format!(
+                            "target.channel `{name}` is not declared in superagent.channels \
+                             (fail-closed cross-reference, §3.2)"
+                        ));
+                        None
+                    } else {
+                        Some(CronTarget::Channel {
+                            channel: name.to_string(),
+                            topic: topic.to_string(),
+                        })
+                    }
+                }
+            };
+
+            // §3.4: the prompt is the turn's user message — an empty one is
+            // an error, never an empty turn.
+            if def.prompt.trim().is_empty() {
+                fail("prompt must be non-empty (it is the firing turn's user message)".to_string());
+            }
+
+            // §3.3 rules 4 and 5: real bounds, no contradiction.
+            let overlap = def.overlap.unwrap_or_default();
+            let catch_up = match def.catch_up.unwrap_or_default() {
+                CronCatchUpDef::Latest => kian_cron::CatchUp::Latest,
+                CronCatchUpDef::Skip => kian_cron::CatchUp::Skip,
+            };
+            let coalesce_ms = def.coalesce_ms.unwrap_or(DEFAULT_CRON_COALESCE_MS);
+            let max_concurrent = def.max_concurrent.unwrap_or(DEFAULT_CRON_MAX_CONCURRENT);
+            let timeout_ms = def.timeout_ms.unwrap_or(DEFAULT_CRON_TIMEOUT_MS);
+            if coalesce_ms == 0 {
+                fail("coalesce_ms must be > 0 (a zero window honors no lateness)".to_string());
+            }
+            if max_concurrent == 0 {
+                fail("max_concurrent must be >= 1".to_string());
+            }
+            if timeout_ms == 0 {
+                fail("timeout_ms must be > 0".to_string());
+            }
+            if overlap == CronOverlap::KillPrevious && max_concurrent > 1 {
+                fail(format!(
+                    "overlap: kill-previous contradicts max_concurrent: {max_concurrent} \
+                     (§3.3 rule 5)"
+                ));
+            }
+
+            // §6 isolation: a declared `worktree` policy selects the
+            // worktree-backed dispatcher for this schedule's firings.
+            let worktree = match def.worktree.as_ref() {
+                None => None,
+                Some(CronWorktreeDef::Flag(false)) => None,
+                Some(declared) => {
+                    let mut policy = crate::cron_worktree::WorktreePolicy::from_section(self);
+                    let mut repo: Option<std::path::PathBuf> = None;
+                    if let CronWorktreeDef::Policy(declared) = declared {
+                        if let Some(raw) = declared.repo.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.repo must be non-empty when set".to_string());
+                            } else {
+                                let path = std::path::PathBuf::from(raw);
+                                repo = Some(if path.is_absolute() {
+                                    path
+                                } else {
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                        .join(path)
+                                });
+                            }
+                        }
+                        if let Some(raw) = declared.root.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.root must be non-empty when set".to_string());
+                            } else {
+                                policy.root = Some(std::path::PathBuf::from(raw));
+                            }
+                        }
+                        if let Some(raw) = declared.base.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.base must be non-empty when set".to_string());
+                            } else {
+                                policy.base = Some(raw.to_string());
+                            }
+                        }
+                        if let Some(keep) = declared.keep_on_failure {
+                            policy.keep_on_failure = keep;
+                        }
+                    }
+                    Some(CronWorktreePlan { repo, policy })
+                }
+            };
+
+            if errors.len() > before {
+                continue;
+            }
+            let (Some(expr), Some(target)) = (expr, target) else {
+                continue;
+            };
+            resolved.push(CronRuntimeSchedule {
+                id: def.id.clone(),
+                expr,
+                tz,
+                tz_name,
+                enabled: def.enabled.unwrap_or(true),
+                target,
+                prompt: def.prompt.clone(),
+                overlap,
+                catch_up,
+                coalesce_ms,
+                max_concurrent,
+                timeout_ms,
+                worktree,
+            });
+        }
+
+        if !errors.is_empty() {
+            return Err(invalid(errors.join("; ")));
+        }
+        Ok(resolved)
+    }
+}
+
+/// The worktree arm the resident ticker arms: the first schedule that asked
+/// for isolation decides the repo and the policy. `None` = no schedule wants
+/// isolation, so the ticker arms the resident engine alone.
+pub fn cron_worktree_plan(
+    schedules: &[CronRuntimeSchedule],
+) -> Option<(std::path::PathBuf, crate::cron_worktree::WorktreePolicy)> {
+    schedules.iter().find_map(|schedule| {
+        schedule.worktree.as_ref().map(|plan| {
+            let repo = plan
+                .repo
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            (repo, plan.policy.clone())
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -6823,5 +7643,311 @@ recovery:
         let cfg = ServeConfig::parse(&text).expect("empty sets are legal");
         let sidecars = cfg.sidecars.expect("present");
         assert!(sidecars.scopes.server.is_empty());
+    }
+
+    // -- superagent.cron (CRON-MODEL §3) --------------------------
+
+    /// A channel map with one declared `cron-jobs` channel — the target
+    /// every cron fixture below resolves against.
+    fn cron_channels() -> std::collections::BTreeMap<String, ChannelConfig> {
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            "cron-jobs".to_string(),
+            ChannelConfig {
+                channel_type: "mock-im".into(),
+                lark: None,
+                timer: None,
+                github: None,
+                wechat: None,
+            },
+        );
+        channels
+    }
+
+    /// A fixed "now" (2027-01-15T08:00:00Z) — the §2.5 input is a pure
+    /// function, so the fixtures never read the clock.
+    fn cron_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+
+    /// Parses a `CronSection` document and resolves it against the fixture
+    /// channels (`Err` is the fail-closed load path).
+    fn cron_section_from(yaml: &str) -> Result<Vec<CronRuntimeSchedule>, ConfigError> {
+        let section: CronSection = serde_yaml::from_str(yaml).unwrap();
+        section.to_runtime(&cron_channels(), cron_now())
+    }
+
+    /// Two schedules round-trip through the wire form and resolve: one with
+    /// an explicit `tz:` and non-default policies, one defaulting to the
+    /// frozen host timezone with every §3.1 default.
+    #[test]
+    fn cron_section_round_trips_with_explicit_and_host_tz() {
+        let yaml = r#"
+schedules:
+  - id: night-audit
+    expr: "30 3 * * 1-5"
+    tz: Europe/Berlin
+    target: { channel: cron-jobs, topic: audit }
+    prompt: "Audit .state/ for orphaned worktrees."
+    overlap: queue
+    catch_up: skip
+    coalesce_ms: 60000
+    max_concurrent: 2
+    timeout_ms: 120000
+  - id: hourly-ping
+    expr: "@hourly"
+    enabled: false
+    target: { session: "99999999-8888-7777-6666-555555555555" }
+    payload: "ping"
+"#;
+        let section: CronSection = serde_yaml::from_str(yaml).unwrap();
+        // the wire form survives a serialize → parse → serialize cycle.
+        let round_tripped =
+            serde_yaml::to_string(&section).expect("a parsed cron section serializes");
+        let again: CronSection = serde_yaml::from_str(&round_tripped).unwrap();
+        assert_eq!(again, section);
+
+        let resolved = section.to_runtime(&cron_channels(), cron_now()).unwrap();
+        assert_eq!(resolved.len(), 2);
+
+        let audit = &resolved[0];
+        assert_eq!(audit.id, "night-audit");
+        assert_eq!(audit.expr.source(), "30 3 * * 1-5");
+        assert_eq!(
+            audit.tz,
+            kian_cron::parse_timezone("Europe/Berlin").unwrap()
+        );
+        assert_eq!(audit.tz_name, "Europe/Berlin");
+        assert!(audit.enabled);
+        assert_eq!(
+            audit.target,
+            CronTarget::Channel {
+                channel: "cron-jobs".into(),
+                topic: "audit".into()
+            }
+        );
+        assert_eq!(audit.overlap, CronOverlap::Queue);
+        assert_eq!(audit.catch_up, kian_cron::CatchUp::Skip);
+        assert_eq!(audit.coalesce_ms, 60_000);
+        assert_eq!(audit.max_concurrent, 2);
+        assert_eq!(audit.timeout_ms, 120_000);
+        assert!(audit.next_fire_after(cron_now()).unwrap() > cron_now());
+
+        // the second schedule freezes the host timezone (§2.3) and takes
+        // every remaining §3.1 default.
+        let ping = &resolved[1];
+        assert_eq!(ping.id, "hourly-ping");
+        assert_eq!(ping.expr.source(), "0 * * * *");
+        let (host_tz, host_name) = host_timezone();
+        assert_eq!(ping.tz, host_tz);
+        assert_eq!(ping.tz_name, host_name);
+        assert!(!ping.enabled, "`enabled: false` is carried, never fired");
+        assert_eq!(
+            ping.target,
+            CronTarget::Session {
+                session: "99999999-8888-7777-6666-555555555555".into()
+            }
+        );
+        assert_eq!(ping.prompt, "ping");
+        assert_eq!(ping.overlap, CronOverlap::Skip);
+        assert_eq!(ping.catch_up, kian_cron::CatchUp::Latest);
+        assert_eq!(ping.coalesce_ms, DEFAULT_CRON_COALESCE_MS);
+        assert_eq!(ping.max_concurrent, DEFAULT_CRON_MAX_CONCURRENT);
+        assert_eq!(ping.timeout_ms, DEFAULT_CRON_TIMEOUT_MS);
+    }
+
+    /// A malformed expression refuses load, naming the schedule id.
+    #[test]
+    fn cron_schedule_bad_expr_refuses_naming_the_id() {
+        let err = cron_section_from(
+            "schedules:\n  - id: night-audit\n    expr: \"0 0 * *\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("night-audit"), "{err}");
+        assert!(err.contains("exactly 5 are required"), "{err}");
+    }
+
+    /// A valid-but-never-matching shape refuses load (§2.5 horizon).
+    #[test]
+    fn cron_never_firing_shape_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: never\n    expr: \"0 0 30 2 *\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`never`"), "{err}");
+        assert!(err.contains("horizon"), "{err}");
+    }
+
+    /// An unknown `@`-alias refuses load (§2.2).
+    #[test]
+    fn cron_unknown_alias_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: boot\n    expr: \"@reboot\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("@reboot"), "{err}");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// An unresolvable timezone refuses load — never a fallback to UTC
+    /// (§2.3).
+    #[test]
+    fn cron_schedule_bad_tz_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    tz: Mars/Olympus\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Mars/Olympus"), "{err}");
+        assert!(err.contains("`audit`"), "{err}");
+    }
+
+    /// Duplicate ids refuse load (§3.3 rule 2) — the id is the cursor key.
+    #[test]
+    fn cron_duplicate_id_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n  \
+             - id: audit\n    expr: \"@hourly\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate id"), "{err}");
+        assert!(err.contains("schedules[1]"), "{err}");
+    }
+
+    /// A missing `target` / a misspelled key is a parse error
+    /// (`deny_unknown_fields`), never a silently ignored field.
+    #[test]
+    fn cron_missing_target_and_unknown_fields_refuse_at_parse() {
+        // no target at all
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n"
+            )
+            .is_err()
+        );
+        // unknown key inside a schedule
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n    \
+                 tzname: UTC\n    target: { session: \"99999999-8888-7777-6666-555555555555\" }\n"
+            )
+            .is_err()
+        );
+        // unknown key inside a target
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n    \
+                 target: { channel: cron-jobs, topic: audit, extra: x }\n"
+            )
+            .is_err()
+        );
+        // unknown key on the section itself
+        assert!(serde_yaml::from_str::<CronSection>("schedulz: []\n").is_err());
+    }
+
+    /// The target resolves fail-closed (§3.2) and an empty prompt refuses.
+    #[test]
+    fn cron_target_and_prompt_are_fail_closed() {
+        let undeclared = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: nope, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(undeclared.contains("not declared"), "{undeclared}");
+
+        let no_topic = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(no_topic.contains("target.topic"), "{no_topic}");
+
+        let bad_uuid = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: not-a-uuid }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_uuid.contains("not-a-uuid"), "{bad_uuid}");
+
+        let empty_prompt = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: \"  \"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            empty_prompt.contains("prompt must be non-empty"),
+            "{empty_prompt}"
+        );
+    }
+
+    /// Zero bounds and a contradictory overlap policy refuse, and every
+    /// declaration's errors are collected in one load (§3.3 rules 4, 5).
+    #[test]
+    fn cron_bounds_and_contradictions_refuse_and_collect_all_errors() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n    \
+             overlap: kill-previous\n    max_concurrent: 2\n    coalesce_ms: 0\n  \
+             - id: sweep\n    expr: \"@hourly\"\n    tz: Nowhere/Land\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: sweep\n    \
+             timeout_ms: 0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        // both schedules are named: the load reports one error list, not
+        // one error per restart.
+        assert!(err.contains("`audit`"), "{err}");
+        assert!(err.contains("`sweep`"), "{err}");
+        assert!(err.contains("coalesce_ms"), "{err}");
+        assert!(err.contains("kill-previous"), "{err}");
+        assert!(err.contains("timeout_ms"), "{err}");
+        assert!(err.contains("Nowhere/Land"), "{err}");
+    }
+
+    /// The schedule id shape is enforced (§3.1).
+    #[test]
+    fn cron_id_shape_is_enforced() {
+        for bad in ["Night-Audit", "-audit", "audit!", ""] {
+            let yaml = format!(
+                "schedules:\n  - id: \"{bad}\"\n    expr: \"@daily\"\n    \
+                 target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit\n"
+            );
+            let err = cron_section_from(&yaml).unwrap_err().to_string();
+            assert!(err.contains("[a-z0-9][a-z0-9_-]{0,63}"), "{bad}: {err}");
+        }
+    }
+
+    /// A declared `superagent.cron` block reaches the load-time gate from
+    /// `ServeConfig::parse`, and a broken one refuses boot.
+    #[test]
+    fn serve_config_validates_cron_at_load() {
+        let good = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  cron:\n    schedules:\n      - id: audit\n        expr: \"@daily\"\n        \
+             target: { channel: mock-im, topic: audit }\n        prompt: audit\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&good).expect("cron declarations parse");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        assert_eq!(sa.cron.schedules.len(), 1);
+        assert_eq!(sa.cron.schedules[0].id, "audit");
+
+        // fail-closed at load: an unknown alias refuses boot from parse().
+        let bad = good.replace("expr: \"@daily\"", "expr: \"@reboot\"");
+        assert!(ServeConfig::parse(&bad).is_err());
     }
 }

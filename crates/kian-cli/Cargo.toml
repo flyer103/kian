@@ -30,6 +30,10 @@ kian-memory.workspace = true
 # the dsh bridge mount (worker template, config-gated).
 kian-dsh.workspace = true
 kian-exec.workspace = true
+# the cron scheduling core (CRON-MODEL §2): `superagent.cron`
+# declarations parse their expressions and timezones through it.
+kian-cron.workspace = true
+chrono.workspace = true
 kian-sdk.workspace = true
 # webhook receiver: HMAC-SHA256 over the raw body (sha2 already
 # pinned in the workspace).

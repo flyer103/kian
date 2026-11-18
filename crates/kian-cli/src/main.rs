@@ -99,6 +99,14 @@ const USAGE: &str = "usage:
                                          one note by event id or subject
   kian memory verify --session <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          re-check derived_from ranges against the sources
+  kian cron list [--config <path>] [--json]
+                                         declared schedules: expr, tz, next fire, enabled, last outcome
+  kian cron run-now <id> [--config <path>] [--json]
+                                         admit one firing immediately (same slot key, worktree dispatcher)
+  kian cron logs --schedule <id> [--limit N] [--config <path>] [--json]
+                                         recent firings: state, fire time, duration, skip reason
+  kian cron rm <id> [--config <path>] [--json]
+                                         drop the store row (the config declaration still needs editing)
   kian --version                        print the version
 ";
 
@@ -119,6 +127,7 @@ fn main() -> ExitCode {
         Some("memory") => memory(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
+        Some("cron") => cron(&args[2..]),
         Some("workers") => workers(&args[2..]),
         Some("board") => board(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
@@ -132,6 +141,19 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("kian: unknown command `{other}`\n{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn cron(args: &[String]) -> ExitCode {
+    match kian_cli::cron_cli::run(args) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: {}", e.message());
+            ExitCode::from(e.exit_code())
         }
     }
 }

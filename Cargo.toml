@@ -13,6 +13,7 @@ members = [
     "crates/kian-superagent",
     "crates/kian-sdk",
     "crates/kian-dsh",
+    "crates/kian-cron",
     "crates/kian-cli",
     "crates/kiand",
 ]
@@ -38,6 +39,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 # calling tool-call id so session recovery + re-execution dedupes at the
 # queue-row level (ADR-007).
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+# cron scheduling core (CRON-MODEL §2, §2.4 DST rules need the full IANA database).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
 thiserror = "2"
 tracing = "0.1"
 futures = "0.3"
@@ -71,6 +75,8 @@ kian-superagent = { path = "crates/kian-superagent" }
 kian-sdk = { path = "crates/kian-sdk" }
 # the dsh bridge — depends on kian-core only (narrow waist).
 kian-dsh = { path = "crates/kian-dsh" }
+# the cron scheduling core (CRON-MODEL §2, §5) — pure: no I/O, no clock.
+kian-cron = { path = "crates/kian-cron" }
 kian-cli = { path = "crates/kian-cli" }
 kiand = { path = "crates/kiand" }
 

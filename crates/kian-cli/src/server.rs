@@ -57,6 +57,33 @@ pub enum ServeError {
     Engine(#[from] EngineError),
 }
 
+/// The resident-engine turn sink the cron dispatcher writes through: one
+/// durable inbox row for the schedule's target session (the engine folds the
+/// wake itself). Blocking on the serve runtime's handle is safe here because the
+/// cron ticker runs on its own OS thread, never on a runtime worker.
+struct EngineTurn {
+    engine: Arc<Engine<ServeLoopDriver>>,
+    handle: tokio::runtime::Handle,
+}
+
+impl crate::cron_engine::ResidentTurn for EngineTurn {
+    fn deliver(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<(), String> {
+        self.handle
+            .block_on(async {
+                self.engine
+                    .admit(session, content, idempotency_key)
+                    .await
+                    .map(|_| ())
+            })
+            .map_err(|e| format!("admit: {e}"))
+    }
+}
+
 /// The assembled single-machine server.
 pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
@@ -96,6 +123,11 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
+    /// The resolved `superagent.cron` schedules (CRON-MODEL §3): empty iff
+    /// no cron section is configured (or none resolved). [`Server::serve`]
+    /// spawns the cron ticker only when this is non-empty — feature-off
+    /// arms no timer at all (M8).
+    cron_schedules: Vec<crate::config::CronRuntimeSchedule>,
     /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
     /// plan pin P5): present iff the superagent bundle configures
     /// `superagent.multiagent` limits. [`Server::serve`] spawns its
@@ -894,6 +926,18 @@ impl Server {
             None => None,
         };
 
+        // The resolved cron schedules (CRON-MODEL §3). The load-time gate
+        // already validated the section, so resolution failing here can
+        // only mean a channel target moved: arming nothing is the
+        // fail-closed choice, and an empty set arms no timer at all.
+        let cron_schedules: Vec<crate::config::CronRuntimeSchedule> = match superagent_cfg {
+            Some(sa) => sa
+                .cron
+                .to_runtime(&sa.channels, chrono::Utc::now())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
         let server = Self {
             engine,
             store,
@@ -911,6 +955,7 @@ impl Server {
             // above; the §8/§9 sidecar runtime mounts on it after the
             // inbox rebuild).
             hooks,
+            cron_schedules,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -1150,6 +1195,87 @@ impl Server {
                     .await;
                 }
             });
+        }
+        // Cron ticker (CRON-MODEL §5.2): the declared `superagent.cron`
+        // schedules are decided here. Due-ness, the catch-up policy and the
+        // coalesce window are `cron_tick::tick_once`'s business, not this
+        // loop's; the loop owns only the cadence, the panic guard and the
+        // event emission. Armed only when at least one schedule resolved.
+        if !self.cron_schedules.is_empty() {
+            let schedules = self.cron_schedules.clone();
+            // The ticker gets its own thread: `cron_tick::tick_once` is
+            // synchronous and the store is async, so the durable adapter
+            // blocks on the serve runtime's handle from an OS thread instead
+            // of stalling a runtime worker.
+            let store = crate::cron_engine::DurableCronTickStore::new(
+                self.store.clone(),
+                tokio::runtime::Handle::current(),
+                schedules.clone(),
+            );
+            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn {
+                engine: Arc::clone(&self.engine),
+                handle: tokio::runtime::Handle::current(),
+            });
+            let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
+                Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
+            // Selection rule: a schedule that declares `worktree:` is
+            // dispatched to the worktree-backed arm; every other schedule goes
+            // to the resident engine.
+            let mut selection = crate::cron_engine::ScheduleDispatcher::resident(resident);
+            if let Some((repo, policy)) = crate::config::cron_worktree_plan(&schedules) {
+                selection = selection.with_worktree(Arc::new(
+                    crate::cron_worktree::WorktreeDispatcher::new(repo).with_policy(policy),
+                ));
+            }
+            let dispatcher = Arc::new(selection);
+            let started = std::thread::Builder::new()
+                .name("kian-cron".to_string())
+                .spawn(move || {
+                    loop {
+                        let now = chrono::Utc::now();
+                        // One schedule at a time, each under its own panic
+                        // guard: a malformed declaration cannot kill the
+                        // ticker for the others.
+                        for schedule in &schedules {
+                            let outcome =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::cron_engine::tick_and_dispatch_classified(
+                                        now,
+                                        std::slice::from_ref(schedule),
+                                        &store,
+                                        &*dispatcher,
+                                    )
+                                }));
+                            match outcome {
+                                Ok((report, extra)) => {
+                                    for event in extra
+                                        .into_iter()
+                                        .chain(crate::cron_tick::report_events(&report, now))
+                                    {
+                                        eprintln!("{event}");
+                                    }
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "event": "cron/failed",
+                                            "at": now.to_rfc3339(),
+                                            "schedule_id": schedule.id,
+                                            "error": "tick panicked",
+                                        })
+                                    );
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            crate::cron_tick::TICK_INTERVAL_MS,
+                        ));
+                    }
+                });
+            if let Err(error) = started {
+                tracing::warn!(%error, "cron ticker could not start");
+            }
         }
         // Child inactivity bound (MULTIAGENT-MODEL §5.3:587, plan pin
         // P5): a ticker whose each beat walks the root→child stream

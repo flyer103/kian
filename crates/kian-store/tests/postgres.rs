@@ -20,7 +20,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use kian_store::migrations;
-use kian_store::{AppendGuard, EventStore, Head, InboxError, SnapshotRow, StoreError};
+use kian_store::{
+    AppendGuard, CronError, CronFiringRow, EventStore, FiringState, Head, InboxError,
+    ScheduleUpsert, SnapshotRow, StoreError,
+};
 
 const T0: u64 = 1_761_900_000_000;
 
@@ -1483,6 +1486,180 @@ async fn pg_scan_kind_parity_index_and_read_only_pool() {
         );
     }
     reader.close().await;
+
+    pg.finish().await;
+}
+
+// -- durable cron state (CRON-MODEL §4/§9, v7) -------------------------------
+
+/// The cron state semantics on postgres: the migration applies, the
+/// insert-if-absent claim has exactly one winner under a real race, the
+/// cursor is monotonic and admit-then-advance guarded, and a reopened
+/// store reads the same cursor (§7.4 restart safety).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_cron_claims_advance_and_restart() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("applied versions");
+    assert!(
+        versions.contains(&7),
+        "open_postgres applies v7, got {versions:?}"
+    );
+
+    const T0: u64 = 1_761_900_000_000;
+    fn firing(schedule_id: &str, fire_time: &str) -> CronFiringRow {
+        CronFiringRow {
+            firing_id: format!("{schedule_id}@{fire_time}"),
+            schedule_id: schedule_id.to_owned(),
+            fire_time: fire_time.to_owned(),
+            admitted_at: T0,
+            state: FiringState::Admitted,
+            skip_reason: None,
+            worktree_path: None,
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    assert_eq!(
+        pg.store
+            .upsert_schedule("night-audit", "*/5 * * * *", "UTC", "d1", true, T0)
+            .await
+            .expect("insert schedule"),
+        ScheduleUpsert::Inserted
+    );
+    // Idempotent redeclaration.
+    assert_eq!(
+        pg.store
+            .upsert_schedule("night-audit", "*/5 * * * *", "UTC", "d1", true, T0 + 1)
+            .await
+            .expect("re-upsert"),
+        ScheduleUpsert::Unchanged
+    );
+
+    // A real race: four concurrent claims of the same slot, one winner.
+    let slot = firing("night-audit", "2026-11-09T02:30:00Z");
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let store = pg.store.clone();
+        let slot = slot.clone();
+        handles.push(tokio::spawn(async move {
+            store.claim_firing(&slot).await.expect("claim")
+        }));
+    }
+    let mut winners = 0;
+    for h in handles {
+        if h.await.expect("join") {
+            winners += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one racer may own the slot");
+    assert!(!pg.store.claim_firing(&slot).await.expect("replay claim"));
+
+    // Settle once; the terminal row is never rewritten.
+    assert!(
+        pg.store
+            .finish_firing(
+                &slot.firing_id,
+                FiringState::Succeeded,
+                Some(T0 + 5_000),
+                Some("/tmp/wt/a"),
+                None
+            )
+            .await
+            .expect("settle")
+    );
+    assert!(
+        !pg.store
+            .finish_firing(
+                &slot.firing_id,
+                FiringState::Failed,
+                Some(T0 + 6_000),
+                None,
+                Some("late")
+            )
+            .await
+            .expect("replay settle")
+    );
+
+    // Admit-then-advance: an unrecorded slot is refused, the recorded one
+    // moves the cursor exactly once.
+    let unrecorded = pg
+        .store
+        .advance_cursor(
+            "night-audit",
+            "2026-11-09T02:35:00Z",
+            "2026-11-09T02:40:00Z",
+            T0,
+        )
+        .await;
+    assert!(
+        matches!(unrecorded, Err(CronError::UnrecordedFiring { .. })),
+        "got {unrecorded:?}"
+    );
+    assert!(
+        pg.store
+            .advance_cursor(
+                "night-audit",
+                "2026-11-09T02:30:00Z",
+                "2026-11-09T02:35:00Z",
+                T0
+            )
+            .await
+            .expect("advance")
+    );
+    assert!(
+        !pg.store
+            .advance_cursor(
+                "night-audit",
+                "2026-11-09T02:30:00Z",
+                "2026-11-09T02:35:00Z",
+                T0
+            )
+            .await
+            .expect("replay advance")
+    );
+    assert!(
+        !pg.store
+            .advance_cursor(
+                "night-audit",
+                "2026-11-09T02:25:00Z",
+                "2026-11-09T02:35:00Z",
+                T0
+            )
+            .await
+            .expect("backwards advance is a no-op")
+    );
+    let row = pg
+        .store
+        .load_schedule("night-audit")
+        .await
+        .expect("load")
+        .expect("row");
+    assert_eq!(row.cursor_fire_at.as_deref(), Some("2026-11-09T02:30:00Z"));
+    assert_eq!(row.next_fire_at.as_deref(), Some("2026-11-09T02:35:00Z"));
+
+    // Restart safety: a freshly opened store on the same database reads
+    // the same cursor, and the settled slot is still not claimable.
+    let reopened = EventStore::open_postgres(&pg.url()).await.expect("reopen");
+    let row = reopened
+        .load_schedule("night-audit")
+        .await
+        .expect("reload")
+        .expect("row");
+    assert_eq!(row.cursor_fire_at.as_deref(), Some("2026-11-09T02:30:00Z"));
+    assert!(!reopened.claim_firing(&slot).await.expect("replay claim"));
+    let firings = reopened
+        .list_firings(Some("night-audit"), 10)
+        .await
+        .expect("list");
+    assert_eq!(firings.len(), 1);
+    assert_eq!(firings[0].state, FiringState::Succeeded);
+    reopened.close().await;
 
     pg.finish().await;
 }
