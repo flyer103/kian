@@ -1,0 +1,10 @@
+[package]
+name = "kian-cron"
+description = "Cron scheduling core: expression grammar, DST-correct next-fire math, misfire policy (CRON-MODEL §2, §5)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+thiserror.workspace = true

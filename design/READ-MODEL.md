@@ -206,6 +206,7 @@ none may).
 | `audit_kind_index` | event kind/ts | n/a | append-time (database-maintained) | drop/rebuild | none (never stale) |
 | `idx_events_session_kind_seq` | event session/kind/seq columns | n/a | append-time (database-maintained) | recreated by the v6 migration; an out-of-band drop is **not** repaired (reads stay correct, slower) | none (never stale) |
 | `session_cache` | `step/request` prefixes, `compact` | store head | maintenance rebuild | drop/rebuild | observability, ≤ B |
+| `task_board` | events + inbox rows | session `head` + store key | maintenance rebuild | drop/rebuild | observability, ≤ B |
 
 Landed shape (P2a):
 
@@ -237,6 +238,17 @@ Landed shape (P2a):
   declared no view over the prefix-stability counters. Its source is the `step/request` audit
   copies (the A2 bytes) and `compact` events; it reports the same per-session counters
   `kian cache-stats` derives.
+- **`task_board` was declared additively by the R17 C4 change** (MULTIAGENT-MODEL §4.2/§4.3):
+  a logical view over the same v4 `view_rows`/`view_state` tables — one row per delegation **task**
+  (keyed by the wrapper's `task_id`, `BTreeMap`-ordered), derived exactly like the honest full-stream
+  derivation and published through the same one-transaction version flip under the `views:all` lease,
+  with its own change trigger (`thread/started`, `thread/completed`, `evidence/verdict`,
+  `session/ended`, `input/admitted` — separate from `ticket_stage`'s). Publication requires **both**
+  `superagent.board.enabled` and `read_model.views.enabled`; a disabled board deletes any stored rows
+  and state in the next rebuild (a disposable view — a later re-enable cannot serve a stale era).
+- **`task_board` declared bound.** Event-derived columns are exact-version fresh; `input_required`
+  (derived from the parent's durable inbox report row — the one non-event input, read through the
+  store's read-only `input_rows`) is as of the last rebuild: `B = read_model.views.interval_ms`.
 - **Freshness gate.** A view is served only at exactly the store key it was derived at (any
   append makes it stale — not a TTL), only when the digest over the read rows matches the stored
   digest, and only when every payload decodes. Stale, corrupt, undecodable, absent (a read-only
@@ -344,8 +356,10 @@ Landed shape (P2b):
   identity is a first-class check), or an existing session id, and restores the events (under
   their own epoch/seq) and the full input rows — exactly the rows verification replayed, never a
   re-read — into the target store; the restored stream projects and re-exports identically.
-- **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass
-  (the round-9 plan's non-goal list keeps cron cadence out of scope).
+- **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass.
+  Wall-clock scheduling — retention cadence, dream cadence and every other cadence — is owned by
+  [CRON-MODEL.md](CRON-MODEL.md) (ADR-033), which supersedes the earlier "cadence out of scope"
+  statement; this document only defines the serving form.
 
 ## 8. Bounded staleness and degradation (P2/P3)
 

@@ -22,7 +22,7 @@
 //! ```text
 //! pending ──▶ inflight ──▶ done
 //!    │ │
-//!    └───────────┴──▶ abandoned (queue timeout; terminal)
+//!    └───────────┴──▶ abandoned (queue timeout / exhausted re-drive; terminal)
 //! ```
 //!
 //! `done` and `abandoned` are terminal: every transition statement carries a
@@ -30,6 +30,14 @@
 //! updated again and no row is ever deleted (asserted by
 //! `no_delete_and_done_rows_are_never_mutated` and
 //! `backend_modules_keep_guards_and_never_delete` — the review pattern).
+//!
+//! Re-drive is at-least-once and therefore **bounded** (ADR-033): every claim
+//! increments `dispatch_attempts`, and a driver may only claim a row already
+//! `inflight` while that count is below the caller's bound (`1 +
+//! max_redrives`). A row whose result was lost to a transport loss gets its
+//! retry; a row that keeps losing its result because the command itself
+//! destroys the ack path (restarting the server, killing the worker) reaches
+//! [`ExecStore::abandon_exhausted`] instead of looping forever.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -278,6 +286,10 @@ pub struct QueuedCommand {
     pub tool_call_ref: Option<String>,
     /// Present iff `status == Done`.
     pub outcome: Option<CommandOutcome>,
+    /// How many wire dispatches this row has been claimed for (ADR-033).
+    /// `0` on a never-dispatched row; `1` after the first dispatch. A driver
+    /// may only re-drive an `inflight` row while this is below its bound.
+    pub dispatch_attempts: u32,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -396,6 +408,19 @@ const V5_REGISTRY_CAPABILITIES: Migration = Migration {
     up: "ALTER TABLE endpoint_registry ADD COLUMN capabilities TEXT",
 };
 
+/// v6 — the bounded re-drive counter (ADR-033): `dispatch_attempts` counts
+/// how many times a driver has claimed the row for a wire dispatch. The
+/// count is what lets at-least-once re-drive stay honest *and* terminate: a
+/// row whose result was lost to a transport loss gets its retry, while a row
+/// that keeps losing its result because the command itself destroyed the ack
+/// path (restarting the server, killing the worker) stops at the bound and is
+/// abandoned. Additive `ALTER TABLE`; pre-v6 rows read as zero attempts.
+const V6_QUEUE_DISPATCH_ATTEMPTS: Migration = Migration {
+    version: 6,
+    name: "v6_queue_dispatch_attempts",
+    up: "ALTER TABLE exec_queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0",
+};
+
 /// The registered adjacent sqlite chain, ordered v0 → head. Extensible by
 /// appending; committed entries are never edited.
 pub fn chain() -> &'static [Migration] {
@@ -406,6 +431,7 @@ pub fn chain() -> &'static [Migration] {
         V3_EXEC_QUEUE_KIND,
         V4_REGISTRY_DECLARATION,
         V5_REGISTRY_CAPABILITIES,
+        V6_QUEUE_DISPATCH_ATTEMPTS,
     ]
 }
 
@@ -457,6 +483,14 @@ const PG_V5_REGISTRY_CAPABILITIES: Migration = Migration {
     up: "ALTER TABLE endpoint_registry ADD COLUMN capabilities TEXT",
 };
 
+/// v6 (postgres chain) — the bounded re-drive counter, pg DDL. Same
+/// version and name as the sqlite v6.
+const PG_V6_QUEUE_DISPATCH_ATTEMPTS: Migration = Migration {
+    version: 6,
+    name: "v6_queue_dispatch_attempts",
+    up: "ALTER TABLE exec_queue ADD COLUMN dispatch_attempts BIGINT NOT NULL DEFAULT 0",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] (enforced by `pg_chain_mirrors_sqlite_chain_versions_and_names`).
 pub fn pg_chain() -> &'static [Migration] {
@@ -467,6 +501,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V3_EXEC_QUEUE_KIND,
         PG_V4_REGISTRY_DECLARATION,
         PG_V5_REGISTRY_CAPABILITIES,
+        PG_V6_QUEUE_DISPATCH_ATTEMPTS,
     ]
 }
 
@@ -803,11 +838,15 @@ impl ExecStore {
     // -- queue-row leases (ADR-009 decision 5) -------------------------
 
     /// Claims one `exec_queue` row with a single-statement lease
-    /// (`claimed_by`/`claimed_until_ms`, v2 columns). The claim lands
-    /// iff the row is live (`pending`/`inflight` — terminal rows freeze)
-    /// and unclaimed, expired, or already this holder's. Returns
-    /// `false` when a fresh lease is held by another replica — the
-    /// caller skips the row; that replica's driver owns it.
+    /// (`claimed_by`/`claimed_until_ms`, v2 columns) and counts the dispatch
+    /// attempt (`dispatch_attempts`, v6). The claim lands iff the row is live
+    /// (`pending`/`inflight` — terminal rows freeze), unclaimed, expired or
+    /// already this holder's, **and** the bound admits it: a `pending` row's
+    /// first dispatch always lands, while an `inflight` row is re-drivable
+    /// only while `dispatch_attempts < max_dispatches` (ADR-033). Returns
+    /// `false` when a fresh lease is held by another replica *or* the
+    /// re-drive bound is exhausted; [`ExecStore::abandon_exhausted`] tells
+    /// the two apart.
     ///
     /// The lease is **liveness only**: it bounds duplicate dispatch
     /// across replicas and is never consulted for accepting a result —
@@ -818,13 +857,66 @@ impl ExecStore {
         holder: &str,
         ttl_ms: i64,
         now_ms: i64,
+        max_dispatches: u32,
     ) -> Result<bool, QueueStoreError> {
         match self {
             Self::Sqlite(pool) => {
-                crate::sqlite::claim_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+                crate::sqlite::claim_queue_row(
+                    pool,
+                    command_id,
+                    holder,
+                    ttl_ms,
+                    now_ms,
+                    i64::from(max_dispatches),
+                )
+                .await
             }
             Self::Postgres(pool) => {
-                crate::postgres::claim_queue_row(pool, command_id, holder, ttl_ms, now_ms).await
+                crate::postgres::claim_queue_row(
+                    pool,
+                    command_id,
+                    holder,
+                    ttl_ms,
+                    now_ms,
+                    i64::from(max_dispatches),
+                )
+                .await
+            }
+        }
+        .map_err(QueueStoreError::from)
+    }
+
+    /// Converges an `inflight` row whose re-drive bound is spent (ADR-033):
+    /// `inflight → abandoned` exactly when `dispatch_attempts >=
+    /// max_dispatches` **and** no live lease is held. A fresh lease means a
+    /// driver is dispatching the row right now (that attempt may still
+    /// settle it), so the transition is refused and the caller retries on a
+    /// later loop turn — never an abandonment race against a live dispatch.
+    /// Returns `true` iff this call made the row terminal.
+    pub async fn abandon_exhausted(
+        &self,
+        command_id: Uuid,
+        max_dispatches: u32,
+        now_ms: i64,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::abandon_exhausted(
+                    pool,
+                    command_id,
+                    i64::from(max_dispatches),
+                    now_ms,
+                )
+                .await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::abandon_exhausted(
+                    pool,
+                    command_id,
+                    i64::from(max_dispatches),
+                    now_ms,
+                )
+                .await
             }
         }
         .map_err(QueueStoreError::from)
@@ -978,21 +1070,21 @@ impl ExecStore {
     }
 }
 
-/// Parses one queue row tuple. `result` is stored as the raw outcome JSON;
+/// Parses one queue row. `result` is stored as the raw outcome JSON;
 /// its kind (ok / err) is recovered from the payload shape.
-fn parse_row(
-    (command_id, endpoint_id, cmd, kind, status, tool_call_ref, result, created_at, updated_at): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        i64,
-        i64,
-    ),
-) -> Result<QueuedCommand, QueueStoreError> {
+fn parse_row(row: crate::sqlite::QueueRow) -> Result<QueuedCommand, QueueStoreError> {
+    let (
+        command_id,
+        endpoint_id,
+        cmd,
+        kind,
+        status,
+        tool_call_ref,
+        result,
+        created_at,
+        updated_at,
+        dispatch_attempts,
+    ) = row;
     let command_id = Uuid::parse_str(&command_id)
         .map_err(|e| QueueStoreError::Corrupt(format!("bad command id: {e}")))?;
     let kind = CommandKind::from_str(&kind)?;
@@ -1021,6 +1113,7 @@ fn parse_row(
         status,
         tool_call_ref,
         outcome,
+        dispatch_attempts: u32::try_from(dispatch_attempts).unwrap_or(u32::MAX),
         created_at,
         updated_at,
     })
@@ -1097,6 +1190,26 @@ mod tests {
                 "v2 must be ALTER TABLE only: {stmt}"
             );
         }
+    }
+
+    /// v6 is committed the moment this chain ships: pinned byte-for-byte
+    /// (additive `ALTER TABLE` only — the bounded re-drive counter,
+    /// ADR-033).
+    #[test]
+    fn v6_generation_sql_is_frozen_and_additive() {
+        let v6: &Migration = &chain()[6];
+        assert_eq!(v6.version, 6);
+        assert_eq!(v6.name, "v6_queue_dispatch_attempts");
+        assert_eq!(
+            v6.up,
+            "ALTER TABLE exec_queue ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0"
+        );
+        // Additive only: no CREATE, no DROP, no column rewrite, and a
+        // default so every pre-v6 row reads as "never dispatched".
+        assert!(!v6.up.contains("CREATE"));
+        assert!(!v6.up.contains("DROP"));
+        assert!(v6.up.starts_with("ALTER TABLE"));
+        assert!(v6.up.contains("DEFAULT 0"));
     }
 
     /// The pg chain tracks the sqlite chain generation for generation:

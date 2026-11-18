@@ -859,8 +859,8 @@ graph LR
 - **Runtime membership — the directory, the routes and the runtime catalog** (ADR-021, ADR-031;
   semantics in [`design/WORKER-MODEL.md`](WORKER-MODEL.md), wire in
   [`design/API-CONTRACT.md`](API-CONTRACT.md) §8). Membership is **runtime, not configuration**: with a
-  `workers:` section (`listen`, `offline_after_ms`, `allow_public`, `queue_timeout_ms`, and either a
-  shared `token_env` or per-worker `tokens`) `kian serve` opens a **worker-dialed** KiandProto v3
+  `workers:` section (`listen`, `offline_after_ms`, `allow_public`, `queue_timeout_ms`,
+  `queue_max_redrives`, and either a shared `token_env` or per-worker `tokens`) `kian serve` opens a **worker-dialed** KiandProto v3
   registration listener on a private address, outside
   `/rpc`/`/ops/rpc`/`/metrics` and gated by env-only tokens. A worker (`kiand --register-to …`)
   registers, and kian **reuses that connection as the command channel** for its id — the route.
@@ -888,7 +888,12 @@ graph LR
     own id's rows, and there is no fallback route, no failover and no local-exec substitution for a
     bound session (§4.3's exec layer, ADR-007). The queue row carries its command family (`kind`,
     migration v3): an exec row keeps its v1 bytes and result shape, an fs row carries the v2
-    command/result, and a restart re-drives each through its own frame family.
+    command/result, and a restart re-drives each through its own frame family. Re-drive is
+    **bounded** (ADR-033, migration v6): `dispatch_attempts` counts dispatches, an `inflight` row
+    re-drives only below `1 + workers.queue_max_redrives`, and a spent bound converges the row to
+    `abandoned` once no live lease is held — one audit line, no fabricated result. That is what
+    keeps at-least-once terminating for a command whose own side effect destroys its ack path
+    (restarting the server or killing its worker).
   - **Per-worker sides become runtime-provided.** Instead of one prebuilt `WorkerLoopDriver` per
     configured worker, the assembly keeps a **lazy per-id side cache** built from a factory and never
     evicts it (an offline worker's side still enqueues by id); the per-drive selection rule from the
@@ -1353,8 +1358,38 @@ unchanged; it adds one config block (`superagent.multiagent`), one read-surface 
 `kian tasks --all`, `kian agents`), and **no** event kind, table, route, ops method, metrics key or core
 change. In the design the board is a disposable `task_board` view over existing bytes (READ-MODEL §6)
 whose control path is recomputed from the primary at decision time — never a board entity, and never a
-control read on the view; neither view nor CLI exists yet. Phases P1–P4 with per-phase rollback are
-recorded in its §8, and nothing there is implemented.
+control read on the view. The view and the three verbs exist, and Phases P1–P4 are
+landed in code + tests with no live-run evidence — MULTIAGENT-MODEL §10 records the status
+per phase; §8 still records the per-phase rollback.
+
+Refinement (the roster and the per-assignee child, as implemented): `superagent.roster` is a list
+of named entries — `id`, `description`, `agent` (a name from `agents:`), `mandate_template`
+(`scope`, `strength` — required, `explicit` | `inferred`), optional `tools_allow` (the separate
+tool fence) and optional `limits`. With the
+roster present the Router's `spawn_worker` tool grows three arguments: `agent` (the entry id),
+`task_key` (the stable `Task` identity — a retry with the same key re-admits onto the same task)
+and `output_schema` (the closed P2 subset: `type`, `properties`, `required`, `additionalProperties`,
+`items`, `enum`, `const`, `minLength`, `maxLength`, `minimum`, `maximum`, `minItems`, and `maxItems`;
+any other keyword is refused before a side effect). `kian agents` renders each roster entry's `id`,
+`description`, `agent`, `tools_allow`, `limits`, and `output_schema` presence, read-only from the same
+config. The child's worker side is built from the entry's own `agents:` definition — its model
+slots and budgets, never the worker template's — and its tool surface is exactly
+`agent.tools ∩ tools_allow`, narrowed structurally before the provider request, so a denied tool
+is absent from the request schema rather than refused at call time; a `tools_allow` name outside
+the mounted surface refuses to boot. The assignee is read from the child's committed wrapper, so
+editing the roster after a spawn never changes that child's surface, and an assignee whose entry
+has vanished runs a refusing side instead of widening onto another agent's tools. When the
+wrapper carries `output_schema`, the child's final assistant answer is validated against it
+before the evidence gate: a first miss admits exactly one correction; a second miss commits
+`evidence/verdict{gate:"output_schema",passed:false}` and a failed completion preserving the raw
+answer, which the join projects as `invalid_output`. The correction's uniqueness is
+count-derived, not key-derived: `attempt = schema_correction_count(events)`, so a takeover
+re-derives the same ordinal and goes to the verdict instead of appending a second correction;
+the logged `schema-correction:<spawn_uid>:<attempt>` key is an audit label, never a persisted
+fact. An empty final answer stays `empty_output`
+and never enters the schema gate; a pass appends no verdict. **With the roster absent or empty,
+none of this exists** — no `agent`/`task_key`/`output_schema` arguments, no `kian agents` roster,
+no per-assignee side, no schema gate — and every byte is the pre-roster bundle's.
 
 ## 5. Control-plane protocol (P5 protocolized)
 
@@ -1365,7 +1400,7 @@ Unified semantics (portable across harnesses/channels):
 | `steer(text, scope)` | Inject a direction change; advisory; takes effect only at provider-turn safe boundaries; resets the allowance |
 | `interrupt(reason)` | Abort the active drain; settle on abort (re-evaluate inbox); partial completion labeled interrupted |
 | `queue(msg)` | Queue an input without interrupting the current drain |
-| `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-033](decisions/ADR-033-durable-confirmation-plane.md)) |
+| `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-035](decisions/ADR-035-durable-confirmation-plane.md)) |
 | `pending(session)` | The session's unanswered asks with the TTL overlay — a pure read, no writes |
 
 Implementation: JSON-RPC over HTTP (axum) + SSE event stream. All control-plane operations **only
@@ -1384,7 +1419,7 @@ event stream, strictly increasing seq), `event: done` after `session/ended`, `ev
 unknown session. `confirm`/`pending` are implemented since the confirmation plane landed
 ([design/CONFIRMATION-MODEL.md](CONFIRMATION-MODEL.md)): `ask` = a deferred tool call, the answer =
 an admitted control row, the wait = the fifth end reason `awaiting_input`
-([ADR-033](decisions/ADR-033-durable-confirmation-plane.md)). The iron rule is enforced
+([ADR-035](decisions/ADR-035-durable-confirmation-plane.md)). The iron rule is enforced
 structurally: the HTTP module sees only a `ControlPlane` trait (`create_session` / `submit` /
 `steer` / `queue` / `interrupt` / `projection` / `session_events` — inbox writes and reads only);
 `kian-cli::server` implements it over the engine, and a resident test greps the handler module for
@@ -1566,6 +1601,7 @@ graph TB
  KC[kian-core<br/>concept model / state machine / invariants]
  KS[kian-store<br/>EventStore / Inbox / projection engine]
  KO[kian-orchestrator<br/>Admit→Wake→Drain→Promote<br/>+ recovery subsystem]
+ KCR[kian-cron<br/>grammar / next-fire / misfire]
  KL[kian-llm<br/>ModelProvider seam + openai-compat]
  KE[kian-exec<br/>KiandProto server half:<br/>ConnectionManager<br/>+ durable queue]
  KP[kian-plugin<br/>Ctx/Plugin/Disposer/dispatch]
@@ -1584,6 +1620,7 @@ graph TB
  KE --> KC & KS
  KSA --> KP & KO & KLD
  KCL --> KO
+ KCL --> KCR
  KDD --> KEP
  KE -.->|dials over TCP| KEP
  KSDK -.->| JSON-RPC + SSE over HTTP| KCL
@@ -1595,7 +1632,7 @@ graph TB
 | kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project` |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
-| kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
+| kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032; v6 bounds the re-drive count, ADR-033), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
 | kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
 | kian-memory | The memory bundle (MEMORY-MODEL Phases 1–2): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume, and the frozen creation-time index renderer `render_memory_index` (verified-only latest-per-subject fold, subject byte order, fixed "data, not instructions" header and excerpt cap, patterns-only default redaction with an explicit-redactor seam) turns the folded notes into the bounded index P2 injects; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `render_memory_index`, `eligible_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
@@ -1604,7 +1641,21 @@ graph TB
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
+| kian-cron | Wall-clock scheduling core (CRON-MODEL, ADR-033): five-field grammar and aliases, IANA zone resolution, DST gap/overlap-aware next-fire math, and misfire/coalescing plans. Pure — no I/O, no clock read, no store; the server and CLI own the loop | `CronExpr`, `next_fire_after`, `misfire::plan` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
+
+**Cron scheduling (CRON-MODEL — P0/P1 landed).** `kian-cli` owns the wall-clock loop: `kian
+serve` resolves `superagent.cron` at config load and, when the section is non-empty, arms one 1s
+ticker on a dedicated OS thread. Each tick walks the schedules; a due slot is claimed in
+`cron_firings` (the primary key is the idempotency lock) *before* anything is dispatched, and the
+cursor advances only after the claim, so a crash between the two re-claims nothing. Dispatch has
+two arms: the resident arm admits one durable inbox row for the target session (`{content, cron}`
+payload — the firing proof is additive and non-context — idempotency key `cron:<firing_id>`), and
+the worktree arm cuts a detached git tree under the resolved `worktree.root`, runs the configured
+harness under `timeout_ms`, then captures and cleans up (or keeps, `keep_on_failure`) the tree;
+the disk guards and the per-schedule slot ceiling live in `cron_worktree`. The ticker is not a
+plugin and not a second binary; it exits with the server. Semantics belong to
+[CRON-MODEL](CRON-MODEL.md).
 
 **Agent memory (MEMORY-MODEL Phases 1–2 — landed).** The `memory/note` kind and the pure fail-closed
 `parse_note`/`project_notes`/`verify_note` functions live in `kian-core::memory`; the dreamer

@@ -465,13 +465,13 @@ async fn pg_row_lease_claims_expire_and_redrive() {
 
     assert!(
         store
-            .claim_queue_row(id, "replica-a", 1_000, 0)
+            .claim_queue_row(id, "replica-a", 1_000, 0, 8)
             .await
             .unwrap()
     );
     assert!(
         !store
-            .claim_queue_row(id, "replica-b", 1_000, 500)
+            .claim_queue_row(id, "replica-b", 1_000, 500, 8)
             .await
             .unwrap()
     );
@@ -483,20 +483,20 @@ async fn pg_row_lease_claims_expire_and_redrive() {
     );
     assert!(
         !store
-            .claim_queue_row(id, "replica-b", 1_000, 1_500)
+            .claim_queue_row(id, "replica-b", 1_000, 1_500, 8)
             .await
             .unwrap()
     );
     // Past expiry (1801 > 800 + 1000) any replica takes over honestly.
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 1_000, 1_801)
+            .claim_queue_row(id, "replica-b", 1_000, 1_801, 8)
             .await
             .unwrap()
     );
     assert!(
         store
-            .claim_queue_row(id, "replica-b", 1_000, 1_900)
+            .claim_queue_row(id, "replica-b", 1_000, 1_900, 8)
             .await
             .unwrap()
     );
@@ -520,7 +520,7 @@ async fn pg_row_lease_claims_expire_and_redrive() {
     assert!(store.mark_done(id, &outcome).await.unwrap());
     assert!(
         !store
-            .claim_queue_row(id, "replica-c", 1_000, 5_000)
+            .claim_queue_row(id, "replica-c", 1_000, 5_000, 8)
             .await
             .unwrap()
     );

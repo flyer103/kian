@@ -533,3 +533,155 @@ async fn foreign_logical_format_is_refused_before_any_mapping() {
 fn silence() {
     let _ = ctx_err as fn(kian_core::events::Event) -> DshCtxError;
 }
+
+/// Port (d″) — the retrospective `tool/post` observation (§3.5): the
+/// post-append branch fires the crate-local port with the step's
+/// mapped name, the serialized output's byte count and digest, and no
+/// redaction provenance; a result with no matching mapped call would
+/// be skipped with one audit line (name-resolution is by the recorded
+/// `tool/call`, never fabricated).
+#[tokio::test]
+async fn tool_post_observes_the_mapped_tool_result_retrospectively() {
+    struct RecordingPort {
+        seen: Mutex<Vec<kian_dsh::toolpost::ToolPostView>>,
+    }
+    impl kian_dsh::toolpost::ToolPostPort for RecordingPort {
+        fn tool_post(
+            &self,
+            view: kian_dsh::toolpost::ToolPostView,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            self.seen.lock().expect("port").push(view);
+            Box::pin(async {})
+        }
+    }
+
+    let ctx = FakeCtx::seeded(deploy());
+    let port = Arc::new(RecordingPort {
+        seen: Mutex::new(Vec::new()),
+    });
+    let driver = driver("basic_turn.jsonl")
+        .with_tool_post_port(port.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
+    let outcomes =
+        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
+            .await
+            .expect("bridge flow completes");
+    assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
+
+    let seen = port.seen.lock().expect("port").clone();
+    assert_eq!(seen.len(), 1, "one observation per mapped tool result");
+    assert_eq!(seen[0].call_id, "call-1");
+    assert_eq!(
+        seen[0].name, "run_build",
+        "the name comes from the step's mapped tool/call"
+    );
+    // Byte count and digest describe the serialized output exactly.
+    let output = serde_json::json!({"ok": true});
+    let bytes = serde_json::to_vec(&output).expect("serialize");
+    assert_eq!(seen[0].output_bytes, bytes.len() as u64);
+    assert_eq!(
+        seen[0].output_sha256,
+        kian_dsh::toolpost::sha256_hex(&bytes)
+    );
+    assert!(seen[0].redactions.is_empty());
+    // The observation is honest about sequencing: the `tool/result`
+    // append it describes is already committed.
+    assert!(ctx.kinds().contains(&EventKind::ToolResult));
+}
+
+/// §3.5/§17 (M4-c): a `tool/result` with **no matching mapped
+/// `tool/call`** is SKIPPED — one audit line, never a dispatched
+/// observation with a fabricated name.
+#[tokio::test]
+async fn result_without_mapped_call_is_skipped_with_audit() {
+    struct RecordingPort {
+        seen: Mutex<Vec<kian_dsh::toolpost::ToolPostView>>,
+    }
+    impl kian_dsh::toolpost::ToolPostPort for RecordingPort {
+        fn tool_post(
+            &self,
+            view: kian_dsh::toolpost::ToolPostView,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            self.seen.lock().expect("port").push(view);
+            Box::pin(async {})
+        }
+    }
+
+    let ctx = FakeCtx::seeded(deploy());
+    let port = Arc::new(RecordingPort {
+        seen: Mutex::new(Vec::new()),
+    });
+    // The fixture's `call-1` result arrives with NO mapped `tool/call`
+    // event before it (the assistant message's tool_calls are model
+    // speech, not the recorded event).
+    let driver = driver("unmapped_result.jsonl")
+        .with_tool_post_port(port.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
+    let outcomes =
+        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
+            .await
+            .expect("bridge flow completes");
+    assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
+
+    assert!(
+        port.seen.lock().expect("port").is_empty(),
+        "a result with no matching mapped call is skipped — never dispatched with a fabricated name"
+    );
+    // The skip is audited, not silent: the `tool/result` itself still
+    // landed in the stream (the observation is the only thing skipped).
+    assert!(ctx.kinds().contains(&EventKind::ToolResult));
+}
+
+/// §3.5/§17 (M4-c): the dedupe path dispatches nothing — a replayed
+/// event (already persisted by an earlier drain) is skipped before the
+/// append, so its retrospective `tool/post` observation never re-fires.
+#[tokio::test]
+async fn dedupe_path_dispatches_nothing() {
+    struct RecordingPort {
+        seen: Mutex<Vec<kian_dsh::toolpost::ToolPostView>>,
+    }
+    impl kian_dsh::toolpost::ToolPostPort for RecordingPort {
+        fn tool_post(
+            &self,
+            view: kian_dsh::toolpost::ToolPostView,
+        ) -> futures::future::BoxFuture<'static, ()> {
+            self.seen.lock().expect("port").push(view);
+            Box::pin(async {})
+        }
+    }
+
+    let ctx = FakeCtx::seeded(deploy());
+    // Drive 1: the mapped result appends and observes exactly once.
+    let port1 = Arc::new(RecordingPort {
+        seen: Mutex::new(Vec::new()),
+    });
+    let driver1 = driver("basic_turn.jsonl")
+        .with_tool_post_port(port1.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
+    let outcomes =
+        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver1, ctx.clone()))
+            .await
+            .expect("first drive completes");
+    assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
+    assert_eq!(port1.seen.lock().expect("port").len(), 1);
+    let appended_after_first = ctx.events_snapshot().len();
+
+    // Drive 2 over the SAME stream: every mapped event is a replay —
+    // deduped before the append, so nothing re-appends and nothing
+    // re-observes.
+    let port2 = Arc::new(RecordingPort {
+        seen: Mutex::new(Vec::new()),
+    });
+    let driver2 = driver("basic_turn.jsonl")
+        .with_tool_post_port(port2.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
+    let _ = tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver2, ctx.clone()))
+        .await
+        .expect("second drive completes");
+
+    assert!(
+        port2.seen.lock().expect("port").is_empty(),
+        "a deduped (replayed) result dispatches no tool/post"
+    );
+    assert_eq!(
+        ctx.events_snapshot().len(),
+        appended_after_first,
+        "the dedupe path appends nothing either"
+    );
+}

@@ -91,6 +91,12 @@ pub enum RoutingOutcome {
     /// signal (no @-mention, no adapter-declared `explicit: true`):
     /// audit-logged and counted, no inbox row, no wake.
     DroppedNotExplicit,
+    /// A hook veto at `admit/pre` (PLUGIN-SPEC §4.1): a valid `stop`
+    /// (or the fail-closed default of an unreachable `veto:admit`
+    /// holder at channel origin) refused the event for **every**
+    /// target — no inbox row anywhere, one audit line, and the sender
+    /// is not told in v1 (§16.15). A redelivery is re-vetoed (§8.6).
+    RefusedByHook { plugin: String, reason: String },
 }
 
 /// One subscriber's admission inside a [`RoutingOutcome::FannedOut`].
@@ -146,6 +152,11 @@ pub struct SubscriptionService {
     thread_keys: crate::intake::ThreadKeySet,
     registry: Arc<RwLock<PassthroughRegistry>>,
     inbox: Arc<dyn InboxWriter>,
+    /// Port (a) — `admit/pre` + `admit/post` (PLUGIN-SPEC §4.1): the
+    /// hook bus consulted at this shaping boundary, after the payload
+    /// is shaped and before the first inbox row. `None` (default)
+    /// consults nothing — byte-identical fan-out behavior.
+    hooks: Option<kian_plugin::hooks::HookBus>,
 }
 
 impl SubscriptionService {
@@ -165,6 +176,7 @@ impl SubscriptionService {
             thread_keys: crate::intake::ThreadKeySet::default(),
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
+            hooks: None,
         }
     }
 
@@ -188,7 +200,17 @@ impl SubscriptionService {
             thread_keys: crate::intake::ThreadKeySet::default(),
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
+            hooks: None,
         }
+    }
+
+    /// Mounts the hook bus at the admission boundary (PLUGIN-SPEC §4
+    /// row (a)): `admit/pre` is evaluated once per inbound event over
+    /// the complete target set before any inbox row exists, and
+    /// `admit/post` fires per admitted target after its row is durable.
+    pub fn with_hook_bus(mut self, hooks: kian_plugin::hooks::HookBus) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     /// Sets the follow-up-ownership gate (`superagent.followup_ownership`,
@@ -491,6 +513,29 @@ impl SubscriptionService {
                 serde_json::Value::String(key.topic().to_string()),
             );
         }
+        // Port (a) — `admit/pre` (PLUGIN-SPEC §4.1): one evaluation at
+        // this channel-policy boundary, over the complete target set,
+        // after shaping and before the first inbox row. The write loop
+        // below starts only after the grid resolves; a `stop` refuses
+        // the event for every target (no row, no wake — audit-only,
+        // the sender is not told in v1).
+        if let Some(bus) = self.hooks.as_ref() {
+            let draft = self.admit_draft(&event, &targets, &payload);
+            if let kian_plugin::hooks::AdmitVerdict::Stop { plugin, reason } =
+                bus.admit(&draft).await
+            {
+                warn!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    plugin = %plugin,
+                    reason = %reason,
+                    targets = targets.len(),
+                    "subscription audit: event refused by hook veto (no inbox row for any target)"
+                );
+                return Ok(RoutingOutcome::RefusedByHook { plugin, reason });
+            }
+        }
         // Invariant 1 per subscriber: the admit future resolves only
         // on commit, and that subscriber's wake strictly after. The
         // set is sorted, so a fan-out admits in deterministic order.
@@ -520,6 +565,32 @@ impl SubscriptionService {
                         session: target,
                         deduplicated: receipt.deduplicated,
                     });
+                    // `admit/post` (§4.1 step 4): fires per admitted
+                    // target after its row is durable — single-target
+                    // by construction, with that target's receipt. The
+                    // `seq` field is the floor 0: the bundle's
+                    // `InboxWriter` receipt carries no sequence (the
+                    // inbox row is not an event), and inventing one
+                    // would need a wire D3 forbids this round.
+                    if let Some(bus) = self.hooks.as_ref() {
+                        let content_bytes = serde_json::to_string(&payload)
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0);
+                        bus.admit_post(&kian_plugin::hooks::AdmitReceiptView {
+                            session: target,
+                            event_id: event.event_id.clone(),
+                            seq: 0,
+                            origin: kian_plugin::hooks::Origin::Channel,
+                            deduplicated: receipt.deduplicated,
+                            input: kian_plugin::hooks::AdmitPostInput {
+                                role: "user".to_string(),
+                                content_bytes,
+                                spilled: payload.get("spill").is_some(),
+                            },
+                            frame: Some(kian_plugin::hooks::FrameInfo::new(target)),
+                        })
+                        .await;
+                    }
                 }
                 Err(e) => {
                     // The audit log names the drop; the subscriber is
@@ -548,6 +619,62 @@ impl SubscriptionService {
             })
         } else {
             Ok(RoutingOutcome::FannedOut { admitted })
+        }
+    }
+
+    /// Builds the §3.2.1 `admit/pre` view for one shaped event: the
+    /// complete fan-out set (sorted by session id), the payload every
+    /// target would receive, and floor frames (§7.3 — this boundary
+    /// holds no worker bindings or per-session seqs).
+    fn admit_draft(
+        &self,
+        event: &ChannelEvent,
+        targets: &[SessionId],
+        payload: &serde_json::Value,
+    ) -> kian_plugin::hooks::AdmitDraft {
+        use kian_plugin::hooks::{
+            AdmissionInfo, AdmitInput, AdmitTarget, ChannelProvenance, FrameInfo,
+        };
+        let content =
+            serde_json::to_string(payload).expect("serializing a serde_json::Value cannot fail");
+        let (content_preview, content_truncated) = kian_plugin::hooks::preview(&content);
+        // The over-cap spill shape is `{content, spill}` — the row then
+        // carries only the Inline view (§3.2.1 `inline_view`).
+        let spilled = payload.get("spill").is_some();
+        let mut sorted: Vec<AdmitTarget> = targets
+            .iter()
+            .map(|&session| AdmitTarget {
+                session,
+                router: session == self.router_session,
+            })
+            .collect();
+        sorted.sort_by_key(|t| t.session);
+        let frames = sorted.iter().map(|t| FrameInfo::new(t.session)).collect();
+        kian_plugin::hooks::AdmitDraft {
+            origin: kian_plugin::hooks::Origin::Channel,
+            targets: sorted,
+            input: AdmitInput {
+                role: "user".to_string(),
+                synthetic: false,
+                content_preview,
+                content_bytes: content.len() as u64,
+                content_sha256: kian_plugin::hooks::sha256_hex(content.as_bytes()),
+                content_truncated,
+                inline_view: spilled,
+            },
+            channel: Some(ChannelProvenance {
+                name: event.channel.clone(),
+                event_id: event.event_id.clone(),
+                topic: event.topic.clone(),
+            }),
+            admission: AdmissionInfo {
+                policy: match self.shaping.inline_cap_bytes {
+                    Some(cap) => format!("inline_cap_bytes={cap}"),
+                    None => "inline_cap_bytes=unbounded".to_string(),
+                },
+                spilled,
+            },
+            frames,
         }
     }
 
@@ -1382,6 +1509,185 @@ mod tests {
             inbox.committed.lock().unwrap().len(),
             1,
             "exactly one durable row exists"
+        );
+    }
+
+    // -- port (a): the admission boundary (PLUGIN-SPEC §4.1) ---------------
+
+    use futures::FutureExt;
+    use kian_plugin::hooks::{
+        AdmitVerdict, HandlerId, HookBus, HookId, HookPayload, HookReply, Registry,
+    };
+
+    /// A bus over a private registry with one `admit/pre` subscriber
+    /// answering `reply` and recording the drafts it evaluated.
+    fn admit_bus(
+        plugin: &'static str,
+        reply: HookReply,
+    ) -> (
+        HookBus,
+        Arc<Mutex<Vec<kian_plugin::hooks::AdmitDraft>>>,
+        kian_plugin::Disposer,
+    ) {
+        let registry = Arc::new(Registry::new());
+        let drafts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&drafts);
+        let keep = registry.register(
+            HandlerId {
+                plugin,
+                hook: HookId::AdmitPre,
+                grants: kian_plugin::hooks::GrantSet::from_names(&["observe:admit", "veto:admit"])
+                    .unwrap(),
+                order: 0,
+            },
+            Arc::new(move |payload: &HookPayload| {
+                let seen = Arc::clone(&seen);
+                let reply = reply.clone();
+                async move {
+                    if let HookPayload::AdmitDraft(draft) = payload {
+                        seen.lock().unwrap().push(draft.clone());
+                    }
+                    reply
+                }
+                .boxed()
+            }),
+        );
+        (HookBus::with_registry(registry), drafts, keep)
+    }
+
+    #[tokio::test]
+    async fn admit_pre_stop_refuses_the_event_for_every_target() {
+        let inbox = ScriptedInbox::new();
+        let router = sid(1);
+        let worker = sid(2);
+        let (bus, drafts, _keep_gate) = admit_bus(
+            "gate",
+            HookReply::FlowStop {
+                reason: "off-hours".to_string(),
+            },
+        );
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
+                .with_hook_bus(bus);
+        service.register_topic("pr-9", worker);
+
+        let outcome = service
+            .handle_event(event("ci", "evt-9", Some("pr-9")))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::RefusedByHook {
+                plugin: "gate".to_string(),
+                reason: "off-hours".to_string(),
+            }
+        );
+        // No inbox row for ANY target, and no wake (§4.1: the write
+        // loop never starts after a stop).
+        assert!(inbox.admits.lock().unwrap().is_empty());
+        assert!(inbox.wakes.lock().unwrap().is_empty());
+
+        // One evaluation, the complete target set in the view.
+        let drafts = drafts.lock().unwrap().clone();
+        assert_eq!(drafts.len(), 1, "one evaluation per inbound event");
+        assert_eq!(drafts[0].targets.len(), 1);
+        assert_eq!(drafts[0].targets[0].session, worker);
+        assert!(!drafts[0].targets[0].router);
+        assert_eq!(drafts[0].origin.as_str(), "channel");
+        assert_eq!(
+            drafts[0].channel.as_ref().unwrap().event_id,
+            "evt-9",
+            "channel provenance rides the view"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_pre_next_admits_and_admit_post_fires_per_target() {
+        let inbox = ScriptedInbox::new();
+        let router = sid(1);
+        let receipts = Arc::new(Mutex::new(
+            Vec::<kian_plugin::hooks::AdmitReceiptView>::new(),
+        ));
+        let registry = Arc::new(Registry::new());
+        let seen = Arc::clone(&receipts);
+        let _keep = registry.register(
+            HandlerId {
+                plugin: "auditor",
+                hook: HookId::AdmitPost,
+                grants: kian_plugin::hooks::GrantSet::from_names(&["observe:admit"]).unwrap(),
+                order: 0,
+            },
+            Arc::new(move |payload: &HookPayload| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if let HookPayload::AdmitReceipt(r) = payload {
+                        seen.lock().unwrap().push(r.clone());
+                    }
+                    HookReply::Ack { note: None }
+                }
+                .boxed()
+            }),
+        );
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
+                .with_hook_bus(HookBus::with_registry(registry));
+
+        let outcome = service
+            .handle_event(event("mock-im", "evt-1", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: router,
+                deduplicated: false
+            }
+        );
+        // The row landed (unchanged fan-out behavior on `next`) and the
+        // receipt fired once, for that target, after the wake.
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1);
+        assert_eq!(inbox.wakes.lock().unwrap().len(), 1);
+        let receipts = receipts.lock().unwrap().clone();
+        assert_eq!(receipts.len(), 1, "admit/post fires per admitted target");
+        assert_eq!(receipts[0].session, router);
+        assert_eq!(receipts[0].event_id, "evt-1");
+        assert_eq!(receipts[0].origin.as_str(), "channel");
+    }
+
+    #[tokio::test]
+    async fn no_bus_mounted_is_byte_identical_legacy_behavior() {
+        let inbox = ScriptedInbox::new();
+        let router = sid(1);
+        let service =
+            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let outcome = service
+            .handle_event(event("mock-im", "evt-3", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutingOutcome::Routed {
+                session: router,
+                deduplicated: false
+            }
+        );
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1);
+    }
+
+    /// Compile-time shape check: the verdict enum is what the boundary
+    /// consumes (keeps `AdmitVerdict` in this module's surface).
+    #[test]
+    fn admit_verdict_shape_is_next_or_stop() {
+        assert_eq!(AdmitVerdict::Next, AdmitVerdict::Next);
+        assert_eq!(
+            AdmitVerdict::Stop {
+                plugin: "g".into(),
+                reason: "r".into()
+            },
+            AdmitVerdict::Stop {
+                plugin: "g".into(),
+                reason: "r".into()
+            }
         );
     }
 }

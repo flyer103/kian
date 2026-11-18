@@ -559,6 +559,7 @@ async fn build_harness(
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: None,
+            board_gating: kian_superagent::BoardGating::default(),
         },
         port_for_ctx(),
     );

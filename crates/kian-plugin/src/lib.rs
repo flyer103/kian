@@ -13,9 +13,13 @@
 //!   `Disposer`
 //! - [`dispatch`] — five-mode typed-event dispatch (`emit` / `waterfall` /
 //!   `parallel` / `serial` / `bail`)
+//! - [`hooks`] — the hook-plugin vocabulary (closed catalog, payload views,
+//!   capability grants), the hook-scoped tier-0 registry and the `HookBus`
+//!   dispatch core (PLUGIN-SPEC v2.2, ADR-028)
 
 pub mod ctx;
 pub mod dispatch;
+pub mod hooks;
 
 pub use ctx::{Ctx, Disposer, Plugin, PluginError, PluginSet, Service};
 pub use dispatch::{

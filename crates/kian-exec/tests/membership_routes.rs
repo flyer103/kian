@@ -46,6 +46,7 @@ fn queue_config(queue_timeout_ms: u64) -> RemoteExecConfig {
     RemoteExecConfig {
         queue_timeout: Duration::from_millis(queue_timeout_ms),
         poll_interval: Duration::from_millis(40),
+        max_redrives: 1,
     }
 }
 
@@ -792,5 +793,135 @@ async fn dynamic_default_resolves_the_online_member() {
 
     drop(_shutdown_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+    backend.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// A4 + ADR-033 — bounded re-drive: a worker that dies before replying
+// ---------------------------------------------------------------------------
+
+/// The defect ADR-033 bounds, on the real driver/wire path: a command whose
+/// own side effect destroys the ack path (it restarts the server or kills its
+/// worker) is received and executed, and the worker dies before its result can
+/// fly. Before the bound, every re-attach re-dispatched the row forever. Now
+/// the worker sees `1 + max_redrives` command frames, the third attach gets
+/// none, and the row converges to the honest terminal `abandoned`.
+#[tokio::test]
+async fn redrive_bound_converges_a_row_whose_result_is_never_delivered() {
+    let store = ExecStore::open(temp_db()).await.expect("exec store");
+    // A short row lease so convergence happens in test time; the caller's
+    // wait is deliberately longer, so the abandonment observed is the bound's.
+    let backend = RemoteExecBackend::with_membership(
+        store.clone(),
+        Vec::new(),
+        DefaultRoute::Dynamic,
+        RemoteExecConfig {
+            queue_timeout: Duration::from_millis(3_000),
+            poll_interval: Duration::from_millis(40),
+            max_redrives: 1,
+        },
+        "kian-test",
+        Duration::from_millis(300),
+        kian_core::secrets::SecretRedactor::patterns_only(),
+        Some(kian_exec::MembershipConfig {
+            directory: WorkerDirectory::new(),
+            offline_after_ms: 30_000,
+        }),
+    )
+    .expect("membership backend");
+
+    let id = Uuid::new_v4();
+    let caller = {
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            backend
+                .exec_tracked(
+                    id,
+                    "builder-1",
+                    cmd(&["systemctl", "restart", "kian"]),
+                    Some("call-poison".into()),
+                )
+                .await
+        })
+    };
+    until_async("parked pending", || async {
+        matches!(
+            store.get(id).await,
+            Ok(Some(row)) if matches!(row.status, kian_exec::QueueStatus::Pending)
+        )
+    })
+    .await;
+
+    // Attempt 1: the worker receives the command and dies before replying.
+    let (worker, mut fake) = registered("builder-1", 1);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+            1,
+        )
+        .await;
+    let frame = tokio::time::timeout(Duration::from_secs(3), fake.writer_rx.recv())
+        .await
+        .expect("first dispatch within 3s")
+        .expect("a command frame");
+    let ServerFrame::Command { id: wire_id, .. } = frame else {
+        panic!("expected a command frame, got {frame:?}");
+    };
+    assert_eq!(wire_id, id, "command id is the dedupe key");
+    drop(fake);
+
+    // Attempt 2: the at-least-once retry lands (`1 + max_redrives` = 2).
+    let (worker, mut fake) = registered("builder-1", 2);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+            2,
+        )
+        .await;
+    let frame = tokio::time::timeout(Duration::from_secs(3), fake.writer_rx.recv())
+        .await
+        .expect("the re-drive lands within 3s")
+        .expect("a command frame");
+    let ServerFrame::Command { id: wire_id, .. } = frame else {
+        panic!("expected a command frame, got {frame:?}");
+    };
+    assert_eq!(wire_id, id);
+    drop(fake);
+
+    // Attempt 3: the bound refuses the claim — no third command frame ever
+    // flies, and the row converges once the lease lapses.
+    let (worker, mut fake) = registered("builder-1", 3);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+            3,
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), fake.writer_rx.recv())
+            .await
+            .is_err(),
+        "a replay past the bound is the bug this test exists for"
+    );
+    until_async("row converged to abandoned", || async {
+        matches!(
+            store.get(id).await,
+            Ok(Some(row)) if matches!(row.status, kian_exec::QueueStatus::Abandoned)
+        )
+    })
+    .await;
+    let row = store.get(id).await.expect("row read").expect("row present");
+    assert_eq!(
+        row.dispatch_attempts, 2,
+        "exactly 1 + max_redrives dispatches"
+    );
+
+    // The caller's honest answer: Timeout — never a fabricated result.
+    let err = caller.await.expect("caller task").unwrap_err();
+    assert!(matches!(err, ExecError::Timeout), "was: {err:?}");
+
     backend.shutdown().await;
 }

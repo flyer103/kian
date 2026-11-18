@@ -89,6 +89,7 @@ async fn setup() -> Harness {
             RemoteExecConfig {
                 queue_timeout: Duration::from_secs(8),
                 poll_interval: Duration::from_millis(40),
+                max_redrives: 1,
             },
         )
         .unwrap(),

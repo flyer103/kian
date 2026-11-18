@@ -49,6 +49,9 @@ The same runtime also ships:
   of Recall, and untrusted-input marking.
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
+- **Scheduled turns** — declarative `superagent.cron` schedules execute as ordinary durable turns
+  (resident, or a detached per-firing git worktree), with a durable slot cursor, DST-correct
+  next-fire math, misfire coalescing, disk guards and a `kian cron list|run-now|logs|rm` surface.
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
@@ -62,6 +65,12 @@ The same runtime also ships:
   machine (its `--workspace-root`, a lexical path guard, 1 MiB bounds) with the same schemas and
   result shapes as the local built-ins; the durable queue, 1:1 binding and no-failover rules are
   unchanged (KiandProto v2, [ADR-023](design/decisions/ADR-023-worker-fs-tools.md)).
+- **Hook plugins** — operator-trusted sidecars extend the harness at the admission, tool and
+  settlement boundaries ([PLUGIN-SPEC](design/PLUGIN-SPEC.md), [ADR-028](design/decisions/ADR-028-harness-hook-plugins.md)):
+  observe every port, deny a side effect before it happens (`tool/pre`), gate `completed`, with
+  per-dispatch deadlines, digest-pinned spawns, quarantine and fail-closed defaults — in any
+  language that speaks newline-delimited JSON on stdio (see the
+  [reference approval gate](examples/hook-approval-gate/README.md)).
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
@@ -72,8 +81,8 @@ The same runtime also ships:
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
   the event stream stays the only truth.
-- **Operator surfaces and SDK** — inspect/replay/export/tickets/usage-stats/workers, `/metrics`, and
-  a frozen wire-only `kian-sdk`.
+- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/workers,
+  `/metrics`, and a frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
   process plus embedded sqlite is the whole system, with no hosted service required.
 
@@ -109,7 +118,9 @@ The same runtime also ships:
 | [design/EVENT-MODEL.md](design/EVENT-MODEL.md) | The normative event contract: envelope, kind catalog, change protocol |
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
 | [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, creation-time injection, retrieval and representations |
+| [design/CONFIRMATION-MODEL.md](design/CONFIRMATION-MODEL.md) | The normative confirmation-plane contract: `ask`, the pending-call projection, `awaiting_input`, the admitted answer and the resume rule |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
+| [design/CRON-MODEL.md](design/CRON-MODEL.md) | The normative scheduling contract: expressions, timezones/DST, durable cursors, misfire/overlap, worktree firings, `kian cron` |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
@@ -349,6 +360,25 @@ cargo run -p kian-cli --bin kian -- mock-channel-send mock-im --text "deploy ple
 curl -s localhost:7433/metrics | jq .superagent   # evidence / subscription / channel counters
 ```
 
+To delegate to named agents, add a roster: each entry points at an `agents:` definition, and
+`tools_allow` narrows the child's tools to exactly the intersection with that definition's
+`tools:` (see DESIGN §4.8 and MULTIAGENT-MODEL §7.3). The Router's `spawn_worker` then accepts
+`agent`, `task_key` and `output_schema`:
+
+```yaml
+superagent:
+  roster:
+    - id: researcher
+      description: Finds and cites sources
+      agent: researcher            # an entry in agents: with its own model slots
+      mandate_template: { scope: read-only research, strength: inferred }
+      tools_allow: ["fs_read"]     # the child sees only these tools
+```
+
+```bash
+cargo run -p kian-cli --bin kian -- agents   # list the delegation roster
+```
+
 ### Channels (GitHub, Lark, WeChat)
 
 Channels admit external events into subscriptions. `type: github` mounts the `POST /webhooks/github`
@@ -414,6 +444,33 @@ superagent:
   and a parked delivery names its conversation on the stage board.
 - **Policy version** renders as a `[policy <label>]` header; boot-time drift is marked without
   rewriting live sessions.
+
+### Delegation task board (kian board / kian tasks --all)
+
+Every `spawn_worker` delegation is a task with a derived identity. The board is the read-only
+operator surface over those tasks — one row per task, derived from the committed wrapper plus the
+child's own stream (never from prose), served from the materialized `task_board` view when fresh
+and from the honest full-stream derivation otherwise (identical output either way):
+
+```yaml
+superagent:
+  board:
+    enabled: true      # default false: no view published, verbs refuse with exit 2
+    gating: true       # P4: the depends_on/group spawn arguments, readiness gating and the
+                       # multiagent audit key groups (default false: P3 bytes exactly)
+```
+
+```console
+$ kian board --db kian.sqlite
+TASK_ID                               ASSIGNEE   ATTEMPT                OUTCOME              STATUS       GATE   EVIDENCE                  READY
+8d810f2b-a34f-5188-81fb-3611c2489591  -                1     completed_verified         completed     pass   pass@6 (derived)          yes
+4e69aaa3-4650-5b49-b37e-5b9a01ac212f  -                1           outstanding       outstanding   absent   -                          no
+
+$ kian tasks --all --db kian.sqlite --json   # the same rows, flat / as {now_ms, version, tasks}
+```
+
+`kian tasks` without `--all` refuses with usage (there is no filtered task surface in v1); both
+verbs write nothing — no events, no inbox rows, no view updates.
 
 ### BYOM execution endpoints
 
@@ -485,6 +542,7 @@ workers:
     iphone: KIAN_IPHONE_TOKEN
     mac-mini: KIAN_MAC_MINI_TOKEN
   queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
+  queue_max_redrives: 1        # re-drive retries before an unacknowledgeable row is abandoned
 ```
 
 ```bash
@@ -606,8 +664,26 @@ The session goes `idle` with end reason `awaiting_input`; `kian pending <uuid>` 
 `kian confirm <uuid> <call-id> --approve|--reject` answers it (or the `confirm`/`pending` RPCs).
 Approving invokes the frozen call and appends its result; rejecting appends the honest error.
 Contract: [CONFIRMATION-MODEL](design/CONFIRMATION-MODEL.md)
-([ADR-033](design/decisions/ADR-033-durable-confirmation-plane.md)). Phase 1 supports plain
+([ADR-035](design/decisions/ADR-035-durable-confirmation-plane.md)). Phase 1 supports plain
 sessions — `ask` on a superagent worker agent refuses to start until phase 2.
+### Hook plugins (`sidecars:`)
+
+Operator-trusted sidecar processes subscribe to harness hooks over a stdio JSON-lines ABI
+([PLUGIN-SPEC](design/PLUGIN-SPEC.md)): `tool/pre` can deny a side effect before it happens (the
+honest error says which plugin and why), and every port is observable. Deadlines, digest-pinned
+spawns, quarantine and fail-closed defaults are the contract's own. Any language works — the
+in-tree [approval-gate reference](examples/hook-approval-gate/README.md) is a Python stdlib script:
+
+```yaml
+sidecars:
+  plugins:
+    approval-gate:
+      manifest: "/etc/kian/plugins/approval-gate.toml"
+  scopes:
+    server: ["approval-gate"]   # every session
+```
+
+Absent the `sidecars:` section, behavior is byte-identical — no bus, no spawns.
 
 ### Agent memory (notes + dreaming)
 
@@ -695,11 +771,40 @@ target/debug/kian archive run    --config kian.yaml          # verify → marker
 target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes + replay offline
 ```
 
+### Scheduled turns (`superagent.cron`)
+
+```yaml
+superagent:
+  cron:
+    schedules:
+      - id: night-audit
+        expr: "30 3 * * 1-5"          # or an @alias: @daily, @weekly, ...
+        tz: Europe/Berlin
+        target: { channel: lark, topic: ops }
+        prompt: "audit the repo and summarise drift"
+        worktree: true                # detached per-firing git tree
+```
+
+Every due slot is claimed once in `cron_firings` and runs as an ordinary turn — on the resident
+engine, or in a detached worktree when `worktree:` is declared (disk guards and
+`keep_on_failure` apply). Inspect and drive it from the CLI:
+
+```bash
+target/debug/kian cron list   --config kian.yaml            # declarations, next fire, last outcome
+target/debug/kian cron logs   --schedule night-audit --limit 20
+target/debug/kian cron run-now night-audit --config kian.yaml   # one explicit slot
+target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store row
+```
+
+Semantics: [design/CRON-MODEL.md](design/CRON-MODEL.md); decision:
+[ADR-034](design/decisions/ADR-034-cron-scheduler.md).
+
 ### Operator surfaces
 
 | Surface | What it does |
 |---------|--------------|
 | `kian tickets [--json]` | Read-only Ticket stage board: `queued`, `working`, `awaiting-answer`, `awaiting-review`, `delivery-retry`, `blocked-failed`, `idle` |
+| `kian board [--json]` / `kian tasks --all [--json]` | Read-only delegation task board: one row per task (task_id, assignee, attempt, outcome, gate); refuses with exit 2 while `superagent.board.enabled` is false |
 | `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
@@ -741,6 +846,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
 | `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — the frozen creation-time index renderer, and the read-only search/map views |
+| `kian-cron` | Wall-clock scheduling core: cron grammar, IANA zones, DST-aware next-fire, misfire/coalescing |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
 | `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |

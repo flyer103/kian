@@ -303,7 +303,7 @@ artifact.** Semantics: DESIGN §4.7; operator surface: the README's bundle-polic
 | Issue-watch multi-Ticket dogfood | GitHub poll-receive mode beside the webhook (`since` cursors, bounded backfill); `examples/issue-watch` v2 composes the whole stack — one Ticket per live issue, thread-keyed topics, mandate-bounded triagers, speak-rule deliveries through the outbox; v1 kept as `config-timer.yaml` | landed |
 | live validation | The eight-step validation protocol executed live against `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`): steps 1, 4, 5, 6, 7, 8 PASS with captured evidence; steps 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; the gap report filed the gaps (`examples/issue-watch/RUNLOG.md` §7) | executed (with honest negatives) |
 | gap fixes | The four gaps, all landed: the `User-Agent` stamp on every github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode; `spawn_topic` accepts the live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing work live; outbox park rebuilt at boot and surfaced per-ticket on the stage board; exec secret hygiene — shared core redactor + env policy, `env` dumps never persist secrets (the one cross-bundle-fence commit, filed separately) | landed |
-| Multiagent delegation (session-internal + roster) | The multiagent contract: delegation = a **child session** via `Thread` (one mechanism, no lighter tier) with a derived spawn identity (`spawn_uid`) so a replay cannot mint a duplicate child, and a completion delivered as a **pair of writes** with a reconciliation rule; cross-session composition = existing Thread/Mandate/subscription/`agent.id` + a config agent roster over `AgentDef` (`superagent.roster`, selected only through a read-only `list_agents`); the board ruling — a disposable `task_board` view plus a control path recomputed from the primary, **never** a board entity and never a control read on the view; a closed nine-value task-outcome vocabulary (an empty answer is never a success) plus a separate two-value spawn outcome; config-only caps (`max_children` 4, `max_depth` 1). **Zero new event kinds, no new table/route/ops method/metrics key, no core change**; **no event-payload key set changes before P4** — P1 adds message content inside new delegation wrappers and new reports, P2 adds three `spawn_worker` arguments (one constraint-3 change), and the two additive `thread/*` audit key groups are a P4 owner gate — [MULTIAGENT-MODEL](../design/MULTIAGENT-MODEL.md), [ADR-029](../design/decisions/ADR-029-multiagent-delegation-and-board.md) | designed (R14; nothing implemented) |
+| Multiagent delegation (session-internal + roster) | The multiagent contract: delegation = a **child session** via `Thread` (one mechanism, no lighter tier) with a derived spawn identity (`spawn_uid`) so a replay cannot mint a duplicate child, and a completion delivered as a **pair of writes** with a reconciliation rule; cross-session composition = existing Thread/Mandate/subscription/`agent.id` + a config agent roster over `AgentDef` (`superagent.roster`, selected only through a read-only `list_agents`); the board ruling — a disposable `task_board` view plus a control path recomputed from the primary, **never** a board entity and never a control read on the view; a closed nine-value task-outcome vocabulary (an empty answer is never a success) plus a separate two-value spawn outcome; config-only caps (`max_children` 4, `max_depth` 1). **Zero new event kinds, no new table/route/ops method/metrics key, no core change**; **no event-payload key set changes before P4** — P1 adds message content inside new delegation wrappers and new reports, P2 adds three `spawn_worker` arguments (one constraint-3 change), and the two additive `thread/*` audit key groups are a P4 owner gate — [MULTIAGENT-MODEL](../design/MULTIAGENT-MODEL.md), [ADR-029](../design/decisions/ADR-029-multiagent-delegation-and-board.md) | implemented P1–P4 (R15–R17; tests only — no live-run evidence) |
 
 Known deviations, kept visible (the honest v1 record): a kian **Ticket v1 = one worker
 session** (one `thread/started`), not the prototype's full resumable lifecycle; **an ended
@@ -423,6 +423,7 @@ goldens.**
 | Registration (KiandProto v1) | Worker-dial `register`/`welcome`/`rejected` handshake over the same line framing; closed five-reason refusal set (`version_mismatch`/`bad_token`/`duplicate_static`/`id_conflict`/`disabled`) with typed terminal-vs-retryable reactions; worker-side `bye`; legacy static `hello`→`welcome` kept at v1; upgrade order kian-first, no v0 shim — API-CONTRACT §8 | landed |
 | Membership directory + liveness | Runtime-only directory (id → description, version, generation, last-seen, peer); state is **computed** (online = live connection ∧ fresh heartbeat); durable projection is the existing `endpoint_registry` row plus the ADR-025 last-declared cache columns (migration v4 — declarations, not liveness); duplicate dynamic id replaces (generation+1, audited); static-vs-dynamic id collision refused; stale ids never pruned (offline-known stays honest) | landed |
 | Queue-first dispatch | `exec` enqueues durably by the bound worker id with no live-route requirement; rows park `pending` until the worker registers or the honest `queue_timeout` abandons them; no cross-worker dispatch, no failover; runtime routes attach/detach with membership | landed |
+| Bounded queue re-drive | At-least-once re-drive terminates: `exec_queue.dispatch_attempts` (exec migration v6) counts dispatches, an `inflight` row re-drives only below `1 + workers.queue_max_redrives` (default 1, 0 = first dispatch only, ceiling 16), and a spent bound converges the row `inflight → abandoned` once no live lease is held — one audit line, no fabricated result, no new status/event/wire — [ADR-035](../design/decisions/ADR-033-bounded-queue-redrive.md) | landed |
 | Router surface | `spawn_worker.exec_worker` is a plain non-empty string (no enum, no catalog block — supersedes ADR-020 D5–D7); one frozen prompt instruction line; new read-only `list_workers` tool (id, description?, state, bound session/thread; a registry-only id's description comes from the ADR-025 last-declared cache with `declaration_stale: true`); spawn validates against the runtime catalog — unknown refused naming known ids, offline-known allowed with a queue note, busy refused naming the owner; no membership byte ever enters a prompt or tool schema | landed |
 | Operator verb | `kian workers [--json]`: read-only embedded view over the durable projection (id, state, last-seen, bound session/thread, and — since ADR-025 — the last-declared description/protocol version when declared; absent otherwise) | landed |
 | Security boundary | Private-bind-only listener (loopback/RFC1918/CGNAT/ULA; wildcard counts as public) with `allow_public` override; env-only tokens (shared or per-worker enrollment, ADR-031), constant-time compare, redacting type, bounded failed attempts; token never in config/argv/logs/events/metrics | landed |
@@ -485,7 +486,7 @@ recorded ("a durable pending-confirmation state, a human/control-plane response 
 inbox, and hold semantics") and the superagent `awaiting-answer` stage's read-side-only deviation.
 
 The normative contract is [design/CONFIRMATION-MODEL.md](../design/CONFIRMATION-MODEL.md); the
-decision record is [ADR-033](../design/decisions/ADR-033-durable-confirmation-plane.md). The catalog
+decision record is [ADR-035](../design/decisions/ADR-035-durable-confirmation-plane.md). The catalog
 deltas (the 23rd kind `control/confirm`; the widened `tool/call.permission.evaluated` and
 `session/ended.reason`) landed with the code in EVENT-MODEL and API-CONTRACT, and the drift tests
 pin them together.
@@ -504,6 +505,23 @@ while waiting). No L3 claim in phase 1 (no UI card; the `pending` read is its se
 Non-goals recorded with phase 1: no hook `ask`, no channel answering, no automatic expiry, no
 `ask` on worker/resident agents, no new session state, no `LoopDriver`/`LoopOutcome` change, no
 outbox row for the request.
+### Scheduled turns (cron, P0–P1 landed)
+
+Scope: wall-clock scheduled work executes as ordinary durable turns — no schedule-execution
+engine, no new event kinds. The normative contract is
+[design/CRON-MODEL.md](../design/CRON-MODEL.md); the decision record is
+[ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-cron, kian-store, kian-cli | Five-field/`@`-alias grammar with IANA zones and DST gap/overlap rules; durable `cron_schedules`/`cron_firings` (sqlite + postgres, migration v7); claim-before-dispatch cursor; `kian cron list\|run-now\|logs\|rm`; config-only declarations, fail-closed at load | landed |
+| P1 | kian-cli | Worktree-backed firings: detached per-firing git tree, harness invocation, diff/stderr capture, `keep_on_failure`, free-space floor and total-cap GC; catch-up coalescing; one JSON tick report per decision | landed |
+| P2 | kian-cli, kian-store | Config-writing `kian cron add`, store-scoped schedules, per-firing `sandbox.*` knobs, `queue`/`kill-previous` overlap enforcement | designed |
+
+No new event kinds: a firing is an ordinary admitted turn. The admitted input carries the
+additive, non-context `cron` key plus a `cron:<firing_id>` idempotency key, so the model request
+bytes are the prompt alone. The tick loop and the durable adapter are exercised in-process (L2);
+the grammar, DST, misfire, store and worktree paths carry unit coverage (L1).
 
 ### Deferred (unchanged)
 | Item | Reason |

@@ -7,7 +7,10 @@
 //! calling tool: connected → send immediately; offline → the row parks as
 //! `pending` and the driver re-drives on the next connect (a `server`
 //! restart re-drives `inflight` rows too — at-least-once to the endpoint,
-//! deduped by command id at the row level).
+//! deduped by command id at the row level). Re-drive is **bounded**
+//! (ADR-033): a row whose result was lost gets [`RemoteExecConfig::max_redrives`]
+//! retries and is then abandoned, so a command that destroys its own ack
+//! path (restarting the server or its worker) converges instead of looping.
 //!
 //! The caller's future resolves from the correlated result. How long it
 //! waits is per phase (ADR-030): the *dispatch* wait is `queue_timeout`, and
@@ -202,6 +205,14 @@ pub struct RemoteExecConfig {
     /// Idle poll of the queue table while connected (a safety net behind
     /// the wake-up; also refreshes the registry projection).
     pub poll_interval: Duration,
+    /// How many times an `inflight` row may be **re-driven** after its
+    /// result was lost (ADR-033). The bound exists so at-least-once re-drive
+    /// terminates: a command whose own side effect destroys the ack path
+    /// (restarting the server, killing its worker) can never be
+    /// acknowledged, so the driver abandons the row after `1 + max_redrives`
+    /// dispatches instead of replaying it forever. `0` disables re-drive
+    /// entirely (first dispatch only).
+    pub max_redrives: u32,
 }
 
 impl Default for RemoteExecConfig {
@@ -209,6 +220,7 @@ impl Default for RemoteExecConfig {
         Self {
             queue_timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(250),
+            max_redrives: 1,
         }
     }
 }
@@ -1196,6 +1208,13 @@ async fn drive_row_inner(
     // is liveness only; command-id correlation is the safety net).
     // Same-holder claims always land, so single-process behavior is
     // unchanged.
+    //
+    // The same statement counts the dispatch attempt and enforces the
+    // re-drive bound (ADR-033): a `pending` row always dispatches, an
+    // `inflight` row only while its attempts are below `1 + max_redrives`.
+    // At-least-once therefore terminates even for a command that destroys
+    // its own ack path.
+    let max_dispatches = 1u32.saturating_add(core.config.max_redrives);
     let lease_ttl_ms = duration_ms_i64(core.row_lease_ttl);
     match core
         .store
@@ -1204,11 +1223,46 @@ async fn drive_row_inner(
             &core.row_lease_holder,
             lease_ttl_ms,
             now_ms(),
+            max_dispatches,
         )
         .await
     {
         Ok(true) => {}
+        // Two causes, told apart by the store: a fresh foreign lease (that
+        // replica owns the row — leave it untouched), or a spent re-drive
+        // bound (converge the row now). The convergence transition is
+        // guarded on "no live lease", so it cannot abandon a row another
+        // driver is dispatching right now.
         Ok(false) => {
+            // Only a row that already looks spent is worth the convergence
+            // write; the common case (a fresh foreign lease) stays a read-only
+            // skip with no writer-lock churn on the poll path.
+            let looks_exhausted = matches!(row.status, QueueStatus::Inflight)
+                && row.dispatch_attempts >= max_dispatches;
+            if looks_exhausted {
+                match core
+                    .store
+                    .abandon_exhausted(row.command_id, max_dispatches, now_ms())
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::warn!(
+                            command_id = %row.command_id,
+                            endpoint = %row.endpoint_id,
+                            dispatch_attempts = row.dispatch_attempts,
+                            max_dispatches,
+                            max_redrives = core.config.max_redrives,
+                            tool_call_ref = row.tool_call_ref.as_deref().unwrap_or(""),
+                            "queue row abandoned: re-drive bound exhausted — the command ran without ever delivering a result (its side effect can destroy the ack path, e.g. restarting the server or its worker); at-least-once re-drive stops here"
+                        );
+                    }
+                    // A live lease (or a concurrent settle) still owns the
+                    // outcome; the next loop turn re-reads and converges.
+                    Ok(false) => {}
+                    Err(e) => return Err(format!("exhausted re-drive convergence failed: {e}")),
+                }
+                return Ok(());
+            }
             tracing::debug!(
                 command_id = %row.command_id,
                 holder = %core.row_lease_holder,

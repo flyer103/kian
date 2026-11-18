@@ -129,14 +129,19 @@ when the owner asks. Negative results commit documentation only — never broken
   **Any memory semantic change starts here**; the kind bytes stay in EVENT-MODEL, the wire in
   API-CONTRACT, the placement in DESIGN.
 - `design/CONFIRMATION-MODEL.md` — the normative confirmation-plane contract (source of truth,
-  phase 1 designed / not yet landed): what an `ask` is, the pending-call projection, the
-  `awaiting_input` resumable end, the answer as an admitted control row and the resume rule.
+  phase 1 landed): what an `ask` is, the pending-call projection, the `awaiting_input` resumable
+  end, the answer as an admitted control row and the resume rule.
   **Any `ask`/confirmation semantic change starts here**; the kind bytes and wire tables land in
   EVENT-MODEL / API-CONTRACT with the implementation (both are drift-tested against code).
 - `design/READ-MODEL.md` — the normative serving-form contract (source of truth): versions,
   unchanged/delta reads, resumable streams, verified snapshots, materialized views, opt-in
   export-only retention and bounded-staleness reads. Truth stays the event stream; wire shapes
   stay in API-CONTRACT. **Any serving/read-surface change starts here**.
+- `design/CRON-MODEL.md` — the normative wall-clock-scheduling contract (source of truth, P0/P1
+  landed): cron expressions, timezones and DST rules, the durable schedule cursor, misfire and
+  overlap policy, worktree-backed firings and disk guards, the `kian cron` CLI and the
+  "why didn't it run" records. **Any scheduling-semantic change starts here**; a firing is an
+  ordinary turn, so the kind bytes stay in EVENT-MODEL and the wire in API-CONTRACT.
 - `design/CHANNEL-WECHAT.md` — the normative WeChat iLink channel contract (source of truth,
   best-effort by contract): protocol mapping, credential file, config/CLI, receive allowlist,
   dedupe and the cursor bound, degradation. **Any WeChat channel change starts here**; a protocol

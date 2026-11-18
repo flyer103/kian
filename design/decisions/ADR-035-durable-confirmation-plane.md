@@ -1,6 +1,6 @@
-# ADR-033: The durable confirmation plane — `ask` as a deferred tool call, a fifth end reason, and the answer as an admitted control row
+# ADR-035: The durable confirmation plane — `ask` as a deferred tool call, a fifth end reason, and the answer as an admitted control row
 
-- **Status**: accepted (owner gate, 2026-11-15; append-only — ADR-001…032 immutable)
+- **Status**: accepted (owner gate, 2026-11-15; append-only — ADR-001…034 immutable)
 - **Date**: 2026-11-15
 - **Related**: [design/CONFIRMATION-MODEL.md](../CONFIRMATION-MODEL.md) (normative semantics),
   [ADR-015](ADR-015-tool-permission-provenance.md) (§7: `ask` out of scope, "deferred, not
@@ -34,9 +34,10 @@ Two shapes were available and only one is kian-native.
    arm never invokes the tool and appends no `tool/result`; the drain ends.
 2. **The pending set is a projection, never a store.** `kian-core::confirmation::pending_calls`
    folds the stream: ask calls without an answering result, in order. It reads events (the
-   provenance key is non-context), is gated by the cheap necessary condition "the last end reason is
-   `awaiting_input`", and survives restarts by construction. No pending table, no inbox status
-   column, no in-memory wait. A `compact` range may not cut an unpaired ask.
+   provenance key is non-context), has **no** "last end reason is `awaiting_input`" gate — that
+   shortcut misses a drain that died after the ask append but before its end write — and survives
+   restarts by construction. No pending table, no inbox status column, no in-memory wait. A
+   `compact` range may not cut an unpaired ask.
 3. **A fifth end reason `awaiting_input`** (widened `session/ended.reason`) projects
    `running → idle`: the session is resumable, holds no lease, and is never reported completed while
    a call is pending. It is a widening of a closed value set, not an envelope shape change — no

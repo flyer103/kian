@@ -147,6 +147,18 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   from the durable record. For the v2 filesystem family the same rule is recorded explicitly:
   `fs_list`/`fs_read` are idempotent, and a repeated `fs_write` writes the same path and content
   again (mtime may move) — never a different payload.
+- **Re-drive is bounded** ([ADR-035](decisions/ADR-033-bounded-queue-redrive.md)). At-least-once
+  must also terminate, so every dispatch counts an attempt: a `pending` row always dispatches,
+  while an `inflight` row re-drives only while its `dispatch_attempts` are below
+  `1 + workers.queue_max_redrives` (default `1`; `0` = first dispatch only; global by construction,
+  like the queue timeout). A row whose result was lost to a transport loss therefore gets its
+  retry; a row that keeps losing its result because the **command itself** destroyed the ack path
+  — `systemctl restart kian`, `pkill kiand` — can never be acknowledged, so the driver converges
+  it: `inflight → abandoned` once the bound is spent **and** no live lease is held, with one audit
+  line naming command id, endpoint, attempt count and `tool_call_ref`. No result is fabricated, no
+  row is deleted, no new status or event exists; a caller re-attaching after the fact reads
+  `abandoned` and gets the honest timeout. The bound is a recovery cap, not a retry policy: a row
+  abandoned here may have run — the audit line says so.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
 - **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being

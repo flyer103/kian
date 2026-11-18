@@ -11,6 +11,10 @@ kian-core.workspace = true
 # and consumes the provider/slot machinery from kian-llm.
 kian-llm.workspace = true
 kian-orchestrator.workspace = true
+# PLUGIN-SPEC §4 row (b)-(f): the loop consults the hook bus at its
+# five ReAct sites. The bus instance is injected at construction — the
+# loop never builds one (ADR-028 D4's one allowed new edge).
+kian-plugin.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

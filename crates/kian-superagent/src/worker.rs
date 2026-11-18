@@ -78,13 +78,19 @@ use uuid::Uuid;
 
 use crate::inbox::{InboxWriteError, InboxWriter};
 use crate::multiagent::{
-    MultiagentLimits, Reconcile, SpawnIdentity, child_session_id, derive_outcome, join_target,
-    reconcile_completion, report_key_for,
+    BoardGating, MultiagentLimits, Reconcile, SpawnIdentity, child_session_id, derive_outcome,
+    join_target, outcome_evidence_ref, outcome_for_completion, reconcile_completion,
+    report_key_for,
 };
 
 /// Gate name the worker wrapper stamps on its verdicts (distinct from
 /// the built-in loop's `builtin` so both can coexist on one stream).
 pub const WORKER_GATE_NAME: &str = "worker";
+
+/// (R17-C3, pin P2-4) Gate name the roster's `output_schema` gate
+/// stamps on its verdicts — the only gate name that derives
+/// [`crate::multiagent::TaskOutcome::InvalidOutput`] (pin P2-5).
+pub const SCHEMA_GATE_NAME: &str = "output_schema";
 
 /// Idempotency key for a spawned worker's task input row (one row per
 /// thread, never two).
@@ -221,26 +227,36 @@ pub fn delegation_mandate(content: &Value) -> Option<&Value> {
 // ---------------------------------------------------------------------------
 
 /// Reads the derived task identity off a delegation wrapper — the
-/// inverse of the four additive keys [`WorkerSpawner::prepare`]
-/// appends on the multiagent path (`spawn_uid`, `task_id`,
-/// `agent_def`, `agent_def_version`, pin P6). The child side and the
-/// completion reconciliation recover the identity from the wrapper
-/// bytes alone (the resolution is recorded, never re-resolved,
-/// §2.1.1), so a replay rehydrates rather than re-consults.
+/// inverse of the additive keys [`WorkerSpawner::prepare`] appends on
+/// the multiagent path (`spawn_uid`, `task_id`, `agent_def`,
+/// `agent_def_version`, and — R17-C2 — `assignee`, pin P6/P2-8). The
+/// child side and the completion reconciliation recover the identity
+/// from the wrapper bytes alone (the resolution is recorded, never
+/// re-resolved, §2.1.1), so a replay rehydrates rather than
+/// re-consults.
 ///
-/// `None` on legacy wrappers (the keys are absent — the legacy path
-/// never writes them) and on partially-written or malformed ones: the
-/// identity is never guessed, never defaulted, never reconstructed
-/// from `thread_id` (a malformed writer is a bug to surface, not a
-/// value to paper over).
+/// `thread_id` is read from the wrapper's own frozen `thread_id` key
+/// (pin P2-8: it is no longer derivable from `task_id` once a
+/// `task_key` splits the two). `assignee` is `None` on wrappers
+/// written before the roster resolved one (the P1 form) — absent,
+/// never guessed. `None` on legacy wrappers (the keys are absent —
+/// the legacy path never writes them) and on partially-written or
+/// malformed ones: the identity is never guessed, never defaulted,
+/// never reconstructed from `thread_id` alone (a malformed writer is
+/// a bug to surface, not a value to paper over).
 #[must_use]
 pub fn spawn_identity_of(wrapper: &Value) -> Option<SpawnIdentity> {
     let obj = wrapper.as_object()?;
     Some(SpawnIdentity {
         spawn_uid: Uuid::parse_str(obj.get("spawn_uid")?.as_str()?).ok()?,
+        thread_id: Uuid::parse_str(obj.get("thread_id")?.as_str()?).ok()?,
         task_id: Uuid::parse_str(obj.get("task_id")?.as_str()?).ok()?,
         agent_def: obj.get("agent_def")?.as_str()?.to_string(),
         agent_def_version: obj.get("agent_def_version")?.as_u64()?,
+        assignee: obj
+            .get("assignee")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -253,8 +269,10 @@ pub fn spawn_identity_of(wrapper: &Value) -> Option<SpawnIdentity> {
 /// top level, the `spawn_worker` tool argument, and the spawn result
 /// echo. The value is the configured `endpoints[].id`, an opaque
 /// non-empty string. `worker` stays the worker **session** uuid and
-/// is never reused for the id.
-pub const EXEC_WORKER_KEY: &str = "exec_worker";
+/// is never reused for the id. The constant lives in
+/// `kian-plugin::hooks` (frame identity's crate) and is re-exported
+/// here so the two spellings cannot drift.
+pub const EXEC_WORKER_KEY: &str = kian_plugin::hooks::EXEC_WORKER_KEY;
 
 /// The binding state of one surface (D2): the key is absent (legacy
 /// unbound, byte-identical), present with a non-empty string value
@@ -547,7 +565,7 @@ pub fn thread_report_content_ident(
     summary: Value,
     contract: Option<Value>,
 ) -> Value {
-    let mut report = thread_report_content(identity.task_id, status, summary);
+    let mut report = thread_report_content(identity.thread_id, status, summary);
     report["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
     report["task_id"] = Value::String(identity.task_id_str());
     if let Some(contract) = contract {
@@ -773,9 +791,9 @@ impl WorkerSpawner {
     ///
     /// When `request.identity` is `Some` (the multiagent path, R15
     /// plan §4 C2) both ids are **derived from the identity** (pin
-    /// P1): the thread id is the identity's `task_id` (the derived
-    /// thread id, pin P7 — equal to
-    /// `child_thread_id(parent, spawn_uid)` by construction) and the
+    /// P1): the thread id is the identity's `thread_id` (pin P2-8 —
+    /// `child_thread_id(parent, spawn_uid)`, **never** `task_id`,
+    /// which a shared `task_key` would collide across spawns) and the
     /// worker session is `child_session_id(thread_id)`. Derived,
     /// never minted: a replay of the same committed `tool/call`
     /// recomputes the same child instead of minting a second one
@@ -784,12 +802,12 @@ impl WorkerSpawner {
     #[must_use]
     pub fn prepare(&self, request: &SpawnRequest) -> SpawnedWorker {
         let (thread_id, worker_session) = match &request.identity {
-            // Pin P1: the identity carries the resolution — the thread
-            // id is taken from it (never re-minted) and the worker
-            // session is derived from that thread id, so preparing the
-            // same identity twice yields identical ids and identical
-            // wrapper bytes.
-            Some(identity) => (identity.task_id, child_session_id(identity.task_id)),
+            // Pin P1/P2-8: the identity carries the resolution — the
+            // thread id is taken from it (never re-minted) and the
+            // worker session is derived from that thread id, so
+            // preparing the same identity twice yields identical ids
+            // and identical wrapper bytes.
+            Some(identity) => (identity.thread_id, child_session_id(identity.thread_id)),
             None => (Uuid::new_v4(), SessionId::new()),
         };
         let thread = Thread {
@@ -827,11 +845,24 @@ impl WorkerSpawner {
         // appended after the existing additive keys — new wrappers
         // only; the legacy path writes none of them (absent, never
         // null), so every landed wrapper's byte order is untouched.
+        // (R17-C2, §2.1.1:264-269) two more appended keys, in the
+        // same discipline: `assignee` (the roster entry id the spawn
+        // resolved through — present iff a resolution happened) and
+        // `output_schema` (the class-B copy of the declared
+        // expectation, §3.2.1:438-441 — present iff one was declared;
+        // the child is thereby "told about" it, so a restart
+        // reconstructs the gate from its own stream).
         if let Some(identity) = &request.identity {
             wrapper["spawn_uid"] = Value::String(identity.spawn_uid.to_string());
             wrapper["task_id"] = Value::String(identity.task_id_str());
             wrapper["agent_def"] = Value::String(identity.agent_def.clone());
             wrapper["agent_def_version"] = json!(identity.agent_def_version);
+            if let Some(assignee) = &identity.assignee {
+                wrapper["assignee"] = Value::String(assignee.clone());
+            }
+            if let Some(schema) = &request.output_schema {
+                wrapper["output_schema"] = schema.clone();
+            }
         }
         let task_message = json!({"role": "user", "content": wrapper});
         SpawnedWorker {
@@ -872,6 +903,7 @@ impl WorkerSpawner {
             mandate,
             exec_worker: None,
             identity: None,
+            output_schema: None,
         })
         .await
     }
@@ -902,6 +934,15 @@ pub struct SpawnRequest {
     /// the seam: every future spawn-side fact composes here, never as
     /// loose fields.
     pub identity: Option<SpawnIdentity>,
+    /// (R17-C2, §3.2.1:438-441) the declared `output_schema` — the
+    /// call's, or the resolved roster entry's default when the call
+    /// declared none. Copied verbatim into the wrapper as the class-B
+    /// `output_schema` key **iff** one was declared: the child is
+    /// thereby "told about" the expectation, so a restart
+    /// reconstructs the gate from the child's own stream (constraint
+    /// 2). `None` (the `Default`) writes no key — absent, never
+    /// `null` — and the legacy path never sets it.
+    pub output_schema: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -929,12 +970,21 @@ pub enum LineagePlan {
 /// resident state). A stream is a worker stream iff it already carries
 /// a `thread/started` naming this session, or its **first** input
 /// carries the delegation wrapper.
+///
+/// (R17-C6, pin P4-1/P4-2) `gating` is the `superagent.board.gating`
+/// class-A switch: off (the default) the emitted bytes are exactly
+/// today's; on, a wrapper carrying the spawn identity gains the
+/// child-side keys — `spawn_uid` + the derivable `multiagent` subset
+/// (`task_id`, `assignee`) — over the same base payload. A wrapper
+/// without a readable identity writes no key (never guessed), and the
+/// wrapper itself never changes: the keys ride outside `content`.
 #[must_use]
 pub fn lineage_plan(
     events: &[Event],
     self_session: SessionId,
     router: SessionId,
     worker_version: u64,
+    gating: BoardGating,
 ) -> LineagePlan {
     if let Some(existing) = events
         .iter()
@@ -975,6 +1025,21 @@ pub fn lineage_plan(
         WorkerBinding::Unbound | WorkerBinding::Malformed => {
             thread_started_payload(&thread, self_session, &first_input.bytes)
         }
+    };
+    // (R17-C6, pin P4-2): the child-side class-A keys — only when the
+    // gate is on AND the wrapper carries a readable identity (all
+    // four pin-P6 class-B keys; a partial identity is malformed
+    // history and writes no key, never a guess). The keys compose
+    // over the base payload above, so the bound form keeps its
+    // `exec_worker` key and the wrapper bytes never move.
+    let started_bytes = match (gating.is_on(), spawn_identity_of(content)) {
+        (true, Some(identity)) => crate::audit::child_thread_started_payload(
+            started_bytes,
+            identity.spawn_uid,
+            identity.task_id,
+            identity.assignee.as_deref(),
+        ),
+        _ => started_bytes,
     };
     LineagePlan::Emit {
         thread_id: delegation.thread_id,
@@ -1024,6 +1089,185 @@ pub fn completion_summary(events: &[Event], fallback_text: &str) -> Value {
         }
     }
     json!({"text": fallback_text})
+}
+
+// ---------------------------------------------------------------------------
+// The output_schema gate (R17-C3, pin P2-4 — pure planning half)
+// ---------------------------------------------------------------------------
+
+/// The roster assignee of one committed stream (pin P2-2): the
+/// **first** `input/admitted` wrapper's additive `assignee` key — the
+/// recorded resolution (§2.1.1), never a live-config re-resolution.
+/// `None` on legacy wrappers and non-wrapper streams.
+#[must_use]
+pub fn stream_assignee_of(events: &[Event]) -> Option<String> {
+    let assignee = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::InputAdmitted)?
+        .bytes
+        .get("content")?
+        .get("assignee")
+        .and_then(Value::as_str)?;
+    if assignee.is_empty() {
+        return None;
+    }
+    Some(assignee.to_string())
+}
+
+/// The final assistant answer text, if the stream carries one (the
+/// same read [`completion_summary`] performs). `None` when there is no
+/// assistant message or its text is blank — an **empty** final answer
+/// never enters the schema gate (`empty_output` owns that case,
+/// §6.2 row 3).
+#[must_use]
+pub fn final_assistant_answer(events: &[Event]) -> Option<String> {
+    for ev in events.iter().rev() {
+        if ev.kind == EventKind::AssistantMessage
+            && let Some(text) = ev
+                .bytes
+                .get("content")
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+        {
+            return if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            };
+        }
+    }
+    None
+}
+
+/// The idempotency key of the schema-gate correction input (pin P2-4,
+/// §13 pattern): `schema-correction:<spawn_uid>:<attempt>` — derived
+/// from the committed wrapper's `spawn_uid` and the stream-derived
+/// attempt, so a replay of the same committed events re-derives the
+/// same key (byte-stable) and a retried drive never double-appends.
+#[must_use]
+pub fn schema_correction_key(spawn_uid: &str, attempt: u64) -> String {
+    format!("schema-correction:{spawn_uid}:{attempt}")
+}
+
+/// The correction input's committed bytes (pin P2-4): a synthetic
+/// input whose `kian_schema_check` object carries the failed checks
+/// with their honest detail lines, plus the attempt the key derives
+/// from. Pure: same failed checks, same bytes.
+#[must_use]
+pub fn schema_correction_content(attempt: u64, checks: &[kian_loop::CheckOutcome]) -> Value {
+    let errors: Vec<Value> = checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| {
+            let mut row = json!({"name": check.name});
+            if let Some(detail) = &check.detail {
+                row["detail"] = Value::String(detail.clone());
+            }
+            row
+        })
+        .collect();
+    json!({
+        "synthetic": true,
+        "content": {"kian_schema_check": {"attempt": attempt, "errors": errors}},
+    })
+}
+
+/// Counts the correction inputs already committed on the stream (the
+/// schema gate's stream-derived attempt counter — the same discipline
+/// as `evaluate_evidence_gate`'s verdict count: the budget survives
+/// episodes and takeover because it is read off the committed bytes).
+#[must_use]
+pub fn schema_correction_count(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .filter(|ev| {
+            ev.kind == EventKind::InputAdmitted
+                && ev.bytes.get("synthetic") == Some(&json!(true))
+                && ev.bytes.pointer("/content/kian_schema_check").is_some()
+        })
+        .count() as u64
+}
+
+/// One roster-subset keyword check rendered as a gate-verdict check
+/// row (the `{keyword, passed, detail?}` shape mapped onto the verdict
+/// payload's `{name, passed, detail?}`).
+fn check_row(check: &crate::roster::CheckOutcome) -> kian_loop::CheckOutcome {
+    kian_loop::CheckOutcome {
+        name: check.keyword.clone(),
+        passed: check.passed,
+        detail: check.detail.clone(),
+    }
+}
+
+/// Evaluates the final answer text against the declared subset schema
+/// (pin P2-3): an unparseable answer is the `json_parse` violation;
+/// a parseable one is validated keyword for keyword. Pure.
+#[must_use]
+pub fn schema_gate_checks(schema: &Value, answer: &str) -> Vec<kian_loop::CheckOutcome> {
+    match serde_json::from_str::<Value>(answer.trim()) {
+        Err(error) => vec![kian_loop::CheckOutcome {
+            name: "json_parse".to_string(),
+            passed: false,
+            detail: Some(format!("the final answer is not valid JSON: {error}")),
+        }],
+        Ok(instance) => crate::roster::validate_instance(schema, &instance)
+            .iter()
+            .map(check_row)
+            .collect(),
+    }
+}
+
+/// The schema gate's plan for one terminal outcome (pin P2-4), a pure
+/// function of the committed stream:
+///
+/// - [`SchemaGatePlan::Skip`] — no `output_schema` on the wrapper, or
+///   the final answer is empty (never a schema miss, §6.2 row 3);
+/// - [`SchemaGatePlan::Pass`] — every check passed (the gate stays
+///   silent: no verdict is committed, `completed_unverified` keeps the
+///   label unless the *worker* gate verifies it);
+/// - [`SchemaGatePlan::Miss`] — the failed checks, the stream-derived
+///   attempt (committed corrections), and the wrapper's `spawn_uid`
+///   (the correction-key derivation; `None` on a wrapper without one —
+///   no key can be derived, so the miss goes straight to the verdict).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaGatePlan {
+    /// No declared schema, or an empty final answer: the gate appends
+    /// nothing at all (M8 — a wrapper without `output_schema` keeps
+    /// today's bytes exactly).
+    Skip,
+    /// Every check passed: the honest silence — no verdict, no bytes.
+    Pass,
+    /// The failed checks, the stream-derived attempt, and the wrapper's
+    /// `spawn_uid` for the correction-key derivation.
+    Miss {
+        checks: Vec<kian_loop::CheckOutcome>,
+        attempt: u64,
+        spawn_uid: Option<String>,
+    },
+}
+
+/// Plans the schema gate for one drive off the committed events alone.
+#[must_use]
+pub fn schema_gate_plan(events: &[Event]) -> SchemaGatePlan {
+    let wrapper = first_input_content(events);
+    let Some(schema) = wrapper.get("output_schema") else {
+        return SchemaGatePlan::Skip;
+    };
+    let Some(answer) = final_assistant_answer(events) else {
+        return SchemaGatePlan::Skip;
+    };
+    let checks = schema_gate_checks(schema, &answer);
+    if checks.iter().all(|check| check.passed) {
+        return SchemaGatePlan::Pass;
+    }
+    SchemaGatePlan::Miss {
+        checks,
+        attempt: schema_correction_count(events),
+        spawn_uid: wrapper
+            .get("spawn_uid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1555,14 @@ pub struct WorkerLoopConfig {
     /// byte-identically (M8): the ambient [`WorkerLoopConfig::router`]
     /// admits the legacy report under the legacy key.
     pub multiagent: Option<MultiagentLimits>,
+    /// (R17-C6, pin P4-1) The `superagent.board.gating` class-A
+    /// emission switch: `false` (the default) ⇒ the child-side
+    /// `thread/started` and `thread/completed` payloads keep their
+    /// P3 bytes exactly; `true` ⇒ each gains `spawn_uid` + the
+    /// `multiagent` audit group (the derivable subset on `started`,
+    /// the outcome group on `completed` — `crates/kian-superagent/
+    /// src/audit.rs`). Wiring only; the config block is C4's.
+    pub board_gating: BoardGating,
 }
 
 /// A decorator over any inner [`LoopDriver`] that adds Thread lineage
@@ -1330,6 +1582,13 @@ struct DriverCore<D: LoopDriver> {
     inbox: Arc<dyn InboxWriter>,
     config: WorkerLoopConfig,
     port_for: PortFor<D::Ctx>,
+    /// Port (e) — `settle/pre` (PLUGIN-SPEC §4.6): the hook bus this
+    /// gate consults before propagating `LoopOutcome::Settled` on a
+    /// worker stream. `None` mounts no gate — today's behavior,
+    /// byte-identical. Worker-lineage only by construction (§3.4.4):
+    /// the gate sits on the `Some(thread_id)` path, which a non-worker
+    /// stream never reaches.
+    hooks: Option<kian_plugin::hooks::HookBus>,
 }
 
 impl<D: LoopDriver> Clone for WorkerLoopDriver<D> {
@@ -1351,12 +1610,27 @@ impl<D: LoopDriver> WorkerLoopDriver<D> {
         config: WorkerLoopConfig,
         port_for: PortFor<D::Ctx>,
     ) -> Self {
+        Self::with_hooks(driver, inbox, config, port_for, None)
+    }
+
+    /// [`WorkerLoopDriver::new`] with the settle-gate bus mounted
+    /// (PLUGIN-SPEC §4.6): the completion gate exists exactly where
+    /// this wrapper is mounted **and** the stream is a worker stream —
+    /// `RouterDriver` and `ServeLoopDriver` never consult (§3.4.4).
+    pub fn with_hooks(
+        driver: Arc<D>,
+        inbox: Arc<dyn InboxWriter>,
+        config: WorkerLoopConfig,
+        port_for: PortFor<D::Ctx>,
+        hooks: Option<kian_plugin::hooks::HookBus>,
+    ) -> Self {
         Self {
             inner: Arc::new(DriverCore {
                 driver,
                 inbox,
                 config,
                 port_for,
+                hooks,
             }),
         }
     }
@@ -1408,7 +1682,30 @@ where
                         Phase::Done => return None,
                         Phase::Lineage(ctx, port) => {
                             match begin_lineage(&core, Arc::clone(&port)).await {
-                                Ok(thread_id) => {
+                                Ok((thread_id, events)) => {
+                                    // §9.2 steps 1–4 at the drain/claim
+                                    // boundary (PLUGIN-SPEC): when the
+                                    // settle-gate bus is mounted, the same
+                                    // instance's session-consistency guard
+                                    // records the set digest at first sight
+                                    // and re-checks it on every claim this
+                                    // process serves. The frame carries the
+                                    // session's durable `exec_worker`
+                                    // binding (§7.3/§8.2) — derived from the
+                                    // same stream read the lineage
+                                    // classification just made, never from
+                                    // resident state — so a worker-bound
+                                    // session resolves its narrowed set and
+                                    // the digest records that set, not the
+                                    // server scope's.
+                                    if let Some(bus) = core.hooks.as_ref() {
+                                        bus.session_begin(kian_plugin::hooks::FrameInfo {
+                                            session: port.session(),
+                                            worker: settle_view_worker(&events, port.session()),
+                                            seq: 0,
+                                            epoch: None,
+                                        });
+                                    }
                                     let stream = core.driver.drive(ctx.clone());
                                     phase = Phase::Inner {
                                         ctx,
@@ -1443,6 +1740,27 @@ where
                                     // pass-through of the terminal outcome.
                                     None => Some((outcome, Phase::Done)),
                                     Some(thread_id) => {
+                                        // Port (e) — `settle/pre`
+                                        // (§4.6 step 2): consulted ONLY
+                                        // for `LoopOutcome::Settled` (the
+                                        // loop's own completion decision);
+                                        // `SoftFailed`, `Stopped` and every
+                                        // interrupt path propagate
+                                        // untouched (§3.4.2's protected
+                                        // classes never reach the port).
+                                        if matches!(outcome, LoopOutcome::Settled)
+                                            && let Some(bus) = core.hooks.clone()
+                                            && let Some((yielded, next)) = settle_gate(
+                                                &core,
+                                                &bus,
+                                                Arc::clone(&port),
+                                                thread_id,
+                                                outcome.clone(),
+                                            )
+                                            .await
+                                        {
+                                            return Some((yielded, next));
+                                        }
                                         phase = Phase::Terminal {
                                             ctx,
                                             port,
@@ -1484,10 +1802,13 @@ where
 
 /// built-in: classify the stream and, for a fresh worker, append the
 /// `thread/started` lineage event. Pure decision via [`lineage_plan`].
+/// Returns the classified thread id **and the events read** — the
+/// drain-boundary §9.2 guard derives the session's durable worker
+/// binding from the same read, never a second one.
 async fn begin_lineage<D>(
     core: &DriverCore<D>,
     port: Arc<dyn StreamPort>,
-) -> Result<Option<Uuid>, String>
+) -> Result<(Option<Uuid>, Vec<Event>), String>
 where
     D: LoopDriver,
 {
@@ -1500,9 +1821,10 @@ where
         port.session(),
         core.config.router,
         core.config.worker_version,
+        core.config.board_gating,
     ) {
-        LineagePlan::PassThrough => Ok(None),
-        LineagePlan::Resume { thread_id } => Ok(Some(thread_id)),
+        LineagePlan::PassThrough => Ok((None, events)),
+        LineagePlan::Resume { thread_id } => Ok((Some(thread_id), events)),
         LineagePlan::Emit {
             thread_id,
             started_bytes,
@@ -1510,8 +1832,179 @@ where
             port.emit(EventKind::ThreadStarted, started_bytes)
                 .await
                 .map_err(|e| format!("worker lineage: thread/started write failed: {e}"))?;
-            Ok(Some(thread_id))
+            Ok((Some(thread_id), events))
         }
+    }
+}
+
+/// Port (e) — the §4.6 settle gate, one consultation of a mounted bus
+/// before `LoopOutcome::Settled` propagates on a worker stream.
+///
+/// Returns `Some((yielded, next_phase))` when the gate decides the
+/// drive must not reach the terminal decoration:
+/// - `Deny` — the marker row is durable; the outcome propagates
+///   unchanged and the engine's own check re-arms the loop
+///   (`Supervised::Settled` + eligible input → `continue 'episodes`),
+///   so the completion pair is written only when the session really
+///   settles (§4.6 step 3);
+/// - `AdmitFailed` — the three-step failure path: the gate does NOT
+///   settle; the append error propagates as the driver's honest
+///   failure through the existing route (step 1 of §4.6's path), and
+///   the budget was consumed anyway via the bus's in-process counter.
+///
+/// `None` (Allow, Override, or an unreadable stream) proceeds to the
+/// terminal decoration exactly as today.
+async fn settle_gate<D>(
+    core: &DriverCore<D>,
+    bus: &kian_plugin::hooks::HookBus,
+    port: Arc<dyn StreamPort>,
+    _thread_id: uuid::Uuid,
+    outcome: LoopOutcome,
+) -> Option<(LoopOutcome, Phase<D::Ctx>)>
+where
+    D: LoopDriver,
+    D::Ctx: Clone + Send + Sync + 'static,
+{
+    // The same read tolerance `finish_thread` already applies: an
+    // unreadable stream cannot count a budget, and failing the session
+    // over the gate's own read would turn an observer into an outage.
+    let events = port.read_stream().await.unwrap_or_default();
+    let session = port.session();
+    let view = settle_view(&events, session);
+    let ctl = std::sync::Arc::new(GateCtl {
+        session,
+        inbox: Arc::clone(&core.inbox) as Arc<dyn InboxWriter>,
+        events,
+    });
+    match bus.settle(&view, ctl.as_ref()).await {
+        kian_plugin::hooks::SettleVerdict::Allow
+        | kian_plugin::hooks::SettleVerdict::Override { .. } => None,
+        // §4.6 step 3: the marker is durable; propagate unchanged. No
+        // terminal decoration this drive — the re-armed episode owns
+        // the completion pair when it truly settles.
+        kian_plugin::hooks::SettleVerdict::Deny { .. } => Some((outcome, Phase::Done)),
+        // §4.6's append-failure path, step 1: the outcome becomes the
+        // driver's honest failure — never `Settled`, never `completed`;
+        // the session stays recoverable and resumable.
+        kian_plugin::hooks::SettleVerdict::AdmitFailed { error, .. } => Some((
+            LoopOutcome::SoftFailed {
+                reason: format!("settle gate: veto marker admit failed: {error}"),
+            },
+            Phase::Done,
+        )),
+    }
+}
+
+/// The session's durable `exec_worker` binding as a frame `worker`
+/// string (§7.3): the bound id, or the honest empty floor for an
+/// unbound or malformed binding. Derived from the stream alone — the
+/// wrapper holds no resident binding, so replay rebuilds it.
+fn settle_view_worker(events: &[Event], session: SessionId) -> String {
+    match worker_binding_of(events, session) {
+        WorkerBinding::Bound(id) => id.into_owned(),
+        WorkerBinding::Unbound | WorkerBinding::Malformed => String::new(),
+    }
+}
+
+/// The §3.2.8 `settle/pre` view from the session's own stream.
+fn settle_view(events: &[Event], session: SessionId) -> kian_plugin::hooks::SettleView {
+    let turns = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::TurnStart))
+        .count() as u64;
+    let tool_calls = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::ToolCall))
+        .count() as u64;
+    // Episodes completed before this one: the stream is the sole truth,
+    // and a resumed session's prior `session/ended`s are exactly that.
+    let episodes = events
+        .iter()
+        .filter(|ev| matches!(ev.kind, EventKind::SessionEnded { .. }))
+        .count() as u64;
+    let evidence = events
+        .iter()
+        .rev()
+        .find(|ev| matches!(ev.kind, EventKind::EvidenceVerdict))
+        .and_then(|ev| ev.bytes.get("passed").and_then(Value::as_bool))
+        .map_or("none".to_string(), |passed| {
+            if passed { "passed" } else { "failed" }.to_string()
+        });
+    let frame = kian_plugin::hooks::FrameInfo {
+        session,
+        worker: settle_view_worker(events, session),
+        seq: events.last().map_or(0, |ev| ev.seq),
+        epoch: events.last().map(|ev| Some(ev.epoch.0)).unwrap_or(None),
+    };
+    kian_plugin::hooks::SettleView {
+        reason: "completed".to_string(),
+        turns,
+        tool_calls,
+        evidence,
+        // §3.2.8's `vetoes_used`/`vetoes_remaining` are per plugin: the
+        // bus rebuilds each subscriber's view with its own durable
+        // count and its own §6.1 limit before dispatch — the zeros here
+        // are the base view, never the numbers a gate reads.
+        vetoes_used: 0,
+        vetoes_remaining: 0,
+        episodes,
+        frame: Some(frame),
+    }
+}
+
+/// The `SettleCtl` the gate injects (§4.6): the two operations over
+/// what the wrapper already holds — the `InboxWriter` for the marker
+/// row (the existing, honest steer shape: `{"synthetic": true,
+/// "content": …}`, persisted before the model can see it) and the
+/// committed stream for the per-plugin veto count.
+struct GateCtl {
+    session: SessionId,
+    inbox: Arc<dyn InboxWriter>,
+    events: Vec<Event>,
+}
+
+impl kian_plugin::hooks::SettleCtl for GateCtl {
+    fn admit_synthetic(
+        &self,
+        content: String,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let inbox = Arc::clone(&self.inbox);
+        let session = self.session;
+        Box::pin(async move {
+            // Durable row first (persist-what-you-send), then the
+            // advisory wake — which folds, since this drain is in
+            // flight; the engine re-evaluates the inbox at Settled.
+            let receipt = inbox
+                .admit(
+                    session,
+                    serde_json::json!({"synthetic": true, "content": content}),
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = inbox.wake(session);
+            let _ = receipt;
+            Ok(())
+        })
+    }
+
+    fn veto_count(&self, plugin: &str) -> u64 {
+        // §4.6's budget predicate: `synthetic` + the plugin's marker
+        // prefix, never `role` — a projection of the durable stream.
+        self.events
+            .iter()
+            .filter(|ev| matches!(ev.kind, EventKind::InputAdmitted))
+            .filter(|ev| {
+                ev.bytes.get("synthetic").and_then(Value::as_bool) == Some(true)
+                    && ev
+                        .bytes
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| {
+                            kian_plugin::hooks::is_veto_marker(plugin, true, content)
+                        })
+            })
+            .count() as u64
     }
 }
 
@@ -1534,6 +2027,114 @@ where
     if matches!(final_outcome, LoopOutcome::SoftFailed { .. }) {
         // Honest failure: no gate, no verdict — the thread records
         // `failed` (constraint 7: never completed).
+    } else {
+        // (R17-C3, pin P2-4) the output_schema gate — BEFORE the
+        // worker evidence gate, off the committed stream alone: the
+        // wrapper's class-B `output_schema` key declares the
+        // expectation, the final assistant text is the instance.
+        // A pass stays silent (no verdict — `completed_unverified`
+        // keeps the label); miss #0 appends exactly one correction
+        // input and re-drives; miss #1 commits the verdict and fails
+        // the thread with the raw answer preserved. An empty final
+        // answer never enters the gate (`empty_output` owns it).
+        let events = match port.read_stream().await {
+            Ok(events) => events,
+            Err(e) => {
+                return (
+                    LoopOutcome::SoftFailed {
+                        reason: format!("schema gate: stream read failed: {e}"),
+                    },
+                    Phase::Done,
+                );
+            }
+        };
+        match schema_gate_plan(&events) {
+            SchemaGatePlan::Skip | SchemaGatePlan::Pass => {}
+            SchemaGatePlan::Miss {
+                checks,
+                attempt,
+                spawn_uid,
+            } if attempt == 0 && spawn_uid.is_some() => {
+                // The one correction (§3.2.1:442-445): an input/admitted
+                // event on the child's OWN stream (an inbox row would
+                // strand behind the engine's per-episode take), under
+                // the byte-stable idempotency key
+                // `schema-correction:<spawn_uid>:<attempt>` — a retried
+                // or takeover drive re-derives the same key from the
+                // same committed bytes, so the correction is exactly
+                // one per attempt.
+                let spawn_uid = spawn_uid.expect("checked by the guard");
+                if let Err(e) = port
+                    .emit(
+                        EventKind::InputAdmitted,
+                        schema_correction_content(attempt, &checks),
+                    )
+                    .await
+                {
+                    return (
+                        LoopOutcome::SoftFailed {
+                            reason: format!("schema gate: correction write failed: {e}"),
+                        },
+                        Phase::Done,
+                    );
+                }
+                tracing::info!(
+                    target: "kian::worker",
+                    key = %schema_correction_key(&spawn_uid, attempt),
+                    failed = checks.iter().filter(|c| !c.passed).count(),
+                    "schema gate: one correction admitted; re-driving the inner loop"
+                );
+                let stream = core.driver.drive(ctx.clone());
+                return (
+                    LoopOutcome::TurnDone,
+                    Phase::Inner {
+                        ctx: ctx.clone(),
+                        port,
+                        thread_id: Some(thread_id),
+                        stream,
+                    },
+                );
+            }
+            SchemaGatePlan::Miss {
+                checks, attempt, ..
+            } => {
+                // Miss #1 (or a miss with no derivable key): commit the
+                // verdict and fail the thread. The completion below
+                // preserves the RAW answer as the summary — the parent
+                // sees what the child actually said, never a summary of
+                // the failure alone (§3.2.1:445-451).
+                let verdict = kian_loop::GateVerdict {
+                    passed: false,
+                    checks,
+                    attempt,
+                };
+                if let Err(e) = port
+                    .emit(
+                        EventKind::EvidenceVerdict,
+                        verdict_payload(SCHEMA_GATE_NAME, &verdict),
+                    )
+                    .await
+                {
+                    return (
+                        LoopOutcome::SoftFailed {
+                            reason: format!("schema gate: verdict write failed: {e}"),
+                        },
+                        Phase::Done,
+                    );
+                }
+                final_outcome = LoopOutcome::SoftFailed {
+                    reason: format!(
+                        "output_schema gate `{SCHEMA_GATE_NAME}` failed after {} attempt(s)",
+                        attempt + 1
+                    ),
+                };
+            }
+        }
+    }
+    if matches!(final_outcome, LoopOutcome::SoftFailed { .. }) {
+        // The schema gate's terminal miss lands here too: no worker
+        // gate for an already-failed thread (one honest reason, not
+        // two competing verdicts).
     } else if core.config.gate.enabled {
         let events = match port.read_stream().await {
             Ok(events) => events,
@@ -1708,11 +2309,37 @@ where
             }
         }
     }
+    // (R17-C6, pins P4-1/P4-3): the class-A completion keys —
+    // `spawn_uid` + the `multiagent` outcome group — ride only when
+    // the gate is on AND the wrapper carries a readable identity.
+    // `outcome` is written by the at-write helper (the six
+    // completion-borne values; `None` means the status refines to a
+    // no-carrier value, which stays derived on demand), `evidence_ref`
+    // points at the committed verdict that decided the outcome,
+    // `contract` is the pin-P6 twin of a committed worker-gate
+    // verdict. Gating off (or no identity): exactly today's bytes.
+    let wrapper = first_input_content(&events);
+    let completed_payload = match (
+        core.config.board_gating.is_on(),
+        spawn_identity_of(&wrapper),
+    ) {
+        (true, Some(identity)) => {
+            let outcome = outcome_for_completion(status, &events, None);
+            let evidence_ref =
+                outcome.and_then(|outcome| outcome_evidence_ref(&events, port.session(), outcome));
+            crate::audit::thread_completed_payload_keyed(
+                thread_completed_payload(thread_id, status, summary.clone()),
+                identity.spawn_uid,
+                identity.task_id,
+                outcome,
+                evidence_ref,
+                worker_contract(&events),
+            )
+        }
+        _ => thread_completed_payload(thread_id, status, summary.clone()),
+    };
     if let Err(e) = port
-        .emit(
-            EventKind::ThreadCompleted,
-            thread_completed_payload(thread_id, status, summary.clone()),
-        )
+        .emit(EventKind::ThreadCompleted, completed_payload)
         .await
     {
         return (
@@ -1728,7 +2355,6 @@ where
     // the pin-P3 key for the wrapper (`spawn:<spawn_uid>`, else the
     // legacy `thread-report:` key). Feature-off derives exactly the
     // legacy pair (M8).
-    let wrapper = first_input_content(&events);
     let key = report_key_for(&wrapper, thread_id);
     let report = match spawn_identity_of(&wrapper) {
         Some(identity) => {
@@ -1799,6 +2425,7 @@ fn worker_contract(events: &[Event]) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::multiagent;
     use kian_core::model::Epoch;
     use kian_core::seams::LoopOutcome;
     use serde_json::json;
@@ -1812,6 +2439,7 @@ mod tests {
         reported_outcome, revalidate_mandate, speculative_delegation_content,
         thread_completed_payload, thread_report_content, thread_started_payload,
     };
+    use crate::multiagent::BoardGating;
     use crate::templates::worker_template;
     use kian_core::events::{Event, EventKind};
     use kian_core::model::{SessionId, Thread};
@@ -2356,7 +2984,7 @@ mod tests {
         let router = sid(10);
         let worker = sid(20);
         let events = worker_stream_first_input(worker);
-        let plan = lineage_plan(&events, worker, router, 7);
+        let plan = lineage_plan(&events, worker, router, 7, BoardGating::default());
         let LineagePlan::Emit {
             thread_id,
             started_bytes,
@@ -2391,7 +3019,7 @@ mod tests {
             }),
         ));
         assert_eq!(
-            lineage_plan(&events, worker, router, 7),
+            lineage_plan(&events, worker, router, 7, BoardGating::default()),
             LineagePlan::Resume {
                 thread_id: tid(0xee)
             },
@@ -2419,7 +3047,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            lineage_plan(&events, router, router, 1),
+            lineage_plan(&events, router, router, 1, BoardGating::default()),
             LineagePlan::PassThrough
         );
         // A worker-side event naming another session is not our lineage.
@@ -2430,7 +3058,7 @@ mod tests {
             json!({"thread_id": tid(2).to_string(), "worker": sid(98).0.to_string()}),
         );
         assert_eq!(
-            lineage_plan(&[other], router, router, 1),
+            lineage_plan(&[other], router, router, 1, BoardGating::default()),
             LineagePlan::PassThrough
         );
     }
@@ -2622,6 +3250,7 @@ mod tests {
             mandate: None,
             exec_worker: None,
             identity: None,
+            output_schema: None,
         });
         let bound = spawner.prepare(&super::SpawnRequest {
             task: json!("do the thing"),
@@ -2630,6 +3259,7 @@ mod tests {
             mandate: None,
             exec_worker: Some("mac-mini".into()),
             identity: None,
+            output_schema: None,
         });
         // The same frozen fields over the BOUND spawn's own thread id
         // (two prepares mint two threads — the id is the only
@@ -2862,6 +3492,105 @@ mod tests {
         let _ = legacy; // (shape fixture kept explicit above)
     }
 
+    /// n1: the TWO stream readers of the same `exec_worker` binding —
+    /// this crate's routing-layer `worker_binding_of` and
+    /// `kian_plugin::hooks::durable_worker_binding` (the hook
+    /// resolver's §7.3 floor reader; the crate edges only run
+    /// superagent → plugin, so the duplication is by design and pinned
+    /// HERE, where both are visible). They agree on every Bound and
+    /// Unbound stream; the deliberate divergence is malformed input —
+    /// the routing layer refuses (`Malformed`), the floor reader folds
+    /// an unreadable value into "absent" and keeps the readable side's
+    /// id. Any drift in either reader fails the shape it drifted on.
+    #[test]
+    fn durable_worker_binding_agrees_with_the_routing_reader() {
+        use super::{WorkerBinding, worker_binding_of};
+        use kian_plugin::hooks::durable_worker_binding;
+        let worker = sid(21);
+        let started = |binding: serde_json::Value| {
+            event(
+                worker,
+                5,
+                EventKind::ThreadStarted,
+                json!({
+                    "thread_id": tid(0xee).to_string(),
+                    "parent": sid(10).0.to_string(),
+                    "worker": worker.0.to_string(),
+                    "pinned_version": 7,
+                    "task": {},
+                    "exec_worker": binding,
+                }),
+            )
+        };
+        let input = |binding: serde_json::Value| {
+            event(
+                worker,
+                1,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": {
+                    "thread_id": tid(0xee).to_string(),
+                    "task": "x",
+                    "exec_worker": binding,
+                }}),
+            )
+        };
+        // Bound: both readers name the same id.
+        let bound = vec![input(json!("mac-mini")), started(json!("mac-mini"))];
+        assert_eq!(
+            worker_binding_of(&bound, worker),
+            WorkerBinding::Bound(std::borrow::Cow::Borrowed("mac-mini"))
+        );
+        assert_eq!(
+            durable_worker_binding(&bound, &worker),
+            Some("mac-mini".to_string())
+        );
+        // Unbound: both read no binding (legacy stream, no keys).
+        let mut unbound = worker_stream_first_input(worker);
+        unbound.push(event(
+            worker,
+            2,
+            EventKind::ThreadStarted,
+            json!({
+                "thread_id": tid(0xee).to_string(),
+                "parent": sid(10).0.to_string(),
+                "worker": worker.0.to_string(),
+                "pinned_version": 7,
+                "task": {},
+            }),
+        ));
+        assert_eq!(worker_binding_of(&unbound, worker), WorkerBinding::Unbound);
+        assert_eq!(durable_worker_binding(&unbound, &worker), None);
+        // Disagreement (two readable, different ids): the routing
+        // layer refuses; the floor reader maps it to the honest floor.
+        let disagree = vec![input(json!("mac-mini")), started(json!("vultr"))];
+        assert_eq!(
+            worker_binding_of(&disagree, worker),
+            WorkerBinding::Malformed
+        );
+        assert_eq!(durable_worker_binding(&disagree, &worker), None);
+        // Malformed payload key (non-string) + valid wrapper: the
+        // deliberate divergence — routing refuses (`Malformed`), the
+        // floor reader folds the malformed key into "absent" and keeps
+        // the wrapper's id.
+        let malformed = vec![input(json!("mac-mini")), started(json!(7))];
+        assert_eq!(
+            worker_binding_of(&malformed, worker),
+            WorkerBinding::Malformed
+        );
+        assert_eq!(
+            durable_worker_binding(&malformed, &worker),
+            Some("mac-mini".to_string())
+        );
+        // Malformed wrapper alone: routing still refuses; the floor
+        // reader has no readable id on either side → the floor.
+        let malformed_wrapper = vec![input(json!(""))];
+        assert_eq!(
+            worker_binding_of(&malformed_wrapper, worker),
+            WorkerBinding::Malformed
+        );
+        assert_eq!(durable_worker_binding(&malformed_wrapper, &worker), None);
+    }
+
     /// The worker-side lineage derives the bound payload from the
     /// FIRST input wrapper (D4): identical bytes to the Router side.
     #[test]
@@ -2884,7 +3613,7 @@ mod tests {
                 json!({"role": "user", "content": wrapper}),
             ),
         ];
-        let plan = lineage_plan(&events, worker, router, 7);
+        let plan = lineage_plan(&events, worker, router, 7, BoardGating::default());
         let LineagePlan::Emit { started_bytes, .. } = plan else {
             panic!("expected Emit, got {plan:?}");
         };
@@ -3190,6 +3919,7 @@ mod tests {
             mandate: Some(mandate.clone()),
             exec_worker: Some("mac-mini".into()),
             identity: Some(identity.clone()),
+            output_schema: None,
         });
         let wrapper = &spawned.task_message["content"];
         // The composed legacy form over the SAME (derived) thread id.
@@ -3231,13 +3961,20 @@ mod tests {
         let identity = crate::multiagent::SpawnIdentity::derive(router, 3, "mock-worker", 7);
         let good = json!({
             "spawn_uid": identity.spawn_uid.to_string(),
+            "thread_id": identity.thread_id.to_string(),
             "task_id": identity.task_id.to_string(),
             "agent_def": "mock-worker",
             "agent_def_version": 7,
         });
         assert_eq!(super::spawn_identity_of(&good), Some(identity.clone()));
         // Each missing key alone breaks the round trip.
-        for key in ["spawn_uid", "task_id", "agent_def", "agent_def_version"] {
+        for key in [
+            "spawn_uid",
+            "thread_id",
+            "task_id",
+            "agent_def",
+            "agent_def_version",
+        ] {
             let mut partial = good.clone();
             partial.as_object_mut().unwrap().remove(key);
             assert_eq!(super::spawn_identity_of(&partial), None, "missing `{key}`");
@@ -3421,5 +4158,639 @@ mod tests {
             super::worker_contract(&[worker]),
             Some(json!({"passed": false, "errors": ["no_error_tool_result_tail"]}))
         );
+    }
+
+    // -- port (e): the settle gate (PLUGIN-SPEC §4.6) -----------------------
+
+    use futures::{FutureExt, StreamExt};
+    use kian_core::seams::LoopDriver;
+    use kian_plugin::hooks::{
+        HandlerId as HookHandlerId, HookBus, HookId, HookPayload, HookReply, Registry,
+        SettleVerdict, veto_marker,
+    };
+
+    /// An inner driver that replays scripted outcomes (here: always
+    /// `Settled` — the loop's own completion decision).
+    struct SettledDriver;
+
+    impl LoopDriver for SettledDriver {
+        type Ctx = ();
+
+        fn drive(&self, _ctx: ()) -> futures::stream::BoxStream<'static, LoopOutcome> {
+            futures::stream::iter(vec![LoopOutcome::Settled]).boxed()
+        }
+    }
+
+    /// A stream port over a shared, mutable event list.
+    #[derive(Clone)]
+    struct FakePort {
+        session: SessionId,
+        events: Arc<std::sync::Mutex<Vec<Event>>>,
+    }
+
+    impl FakePort {
+        fn new(session: SessionId) -> Self {
+            Self {
+                session,
+                events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Seeds the first `input/admitted` with the delegation
+        /// wrapper — what makes `lineage_plan` classify this stream as
+        /// a worker stream (Emit/Resume) rather than a pass-through.
+        fn seed_delegation(&self) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind: EventKind::InputAdmitted,
+                bytes: json!({
+                    "role": "user",
+                    "content": super::delegation_content(tid(0xaa), None, json!("do the thing")),
+                }),
+                version: 0,
+            });
+        }
+
+        /// A **bound** delegation (D4): the wrapper carries the additive
+        /// `exec_worker` key naming `exec_worker` — the durable binding
+        /// §7.3/§8.2 frames derive.
+        fn seed_bound_delegation(&self, exec_worker: &str) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            let mut content = super::delegation_content(tid(0xab), None, json!("do the thing"));
+            content[super::EXEC_WORKER_KEY] = json!(exec_worker);
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind: EventKind::InputAdmitted,
+                bytes: json!({
+                    "role": "user",
+                    "content": content,
+                }),
+                version: 0,
+            });
+        }
+
+        fn seed_marker(&self, plugin: &str) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind: EventKind::InputAdmitted,
+                bytes: json!({
+                    "role": "user",
+                    "synthetic": true,
+                    "content": veto_marker(plugin, "settle/pre", "not done yet"),
+                }),
+                version: 0,
+            });
+        }
+
+        fn kinds(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.kind.as_str())
+                .collect()
+        }
+    }
+
+    impl super::StreamPort for FakePort {
+        fn session(&self) -> SessionId {
+            self.session
+        }
+
+        fn emit(
+            &self,
+            kind: EventKind,
+            bytes: serde_json::Value,
+        ) -> futures::future::BoxFuture<'static, Result<(), super::StreamPortError>> {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind,
+                bytes,
+                version: 0,
+            });
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_stream(
+            &self,
+        ) -> futures::future::BoxFuture<'static, Result<Vec<Event>, super::StreamPortError>>
+        {
+            let events = self.events.lock().unwrap().clone();
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    /// A bus whose one `settle/pre` subscriber always denies.
+    fn deny_bus(hits: Arc<std::sync::Mutex<u32>>) -> (HookBus, kian_plugin::Disposer) {
+        let registry = Arc::new(Registry::new());
+        let keep = registry.register(
+            HookHandlerId {
+                plugin: "quality-gate",
+                hook: HookId::SettlePre,
+                grants: kian_plugin::hooks::GrantSet::from_names(&[
+                    "observe:settle",
+                    "veto:settle",
+                ])
+                .unwrap(),
+                order: 0,
+            },
+            Arc::new(move |_payload: &HookPayload| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    *hits.lock().unwrap() += 1;
+                    HookReply::BailDeny {
+                        reason: "not done yet".to_string(),
+                    }
+                }
+                .boxed()
+            }),
+        );
+        (HookBus::with_registry(registry), keep)
+    }
+
+    fn gate_config() -> super::WorkerLoopConfig {
+        super::WorkerLoopConfig {
+            router: sid(10),
+            worker_version: 1,
+            gate: kian_loop::evidence::EvidenceGateConfig::default(),
+            multiagent: None,
+            board_gating: multiagent::BoardGating(false),
+        }
+    }
+
+    async fn drive_once(driver: &super::WorkerLoopDriver<SettledDriver>) -> Vec<LoopOutcome> {
+        driver.drive(()).collect().await
+    }
+
+    /// One process-wide audit capture for the lib-test binary (no
+    /// other test here installs a subscriber). `set_global_default`
+    /// rebuilds the callsite Interest cache, so library `tracing`
+    /// events are observed regardless of test order — the thread-local
+    /// `set_default` pattern would silently lose them.
+    fn audit_capture() -> Arc<std::sync::Mutex<String>> {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<String>>);
+        impl Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(buf));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        static BUFFER: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+        BUFFER
+            .get_or_init(|| {
+                let buffer = Arc::new(Mutex::new(String::new()));
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer({
+                        let buffer = Buffer(Arc::clone(&buffer));
+                        move || buffer.clone()
+                    })
+                    .with_ansi(false)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("this process installs its global subscriber once");
+                buffer
+            })
+            .clone()
+    }
+
+    /// The P2 acceptance: a settle veto re-arms the loop once (the
+    /// marker row is admitted, the outcome propagates unchanged, no
+    /// completion pair is written), and budget exhaustion overrides —
+    /// settlement proceeds WITH the completion pair (§4.6 steps 3–4).
+    #[tokio::test]
+    async fn settle_veto_rearms_once_then_budget_exhausts_to_override() {
+        let audit = audit_capture();
+        let worker_session = sid(0x77);
+        let port = FakePort::new(worker_session);
+        port.seed_delegation();
+        let inbox = CapturingInbox::shared();
+        let hits = Arc::new(std::sync::Mutex::new(0u32));
+        let (bus, _keep_gate) = deny_bus(Arc::clone(&hits));
+
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::with_hooks(
+            Arc::new(SettledDriver),
+            inbox.clone(),
+            gate_config(),
+            port_for,
+            Some(bus),
+        );
+
+        // Drive 1 — budget empty: deny re-arms. The marker row is the
+        // §4.6 step-3 shape, admitted durably; NO thread/completed.
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled]);
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1, "one synthetic marker input, exactly");
+        assert_eq!(
+            admits[0].1,
+            json!({
+                "synthetic": true,
+                "content": veto_marker("quality-gate", "settle/pre", "not done yet"),
+            }),
+            "the marker is the §4.6 step 3 template through the steer shape"
+        );
+        assert_eq!(admits[0].0, worker_session);
+        assert!(
+            !port.kinds().contains(&"thread/completed"),
+            "a re-armed settle writes no completion pair"
+        );
+        assert_eq!(*hits.lock().unwrap(), 1);
+
+        // The re-armed episode consumed the marker (the consumption
+        // write persists it as `input/admitted`) and settled again.
+        port.seed_marker("quality-gate");
+
+        // Drive 2 — budget 1 of 3: deny re-arms again.
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled]);
+        assert_eq!(inbox.admits.lock().unwrap().len(), 2);
+        assert!(!port.kinds().contains(&"thread/completed"));
+        assert_eq!(*hits.lock().unwrap(), 2);
+
+        // Drives 3+4 consume and settle twice more: four markers total.
+        port.seed_marker("quality-gate");
+        port.seed_marker("quality-gate");
+
+        // Drive 5 — budget exhausted (3 markers in the stream): the
+        // veto is recorded but settlement PROCEEDS — the completion
+        // pair is written and the outcome is still an honest Settled.
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(
+            outcomes,
+            vec![LoopOutcome::Settled],
+            "an override never launders the outcome"
+        );
+        assert!(
+            port.kinds().contains(&"thread/completed"),
+            "budget exhaustion lets the completion pair land"
+        );
+        assert_eq!(
+            inbox.admits.lock().unwrap().len(),
+            3,
+            "an override admits no marker — plus the completion report"
+        );
+        let report = inbox.admits.lock().unwrap()[2].1.clone();
+        assert!(
+            report.get("status").is_some(),
+            "the third admit is the completion report, not a marker"
+        );
+        assert_eq!(*hits.lock().unwrap(), 3, "the gate was consulted each time");
+
+        // §4.6 step 4 + §10.6: the override emits ONE `hook-override`
+        // audit line naming the hook, the plugin and its own count.
+        let log = audit.lock().unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("hook-override"))
+            .expect("the budget-exhaustion override is audited");
+        assert!(line.contains("settle/pre"), "{line}");
+        assert!(line.contains("quality-gate"), "{line}");
+        assert!(line.contains("vetoes=3"), "{line}");
+        assert_eq!(
+            log.lines().filter(|l| l.contains("hook-override")).count(),
+            1,
+            "exactly one override line across the five drives"
+        );
+    }
+
+    /// §4.6's append-failure path: the gate does NOT settle — the
+    /// outcome becomes the driver's honest failure (never `Settled`,
+    /// never `completed`), and the session stays recoverable.
+    #[tokio::test]
+    async fn settle_marker_admit_failure_does_not_settle() {
+        struct FailingInbox;
+
+        impl crate::InboxWriter for FailingInbox {
+            fn admit(
+                &self,
+                _session: SessionId,
+                _payload: serde_json::Value,
+                _key: Option<String>,
+            ) -> futures::future::BoxFuture<
+                'static,
+                Result<crate::AdmitReceipt, crate::InboxWriteError>,
+            > {
+                Box::pin(async { Err(crate::InboxWriteError::Write("disk full".into())) })
+            }
+
+            fn wake(&self, _session: SessionId) -> kian_orchestrator::WakeOutcome {
+                kian_orchestrator::WakeOutcome::Folded
+            }
+        }
+
+        let worker_session = sid(0x78);
+        let port = FakePort::new(worker_session);
+        port.seed_delegation();
+        let hits = Arc::new(std::sync::Mutex::new(0u32));
+        let (bus, _keep_gate) = deny_bus(Arc::clone(&hits));
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::with_hooks(
+            Arc::new(SettledDriver),
+            Arc::new(FailingInbox),
+            gate_config(),
+            port_for,
+            Some(bus),
+        );
+
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            LoopOutcome::SoftFailed { reason } => assert!(
+                reason.contains("settle gate: veto marker admit failed")
+                    && reason.contains("disk full"),
+                "the honest failure names the append error: {reason}"
+            ),
+            other => panic!("expected SoftFailed, got {other:?}"),
+        }
+        assert!(
+            !port.kinds().contains(&"thread/completed"),
+            "no completion on a failed marker append"
+        );
+    }
+
+    /// §3.4.4's fourth row: a stream that is NOT a worker stream is a
+    /// transparent pass-through — the gate is never consulted, even
+    /// mounted, even with a denying subscriber registered.
+    #[tokio::test]
+    async fn non_worker_stream_never_reaches_the_gate() {
+        // The Router's own session: lineage classifies it as
+        // pass-through (thread_id None).
+        let router_session = sid(10);
+        let port = FakePort::new(router_session);
+        let hits = Arc::new(std::sync::Mutex::new(0u32));
+        let (bus, _keep_gate) = deny_bus(Arc::clone(&hits));
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::with_hooks(
+            Arc::new(SettledDriver),
+            CapturingInbox::shared(),
+            gate_config(),
+            port_for,
+            Some(bus),
+        );
+
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled]);
+        assert_eq!(
+            *hits.lock().unwrap(),
+            0,
+            "a non-worker stream never reaches Phase::Terminal's gate"
+        );
+    }
+
+    /// `SettleVerdict` is reachable from this module's surface (the
+    /// gate's decision vocabulary, §4.6 steps 3–5).
+    #[test]
+    fn settle_verdict_shape() {
+        assert_eq!(SettleVerdict::Allow, SettleVerdict::Allow);
+    }
+
+    /// §4.6's trust boundary, at the [`GateCtl`] the wrapper injects:
+    /// the budget predicate is `synthetic` + the plugin's marker
+    /// prefix, **never** `role` — a steer-capable caller can mint a
+    /// marker-shaped row, and it counts against the named plugin's
+    /// budget (forgeability is the documented behaviour, §17).
+    #[test]
+    fn steer_minted_marker_consumes_budget() {
+        let session = sid(0x7b);
+        let marker = |plugin: &str| {
+            (
+                "user",
+                true,
+                veto_marker(plugin, "settle/pre", "not done yet"),
+            )
+        };
+        let rows = [
+            marker("quality-gate"),
+            // An arbitrary role mints equally — the predicate never
+            // reads `role`.
+            ("assistant", true, marker("quality-gate").2),
+            // Not synthetic: never counted, whatever the content.
+            ("user", false, marker("quality-gate").2),
+            // Another plugin's marker: counts for that plugin only.
+            ("user", true, marker("other-gate").2),
+            // A plain synthetic row without the prefix: no budget.
+            ("user", true, "just a steer note".to_string()),
+        ];
+        let events: Vec<Event> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (role, synthetic, content))| Event {
+                seq: i as u64 + 1,
+                session,
+                epoch: Epoch(1),
+                ts: i as u64 + 1,
+                kind: EventKind::InputAdmitted,
+                bytes: json!({
+                    "role": role,
+                    "synthetic": synthetic,
+                    "content": content,
+                }),
+                version: 0,
+            })
+            .collect();
+        let ctl = super::GateCtl {
+            session,
+            inbox: CapturingInbox::shared(),
+            events,
+        };
+        assert_eq!(
+            kian_plugin::hooks::SettleCtl::veto_count(&ctl, "quality-gate"),
+            2
+        );
+        assert_eq!(
+            kian_plugin::hooks::SettleCtl::veto_count(&ctl, "other-gate"),
+            1
+        );
+        assert_eq!(kian_plugin::hooks::SettleCtl::veto_count(&ctl, "absent"), 0);
+    }
+
+    /// (B1/§8.2/§9.2 end-to-end): the wrapper's drain-boundary frame
+    /// derives the session's durable `exec_worker` binding from the
+    /// stream, so a worker-scoped `use:` narrowing **actually removes**
+    /// a mounted instance from this session's dispatches, and the §9.2
+    /// digest the guard records is the narrowed set's — not the server
+    /// scope's.
+    #[tokio::test]
+    async fn worker_scoped_narrowing_removes_a_mounted_instance_and_records_the_narrowed_digest() {
+        let worker_session = sid(0x79);
+        let port = FakePort::new(worker_session);
+        port.seed_bound_delegation("node-zulu");
+
+        // A mounted "gate" instance, deny-on-settle, registered under
+        // the sidecar's instance name so the §8.2 dispatch filter owns
+        // its fate.
+        let registry = Arc::new(Registry::new());
+        let hits = Arc::new(std::sync::Mutex::new(0u32));
+        let counter = Arc::clone(&hits);
+        let keep_gate = registry.register(
+            HookHandlerId {
+                plugin: "gate",
+                hook: HookId::SettlePre,
+                grants: kian_plugin::hooks::GrantSet::from_names(&[
+                    "observe:settle",
+                    "veto:settle",
+                ])
+                .unwrap(),
+                order: 0,
+            },
+            Arc::new(move |_payload: &HookPayload| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    *counter.lock().unwrap() += 1;
+                    HookReply::BailDeny {
+                        reason: "not done yet".to_string(),
+                    }
+                }
+                .boxed()
+            }),
+        );
+        let bus = HookBus::with_registry(registry);
+        // Boot snapshot: the server scope mounts `gate`, but
+        // `node-zulu`'s `use:` narrows it away (§8.2's closed grammar).
+        let cfg: kian_plugin::hooks::resolve::SidecarConfig = serde_json::from_value(json!({
+            "plugins": {"gate": {"manifest": "/etc/kian/plugins/gate.toml"}},
+            "scopes": {
+                "server": ["gate"],
+                "worker": {"node-zulu": {"use": []}}
+            }
+        }))
+        .unwrap();
+        let manifest_text = format!(
+            "[plugin]\nname = \"gate\"\nversion = \"0.1.0\"\nabi = 1\n\
+             [process]\nargv = [\"/bin/cat\"]\nsha256 = \"{}\"\n\
+             [grants]\nhooks = [\"settle/pre\"]\ncapabilities = [\"observe:settle\", \"veto:settle\"]\n\
+             [limits]\ndeadline_ms = 500\n",
+            "a".repeat(64)
+        );
+        let mctx = kian_plugin::hooks::sidecar::ValidationCtx {
+            instance_key: "gate",
+            ..Default::default()
+        };
+        let manifest =
+            kian_plugin::hooks::sidecar::parse_manifest(&manifest_text, &mctx).expect("manifest");
+        let mut manifests = std::collections::BTreeMap::new();
+        manifests.insert("gate".to_string(), manifest);
+        bus.install_sidecars(cfg, manifests).expect("boot install");
+
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::with_hooks(
+            Arc::new(SettledDriver),
+            CapturingInbox::shared(),
+            gate_config(),
+            port_for,
+            Some(bus.clone()),
+        );
+
+        // One drive: the §9.2 guard opens the session through the
+        // stream-derived binding and the settle gate consults with the
+        // narrowed set — the gate is absent, so the honest Settled
+        // propagates to the terminal decoration.
+        let outcomes = drive_once(&driver).await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled]);
+        assert_eq!(
+            *hits.lock().unwrap(),
+            0,
+            "the narrowed-away instance was never consulted"
+        );
+
+        // §9.2: the recorded digest is the NARROWED set's — a
+        // server-scope session on the same bus records a different one.
+        let narrowed = bus
+            .session_set_digest(&worker_session)
+            .expect("the guard recorded the worker session");
+        let plain_session = sid(0x7a);
+        bus.session_begin(kian_plugin::hooks::FrameInfo::new(plain_session));
+        let server = bus
+            .session_set_digest(&plain_session)
+            .expect("the guard recorded the plain session");
+        assert_ne!(
+            narrowed, server,
+            "the worker session's digest is its narrowed set's, not the server scope's"
+        );
+
+        // §8.2 through the production view: settle_view derives the
+        // binding from the same stream, and a dispatch under that frame
+        // skips the removed instance — while the same dispatch under
+        // the server scope consults and denies.
+        let events = port.events.lock().unwrap().clone();
+        let view = super::settle_view(&events, worker_session);
+        assert_eq!(
+            view.frame.as_ref().expect("frame").worker,
+            "node-zulu",
+            "the settle frame carries the durable binding"
+        );
+        let ctl = std::sync::Arc::new(super::GateCtl {
+            session: worker_session,
+            inbox: CapturingInbox::shared(),
+            events: events.clone(),
+        });
+        let verdict = bus.settle(&view, ctl.as_ref()).await;
+        assert!(
+            matches!(verdict, SettleVerdict::Allow),
+            "the removed instance cannot veto: {verdict:?}"
+        );
+        assert_eq!(*hits.lock().unwrap(), 0);
+
+        // Control: the same gate, consulted under a SERVER-scope session
+        // (a fresh session with no worker binding — §8.4 memoizes the
+        // worker session's set, so the control rides its own identity),
+        // denies as designed.
+        let mut server_frame_view = super::settle_view(&events, worker_session);
+        server_frame_view.frame.as_mut().unwrap().session = plain_session;
+        server_frame_view.frame.as_mut().unwrap().worker = String::new();
+        let verdict = bus.settle(&server_frame_view, ctl.as_ref()).await;
+        assert!(
+            matches!(verdict, SettleVerdict::Deny { .. }),
+            "the server scope still consults the gate: {verdict:?}"
+        );
+        assert_eq!(*hits.lock().unwrap(), 1);
+        drop(keep_gate);
     }
 }

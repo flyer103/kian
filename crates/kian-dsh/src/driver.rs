@@ -295,6 +295,12 @@ struct BridgeSession {
     /// child (never re-deliver to the same process).
     delivered: BTreeSet<String>,
     interrupt_sent: bool,
+    /// The step's mapped `tool/call` names by call id (§3.5): the
+    /// retrospective `tool/post` observation names the call through
+    /// the step's own mapped record — recorded for replayed calls too
+    /// (before the dedup skip), so a take-over drain can still resolve
+    /// a name for a result whose call landed in an earlier drain.
+    tool_names: std::collections::BTreeMap<String, String>,
 }
 
 /// Per-driver session table: the cross-drive home of a live child. An
@@ -334,6 +340,10 @@ pub struct DshDriver {
 struct DriverInner {
     config: Option<DshDriverConfig>,
     table: SessionTable,
+    /// Port (d″) — the crate-local `tool/post` port (§3.5), injected
+    /// at driver construction and implemented by assembly over the
+    /// real hook bus. `None` observes nothing.
+    tool_post: Option<Arc<dyn crate::toolpost::ToolPostPort>>,
 }
 
 impl DshDriver {
@@ -343,8 +353,23 @@ impl DshDriver {
             inner: Arc::new(DriverInner {
                 config: Some(config),
                 table: SessionTable::default(),
+                tool_post: None,
             }),
         }
+    }
+
+    /// [`DshDriver::new`] with the `tool/post` port mounted (§3.5).
+    /// Call before serving: the builder derives a fresh inner (no
+    /// sessions are parked yet at construction time).
+    #[must_use]
+    pub fn with_tool_post_port(mut self, port: Arc<dyn crate::toolpost::ToolPostPort>) -> Self {
+        let config = self.inner.config.clone();
+        self.inner = Arc::new(DriverInner {
+            config,
+            table: SessionTable::default(),
+            tool_post: Some(port),
+        });
+        self
     }
 
     fn config(&self) -> &DshDriverConfig {
@@ -523,6 +548,7 @@ impl DshDriver {
             dedup: Dedup::build(events),
             delivered: BTreeSet::new(),
             interrupt_sent: false,
+            tool_names: std::collections::BTreeMap::new(),
         })
     }
 
@@ -626,6 +652,23 @@ impl DshDriver {
                         }
                         Ok(Some(Mapped::Absorbed { .. })) => {}
                         Ok(Some(Mapped::Event { kind, payload })) => {
+                            // §3.5: record the step's mapped `tool/call`
+                            // names (by call id) BEFORE the dedup skip, so
+                            // a replayed call from an earlier drain still
+                            // resolves a name for its retrospective
+                            // `tool/post` observation.
+                            if matches!(kind, EventKind::ToolCall)
+                                && let (Some(id), Some(name)) = (
+                                    payload
+                                        .pointer("/content/id")
+                                        .and_then(serde_json::Value::as_str),
+                                    payload
+                                        .pointer("/content/name")
+                                        .and_then(serde_json::Value::as_str),
+                                )
+                            {
+                                sess.tool_names.insert(id.to_string(), name.to_string());
+                            }
                             if sess.dedup.take(kind, &payload) {
                                 // Already persisted (previous drain or a
                                 // promotion): append nothing.
@@ -644,13 +687,61 @@ impl DshDriver {
                                             St::Done,
                                         );
                                     }
-                                    ctx.begin_turn(payload).await
+                                    ctx.begin_turn(payload.clone()).await
                                 }
-                                EventKind::TurnEnd => ctx.end_turn(payload).await,
-                                ref other => ctx.append(*other, payload).await,
+                                EventKind::TurnEnd => ctx.end_turn(payload.clone()).await,
+                                ref other => ctx.append(*other, payload.clone()).await,
                             };
                             if let Err(e) = appended {
                                 return (soft("append", e), St::Done);
+                            }
+                            // Port (d″) — `tool/post`, dsh site (§3.5):
+                            // the post-append branch, retrospective and
+                            // observe-only, after `ctx.append(ToolResult)`
+                            // returns `Ok`. The name comes from the
+                            // step's mapped `tool/call` for that call_id;
+                            // a result with no matching mapped call is
+                            // SKIPPED with one audit line — never
+                            // dispatched with a fabricated name.
+                            if matches!(kind, EventKind::ToolResult)
+                                && let Some(port) = self.inner.tool_post.clone()
+                                && let Some(content) = payload.get("content")
+                            {
+                                let call_id = content
+                                    .get("call_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                match sess.tool_names.get(call_id) {
+                                    Some(name) => {
+                                        let output = content
+                                            .get("output")
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null);
+                                        let bytes = serde_json::to_vec(&output).unwrap_or_default();
+                                        port.tool_post(crate::toolpost::ToolPostView {
+                                            call_id: call_id.to_string(),
+                                            name: name.clone(),
+                                            is_error: content
+                                                .get("is_error")
+                                                .and_then(serde_json::Value::as_bool)
+                                                .unwrap_or(false),
+                                            output_bytes: bytes.len() as u64,
+                                            output_sha256: crate::toolpost::sha256_hex(&bytes),
+                                            // The child's executor owns any
+                                            // scrubbing; the bridge has no
+                                            // redaction provenance to report.
+                                            redactions: Vec::new(),
+                                        })
+                                        .await;
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            target: "kian::dsh",
+                                            call_id = %call_id,
+                                            "dsh tool/post skipped: no matching mapped tool/call"
+                                        );
+                                    }
+                                }
                             }
                             if matches!(kind, EventKind::TurnEnd) {
                                 // A provider turn completed: a safe

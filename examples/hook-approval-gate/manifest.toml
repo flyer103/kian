@@ -1,0 +1,33 @@
+# The approval-gate manifest (PLUGIN-SPEC §6.1, closed TOML).
+#
+# Copy next to your plugin layout and fill in the two placeholders:
+#   1. `argv` — your python3's ABSOLUTE path, then this script's absolute path
+#   2. `sha256` — the digest of argv[0] (the interpreter binary), from:
+#         shasum -a 256 "$(command -v python3)"
+# A wrong digest is a `digest_mismatch` refusal at boot (§6.2 rule 6) — the
+# pin is the point, never repair it.
+
+[plugin]
+name = "approval-gate"          # must equal the instance key in sidecars.plugins
+version = "0.1.0"
+abi = 1
+order = 0
+required = true                 # this plugin's refusal is fatal (fail-closed boot)
+
+[process]
+argv = ["/absolute/path/to/python3", "/absolute/path/to/examples/hook-approval-gate/sidecar.py"]
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"  # digest of argv[0]
+env_allow = ["APPROVAL_GATE_SESSIONS", "APPROVAL_GATE_FRAMES", "APPROVAL_GATE_MODE"]
+startup_timeout_ms = 2000
+
+[grants]
+hooks = ["tool/pre", "tool/post"]
+capabilities = ["observe:tool", "veto:tool"]
+
+[limits]
+deadline_ms = 500
+max_payload_kib = 256
+restarts_per_window = 3
+restart_window_ms = 60000
+max_stderr_line_kib = 8
+stderr_rate_kib_per_min = 1024

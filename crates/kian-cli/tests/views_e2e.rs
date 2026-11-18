@@ -224,7 +224,7 @@ async fn rebuild_equals_full_derivation_on_a_multi_session_store() {
         let store = EventStore::open(&path).await.unwrap();
         seed_store(&store, 5, 3, seed).await;
 
-        let out = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        let out = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
             .await
             .unwrap();
         assert!(!out.lease_held);
@@ -298,7 +298,7 @@ async fn stale_view_falls_back_to_full_derivation() {
     let path = temp_db("stale");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 2, 1, 5).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     assert!(kian_cli::views::fresh_usage(&store).await.is_some());
@@ -344,7 +344,7 @@ async fn corrupt_view_is_discarded_and_the_gate_hides_views() {
     let path = temp_db("corrupt");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 2, 1, 11).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     let honest = kian_cli::usage_metrics::usage_stats_report(&store, None, false)
@@ -419,7 +419,7 @@ async fn rebuild_lease_excludes_concurrent_rebuilders() {
             .await
             .unwrap()
     );
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(out.lease_held);
@@ -432,7 +432,7 @@ async fn rebuild_lease_excludes_concurrent_rebuilders() {
         .maintenance_lease_release("views:all", "other")
         .await
         .unwrap();
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
         .await
         .unwrap();
     assert!(!out.lease_held);
@@ -450,7 +450,7 @@ async fn incremental_tick_after_no_changes_is_a_noop() {
     let path = temp_db("idle");
     let store = EventStore::open(&path).await.unwrap();
     seed_store(&store, 5, 2, 21).await;
-    let first = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    let first = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     assert_eq!(first.sessions, 7);
@@ -459,7 +459,7 @@ async fn incremental_tick_after_no_changes_is_a_noop() {
 
     // Nothing appended between the ticks: the second tick derives zero
     // sessions and publishes nothing, and the views remain fresh.
-    let second = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let second = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(!second.lease_held);
@@ -482,7 +482,7 @@ async fn incremental_rebuild_equals_full_after_partial_changes() {
     let path = temp_db("delta");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 6, 3, 33).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
 
@@ -530,7 +530,7 @@ async fn incremental_rebuild_equals_full_after_partial_changes() {
             .unwrap();
     }
 
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
         .await
         .unwrap();
     assert!(!out.lease_held);
@@ -595,7 +595,7 @@ async fn tampered_view_self_heals_on_the_next_incremental_tick() {
     let path = temp_db("heal");
     let store = EventStore::open(&path).await.unwrap();
     seed_store(&store, 4, 2, 44).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     if let EventStore::Sqlite(pool) = &store {
@@ -609,7 +609,7 @@ async fn tampered_view_self_heals_on_the_next_incremental_tick() {
     // The stored digest no longer covers the stored bytes; the next
     // tick must NOT reuse the tampered rows — it discards and fully
     // rebuilds the view (self-heal preserved).
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(out.derived > 0, "digest mismatch ⇒ full re-derivation");
@@ -648,7 +648,7 @@ async fn pending_inbox_drift_without_appends_refreshes_tickets() {
         .await
         .unwrap();
 
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     let entries = kian_cli::views::fresh_tickets(&store)
@@ -660,7 +660,7 @@ async fn pending_inbox_drift_without_appends_refreshes_tickets() {
 
     // Time passes; no appends. The tick compares live pending counts
     // with the stored rows, sees the drift, refreshes the board.
-    let out = kian_cli::views::rebuild_views(&store, "builder", 6_000)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 6_000, false)
         .await
         .unwrap();
     assert!(out.board_refreshed, "pending drift forces a board refresh");
@@ -686,7 +686,7 @@ async fn plain_append_does_not_refresh_the_board() {
     let path = temp_db("plainappend");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 4, 2, 66).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
 
@@ -703,7 +703,7 @@ async fn plain_append_does_not_refresh_the_board() {
     )
     .await;
 
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert_eq!(out.derived, 1, "only the grown session");
@@ -760,5 +760,384 @@ async fn pre_v4_read_only_reader_falls_back() {
     assert_eq!(via_view, honest);
     assert_eq!(via_view.sessions, 2);
     reader.close().await;
+    cleanup(&path);
+}
+
+// ---------------------------------------------------------------------------
+// the task_board view (R17 C4, pins P3-1/P3-3/P3-5)
+// ---------------------------------------------------------------------------
+
+/// Seeds one delegation lineage (parent dispatch side + child stream +
+/// the parent's waiting report row) and returns the task id. The
+/// wrapper carries the derived identity exactly as
+/// `WorkerSpawner::prepare` records it.
+async fn seed_task_lineage(store: &EventStore, tag: &str) -> String {
+    let parent = SessionId::new();
+    let identity = kian_superagent::SpawnIdentity::derive(parent, 100, "worker", 7);
+    let child = kian_superagent::child_session_id(identity.task_id);
+    let wrapper = json!({
+        "thread_id": identity.task_id_str(),
+        "task": format!("task {tag}"),
+        "spawn_uid": identity.spawn_uid.to_string(),
+        "task_id": identity.task_id_str(),
+        "agent_def": "worker",
+        "agent_def_version": 7,
+    });
+    let started = json!({
+        "thread_id": identity.task_id_str(),
+        "parent": parent.0.to_string(),
+        "worker": child.0.to_string(),
+        "pinned_version": 7,
+        "task": {"role": "user", "content": wrapper},
+    });
+    // The parent's dispatch side.
+    push(
+        store,
+        parent,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    push(
+        store,
+        parent,
+        2,
+        Epoch(1),
+        EventKind::DrainClaimed,
+        json!({}),
+    )
+    .await;
+    push(
+        store,
+        parent,
+        3,
+        Epoch(1),
+        EventKind::ThreadStarted,
+        started.clone(),
+    )
+    .await;
+    // The child's own side, completed with a passed verdict.
+    push(
+        store,
+        child,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        json!({}),
+    )
+    .await;
+    push(
+        store,
+        child,
+        2,
+        Epoch(1),
+        EventKind::DrainClaimed,
+        json!({}),
+    )
+    .await;
+    push(store, child, 3, Epoch(1), EventKind::ThreadStarted, started).await;
+    push(
+        store,
+        child,
+        4,
+        Epoch(1),
+        EventKind::InputAdmitted,
+        json!({"role": "user", "content": wrapper}),
+    )
+    .await;
+    push(
+        store,
+        child,
+        5,
+        Epoch(1),
+        EventKind::TurnEnd,
+        json!({"iteration": 0, "outcome": "final_answer"}),
+    )
+    .await;
+    push(
+        store,
+        child,
+        6,
+        Epoch(1),
+        EventKind::EvidenceVerdict,
+        json!({"gate": "worker", "passed": true, "checks": []}),
+    )
+    .await;
+    push(
+        store,
+        child,
+        7,
+        Epoch(1),
+        EventKind::ThreadCompleted,
+        json!({"thread_id": identity.task_id_str(), "status": "completed",
+               "summary": {"role": "assistant", "content": "done"}}),
+    )
+    .await;
+    // The parent's durable report row (pin P3-5's read).
+    store
+        .admit(kian_core::model::InputRow {
+            id: uuid::Uuid::new_v4(),
+            session: parent,
+            payload: json!({
+                "thread_id": identity.task_id_str(),
+                "status": "completed",
+                "summary": {"role": "assistant", "content": "done"},
+            }),
+            admitted_at: 1,
+            eligible_at: 1,
+            idempotency_key: Some(format!("spawn:{}", identity.spawn_uid)),
+        })
+        .await
+        .expect("admit report");
+    identity.task_id_str()
+}
+
+/// 🔴 R17 C4: view ≡ honest derivation, byte-for-byte at the same
+/// store key — the `rebuild_equals_full_derivation` pattern applied to
+/// the fifth view, on a multi-session store (a plain session, a ticket
+/// worker and a delegation lineage).
+#[tokio::test]
+async fn task_board_rows_equal_the_honest_derivation_at_the_same_store_key() {
+    let path = temp_db("task-equiv");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 3, 2, 9).await;
+    let task = seed_task_lineage(&store, "equiv").await;
+
+    let out = kian_cli::views::rebuild_views_with(&store, "builder", 1_000, true)
+        .await
+        .unwrap();
+    assert!(!out.lease_held);
+    assert_eq!(out.views, 5, "the four views + the task board");
+
+    let entries = kian_cli::views::fresh_task_board(&store)
+        .await
+        .expect("fresh task board");
+    let via_view: Vec<_> = entries.iter().map(|e| e.to_row().unwrap()).collect();
+    let honest = kian_cli::commands::task_board_rows(&store).await.unwrap();
+    assert_eq!(
+        via_view, honest,
+        "task view must equal the honest derivation"
+    );
+    assert_eq!(via_view.len(), 1);
+    assert_eq!(via_view[0].task_id, task);
+    assert_eq!(via_view[0].outcome, "completed_verified");
+    // And the full rebuild agrees with the incremental one at the
+    // same key (the same store, nothing appended between).
+    kian_cli::views::rebuild_views_full_with(&store, "builder", 1_050, true)
+        .await
+        .unwrap();
+    let entries = kian_cli::views::fresh_task_board(&store)
+        .await
+        .expect("fresh after the full rebuild");
+    let via_full: Vec<_> = entries.iter().map(|e| e.to_row().unwrap()).collect();
+    assert_eq!(via_full, honest, "full rebuild == incremental == honest");
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// 🔴 R17 C4 (`anchors.md` rule 4, pin P3-1): board off ⇒ no view, no
+/// rows, no state — and the other four views are unaffected. Rows
+/// published by an earlier ENABLED era are deleted by the next
+/// off-tick (a disposable view: a later re-enable cannot serve a
+/// stale era).
+#[tokio::test]
+async fn board_off_publishes_no_task_board_rows_and_no_view_state() {
+    let path = temp_db("task-off");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 2, 1, 17).await;
+    seed_task_lineage(&store, "off").await;
+
+    // The default rebuild (board off): four views, no task board.
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
+        .await
+        .unwrap();
+    assert_eq!(out.views, 4);
+    assert_eq!(
+        store.view_rows("task_board").await.unwrap(),
+        Some(vec![]),
+        "no task_board rows"
+    );
+    assert!(
+        store.view_state("task_board").await.unwrap().is_none(),
+        "no task_board state"
+    );
+    // The other four views are unaffected (rule 4's isolation).
+    assert!(kian_cli::views::fresh_directory(&store).await.is_some());
+    assert!(kian_cli::views::fresh_usage(&store).await.is_some());
+    assert!(kian_cli::views::fresh_cache(&store).await.is_some());
+    assert!(kian_cli::views::fresh_tickets(&store).await.is_some());
+
+    // An enabled era publishes; the next OFF tick deletes those rows
+    // and the state in the same publication.
+    kian_cli::views::rebuild_views_with(&store, "builder", 1_100, true)
+        .await
+        .unwrap();
+    assert!(kian_cli::views::fresh_task_board(&store).await.is_some());
+    kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.view_rows("task_board").await.unwrap(),
+        Some(vec![]),
+        "the stale era's rows are deleted"
+    );
+    assert!(
+        store.view_state("task_board").await.unwrap().is_none(),
+        "the stale era's state is deleted"
+    );
+    // And the four views survive the disposal untouched.
+    assert!(kian_cli::views::fresh_tickets(&store).await.is_some());
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// 🔴 R17 C4 (READ-MODEL §6 freshness gate): an append after a rebuild
+/// moves the store key — `fresh_task_board` reads `None` and the
+/// caller falls back to the honest derivation.
+#[tokio::test]
+async fn a_stale_task_board_view_is_never_served() {
+    let path = temp_db("task-stale");
+    let store = EventStore::open(&path).await.unwrap();
+    let sessions = seed_store(&store, 1, 1, 23).await;
+    seed_task_lineage(&store, "stale").await;
+    kian_cli::views::rebuild_views_with(&store, "builder", 1_000, true)
+        .await
+        .unwrap();
+    assert!(kian_cli::views::fresh_task_board(&store).await.is_some());
+
+    // ANY append makes the whole version stale.
+    let head = store.head(sessions[0]).await.unwrap().next_seq;
+    push(
+        &store,
+        sessions[0],
+        head,
+        Epoch(2),
+        EventKind::TurnEnd,
+        json!({"n": 1}),
+    )
+    .await;
+    assert!(
+        kian_cli::views::fresh_task_board(&store).await.is_none(),
+        "a stale task board is never served"
+    );
+    // The honest derivation still answers.
+    assert_eq!(
+        kian_cli::commands::task_board_rows(&store)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R17 C4 (§6 rules:270-274): a tampered payload breaks the digest —
+/// the view is discarded, never repaired by guessing.
+#[tokio::test]
+async fn a_corrupt_task_board_view_is_discarded_not_repaired() {
+    let path = temp_db("task-corrupt");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 1, 1, 29).await;
+    seed_task_lineage(&store, "corrupt").await;
+    kian_cli::views::rebuild_views_with(&store, "builder", 1_000, true)
+        .await
+        .unwrap();
+
+    if let EventStore::Sqlite(pool) = &store {
+        sqlx::query("UPDATE view_rows SET payload = ? WHERE view = 'task_board'")
+            .bind(r#"{"task_id":"x","outcome":"completed_verified"}"#)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        kian_cli::views::fresh_task_board(&store).await.is_none(),
+        "a corrupt task board is discarded"
+    );
+
+    store.close().await;
+    cleanup(&path);
+}
+
+/// R17 C4 (the R9-10 reuse path): the incremental rebuild after a
+/// task-board delta (a verdict landing on the child) produces the
+/// same rows as the honest full derivation.
+#[tokio::test]
+async fn incremental_rebuild_equals_full_for_task_board() {
+    let path = temp_db("task-delta");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 2, 1, 31).await;
+    let task = seed_task_lineage(&store, "delta").await;
+    // First build WITHOUT the completion: seed_task_lineage already
+    // completed the child, so instead delete the completion and
+    // re-append it as the delta. (Behind the API's back — the
+    // retention shape the incremental path must survive. The store's
+    // only thread/completed events are this lineage's.)
+    if let EventStore::Sqlite(pool) = &store {
+        sqlx::query("DELETE FROM events WHERE kind = 'thread/completed'")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    kian_cli::views::rebuild_views_with(&store, "builder", 1_000, true)
+        .await
+        .unwrap();
+    let entries = kian_cli::views::fresh_task_board(&store)
+        .await
+        .expect("fresh");
+    let before: Vec<_> = entries.iter().map(|e| e.to_row().unwrap()).collect();
+    assert_eq!(
+        before[0].outcome, "outstanding",
+        "the completion is gone from the stream"
+    );
+
+    // The delta: the child completes (a task-board kind event).
+    let identity = kian_superagent::SpawnIdentity::derive(
+        before[0]
+            .parent
+            .parse()
+            .map(kian_core::model::SessionId)
+            .unwrap(),
+        100,
+        "worker",
+        7,
+    );
+    let child: kian_core::model::SessionId = before[0]
+        .child
+        .parse()
+        .map(kian_core::model::SessionId)
+        .unwrap();
+    let head = store.head(child).await.unwrap().next_seq;
+    push(
+        &store,
+        child,
+        head,
+        Epoch(1),
+        EventKind::ThreadCompleted,
+        json!({"thread_id": identity.task_id_str(), "status": "completed",
+               "summary": {"role": "assistant", "content": "done"}}),
+    )
+    .await;
+
+    let out = kian_cli::views::rebuild_views_with(&store, "builder", 1_200, true)
+        .await
+        .unwrap();
+    assert!(!out.lease_held);
+    let entries = kian_cli::views::fresh_task_board(&store)
+        .await
+        .expect("fresh after the delta");
+    let via_view: Vec<_> = entries.iter().map(|e| e.to_row().unwrap()).collect();
+    let honest = kian_cli::commands::task_board_rows(&store).await.unwrap();
+    assert_eq!(via_view, honest, "incremental == honest after the delta");
+    assert_eq!(via_view[0].task_id, task);
+    assert_eq!(via_view[0].outcome, "completed_verified");
+
+    store.close().await;
     cleanup(&path);
 }

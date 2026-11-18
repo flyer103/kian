@@ -258,6 +258,12 @@ const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligib
 
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND consumed_by_seq IS NULL AND eligible_at <= $2::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
+/// (R17 C4, pin P3-5) the read-only per-session inbox read behind the
+/// task board's `input_required` arm: EVERY row of the session,
+/// consumed rows included (the row is durable and audit-visible after
+/// `mark_consumed`). Dialect-identical to sqlite's INPUT_ROWS_SQL.
+const INPUT_ROWS_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text ORDER BY eligible_at ASC, admitted_seq ASC";
+
 const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= $1::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// Dialect-identical to sqlite's CONSUME modulo placeholders (pg reuses
@@ -344,6 +350,19 @@ pub(crate) async fn eligible_inputs(
     let rows: Vec<InputCols> = sqlx::query_as(ELIGIBLE_SQL)
         .bind(session.0.to_string())
         .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(decode_input).collect()
+}
+
+/// (R17 C4, pin P3-5): every inbox row of the session — read-only,
+/// consumed rows included, oldest first. No new table, no migration.
+pub(crate) async fn input_rows(
+    pool: &PgPool,
+    session: SessionId,
+) -> Result<Vec<InputRow>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(INPUT_ROWS_SQL)
+        .bind(session.0.to_string())
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(decode_input).collect()
@@ -836,4 +855,182 @@ pub(crate) async fn view_publish_delta(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+// -- durable cron state (CRON-MODEL §4/§9, v7) ------------------------------
+// Same statements as the sqlite twins, `$N` placeholders with explicit
+// casts (every nullable parameter needs one — pg cannot infer a bare
+// NULL). Fire times stay TEXT in the canonical UTC RFC 3339 `Z` form, so
+// the cursor comparison and the firing ordering are the same text
+// comparisons on both backends.
+
+pub(crate) const CRON_SCHEDULE_UPSERT_SQL: &str = "INSERT INTO cron_schedules (id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at)\nVALUES ($1::text, $2::text, $3::text, $4::text, NULL, NULL, $5::bigint, $6::bigint, $6::bigint)\nON CONFLICT (id) DO UPDATE SET\n    expr = excluded.expr,\n    tz = excluded.tz,\n    enabled = excluded.enabled,\n    cursor_fire_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        THEN cron_schedules.cursor_fire_at ELSE NULL END,\n    next_fire_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        THEN cron_schedules.next_fire_at ELSE NULL END,\n    declaration_digest = excluded.declaration_digest,\n    updated_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        AND cron_schedules.expr = excluded.expr\n        AND cron_schedules.tz = excluded.tz\n        AND cron_schedules.enabled = excluded.enabled\n        THEN cron_schedules.updated_at ELSE excluded.updated_at END";
+
+pub(crate) const CRON_SCHEDULE_DIGEST_SQL: &str =
+    "SELECT declaration_digest FROM cron_schedules WHERE id = $1::text";
+
+pub(crate) const CRON_SCHEDULE_CURSOR_SQL: &str =
+    "SELECT cursor_fire_at FROM cron_schedules WHERE id = $1::text";
+
+pub(crate) const CRON_SCHEDULES_SQL: &str = "SELECT id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at FROM cron_schedules ORDER BY id ASC";
+
+pub(crate) const CRON_SCHEDULE_SQL: &str = "SELECT id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at FROM cron_schedules WHERE id = $1::text";
+
+/// Insert-if-absent. Two racers reach the unique index together; one
+/// commits and the other blocks, then reports zero rows — exactly one
+/// winner (`rows_affected() == 1`).
+pub(crate) const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WHERE id = $1::text";
+
+pub(crate) const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES ($1::text, $2::text, $3::text, $4::bigint, $5::text, $6::text, $7::text, $8::bigint, $9::text)\nON CONFLICT DO NOTHING";
+
+pub(crate) const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = $2::text,\n    worktree_path = COALESCE($3::text, worktree_path),\n    finished_at = $4::bigint,\n    error = $5::text\nWHERE firing_id = $1::text AND state IN ('admitted', 'running')";
+
+pub(crate) const CRON_ADVANCE_CURSOR_SQL: &str = "UPDATE cron_schedules\nSET cursor_fire_at = $2::text,\n    next_fire_at = $3::text,\n    updated_at = $4::bigint\nWHERE id = $1::text\n  AND (cursor_fire_at IS NULL OR cursor_fire_at < $2::text)\n  AND EXISTS (SELECT 1 FROM cron_firings WHERE firing_id = $5::text)";
+
+pub(crate) const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE ($1::text IS NULL OR schedule_id = $1::text)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT $2::bigint";
+
+pub(crate) const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = $1::text";
+
+pub(crate) async fn cron_upsert_schedule(
+    pool: &PgPool,
+    p: &crate::cron::ScheduleInsert<'_>,
+) -> Result<Option<String>, StoreError> {
+    // `FOR UPDATE` would be the paranoid form; the reset decision is made
+    // by the UPSERT itself, so the pre-read only feeds the caller's
+    // report (documented on the sqlite twin).
+    let previous: Option<String> = sqlx::query_scalar(CRON_SCHEDULE_DIGEST_SQL)
+        .bind(p.id)
+        .fetch_optional(pool)
+        .await?;
+    sqlx::query(CRON_SCHEDULE_UPSERT_SQL)
+        .bind(p.id)
+        .bind(p.expr)
+        .bind(p.tz)
+        .bind(p.digest)
+        .bind(p.enabled)
+        .bind(p.now)
+        .execute(pool)
+        .await?;
+    Ok(previous)
+}
+
+pub(crate) async fn cron_load_schedules(
+    pool: &PgPool,
+) -> Result<Vec<crate::cron::ScheduleCols>, StoreError> {
+    let rows: Vec<crate::cron::ScheduleCols> =
+        sqlx::query_as(CRON_SCHEDULES_SQL).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+pub(crate) async fn cron_load_schedule(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<crate::cron::ScheduleCols>, StoreError> {
+    let row: Option<crate::cron::ScheduleCols> = sqlx::query_as(CRON_SCHEDULE_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub(crate) async fn cron_delete_schedule(pool: &PgPool, id: &str) -> Result<bool, StoreError> {
+    let res = sqlx::query(CRON_DELETE_SCHEDULE_SQL)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn cron_claim_firing(
+    pool: &PgPool,
+    p: &crate::cron::FiringInsert<'_>,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_FIRING_CLAIM_SQL)
+        .bind(p.firing_id)
+        .bind(p.schedule_id)
+        .bind(p.fire_time)
+        .bind(p.admitted_at)
+        .bind(p.state)
+        .bind(p.skip_reason)
+        .bind(p.worktree_path)
+        .bind(p.finished_at)
+        .bind(p.error)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn cron_finish_firing(
+    pool: &PgPool,
+    firing_id: &str,
+    state: &str,
+    finished_at: Option<i64>,
+    worktree_path: Option<&str>,
+    error: Option<&str>,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_FIRING_FINISH_SQL)
+        .bind(firing_id)
+        .bind(state)
+        .bind(worktree_path)
+        .bind(finished_at)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn cron_advance_cursor(
+    pool: &PgPool,
+    id: &str,
+    firing_id: &str,
+    admitted_fire_at: &str,
+    next_fire_at: &str,
+    now: i64,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_ADVANCE_CURSOR_SQL)
+        .bind(id)
+        .bind(admitted_fire_at)
+        .bind(next_fire_at)
+        .bind(now)
+        .bind(firing_id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 1 {
+        return Ok(true);
+    }
+    let current: Option<Option<String>> = sqlx::query_scalar(CRON_SCHEDULE_CURSOR_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match current {
+        None => Err(crate::cron::CronError::UnknownSchedule { id: id.to_owned() }),
+        Some(cursor) if cursor.as_deref().is_some_and(|c| c >= admitted_fire_at) => Ok(false),
+        Some(_) => Err(crate::cron::CronError::UnrecordedFiring {
+            firing_id: firing_id.to_owned(),
+        }),
+    }
+}
+
+pub(crate) async fn cron_list_firings(
+    pool: &PgPool,
+    schedule_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<crate::cron::FiringCols>, StoreError> {
+    let rows: Vec<crate::cron::FiringCols> = sqlx::query_as(CRON_LIST_FIRINGS_SQL)
+        .bind(schedule_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub(crate) async fn cron_load_firing(
+    pool: &PgPool,
+    firing_id: &str,
+) -> Result<Option<crate::cron::FiringCols>, StoreError> {
+    let row: Option<crate::cron::FiringCols> = sqlx::query_as(CRON_LOAD_FIRING_SQL)
+        .bind(firing_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
 }

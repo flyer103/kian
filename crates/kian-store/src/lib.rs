@@ -33,6 +33,7 @@
 //!   §3.3)
 
 pub mod archive;
+pub mod cron;
 pub mod event_store;
 pub mod inbox;
 pub mod migrations;
@@ -46,6 +47,7 @@ mod sqlite;
 pub use archive::{
     ArchiveCandidate, ArchiveCommitOutcome, ArchiveError, ArchivedInput, ArchivedMarker,
 };
+pub use cron::{CronError, CronFiringRow, CronScheduleRow, FiringState, ScheduleUpsert};
 pub use event_store::{AppendGuard, EventStore, Head, StoreError};
 pub use inbox::{AdmitOutcome, InboxError, SessionInbox};
 pub use snapshots::{SnapshotCandidate, SnapshotRow};

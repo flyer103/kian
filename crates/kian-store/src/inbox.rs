@@ -171,6 +171,21 @@ impl EventStore {
         }
     }
 
+    /// (R17 C4, pin P3-5) **every** inbox row of the session —
+    /// read-only, oldest first, consumed rows included. The task
+    /// board's non-event input (`input_required`) reads the parent's
+    /// durable report rows here: a report row keeps its
+    /// `state:"waiting"` fact after the parent's drain consumed it
+    /// (the row is audit-visible, never deleted), so the board reads
+    /// the row, not the eligibility window and never any prose. No
+    /// new table, no migration — the existing `inputs` table only.
+    pub async fn input_rows(&self, session: SessionId) -> Result<Vec<InputRow>, InboxError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::input_rows(pool, session).await,
+            EventStore::Postgres(pool) => crate::postgres::input_rows(pool, session).await,
+        }
+    }
+
     /// Marks one input consumed *by an already-committed event*: the
     /// write is refused unless `(session, seq)` exists in the events
     /// table, so eligibility can never be destroyed before the
@@ -1182,6 +1197,51 @@ mod tests {
         let missing = temp_db_path();
         assert!(EventStore::open_read_only(&missing).await.is_err());
         assert!(!missing.exists(), "read-only open must not create the file");
+    }
+
+    /// (R17 C4, pin P3-5) `input_rows` reads EVERY row of the session,
+    /// including rows already consumed by a committed event — the
+    /// durable-row fact the task board's `input_required` arm reads.
+    /// `eligible_inputs` hides the consumed row; `input_rows` must not
+    /// (a consumed report row still carries its `state:"waiting"`).
+    #[tokio::test]
+    async fn input_rows_return_consumed_rows_too() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let pending = input(sid, Some("pending"), T0, T0 - 10, json!("pending"));
+        let consumed = input(
+            sid,
+            Some("spawn:report"),
+            T0,
+            T0 - 20,
+            json!({
+                "thread_id": "00000000-0000-4000-8000-000000000000",
+                "status": "completed",
+                "summary": {"role": "assistant", "content": "need a decision"},
+                "state": "waiting",
+            }),
+        );
+        store.admit(pending.clone()).await.unwrap();
+        store.admit(consumed.clone()).await.unwrap();
+        seed_running(&store, sid, Epoch(1)).await; // seqs 1, 2
+        store
+            .mark_consumed(sid, consumed.id, 2)
+            .await
+            .expect("consume the report row");
+
+        // The eligibility window hides the consumed row…
+        assert_eq!(
+            store.eligible_inputs(sid, T0).await.unwrap(),
+            vec![pending.clone()]
+        );
+        // …but the durable read still returns it, oldest first.
+        assert_eq!(
+            store.input_rows(sid).await.unwrap(),
+            vec![consumed, pending],
+            "input_rows must read consumed rows (the durable report fact)"
+        );
+        store.close().await;
+        cleanup(&path);
     }
 }
 

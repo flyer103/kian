@@ -26,6 +26,73 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   (cache stability). New control-plane methods `confirm`/`pending` (+ SDK + `kian confirm` /
   `kian pending`), no new error code. Fail-closed boundaries: unknown permission values refuse boot,
   and `ask` on a superagent worker agent refuses boot until phase 2 (no worker waiting path).
+- **Cron scheduler: declarative wall-clock turns (P0/P1)**. `superagent.cron.schedules` declares
+  five-field or `@`-alias expressions in an IANA zone; each due slot is claimed once in
+  `cron_firings` (migration v7, sqlite + postgres) and runs as an ordinary turn — on the resident
+  engine, or in a detached per-firing worktree when `worktree:` is declared, with disk guards and
+  `keep_on_failure`. Includes catch-up coalescing, DST-correct next-fire math, the
+  `kian cron list|run-now|logs|rm` CLI, and a non-context `cron` proof on the admitted input
+  (prompt bytes unchanged). Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md),
+  [ADR-034](design/decisions/ADR-034-cron-scheduler.md), [docs/SPEC.md](docs/SPEC.md) §5.
+- **Multiagent P4: `depends_on` + `group`, readiness gating (round 17, C7)**. With
+  `superagent.board.gating: true`, `spawn_worker` grows `depends_on` (task keys) and `group`: the
+  spawn is refused — before any side effect, from the primary only — until every named task has a
+  successful completion (`empty_output` never releases; `completed_unverified` only under a policy
+  that accepts it), and a self-reference or cycle over the recorded task graph is refused naming
+  the cycle. The parent's `thread/started` audit group carries the declared facts, and `kian
+  board` gains the `depends_on`/`group`/`ready` columns, flipping `evidence_provenance` to
+  `"recorded"` only where the committed `evidence_ref` key exists. `superagent.multiagent.join`
+  validates `all` | `any` | `quorum:<n>` and refuses to boot on `any`/`quorum:<n>` (no evaluation
+  site in v1 — deferred with fan-in). Gating off is byte-identical P3. Contract:
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §4.4/§7.3, [docs/SPEC.md](docs/SPEC.md) §5.
+- **Multiagent roster: the per-assignee child surface and the output-schema gate (round 17, C1–C3)**.
+  `superagent.roster` names delegation entries over `agents:` definitions; `spawn_worker` grows
+  `agent`/`task_key`/`output_schema` and `kian agents` lists the roster. A roster-spawned child runs
+  its entry's own slots/budgets with the structural `agent.tools ∩ tools_allow` surface (denied tools
+  never reach the request schema), resolved from the committed wrapper — a vanished assignee runs a
+  refusing side, never a wider one. The child's `output_schema` is enforced by a gate with one
+  correction attempt; a second miss commits `evidence/verdict{gate:"output_schema"}` and reads as
+  `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
+  Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
+- **Delegation task board — the read-only operator surface (kian board / kian tasks, round 17, C5)**. Two new
+  `kian` verbs over the fifth view's rows (R17 C4): `kian board [--db] [--config] [--json]`
+  renders one row per delegated task (`task_id`, `assignee`, `attempt`, `outcome`,
+  `thread_status`, `gate`, the derived evidence pointer) in deterministic `task_id` order, and
+  `kian tasks --all` prints the same rows flat (`--all` is required in v1; the bare form refuses
+  with usage). Both are strictly read-only (`open_read_only` — no events, no inbox writes, no
+  view updates, no ops RPC), served from the fresh `task_board` view when
+  `superagent.board.enabled` and `read_model.views.enabled` are both on (the declared staleness
+  bound is the rebuild interval) and from the honest full-stream derivation otherwise — identical
+  operator output on both paths. `--json` emits the frozen document `{now_ms, version, tasks}`
+  (pin P3-3's row key set exactly; absent facts are never fabricated — `evidence_provenance`
+  stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
+  refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
+- **Bounded queue re-drive (ADR-035)** — `exec_queue` rows carry `dispatch_attempts` (exec migration
+  v6, additive, sqlite + postgres); the claim statement counts a dispatch and refuses an `inflight`
+  re-drive at `1 + workers.queue_max_redrives` (new config knob in `kian.yaml` under `workers:`,
+  default `1`, `0` = first dispatch only, validated ceiling `16`), and a spent bound converges the
+  row `inflight → abandoned` once no live lease is held — one audit line naming command id, endpoint,
+  attempts and `tool_call_ref`, no fabricated result. This fixes an unbounded replay observed live:
+  a command whose own side effect destroys its ack path (`systemctl restart kian`, `pkill kiand`)
+  was re-dispatched on every reconnect forever, because the caller-applied `queue_timeout` bounds
+  only rows someone is waiting on. No new status, event kind, wire frame or prompt byte; a caller
+  re-attaching after convergence reads `abandoned` and gets the existing honest timeout. Semantics:
+  [WORKER-MODEL §4](design/WORKER-MODEL.md), placement [DESIGN](design/DESIGN.md),
+  decision [ADR-035](design/decisions/ADR-033-bounded-queue-redrive.md).
+
+- **Hook plugins — the two-tier harness-extension contract (round 16, [PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
+  [ADR-028](../design/decisions/ADR-028-harness-hook-plugins.md))**. A closed hook vocabulary over seven
+  interception ports (admission, turn, tool, recovery, settlement) with a tier-0 compile-time registry
+  (`kian-plugin::hooks`) and a tier-1 sidecar tier: operator-trusted child processes over a stdio
+  JSON-lines ABI with digest-pinned spawns, `env_allow`-only environments, per-dispatch deadlines, a
+  failure window with one-strike quarantine, and grant-keyed fail-closed/fail-open class defaults. New
+  `sidecars:` config section (instance manifests + server/worker scopes, set digest + session-consistency
+  quarantine); `tool/pre` denials surface as honest-error `tool/result`s with the additive
+  `tool/call.permission.policy:"hook"` value naming `<plugin>:<hook>` (the round's one EVENT-MODEL
+  amendment). Ships with an in-tree reference sidecar — a Python stdlib `tool/pre` approval gate under
+  `examples/hook-approval-gate/` — and no `sidecars:` section leaves behavior byte-identical.
+
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:

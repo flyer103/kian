@@ -57,6 +57,33 @@ pub enum ServeError {
     Engine(#[from] EngineError),
 }
 
+/// The resident-engine turn sink the cron dispatcher writes through: one
+/// durable inbox row for the schedule's target session (the engine folds the
+/// wake itself). Blocking on the serve runtime's handle is safe here because the
+/// cron ticker runs on its own OS thread, never on a runtime worker.
+struct EngineTurn {
+    engine: Arc<Engine<ServeLoopDriver>>,
+    handle: tokio::runtime::Handle,
+}
+
+impl crate::cron_engine::ResidentTurn for EngineTurn {
+    fn deliver(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> Result<(), String> {
+        self.handle
+            .block_on(async {
+                self.engine
+                    .admit(session, content, idempotency_key)
+                    .await
+                    .map(|_| ())
+            })
+            .map_err(|e| format!("admit: {e}"))
+    }
+}
+
 /// The assembled single-machine server.
 pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
@@ -96,6 +123,11 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
+    /// The resolved `superagent.cron` schedules (CRON-MODEL §3): empty iff
+    /// no cron section is configured (or none resolved). [`Server::serve`]
+    /// spawns the cron ticker only when this is non-empty — feature-off
+    /// arms no timer at all (M8).
+    cron_schedules: Vec<crate::config::CronRuntimeSchedule>,
     /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
     /// plan pin P5): present iff the superagent bundle configures
     /// `superagent.multiagent` limits. [`Server::serve`] spawns its
@@ -121,6 +153,19 @@ pub struct Server {
     /// Keeps the plugin-registered services alive for the server's
     /// lifetime; dropping it would unregister them (disposer).
     _plugin_disposer: Disposer,
+    /// The mounted sidecars (PLUGIN-SPEC §13.1, P3b): the runners (one
+    /// process per instance, for the server lifetime — R11) and their
+    /// handler registrations. `None` (the `sidecars:` section absent)
+    /// mounts nothing and changes nothing — byte-identical (§13.3).
+    /// Dropping it stops every runner (`bye`, bounded grace, group
+    /// kill — §7.5).
+    sidecars: Option<crate::sidecars::SidecarMount>,
+    /// Port (a′) — the API-borne `admit/pre` observation (PLUGIN-SPEC
+    /// §4 row (a′), observe-only by construction at `origin:"api"`):
+    /// the bus `submit`/`queue`/`steer` consult before
+    /// `engine.admit`. A stop answered here is discarded by the bus
+    /// (§3.4.3 — no refusal wire exists); only the observation lands.
+    hooks: kian_plugin::hooks::HookBus,
 }
 
 /// The serve-side snapshot builder plan (READ-MODEL §5/§9).
@@ -132,10 +177,16 @@ struct SnapshotMaintenance {
 }
 
 /// The serve-side view rebuilder plan (READ-MODEL §6/§9, P2a).
+/// `board_enabled` (R17 C4, pin P3-1) is the conjunction
+/// `superagent.board.enabled && read_model.views.enabled` — the
+/// machinery switch already gated the plan's existence, so this field
+/// only composes the two; the task-board arm of the rebuild publishes
+/// nothing while it is false.
 #[derive(Clone)]
 struct ViewsMaintenance {
     interval_ms: u64,
     holder: String,
+    board_enabled: bool,
 }
 
 /// The serve-side child inactivity plan (MULTIAGENT-MODEL §5.3, pin
@@ -260,6 +311,17 @@ impl Server {
         };
 
         let mut ctx = PluginCtx::new();
+        // The hook bus (PLUGIN-SPEC §1/§4): one instance for the whole
+        // process, created before the plugins activate so the loop
+        // plugins can resolve it and mount their ports (§13.1: "the
+        // bus registers its ports when the driver/wrapper is
+        // constructed"). The same instance is the Server's port (a)
+        // and carries the §8/§9 sidecar runtime, installed after the
+        // inbox rebuild.
+        let hooks = kian_plugin::hooks::HookBus::new();
+        let _bus_provide = ctx
+            .provide::<kian_plugin::hooks::HookBus>(Arc::new(hooks.clone()))
+            .map_err(|e| ServeError::Assembly(format!("hook bus provide: {e}")))?;
         // the exec secret hygiene pair, built once and shared
         // by the local tool surface and the remote-exec queue:
         //
@@ -335,6 +397,29 @@ impl Server {
             .transpose()
             .map_err(ServeError::Config)?
             .flatten();
+        // (R17-C6, pin P4-1): the class-A emission switch — converted
+        // once beside the bounds (the block is C4's; this is wiring
+        // only). `false` (absent block or absent key) keeps every
+        // event payload at its P3 bytes; `true` arms the two key
+        // groups (the config parse refuses `gating: true` without the
+        // `multiagent` block — §7.1:737-741).
+        let board_gating = superagent_cfg
+            .map(|sa| {
+                sa.board_config()
+                    .map(|board| kian_superagent::BoardGating(board.gating))
+            })
+            .transpose()
+            .map_err(ServeError::Config)?
+            .unwrap_or_default();
+        // (R17-C1): the roster — converted once, fail-closed (an
+        // entry naming no configured `agents:` id, a widening
+        // `tools_allow` or an out-of-subset `output_schema` refuses
+        // to boot, naming the key). `None` (absent/empty) = the
+        // roster feature is off (pin P2-6).
+        let roster = config.roster_config().map_err(ServeError::Config)?;
+        // (R17-C3) a snapshot for the per-entry AgentDef resolution
+        // below (the plugin consumes `roster` by value).
+        let roster_snapshot = roster.clone();
         // the child inactivity plan (C6's ticker): filled inside the
         // superagent arm once the re-arm walk resolves the live
         // Router session (pin P5's walk root).
@@ -630,6 +715,28 @@ impl Server {
                 // (R15-C5): the delegation bounds; `None` (absent
                 // block) = feature off, byte-identical (M8, §8.1).
                 multiagent: multiagent_limits,
+                // (R17-C6, pin P4-1): the class-A key-emission
+                // switch (`superagent.board.gating`).
+                board_gating,
+                // (R17-C1): the roster; `None` (absent/empty) = the
+                // roster feature is off (pin P2-6).
+                roster,
+                // (R17-C3, pin P2-1 — wiring only): the per-entry
+                // resolved AgentDefs the per-assignee sides are built
+                // from (`named_agent_def`, never the default agent).
+                roster_agent_defs: roster_snapshot
+                    .as_ref()
+                    .map(|r| {
+                        r.entries
+                            .iter()
+                            .filter_map(|entry| {
+                                config
+                                    .named_agent_def(&entry.agent)
+                                    .map(|def| (entry.id.clone(), def))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 // /ADR-013: the thread-key derivations (validated at
                 // parse; converted again here — one shape, both gates).
                 thread_keys: sa
@@ -785,15 +892,25 @@ impl Server {
                     interval_ms: config.read_model.snapshots.interval_ms,
                     holder: config.drain.holder.clone(),
                 });
+        // (R17 C4, pin P3-1): the task-board switch, converted
+        // fail-closed (a `gating: true` already refused the parse).
+        // `None` superagent section = the block's default = off.
+        let board_enabled = superagent_cfg
+            .map(|sa| sa.board_config())
+            .transpose()
+            .map_err(ServeError::Config)?
+            .is_some_and(|board| board.enabled);
         // READ-MODEL §6 (P2a): the view maintenance plan — present iff
         // `read_model.views.enabled`. [`Server::serve`] spawns its
         // ticker; the rebuilder runs outside every drain under the
         // `views:all` maintenance lease. The gate also decides whether
         // the /metrics aggregates may consult views (a disabled gate
-        // hides every view — honest full derivation).
+        // hides every view — honest full derivation). The task board
+        // rides the same ticker behind the composed board switch.
         let views_maintenance = config.read_model.views.enabled.then(|| ViewsMaintenance {
             interval_ms: config.read_model.views.interval_ms,
             holder: config.drain.holder.clone(),
+            board_enabled,
         });
         let views_enabled = config.read_model.views.enabled;
         let event_stream_enabled = config.api.event_stream.enabled;
@@ -813,6 +930,18 @@ impl Server {
             None => None,
         };
 
+        // The resolved cron schedules (CRON-MODEL §3). The load-time gate
+        // already validated the section, so resolution failing here can
+        // only mean a channel target moved: arming nothing is the
+        // fail-closed choice, and an empty set arms no timer at all.
+        let cron_schedules: Vec<crate::config::CronRuntimeSchedule> = match superagent_cfg {
+            Some(sa) => sa
+                .cron
+                .to_runtime(&sa.channels, chrono::Utc::now())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+
         let server = Self {
             engine,
             store,
@@ -826,6 +955,11 @@ impl Server {
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
             views_maintenance,
+            // The one process-wide hook bus (provided to the plugin ctx
+            // above; the §8/§9 sidecar runtime mounts on it after the
+            // inbox rebuild).
+            hooks,
+            cron_schedules,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -838,6 +972,7 @@ impl Server {
             event_stream_enabled,
             confirmation_ttl_ms: config.confirmation.ttl_ms,
             _plugin_disposer: plugin_disposer,
+            sidecars: None,
         };
         // (R15-C5): arm the child inactivity ticker with the same
         // converted limits the bundle carries — the plan's root is
@@ -852,6 +987,16 @@ impl Server {
         let sessions = server.engine.startup_rebuild().await?;
         tracing::info!(sessions, "startup inbox rebuild complete");
         crate::superagent::record_rebuild_done(&startup_order);
+
+        // -- 5.5 sidecars mount (PLUGIN-SPEC §13.1): strictly after the
+        //       inbox rebuild, never in a plugin's synchronous apply.
+        //       Per-instance fail-closed validation (§6.2), the widening
+        //       boot check (§8.2), runner spawn + handler registration,
+        //       and the §8/§9 runtime on the bus. Absent section = no
+        //       mount, byte-identical (§13.3).
+        let sidecars = crate::sidecars::mount(&config, &server.hooks, &secret_env_names)?;
+        let mut server = server;
+        server.sidecars = sidecars;
 
         // -- 6. superagent services start (registry → subscriptions →
         //       watchdog → router bootstrap), strictly AFTER the rebuild.
@@ -1046,9 +1191,96 @@ impl Server {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    crate::views::views_maintenance_tick(&store, &plan.holder, now_ms).await;
+                    crate::views::views_maintenance_tick_with(
+                        &store,
+                        &plan.holder,
+                        now_ms,
+                        plan.board_enabled,
+                    )
+                    .await;
                 }
             });
+        }
+        // Cron ticker (CRON-MODEL §5.2): the declared `superagent.cron`
+        // schedules are decided here. Due-ness, the catch-up policy and the
+        // coalesce window are `cron_tick::tick_once`'s business, not this
+        // loop's; the loop owns only the cadence, the panic guard and the
+        // event emission. Armed only when at least one schedule resolved.
+        if !self.cron_schedules.is_empty() {
+            let schedules = self.cron_schedules.clone();
+            // The ticker gets its own thread: `cron_tick::tick_once` is
+            // synchronous and the store is async, so the durable adapter
+            // blocks on the serve runtime's handle from an OS thread instead
+            // of stalling a runtime worker.
+            let store = crate::cron_engine::DurableCronTickStore::new(
+                self.store.clone(),
+                tokio::runtime::Handle::current(),
+                schedules.clone(),
+            );
+            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn {
+                engine: Arc::clone(&self.engine),
+                handle: tokio::runtime::Handle::current(),
+            });
+            let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
+                Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
+            // Selection rule: a schedule that declares `worktree:` is
+            // dispatched to the worktree-backed arm; every other schedule goes
+            // to the resident engine.
+            let mut selection = crate::cron_engine::ScheduleDispatcher::resident(resident);
+            if let Some((repo, policy)) = crate::config::cron_worktree_plan(&schedules) {
+                selection = selection.with_worktree(Arc::new(
+                    crate::cron_worktree::WorktreeDispatcher::new(repo).with_policy(policy),
+                ));
+            }
+            let dispatcher = Arc::new(selection);
+            let started = std::thread::Builder::new()
+                .name("kian-cron".to_string())
+                .spawn(move || {
+                    loop {
+                        let now = chrono::Utc::now();
+                        // One schedule at a time, each under its own panic
+                        // guard: a malformed declaration cannot kill the
+                        // ticker for the others.
+                        for schedule in &schedules {
+                            let outcome =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::cron_engine::tick_and_dispatch_classified(
+                                        now,
+                                        std::slice::from_ref(schedule),
+                                        &store,
+                                        &*dispatcher,
+                                    )
+                                }));
+                            match outcome {
+                                Ok((report, extra)) => {
+                                    for event in extra
+                                        .into_iter()
+                                        .chain(crate::cron_tick::report_events(&report, now))
+                                    {
+                                        eprintln!("{event}");
+                                    }
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "event": "cron/failed",
+                                            "at": now.to_rfc3339(),
+                                            "schedule_id": schedule.id,
+                                            "error": "tick panicked",
+                                        })
+                                    );
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            crate::cron_tick::TICK_INTERVAL_MS,
+                        ));
+                    }
+                });
+            if let Err(error) = started {
+                tracing::warn!(%error, "cron ticker could not start");
+            }
         }
         // Child inactivity bound (MULTIAGENT-MODEL §5.3:587, plan pin
         // P5): a ticker whose each beat walks the root→child stream
@@ -1158,6 +1390,61 @@ impl Server {
 // ---------------------------------------------------------------------------
 
 impl Server {
+    /// Port (a′) — the API-borne admission observation (§4 row (a′),
+    /// §3.4.3's observe-only rows): one `admit/pre` evaluation over
+    /// the single target before `engine.admit`. The verdict is
+    /// discarded by construction — at `origin:"api"` a `stop` is
+    /// out-of-origin speech (§5.2), and no refusal wire exists (§16.3)
+    /// — so the input is admitted unchanged whatever a plugin says;
+    /// only the observation (and the bus's audit lines) land.
+    async fn observe_api_admission(
+        &self,
+        session: SessionId,
+        content: &serde_json::Value,
+        synthetic: bool,
+    ) {
+        use kian_plugin::hooks::{AdmissionInfo, AdmitInput, AdmitTarget};
+        let serialized = serde_json::to_string(content).unwrap_or_default();
+        let (content_preview, content_truncated) = kian_plugin::hooks::preview(&serialized);
+        let draft = kian_plugin::hooks::AdmitDraft {
+            origin: kian_plugin::hooks::Origin::Api,
+            targets: vec![AdmitTarget {
+                session,
+                router: false,
+            }],
+            input: AdmitInput {
+                role: "user".to_string(),
+                synthetic,
+                content_preview,
+                content_bytes: serialized.len() as u64,
+                content_sha256: kian_plugin::hooks::sha256_hex(serialized.as_bytes()),
+                content_truncated,
+                // API-borne input is never shaped at this boundary.
+                inline_view: false,
+            },
+            // No channel behind an API call, and no Inline/Spill policy
+            // applies here — the honest "no shaping" row.
+            channel: None,
+            admission: AdmissionInfo {
+                policy: "none".to_string(),
+                spilled: false,
+            },
+            // Declared limitation (n3, §7.3's floor): the frame is
+            // unconditionally the floor frame (no worker binding), so
+            // this API-borne admission resolves against the SERVER
+            // scope even when `session` is worker-bound. Observe-only
+            // (§3.4.3): no veto can leak at `origin:"api"`, but a
+            // sidecar narrowed away from that worker's scope can still
+            // observe API submits here. Making this boundary read the
+            // session's durable binding (a §7.3/§13 note, or a
+            // `StreamPort` injection) is later-round work — PLUGIN-SPEC
+            // is frozen this round, so the floor is declared here, not
+            // silently narrowed.
+            frames: vec![kian_plugin::hooks::FrameInfo::new(session)],
+        };
+        let _ = self.hooks.admit(&draft).await;
+    }
+
     /// The creation-time memory injection (MEMORY-MODEL §6, kian-101):
     /// read the source memory session's `memory/note` events (narrow
     /// `scan_kind` since P3b-1 — the fold ignores non-note events), fold
@@ -1297,6 +1584,8 @@ impl ControlPlane for Server {
     ) -> BoxFuture<'_, Result<bool, ControlError>> {
         Box::pin(async move {
             // Inbox write first (constraint 6); the engine folds the wake.
+            // Port (a′): observe-only admission (§3.4.3 — the API row).
+            self.observe_api_admission(session, &content, false).await;
             self.engine
                 .admit(session, content, idempotency_key)
                 .await
@@ -1312,6 +1601,9 @@ impl ControlPlane for Server {
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<bool, ControlError>> {
         Box::pin(async move {
+            // Port (a′): observe-only admission; `steer` lands as the
+            // synthetic (strippable) row the engine wraps engine-side.
+            self.observe_api_admission(session, &content, true).await;
             self.engine
                 .steer(session, content, idempotency_key)
                 .await
@@ -1330,6 +1622,9 @@ impl ControlPlane for Server {
         // same durable inbox; a drain in flight folds the wake and
         // consumes it in the same sweep (batch semantics).
         Box::pin(async move {
+            // Port (a′): observe-only admission (§3.4.3 — the queue row
+            // shares submit's ingress).
+            self.observe_api_admission(session, &content, false).await;
             self.engine
                 .admit(session, content, idempotency_key)
                 .await
@@ -2112,6 +2407,129 @@ recovery:
         assert!(
             server.child_timeout_maintenance.is_none(),
             "feature-off must arm no child inactivity ticker"
+        );
+    }
+
+    /// A bootable super-agent config (dead localhost providers, the
+    /// `superagent_serve.rs` base shape) with `superagent_extra`
+    /// appended inside the `superagent:` section and `read_model_extra`
+    /// appended at the top level.
+    fn write_superagent_config(
+        dir: &std::path::Path,
+        superagent_extra: &str,
+        read_model_extra: &str,
+    ) -> std::path::PathBuf {
+        let sqlite = dir.join("kian.sqlite");
+        let yaml = format!(
+            r#"listen: "127.0.0.1:0"
+storage:
+  sqlite: "{sqlite}"
+agent:
+  id: default
+  model_slots:
+    main:
+      provider: mock
+      model: mock-model
+agents:
+  router:
+    id: router
+    version: 3
+    model_slots:
+      router:
+        provider: mock
+        model: mock-router
+    tools: ["spawn_worker", "reply", "deliver_structured"]
+  worker:
+    id: worker
+    version: 7
+    model_slots:
+      main:
+        provider: mock
+        model: mock-worker
+    tools: ["fs_read", "fs_write", "exec"]
+superagent:
+  router:
+    session_id: "11111111-2222-3333-4444-555555555555"
+    agent: router
+    slot: router
+  worker:
+    agent: worker
+  subscriptions:
+    - channel: mock-im
+      match: always
+      route: router
+  channels:
+    mock-im:
+      type: mock-im
+{superagent_extra}{read_model_extra}providers:
+  mock:
+    base_url: "http://127.0.0.1:9"
+    api_key_env: KIAN_E2E_UNUSED
+plugins: ["openai-compat", "local-tools", "superagent"]
+drain:
+  max_iterations: 8
+recovery:
+  budget:
+    tokens: 16
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+            sqlite = sqlite.display(),
+            superagent_extra = superagent_extra,
+            read_model_extra = read_model_extra,
+        );
+        let path = dir.join("kian.yaml");
+        std::fs::write(&path, yaml).expect("write kian.yaml");
+        path
+    }
+
+    /// R17 C4 acceptance `board_on_with_views_off_publishes_nothing`
+    /// (pin P3-1, §7.1:741-742): BOTH switches are required. With
+    /// `read_model.views.enabled: false` the whole maintenance plan is
+    /// absent — no ticker exists, so nothing (the four views or the
+    /// task board) can be published, however the board block is set.
+    #[tokio::test]
+    async fn board_on_with_views_off_arms_no_view_publication() {
+        unsafe { std::env::set_var("KIAN_E2E_UNUSED", "unused") };
+        let dir = temp_dir("board-views-off");
+        let config = write_superagent_config(
+            &dir,
+            "  board:\n    enabled: true\n",
+            "read_model:\n  views:\n    enabled: false\n",
+        );
+        let (server, _cfg) = Server::from_config_file(&config).await.expect("assemble");
+        assert!(
+            server.views_maintenance.is_none(),
+            "views off ⇒ no maintenance ticker at all ⇒ nothing publishes"
+        );
+    }
+
+    /// The composition the other way (R17 C4, pin P3-1): views on +
+    /// board on ⇒ the plan carries `board_enabled: true`; board off
+    /// (the absent-block default) ⇒ the plan still exists for the four
+    /// views with `board_enabled: false`.
+    #[tokio::test]
+    async fn board_switch_composes_into_the_views_plan() {
+        unsafe { std::env::set_var("KIAN_E2E_UNUSED", "unused") };
+        let dir = temp_dir("board-on");
+        let config = write_superagent_config(&dir, "  board:\n    enabled: true\n", "");
+        let (server, _cfg) = Server::from_config_file(&config).await.expect("assemble");
+        let plan = server.views_maintenance.as_ref().expect("views on ⇒ plan");
+        assert!(plan.board_enabled, "board on + views on ⇒ board_enabled");
+
+        let dir = temp_dir("board-default");
+        let config = write_superagent_config(&dir, "", "");
+        let (server, _cfg) = Server::from_config_file(&config).await.expect("assemble");
+        let plan = server
+            .views_maintenance
+            .as_ref()
+            .expect("views on ⇒ plan even with the board off");
+        assert!(
+            !plan.board_enabled,
+            "absent board block (the default) ⇒ board off, four views only"
         );
     }
 }

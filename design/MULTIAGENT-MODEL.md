@@ -1,10 +1,11 @@
 # Multiagent model — the multiagent-domain contract
 
-- **Status**: proposed (R14 design draft, docs-only). No code, test or live evidence exists yet: this
-  file is written *ahead* of implementation, the way
-  [ADR-012](decisions/ADR-012-delegation-mandate.md) was proposed ahead of its landing. Every
-  normative sentence here is a requirement on the landing change, not a description of shipped
-  behavior; §10 says exactly what is unverified.
+- **Status**: implemented through P4 in code + tests (R15–R17: the delegation core, the P2 roster
+  and spawn inputs, the P3 task board, and the P4 `depends_on`/`group` arguments, readiness gating
+  and audit key groups behind `superagent.board.gating`). **No live-run evidence exists** — nothing
+  here has run against a live provider or a multi-session production store; §10 says exactly what
+  is unverified. Every normative sentence remains a requirement the tests pin, not a claim about
+  observed behavior.
 - **Date**: 2026-11-15
 - **Owns**: multiagent-domain *semantics* — parent/child delegation, spawn identity, the named-agent
   roster, the board ruling (control path vs observability view), child authority and limits, outcome
@@ -38,7 +39,7 @@
 This contract introduces **no** new event kind, **no** new table, **no** new HTTP route, **no** new
 ops method, **no** new metrics key, and **no** core-crate change. It introduces one additive config
 block (`superagent.multiagent`), one additive config list (`superagent.roster`), one additive
-read-surface switch (`superagent.board`, off by default), three proposed read-only CLI verbs
+read-surface switch (`superagent.board`, off by default), three read-only CLI verbs
 (`kian board`, `kian tasks --all`, `kian agents` — §4.2), and — only at phase P4, behind an explicit
 owner gate — two additive payload key groups on events that already exist (§7.2). **No event-payload
 key set changes before P4**; §0.3 draws that boundary once, because the rest of this file depends on
@@ -744,7 +745,14 @@ view-machinery switch READ-MODEL owns.
 Unknown or malformed values refuse to boot (the fail-closed config discipline used by the permission
 table and `workers.token_env`); an absent block is not an error and changes nothing.
 
-### 7.2 The P4 additive payload keys (proposed; owner gate; NOT this round)
+> **`join` narrowing (R17, P4 landing note).** Config accepts and validates `all` | `any` |
+> `quorum:<n>` (n ≥ 1), but **v1 evaluates only `all`** — the one shape with an evaluation site
+> (one spawn, one parent). `any` and `quorum:<n>` **refuse to boot** naming the missing evaluation
+> site and the §9 deferral; they are *not* accepted-and-ignored, because a silent accept would
+> imply any-of success (§5.3's `join` row, §9:882-888). This narrows the accepted *bootable* value
+> set, is reversible, and touches no bytes.
+
+### 7.2 The P4 additive payload keys (landed R17; owner gate; one-way)
 
 Two key groups on events that already exist, both **class A** (§0.3): outside `content`, non-context,
 omitted when unset, leaving legacy bytes byte-identical (EVENT-MODEL §4.2, §6.3):
@@ -898,9 +906,11 @@ duplicate child. Every row is an audit line plus an honest error at the seam.
 
 ## 10. UNVERIFIED (must stay visible)
 
-- **Nothing in this contract is implemented.** Every rule above is a requirement on the landing
-  change; there is no code, no test, no fault injection and no live run behind any of it as of this
-  draft.
+- **Implemented through P4, but with no live-run evidence.** R15–R17 landed the delegation core,
+  the P2 roster and spawn inputs, the P3 task board, and the P4 `depends_on`/`group` arguments,
+  readiness gating and the §7.2 audit key groups — all pinned by tests, none of it run against a
+  live provider, a live child delegation, or a multi-session production store. Every rule above is
+  now a requirement the tests pin, not an observation of shipped behavior.
 - **Spawn exactly-once is not claimed and not measured.** The `unknown` window (§2.1) is a design
   admission; a fault-injection experiment that crashes between the committed `tool/call` and the
   `thread/started` write would be the first honest measurement of it, and it does not exist yet.

@@ -526,8 +526,12 @@ The queue is server-side and durable; delivery is at-least-once with command-id 
 ([ADR-007](decisions/ADR-007-kiand-delivery-semantics.md)). Since v1 (unchanged at v3) dispatch is **queue-first by
 worker id**: a command enqueues durably even with no live route (a registered worker's route appears
 and disappears at runtime) and parks `pending` until a route appears or the `queue_timeout` abandons
-it honestly; there is no cross-worker dispatch. That semantics lives in
-[WORKER-MODEL](WORKER-MODEL.md) §4 and DESIGN §4.3; this section fixes only the frames.
+it honestly; there is no cross-worker dispatch. At-least-once re-drive is **bounded** (ADR-033):
+an endpoint may see the same command id at most `1 + workers.queue_max_redrives` times, after which
+the row converges to the terminal `abandoned` without a further frame — a command whose own side
+effect destroys the ack path (restarting the server or the worker) can therefore be received but
+never replayed forever. That semantics lives in [WORKER-MODEL](WORKER-MODEL.md) §4 and DESIGN §4.3;
+this section fixes only the frames.
 
 ### 8.5 Upgrade v0 → v1
 

@@ -257,6 +257,14 @@ const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligib
 
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, admitted_seq ASC";
 
+/// (R17 C4, pin P3-5) the read-only per-session inbox read behind the
+/// task board's `input_required` arm: EVERY row of the session,
+/// consumed rows included — the row is durable and audit-visible after
+/// `mark_consumed`, so a report row that was already consumed by the
+/// parent's drain still carries its `state:"waiting"` fact. No
+/// eligibility filter, no clock: the caller reads facts, not work.
+const INPUT_ROWS_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 ORDER BY eligible_at ASC, admitted_seq ASC";
+
 const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// Consumption is event-driven by construction: the row is touched only
@@ -350,6 +358,19 @@ pub(crate) async fn eligible_inputs(
     let rows: Vec<InputCols> = sqlx::query_as(ELIGIBLE_SQL)
         .bind(session.0.to_string())
         .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(decode_input).collect()
+}
+
+/// (R17 C4, pin P3-5): every inbox row of the session — read-only,
+/// consumed rows included, oldest first. No new table, no migration.
+pub(crate) async fn input_rows(
+    pool: &SqlitePool,
+    session: SessionId,
+) -> Result<Vec<InputRow>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(INPUT_ROWS_SQL)
+        .bind(session.0.to_string())
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(decode_input).collect()
@@ -885,4 +906,191 @@ pub(crate) async fn view_publish_delta(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+// -- durable cron state (CRON-MODEL §4/§9, migration v7) --------------------
+// The sqlite twin of the pg statements below. Fire times are canonical
+// UTC RFC 3339 `Z` TEXT, so `<` on them is chronological and the
+// monotonic cursor guard needs no calendar math.
+
+/// Idempotent by `declaration_digest`: the reset decision is made inside
+/// this one statement against the *live* row, so a racing redeclaration
+/// cannot resurrect a stale cursor. Target-table references on the right
+/// of `DO UPDATE SET` are the pre-update row values (sqlite and pg agree).
+const CRON_SCHEDULE_UPSERT_SQL: &str = "INSERT INTO cron_schedules (id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at)\nVALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, ?6)\nON CONFLICT (id) DO UPDATE SET\n    expr = excluded.expr,\n    tz = excluded.tz,\n    enabled = excluded.enabled,\n    cursor_fire_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        THEN cron_schedules.cursor_fire_at ELSE NULL END,\n    next_fire_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        THEN cron_schedules.next_fire_at ELSE NULL END,\n    declaration_digest = excluded.declaration_digest,\n    updated_at = CASE WHEN cron_schedules.declaration_digest = excluded.declaration_digest\n        AND cron_schedules.expr = excluded.expr\n        AND cron_schedules.tz = excluded.tz\n        AND cron_schedules.enabled = excluded.enabled\n        THEN cron_schedules.updated_at ELSE excluded.updated_at END";
+
+const CRON_SCHEDULE_DIGEST_SQL: &str = "SELECT declaration_digest FROM cron_schedules WHERE id = ?";
+
+const CRON_SCHEDULE_CURSOR_SQL: &str = "SELECT cursor_fire_at FROM cron_schedules WHERE id = ?";
+
+const CRON_SCHEDULES_SQL: &str = "SELECT id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at FROM cron_schedules ORDER BY id ASC";
+
+const CRON_SCHEDULE_SQL: &str = "SELECT id, expr, tz, declaration_digest, cursor_fire_at, next_fire_at, enabled, created_at, updated_at FROM cron_schedules WHERE id = ?";
+
+/// Insert-if-absent: the PK on `firing_id` is the idempotency rule, so
+/// `rows_affected() == 1` is exactly "this caller won the slot".
+const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WHERE id = ?1";
+
+const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)\nON CONFLICT DO NOTHING";
+
+/// Non-terminal rows only: a settled slot is never rewritten.
+const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = ?2,\n    worktree_path = COALESCE(?3, worktree_path),\n    finished_at = ?4,\n    error = ?5\nWHERE firing_id = ?1 AND state IN ('admitted', 'running')";
+
+/// The admit-then-advance guard (§4.3): the cursor only moves when it is
+/// unset or strictly behind the slot, and only when that slot has a
+/// firing record — the cursor may lag the truth, never lead it.
+const CRON_ADVANCE_CURSOR_SQL: &str = "UPDATE cron_schedules\nSET cursor_fire_at = ?2,\n    next_fire_at = ?3,\n    updated_at = ?4\nWHERE id = ?1\n  AND (cursor_fire_at IS NULL OR cursor_fire_at < ?2)\n  AND EXISTS (SELECT 1 FROM cron_firings WHERE firing_id = ?5)";
+
+const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE (?1 IS NULL OR schedule_id = ?1)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT ?2";
+
+const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = ?";
+
+/// One idempotent declaration upsert. The pre-read digest is for the
+/// caller's *report* only (Inserted / Unchanged / Redeclared): the state
+/// change is decided by the statement itself, so a race can only make
+/// the report approximate, never the cursor wrong.
+pub(crate) async fn cron_upsert_schedule(
+    pool: &SqlitePool,
+    p: &crate::cron::ScheduleInsert<'_>,
+) -> Result<Option<String>, StoreError> {
+    let mut tx = pool.begin().await?;
+    let previous: Option<String> = sqlx::query_scalar(CRON_SCHEDULE_DIGEST_SQL)
+        .bind(p.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    sqlx::query(CRON_SCHEDULE_UPSERT_SQL)
+        .bind(p.id)
+        .bind(p.expr)
+        .bind(p.tz)
+        .bind(p.digest)
+        .bind(p.enabled)
+        .bind(p.now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(previous)
+}
+
+pub(crate) async fn cron_load_schedules(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::cron::ScheduleCols>, StoreError> {
+    let rows: Vec<crate::cron::ScheduleCols> =
+        sqlx::query_as(CRON_SCHEDULES_SQL).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+pub(crate) async fn cron_load_schedule(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<crate::cron::ScheduleCols>, StoreError> {
+    let row: Option<crate::cron::ScheduleCols> = sqlx::query_as(CRON_SCHEDULE_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub(crate) async fn cron_delete_schedule(pool: &SqlitePool, id: &str) -> Result<bool, StoreError> {
+    let res = sqlx::query(CRON_DELETE_SCHEDULE_SQL)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn cron_claim_firing(
+    pool: &SqlitePool,
+    p: &crate::cron::FiringInsert<'_>,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_FIRING_CLAIM_SQL)
+        .bind(p.firing_id)
+        .bind(p.schedule_id)
+        .bind(p.fire_time)
+        .bind(p.admitted_at)
+        .bind(p.state)
+        .bind(p.skip_reason)
+        .bind(p.worktree_path)
+        .bind(p.finished_at)
+        .bind(p.error)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+pub(crate) async fn cron_finish_firing(
+    pool: &SqlitePool,
+    firing_id: &str,
+    state: &str,
+    finished_at: Option<i64>,
+    worktree_path: Option<&str>,
+    error: Option<&str>,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_FIRING_FINISH_SQL)
+        .bind(firing_id)
+        .bind(state)
+        .bind(worktree_path)
+        .bind(finished_at)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Advances the cursor, then explains a refusal: an unknown schedule is a
+/// caller bug, an already-at-or-past cursor is an idempotent no-op, and a
+/// slot with no firing record is the admit-then-advance violation.
+pub(crate) async fn cron_advance_cursor(
+    pool: &SqlitePool,
+    id: &str,
+    firing_id: &str,
+    admitted_fire_at: &str,
+    next_fire_at: &str,
+    now: i64,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_ADVANCE_CURSOR_SQL)
+        .bind(id)
+        .bind(admitted_fire_at)
+        .bind(next_fire_at)
+        .bind(now)
+        .bind(firing_id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 1 {
+        return Ok(true);
+    }
+    let current: Option<Option<String>> = sqlx::query_scalar(CRON_SCHEDULE_CURSOR_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match current {
+        None => Err(crate::cron::CronError::UnknownSchedule { id: id.to_owned() }),
+        Some(cursor) if cursor.as_deref().is_some_and(|c| c >= admitted_fire_at) => Ok(false),
+        Some(_) => Err(crate::cron::CronError::UnrecordedFiring {
+            firing_id: firing_id.to_owned(),
+        }),
+    }
+}
+
+pub(crate) async fn cron_list_firings(
+    pool: &SqlitePool,
+    schedule_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<crate::cron::FiringCols>, StoreError> {
+    let rows: Vec<crate::cron::FiringCols> = sqlx::query_as(CRON_LIST_FIRINGS_SQL)
+        .bind(schedule_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+pub(crate) async fn cron_load_firing(
+    pool: &SqlitePool,
+    firing_id: &str,
+) -> Result<Option<crate::cron::FiringCols>, StoreError> {
+    let row: Option<crate::cron::FiringCols> = sqlx::query_as(CRON_LOAD_FIRING_SQL)
+        .bind(firing_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
 }

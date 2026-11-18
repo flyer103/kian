@@ -123,6 +123,18 @@ pub struct ServeConfig {
     /// archive directory and at least one online-window threshold.
     #[serde(default)]
     pub retention: RetentionSection,
+    /// The `sidecars:` section (PLUGIN-SPEC §8.1/§13.1). `None` (the
+    /// section absent) is sidecars **off**: no runner spawns, no bus
+    /// runtime installs, no ports gain a subscriber — byte-identical
+    /// behavior (§13.3). Present parses the closed two-scope grammar
+    /// fail-closed (an unknown scope key — `harness:`, `profile:` —
+    /// refuses boot naming the key, §8.1/§6.2 boundary case 2) and gates
+    /// the boot checks: every set entry a declared instance, `use ⊆
+    /// scopes.server`, limits naming receivable instances and narrowing
+    /// only (§8.2; the widening check runs in the serve assembly, where
+    /// the manifests are loaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecars: Option<kian_plugin::hooks::resolve::SidecarConfig>,
     /// The `api:` section (READ-MODEL §4.2, P3). Absent = the defaults:
     /// the fan-in event stream enabled, explicit session allowlists
     /// only (no wildcard in OSS).
@@ -978,6 +990,24 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::multiagent_config`].
     #[serde(default)]
     pub multiagent: Option<MultiagentConfigDef>,
+    /// (R17-C1) the roster (`superagent.roster`, MULTIAGENT-MODEL
+    /// §3.1/§7.1): the named agents the Router may delegate to.
+    /// Absent/empty (the default) = the roster feature is **off** —
+    /// no `list_agents` tool, no roster validation, today's exact
+    /// bytes (pin P2-6, §3.1:366-367). Converted fail-closed by
+    /// [`ServeConfig::roster_config`].
+    #[serde(default)]
+    pub roster: Vec<RosterEntryDef>,
+    /// (R17 C4) the task-board switch block
+    /// (`superagent.board`): `enabled`/`gating`, **both default
+    /// `false`**. Absent block = board off: no `task_board` view is
+    /// published or served and any rows from an earlier era are
+    /// deleted by the next rebuild (a disposable view,
+    /// `anchors.md` rule 4). Converted fail-closed by
+    /// [`SuperAgentConfig::board_config`] — `gating: true` is a P4
+    /// key and refuses to boot in P3.
+    #[serde(default)]
+    pub board: BoardConfigDef,
     /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
     /// surfaces in the Inline `neighbors` block (`thread_key`) as
@@ -987,6 +1017,14 @@ pub struct SuperAgentConfig {
     /// Absent = no derivation, byte-identical wrappers.
     #[serde(default)]
     pub intake: IntakeConfig,
+    /// (CRON-MODEL §3) the declared cron schedules (`superagent.cron`).
+    /// Absent (the default) = no cron schedules declared, nothing to
+    /// fire; the tick loop, the durable cursor and the CLI are later
+    /// increments. Validated fail-closed at load by
+    /// [`CronSection::validate`] (expression, timezone, id uniqueness,
+    /// target cross-reference, bounds).
+    #[serde(default)]
+    pub cron: CronSection,
 }
 
 /// 's default: follow-up ownership is **on** — the honest default
@@ -1090,7 +1128,79 @@ impl SuperAgentConfig {
         converted
             .validate()
             .map_err(|message| invalid(format!("superagent.multiagent: {message}")))?;
+        // (R17-C7, pin P4-5) the `join` fan-in policy: v1 evaluates
+        // only `all` — the one shape with an evaluation site (one
+        // spawn, one parent). `any`/`quorum:<n>` refuse to boot
+        // naming the missing evaluation site and the §9 deferral;
+        // anything else is an unknown value naming the accepted
+        // forms. Never accepted-and-ignored.
+        if let Some(join) = config.join.as_deref() {
+            match join {
+                "all" => {}
+                "any" => {
+                    return Err(invalid(
+                        "superagent.multiagent: join: `any` has no evaluation site in v1 (one \
+                         spawn, one parent — only `all` is evaluated); fan-in is deferred with \
+                         its own ADR (MULTIAGENT-MODEL §9) — refused rather than \
+                         accepted-and-ignored"
+                            .to_string(),
+                    ));
+                }
+                value if value.starts_with("quorum:") => {
+                    let n = &value["quorum:".len()..];
+                    // n ≥ 1: empty, non-numeric and zero are all
+                    // typos of the same bound (fail-closed).
+                    if !matches!(n.parse::<u32>(), Ok(v) if v >= 1) {
+                        return Err(invalid(format!(
+                            "superagent.multiagent: join: `{value}` — a quorum needs n ≥ 1 \
+                             (got `{n}`)"
+                        )));
+                    }
+                    return Err(invalid(format!(
+                        "superagent.multiagent: join: `{value}` has no evaluation site in v1 \
+                         (one spawn, one parent — only `all` is evaluated); fan-in is deferred \
+                         with its own ADR (MULTIAGENT-MODEL §9) — refused rather than \
+                         accepted-and-ignored"
+                    )));
+                }
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.multiagent: join: `{other}` is not one of the accepted \
+                         values `all` | `any` | `quorum:<n>` (n ≥ 1); v1 evaluates `all` only"
+                    )));
+                }
+            }
+        }
         Ok(Some(converted))
+    }
+
+    /// Converts the board section to the runtime switch, fail-closed
+    /// (R17 C4, pin P3-1; R17 C6 made `gating` live). The block
+    /// defaults to **off** (`enabled: false`, `gating: false` — an
+    /// absent block is the same shape), so absence keeps P3
+    /// byte-identical: no `task_board` view, no board output, no
+    /// class-A key. `gating: true` arms the P4 emission switch
+    /// (§8.1) — but only when the `multiagent` block is present
+    /// (§7.1:737-741: neither board key can enable anything
+    /// `multiagent` has not already enabled — a refusal, never a
+    /// silent no-op).
+    pub fn board_config(&self) -> Result<BoardConfig, ConfigError> {
+        let converted = BoardConfig {
+            enabled: self.board.enabled,
+            gating: self.board.gating,
+        };
+        converted
+            .validate()
+            .map_err(|message| invalid(format!("superagent.board: {message}")))?;
+        if converted.gating && self.multiagent.is_none() {
+            return Err(invalid(
+                "superagent.board: gating: true requires the superagent.multiagent block — \
+                 neither board key can enable anything multiagent has not already enabled \
+                 (MULTIAGENT-MODEL §7.1)"
+                    .to_string(),
+            ));
+        }
+        Ok(converted)
     }
 }
 
@@ -1107,19 +1217,130 @@ pub struct OutboxConfigDef {
 }
 
 /// The `superagent.multiagent` section (MULTIAGENT-MODEL §7.1):
-/// `{max_children?, max_depth?, child_timeout_ms?}` — every field
-/// optional with the §5.3 defaults (4 children, 1 hop, 15 minutes);
-/// an empty section enables the feature with the defaults. The
-/// spelling is **`child_timeout_ms`** (pin P4): the anchors' A2 error
-/// would name `timeout_ms`, and this struct's
+/// `{max_children?, max_depth?, child_timeout_ms?, join?}` — every
+/// field optional with the §5.3 defaults (4 children, 1 hop, 15
+/// minutes, `join: all`); an empty section enables the feature with
+/// the defaults. The spelling is **`child_timeout_ms`** (pin P4): the
+/// anchors' A2 error would name `timeout_ms`, and this struct's
 /// `#[serde(deny_unknown_fields)]` makes that typo a boot refusal,
 /// never a silent default. Absent section = the feature is off.
+///
+/// `join` (R17-C7, pin P4-5) is the fan-in policy: `all` (the
+/// default) is the only value v1 has an evaluation site for (one
+/// spawn, one parent); `any`/`quorum:<n>` **refuse to boot** naming
+/// the missing evaluation site and the deferral — never
+/// accepted-and-ignored, which would imply any-of success (§5.3:588,
+/// §9:882-888).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MultiagentConfigDef {
     pub max_children: Option<u32>,
     pub max_depth: Option<u32>,
     pub child_timeout_ms: Option<u64>,
+    pub join: Option<String>,
+}
+
+/// One `superagent.roster` entry (MULTIAGENT-MODEL §3.1:357-362,
+/// §7.1): `{id, description, agent, mandate_template, tools_allow,
+/// limits?, output_schema?}`. `id`/`description`/`agent`/
+/// `mandate_template`/`tools_allow` are required — a missing
+/// `tools_allow` must never silently mean "all tools" (that would be
+/// a widening). `limits` defaults to the §5.3 `max_children` (4);
+/// `output_schema` is the optional per-entry default expectation
+/// (§3.2.1) and must sit inside the closed subset (pin P2-3).
+///
+/// `agent` names an **`agents:` entry** (resolved by
+/// `ServeConfig::named_agent_def`, pin P2-1) — not the default
+/// `agent:` and never an invented id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterEntryDef {
+    /// The name the model uses; unique across the roster, non-empty.
+    pub id: String,
+    /// The one line used for selection (≤200 chars, no control
+    /// characters — the `WorkerEntry` precedent).
+    pub description: String,
+    /// An `agents:` entry id — the `AgentDef` reference and the
+    /// memory scope (pin P2-1).
+    pub agent: String,
+    /// The advisory mandate template: `{scope, strength}` with
+    /// `strength ∈ {explicit, inferred}` (ADR-012 vocabulary).
+    pub mandate_template: RosterMandateTemplateDef,
+    /// The tool fence: intersected with the agent's surface — an
+    /// entry listing a tool the `AgentDef` lacks **refuses boot**
+    /// (M3, §5.1:551-552; never a widening).
+    pub tools_allow: Vec<String>,
+    /// Per-entry limits; `max_children: 0` is a **leaf** — legal
+    /// (§3.1:360-361).
+    #[serde(default)]
+    pub limits: RosterLimitsDef,
+    /// The optional `output_schema` (pin P2-3 subset, ≤8192
+    /// canonical-JSON bytes). Absent = no schema gate for this
+    /// entry's children.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// The `mandate_template` block of a roster entry: the advisory
+/// scope text (recorded and audited, never a permission — §5.1) and
+/// the strength. `strength` is converted fail-closed so a typo
+/// refuses boot naming the key, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterMandateTemplateDef {
+    /// The advisory scope text (never blank — an empty authority
+    /// string is never issued).
+    pub scope: String,
+    /// `explicit` | `inferred` (ADR-012).
+    pub strength: String,
+}
+
+/// The `limits` block of a roster entry — the per-entry bound the
+/// contract defines (§3.1:360-361): `max_children` only, optional
+/// with the §5.3 default (4); `0` names a leaf and is legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RosterLimitsDef {
+    pub max_children: Option<u32>,
+}
+
+/// The `superagent.board` section (R17 C4, MULTIAGENT-MODEL §7.1):
+/// `{enabled?, gating?}` — **both keys default `false`**, and an
+/// absent section is the same shape as an all-false one (feature-off,
+/// byte-identical, `anchors.md` rule 4). `enabled` gates publication
+/// of the `task_board` view and (with `read_model.views.enabled`) the
+/// P3 verbs; `gating` is P4's class-A emission switch — live since
+/// R17 C6, and requiring the `multiagent` block (checked in
+/// [`SuperAgentConfig::board_config`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BoardConfigDef {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gating: bool,
+}
+
+/// The converted runtime board switch (R17 C4, pin P3-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BoardConfig {
+    /// Whether the `task_board` view may be published/served (the
+    /// verbs' own gate composes this with `read_model.views.enabled`).
+    pub enabled: bool,
+    /// P4's class-A key-emission switch (live since R17 C6, pin
+    /// P4-1: `false` ⇒ P3 bytes exactly).
+    pub gating: bool,
+}
+
+impl BoardConfig {
+    /// Fail-closed validation of the switch pair itself. Since R17
+    /// C6 landed the key groups, `gating: true` boots — the
+    /// §7.1 "board cannot enable what multiagent has not" refusal
+    /// lives in [`SuperAgentConfig::board_config`], where the
+    /// multiagent block is visible.
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The `superagent.intake` section (ADR-013):
@@ -2231,6 +2452,16 @@ pub struct WorkersConfig {
     /// the honest timeout of every queued command.
     #[serde(default = "default_workers_queue_timeout_ms")]
     pub queue_timeout_ms: u64,
+    /// How many times a queued command whose result was lost may be
+    /// **re-driven** before the row is abandoned (ADR-033). The re-drive is
+    /// at-least-once, and this bound is what makes it terminate: a command
+    /// that destroys its own ack path (a `systemctl restart kian`, a
+    /// `pkill kiand`) can never deliver a result, so the server stops
+    /// replaying it after `1 + queue_max_redrives` dispatches and records one
+    /// audit line. `0` disables re-drive (first dispatch only). Global by
+    /// construction, like the queue timeout: no per-endpoint override.
+    #[serde(default = "default_workers_queue_max_redrives")]
+    pub queue_max_redrives: u32,
     /// Admission mode (phase 1 of the per-worker-identity work): when
     /// true, only ids in `tokens` may register. Requires a non-empty
     /// `tokens` map and forbids `token_env` (no shared fallback — a
@@ -2252,6 +2483,14 @@ fn default_workers_offline_after_ms() -> u64 {
 fn default_workers_queue_timeout_ms() -> u64 {
     60_000
 }
+
+fn default_workers_queue_max_redrives() -> u32 {
+    1
+}
+
+/// The ceiling on `workers.queue_max_redrives`: the knob bounds a recovery
+/// loop, so a typo must not quietly restore unbounded replay.
+const MAX_QUEUE_REDRIVES: u32 = 16;
 
 impl WorkersConfig {
     /// The parsed listener bind (validated fail-closed).
@@ -2277,6 +2516,11 @@ impl WorkersConfig {
         }
         if self.queue_timeout_ms == 0 {
             return Err(invalid("workers.queue_timeout_ms must be > 0"));
+        }
+        if self.queue_max_redrives > MAX_QUEUE_REDRIVES {
+            return Err(invalid(format!(
+                "workers.queue_max_redrives must be <= {MAX_QUEUE_REDRIVES} (it bounds a re-drive loop; a larger value is unbounded replay in practice)"
+            )));
         }
         if let Some(name) = &self.token_env
             && name.trim().is_empty()
@@ -2570,6 +2814,31 @@ impl ServeConfig {
                 )));
             }
         }
+
+        // The `sidecars:` section (PLUGIN-SPEC §8.1/§13.1): `plugins:`
+        // stays KNOWN_PLUGINS-only (D7) — an instance key colliding
+        // with a known plugin name refuses boot (§6.2 rule 3), and the
+        // closed two-scope grammar's name-only boot checks run here so
+        // a read-only verb catches a typo. The widening check needs the
+        // manifests and runs in the serve assembly.
+        if let Some(sidecars) = &self.sidecars {
+            for name in sidecars.plugins.keys() {
+                if KNOWN_PLUGINS.contains(&name.as_str()) {
+                    return Err(invalid(format!(
+                        "sidecars.plugins key `{name}` collides with a known plugin name \
+                         (code: name_collision, §6.2 rule 3)"
+                    )));
+                }
+            }
+            if let Err(errors) = kian_plugin::hooks::resolve::validate_shape(sidecars) {
+                let rendered: Vec<String> = errors
+                    .iter()
+                    .map(|e| format!("{} (code: {})", e.message, e.code.as_str()))
+                    .collect();
+                return Err(invalid(format!("sidecars: {}", rendered.join("; "))));
+            }
+        }
+
         if self.plugins.iter().any(|p| p == "react-loop") {
             for dep in ["openai-compat", "local-tools"] {
                 if !self.plugins.iter().any(|p| p == dep) {
@@ -2999,6 +3268,11 @@ impl ServeConfig {
                      (phase 1 is single-account: one credential file, one bot token)",
                 ));
             }
+            // (CRON-MODEL §3.3) the cron declarations validate
+            // fail-closed at load: expression + horizon, timezone, id
+            // shape/uniqueness, target cross-reference, bounds. No loop
+            // is mounted in this increment.
+            sa.cron.validate(&sa.channels)?;
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -3112,6 +3386,10 @@ impl ServeConfig {
             // the outbox schedule converts cleanly (fail-closed —
             // a broken retry bound or backoff refuses to start).
             sa.outbox_config()?;
+            // (R17 C4) the board block converts cleanly (fail-closed —
+            // `gating: true` is a P4 key and refuses to boot in P3,
+            // naming the deferral).
+            sa.board_config()?;
             // the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -3280,6 +3558,98 @@ impl ServeConfig {
         self.agents.get(id).map(agent_def_of)
     }
 
+    /// Converts the `superagent.roster` section to the bundle's
+    /// [`kian_superagent::Roster`], fail-closed. `Ok(None)` when the
+    /// section is absent **or empty** — the roster feature is off,
+    /// today's tool set byte-identical (pin P2-6, §3.1:366-367).
+    ///
+    /// Validation is the contract's (§3.1), errors naming the key:
+    /// duplicate ids; an `agent` naming no configured `agents:`
+    /// entry (the refusal names the known ids — pin P2-1, resolved
+    /// exactly through [`Self::named_agent_def`]); `tools_allow`
+    /// listing a tool the AgentDef lacks (a widening refuses boot —
+    /// M3/§5.1:551-552); an `output_schema` outside the closed
+    /// subset (pin P2-3, naming the keyword). `limits.max_children:
+    /// 0` is legal — a leaf (§3.1:360-361).
+    pub fn roster_config(&self) -> Result<Option<kian_superagent::Roster>, ConfigError> {
+        let Some(sa) = self.superagent.as_ref() else {
+            return Ok(None);
+        };
+        if sa.roster.is_empty() {
+            return Ok(None);
+        }
+        // Whole-set check first: duplicate ids (the per-entry pass
+        // below cannot see them).
+        let mut seen = std::collections::BTreeSet::new();
+        for def in &sa.roster {
+            if !seen.insert(def.id.as_str()) {
+                return Err(invalid(format!(
+                    "superagent.roster: duplicate id `{}` — roster ids are unique",
+                    def.id
+                )));
+            }
+        }
+        // The pin P2-1 resolution seam: exactly `named_agent_def`,
+        // and the known `agents:` ids for the refusal text.
+        let known: Vec<String> = self.agents.keys().cloned().collect();
+        let lookup = |id: &str| {
+            self.named_agent_def(id)
+                .map(|def| kian_superagent::AgentSurface {
+                    id: def.id,
+                    tools: def.tools,
+                })
+        };
+        let mut entries = Vec::with_capacity(sa.roster.len());
+        for (i, def) in sa.roster.iter().enumerate() {
+            let strength = match def.mandate_template.strength.as_str() {
+                "explicit" => kian_superagent::MandateStrength::Explicit,
+                "inferred" => kian_superagent::MandateStrength::Inferred,
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.roster[{i}].mandate_template.strength: unknown `{other}` \
+                         (explicit | inferred)"
+                    )));
+                }
+            };
+            let entry = kian_superagent::RosterEntry {
+                id: def.id.clone(),
+                description: def.description.clone(),
+                agent: def.agent.clone(),
+                mandate_template: kian_superagent::MandateTemplate {
+                    scope: def.mandate_template.scope.clone(),
+                    strength,
+                },
+                tools_allow: def.tools_allow.clone(),
+                limits: kian_superagent::RosterLimits {
+                    max_children: def
+                        .limits
+                        .max_children
+                        .unwrap_or_else(kian_superagent::default_roster_max_children),
+                },
+                output_schema: def.output_schema.clone(),
+                // (R17-C2, pin P2-1) the resolution is stamped here,
+                // once, at conversion — the spawn side reads this
+                // recorded fact and never re-consults live config
+                // (§2.1.1 constraint 13). `named_agent_def` resolved
+                // it for the surface check below; the same call
+                // supplies the identity the wrapper will carry.
+                resolved_agent: self.named_agent_def(&def.agent).map(|agent| {
+                    kian_superagent::ResolvedAgent {
+                        def_id: agent.id,
+                        version: agent.version,
+                    }
+                }),
+            };
+            kian_superagent::Roster {
+                entries: vec![entry.clone()],
+            }
+            .validate(&lookup, &known)
+            .map_err(|e| invalid(format!("superagent.roster[{i}]: {e}")))?;
+            entries.push(entry);
+        }
+        Ok(Some(kian_superagent::Roster { entries }))
+    }
+
     /// The compiled definition an agent id the memory section may
     /// reference resolves to (`None` when it names no configured
     /// agent) — [`Self::named_agent_def`] plus the default agent.
@@ -3329,6 +3699,809 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
             wall_clock_ms: agent.budgets.wall_clock_ms,
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// superagent.cron (CRON-MODEL §3)
+// ---------------------------------------------------------------------------
+
+/// Default `coalesce_ms` (CRON-MODEL §3.1): 15 minutes of lateness honored
+/// by `catch_up: latest`.
+pub const DEFAULT_CRON_COALESCE_MS: u64 = 900_000;
+/// Default `max_concurrent` (CRON-MODEL §3.1): one firing at a time.
+pub const DEFAULT_CRON_MAX_CONCURRENT: u32 = 1;
+/// Default `timeout_ms` (CRON-MODEL §3.1): a 30-minute per-firing ceiling.
+pub const DEFAULT_CRON_TIMEOUT_MS: u64 = 1_800_000;
+/// The longest schedule `id` (§3.1: `[a-z0-9][a-z0-9_-]{0,63}`).
+pub const CRON_SCHEDULE_ID_MAX_LEN: usize = 64;
+
+/// The `superagent.cron:` section (CRON-MODEL §3.1): the declared
+/// schedules, validated fail-closed at load and resolved into
+/// [`CronRuntimeSchedule`]s by [`CronSection::to_runtime`]. The tick loop
+/// (§7.3), the durable cursor (§4), the dsh/worktree execution path (§6) and
+/// the CLI (§10) consume these resolutions. `sandbox` (§8.2) is designed, not
+/// v1: an unknown key still refuses boot here (`deny_unknown_fields`), never a
+/// silently ignored policy field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronSection {
+    /// The declared schedules, in declaration order. Order is the
+    /// `kian cron list` order and nothing else — firing order is the
+    /// schedule's own fire time (§2.5).
+    #[serde(default)]
+    pub schedules: Vec<CronScheduleDef>,
+
+    /// The §6.4 disk guards: cron must never fill the host disk. Absent = the
+    /// documented defaults; an explicit `0` refuses boot rather than silently
+    /// disabling a guard.
+    #[serde(default)]
+    pub disk: CronDiskSection,
+
+    /// The §6/§7 harness invocation: *how* a firing's payload is handed
+    /// to `dsh`. Absent = the documented default (the shipped `headless`
+    /// profile, the payload as that app's one positional task argument).
+    #[serde(default)]
+    pub harness: CronHarnessSection,
+}
+
+/// Default `superagent.cron.disk.min_free_gib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MIN_FREE_GIB: u64 = 80;
+/// Default `superagent.cron.disk.min_free_percent` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MIN_FREE_PERCENT: u64 = 25;
+/// Default `superagent.cron.disk.max_worktree_mib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MAX_WORKTREE_MIB: u64 = 2048;
+/// Default `superagent.cron.disk.total_cap_mib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_TOTAL_CAP_MIB: u64 = 20480;
+/// Default `superagent.cron.disk.max_output_kib` (CRON-MODEL §6.4).
+pub const CRON_DEFAULT_MAX_OUTPUT_KIB: u64 = 256;
+
+/// The `superagent.cron.disk:` section (CRON-MODEL §6.4): the guards that keep
+/// cron from filling the host disk. Every field is `Option` — absent means the
+/// documented default, an explicit `0` refuses boot
+/// ([`CronDiskSection::collect_errors`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronDiskSection {
+    /// Free-space preflight floor, GiB. Default 80, sized for Rust build artefacts
+    /// (a `target/` tree is GiB, not MiB). The floor actually enforced
+    /// is the larger of this and `min_free_percent` of the filesystem.
+    #[serde(default)]
+    pub min_free_gib: Option<u64>,
+    /// Free-space preflight floor, percent of the filesystem. Default 25.
+    #[serde(default)]
+    pub min_free_percent: Option<u64>,
+    /// Cap on a *single* worktree, MiB. Default 2048.
+    #[serde(default)]
+    pub max_worktree_mib: Option<u64>,
+    /// Cap across *all* cron worktrees, MiB. Default 20480. `max_total_worktree_mib`
+    /// is accepted as a synonym (the same knob under the longer name).
+    #[serde(default, alias = "max_total_worktree_mib")]
+    pub total_cap_mib: Option<u64>,
+    /// Bound on each stored stdout/stderr/diff of a firing, KiB. Default 256.
+    #[serde(default)]
+    pub max_output_kib: Option<u64>,
+}
+
+impl CronDiskSection {
+    /// The section with §6.4's defaults applied — what
+    /// [`crate::cron_worktree::WorktreePolicy`] is built from.
+    pub fn resolved(&self) -> CronDiskLimits {
+        CronDiskLimits {
+            min_free_gib: self.min_free_gib.unwrap_or(CRON_DEFAULT_MIN_FREE_GIB),
+            min_free_percent: self
+                .min_free_percent
+                .unwrap_or(CRON_DEFAULT_MIN_FREE_PERCENT),
+            max_worktree_mib: self
+                .max_worktree_mib
+                .unwrap_or(CRON_DEFAULT_MAX_WORKTREE_MIB),
+            total_cap_mib: self.total_cap_mib.unwrap_or(CRON_DEFAULT_TOTAL_CAP_MIB),
+            max_output_kib: self.max_output_kib.unwrap_or(CRON_DEFAULT_MAX_OUTPUT_KIB),
+        }
+    }
+
+    /// §3.3 fail-closed: a knob set to `0` (or a percent outside `1..=100`)
+    /// refuses boot rather than silently disabling a disk guard.
+    pub fn collect_errors(&self, errors: &mut Vec<String>) {
+        let sized = [
+            ("min_free_gib", self.min_free_gib),
+            ("max_worktree_mib", self.max_worktree_mib),
+            ("total_cap_mib", self.total_cap_mib),
+            ("max_output_kib", self.max_output_kib),
+        ];
+        for (name, value) in sized {
+            if value == Some(0) {
+                errors.push(format!(
+                    "superagent.cron.disk.{name} must be > 0 (omit it for the default)"
+                ));
+            }
+        }
+        if let Some(percent) = self.min_free_percent
+            && !(1..=100).contains(&percent)
+        {
+            errors.push(
+                "superagent.cron.disk.min_free_percent must be 1..=100 (omit it for the default 25)"
+                    .to_owned(),
+            );
+        }
+        // §6.4: the total cap bounds all worktrees, so a per-worktree cap larger
+        // than it can never be reached — the config is contradictory, refuse it.
+        let limits = self.resolved();
+        if limits.min_free_gib > 0
+            && limits.max_worktree_mib > 0
+            && limits.total_cap_mib > 0
+            && limits.max_worktree_mib > limits.total_cap_mib
+        {
+            errors.push(format!(
+                "superagent.cron.disk.total_cap_mib ({}) must be >= max_worktree_mib ({})",
+                limits.total_cap_mib, limits.max_worktree_mib
+            ));
+        }
+    }
+}
+
+/// [`CronDiskSection`] with §6.4's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CronDiskLimits {
+    /// Free-space preflight floor, GiB.
+    pub min_free_gib: u64,
+    /// Free-space preflight floor, percent of the filesystem.
+    pub min_free_percent: u64,
+    /// Cap on a single worktree, MiB.
+    pub max_worktree_mib: u64,
+    /// Cap across all cron worktrees, MiB.
+    pub total_cap_mib: u64,
+    /// Bound on each stored stdout/stderr/diff, KiB.
+    pub max_output_kib: u64,
+}
+/// Default `superagent.cron.harness.profile` (CRON-MODEL §6.2): the shipped
+/// `headless` dsh profile — `dsh headless "run the tests"` answers one task,
+/// prints the result and exits, which is exactly one cron firing's turn.
+pub const CRON_DEFAULT_DSH_PROFILE: &str = "headless";
+
+/// The `superagent.cron.harness:` section (CRON-MODEL §6.2): how a firing's turn
+/// is handed to the harness.
+///
+/// dsh's own contract is `dsh [--profile] <name> [options] [app-args...]`:
+/// the profile selects the app, and the scheduled payload is that app's one
+/// positional task argument (`dsh headless "run the tests"`). An argv with no
+/// `--profile` makes dsh parse the payload *as the profile name* and refuse
+/// (`profile "say hello" does not exist`), which is the bug this section fixes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronHarnessSection {
+    /// The dsh profile to boot — `dsh --profile <name>`. Default `headless`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The dsh binary. Absent = `KIAN_DSH_BIN`, then `dsh` on `PATH`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra environment for the harness child: peer/model/session selects and
+    /// credential *references*. Values come from config or the environment and
+    /// are never echoed into a firing, a log line or an error.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl CronHarnessSection {
+    /// The section with the documented defaults applied — what
+    /// [`crate::cron_worktree::DshTurnRunner`] is built from.
+    pub fn resolved(&self) -> CronHarnessSettings {
+        let profile = self
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(CRON_DEFAULT_DSH_PROFILE)
+            .to_owned();
+        let command = self
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("KIAN_DSH_BIN")
+                    .ok()
+                    .map(|cmd| cmd.trim().to_owned())
+                    .filter(|cmd| !cmd.is_empty())
+            })
+            .unwrap_or_else(|| "dsh".to_owned());
+        CronHarnessSettings {
+            profile,
+            command,
+            env: self.env.clone(),
+        }
+    }
+
+    /// §3.3 fail-closed: a whitespace-only knob refuses boot rather than
+    /// silently falling back to a default the operator did not choose.
+    pub fn collect_errors(&self, errors: &mut Vec<String>) {
+        if self
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile.trim().is_empty())
+        {
+            errors.push(
+                "superagent.cron.harness.profile must be non-empty (omit it for `headless`)"
+                    .to_owned(),
+            );
+        }
+        if self
+            .command
+            .as_deref()
+            .is_some_and(|command| command.trim().is_empty())
+        {
+            errors.push(
+                "superagent.cron.harness.command must be non-empty (omit it for                  `KIAN_DSH_BIN` or `dsh` on PATH)"
+                    .to_owned(),
+            );
+        }
+        for name in self.env.keys() {
+            if name.trim().is_empty() {
+                errors.push("superagent.cron.harness.env keys must be non-empty".to_owned());
+            }
+        }
+    }
+}
+
+/// [`CronHarnessSection`] with the documented defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronHarnessSettings {
+    /// The dsh profile to boot.
+    pub profile: String,
+    /// The dsh binary.
+    pub command: String,
+    /// Extra environment for the harness child (never logged).
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for CronHarnessSettings {
+    fn default() -> Self {
+        CronHarnessSection::default().resolved()
+    }
+}
+
+/// One declared cron schedule (CRON-MODEL §3.1), wire form.
+///
+/// `Option<_>` marks every field with a §3.1 default: absent means the
+/// documented default, an explicit value is validated (`0` where the spec
+/// requires `> 0` refuses boot rather than silently defaulting).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronScheduleDef {
+    /// Stable identity — the cursor key and log namespace (§3.1). Shape
+    /// and uniqueness are validated in [`CronSection::to_runtime`].
+    pub id: String,
+    /// Five-field expression or `@`-alias (§2.1, §2.2).
+    pub expr: String,
+    /// IANA timezone (§2.3). Omitted = the host timezone, resolved once
+    /// at load and frozen into the resolved schedule.
+    #[serde(default)]
+    pub tz: Option<String>,
+    /// Declared-but-off schedules are validated and listed, never fired.
+    /// Default `true`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Where the firing's turn lands (§3.2): exactly one of
+    /// `{session: <uuid>}` or `{channel: <name>, topic: <topic>}`.
+    pub target: CronTargetDef,
+    /// The firing turn's user message (§3.4). `payload` is accepted as a
+    /// synonym (the same string under either name).
+    #[serde(alias = "payload")]
+    pub prompt: String,
+    /// Overlap policy (§5.1). Default `skip`.
+    #[serde(default)]
+    pub overlap: Option<CronOverlap>,
+    /// Missed-slot policy (§5.3). Default `latest`.
+    #[serde(default)]
+    pub catch_up: Option<CronCatchUpDef>,
+    /// Lateness honored by `latest`, milliseconds (§5.3). Default 15 min.
+    #[serde(default)]
+    pub coalesce_ms: Option<u64>,
+    /// Ceiling for this schedule (§5.4). Default `1`.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    /// Per-firing ceiling, milliseconds (§5.5). Default 30 min.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Worktree isolation (§6). Absent = the firing runs on the resident
+    /// engine; present = the schedule's firings are dispatched to the
+    /// worktree-backed `WorktreeDispatcher` (a bare `true` takes §6's
+    /// defaults, an object sets `repo`/`root`/`base`/`keep_on_failure`).
+    #[serde(default)]
+    pub worktree: Option<CronWorktreeDef>,
+}
+
+/// Wire form of a schedule's `worktree:` policy (§6): `true` for §6's
+/// defaults, or an object with the fields below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CronWorktreeDef {
+    /// `worktree: true` / `worktree: false`.
+    Flag(bool),
+    /// `worktree: {repo, root, base, keep_on_failure}`.
+    Policy(CronWorktreePolicyDef),
+}
+
+/// `worktree: {...}` (§6.2/§6.3); every field optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronWorktreePolicyDef {
+    /// The repo the per-firing trees are cut from. Default: the process cwd.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// `worktree.root`: where the trees live. Default
+    /// `<git-common-dir>/kian-worktrees` (resolved by git, so a linked
+    /// worktree's gitfile still lands in the shared git dir).
+    #[serde(default)]
+    pub root: Option<String>,
+    /// `worktree.base`: the git rev a tree starts from. Default `HEAD`.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Leave a failed firing's tree behind for inspection (§6.2). Default true.
+    #[serde(default)]
+    pub keep_on_failure: Option<bool>,
+}
+
+/// One schedule's resolved isolation plan (§6): the repo to cut from and the
+/// policy (whose disk knobs come from `superagent.cron.disk`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronWorktreePlan {
+    /// `worktree.repo`; `None` = the process's working directory.
+    pub repo: Option<std::path::PathBuf>,
+    /// The resolved §6.2/§6.4 policy.
+    pub policy: crate::cron_worktree::WorktreePolicy,
+}
+
+/// Wire form of a schedule's `target` (CRON-MODEL §3.2): the untagged pair
+/// of the two legal shapes. The inner structs carry `deny_unknown_fields`
+/// so a stray key is a parse error, and `topic` is `Option` so a channel
+/// target missing its topic fails with a named §3.2 message rather than
+/// serde's untagged "did not match any variant".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CronTargetDef {
+    /// `{session: <uuid>}` — fire into a fixed session.
+    Session(CronSessionTargetDef),
+    /// `{channel: <name>, topic: <topic>}` — fire as a channel event.
+    Channel(CronChannelTargetDef),
+}
+
+/// `target: {session: <uuid>}` (§3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronSessionTargetDef {
+    /// The fixed session id (a uuid, validated).
+    pub session: String,
+}
+
+/// `target: {channel: <name>, topic: <topic>}` (§3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CronChannelTargetDef {
+    /// A channel declared in `superagent.channels` (fail-closed
+    /// cross-reference).
+    pub channel: String,
+    /// The routing topic the firing carries.
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+/// A resolved target (CRON-MODEL §3.2), every field validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronTarget {
+    /// Fire into this session.
+    Session {
+        /// A validated uuid.
+        session: String,
+    },
+    /// Fire as a channel event on this declared channel/topic.
+    Channel {
+        /// A declared channel name.
+        channel: String,
+        /// A non-empty routing topic.
+        topic: String,
+    },
+}
+
+/// The overlap policy (§5.1), wire and resolved form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronOverlap {
+    /// Do not fire while the previous firing still runs (the default).
+    #[default]
+    Skip,
+    /// Queue the slot behind the running firing.
+    Queue,
+    /// Kill the running firing, then run this one.
+    #[serde(alias = "kill_previous")]
+    KillPrevious,
+}
+
+/// The `catch_up` policy (§5.3), wire form. Converted to the scheduling
+/// core's [`kian_cron::CatchUp`] in [`CronSection::to_runtime`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronCatchUpDef {
+    /// Fire at most once for the most recent missed slot (the default).
+    #[default]
+    Latest,
+    /// Never fire for a slot that is already past.
+    Skip,
+}
+
+/// One fully resolved schedule: everything a tick loop needs to compute the
+/// next fire time and to describe the firing, and nothing that still needs
+/// validation.
+///
+/// The next-fire *inputs* are the parsed [`kian_cron::CronExpr`] and the
+/// frozen [`kian_cron::Tz`]; [`CronRuntimeSchedule::next_fire_after`] is the
+/// pure §2.5 computation over them. There is no clock read and no store
+/// access here — the cursor, the tick loop and the firing path are later
+/// increments.
+#[derive(Debug, Clone)]
+pub struct CronRuntimeSchedule {
+    /// The declared id (cursor key, §4.1).
+    pub id: String,
+    /// The parsed expression (aliases already expanded, §2.2).
+    pub expr: kian_cron::CronExpr,
+    /// The effective timezone: explicit, or the host timezone frozen at
+    /// load (§2.3).
+    pub tz: kian_cron::Tz,
+    /// The effective timezone's IANA name, for `kian cron list` to echo.
+    pub tz_name: String,
+    /// Declared-but-off schedules are listed, never fired.
+    pub enabled: bool,
+    /// The resolved target (§3.2).
+    pub target: CronTarget,
+    /// The firing turn's user message.
+    pub prompt: String,
+    /// The overlap policy (§5.1).
+    pub overlap: CronOverlap,
+    /// The missed-slot policy (§5.3).
+    pub catch_up: kian_cron::CatchUp,
+    /// Lateness honored by `latest`, milliseconds.
+    pub coalesce_ms: u64,
+    /// This schedule's concurrency ceiling.
+    pub max_concurrent: u32,
+    /// The per-firing ceiling, milliseconds.
+    pub timeout_ms: u64,
+    /// The §6 worktree isolation plan; `None` = resident-engine dispatch.
+    pub worktree: Option<CronWorktreePlan>,
+}
+
+impl CronRuntimeSchedule {
+    /// The earliest fire time strictly after `from` (§2.5) — pure: no
+    /// clock read, no store access, DST gaps skipped and overlaps
+    /// collapsed (§2.4). The tick loop is the only caller-to-be.
+    pub fn next_fire_after(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chrono::DateTime<chrono::Utc>, kian_cron::CronError> {
+        self.expr.next_fire_after(&self.tz, from)
+    }
+}
+
+/// The host's IANA timezone, resolved **once at load** (CRON-MODEL §2.3):
+/// `TZ` first, then the `/etc/localtime` symlink, then UTC.
+///
+/// The name is returned beside the zone so the effective value can be
+/// frozen into the resolved schedule and echoed by `kian cron list`; a
+/// later host timezone change never moves an existing schedule. An
+/// explicit `tz:` that does not resolve is still a config error (§2.3) —
+/// this fallback only applies to the *omitted* default.
+pub fn host_timezone() -> (kian_cron::Tz, String) {
+    if let Ok(raw) = std::env::var("TZ") {
+        let name = raw.trim().trim_start_matches(':');
+        if !name.is_empty()
+            && let Ok(tz) = kian_cron::parse_timezone(name)
+        {
+            return (tz, name.to_string());
+        }
+    }
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let text = link.to_string_lossy().into_owned();
+        if let Some(pos) = text.find("zoneinfo/") {
+            let name = text[pos + "zoneinfo/".len()..].trim_end_matches('/');
+            if !name.is_empty()
+                && let Ok(tz) = kian_cron::parse_timezone(name)
+            {
+                return (tz, name.to_string());
+            }
+        }
+    }
+    (kian_cron::Tz::UTC, "UTC".to_string())
+}
+
+/// Is `id` a legal schedule id (§3.1: `[a-z0-9][a-z0-9_-]{0,63}`)?
+fn is_valid_cron_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && id.len() <= CRON_SCHEDULE_ID_MAX_LEN
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+impl CronSection {
+    /// The load-time gate (§3.3): performs the full conversion and
+    /// discards the result. Every rejection is fail-closed and names the
+    /// schedule id.
+    pub fn validate(
+        &self,
+        channels: &std::collections::BTreeMap<String, ChannelConfig>,
+    ) -> Result<(), ConfigError> {
+        self.to_runtime(channels, chrono::Utc::now()).map(|_| ())
+    }
+
+    /// Converts the declarations into resolved schedules (the timer's
+    /// `to_runtime` pattern), fail-closed on every degenerate field
+    /// (§3.3): a malformed expression, an unresolvable timezone, a
+    /// duplicate or malformed id, a target that does not resolve, an
+    /// empty prompt, a zero bound or a contradictory overlap policy is a
+    /// config error — never a silent skip and never a silent default.
+    ///
+    /// All *declaration* errors are collected (each naming its schedule
+    /// id) and reported together, so an operator fixes one load rather
+    /// than one error per restart.
+    ///
+    /// §3.3 rule 7 (`cron_targets_watchdog`) is not enforced here yet: the
+    /// watchdog session is a `superagent.watchdog` cross-reference that
+    /// lands with the assembly increment.
+    pub fn to_runtime(
+        &self,
+        channels: &std::collections::BTreeMap<String, ChannelConfig>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<CronRuntimeSchedule>, ConfigError> {
+        let (host_tz, host_name) = host_timezone();
+        let mut errors: Vec<String> = Vec::new();
+        self.disk.collect_errors(&mut errors);
+        self.harness.collect_errors(&mut errors);
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        let mut resolved = Vec::with_capacity(self.schedules.len());
+
+        for (i, def) in self.schedules.iter().enumerate() {
+            let before = errors.len();
+            let mut fail = |message: String| {
+                errors.push(format!(
+                    "superagent.cron.schedules[{i}] `{}`: {message}",
+                    def.id
+                ));
+            };
+
+            // §3.1 id shape + §3.3 rule 2 (unique, and not a channel name).
+            if def.id.trim() != def.id || !is_valid_cron_id(&def.id) {
+                fail(
+                    "id must match [a-z0-9][a-z0-9_-]{0,63} (lowercase, at most 64 \
+                     characters)"
+                        .to_string(),
+                );
+            } else if let Some(first) = seen.insert(def.id.clone(), i) {
+                fail(format!(
+                    "duplicate id (already declared at superagent.cron.schedules[{first}]; \
+                     the id is the cursor key and must be unique)"
+                ));
+            } else if channels.contains_key(&def.id) {
+                fail(format!(
+                    "id `{}` collides with a declared channel name (§3.3 rule 2)",
+                    def.id
+                ));
+            }
+
+            // §2.3 timezone: explicit, or the host timezone frozen at load.
+            let (tz, tz_name) = match def.tz.as_deref() {
+                None => (host_tz, host_name.clone()),
+                Some(raw) => {
+                    let name = raw.trim();
+                    if name.is_empty() {
+                        fail(
+                            "tz must be non-empty when set (omit the key to freeze the host \
+                             timezone)"
+                                .to_string(),
+                        );
+                        (host_tz, host_name.clone())
+                    } else {
+                        match kian_cron::parse_timezone(name) {
+                            Ok(tz) => (tz, name.to_string()),
+                            Err(e) => {
+                                fail(format!("tz `{name}` does not resolve: {e}"));
+                                (host_tz, host_name.clone())
+                            }
+                        }
+                    }
+                }
+            };
+
+            // §3.3 rule 1: the expression parses and has a fire time inside
+            // the §2.5 horizon (a valid-but-never-matching shape refuses).
+            let expr = match kian_cron::CronExpr::parse(&def.expr) {
+                Ok(expr) => match expr.next_fire_after(&tz, now) {
+                    Ok(_) => Some(expr),
+                    Err(e) => {
+                        fail(format!(
+                            "expr `{}` yields no fire time within the {} day horizon: {e}",
+                            def.expr.trim(),
+                            kian_cron::MAX_SCAN_DAYS
+                        ));
+                        None
+                    }
+                },
+                Err(e) => {
+                    fail(format!("expr `{}` is invalid: {e}", def.expr.trim()));
+                    None
+                }
+            };
+
+            // §3.2 target: exactly one of session | channel.
+            let target = match &def.target {
+                CronTargetDef::Session(session) => {
+                    let value = session.session.trim();
+                    if value.is_empty() {
+                        fail("target.session must be non-empty".to_string());
+                        None
+                    } else if let Err(e) = uuid::Uuid::parse_str(value) {
+                        fail(format!("target.session `{value}` is not a uuid ({e})"));
+                        None
+                    } else {
+                        Some(CronTarget::Session {
+                            session: value.to_string(),
+                        })
+                    }
+                }
+                CronTargetDef::Channel(channel) => {
+                    let name = channel.channel.trim();
+                    let topic = channel.topic.as_deref().map(str::trim).unwrap_or("");
+                    if name.is_empty() {
+                        fail("target.channel must be non-empty".to_string());
+                        None
+                    } else if topic.is_empty() {
+                        fail(
+                            "target.topic must be non-empty for a channel target (§3.2 \
+                             {channel: <name>, topic: <topic>})"
+                                .to_string(),
+                        );
+                        None
+                    } else if !channels.contains_key(name) {
+                        fail(format!(
+                            "target.channel `{name}` is not declared in superagent.channels \
+                             (fail-closed cross-reference, §3.2)"
+                        ));
+                        None
+                    } else {
+                        Some(CronTarget::Channel {
+                            channel: name.to_string(),
+                            topic: topic.to_string(),
+                        })
+                    }
+                }
+            };
+
+            // §3.4: the prompt is the turn's user message — an empty one is
+            // an error, never an empty turn.
+            if def.prompt.trim().is_empty() {
+                fail("prompt must be non-empty (it is the firing turn's user message)".to_string());
+            }
+
+            // §3.3 rules 4 and 5: real bounds, no contradiction.
+            let overlap = def.overlap.unwrap_or_default();
+            let catch_up = match def.catch_up.unwrap_or_default() {
+                CronCatchUpDef::Latest => kian_cron::CatchUp::Latest,
+                CronCatchUpDef::Skip => kian_cron::CatchUp::Skip,
+            };
+            let coalesce_ms = def.coalesce_ms.unwrap_or(DEFAULT_CRON_COALESCE_MS);
+            let max_concurrent = def.max_concurrent.unwrap_or(DEFAULT_CRON_MAX_CONCURRENT);
+            let timeout_ms = def.timeout_ms.unwrap_or(DEFAULT_CRON_TIMEOUT_MS);
+            if coalesce_ms == 0 {
+                fail("coalesce_ms must be > 0 (a zero window honors no lateness)".to_string());
+            }
+            if max_concurrent == 0 {
+                fail("max_concurrent must be >= 1".to_string());
+            }
+            if timeout_ms == 0 {
+                fail("timeout_ms must be > 0".to_string());
+            }
+            if overlap == CronOverlap::KillPrevious && max_concurrent > 1 {
+                fail(format!(
+                    "overlap: kill-previous contradicts max_concurrent: {max_concurrent} \
+                     (§3.3 rule 5)"
+                ));
+            }
+
+            // §6 isolation: a declared `worktree` policy selects the
+            // worktree-backed dispatcher for this schedule's firings.
+            let worktree = match def.worktree.as_ref() {
+                None => None,
+                Some(CronWorktreeDef::Flag(false)) => None,
+                Some(declared) => {
+                    let mut policy = crate::cron_worktree::WorktreePolicy::from_section(self);
+                    let mut repo: Option<std::path::PathBuf> = None;
+                    if let CronWorktreeDef::Policy(declared) = declared {
+                        if let Some(raw) = declared.repo.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.repo must be non-empty when set".to_string());
+                            } else {
+                                let path = std::path::PathBuf::from(raw);
+                                repo = Some(if path.is_absolute() {
+                                    path
+                                } else {
+                                    std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                                        .join(path)
+                                });
+                            }
+                        }
+                        if let Some(raw) = declared.root.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.root must be non-empty when set".to_string());
+                            } else {
+                                policy.root = Some(std::path::PathBuf::from(raw));
+                            }
+                        }
+                        if let Some(raw) = declared.base.as_deref() {
+                            let raw = raw.trim();
+                            if raw.is_empty() {
+                                fail("worktree.base must be non-empty when set".to_string());
+                            } else {
+                                policy.base = Some(raw.to_string());
+                            }
+                        }
+                        if let Some(keep) = declared.keep_on_failure {
+                            policy.keep_on_failure = keep;
+                        }
+                    }
+                    Some(CronWorktreePlan { repo, policy })
+                }
+            };
+
+            if errors.len() > before {
+                continue;
+            }
+            let (Some(expr), Some(target)) = (expr, target) else {
+                continue;
+            };
+            resolved.push(CronRuntimeSchedule {
+                id: def.id.clone(),
+                expr,
+                tz,
+                tz_name,
+                enabled: def.enabled.unwrap_or(true),
+                target,
+                prompt: def.prompt.clone(),
+                overlap,
+                catch_up,
+                coalesce_ms,
+                max_concurrent,
+                timeout_ms,
+                worktree,
+            });
+        }
+
+        if !errors.is_empty() {
+            return Err(invalid(errors.join("; ")));
+        }
+        Ok(resolved)
+    }
+}
+
+/// The worktree arm the resident ticker arms: the first schedule that asked
+/// for isolation decides the repo and the policy. `None` = no schedule wants
+/// isolation, so the ticker arms the resident engine alone.
+pub fn cron_worktree_plan(
+    schedules: &[CronRuntimeSchedule],
+) -> Option<(std::path::PathBuf, crate::cron_worktree::WorktreePolicy)> {
+    schedules.iter().find_map(|schedule| {
+        schedule.worktree.as_ref().map(|plan| {
+            let repo = plan
+                .repo
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            (repo, plan.policy.clone())
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3437,6 +4610,46 @@ recovery:
 
     // -- workers: (R12, C1–C6) -------------------------------------
 
+    /// ADR-033: `workers.queue_max_redrives` is the bounded re-drive knob —
+    /// explicit values parse, `0` is meaningful (no re-drive), and the
+    /// fail-closed ceiling refuses a value that would restore unbounded
+    /// replay in practice.
+    #[test]
+    fn workers_queue_max_redrives_parses_and_is_fail_closed() {
+        let base = valid_yaml();
+        let with = |max: u32| {
+            format!(
+                "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+                 workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n  \
+                 queue_max_redrives: {max}\n"
+            )
+        };
+
+        let cfg = ServeConfig::parse(&with(0)).expect("explicit zero parses");
+        assert_eq!(
+            cfg.workers
+                .clone()
+                .expect("section present")
+                .queue_max_redrives,
+            0
+        );
+        assert!(cfg.validate().is_ok(), "zero = first dispatch only");
+
+        let cfg = ServeConfig::parse(&with(3)).expect("explicit bound parses");
+        assert_eq!(
+            cfg.workers
+                .clone()
+                .expect("section present")
+                .queue_max_redrives,
+            3
+        );
+        assert!(cfg.validate().is_ok());
+
+        // `parse` validates: the ceiling refuses at load time, not later.
+        let err = ServeConfig::parse(&with(17)).expect_err("ceiling must fail closed");
+        assert!(err.to_string().contains("queue_max_redrives"), "was: {err}");
+    }
+
     /// A config with a `workers:` section and zero `endpoints:` boots
     /// (C6): the remote-exec plugin's presence lock covers the dynamic
     /// half. Absent section parses to `None` (feature off).
@@ -3453,6 +4666,7 @@ recovery:
         assert_eq!(workers.token_env.as_deref(), Some("KIAN_WORKER_TOKEN"));
         assert_eq!(workers.offline_after_ms, 30_000, "default");
         assert_eq!(workers.queue_timeout_ms, 60_000, "default");
+        assert_eq!(workers.queue_max_redrives, 1, "default");
         assert!(!workers.allow_public, "default");
         assert!(!workers.enrolled_only, "default");
         assert!(workers.tokens.is_empty(), "default");
@@ -3479,6 +4693,7 @@ recovery:
         assert!(workers.token_env.is_none());
         assert!(workers.enrolled_only);
         assert_eq!(workers.queue_timeout_ms, 600_000);
+        assert_eq!(workers.queue_max_redrives, 1, "default when omitted");
         assert_eq!(workers.offline_after_ms, 120_000);
         assert_eq!(
             workers.tokens.get("iphone").map(String::as_str),
@@ -3516,6 +4731,7 @@ recovery:
                 offline_after_ms: offline,
                 allow_public: false,
                 queue_timeout_ms: queue,
+                queue_max_redrives: 1,
                 enrolled_only: false,
                 tokens: BTreeMap::new(),
             }
@@ -3935,6 +5151,190 @@ recovery:
         );
         let err = ServeConfig::parse(&watchdog).expect_err("watchdog permissions must refuse boot");
         assert!(err.to_string().contains("watchdog"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // the join fan-in policy (R17 C7, pin P4-5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn any_and_quorum_join_values_refuse_to_boot_naming_the_deferral() {
+        // (R17-C7, pin P4-5) v1 evaluates only `all` — the one shape
+        // with an evaluation site (one spawn, one parent). `any` and
+        // `quorum:<n>` refuse to boot naming the missing evaluation
+        // site and the §9 deferral; they are never
+        // accepted-and-ignored (which would imply any-of success,
+        // §5.3:588).
+        for join in ["any", "quorum:2"] {
+            let yaml = superagent_yaml().replacen(
+                "superagent:\n",
+                format!("superagent:\n  multiagent:\n    join: {join}\n").as_str(),
+                1,
+            );
+            let cfg = ServeConfig::parse(&yaml).unwrap();
+            let sa = cfg.superagent.as_ref().unwrap();
+            let err = sa
+                .multiagent_config()
+                .expect_err("join any/quorum must refuse to boot");
+            let msg = err.to_string();
+            assert!(msg.contains("superagent.multiagent"), "{msg}");
+            assert!(msg.contains("join"), "{msg}");
+            assert!(
+                msg.contains("no evaluation site"),
+                "names the missing evaluation site: {msg}"
+            );
+            assert!(
+                msg.contains("deferred") || msg.contains("deferral"),
+                "names the deferral: {msg}"
+            );
+        }
+        // A quorum of zero is a malformed bound, not a deferral.
+        let zero = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: quorum:0\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&zero).unwrap();
+        let err = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .multiagent_config()
+            .expect_err("quorum:0 must refuse");
+        assert!(err.to_string().contains("n ≥ 1"), "names the bound: {err}");
+    }
+
+    #[test]
+    fn join_all_and_absent_boot_and_unknown_values_refuse_naming_the_forms() {
+        // Absent: the default policy (`all`) — the block still boots.
+        let absent = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    max_children: 2\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&absent).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert!(
+            sa.multiagent_config().unwrap().is_some(),
+            "absent join boots with the default"
+        );
+        // Explicit `all`: accepted.
+        let all = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: all\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&all).unwrap();
+        assert!(
+            cfg.superagent
+                .as_ref()
+                .unwrap()
+                .multiagent_config()
+                .unwrap()
+                .is_some(),
+            "join: all boots"
+        );
+        // An unknown value names the accepted forms.
+        let bogus = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: sometimes\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&bogus).unwrap();
+        let err = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .multiagent_config()
+            .expect_err("unknown join value must refuse");
+        assert!(
+            err.to_string().contains("`all` | `any` | `quorum:<n>`"),
+            "names the accepted forms: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // the task-board switch block (R17 C4, pin P3-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn board_block_defaults_off_and_parses_both_keys() {
+        // Absent block: both keys false — feature-off, byte-identical
+        // (`anchors.md` rule 4), and the conversion is simply off.
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(sa.board, BoardConfigDef::default());
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: false,
+                gating: false
+            }
+        );
+
+        // The block parses both keys; `enabled` alone is legal P3.
+        let on = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabled: true\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&on).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: true,
+                gating: false
+            }
+        );
+    }
+
+    #[test]
+    fn board_gating_true_boots_with_the_multiagent_block_and_refuses_without_it() {
+        // (R17-C6, pin P4-1 / §7.1:737-741) `gating: true` is live
+        // since the key groups landed: it converts cleanly when (and
+        // only when) the `multiagent` block is present — neither board
+        // key can enable anything multiagent has not already enabled.
+        let with_multiagent = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    max_children: 2\n  board:\n    gating: true\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&with_multiagent).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: false,
+                gating: true
+            }
+        );
+
+        // Without the multiagent block: a refusal naming the block,
+        // never a silent no-op (§7.1:737-741).
+        let gating = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    gating: true\n",
+            1,
+        );
+        let err = ServeConfig::parse(&gating)
+            .expect_err("board.gating without multiagent must refuse to boot");
+        let msg = err.to_string();
+        assert!(msg.contains("superagent.board"), "{msg}");
+        assert!(msg.contains("multiagent"), "{msg}");
+    }
+
+    #[test]
+    fn board_unknown_keys_refuse_boot() {
+        let typo = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabeld: true\n",
+            1,
+        );
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse a mistyped board key"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6025,5 +7425,582 @@ recovery:
             ServeConfig::parse(&spliced).is_ok(),
             "zero-endpoints dsh config boots exactly as before"
         );
+    }
+
+    // -- superagent.roster: (R17-C1) --------------------------------
+
+    /// The superagent fixture plus a `research` agent (the roster's
+    /// resolution target) — the base every roster case splices onto.
+    fn roster_base_yaml() -> String {
+        superagent_yaml().replace(
+            "superagent:\n  router:",
+            "  research:\n    id: research\n    version: 1\n    model_slots:\n      \
+             main:\n        provider: openai\n        model: gpt-research\n    tools: \
+             [\"fs_read\", \"recall_event\"]\nsuperagent:\n  router:",
+        )
+    }
+
+    /// The base fixture with `roster_block` spliced under
+    /// `superagent:` (the caller indents to the entry level).
+    fn roster_yaml(roster_block: &str) -> String {
+        roster_base_yaml().replace(
+            "  worker:\n    agent: worker\n    pinned_version: 7\n",
+            &format!("  worker:\n    agent: worker\n    pinned_version: 7\n{roster_block}"),
+        )
+    }
+
+    /// One valid roster entry yaml (agent `research`, a leaf).
+    const VALID_ENTRY: &str = "  roster:\n    - id: researcher\n      description: Finds and \
+         cites sources\n      agent: research\n      mandate_template:\n        scope: read-only \
+         research\n        strength: inferred\n      tools_allow: [\"fs_read\"]\n      limits: \
+         {max_children: 0}\n";
+
+    #[test]
+    fn roster_absent_or_empty_converts_to_none_feature_off() {
+        // Pin P2-6: absent/empty roster ⇒ `None` ⇒ no `list_agents`,
+        // no validation, today's bytes.
+        let base = ServeConfig::parse(&roster_base_yaml()).expect("base config");
+        assert_eq!(base.roster_config().expect("absent roster"), None);
+        let empty = roster_yaml("  roster: []\n");
+        let cfg = ServeConfig::parse(&empty).expect("empty roster config");
+        assert_eq!(cfg.roster_config().expect("empty roster"), None);
+    }
+
+    #[test]
+    fn an_entry_naming_no_configured_agent_refuses_boot_naming_the_known_ids() {
+        // Pin P2-1: discovery is exactly `named_agent_def` — an
+        // unknown `agent` refuses boot, naming the known `agents:`
+        // ids (not the default `agent:`).
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Ghost\n      agent: nope\n      \
+             mandate_template: {scope: s, strength: inferred}\n      tools_allow: []\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("unknown agent refuses");
+        let text = err.to_string();
+        assert!(text.contains("nope"), "names the unknown id: {text}");
+        assert!(
+            text.contains("router") && text.contains("worker") && text.contains("research"),
+            "names the known agents: ids: {text}"
+        );
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_roster_ids_refuse_boot_at_the_config_gate() {
+        let block = format!(
+            "{VALID_ENTRY}    - id: researcher\n      description: Again\n      agent: research\n      \
+             mandate_template: {{scope: s, strength: inferred}}\n      tools_allow: []\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let err = cfg.roster_config().expect_err("duplicate ids refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("duplicate") && text.contains("researcher"),
+            "{text}"
+        );
+        assert!(text.contains("superagent.roster"), "{text}");
+    }
+
+    #[test]
+    fn a_widening_tools_allow_refuses_boot_at_the_config_gate() {
+        // M3 / §5.1:551-552 — `exec` is not on the `research` agent's
+        // surface, so listing it refuses boot.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Widening\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: [\"fs_read\", \"exec\"]\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("widening refuses");
+        let text = err.to_string();
+        assert!(text.contains("exec"), "names the tool: {text}");
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_subset_output_schema_refuses_boot_naming_the_key_and_keyword() {
+        // Pin P2-3: `oneOf` is outside the closed subset — the
+        // refusal names the keyword and the key.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Scheming\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: []\n      output_schema:\n        oneOf:\n          - type: string\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("outside the subset refuses");
+        let text = err.to_string();
+        assert!(text.contains("oneOf"), "names the keyword: {text}");
+        assert!(
+            text.contains("superagent.roster[0].output_schema") || {
+                // the RosterError prefix composes as
+                // `superagent.roster[0]: … output_schema: …`
+                text.contains("superagent.roster[0]") && text.contains("output_schema")
+            },
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn a_valid_roster_converts_in_config_order_with_leaf_legal() {
+        // §3.1:360-361: `max_children: 0` is a legal leaf; a missing
+        // `limits` takes the §5.3 default (4); config order holds.
+        let block = format!(
+            "{VALID_ENTRY}    - id: recaller\n      description: Recalls events\n      agent: \
+             research\n      mandate_template: {{scope: s, strength: explicit}}\n      \
+             tools_allow: [\"fs_read\", \"recall_event\"]\n      output_schema:\n        \
+             type: object\n        required: [summary]\n        properties:\n          summary: \
+             {{type: string}}\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let roster = cfg
+            .roster_config()
+            .expect("valid roster converts")
+            .expect("some");
+        assert_eq!(roster.known_ids(), vec!["researcher", "recaller"]);
+        let leaf = roster.resolve("researcher").expect("leaf resolves");
+        assert_eq!(leaf.limits.max_children, 0, "the leaf fact");
+        assert_eq!(leaf.agent, "research");
+        let defaulted = roster.resolve("recaller").expect("defaulted resolves");
+        assert_eq!(defaulted.limits.max_children, 4, "the §5.3 default");
+        assert_eq!(
+            defaulted.mandate_template.strength,
+            kian_superagent::MandateStrength::Explicit
+        );
+        assert!(
+            defaulted.output_schema.is_some(),
+            "the schema rides the entry"
+        );
+    }
+
+    // -- sidecars: the §8.1 config surface -------------------------
+
+    const SIDECAR_SECTION: &str = r#"sidecars:
+  plugins:
+    approval-gate:
+      manifest: "/etc/kian/plugins/approval-gate.toml"
+    cost-audit:
+      manifest: "/etc/kian/plugins/cost-audit.toml"
+  scopes:
+    server: ["approval-gate", "cost-audit"]
+    worker:
+      node-zulu:
+        use: ["approval-gate"]
+        limits:
+          approval-gate: {deadline_ms: 200}
+      node-yankee:
+        limits:
+          cost-audit: {max_payload_kib: 64}
+"#;
+
+    /// §8.1's example grammar parses and validates (the shape checks —
+    /// the widening check runs in the assembly, where the manifests
+    /// are loaded).
+    #[test]
+    fn sidecars_two_scope_grammar_parses() {
+        let base = valid_yaml();
+        let cfg = ServeConfig::parse(&format!("{base}{SIDECAR_SECTION}"))
+            .expect("the §8.1 example is valid");
+        let sidecars = cfg.sidecars.as_ref().expect("section present");
+        assert_eq!(sidecars.scopes.server.len(), 2);
+        let zulu = sidecars.scopes.worker.get("node-zulu").expect("zulu");
+        assert_eq!(
+            zulu.use_.as_deref(),
+            Some(&["approval-gate".to_string()][..])
+        );
+        assert_eq!(
+            zulu.limits["approval-gate"].deadline_ms,
+            Some(200),
+            "the worker-scope narrowing key"
+        );
+    }
+
+    /// §13.3: an absent section is `None` — no sidecars, byte-identical.
+    #[test]
+    fn sidecars_absent_section_means_no_sidecars() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("valid");
+        assert!(cfg.sidecars.is_none());
+    }
+
+    /// §8.1's closed grammar: `harness:` (or `profile:`) inside
+    /// `scopes:` is an unknown key and refuses boot naming the key.
+    #[test]
+    fn sidecars_unknown_scope_key_refuses_naming_the_key() {
+        let text = format!(
+            "{base}sidecars:\n  scopes:\n    harness:\n      react: [\"x\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("harness"), "names the offender: {err}");
+        let text = format!(
+            "{base}sidecars:\n  scopes:\n    profile:\n      router: [\"x\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("profile"), "names the offender: {err}");
+    }
+
+    /// §8.1/§8.4: `use ⊆ scopes.server` is a static boot check — a
+    /// subset violation names the worker and the name.
+    #[test]
+    fn sidecars_subset_violation_refuses_naming_worker_and_name() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n    b:\n      manifest: \"/etc/b.toml\"\n  scopes:\n    server: [\"a\"]\n    worker:\n      node-bad:\n        use: [\"b\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("node-bad") && err.contains("`b`"), "{err}");
+        assert!(err.contains("subset_violation"), "carries the code: {err}");
+    }
+
+    /// §8.1: a set entry that is not a declared instance refuses boot
+    /// (a typo cannot silently do nothing).
+    #[test]
+    fn sidecars_undeclared_instance_refuses() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n  scopes:\n    server: [\"a\", \"typo-name\"]\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("typo-name"), "{err}");
+        assert!(err.contains("undeclared_instance"), "{err}");
+    }
+
+    /// §6.2 rule 3 via §13.1: an instance key colliding with a
+    /// KNOWN_PLUGINS name refuses boot.
+    #[test]
+    fn sidecars_known_plugin_name_collision_refuses() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    react-loop:\n      manifest: \"/etc/evil.toml\"\n",
+            base = valid_yaml()
+        );
+        let err = ServeConfig::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("react-loop"), "{err}");
+        assert!(err.contains("name_collision"), "{err}");
+    }
+
+    /// §8.1: an empty server list is legal ("no sidecars for anyone"),
+    /// and so is an empty `use: []` at a worker.
+    #[test]
+    fn sidecars_empty_sets_are_legal() {
+        let text = format!(
+            "{base}sidecars:\n  plugins:\n    a:\n      manifest: \"/etc/a.toml\"\n  scopes:\n    server: []\n    worker:\n      w:\n        use: []\n",
+            base = valid_yaml()
+        );
+        let cfg = ServeConfig::parse(&text).expect("empty sets are legal");
+        let sidecars = cfg.sidecars.expect("present");
+        assert!(sidecars.scopes.server.is_empty());
+    }
+
+    // -- superagent.cron (CRON-MODEL §3) --------------------------
+
+    /// A channel map with one declared `cron-jobs` channel — the target
+    /// every cron fixture below resolves against.
+    fn cron_channels() -> std::collections::BTreeMap<String, ChannelConfig> {
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            "cron-jobs".to_string(),
+            ChannelConfig {
+                channel_type: "mock-im".into(),
+                lark: None,
+                timer: None,
+                github: None,
+                wechat: None,
+            },
+        );
+        channels
+    }
+
+    /// A fixed "now" (2027-01-15T08:00:00Z) — the §2.5 input is a pure
+    /// function, so the fixtures never read the clock.
+    fn cron_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+
+    /// Parses a `CronSection` document and resolves it against the fixture
+    /// channels (`Err` is the fail-closed load path).
+    fn cron_section_from(yaml: &str) -> Result<Vec<CronRuntimeSchedule>, ConfigError> {
+        let section: CronSection = serde_yaml::from_str(yaml).unwrap();
+        section.to_runtime(&cron_channels(), cron_now())
+    }
+
+    /// Two schedules round-trip through the wire form and resolve: one with
+    /// an explicit `tz:` and non-default policies, one defaulting to the
+    /// frozen host timezone with every §3.1 default.
+    #[test]
+    fn cron_section_round_trips_with_explicit_and_host_tz() {
+        let yaml = r#"
+schedules:
+  - id: night-audit
+    expr: "30 3 * * 1-5"
+    tz: Europe/Berlin
+    target: { channel: cron-jobs, topic: audit }
+    prompt: "Audit .state/ for orphaned worktrees."
+    overlap: queue
+    catch_up: skip
+    coalesce_ms: 60000
+    max_concurrent: 2
+    timeout_ms: 120000
+  - id: hourly-ping
+    expr: "@hourly"
+    enabled: false
+    target: { session: "99999999-8888-7777-6666-555555555555" }
+    payload: "ping"
+"#;
+        let section: CronSection = serde_yaml::from_str(yaml).unwrap();
+        // the wire form survives a serialize → parse → serialize cycle.
+        let round_tripped =
+            serde_yaml::to_string(&section).expect("a parsed cron section serializes");
+        let again: CronSection = serde_yaml::from_str(&round_tripped).unwrap();
+        assert_eq!(again, section);
+
+        let resolved = section.to_runtime(&cron_channels(), cron_now()).unwrap();
+        assert_eq!(resolved.len(), 2);
+
+        let audit = &resolved[0];
+        assert_eq!(audit.id, "night-audit");
+        assert_eq!(audit.expr.source(), "30 3 * * 1-5");
+        assert_eq!(
+            audit.tz,
+            kian_cron::parse_timezone("Europe/Berlin").unwrap()
+        );
+        assert_eq!(audit.tz_name, "Europe/Berlin");
+        assert!(audit.enabled);
+        assert_eq!(
+            audit.target,
+            CronTarget::Channel {
+                channel: "cron-jobs".into(),
+                topic: "audit".into()
+            }
+        );
+        assert_eq!(audit.overlap, CronOverlap::Queue);
+        assert_eq!(audit.catch_up, kian_cron::CatchUp::Skip);
+        assert_eq!(audit.coalesce_ms, 60_000);
+        assert_eq!(audit.max_concurrent, 2);
+        assert_eq!(audit.timeout_ms, 120_000);
+        assert!(audit.next_fire_after(cron_now()).unwrap() > cron_now());
+
+        // the second schedule freezes the host timezone (§2.3) and takes
+        // every remaining §3.1 default.
+        let ping = &resolved[1];
+        assert_eq!(ping.id, "hourly-ping");
+        assert_eq!(ping.expr.source(), "0 * * * *");
+        let (host_tz, host_name) = host_timezone();
+        assert_eq!(ping.tz, host_tz);
+        assert_eq!(ping.tz_name, host_name);
+        assert!(!ping.enabled, "`enabled: false` is carried, never fired");
+        assert_eq!(
+            ping.target,
+            CronTarget::Session {
+                session: "99999999-8888-7777-6666-555555555555".into()
+            }
+        );
+        assert_eq!(ping.prompt, "ping");
+        assert_eq!(ping.overlap, CronOverlap::Skip);
+        assert_eq!(ping.catch_up, kian_cron::CatchUp::Latest);
+        assert_eq!(ping.coalesce_ms, DEFAULT_CRON_COALESCE_MS);
+        assert_eq!(ping.max_concurrent, DEFAULT_CRON_MAX_CONCURRENT);
+        assert_eq!(ping.timeout_ms, DEFAULT_CRON_TIMEOUT_MS);
+    }
+
+    /// A malformed expression refuses load, naming the schedule id.
+    #[test]
+    fn cron_schedule_bad_expr_refuses_naming_the_id() {
+        let err = cron_section_from(
+            "schedules:\n  - id: night-audit\n    expr: \"0 0 * *\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("night-audit"), "{err}");
+        assert!(err.contains("exactly 5 are required"), "{err}");
+    }
+
+    /// A valid-but-never-matching shape refuses load (§2.5 horizon).
+    #[test]
+    fn cron_never_firing_shape_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: never\n    expr: \"0 0 30 2 *\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`never`"), "{err}");
+        assert!(err.contains("horizon"), "{err}");
+    }
+
+    /// An unknown `@`-alias refuses load (§2.2).
+    #[test]
+    fn cron_unknown_alias_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: boot\n    expr: \"@reboot\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("@reboot"), "{err}");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// An unresolvable timezone refuses load — never a fallback to UTC
+    /// (§2.3).
+    #[test]
+    fn cron_schedule_bad_tz_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    tz: Mars/Olympus\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Mars/Olympus"), "{err}");
+        assert!(err.contains("`audit`"), "{err}");
+    }
+
+    /// Duplicate ids refuse load (§3.3 rule 2) — the id is the cursor key.
+    #[test]
+    fn cron_duplicate_id_refuses() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n  \
+             - id: audit\n    expr: \"@hourly\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate id"), "{err}");
+        assert!(err.contains("schedules[1]"), "{err}");
+    }
+
+    /// A missing `target` / a misspelled key is a parse error
+    /// (`deny_unknown_fields`), never a silently ignored field.
+    #[test]
+    fn cron_missing_target_and_unknown_fields_refuse_at_parse() {
+        // no target at all
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n"
+            )
+            .is_err()
+        );
+        // unknown key inside a schedule
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n    \
+                 tzname: UTC\n    target: { session: \"99999999-8888-7777-6666-555555555555\" }\n"
+            )
+            .is_err()
+        );
+        // unknown key inside a target
+        assert!(
+            serde_yaml::from_str::<CronSection>(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    prompt: audit\n    \
+                 target: { channel: cron-jobs, topic: audit, extra: x }\n"
+            )
+            .is_err()
+        );
+        // unknown key on the section itself
+        assert!(serde_yaml::from_str::<CronSection>("schedulz: []\n").is_err());
+    }
+
+    /// The target resolves fail-closed (§3.2) and an empty prompt refuses.
+    #[test]
+    fn cron_target_and_prompt_are_fail_closed() {
+        let undeclared = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: nope, topic: audit }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(undeclared.contains("not declared"), "{undeclared}");
+
+        let no_topic = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(no_topic.contains("target.topic"), "{no_topic}");
+
+        let bad_uuid = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: not-a-uuid }\n    prompt: audit\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_uuid.contains("not-a-uuid"), "{bad_uuid}");
+
+        let empty_prompt = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: \"  \"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            empty_prompt.contains("prompt must be non-empty"),
+            "{empty_prompt}"
+        );
+    }
+
+    /// Zero bounds and a contradictory overlap policy refuse, and every
+    /// declaration's errors are collected in one load (§3.3 rules 4, 5).
+    #[test]
+    fn cron_bounds_and_contradictions_refuse_and_collect_all_errors() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n    \
+             overlap: kill-previous\n    max_concurrent: 2\n    coalesce_ms: 0\n  \
+             - id: sweep\n    expr: \"@hourly\"\n    tz: Nowhere/Land\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: sweep\n    \
+             timeout_ms: 0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        // both schedules are named: the load reports one error list, not
+        // one error per restart.
+        assert!(err.contains("`audit`"), "{err}");
+        assert!(err.contains("`sweep`"), "{err}");
+        assert!(err.contains("coalesce_ms"), "{err}");
+        assert!(err.contains("kill-previous"), "{err}");
+        assert!(err.contains("timeout_ms"), "{err}");
+        assert!(err.contains("Nowhere/Land"), "{err}");
+    }
+
+    /// The schedule id shape is enforced (§3.1).
+    #[test]
+    fn cron_id_shape_is_enforced() {
+        for bad in ["Night-Audit", "-audit", "audit!", ""] {
+            let yaml = format!(
+                "schedules:\n  - id: \"{bad}\"\n    expr: \"@daily\"\n    \
+                 target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit\n"
+            );
+            let err = cron_section_from(&yaml).unwrap_err().to_string();
+            assert!(err.contains("[a-z0-9][a-z0-9_-]{0,63}"), "{bad}: {err}");
+        }
+    }
+
+    /// A declared `superagent.cron` block reaches the load-time gate from
+    /// `ServeConfig::parse`, and a broken one refuses boot.
+    #[test]
+    fn serve_config_validates_cron_at_load() {
+        let good = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  cron:\n    schedules:\n      - id: audit\n        expr: \"@daily\"\n        \
+             target: { channel: mock-im, topic: audit }\n        prompt: audit\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&good).expect("cron declarations parse");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        assert_eq!(sa.cron.schedules.len(), 1);
+        assert_eq!(sa.cron.schedules[0].id, "audit");
+
+        // fail-closed at load: an unknown alias refuses boot from parse().
+        let bad = good.replace("expr: \"@daily\"", "expr: \"@reboot\"");
+        assert!(ServeConfig::parse(&bad).is_err());
     }
 }
