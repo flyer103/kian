@@ -64,6 +64,7 @@ async fn remote_exec_output_and_durable_row_carry_no_secret() {
         RemoteExecConfig {
             queue_timeout: Duration::from_secs(8),
             poll_interval: Duration::from_millis(40),
+            max_redrives: 1,
         },
         "redact-test",
         Duration::from_secs(8),
@@ -148,6 +149,7 @@ async fn remote_exec_result_and_row_carry_the_redaction_report() {
         RemoteExecConfig {
             queue_timeout: Duration::from_secs(8),
             poll_interval: Duration::from_millis(40),
+            max_redrives: 1,
         },
         "redact-report-test",
         Duration::from_secs(8),

@@ -368,9 +368,19 @@ impl Plugin for RemoteExecPlugin {
         // longer bound also lengthens the honest timeout of every queued
         // command (documented trade-off).
         let max_timeout = backend_queue_timeout(&self.endpoints, self.workers.as_ref());
+        // The re-drive bound is a `workers:` knob only (ADR-033): static
+        // pins keep the queue contract they always had, and the backend's
+        // default applies when no dynamic workers are configured.
+        let max_redrives = self
+            .workers
+            .as_ref()
+            .map_or(RemoteExecConfig::default().max_redrives, |workers| {
+                workers.queue_max_redrives
+            });
         let config = RemoteExecConfig {
             queue_timeout: Duration::from_millis(max_timeout),
             poll_interval: Duration::from_millis(250),
+            max_redrives,
         };
         // The dynamic-membership half (when `workers:` is configured):
         // read the env-only tokens (fail-closed — values never travel
@@ -1647,6 +1657,7 @@ mod backend_queue_timeout_tests {
             offline_after_ms: 30_000,
             allow_public: false,
             queue_timeout_ms: timeout,
+            queue_max_redrives: 1,
             enrolled_only: false,
             tokens: Default::default(),
         }

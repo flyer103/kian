@@ -110,6 +110,7 @@ async fn setup_with(
             RemoteExecConfig {
                 queue_timeout,
                 poll_interval: Duration::from_millis(40),
+                max_redrives: 1,
             },
         )
         .unwrap(),
@@ -326,6 +327,7 @@ async fn remote_tool_duplicate_call_id_is_deduped_at_the_row() {
             RemoteExecConfig {
                 queue_timeout: Duration::from_secs(8),
                 poll_interval: Duration::from_millis(40),
+                max_redrives: 1,
             },
         )
         .unwrap(),
