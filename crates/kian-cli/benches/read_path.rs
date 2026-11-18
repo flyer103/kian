@@ -299,7 +299,7 @@ fn bench_views_at(
         // Build the views once (the first build is a full rebuild); no
         // further appends outside the changed-tick benches, so the
         // read benches below stay fresh (the exact-version gate holds).
-        kian_cli::views::rebuild_views(&store, "bench", 0)
+        kian_cli::views::rebuild_views(&store, "bench", 0, false)
             .await
             .expect("bench view rebuild");
         (store, plain_sessions, worker_sessions)
@@ -363,13 +363,17 @@ fn bench_views_at(
     // views (every stream re-read and re-folded) — the baseline the
     // incremental ticks are measured against.
     group.bench_function(format!("rebuild_full_{tag}"), |b| {
-        b.iter(|| runtime.block_on(kian_cli::views::rebuild_views_full(&store, "bench", 0)))
+        b.iter(|| {
+            runtime.block_on(kian_cli::views::rebuild_views_full(
+                &store, "bench", 0, false,
+            ))
+        })
     });
 
     // R9-10: the incremental tick on an UNCHANGED store — one heads
     // scan, one pending scan, four digest verifications, zero folds.
     group.bench_function(format!("rebuild_incremental_idle_{tag}"), |b| {
-        b.iter(|| runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0)))
+        b.iter(|| runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0, false)))
     });
 
     // R9-10: the incremental tick after 10 plain sessions grew by one
@@ -388,7 +392,8 @@ fn bench_views_at(
                         }
                     });
                     let start = std::time::Instant::now();
-                    let _ = runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0));
+                    let _ =
+                        runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0, false));
                     total += start.elapsed();
                 }
                 total
@@ -409,7 +414,8 @@ fn bench_views_at(
                         append_turn_end(&store, worker).await;
                     });
                     let start = std::time::Instant::now();
-                    let _ = runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0));
+                    let _ =
+                        runtime.block_on(kian_cli::views::rebuild_views(&store, "bench", 0, false));
                     total += start.elapsed();
                 }
                 total

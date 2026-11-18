@@ -356,7 +356,7 @@ superagent:
     - id: researcher
       description: Finds and cites sources
       agent: researcher            # an entry in agents: with its own model slots
-      mandate_template: { scope: read-only research }
+      mandate_template: { scope: read-only research, strength: inferred }
       tools_allow: ["fs_read"]     # the child sees only these tools
 ```
 

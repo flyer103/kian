@@ -423,12 +423,18 @@ pub struct RebuildOutcome {
 /// Board off (the default): the `task_board` view is not published,
 /// and any rows from an earlier enabled era are deleted in the same
 /// tick (pin P3-1 — a disposable view).
+///
+/// (R17-FIX m8) `board_enabled` is a **required** argument: there is
+/// deliberately no defaulting entry point left, because a caller that
+/// forgot the flag under a board-on config would silently delete the
+/// `task_board` rows in the same tick.
 pub async fn rebuild_views(
     store: &EventStore,
     holder: &str,
     now_ms: u64,
+    board_enabled: bool,
 ) -> CmdResult<RebuildOutcome> {
-    rebuild_views_with(store, holder, now_ms, false).await
+    rebuild_views_with(store, holder, now_ms, board_enabled).await
 }
 
 /// [`rebuild_views`] with the task-board switch carried in (R17 C4,
@@ -463,13 +469,15 @@ pub async fn rebuild_views_with(
 /// The pre-R9-10 rebuild: re-derive every session's whole stream and
 /// republish all four views. Still the first-build path, the fallback
 /// on any doubt about the stored views, and the equivalence baseline
-/// for the incremental path's tests and benchmarks.
+/// for the incremental path's tests and benchmarks. (R17-FIX m8)
+/// `board_enabled` is required — see [`rebuild_views`].
 pub async fn rebuild_views_full(
     store: &EventStore,
     holder: &str,
     now_ms: u64,
+    board_enabled: bool,
 ) -> CmdResult<RebuildOutcome> {
-    rebuild_views_full_with(store, holder, now_ms, false).await
+    rebuild_views_full_with(store, holder, now_ms, board_enabled).await
 }
 
 /// [`rebuild_views_full`] with the task-board switch carried in
@@ -1162,16 +1170,26 @@ pub async fn fresh_task_board(store: &EventStore) -> Option<Vec<TaskBoardEntry>>
 mod tests {
     /// R8 (READ-MODEL §6): no control read may consume a view. The
     /// control plane is `kian-orchestrator` (append guards, claim,
-    /// promotion, steer eligibility) plus the store's control paths;
-    /// views live in `kian-store::views` and this module only. This
-    /// pins that boundary at the source level: the orchestrator never
-    /// references the view surface.
+    /// promotion, steer eligibility) plus — since R17 C7 — the
+    /// `kian-superagent` readiness/spawn control path (that crate
+    /// links `kian-store`, so without this scan its control surface
+    /// would sit outside the pin); views live in `kian-store::views`
+    /// and this module only. This pins that boundary at the source
+    /// level: neither control tree references the view surface
+    /// (`task_board` names included), and the scan is proven to cover
+    /// the readiness surface itself — it must see `ready_deps` and
+    /// the readiness walk under `kian-superagent/src`, otherwise the
+    /// extension would itself be decorative (R17-FIX M2).
     #[test]
     fn no_control_read_consumes_a_view() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let orch = root.join("../kian-orchestrator/src");
+        let superagent = root.join("../kian-superagent/src");
         let mut offenders = Vec::new();
-        let visit = |offenders: &mut Vec<String>, dir: &std::path::Path| {
+        let mut control_names_seen: Vec<String> = Vec::new();
+        let visit = |offenders: &mut Vec<String>,
+                     control_names_seen: &mut Vec<String>,
+                     dir: &std::path::Path| {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
             };
@@ -1200,13 +1218,28 @@ mod tests {
                             offenders.push(format!("{} references `{needle}`", path.display()));
                         }
                     }
+                    // Not offenders — the proof that this scan covers
+                    // the readiness control surface it guards.
+                    for name in ["ready_deps", "readiness"] {
+                        if text.contains(name) && !control_names_seen.iter().any(|s| s == name) {
+                            control_names_seen.push(name.to_string());
+                        }
+                    }
                 }
             }
         };
-        visit(&mut offenders, &orch);
+        visit(&mut offenders, &mut control_names_seen, &orch);
+        visit(&mut offenders, &mut control_names_seen, &superagent);
         assert!(
             offenders.is_empty(),
             "control-plane code must not consume views: {offenders:?}"
         );
+        for name in ["ready_deps", "readiness"] {
+            assert!(
+                control_names_seen.iter().any(|s| s == name),
+                "the R8 scan must cover the readiness control surface \
+                 (`{name}` not found under kian-superagent/src)"
+            );
+        }
     }
 }

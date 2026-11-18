@@ -224,7 +224,7 @@ async fn rebuild_equals_full_derivation_on_a_multi_session_store() {
         let store = EventStore::open(&path).await.unwrap();
         seed_store(&store, 5, 3, seed).await;
 
-        let out = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+        let out = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
             .await
             .unwrap();
         assert!(!out.lease_held);
@@ -298,7 +298,7 @@ async fn stale_view_falls_back_to_full_derivation() {
     let path = temp_db("stale");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 2, 1, 5).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     assert!(kian_cli::views::fresh_usage(&store).await.is_some());
@@ -344,7 +344,7 @@ async fn corrupt_view_is_discarded_and_the_gate_hides_views() {
     let path = temp_db("corrupt");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 2, 1, 11).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     let honest = kian_cli::usage_metrics::usage_stats_report(&store, None, false)
@@ -419,7 +419,7 @@ async fn rebuild_lease_excludes_concurrent_rebuilders() {
             .await
             .unwrap()
     );
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(out.lease_held);
@@ -432,7 +432,7 @@ async fn rebuild_lease_excludes_concurrent_rebuilders() {
         .maintenance_lease_release("views:all", "other")
         .await
         .unwrap();
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
         .await
         .unwrap();
     assert!(!out.lease_held);
@@ -450,7 +450,7 @@ async fn incremental_tick_after_no_changes_is_a_noop() {
     let path = temp_db("idle");
     let store = EventStore::open(&path).await.unwrap();
     seed_store(&store, 5, 2, 21).await;
-    let first = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    let first = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     assert_eq!(first.sessions, 7);
@@ -459,7 +459,7 @@ async fn incremental_tick_after_no_changes_is_a_noop() {
 
     // Nothing appended between the ticks: the second tick derives zero
     // sessions and publishes nothing, and the views remain fresh.
-    let second = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let second = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(!second.lease_held);
@@ -482,7 +482,7 @@ async fn incremental_rebuild_equals_full_after_partial_changes() {
     let path = temp_db("delta");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 6, 3, 33).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
 
@@ -530,7 +530,7 @@ async fn incremental_rebuild_equals_full_after_partial_changes() {
             .unwrap();
     }
 
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
         .await
         .unwrap();
     assert!(!out.lease_held);
@@ -595,7 +595,7 @@ async fn tampered_view_self_heals_on_the_next_incremental_tick() {
     let path = temp_db("heal");
     let store = EventStore::open(&path).await.unwrap();
     seed_store(&store, 4, 2, 44).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     if let EventStore::Sqlite(pool) = &store {
@@ -609,7 +609,7 @@ async fn tampered_view_self_heals_on_the_next_incremental_tick() {
     // The stored digest no longer covers the stored bytes; the next
     // tick must NOT reuse the tampered rows — it discards and fully
     // rebuilds the view (self-heal preserved).
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert!(out.derived > 0, "digest mismatch ⇒ full re-derivation");
@@ -648,7 +648,7 @@ async fn pending_inbox_drift_without_appends_refreshes_tickets() {
         .await
         .unwrap();
 
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     let entries = kian_cli::views::fresh_tickets(&store)
@@ -660,7 +660,7 @@ async fn pending_inbox_drift_without_appends_refreshes_tickets() {
 
     // Time passes; no appends. The tick compares live pending counts
     // with the stored rows, sees the drift, refreshes the board.
-    let out = kian_cli::views::rebuild_views(&store, "builder", 6_000)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 6_000, false)
         .await
         .unwrap();
     assert!(out.board_refreshed, "pending drift forces a board refresh");
@@ -686,7 +686,7 @@ async fn plain_append_does_not_refresh_the_board() {
     let path = temp_db("plainappend");
     let store = EventStore::open(&path).await.unwrap();
     let sessions = seed_store(&store, 4, 2, 66).await;
-    kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
 
@@ -703,7 +703,7 @@ async fn plain_append_does_not_refresh_the_board() {
     )
     .await;
 
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
         .await
         .unwrap();
     assert_eq!(out.derived, 1, "only the grown session");
@@ -951,7 +951,7 @@ async fn board_off_publishes_no_task_board_rows_and_no_view_state() {
     seed_task_lineage(&store, "off").await;
 
     // The default rebuild (board off): four views, no task board.
-    let out = kian_cli::views::rebuild_views(&store, "builder", 1_000)
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
         .await
         .unwrap();
     assert_eq!(out.views, 4);
@@ -976,7 +976,7 @@ async fn board_off_publishes_no_task_board_rows_and_no_view_state() {
         .await
         .unwrap();
     assert!(kian_cli::views::fresh_task_board(&store).await.is_some());
-    kian_cli::views::rebuild_views(&store, "builder", 1_200)
+    kian_cli::views::rebuild_views(&store, "builder", 1_200, false)
         .await
         .unwrap();
     assert_eq!(

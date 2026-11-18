@@ -31,7 +31,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
   Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
   [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
-- **Delegation task board — the read-only operator surface (round 17, kian-R17 C5)**. Two new
+- **Delegation task board — the read-only operator surface (kian board / kian tasks, round 17, C5)**. Two new
   `kian` verbs over the fifth view's rows (R17 C4): `kian board [--db] [--config] [--json]`
   renders one row per delegated task (`task_id`, `assignee`, `attempt`, `outcome`,
   `thread_status`, `gate`, the derived evidence pointer) in deterministic `task_id` order, and

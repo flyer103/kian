@@ -39,7 +39,7 @@
 This contract introduces **no** new event kind, **no** new table, **no** new HTTP route, **no** new
 ops method, **no** new metrics key, and **no** core-crate change. It introduces one additive config
 block (`superagent.multiagent`), one additive config list (`superagent.roster`), one additive
-read-surface switch (`superagent.board`, off by default), three proposed read-only CLI verbs
+read-surface switch (`superagent.board`, off by default), three read-only CLI verbs
 (`kian board`, `kian tasks --all`, `kian agents` — §4.2), and — only at phase P4, behind an explicit
 owner gate — two additive payload key groups on events that already exist (§7.2). **No event-payload
 key set changes before P4**; §0.3 draws that boundary once, because the rest of this file depends on
@@ -752,7 +752,7 @@ table and `workers.token_env`); an absent block is not an error and changes noth
 > imply any-of success (§5.3's `join` row, §9:882-888). This narrows the accepted *bootable* value
 > set, is reversible, and touches no bytes.
 
-### 7.2 The P4 additive payload keys (proposed; owner gate; NOT this round)
+### 7.2 The P4 additive payload keys (landed R17; owner gate; one-way)
 
 Two key groups on events that already exist, both **class A** (§0.3): outside `content`, non-context,
 omitted when unset, leaving legacy bytes byte-identical (EVENT-MODEL §4.2, §6.3):

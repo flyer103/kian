@@ -131,6 +131,32 @@ impl kian_superagent::WorkerStreamsPort for MapStreams {
     }
 }
 
+/// (R17-FIX M2) A "view-fed" child lookup: the stale `task_board` row
+/// served as the answer to the ONE lookup readiness is allowed to
+/// make — the dependency child's stream port. The fabricated event
+/// carries the row's *claims* (`outcome: completed_verified`,
+/// `ready: true`, `evidence_provenance: recorded`) dressed as the
+/// child's whole stream, but none of the primary facts a real
+/// completion derives from (no `status`, no committed verdict). A
+/// readiness that consulted the view — or trusted a claimed outcome
+/// instead of deriving it — would answer success and release the
+/// spawn; the primary-only derivation derives `failed` and refuses.
+struct ViewFedStreams {
+    row: Value,
+    asked: Mutex<Vec<SessionId>>,
+}
+
+impl kian_superagent::WorkerStreamsPort for ViewFedStreams {
+    fn read_stream(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<Event>, kian_superagent::WorkerStreamsError>> {
+        self.asked.lock().unwrap().push(session);
+        let fabricated = ev(session, 1, EventKind::ThreadCompleted, self.row.clone());
+        Box::pin(async move { Ok(vec![fabricated]) })
+    }
+}
+
 /// The recording stream port the Router's own `thread/started` lands on.
 struct RouterPort {
     session: SessionId,
@@ -180,8 +206,13 @@ struct RouterRig {
 }
 
 /// One assembled parent surface: multiagent on, a one-entry roster,
-/// and the pin-P4-1 class-A gate set by `gating`.
-fn router_rig(gating: bool, parent_events: Vec<Event>, streams: Arc<MapStreams>) -> RouterRig {
+/// and the pin-P4-1 class-A gate set by `gating`. Generic over the
+/// child-stream port so a test can plant a hostile lookup (§6).
+fn router_rig<S: kian_superagent::WorkerStreamsPort + 'static>(
+    gating: bool,
+    parent_events: Vec<Event>,
+    streams: Arc<S>,
+) -> RouterRig {
     let router = router_session();
     let inbox = CaptureInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
@@ -819,13 +850,34 @@ async fn attempt_counts_thread_started_carrying_the_same_task_id() {
 /// is ready (outcome `completed_verified`, ready `true` — the exact
 /// JSON a stale view would serve), the spawn still refuses: the
 /// evaluation reads the parent's stream and the dependency child's
-/// stream, and nothing else. The board is observability; a stale view
-/// may never authorise a spawn (§4.2 surface B, READ-MODEL R8).
+/// stream, and nothing else. (R17-FIX M2: the row is planted for
+/// REAL — it is served through the one lookup readiness actually
+/// makes, the child-stream port, and the test asserts the fabricated
+/// answer reached the walk — so the mutation "let readiness read the
+/// view / trust a claimed outcome" answers success here and turns
+/// this test red.) The board is observability; a stale view may
+/// never authorise a spawn (§4.2 surface B, READ-MODEL R8).
 #[tokio::test]
 async fn readiness_reads_the_primary_never_the_view() {
     let worker = sid(0xC7_0081);
-    // The PRIMARY: task `a` was spawned and its child is outstanding
-    // (empty child stream — no completion).
+    // The stale view row: the claims a stale `task_board` would serve.
+    let stale_row = json!({
+        "task_id": task_id_for_key(router_session(), "a").to_string(),
+        "outcome": "completed_verified",
+        "ready": true,
+        "evidence_provenance": "recorded",
+    });
+    // The plant is live: the row claims success …
+    assert_eq!(stale_row["outcome"], json!("completed_verified"));
+    assert_eq!(stale_row["ready"], json!(true));
+    let streams = Arc::new(ViewFedStreams {
+        row: stale_row,
+        asked: Mutex::new(Vec::new()),
+    });
+    // The PRIMARY: task `a` was spawned and its child is outstanding.
+    // The child lookup answers with the view row dressed as the
+    // child's stream — a `thread/completed` with no `status` and no
+    // committed verdict, which derives `failed`, never success.
     let rig = router_rig(
         true,
         vec![
@@ -833,19 +885,8 @@ async fn readiness_reads_the_primary_never_the_view() {
             dep_started("a", worker, &[], 4),
             router_tool_call(5, "call-1"),
         ],
-        MapStreams::with(vec![(worker, Vec::new())]),
+        streams.clone(),
     );
-    // The STALE VIEW: a task_board row claiming `a` completed
-    // verified and the dependent ready — planted exactly where a view
-    // would live (a disposable derived document). Readiness must not
-    // be able to see it.
-    let stale_view = json!({
-        "task_id": task_id_for_key(router_session(), "a").to_string(),
-        "outcome": "completed_verified",
-        "ready": true,
-        "evidence_provenance": "recorded",
-    });
-    assert_eq!(stale_view["outcome"], json!("completed_verified"));
     let err = rig
         .tools
         .invoke(spawn_call(
@@ -862,5 +903,12 @@ async fn readiness_reads_the_primary_never_the_view() {
     assert!(
         rig.port.emitted.lock().unwrap().is_empty(),
         "no thread, no row"
+    );
+    // … and the claimed-success row actually flowed through the one
+    // lookup readiness uses (the plant is connected, not dead code).
+    assert_eq!(
+        streams.asked.lock().unwrap().as_slice(),
+        &[worker],
+        "the fabricated view-fed answer reached the readiness walk"
     );
 }
