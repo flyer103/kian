@@ -11,7 +11,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 ## Unreleased
 
 - **Durable confirmation plane — `ask`, `awaiting_input`, `control/confirm` (CONFIRMATION-MODEL
-  phase 1, ADR-033)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
+  phase 1, ADR-035)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
   call (a widened `permission.evaluated` value), never invokes it, and the drain ends with a fifth
   end reason `awaiting_input` (`running → idle`, resumable) instead of `completed`. The pending set
   is a pure projection (`kian-core::confirmation::pending_calls`, no table, no inbox status column,
@@ -68,7 +68,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   (pin P3-3's row key set exactly; absent facts are never fabricated — `evidence_provenance`
   stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
   refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
-- **Bounded queue re-drive (ADR-035)** — `exec_queue` rows carry `dispatch_attempts` (exec migration
+- **Bounded queue re-drive (ADR-033)** — `exec_queue` rows carry `dispatch_attempts` (exec migration
   v6, additive, sqlite + postgres); the claim statement counts a dispatch and refuses an `inflight`
   re-drive at `1 + workers.queue_max_redrives` (new config knob in `kian.yaml` under `workers:`,
   default `1`, `0` = first dispatch only, validated ceiling `16`), and a spent bound converges the
@@ -79,7 +79,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   only rows someone is waiting on. No new status, event kind, wire frame or prompt byte; a caller
   re-attaching after convergence reads `abandoned` and gets the existing honest timeout. Semantics:
   [WORKER-MODEL §4](design/WORKER-MODEL.md), placement [DESIGN](design/DESIGN.md),
-  decision [ADR-035](design/decisions/ADR-033-bounded-queue-redrive.md).
+  decision [ADR-033](design/decisions/ADR-033-bounded-queue-redrive.md).
 
 - **Hook plugins — the two-tier harness-extension contract (round 16, [PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
   [ADR-028](../design/decisions/ADR-028-harness-hook-plugins.md))**. A closed hook vocabulary over seven

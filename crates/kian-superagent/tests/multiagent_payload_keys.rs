@@ -1171,11 +1171,19 @@ fn no_new_event_kind_route_table_or_migration() {
             reason: EndReason::Completed,
         },
     ];
-    assert_eq!(all.len(), 23, "the kind catalog is 23 after control/confirm");
+    assert_eq!(
+        all.len(),
+        23,
+        "the kind catalog is 23 after control/confirm"
+    );
     assert_eq!(spelling(all[0]), "session/created");
 
     let chain = kian_store::migrations::chain();
-    assert_eq!(chain.len(), 8, "the migration chain is v0..=v7 (cron state)");
+    assert_eq!(
+        chain.len(),
+        8,
+        "the migration chain is v0..=v7 (cron state)"
+    );
     for (index, migration) in chain.iter().enumerate() {
         assert_eq!(
             migration.version, index as u32,

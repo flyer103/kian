@@ -147,7 +147,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   from the durable record. For the v2 filesystem family the same rule is recorded explicitly:
   `fs_list`/`fs_read` are idempotent, and a repeated `fs_write` writes the same path and content
   again (mtime may move) — never a different payload.
-- **Re-drive is bounded** ([ADR-035](decisions/ADR-033-bounded-queue-redrive.md)). At-least-once
+- **Re-drive is bounded** ([ADR-033](decisions/ADR-033-bounded-queue-redrive.md)). At-least-once
   must also terminate, so every dispatch counts an attempt: a `pending` row always dispatches,
   while an `inflight` row re-drives only while its `dispatch_attempts` are below
   `1 + workers.queue_max_redrives` (default `1`; `0` = first dispatch only; global by construction,
