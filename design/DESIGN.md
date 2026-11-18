@@ -1353,8 +1353,38 @@ unchanged; it adds one config block (`superagent.multiagent`), one read-surface 
 `kian tasks --all`, `kian agents`), and **no** event kind, table, route, ops method, metrics key or core
 change. In the design the board is a disposable `task_board` view over existing bytes (READ-MODEL §6)
 whose control path is recomputed from the primary at decision time — never a board entity, and never a
-control read on the view; neither view nor CLI exists yet. Phases P1–P4 with per-phase rollback are
-recorded in its §8, and nothing there is implemented.
+control read on the view. The view and the three verbs exist, and Phases P1–P4 are
+landed in code + tests with no live-run evidence — MULTIAGENT-MODEL §10 records the status
+per phase; §8 still records the per-phase rollback.
+
+Refinement (the roster and the per-assignee child, as implemented): `superagent.roster` is a list
+of named entries — `id`, `description`, `agent` (a name from `agents:`), `mandate_template`
+(`scope`, `strength` — required, `explicit` | `inferred`), optional `tools_allow` (the separate
+tool fence) and optional `limits`. With the
+roster present the Router's `spawn_worker` tool grows three arguments: `agent` (the entry id),
+`task_key` (the stable `Task` identity — a retry with the same key re-admits onto the same task)
+and `output_schema` (the closed P2 subset: `type`, `properties`, `required`, `additionalProperties`,
+`items`, `enum`, `const`, `minLength`, `maxLength`, `minimum`, `maximum`, `minItems`, and `maxItems`;
+any other keyword is refused before a side effect). `kian agents` renders each roster entry's `id`,
+`description`, `agent`, `tools_allow`, `limits`, and `output_schema` presence, read-only from the same
+config. The child's worker side is built from the entry's own `agents:` definition — its model
+slots and budgets, never the worker template's — and its tool surface is exactly
+`agent.tools ∩ tools_allow`, narrowed structurally before the provider request, so a denied tool
+is absent from the request schema rather than refused at call time; a `tools_allow` name outside
+the mounted surface refuses to boot. The assignee is read from the child's committed wrapper, so
+editing the roster after a spawn never changes that child's surface, and an assignee whose entry
+has vanished runs a refusing side instead of widening onto another agent's tools. When the
+wrapper carries `output_schema`, the child's final assistant answer is validated against it
+before the evidence gate: a first miss admits exactly one correction; a second miss commits
+`evidence/verdict{gate:"output_schema",passed:false}` and a failed completion preserving the raw
+answer, which the join projects as `invalid_output`. The correction's uniqueness is
+count-derived, not key-derived: `attempt = schema_correction_count(events)`, so a takeover
+re-derives the same ordinal and goes to the verdict instead of appending a second correction;
+the logged `schema-correction:<spawn_uid>:<attempt>` key is an audit label, never a persisted
+fact. An empty final answer stays `empty_output`
+and never enters the schema gate; a pass appends no verdict. **With the roster absent or empty,
+none of this exists** — no `agent`/`task_key`/`output_schema` arguments, no `kian agents` roster,
+no per-assignee side, no schema gate — and every byte is the pre-roster bundle's.
 
 ## 5. Control-plane protocol (P5 protocolized)
 

@@ -10,6 +10,41 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Multiagent P4: `depends_on` + `group`, readiness gating (round 17, C7)**. With
+  `superagent.board.gating: true`, `spawn_worker` grows `depends_on` (task keys) and `group`: the
+  spawn is refused — before any side effect, from the primary only — until every named task has a
+  successful completion (`empty_output` never releases; `completed_unverified` only under a policy
+  that accepts it), and a self-reference or cycle over the recorded task graph is refused naming
+  the cycle. The parent's `thread/started` audit group carries the declared facts, and `kian
+  board` gains the `depends_on`/`group`/`ready` columns, flipping `evidence_provenance` to
+  `"recorded"` only where the committed `evidence_ref` key exists. `superagent.multiagent.join`
+  validates `all` | `any` | `quorum:<n>` and refuses to boot on `any`/`quorum:<n>` (no evaluation
+  site in v1 — deferred with fan-in). Gating off is byte-identical P3. Contract:
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §4.4/§7.3, [docs/SPEC.md](docs/SPEC.md) §5.
+- **Multiagent roster: the per-assignee child surface and the output-schema gate (round 17, C1–C3)**.
+  `superagent.roster` names delegation entries over `agents:` definitions; `spawn_worker` grows
+  `agent`/`task_key`/`output_schema` and `kian agents` lists the roster. A roster-spawned child runs
+  its entry's own slots/budgets with the structural `agent.tools ∩ tools_allow` surface (denied tools
+  never reach the request schema), resolved from the committed wrapper — a vanished assignee runs a
+  refusing side, never a wider one. The child's `output_schema` is enforced by a gate with one
+  correction attempt; a second miss commits `evidence/verdict{gate:"output_schema"}` and reads as
+  `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
+  Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
+  [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
+- **Delegation task board — the read-only operator surface (kian board / kian tasks, round 17, C5)**. Two new
+  `kian` verbs over the fifth view's rows (R17 C4): `kian board [--db] [--config] [--json]`
+  renders one row per delegated task (`task_id`, `assignee`, `attempt`, `outcome`,
+  `thread_status`, `gate`, the derived evidence pointer) in deterministic `task_id` order, and
+  `kian tasks --all` prints the same rows flat (`--all` is required in v1; the bare form refuses
+  with usage). Both are strictly read-only (`open_read_only` — no events, no inbox writes, no
+  view updates, no ops RPC), served from the fresh `task_board` view when
+  `superagent.board.enabled` and `read_model.views.enabled` are both on (the declared staleness
+  bound is the rebuild interval) and from the honest full-stream derivation otherwise — identical
+  operator output on both paths. `--json` emits the frozen document `{now_ms, version, tasks}`
+  (pin P3-3's row key set exactly; absent facts are never fabricated — `evidence_provenance`
+  stays `"derived"` until P4 records the durable link). Board off (the default): both verbs
+  refuse with exit 2 naming `superagent.board.enabled` before the store is even opened.
+
 - **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:

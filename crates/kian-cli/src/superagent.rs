@@ -622,6 +622,18 @@ pub type WorkerSideFactory = Arc<
         + Sync,
 >;
 
+/// (R17-C3, pin P2-2) Builds one **per-assignee** side for a roster
+/// entry id: the entry's resolved `AgentDef` (slots and budgets from
+/// the `agents:` definition, pin P2-1) with
+/// `tools = entry.agent.tools ∩ entry.tools_allow` — a structural
+/// narrowing at the provider edge, so a denied tool is absent from
+/// the request schema, never merely refused at call time (§5.1,
+/// M3). An assignee with no live entry gets a **refusing** side (the
+/// [`Refusal::VanishedAssignee`] row): no working tool, the honest
+/// reason, never a silent fallback onto another agent's surface.
+pub type AssigneeSideFactory =
+    Arc<dyn Fn(&str) -> WorkerLoopDriver<crate::superagent::WorkerInnerDriver> + Send + Sync>;
+
 /// The selection input for one drive (R12, S2): the static config ids
 /// (config order — the legacy-unbound first rule) ∪ the directory
 /// port's known ids, appended in the port's id-ascending order. One
@@ -647,6 +659,11 @@ pub enum Refusal {
     Unconfigured(String),
     /// The stream's binding is malformed (D2) — no id exists to name.
     Malformed,
+    /// (R17-C3, pin P2-2) The committed wrapper names a roster
+    /// assignee that has no live roster entry (§2.1.1:270-274). The
+    /// message names the assignee; the side never widens onto any
+    /// other agent's tools.
+    VanishedAssignee(String),
 }
 
 impl Refusal {
@@ -664,6 +681,11 @@ impl Refusal {
             Self::Malformed => format!(
                 "{family} refused: this session carries a malformed `exec_worker` binding on its \
                  stream — no command was queued and nothing ran elsewhere"
+            ),
+            Self::VanishedAssignee(id) => format!(
+                "{family} refused: this session's committed delegation names roster assignee \
+                 `{id}`, which has no live roster entry — no command was queued and nothing ran \
+                 elsewhere"
             ),
         }
     }
@@ -945,10 +967,24 @@ pub struct SuperAgentDriver {
     /// a rebuild storm on a flapping worker — A13).
     worker_sides:
         Arc<Mutex<BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>>>,
+    /// (R17-C3, pin P2-2) the per-**assignee** side cache: keyed by
+    /// the roster entry id the committed wrapper names, built lazily
+    /// on first use and cached forever — the same never-evict
+    /// reasoning as `worker_sides` (the side's exec enqueues by id;
+    /// eviction only risks a rebuild storm). The surface is therefore
+    /// stable for the life of the child: post-spawn roster edits never
+    /// re-resolve it (constraint 13, §2.1.1).
+    assignee_sides:
+        Arc<Mutex<BTreeMap<String, WorkerLoopDriver<crate::superagent::WorkerInnerDriver>>>>,
     /// The side factory (S1). `None` (zero `endpoints:` and no
     /// `workers:`) = the feature is off and `worker_side` above is
     /// today's exact path, byte-identical.
     side_factory: Option<WorkerSideFactory>,
+    /// (R17-C3, pin P2-2) the per-assignee factory — installed iff the
+    /// roster is non-empty (pin P2-6). `None` = no roster, and no
+    /// wrapper ever carries an `assignee` key, so the selection below
+    /// is unreachable (the arm degrades to a warn + today's path).
+    assignee_side_factory: Option<AssigneeSideFactory>,
     /// The static pins in **config order** (`endpoints` file order).
     /// The legacy-unbound row routes to the first static pin (B1);
     /// a bound row matches the statics ∪ the port's known ids.
@@ -968,6 +1004,10 @@ pub struct SuperAgentDriver {
     /// itself stays a pure function of (stream binding,
     /// configured ids).
     legacy_unbound_audited: Arc<Mutex<BTreeSet<SessionId>>>,
+    /// (R17-C6, pin P4-1): the `superagent.board.gating` class-A
+    /// emission switch — passed to the child-side `lineage_plan` so
+    /// a gated child emits its `thread/started` audit keys.
+    board_gating: kian_superagent::BoardGating,
 }
 
 impl SuperAgentDriver {
@@ -988,11 +1028,14 @@ impl SuperAgentDriver {
             watchdog: None,
             watchdog_side: None,
             worker_sides: Arc::new(Mutex::new(BTreeMap::new())),
+            assignee_sides: Arc::new(Mutex::new(BTreeMap::new())),
             side_factory: None,
+            assignee_side_factory: None,
             worker_order: Vec::new(),
             known_ids_port: None,
             refuse_side: None,
             legacy_unbound_audited: Arc::new(Mutex::new(BTreeSet::new())),
+            board_gating: kian_superagent::BoardGating::default(),
         }
     }
 
@@ -1028,6 +1071,26 @@ impl SuperAgentDriver {
         self.worker_order = worker_order;
         self.refuse_side = Some(refuse_side);
         self.known_ids_port = known_ids_port;
+        self
+    }
+
+    /// (R17-C3, pin P2-2) attaches the per-assignee side factory —
+    /// installed iff the roster is non-empty (pin P2-6). Additive:
+    /// with no factory installed a wrapper never carries `assignee`
+    /// (the roster wrote none), so routing is exactly as before.
+    #[must_use]
+    pub fn with_assignee_sides(mut self, assignee_side_factory: AssigneeSideFactory) -> Self {
+        self.assignee_side_factory = Some(assignee_side_factory);
+        self
+    }
+
+    /// (R17-C6, pin P4-1) installs the `superagent.board.gating`
+    /// class-A emission switch — the child-side `lineage_plan` emits
+    /// its audit keys only when it is on; the absent call (the
+    /// default) keeps today's exact bytes.
+    #[must_use]
+    pub fn with_board_gating(mut self, gating: kian_superagent::BoardGating) -> Self {
+        self.board_gating = gating;
         self
     }
 }
@@ -1066,17 +1129,81 @@ impl LoopDriver for SuperAgentDriver {
         let session = ctx.session();
         let sides = Arc::clone(&self.worker_sides);
         let side_factory = self.side_factory.clone();
+        // (R17-C3, pin P2-2) the assignee-keyed halves: the cache and
+        // the factory, cloned into the async selection block below.
+        let assignee_sides = Arc::clone(&self.assignee_sides);
+        let assignee_side_factory = self.assignee_side_factory.clone();
         // (B1) the legacy-unbound selection input is CONFIG order of
         // the STATIC pins — never alphabetical, never dynamic.
         let order = self.worker_order.clone();
         let port = self.known_ids_port.clone();
         let refuse_side = self.refuse_side.clone();
         let audited = Arc::clone(&self.legacy_unbound_audited);
+        // (R17-C6, pin P4-1): the class-A switch, copied into the
+        // async selection block below (the child-side keys).
+        let board_gating = self.board_gating;
         futures::stream::once(async move {
             let events = ctx.events().await.unwrap_or_default();
-            match lineage_plan(&events, session, router, worker_version) {
+            match lineage_plan(
+                &events,
+                session,
+                router,
+                worker_version,
+                board_gating,
+            ) {
                 LineagePlan::PassThrough => default.drive(ctx).boxed(),
                 plan @ (LineagePlan::Emit { .. } | LineagePlan::Resume { .. }) => {
+                    // (R17-C3, pin P2-2) the assignee-keyed selection,
+                    // BEFORE the endpoint binding: a wrapper carrying
+                    // `assignee` (a roster spawn) routes to that
+                    // assignee's side — built lazily from the factory
+                    // on first use, cached forever (the surface is
+                    // stable for the child's life; post-spawn roster
+                    // edits never re-resolve it, constraint 13). The
+                    // selection input is the **committed wrapper's**
+                    // `assignee`, never a live-config re-resolution
+                    // (§2.1.1); the factory itself owns the
+                    // vanished-entry refusing row. A wrapper without
+                    // `assignee` never enters this arm — today's path
+                    // exactly (M8).
+                    if let Some(assignee) = kian_superagent::stream_assignee_of(&events) {
+                        let factory = match &assignee_side_factory {
+                            Some(factory) => factory.clone(),
+                            None => {
+                                // Unreachable in production (a wrapper
+                                // carries `assignee` only when the
+                                // roster wrote it, and the factory is
+                                // installed exactly then, pin P2-6) —
+                                // but never widen silently: warn and
+                                // take today's worker path.
+                                tracing::warn!(
+                                    target: "kian::superagent",
+                                    session = %session.0,
+                                    assignee = %assignee,
+                                    "worker routing audit: assignee wrapper with no assignee \
+                                     factory installed; routing to the worker template side"
+                                );
+                                return worker.drive(ctx).boxed();
+                            }
+                        };
+                        let side = {
+                            let mut cache = assignee_sides
+                                .lock()
+                                .expect("assignee side cache lock");
+                            if !cache.contains_key(&assignee) {
+                                cache.insert(assignee.clone(), factory(&assignee));
+                            }
+                            cache.get(&assignee).cloned().expect("just inserted")
+                        };
+                        tracing::debug!(
+                            target: "kian::superagent",
+                            session = %session.0,
+                            assignee = %assignee,
+                            resumed = matches!(plan, LineagePlan::Resume { .. }),
+                            "worker routing audit: assignee side selected"
+                        );
+                        return side.drive(ctx).boxed();
+                    }
                     let Some(factory) = side_factory else {
                         // Feature off: today's single worker side.
                         return worker.drive(ctx).boxed();
@@ -2748,5 +2875,328 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(text.contains("malformed `exec_worker` binding"), "{text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (R17-C3, pin P2-2) the per-assignee selection — drive-path probes
+// over a real DrainCtx (sqlite store), with the side's completion
+// inbox as the observable: whichever inbox receives the report names
+// the side that drove.
+// ---------------------------------------------------------------------------
+
+/// A recording inbox for the selection probes: every admit is tagged
+/// with the side that owns it (the observable under test).
+#[cfg(test)]
+mod assignee_selection_tests {
+    use super::*;
+    use kian_core::events::{Event, EventKind};
+    use kian_core::model::Epoch;
+    use kian_orchestrator::{DrainCtx, Metrics, SystemClock};
+    use kian_store::{AppendGuard, EventStore};
+    use kian_superagent::{
+        InboxWriter, RouterDriver, RouterHold, RouterInbox, SpawnIdentity, SpawnRequest,
+        WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner, worker_template,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    /// The tagged inbox: the `tag` names the side whose completion
+    /// report landed here.
+    struct TaggedInbox {
+        tag: &'static str,
+        admits: StdMutex<Vec<&'static str>>,
+    }
+
+    impl TaggedInbox {
+        fn shared(tag: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                tag,
+                admits: StdMutex::new(Vec::new()),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.admits.lock().unwrap().len()
+        }
+    }
+
+    impl InboxWriter for TaggedInbox {
+        fn admit(
+            &self,
+            _session: kian_core::model::SessionId,
+            _payload: serde_json::Value,
+            _idempotency_key: Option<String>,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<kian_superagent::AdmitReceipt, kian_superagent::InboxWriteError>,
+        > {
+            self.admits.lock().unwrap().push(self.tag);
+            Box::pin(async {
+                Ok(kian_superagent::AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+
+        fn wake(&self, _session: kian_core::model::SessionId) -> kian_orchestrator::WakeOutcome {
+            kian_orchestrator::WakeOutcome::Folded
+        }
+    }
+
+    struct NoTools;
+    impl kian_core::seams::ToolProvider for NoTools {
+        fn schemas(&self) -> Vec<kian_core::seams::ToolSchema> {
+            Vec::new()
+        }
+        fn invoke(
+            &self,
+            call: kian_core::seams::ToolCall,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<kian_core::seams::ToolResult, kian_core::seams::ToolError>,
+        > {
+            Box::pin(async move {
+                Err(kian_core::seams::ToolError::InvalidCall(format!(
+                    "no tool `{}`",
+                    call.name
+                )))
+            })
+        }
+    }
+
+    struct NoopPolicy;
+    impl kian_core::seams::RecoveryPolicySource for NoopPolicy {
+        fn table(&self) -> Vec<kian_core::seams::PolicyRule> {
+            Vec::new()
+        }
+    }
+
+    /// A minimal ReAct loop over an empty provider registry: driving it
+    /// fails softly (no provider for the slot), which still drives the
+    /// decorator's completion path — exactly the observable needed.
+    fn minimal_loop() -> Arc<kian_loop::ReActLoop> {
+        Arc::new(kian_loop::ReActLoop::new(
+            worker_template("none", "none", 1),
+            Arc::new(kian_llm::turn::ProviderRegistry::new()),
+            Arc::new(NoTools),
+            Arc::new(NoopPolicy) as Arc<dyn kian_core::seams::RecoveryPolicySource>,
+        ))
+    }
+
+    /// One side over the minimal inner loop, reporting into `inbox`.
+    fn tagged_side(
+        inbox: Arc<TaggedInbox>,
+    ) -> WorkerLoopDriver<crate::superagent::WorkerInnerDriver> {
+        WorkerLoopDriver::new(
+            Arc::new(crate::superagent::WorkerInnerDriver::React(minimal_loop())),
+            inbox as Arc<dyn InboxWriter>,
+            WorkerLoopConfig {
+                router: SessionId::new(),
+                worker_version: 1,
+                gate: kian_loop::EvidenceGateConfig::default(),
+                multiagent: None,
+                board_gating: kian_superagent::BoardGating::default(),
+            },
+            crate::superagent::port_for_ctx(),
+        )
+    }
+
+    /// Seeds one roster child stream (created, wrapper with `assignee`,
+    /// no thread/started yet — the first drive classifies and emits
+    /// lineage) into a fresh sqlite store, and returns the store.
+    async fn seed_child(assignee: &str) -> (EventStore, kian_core::model::SessionId, uuid::Uuid) {
+        let dir = std::env::temp_dir().join(format!("kian-c3-selection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = EventStore::open(&dir.join("kian.sqlite"))
+            .await
+            .expect("open store");
+        let parent = SessionId::new();
+        let identity = SpawnIdentity::derive_delegated(
+            parent,
+            1,
+            "research",
+            5,
+            None,
+            Some(assignee.to_string()),
+        );
+        let spawner = WorkerSpawner::new(
+            SessionId::new(),
+            &worker_template("none", "none", 1),
+            Arc::new(NoopInbox) as Arc<dyn InboxWriter>,
+        );
+        let spawned = spawner.prepare(&SpawnRequest {
+            task: serde_json::json!("do the work"),
+            identity: Some(identity),
+            ..SpawnRequest::default()
+        });
+        let session = spawned.worker_session;
+        let mut seq = 0u64;
+        for (kind, bytes) in [
+            (EventKind::SessionCreated, serde_json::json!({})),
+            (
+                EventKind::InputAdmitted,
+                serde_json::json!({"content": spawned.task_message["content"].clone()}),
+            ),
+        ] {
+            seq += 1;
+            let event = Event {
+                seq,
+                session,
+                epoch: Epoch(1),
+                ts: 1_700_000_000_000 + seq,
+                kind,
+                bytes,
+                version: 0,
+            };
+            store
+                .append(
+                    session,
+                    event,
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("seed append");
+        }
+        (store, session, spawned.thread.id)
+    }
+
+    /// The assembled driver under test: today's worker side reports
+    /// into `worker_inbox`; the assignee factory is the test's own.
+    fn selection_driver(
+        worker_inbox: Arc<TaggedInbox>,
+        factory: crate::superagent::AssigneeSideFactory,
+    ) -> Arc<SuperAgentDriver> {
+        let router_session = SessionId::new();
+        let loop_ = minimal_loop();
+        let router_side = RouterDriver::new(
+            loop_,
+            RouterHold::shared(),
+            crate::superagent::port_for_ctx(),
+            RouterInbox::new(Arc::new(NoopInbox) as Arc<dyn InboxWriter>, router_session),
+        );
+        let worker_side = tagged_side(worker_inbox);
+        Arc::new(
+            SuperAgentDriver::new(router_session, 1, router_side, worker_side, minimal_loop())
+                .with_assignee_sides(factory),
+        )
+    }
+
+    async fn drive_once(
+        driver: &Arc<SuperAgentDriver>,
+        store: &EventStore,
+        session: kian_core::model::SessionId,
+    ) {
+        let ctx = DrainCtx::new(
+            store.clone(),
+            session,
+            Epoch(2),
+            Arc::new(SystemClock),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .expect("ctx");
+        let _ = driver.drive(ctx).collect::<Vec<_>>().await;
+    }
+
+    struct NoopInbox;
+    impl InboxWriter for NoopInbox {
+        fn admit(
+            &self,
+            _session: kian_core::model::SessionId,
+            _payload: serde_json::Value,
+            _idempotency_key: Option<String>,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<kian_superagent::AdmitReceipt, kian_superagent::InboxWriteError>,
+        > {
+            Box::pin(async {
+                Ok(kian_superagent::AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+        fn wake(&self, _session: kian_core::model::SessionId) -> kian_orchestrator::WakeOutcome {
+            kian_orchestrator::WakeOutcome::Folded
+        }
+    }
+
+    /// 🔴 pin P2-2 / §2.1.1:270-274: an assignee whose entry has no
+    /// live roster entry runs the REFUSING side and never widens —
+    /// the completion report lands in the refusing side's inbox, not
+    /// the worker template's (the widening mutation would put it in
+    /// the worker inbox).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_assignee_whose_entry_vanished_runs_a_refusing_side_and_never_widens() {
+        let worker_inbox = TaggedInbox::shared("worker");
+        let known_inbox = TaggedInbox::shared("known");
+        let refused_inbox = TaggedInbox::shared("refused");
+        let refused = Arc::clone(&refused_inbox);
+        let known = Arc::clone(&known_inbox);
+        let factory: crate::superagent::AssigneeSideFactory = Arc::new(move |assignee: &str| {
+            if assignee == "researcher" {
+                tagged_side(Arc::clone(&known))
+            } else {
+                tagged_side(Arc::clone(&refused))
+            }
+        });
+        let driver = selection_driver(Arc::clone(&worker_inbox), factory);
+        let (store, session, _thread) = seed_child("ghost").await;
+        drive_once(&driver, &store, session).await;
+        assert_eq!(
+            refused_inbox.count(),
+            1,
+            "the vanished assignee's completion lands on the refusing side"
+        );
+        assert_eq!(known_inbox.count(), 0, "no live entry was consulted");
+        assert_eq!(
+            worker_inbox.count(),
+            0,
+            "never a silent fallback onto the (wider) worker template side"
+        );
+    }
+
+    /// 🔴 constraint 13 / §2.1.1: the assignee is read from the
+    /// COMMITTED wrapper, and the side is cached never-evicted — a
+    /// later drive of the same child reuses the identical surface even
+    /// after the "live" roster map changed underneath. The factory's
+    /// call log is the red lever: a re-resolving mutation would call
+    /// it again with a live-config id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_assignee_is_read_from_the_committed_wrapper_not_live_config() {
+        let worker_inbox = TaggedInbox::shared("worker");
+        let a_inbox = TaggedInbox::shared("researcher");
+        let b_inbox = TaggedInbox::shared("other");
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let calls_for_factory = Arc::clone(&calls);
+        let a = Arc::clone(&a_inbox);
+        let b = Arc::clone(&b_inbox);
+        let factory: crate::superagent::AssigneeSideFactory = Arc::new(move |assignee: &str| {
+            calls_for_factory.lock().unwrap().push(assignee.to_string());
+            if assignee == "researcher" {
+                tagged_side(Arc::clone(&a))
+            } else {
+                tagged_side(Arc::clone(&b))
+            }
+        });
+        let driver = selection_driver(Arc::clone(&worker_inbox), factory);
+        let (store, session, _thread) = seed_child("researcher").await;
+        drive_once(&driver, &store, session).await;
+        assert_eq!(a_inbox.count(), 1, "the wrapper's assignee side drove");
+        // "Edit the roster after the spawn": a second drive of the
+        // same child must neither re-resolve (the factory would be
+        // called again — with whatever a live config re-read produced)
+        // nor rebuild the side (a different inbox would serve).
+        drive_once(&driver, &store, session).await;
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["researcher"],
+            "the second drive neither re-resolved live config nor rebuilt the side"
+        );
+        assert_eq!(a_inbox.count(), 1, "idempotent: the surface is unchanged");
+        assert_eq!(b_inbox.count(), 0, "the flipped live entry never served");
+        assert_eq!(worker_inbox.count(), 0);
     }
 }

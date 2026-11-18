@@ -68,7 +68,9 @@ use uuid::Uuid;
 use crate::directory::{MemberState, MemberView, WorkerDirectoryPort};
 use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 use crate::metrics::{RouterTurnRecorder, SpeakMetrics};
-use crate::multiagent::{MultiagentLimits, SpawnIdentity, cap_refusal, depth_of, holding_children};
+use crate::multiagent::{
+    BoardGating, MultiagentLimits, SpawnIdentity, cap_refusal, depth_of, holding_children,
+};
 use crate::outbox::{
     Delivered, OutboxConfig, OutboxDriver, SystemRetryClock, conversation_key, intent_ticket,
     with_attempt_keys,
@@ -101,6 +103,13 @@ pub const ROUTER_BOOTSTRAP_KEY: &str = "router:bootstrap";
 /// template artifacts; re-exported here so the historical
 /// `router::JUDGE_PROMPT_TEMPLATE` path keeps resolving.
 pub use crate::templates::JUDGE_PROMPT_TEMPLATE;
+
+/// (R17-C2, §7.3:800-806) the frozen roster instruction line — the
+/// P2 class-D prompt byte, appended by the bootstrap render path iff
+/// the roster is non-empty. Lives in [`crate::templates`] beside the
+/// other template artifacts; re-exported here for the historical
+/// `router::` path discipline.
+pub use crate::templates::ROSTER_INSTRUCTION_PROMPT_LINE;
 
 /// Parking tick default: how often a parked Router re-checks its inbox
 /// signal (and lets supervision observe an interrupt).
@@ -185,6 +194,20 @@ pub const LIST_WORKERS_TOOL: &str = "list_workers";
 pub const LIST_WORKERS_DESCRIPTION: &str = "List the execution workers known to this server: \
      id, optional description, state (`online`/`offline`/`draining`), and the live bound worker \
      session/thread if any. Call this before `spawn_worker`; never invent a worker id.";
+
+/// (R17-C1, §3.1/M9): the read-only roster tool. Mounted on the
+/// Router surface **iff the roster is non-empty** (pin P2-6) — an
+/// absent/empty roster keeps the tool set byte-identical (the tool is
+/// simply absent). Router-only, like `list_workers`.
+pub const LIST_AGENTS_TOOL: &str = "list_agents";
+
+/// The `list_agents` tool description — a constant, like the whole
+/// schema (M9, the I6 lesson at `router.rs:166-171`): no roster id,
+/// no count, no enum ever enters it. The roster reaches the model
+/// only through this tool's **result** (post-prefix).
+pub const LIST_AGENTS_DESCRIPTION: &str = "List the agents this Router can delegate to: id, \
+     one-line description, the agent each entry targets, its allowed tools and its child cap. \
+     Call this before `spawn_worker`; never invent an agent id.";
 
 /// The Router's judge prompt template (declarative, part of the
 /// profile; rendered at bootstrap).
@@ -311,6 +334,15 @@ pub struct RouterProfile {
     /// and `max_children` caps are enforced before every side
     /// effect, and the ack gains the spawn-identity keys (pin P4).
     pub multiagent: Option<MultiagentLimits>,
+    /// (R17-C2, §7.3:800-806): whether the frozen roster instruction
+    /// line ([`ROSTER_INSTRUCTION_PROMPT_LINE`]) is appended after
+    /// the rendered judge prompt — on **iff the roster is non-empty**
+    /// (pin P2-6). `false` (the default, and what an absent/empty
+    /// roster produces) renders today's bootstrap bytes exactly; the
+    /// line is a constant (M9), so an equivalent roster edit changes
+    /// no prefix byte. Persisted prompts are never rewritten
+    /// (constraint 3); only the next bootstrap renders the line.
+    pub roster_instruction: bool,
 }
 
 impl RouterProfile {
@@ -333,6 +365,7 @@ impl RouterProfile {
             worker_membership: false,
             outbox: None,
             multiagent: None,
+            roster_instruction: false,
         }
     }
 
@@ -371,6 +404,19 @@ impl RouterProfile {
         // bootstrap renders the block.
         let rendered = if self.worker_membership {
             format!("{rendered}\n\n{}", WORKER_MEMBERSHIP_PROMPT_BLOCK)
+        } else {
+            rendered
+        };
+        // (R17-C2, §7.3:800-806 — the P2 class-D change, as one
+        // change): the frozen roster instruction line is appended
+        // after the rendered prompt — never inside the template — and
+        // only when the roster is non-empty (pin P2-6), so an
+        // absent/empty roster bootstraps byte-identically to today.
+        // The line is a constant (M9): an equivalent roster edit
+        // rewrites no byte of the prefix, and persisted prompts are
+        // never rewritten — only the next bootstrap renders it.
+        let rendered = if self.roster_instruction {
+            format!("{rendered}\n\n{}", ROSTER_INSTRUCTION_PROMPT_LINE)
         } else {
             rendered
         };
@@ -741,6 +787,20 @@ pub struct RouterTools {
     /// multiagent branch below `spawn_worker` is skipped and the
     /// tool keeps today's exact bytes (M8).
     multiagent: Option<MultiagentLimits>,
+    /// (R17-C6, pin P4-1): the `superagent.board.gating` class-A
+    /// emission switch, mirrored from the config block (C4's — this
+    /// is wiring only). `false` (the default) keeps the Router-side
+    /// `thread/started` bytes exactly as today; `true` adds
+    /// `spawn_uid` + the parent's `multiagent` audit group
+    /// (`crates/kian-superagent/src/audit.rs`).
+    board_gating: BoardGating,
+    /// (R17-C1, §3.1): the configured roster, mounted **iff
+    /// non-empty** (pin P2-6). `None` (the default, and what an
+    /// absent/empty `superagent.roster` produces) keeps the tool set
+    /// byte-identical: no `list_agents` schema, no handler arm, an
+    /// honest unknown-tool error. The roster's contents reach the
+    /// model only through the `list_agents` **result** (M9).
+    roster: Option<crate::roster::Roster>,
     /// The worker template's pinned `AgentDef` version (ADR-006),
     /// read once at construction off a pure probe `prepare` — the
     /// [`SpawnIdentity::derive`] input for `agent_def_version`.
@@ -801,6 +861,8 @@ impl RouterTools {
             directory: None,
             worker_streams: None,
             multiagent: profile.multiagent,
+            board_gating: BoardGating::default(),
+            roster: None,
             worker_pinned_version,
             hold,
         }
@@ -835,6 +897,32 @@ impl RouterTools {
         self
     }
 
+    /// (R17-C6, pin P4-1): installs the `superagent.board.gating`
+    /// class-A emission switch — `true` adds the parent-side audit
+    /// keys (`spawn_uid` + the `multiagent` group) to the Router's
+    /// `thread/started` on multiagent spawns; `false` (the absent
+    /// call, the default) keeps today's exact bytes.
+    #[must_use]
+    pub fn with_board_gating(mut self, gating: BoardGating) -> Self {
+        self.board_gating = gating;
+        self
+    }
+
+    /// (R17-C1, §3.1): installs the configured roster — the whole of
+    /// the roster's model-visible surface. Mounted iff non-empty
+    /// (pin P2-6): the call sites pass `Some` only for a non-empty
+    /// roster, and the empty case never reaches here (an absent call
+    /// is the feature-off default, today's exact bytes). Read-only:
+    /// `list_agents` renders config, no events, no rows, no wakes
+    /// (M9 — the data is a normal tool result).
+    #[must_use]
+    pub fn with_roster(mut self, roster: crate::roster::Roster) -> Self {
+        if !roster.is_empty() {
+            self.roster = Some(roster);
+        }
+        self
+    }
+
     /// The `spawn_worker` parameter schema (R12 R1, §6.1 — supersedes
     /// ADR-020 D6's three shapes). Membership off renders today's
     /// exact bytes (no property, `required: ["task"]` — the
@@ -845,6 +933,14 @@ impl RouterTools {
     /// workers are known would change bytes when a dynamic worker
     /// joins. The description is a constant pointing at
     /// `list_workers`.
+    ///
+    /// (R17-C2, §7.3:782-789 / pin P2-6): a non-empty roster adds the
+    /// three P2 arguments — `agent`, `task_key`, `output_schema` — as
+    /// plain shapes (string / string / object): no enum, no ids, no
+    /// counts (the roster's contents never enter the schema, M9), and
+    /// `required` is untouched (still `["task"]`, or the membership
+    /// form): all three are optional. An absent/empty roster renders
+    /// the pre-P2 property set byte-identically (the class-D gate).
     fn spawn_worker_parameters(&self) -> Value {
         let mut parameters = json!({
             "type": "object",
@@ -861,6 +957,44 @@ impl RouterTools {
             },
             "required": ["task"],
         });
+        // (R17-C2, pin P2-6): the three roster arguments ride the
+        // schema iff the roster is non-empty — appended properties
+        // only, never a renamed or reordered key.
+        if self.roster.is_some() {
+            parameters["properties"]["agent"] = json!({
+                "type": "string",
+                "description": "Roster entry to delegate to — call `list_agents` to see the \
+                 roster; never invent an id",
+            });
+            parameters["properties"]["task_key"] = json!({
+                "type": "string",
+                "description": "Parent-scoped key naming the task — spawns sharing a key are \
+                 attempts of one task (the task id survives retries)",
+            });
+            parameters["properties"]["output_schema"] = json!({
+                "type": "object",
+                "description": "Optional JSON Schema the child's final answer is checked \
+                 against (bounded size, closed keyword subset; malformed is refused)",
+            });
+        }
+        // (R17-C7, §7.3:808-809 / pin P4-1): the two P4 arguments ride
+        // the schema iff `board.gating` is on — appended properties
+        // only, never a renamed or reordered key. Gating off renders
+        // the P2 property set byte-identically (the class-D gate of
+        // anchors.md rule 4: no `depends_on`/`group` argument at all).
+        if self.board_gating.is_on() {
+            parameters["properties"]["depends_on"] = json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Task keys this task waits on — the spawn is refused until \
+                 every named task has a successful completion (empty_output never releases)",
+            });
+            parameters["properties"]["group"] = json!({
+                "type": "string",
+                "description": "Join group label — recorded in the audit group only (v1 \
+                 evaluates join: all)",
+            });
+        }
         if !self.membership {
             return parameters;
         }
@@ -872,7 +1006,6 @@ impl RouterTools {
         parameters["required"] = json!(["task", crate::worker::EXEC_WORKER_KEY]);
         parameters
     }
-
     /// Shares the passthrough registry with the tool surface (
     /// assembly wiring): the `spawn_worker` ownership check and the
     /// fan-out path then read one projection — the same handle the
@@ -1147,6 +1280,74 @@ impl RouterTools {
         }))
     }
 
+    /// (R17-C2, §5.4 argument shape / §7.3:782-789) one optional
+    /// string argument: absent (or explicit `null`) is `None`; a
+    /// non-empty string is `Some`; anything else — including the
+    /// empty string — is an honest refusal naming the argument.
+    /// Pure; called before every feature check and side effect.
+    fn opt_nonempty_string_arg(
+        arguments: &Value,
+        key: &'static str,
+    ) -> Result<Option<String>, ToolError> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+            Some(other) => Err(ToolError::InvalidCall(format!(
+                "spawn_worker `{key}` must be a non-empty string (got {other})"
+            ))),
+        }
+    }
+
+    /// (R17-C2, §5.4 argument shape / §7.3:787) the optional
+    /// `output_schema` argument's structural leg: absent (or explicit
+    /// `null`) is `None`; a JSON object is `Some`; anything else is a
+    /// refusal naming the argument. The subset/size legs live in
+    /// [`crate::roster::validate_output_schema`] and run in their own
+    /// §5.4 step, after the feature-off check and before roster
+    /// resolution.
+    fn opt_object_arg(arguments: &Value, key: &'static str) -> Result<Option<Value>, ToolError> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value @ Value::Object(_)) => Ok(Some(value.clone())),
+            Some(other) => Err(ToolError::InvalidCall(format!(
+                "spawn_worker `{key}` must be a JSON object (got {other})"
+            ))),
+        }
+    }
+
+    /// (R17-C7, §5.4 argument shape / §7.3:788-789) the optional
+    /// `depends_on` argument's structural leg: absent (or explicit
+    /// `null`) is `None`; an array of **non-empty** strings is
+    /// `Some`; anything else — an empty array item, a non-string
+    /// item, a non-array — is an honest refusal naming the argument.
+    /// Pure; called before every feature check and side effect.
+    fn opt_task_key_array_arg(
+        arguments: &Value,
+        key: &'static str,
+    ) -> Result<Option<Vec<String>>, ToolError> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Array(items)) => {
+                let mut keys = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::String(value) if !value.is_empty() => keys.push(value.clone()),
+                        other => {
+                            return Err(ToolError::InvalidCall(format!(
+                                "spawn_worker `{key}` must be an array of non-empty task-key \
+                                 strings (got item {other})"
+                            )));
+                        }
+                    }
+                }
+                Ok(Some(keys))
+            }
+            Some(other) => Err(ToolError::InvalidCall(format!(
+                "spawn_worker `{key}` must be an array of non-empty task-key strings (got {other})"
+            ))),
+        }
+    }
+
     async fn spawn_worker(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         // The port is checked before any side effect: a spawn whose
         // lineage event cannot be recorded must not happen at all.
@@ -1162,36 +1363,264 @@ impl RouterTools {
             .get("speculative")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // (R17-C2, §5.4:599-602 — argument shape, FIRST in the chain)
+        // the three P2 roster arguments are shape-validated the
+        // moment they are present: a malformed one (`agent`/`task_key`
+        // not a non-empty string, `output_schema` not a JSON object)
+        // is refused here, before the feature-off check, before the
+        // schema-subset check, before any resolution attempt, and
+        // before every side effect. `null` reads as absent (the
+        // absent-never-null discipline is about written bytes, and a
+        // model sending an explicit null is asking for the default).
+        let agent_arg = Self::opt_nonempty_string_arg(&call.arguments, "agent")?;
+        let task_key_arg = Self::opt_nonempty_string_arg(&call.arguments, "task_key")?;
+        let output_schema_arg = Self::opt_object_arg(&call.arguments, "output_schema")?;
+        // (R17-C7, §5.4:599-602 — argument shape, FIRST in the chain)
+        // the two P4 arguments shape-validate the moment they are
+        // present (pin P4-1 gates their *acceptance*, not their
+        // validation: a malformed `depends_on`/`group` is refused
+        // here, before the feature checks and before every side
+        // effect).
+        let depends_on_arg = Self::opt_task_key_array_arg(&call.arguments, "depends_on")?;
+        let group_arg = Self::opt_nonempty_string_arg(&call.arguments, "group")?;
+        let p4_args_present = depends_on_arg.is_some() || group_arg.is_some();
+        let roster_args_present =
+            agent_arg.is_some() || task_key_arg.is_some() || output_schema_arg.is_some();
         // (R15-C3, §5.4:599-602 — the P1 subset) the multiagent
         // validation chain, inserted BEFORE the existing worker
         // checks below, every refusal preceding every side effect
         // (no thread id is minted, no `thread/started` is written, no
         // inbox row lands, no lineage exists on any refusal path):
         // `argument shape` → `feature off` (return today's path) →
+        // `output_schema shape` → `roster resolution` (pin P2-1) →
         // `spawn_seq + SpawnIdentity::derive` (pure, no side effect)
         // → `depth` → `max_children` → the existing worker checks
         // (binding / busy / ownership / speculation) → mandate →
-        // mint/lineage/admit. Roster resolution and the
-        // `output_schema` shape checks are P2 insertions BEFORE
-        // `depth` (they bind the identity the caps then guard); this
-        // is the P1 subset of the chain.
+        // mint/lineage/admit.
         //
         // `None` (feature off, §7.1 / M8): the whole branch is
         // skipped — today's validation order, wrapper, lineage and
-        // result bytes, byte-identically.
+        // result bytes, byte-identically. One honest exception: a
+        // call that passes the roster arguments against a config
+        // with no `superagent.multiagent` block names the absent
+        // block (pin P2-6's refusal clause; a spawn the capability
+        // cannot honour is never silently degraded).
+        let mut declared_output_schema = None;
+        let mut declared_depends_on: Vec<String> = Vec::new();
+        let mut declared_group: Option<String> = None;
         let multiagent_identity = match self.multiagent {
-            None => None,
+            None => {
+                if roster_args_present {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `agent`/`task_key`/`output_schema` require a \
+                         superagent.multiagent block, which is not configured"
+                            .into(),
+                    ));
+                }
+                // (R17-C7, pin P4-1 / anchors.md rule 4): the P4
+                // arguments live under the same feature root — a
+                // call passing them against a config with no
+                // `superagent.multiagent` block names the absent
+                // block, never a silent degradation.
+                if p4_args_present {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `depends_on`/`group` require a superagent.multiagent \
+                         block, which is not configured"
+                            .into(),
+                    ));
+                }
+                None
+            }
             Some(limits) => {
+                // §5.4 `feature off` for the roster (pin P2-6): the
+                // three arguments exist iff the roster is non-empty —
+                // a call passing them against an absent/empty roster
+                // is refused naming the block, never silently
+                // degraded to a legacy spawn.
+                if roster_args_present && self.roster.is_none() {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `agent`/`task_key`/`output_schema` require a \
+                         non-empty superagent.roster, which is absent or empty"
+                            .into(),
+                    ));
+                }
+                // (R17-C7, pin P4-1 / anchors.md rule 4): the two P4
+                // arguments exist iff `board.gating` is on — gating
+                // off keeps the P3 spawn bytes exactly, so a call
+                // passing `depends_on`/`group` while the gate is off
+                // is refused naming the switch (the P2-6 refusal
+                // clause applied to the P4 gate), and **no readiness
+                // is evaluated** on that path.
+                if p4_args_present && !self.board_gating.is_on() {
+                    return Err(ToolError::Execution(
+                        "spawn refused: `depends_on`/`group` require superagent.board.gating: \
+                         true, which is false — with gating off the spawn keeps the P3 bytes \
+                         exactly (no P4 argument is accepted, no readiness is evaluated)"
+                            .into(),
+                    ));
+                }
+                declared_depends_on = depends_on_arg.clone().unwrap_or_default();
+                declared_group = group_arg.clone();
+                // §5.4 `output_schema shape` BEFORE `roster
+                // resolution`: a malformed schema must not consume a
+                // resolution attempt (§5.4:604-607). The full pin-P2-3
+                // gate (canonical size + closed subset) names the
+                // keyword on refusal.
+                if let Some(schema) = &output_schema_arg {
+                    crate::roster::validate_output_schema(schema).map_err(|e| {
+                        ToolError::Execution(format!(
+                            "spawn refused: output_schema {e} — the schema is refused \
+                             before any resolution and before any side effect"
+                        ))
+                    })?;
+                }
+                //
+                // §5.4 `roster resolution (+ its pin, §2.1.1)`: the
+                // entry is resolved from the committed-config roster
+                // and its RECORDED `AgentDef` identity (pin P2-1 —
+                // `resolved_agent`, stamped at conversion through
+                // `named_agent_def`) replaces the worker template on
+                // the wrapper. An unknown id names the known ids
+                // (§8.3:862); an entry without a recorded resolution
+                // is a fail-closed refusal, never a silent fallback.
+                let mut assignee = None;
+                let mut agent_def = self.spawner.worker_template_id().to_string();
+                let mut agent_def_version = self.worker_pinned_version;
+                if let Some(agent_id) = &agent_arg {
+                    let roster = self.roster.as_ref().ok_or_else(|| {
+                        ToolError::Execution(
+                            "spawn refused: `agent` requires a non-empty superagent.roster, \
+                             which is absent or empty"
+                                .into(),
+                        )
+                    })?;
+                    let entry = roster
+                        .resolve(agent_id)
+                        .map_err(|e| ToolError::Execution(format!("spawn refused: {e}")))?;
+                    let resolved = entry.resolved_agent.as_ref().ok_or_else(|| {
+                        ToolError::Execution(format!(
+                            "spawn refused: roster entry `{agent_id}` carries no resolved \
+                             agent definition (the roster must come from config conversion)"
+                        ))
+                    })?;
+                    assignee = Some(entry.id.clone());
+                    agent_def = resolved.def_id.clone();
+                    agent_def_version = resolved.version;
+                    // §3.2.1: the entry's default expectation applies
+                    // when the call declared none — re-validated here
+                    // (fail-closed even for a programmatically built
+                    // roster that skipped config validation).
+                    if output_schema_arg.is_none()
+                        && let Some(entry_schema) = &entry.output_schema
+                    {
+                        crate::roster::validate_output_schema(entry_schema).map_err(|e| {
+                            ToolError::Execution(format!(
+                                "spawn refused: roster entry `{agent_id}` output_schema {e}"
+                            ))
+                        })?;
+                    }
+                    declared_output_schema = output_schema_arg
+                        .clone()
+                        .or_else(|| entry.output_schema.clone());
+                } else {
+                    declared_output_schema = output_schema_arg.clone();
+                }
                 // Pin P2: the identity derives from the requesting
                 // `tool/call`'s own committed seq — never the live
                 // tail (constraint 13). Refused before any mint.
                 let seq = self.spawn_seq(&port, &call.id).await?;
-                let identity = SpawnIdentity::derive(
+                let identity = SpawnIdentity::derive_delegated(
                     self.router,
                     seq,
-                    self.spawner.worker_template_id(),
-                    self.worker_pinned_version,
+                    &agent_def,
+                    agent_def_version,
+                    task_key_arg.as_deref(),
+                    assignee,
                 );
+                // (R17-C7, pin P4-4 / §4.4:507-527) readiness —
+                // evaluated AT the spawn, from the primary only (the
+                // parent's own committed stream + the children's
+                // streams through the read-only port), never a view
+                // (M7 / READ-MODEL R8). Placement: after identity
+                // derivation (readiness needs the task id), BEFORE
+                // `max_children` (§5.4's insert point). A refusal here
+                // creates no thread, no row, no lineage — only when
+                // `board.gating` is on is any readiness evaluated at
+                // all (pin P4-1). `accept_unverified` is `false` at
+                // this site: v1 has no policy surface for admitting
+                // unverified work (§5.3's `join` row), so the strict
+                // success set `{completed_verified}` is the honest
+                // default — `empty_output` never releases either way.
+                if self.board_gating.is_on() && !declared_depends_on.is_empty() {
+                    let parent_events = port.read_stream().await.map_err(|e| {
+                        ToolError::Execution(format!(
+                            "spawn refused: readiness stream read failed ({e})"
+                        ))
+                    })?;
+                    let dep_ids: std::collections::BTreeSet<uuid::Uuid> = declared_depends_on
+                        .iter()
+                        .map(|key| crate::multiagent::task_id_for_key(self.router, key))
+                        .collect();
+                    let streams = self.child_streams()?;
+                    let mut child_map: std::collections::HashMap<SessionId, Vec<Event>> =
+                        std::collections::HashMap::new();
+                    for ev in parent_events
+                        .iter()
+                        .filter(|ev| ev.kind == EventKind::ThreadStarted)
+                    {
+                        let Some(task) = crate::audit::thread_started_task_id(&ev.bytes)
+                            .and_then(|raw| uuid::Uuid::parse_str(&raw).ok())
+                        else {
+                            continue;
+                        };
+                        if !dep_ids.contains(&task) {
+                            continue;
+                        }
+                        let Some(worker) = crate::multiagent::event_worker_session(ev) else {
+                            continue;
+                        };
+                        if child_map.contains_key(&worker) {
+                            continue;
+                        }
+                        let events = streams.read_stream(worker).await.map_err(|e| {
+                            // Unreadable referent stream: fail-closed —
+                            // an unreadable dependency is never
+                            // silently released (§8.3:864).
+                            ToolError::Execution(format!(
+                                "spawn refused: readiness cannot read the child stream of a \
+                                 declared dependency ({e})"
+                            ))
+                        })?;
+                        child_map.insert(worker, events);
+                    }
+                    match crate::multiagent::ready_deps(
+                        self.router,
+                        &parent_events,
+                        identity.task_id,
+                        task_key_arg.as_deref(),
+                        &declared_depends_on,
+                        false,
+                        &|session| child_map.get(&session).cloned().unwrap_or_default(),
+                    ) {
+                        crate::multiagent::DepReadiness::Ready => {}
+                        crate::multiagent::DepReadiness::Unmet(keys) => {
+                            return Err(ToolError::Execution(format!(
+                                "spawn refused: depends_on not satisfied — unmet task key(s): \
+                                 {} (no successful completion yet; empty_output never releases a \
+                                 dependent; nothing was spawned)",
+                                keys.join(", ")
+                            )));
+                        }
+                        crate::multiagent::DepReadiness::Cycle(path) => {
+                            return Err(ToolError::Execution(format!(
+                                "spawn refused: depends_on cycle — {} — a self-reference or a \
+                                 cycle over the recorded task graph is refused before any side \
+                                 effect; nothing was spawned",
+                                path.join(" -> ")
+                            )));
+                        }
+                    }
+                }
                 // The child-streams port gates both caps walks;
                 // absent is a fail-closed refusal, never an uncapped
                 // spawn (§5.3, §8.3:864).
@@ -1368,9 +1797,14 @@ impl RouterTools {
             // four pin-P6 class-B keys. `None` is today's path,
             // byte-identical.
             identity: multiagent_identity,
+            // (R17-C2, §3.2.1:438-441): the declared expectation —
+            // the call's, or the resolved entry's default — rides the
+            // wrapper as the class-B `output_schema` copy iff one was
+            // declared. `None` on every legacy and undeclared path.
+            output_schema: declared_output_schema,
         };
         let spawned = self.spawner.prepare(&request);
-        let started_bytes = match &request.exec_worker {
+        let mut started_bytes = match &request.exec_worker {
             Some(id) => thread_started_payload_bound(
                 &spawned.thread,
                 spawned.worker_session,
@@ -1383,6 +1817,38 @@ impl RouterTools {
                 &spawned.task_message,
             ),
         };
+        // (R17-C6/C7, pin P4-2): the parent-side class-A keys — only when
+        // the gate is on AND the spawn carries the derived identity.
+        // The full group rides here (`task_id`, `assignee`, `attempt`,
+        // `depends_on[]`, `group?`): the attempt ordinal is derived
+        // from the parent's OWN committed stream (§1:177-179 — 1 + the
+        // prior `thread/started` carrying the same `task_id`), and
+        // `depends_on`/`group` carry the P4 spawn arguments when the
+        // gate accepted them (R17-C7; both stay empty/unset when the
+        // call declared none). The child's own `thread/started`
+        // carries only the derivable subset, so the two payloads'
+        // audit keys differ by design while the wrapper (`task`) stays
+        // byte-identical. Gating off: exactly today's bytes.
+        if self.board_gating.is_on()
+            && let Some(identity) = &request.identity
+        {
+            let parent_events = port.read_stream().await.map_err(|e| {
+                ToolError::Execution(format!(
+                    "spawn refused: board gating attempt-ordinal stream read failed ({e})"
+                ))
+            })?;
+            started_bytes = crate::audit::parent_thread_started_payload(
+                started_bytes,
+                &crate::audit::ParentThreadAudit {
+                    spawn_uid: identity.spawn_uid,
+                    task_id: identity.task_id,
+                    assignee: identity.assignee.clone(),
+                    attempt: crate::audit::attempt_of(&parent_events, identity.task_id),
+                    depends_on: declared_depends_on.clone(),
+                    group: declared_group.clone(),
+                },
+            );
+        }
         port.emit(EventKind::ThreadStarted, started_bytes)
             .await
             .map_err(|e| ToolError::Execution(format!("thread/started write failed: {e}")))?;
@@ -1692,6 +2158,27 @@ impl RouterTools {
         Ok(ToolResult {
             call_id: call.id,
             output: json!({"workers": rows}),
+            is_error: false,
+            redactions: Vec::new(),
+        })
+    }
+
+    /// (R17-C1, §3.1/M9): the read-only roster tool — the roster's
+    /// *only* model-visible surface. Renders the config order and the
+    /// selection facts (`id`, `description`, `agent`, `tools_allow`,
+    /// `max_children`) as a normal tool **result**; no events, no
+    /// rows, no wakes, no I/O. Roster off (absent/empty) ⇒ the tool
+    /// is absent from `schemas()` and its invocation is an honest
+    /// unknown-tool error — the pre-R17 tool set, byte-identical.
+    async fn list_agents(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
+        let Some(roster) = &self.roster else {
+            return Err(ToolError::InvalidCall(
+                "unknown router tool `list_agents`".into(),
+            ));
+        };
+        Ok(ToolResult {
+            call_id: call.id,
+            output: roster.list_agents_result(),
             is_error: false,
             redactions: Vec::new(),
         })
@@ -2026,6 +2513,22 @@ changes, verification)."
                 }),
             });
         }
+        // (R17-C1, pin P2-6): the roster tool rides the surface only
+        // when the roster is non-empty — an absent/empty roster keeps
+        // the tool set byte-identical (the tool is simply absent).
+        // The schema is a **constant** (M9): no id, no count, no enum
+        // — the roster reaches the model only through the result.
+        if self.roster.is_some() {
+            schemas.push(ToolSchema {
+                name: LIST_AGENTS_TOOL.to_string(),
+                description: LIST_AGENTS_DESCRIPTION.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                }),
+            });
+        }
         schemas
     }
 
@@ -2040,6 +2543,7 @@ changes, verification)."
                 s if s == REPLY_TOOL => this.reply(call).await,
                 s if s == DELIVER_STRUCTURED_TOOL => this.deliver_structured(call).await,
                 s if s == LIST_WORKERS_TOOL => this.list_workers(call).await,
+                s if s == LIST_AGENTS_TOOL => this.list_agents(call).await,
                 other => Err(ToolError::InvalidCall(format!(
                     "unknown router tool `{other}`"
                 ))),
@@ -2075,6 +2579,8 @@ impl Clone for RouterTools {
             directory: self.directory.clone(),
             worker_streams: self.worker_streams.clone(),
             multiagent: self.multiagent,
+            board_gating: self.board_gating,
+            roster: self.roster.clone(),
             worker_pinned_version: self.worker_pinned_version,
             hold: Arc::clone(&self.hold),
         }
@@ -4311,7 +4817,13 @@ mod tests {
         // Replay: the lineage plan over the same bytes re-derives the
         // thread (a takeover would Resume, not re-emit).
         assert_eq!(
-            crate::worker::lineage_plan(&worker_events, worker, sid(10), 7),
+            crate::worker::lineage_plan(
+                &worker_events,
+                worker,
+                sid(10),
+                7,
+                crate::multiagent::BoardGating::default(),
+            ),
             crate::worker::LineagePlan::Resume {
                 thread_id: tid(0xf1)
             }

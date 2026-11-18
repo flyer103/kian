@@ -113,8 +113,8 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `slot/fallback` | — | DrainActivity | `{"slot":<str>,"from":{"provider","model"},"to":{"provider","model"}}` | provider turn | One fallback-chain switch, persisted before the fallback call. |
 | `slot/migration` | — | DrainActivity | `{"slot":<str>,"from_spec":<spec>,"to_spec":<spec>,"reason":<str>}` | ops/control path | The only escape hatch from an immutable binding. |
 | `recovery/budget-reset` | — | DrainActivity | `{"reason":<str>}` | operator | Running-preserving only (the ops path refuses idle/terminal sessions); audit only — budget state re-derives from config, context skips it. |
-| `thread/started` | — | Thread | `{"thread_id":<uuid-str>,"parent":<session-uuid>,"worker":<session-uuid>,"pinned_version":<u64>,"task":<message payload>}`; additive: `"exec_worker":<str>` | superagent / worker | Thread lineage + delegation authority wrapper are durable here (ADR-012). `exec_worker` is the execution-worker id the session is bound to (ADR-020, §4.2). |
-| `thread/completed` | — | DrainActivity | `{"thread_id":<uuid-str>,"status":"completed"\|"failed"\|"interrupted","summary":<message payload>}` | worker | Worker outcome before the end write; never maps a failed gate onto `completed`. |
+| `thread/started` | — | Thread | `{"thread_id":<uuid-str>,"parent":<session-uuid>,"worker":<session-uuid>,"pinned_version":<u64>,"task":<message payload>}`; additive: `"exec_worker":<str>`; additive (P4, gated by `superagent.board.gating`, MULTIAGENT-MODEL §7.2): `"spawn_uid":<uuid-str>`, `"multiagent":{"task_id":<uuid-str>,"assignee"?:<str>,"attempt"?:<u64>,"depends_on":[<str>],"group"?<str>}` — the parent side carries the full group, the child side the derivable subset `{task_id, assignee}` only | superagent / worker | Thread lineage + delegation authority wrapper are durable here (ADR-012). `exec_worker` is the execution-worker id the session is bound to (ADR-020, §4.2). The P4 keys are class-A audit keys outside `task` (§4.2); the wrapper stays byte-identical on both streams. |
+| `thread/completed` | — | DrainActivity | `{"thread_id":<uuid-str>,"status":"completed"\|"failed"\|"interrupted","summary":<message payload>}`; additive (P4, gated by `superagent.board.gating`): `"spawn_uid":<uuid-str>`, `"multiagent":{"task_id":<uuid-str>,"outcome"?:<one of the six completion-borne §6.1.1 values>,"evidence_ref"?:{"session":<uuid-str>,"seq":<u64>},"contract"?:{"passed":<bool>,"errors":[<str>]}}` | worker | Worker outcome before the end write; never maps a failed gate onto `completed`. `outcome` persists only the six completion-borne values (the three no-carrier values stay derived on demand); `evidence_ref` is a pointer at the committed verdict, never a copy. |
 | `evidence/verdict` | — | DrainActivity | `{"gate":<str>,"passed":<bool>,"checks":[{"name":<str>,"passed":<bool>,"detail"?<str>}],"attempt":<u64>}` | loop (evidence gate) | Bounded, declarative stop gate (A6); no model call. |
 | `channel/delivered` | — | DrainActivity | `{"channel":<str>,"target":<json>,"policy":<str>,"words"?<u64>,"truncated":<bool>}`; additive: `"attempt"`,`"first_attempt_ms"`,`"detail"` (present and `true` only on a details-request full delivery) | superagent/channel | Honest delivery receipt; no receipt means no delivery. |
 | `input/spilled` | — | DrainActivity | `{"event_id":<str>,"channel":<str>,"topic":<str\|null>,"raw":<verbatim channel payload>}` | orchestrator (consumption) | Non-context sibling of the Inline `input/admitted`; recall reads the raw from here. |
@@ -184,6 +184,24 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   which machine it runs on, and legitimate because only **new** message bytes carry it. Legacy
   wrapper bytes and every persisted `step/request.body` stay untouched, so history is not rewritten
   and no live session's prefix changes as a result of the record itself.
+- `thread/started` / `thread/completed` (R17-C6, MULTIAGENT-MODEL §7.2, P4): `"spawn_uid"` and the
+  namespaced `"multiagent"` group — the task facts the audit needs (`task_id`, `assignee`,
+  `attempt`, `depends_on[]`, `group?` on the parent's `thread/started`; `task_id`, `assignee` on the
+  child's; `task_id`, `outcome`, `evidence_ref?`, `contract?` on the child's `thread/completed`).
+  Gated by `superagent.board.gating` (default `false` ⇒ **no key is emitted at all** — P3 bytes
+  exactly); omitted when unset, never `null`; legacy event bytes parse/replay byte-identical (§6.3).
+  The two sides' `thread/started` payloads differ by design — the parent-only bookkeeping
+  (`attempt`, `depends_on`, `group`) never rides the child's event — while the embedded delegation
+  wrapper (`task`) stays byte-identical between them. `outcome` is written at the completion by
+  `outcome_for_completion` (the §6.2 table applied to the completion being appended) and persists
+  only the six completion-borne values; the three no-carrier values (`stalled`, `interrupted`,
+  `input_required`) stay derived on demand. `evidence_ref` is `{"session","seq"}` — a durable
+  pointer at the committed `evidence/verdict` that decided the outcome, never a copy of it.
+  Non-context, stated precisely: the keys ride the payload **outside `content`**, and
+  `derive_model_context` — which reads `role`/`content`/`synthetic` only — never puts them in a
+  model request, so they must not change `derive_model_context` output or model request bytes; the
+  model-visible half of every task fact is the wrapper/report **content** copy (class B/C), which
+  P1/P2 already carry.
 
 Rule: an additive key must leave legacy event bytes byte-identical and must not change
 `derive_model_context` output or model request bytes. If a proposed field is model-visible, it is

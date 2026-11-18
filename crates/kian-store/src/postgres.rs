@@ -258,6 +258,12 @@ const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligib
 
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND consumed_by_seq IS NULL AND eligible_at <= $2::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
+/// (R17 C4, pin P3-5) the read-only per-session inbox read behind the
+/// task board's `input_required` arm: EVERY row of the session,
+/// consumed rows included (the row is durable and audit-visible after
+/// `mark_consumed`). Dialect-identical to sqlite's INPUT_ROWS_SQL.
+const INPUT_ROWS_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text ORDER BY eligible_at ASC, admitted_seq ASC";
+
 const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= $1::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// Dialect-identical to sqlite's CONSUME modulo placeholders (pg reuses
@@ -344,6 +350,19 @@ pub(crate) async fn eligible_inputs(
     let rows: Vec<InputCols> = sqlx::query_as(ELIGIBLE_SQL)
         .bind(session.0.to_string())
         .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(decode_input).collect()
+}
+
+/// (R17 C4, pin P3-5): every inbox row of the session — read-only,
+/// consumed rows included, oldest first. No new table, no migration.
+pub(crate) async fn input_rows(
+    pool: &PgPool,
+    session: SessionId,
+) -> Result<Vec<InputRow>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(INPUT_ROWS_SQL)
+        .bind(session.0.to_string())
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(decode_input).collect()

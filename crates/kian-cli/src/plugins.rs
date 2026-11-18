@@ -556,6 +556,23 @@ pub struct SuperAgentPlugin {
     /// (`superagent.multiagent`). `None` = the delegation feature is
     /// off — today's spawn bytes, byte-identical (M8, §8.1).
     pub multiagent: Option<kian_superagent::MultiagentLimits>,
+    /// (R17-C6, pin P4-1) the `superagent.board.gating` class-A
+    /// emission switch, converted once by `ServeConfig::board_config`
+    /// (the block itself is C4's — wiring only). `false` (the
+    /// default) keeps every event payload byte at its P3 form;
+    /// `true` adds the two class-A key groups
+    /// (`crates/kian-superagent/src/audit.rs`).
+    pub board_gating: kian_superagent::BoardGating,
+    /// (R17-C1) the roster (`superagent.roster`), converted
+    /// fail-closed by `ServeConfig::roster_config`. `None` (absent
+    /// or empty) = the roster feature is off — no `list_agents`
+    /// tool, today's tool set byte-identical (pin P2-6).
+    pub roster: Option<kian_superagent::Roster>,
+    /// (R17-C3, pin P2-2/P2-1) the per-entry resolved `AgentDef`s
+    /// (entry id → `ServeConfig::named_agent_def(entry.agent)` — the
+    /// slots/budgets source for the per-assignee sides, never the
+    /// worker template). Empty when the roster is off.
+    pub roster_agent_defs: BTreeMap<String, AgentDef>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -758,6 +775,13 @@ impl Plugin for SuperAgentPlugin {
         // feature off — the whole multiagent branch is skipped and
         // today's spawn bytes stand (M8, §8.1).
         profile.multiagent = self.multiagent;
+        // (R17-C2, §7.3:800-806 — DEVIATION, one wiring line in this
+        // file): the frozen roster instruction line renders iff the
+        // roster is non-empty (pin P2-6). The flag and the render live
+        // in `RouterProfile::bootstrap`; without this line the class-D
+        // prompt byte would never render in production — a config key
+        // with no effect.
+        profile.roster_instruction = self.roster.is_some();
         // (R12, R1/R2 — supersedes ADR-020 D5/D7): membership on iff
         // `endpoints:` is non-empty or `workers:` is configured — the
         // bootstrap then appends the frozen membership block (a
@@ -846,7 +870,11 @@ impl Plugin for SuperAgentPlugin {
             ))
         });
         let mut router_tools = RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
-            .with_followup_registry(Arc::clone(&followup_registry));
+            .with_followup_registry(Arc::clone(&followup_registry))
+            // (R17-C6, pin P4-1): the class-A emission switch rides
+            // the tool surface — the parent-side `thread/started`
+            // keys are written only when it is on.
+            .with_board_gating(self.board_gating);
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }
@@ -902,6 +930,14 @@ impl Plugin for SuperAgentPlugin {
             let worker_streams =
                 crate::superagent::StoreWorkerStreams::new(self.event_store.clone());
             router_tools = router_tools.with_worker_streams(worker_streams);
+        }
+        // (R17-C1): the roster rides the tool surface — the read-only
+        // `list_agents` tool (the roster's only model-visible
+        // surface, M9). Installed only when non-empty (pin P2-6):
+        // `None` installs nothing and the tool set keeps today's
+        // exact bytes.
+        if let Some(roster) = &self.roster {
+            router_tools = router_tools.with_roster(roster.clone());
         }
         let router_tools = Arc::new(router_tools);
         // the recall toolpack reads through the one `StoreRecall`
@@ -1140,6 +1176,8 @@ impl Plugin for SuperAgentPlugin {
                 // `thread/started.parent` only when the driving side
                 // carries them; None = feature off, ambient today.
                 multiagent: self.multiagent,
+                // (R17-C6, pin P4-1): the child-side class-A switch.
+                board_gating: self.board_gating,
             },
             crate::superagent::port_for_ctx(),
         );
@@ -1188,6 +1226,7 @@ impl Plugin for SuperAgentPlugin {
             // configured-endpoint deployments — they carry the same
             // delegation bounds as the primary worker side.
             let side_multiagent = self.multiagent;
+            let side_board_gating = self.board_gating;
             side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
@@ -1227,6 +1266,7 @@ impl Plugin for SuperAgentPlugin {
                         worker_version: side_version,
                         gate: crate::superagent::clone_gate(&side_gate),
                         multiagent: side_multiagent,
+                        board_gating: side_board_gating,
                     },
                     crate::superagent::port_for_ctx(),
                 )
@@ -1247,6 +1287,7 @@ impl Plugin for SuperAgentPlugin {
             let refuse_session = self.router_session;
             let refuse_version = self.worker_agent.version;
             let refuse_multiagent = self.multiagent;
+            let refuse_board_gating = self.board_gating;
             refuse_side = Some(Arc::new(move |refusal: &crate::superagent::Refusal| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
@@ -1278,6 +1319,7 @@ impl Plugin for SuperAgentPlugin {
                         worker_version: refuse_version,
                         gate: crate::superagent::clone_gate(&refuse_gate),
                         multiagent: refuse_multiagent,
+                        board_gating: refuse_board_gating,
                     },
                     crate::superagent::port_for_ctx(),
                 )
@@ -1302,13 +1344,191 @@ impl Plugin for SuperAgentPlugin {
             )
                 as Arc<dyn kian_superagent::WorkerDirectoryPort>);
         }
+        // (R17-C3, pin P2-2) the per-assignee side factory — one side
+        // per roster entry id, built lazily at drive time from the
+        // committed wrapper's `assignee`. Each side is the entry's
+        // resolved `AgentDef` (slots/budgets from the `agents:`
+        // definition, pin P2-1 — never the worker template) with a
+        // structural narrowing at the provider edge:
+        // `agent.tools ∩ tools_allow`, validated fail-closed against
+        // the mounted worker surface here (the `unmatched_tool_names`
+        // discipline — a typo'd allow-name refuses boot instead of
+        // silently widening). An assignee with no live entry gets the
+        // refusing side (no working tool, the honest reason) — never
+        // a fallback onto another agent's surface. Installed iff the
+        // roster is non-empty (pin P2-6): absent roster ⇒ no factory,
+        // and no wrapper ever carries `assignee` (today's bytes).
+        let mut assignee_factory: Option<crate::superagent::AssigneeSideFactory> = None;
+        if let Some(roster) = &self.roster {
+            // The ingredients every assignee side shares (mirrors the
+            // per-worker-id side factory's captures above).
+            let assignee_registry = registry.clone();
+            let assignee_local = local_tools.clone();
+            let assignee_policy: Arc<dyn RecoveryPolicySource> =
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>;
+            let assignee_config = ReActConfig {
+                slot: kian_core::model::SlotName("main".into()),
+                max_iterations: self.max_iterations,
+                budget_scope: kian_loop::BudgetScope::Lifetime,
+                permissions: self.worker_permissions.clone(),
+            };
+            let assignee_recall = self.recall.worker;
+            let assignee_recall_tools = recall_tools.clone();
+            let assignee_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
+            let assignee_gate = crate::superagent::clone_gate(&self.worker_gate);
+            let assignee_session = self.router_session;
+            let assignee_multiagent = self.multiagent;
+            let assignee_board_gating = self.board_gating;
+            // the refusing branch's loop def: the worker template (a
+            // vanished assignee has no entry def to build from; the
+            // side mounts no working tool either way).
+            let worker_refuse_agent = self.worker_agent.clone();
+            let worker_refuse_version = self.worker_agent.version;
+            let assignee_remote = remote.as_ref().map(|r| {
+                (
+                    Arc::clone(&r.backend),
+                    r.endpoints
+                        .iter()
+                        .map(|ep| ep.id.clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
+            // entry id → (the entry's AgentDef, the narrowed tool list)
+            let mut sides: BTreeMap<String, (AgentDef, Vec<String>)> = BTreeMap::new();
+            for entry in &roster.entries {
+                let agent = self.roster_agent_defs.get(&entry.id).ok_or_else(|| {
+                    apply_error(format!(
+                        "superagent.roster entry `{}` names agent `{}`, which resolves to no \
+                         configured `agents:` definition",
+                        entry.id, entry.agent
+                    ))
+                })?;
+                // The pin P2-2 narrowing, in the agent's own `tools:`
+                // order: agent.tools ∩ tools_allow (never a widening —
+                // the roster fence already refused one at parse).
+                let narrowed: Vec<String> = agent
+                    .tools
+                    .iter()
+                    .filter(|tool| entry.tools_allow.contains(tool))
+                    .cloned()
+                    .collect();
+                // Fail-closed against the mounted worker surface (the
+                // same discipline as the worker template's own list):
+                // an allow-name nothing mounts is a typo, not a policy.
+                let unmatched = unmatched_tool_names(&narrowed, &worker_mounted);
+                if !unmatched.is_empty() {
+                    return Err(apply_error(format!(
+                        "superagent.roster entry `{}` narrows to tools not mounted on the worker \
+                         loop: {unmatched:?}",
+                        entry.id
+                    )));
+                }
+                sides.insert(entry.id.clone(), (agent.clone(), narrowed));
+            }
+            assignee_factory = Some(Arc::new(move |assignee: &str| {
+                match sides.get(assignee) {
+                    Some((agent, narrowed)) => {
+                        // The same provider composition as the primary
+                        // worker side (remote exec/fs, recall, local),
+                        // then ONE top-level FilteredTools over the
+                        // union: the denied names are absent from the
+                        // request schema — structural, not call-time.
+                        let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
+                        if let Some((backend, endpoints)) = &assignee_remote {
+                            for id in endpoints {
+                                tools.push(Arc::new(kian_exec::RemoteExecTool::new(
+                                    Arc::clone(backend),
+                                    id.clone(),
+                                )));
+                                tools.push(Arc::new(FilteredTools::new(
+                                    Arc::new(kian_exec::RemoteFsTool::new(
+                                        Arc::clone(backend),
+                                        id.clone(),
+                                    )),
+                                    &agent.tools,
+                                )));
+                            }
+                        }
+                        if assignee_recall {
+                            tools
+                                .push(Arc::new(assignee_recall_tools.clone())
+                                    as Arc<dyn ToolProvider>);
+                        }
+                        tools.push(Arc::new(FilteredTools::new(
+                            assignee_local.clone(),
+                            &agent.tools,
+                        )));
+                        let mounted = Arc::new(crate::superagent::CombinedTools::new(tools));
+                        let narrowed_tools = Arc::new(FilteredTools::new(mounted, narrowed))
+                            as Arc<dyn ToolProvider>;
+                        let side_loop = Arc::new(ReActLoop::with_config(
+                            agent.clone(),
+                            assignee_registry.clone(),
+                            narrowed_tools,
+                            Arc::clone(&assignee_policy),
+                            assignee_config.clone(),
+                        ));
+                        kian_superagent::WorkerLoopDriver::new(
+                            Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
+                            Arc::clone(&assignee_inbox),
+                            kian_superagent::WorkerLoopConfig {
+                                router: assignee_session,
+                                // pin P2-1: the child's own lineage
+                                // stamps the RESOLVED agent's version,
+                                // not the worker template's.
+                                worker_version: agent.version,
+                                gate: crate::superagent::clone_gate(&assignee_gate),
+                                multiagent: assignee_multiagent,
+                                board_gating: assignee_board_gating,
+                            },
+                            crate::superagent::port_for_ctx(),
+                        )
+                    }
+                    None => {
+                        // The vanished-entry refusing side (pin P2-2):
+                        // no working tool mounts — structurally
+                        // incapable of widening onto any other agent's
+                        // surface — and every invoke reports the honest
+                        // reason naming the assignee.
+                        let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
+                        let refusal =
+                            crate::superagent::Refusal::VanishedAssignee(assignee.to_string());
+                        tools.push(Arc::new(crate::superagent::RefusingExecTool::new(
+                            refusal.clone(),
+                        )));
+                        tools.push(Arc::new(crate::superagent::RefusingFsTool::new(refusal)));
+                        let mounted = Arc::new(crate::superagent::CombinedTools::new(tools));
+                        let refuse_loop = Arc::new(ReActLoop::with_config(
+                            worker_refuse_agent.clone(),
+                            assignee_registry.clone(),
+                            mounted,
+                            Arc::clone(&assignee_policy),
+                            assignee_config.clone(),
+                        ));
+                        kian_superagent::WorkerLoopDriver::new(
+                            Arc::new(crate::superagent::WorkerInnerDriver::React(refuse_loop)),
+                            Arc::clone(&assignee_inbox),
+                            kian_superagent::WorkerLoopConfig {
+                                router: assignee_session,
+                                worker_version: worker_refuse_version,
+                                gate: crate::superagent::clone_gate(&assignee_gate),
+                                multiagent: assignee_multiagent,
+                                board_gating: assignee_board_gating,
+                            },
+                            crate::superagent::port_for_ctx(),
+                        )
+                    }
+                }
+            }));
+        }
         let mut driver = crate::superagent::SuperAgentDriver::new(
             self.router_session,
             self.worker_agent.version,
             router_side,
             worker_side,
             default_loop,
-        );
+        )
+        .with_board_gating(self.board_gating);
         if let Some(profile) = &self.watchdog {
             driver = driver.with_watchdog(
                 profile.session,
@@ -1327,6 +1547,11 @@ impl Plugin for SuperAgentPlugin {
                 refuse_side,
                 directory_for_sides,
             );
+        }
+        // (R17-C3, pin P2-2): the per-assignee factory rides the
+        // driver exactly when the roster is non-empty.
+        if let Some(assignee_factory) = assignee_factory {
+            driver = driver.with_assignee_sides(assignee_factory);
         }
         let driver = Arc::new(driver);
 

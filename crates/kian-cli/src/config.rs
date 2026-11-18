@@ -961,6 +961,24 @@ pub struct SuperAgentConfig {
     /// [`SuperAgentConfig::multiagent_config`].
     #[serde(default)]
     pub multiagent: Option<MultiagentConfigDef>,
+    /// (R17-C1) the roster (`superagent.roster`, MULTIAGENT-MODEL
+    /// §3.1/§7.1): the named agents the Router may delegate to.
+    /// Absent/empty (the default) = the roster feature is **off** —
+    /// no `list_agents` tool, no roster validation, today's exact
+    /// bytes (pin P2-6, §3.1:366-367). Converted fail-closed by
+    /// [`ServeConfig::roster_config`].
+    #[serde(default)]
+    pub roster: Vec<RosterEntryDef>,
+    /// (R17 C4) the task-board switch block
+    /// (`superagent.board`): `enabled`/`gating`, **both default
+    /// `false`**. Absent block = board off: no `task_board` view is
+    /// published or served and any rows from an earlier era are
+    /// deleted by the next rebuild (a disposable view,
+    /// `anchors.md` rule 4). Converted fail-closed by
+    /// [`SuperAgentConfig::board_config`] — `gating: true` is a P4
+    /// key and refuses to boot in P3.
+    #[serde(default)]
+    pub board: BoardConfigDef,
     /// /ADR-013 thread-key intake (`superagent.intake`): the
     /// config-owned canonical thread-key derivations. The derived key
     /// surfaces in the Inline `neighbors` block (`thread_key`) as
@@ -1073,7 +1091,79 @@ impl SuperAgentConfig {
         converted
             .validate()
             .map_err(|message| invalid(format!("superagent.multiagent: {message}")))?;
+        // (R17-C7, pin P4-5) the `join` fan-in policy: v1 evaluates
+        // only `all` — the one shape with an evaluation site (one
+        // spawn, one parent). `any`/`quorum:<n>` refuse to boot
+        // naming the missing evaluation site and the §9 deferral;
+        // anything else is an unknown value naming the accepted
+        // forms. Never accepted-and-ignored.
+        if let Some(join) = config.join.as_deref() {
+            match join {
+                "all" => {}
+                "any" => {
+                    return Err(invalid(
+                        "superagent.multiagent: join: `any` has no evaluation site in v1 (one \
+                         spawn, one parent — only `all` is evaluated); fan-in is deferred with \
+                         its own ADR (MULTIAGENT-MODEL §9) — refused rather than \
+                         accepted-and-ignored"
+                            .to_string(),
+                    ));
+                }
+                value if value.starts_with("quorum:") => {
+                    let n = &value["quorum:".len()..];
+                    // n ≥ 1: empty, non-numeric and zero are all
+                    // typos of the same bound (fail-closed).
+                    if !matches!(n.parse::<u32>(), Ok(v) if v >= 1) {
+                        return Err(invalid(format!(
+                            "superagent.multiagent: join: `{value}` — a quorum needs n ≥ 1 \
+                             (got `{n}`)"
+                        )));
+                    }
+                    return Err(invalid(format!(
+                        "superagent.multiagent: join: `{value}` has no evaluation site in v1 \
+                         (one spawn, one parent — only `all` is evaluated); fan-in is deferred \
+                         with its own ADR (MULTIAGENT-MODEL §9) — refused rather than \
+                         accepted-and-ignored"
+                    )));
+                }
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.multiagent: join: `{other}` is not one of the accepted \
+                         values `all` | `any` | `quorum:<n>` (n ≥ 1); v1 evaluates `all` only"
+                    )));
+                }
+            }
+        }
         Ok(Some(converted))
+    }
+
+    /// Converts the board section to the runtime switch, fail-closed
+    /// (R17 C4, pin P3-1; R17 C6 made `gating` live). The block
+    /// defaults to **off** (`enabled: false`, `gating: false` — an
+    /// absent block is the same shape), so absence keeps P3
+    /// byte-identical: no `task_board` view, no board output, no
+    /// class-A key. `gating: true` arms the P4 emission switch
+    /// (§8.1) — but only when the `multiagent` block is present
+    /// (§7.1:737-741: neither board key can enable anything
+    /// `multiagent` has not already enabled — a refusal, never a
+    /// silent no-op).
+    pub fn board_config(&self) -> Result<BoardConfig, ConfigError> {
+        let converted = BoardConfig {
+            enabled: self.board.enabled,
+            gating: self.board.gating,
+        };
+        converted
+            .validate()
+            .map_err(|message| invalid(format!("superagent.board: {message}")))?;
+        if converted.gating && self.multiagent.is_none() {
+            return Err(invalid(
+                "superagent.board: gating: true requires the superagent.multiagent block — \
+                 neither board key can enable anything multiagent has not already enabled \
+                 (MULTIAGENT-MODEL §7.1)"
+                    .to_string(),
+            ));
+        }
+        Ok(converted)
     }
 }
 
@@ -1090,19 +1180,130 @@ pub struct OutboxConfigDef {
 }
 
 /// The `superagent.multiagent` section (MULTIAGENT-MODEL §7.1):
-/// `{max_children?, max_depth?, child_timeout_ms?}` — every field
-/// optional with the §5.3 defaults (4 children, 1 hop, 15 minutes);
-/// an empty section enables the feature with the defaults. The
-/// spelling is **`child_timeout_ms`** (pin P4): the anchors' A2 error
-/// would name `timeout_ms`, and this struct's
+/// `{max_children?, max_depth?, child_timeout_ms?, join?}` — every
+/// field optional with the §5.3 defaults (4 children, 1 hop, 15
+/// minutes, `join: all`); an empty section enables the feature with
+/// the defaults. The spelling is **`child_timeout_ms`** (pin P4): the
+/// anchors' A2 error would name `timeout_ms`, and this struct's
 /// `#[serde(deny_unknown_fields)]` makes that typo a boot refusal,
 /// never a silent default. Absent section = the feature is off.
+///
+/// `join` (R17-C7, pin P4-5) is the fan-in policy: `all` (the
+/// default) is the only value v1 has an evaluation site for (one
+/// spawn, one parent); `any`/`quorum:<n>` **refuse to boot** naming
+/// the missing evaluation site and the deferral — never
+/// accepted-and-ignored, which would imply any-of success (§5.3:588,
+/// §9:882-888).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MultiagentConfigDef {
     pub max_children: Option<u32>,
     pub max_depth: Option<u32>,
     pub child_timeout_ms: Option<u64>,
+    pub join: Option<String>,
+}
+
+/// One `superagent.roster` entry (MULTIAGENT-MODEL §3.1:357-362,
+/// §7.1): `{id, description, agent, mandate_template, tools_allow,
+/// limits?, output_schema?}`. `id`/`description`/`agent`/
+/// `mandate_template`/`tools_allow` are required — a missing
+/// `tools_allow` must never silently mean "all tools" (that would be
+/// a widening). `limits` defaults to the §5.3 `max_children` (4);
+/// `output_schema` is the optional per-entry default expectation
+/// (§3.2.1) and must sit inside the closed subset (pin P2-3).
+///
+/// `agent` names an **`agents:` entry** (resolved by
+/// `ServeConfig::named_agent_def`, pin P2-1) — not the default
+/// `agent:` and never an invented id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterEntryDef {
+    /// The name the model uses; unique across the roster, non-empty.
+    pub id: String,
+    /// The one line used for selection (≤200 chars, no control
+    /// characters — the `WorkerEntry` precedent).
+    pub description: String,
+    /// An `agents:` entry id — the `AgentDef` reference and the
+    /// memory scope (pin P2-1).
+    pub agent: String,
+    /// The advisory mandate template: `{scope, strength}` with
+    /// `strength ∈ {explicit, inferred}` (ADR-012 vocabulary).
+    pub mandate_template: RosterMandateTemplateDef,
+    /// The tool fence: intersected with the agent's surface — an
+    /// entry listing a tool the `AgentDef` lacks **refuses boot**
+    /// (M3, §5.1:551-552; never a widening).
+    pub tools_allow: Vec<String>,
+    /// Per-entry limits; `max_children: 0` is a **leaf** — legal
+    /// (§3.1:360-361).
+    #[serde(default)]
+    pub limits: RosterLimitsDef,
+    /// The optional `output_schema` (pin P2-3 subset, ≤8192
+    /// canonical-JSON bytes). Absent = no schema gate for this
+    /// entry's children.
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Value>,
+}
+
+/// The `mandate_template` block of a roster entry: the advisory
+/// scope text (recorded and audited, never a permission — §5.1) and
+/// the strength. `strength` is converted fail-closed so a typo
+/// refuses boot naming the key, never a silent default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RosterMandateTemplateDef {
+    /// The advisory scope text (never blank — an empty authority
+    /// string is never issued).
+    pub scope: String,
+    /// `explicit` | `inferred` (ADR-012).
+    pub strength: String,
+}
+
+/// The `limits` block of a roster entry — the per-entry bound the
+/// contract defines (§3.1:360-361): `max_children` only, optional
+/// with the §5.3 default (4); `0` names a leaf and is legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RosterLimitsDef {
+    pub max_children: Option<u32>,
+}
+
+/// The `superagent.board` section (R17 C4, MULTIAGENT-MODEL §7.1):
+/// `{enabled?, gating?}` — **both keys default `false`**, and an
+/// absent section is the same shape as an all-false one (feature-off,
+/// byte-identical, `anchors.md` rule 4). `enabled` gates publication
+/// of the `task_board` view and (with `read_model.views.enabled`) the
+/// P3 verbs; `gating` is P4's class-A emission switch — live since
+/// R17 C6, and requiring the `multiagent` block (checked in
+/// [`SuperAgentConfig::board_config`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BoardConfigDef {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gating: bool,
+}
+
+/// The converted runtime board switch (R17 C4, pin P3-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BoardConfig {
+    /// Whether the `task_board` view may be published/served (the
+    /// verbs' own gate composes this with `read_model.views.enabled`).
+    pub enabled: bool,
+    /// P4's class-A key-emission switch (live since R17 C6, pin
+    /// P4-1: `false` ⇒ P3 bytes exactly).
+    pub gating: bool,
+}
+
+impl BoardConfig {
+    /// Fail-closed validation of the switch pair itself. Since R17
+    /// C6 landed the key groups, `gating: true` boots — the
+    /// §7.1 "board cannot enable what multiagent has not" refusal
+    /// lives in [`SuperAgentConfig::board_config`], where the
+    /// multiagent block is visible.
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The `superagent.intake` section (ADR-013):
@@ -3078,6 +3279,10 @@ impl ServeConfig {
             // the outbox schedule converts cleanly (fail-closed —
             // a broken retry bound or backoff refuses to start).
             sa.outbox_config()?;
+            // (R17 C4) the board block converts cleanly (fail-closed —
+            // `gating: true` is a P4 key and refuses to boot in P3,
+            // naming the deferral).
+            sa.board_config()?;
             // the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
@@ -3244,6 +3449,98 @@ impl ServeConfig {
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
         self.agents.get(id).map(agent_def_of)
+    }
+
+    /// Converts the `superagent.roster` section to the bundle's
+    /// [`kian_superagent::Roster`], fail-closed. `Ok(None)` when the
+    /// section is absent **or empty** — the roster feature is off,
+    /// today's tool set byte-identical (pin P2-6, §3.1:366-367).
+    ///
+    /// Validation is the contract's (§3.1), errors naming the key:
+    /// duplicate ids; an `agent` naming no configured `agents:`
+    /// entry (the refusal names the known ids — pin P2-1, resolved
+    /// exactly through [`Self::named_agent_def`]); `tools_allow`
+    /// listing a tool the AgentDef lacks (a widening refuses boot —
+    /// M3/§5.1:551-552); an `output_schema` outside the closed
+    /// subset (pin P2-3, naming the keyword). `limits.max_children:
+    /// 0` is legal — a leaf (§3.1:360-361).
+    pub fn roster_config(&self) -> Result<Option<kian_superagent::Roster>, ConfigError> {
+        let Some(sa) = self.superagent.as_ref() else {
+            return Ok(None);
+        };
+        if sa.roster.is_empty() {
+            return Ok(None);
+        }
+        // Whole-set check first: duplicate ids (the per-entry pass
+        // below cannot see them).
+        let mut seen = std::collections::BTreeSet::new();
+        for def in &sa.roster {
+            if !seen.insert(def.id.as_str()) {
+                return Err(invalid(format!(
+                    "superagent.roster: duplicate id `{}` — roster ids are unique",
+                    def.id
+                )));
+            }
+        }
+        // The pin P2-1 resolution seam: exactly `named_agent_def`,
+        // and the known `agents:` ids for the refusal text.
+        let known: Vec<String> = self.agents.keys().cloned().collect();
+        let lookup = |id: &str| {
+            self.named_agent_def(id)
+                .map(|def| kian_superagent::AgentSurface {
+                    id: def.id,
+                    tools: def.tools,
+                })
+        };
+        let mut entries = Vec::with_capacity(sa.roster.len());
+        for (i, def) in sa.roster.iter().enumerate() {
+            let strength = match def.mandate_template.strength.as_str() {
+                "explicit" => kian_superagent::MandateStrength::Explicit,
+                "inferred" => kian_superagent::MandateStrength::Inferred,
+                other => {
+                    return Err(invalid(format!(
+                        "superagent.roster[{i}].mandate_template.strength: unknown `{other}` \
+                         (explicit | inferred)"
+                    )));
+                }
+            };
+            let entry = kian_superagent::RosterEntry {
+                id: def.id.clone(),
+                description: def.description.clone(),
+                agent: def.agent.clone(),
+                mandate_template: kian_superagent::MandateTemplate {
+                    scope: def.mandate_template.scope.clone(),
+                    strength,
+                },
+                tools_allow: def.tools_allow.clone(),
+                limits: kian_superagent::RosterLimits {
+                    max_children: def
+                        .limits
+                        .max_children
+                        .unwrap_or_else(kian_superagent::default_roster_max_children),
+                },
+                output_schema: def.output_schema.clone(),
+                // (R17-C2, pin P2-1) the resolution is stamped here,
+                // once, at conversion — the spawn side reads this
+                // recorded fact and never re-consults live config
+                // (§2.1.1 constraint 13). `named_agent_def` resolved
+                // it for the surface check below; the same call
+                // supplies the identity the wrapper will carry.
+                resolved_agent: self.named_agent_def(&def.agent).map(|agent| {
+                    kian_superagent::ResolvedAgent {
+                        def_id: agent.id,
+                        version: agent.version,
+                    }
+                }),
+            };
+            kian_superagent::Roster {
+                entries: vec![entry.clone()],
+            }
+            .validate(&lookup, &known)
+            .map_err(|e| invalid(format!("superagent.roster[{i}]: {e}")))?;
+            entries.push(entry);
+        }
+        Ok(Some(kian_superagent::Roster { entries }))
     }
 
     /// The compiled definition an agent id the memory section may
@@ -3878,6 +4175,190 @@ recovery:
         );
         let err = ServeConfig::parse(&watchdog).expect_err("watchdog permissions must refuse boot");
         assert!(err.to_string().contains("watchdog"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // the join fan-in policy (R17 C7, pin P4-5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn any_and_quorum_join_values_refuse_to_boot_naming_the_deferral() {
+        // (R17-C7, pin P4-5) v1 evaluates only `all` — the one shape
+        // with an evaluation site (one spawn, one parent). `any` and
+        // `quorum:<n>` refuse to boot naming the missing evaluation
+        // site and the §9 deferral; they are never
+        // accepted-and-ignored (which would imply any-of success,
+        // §5.3:588).
+        for join in ["any", "quorum:2"] {
+            let yaml = superagent_yaml().replacen(
+                "superagent:\n",
+                format!("superagent:\n  multiagent:\n    join: {join}\n").as_str(),
+                1,
+            );
+            let cfg = ServeConfig::parse(&yaml).unwrap();
+            let sa = cfg.superagent.as_ref().unwrap();
+            let err = sa
+                .multiagent_config()
+                .expect_err("join any/quorum must refuse to boot");
+            let msg = err.to_string();
+            assert!(msg.contains("superagent.multiagent"), "{msg}");
+            assert!(msg.contains("join"), "{msg}");
+            assert!(
+                msg.contains("no evaluation site"),
+                "names the missing evaluation site: {msg}"
+            );
+            assert!(
+                msg.contains("deferred") || msg.contains("deferral"),
+                "names the deferral: {msg}"
+            );
+        }
+        // A quorum of zero is a malformed bound, not a deferral.
+        let zero = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: quorum:0\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&zero).unwrap();
+        let err = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .multiagent_config()
+            .expect_err("quorum:0 must refuse");
+        assert!(err.to_string().contains("n ≥ 1"), "names the bound: {err}");
+    }
+
+    #[test]
+    fn join_all_and_absent_boot_and_unknown_values_refuse_naming_the_forms() {
+        // Absent: the default policy (`all`) — the block still boots.
+        let absent = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    max_children: 2\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&absent).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert!(
+            sa.multiagent_config().unwrap().is_some(),
+            "absent join boots with the default"
+        );
+        // Explicit `all`: accepted.
+        let all = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: all\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&all).unwrap();
+        assert!(
+            cfg.superagent
+                .as_ref()
+                .unwrap()
+                .multiagent_config()
+                .unwrap()
+                .is_some(),
+            "join: all boots"
+        );
+        // An unknown value names the accepted forms.
+        let bogus = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    join: sometimes\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&bogus).unwrap();
+        let err = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .multiagent_config()
+            .expect_err("unknown join value must refuse");
+        assert!(
+            err.to_string().contains("`all` | `any` | `quorum:<n>`"),
+            "names the accepted forms: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // the task-board switch block (R17 C4, pin P3-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn board_block_defaults_off_and_parses_both_keys() {
+        // Absent block: both keys false — feature-off, byte-identical
+        // (`anchors.md` rule 4), and the conversion is simply off.
+        let cfg = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(sa.board, BoardConfigDef::default());
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: false,
+                gating: false
+            }
+        );
+
+        // The block parses both keys; `enabled` alone is legal P3.
+        let on = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabled: true\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&on).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: true,
+                gating: false
+            }
+        );
+    }
+
+    #[test]
+    fn board_gating_true_boots_with_the_multiagent_block_and_refuses_without_it() {
+        // (R17-C6, pin P4-1 / §7.1:737-741) `gating: true` is live
+        // since the key groups landed: it converts cleanly when (and
+        // only when) the `multiagent` block is present — neither board
+        // key can enable anything multiagent has not already enabled.
+        let with_multiagent = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  multiagent:\n    max_children: 2\n  board:\n    gating: true\n",
+            1,
+        );
+        let cfg = ServeConfig::parse(&with_multiagent).unwrap();
+        let sa = cfg.superagent.as_ref().unwrap();
+        assert_eq!(
+            sa.board_config().unwrap(),
+            BoardConfig {
+                enabled: false,
+                gating: true
+            }
+        );
+
+        // Without the multiagent block: a refusal naming the block,
+        // never a silent no-op (§7.1:737-741).
+        let gating = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    gating: true\n",
+            1,
+        );
+        let err = ServeConfig::parse(&gating)
+            .expect_err("board.gating without multiagent must refuse to boot");
+        let msg = err.to_string();
+        assert!(msg.contains("superagent.board"), "{msg}");
+        assert!(msg.contains("multiagent"), "{msg}");
+    }
+
+    #[test]
+    fn board_unknown_keys_refuse_boot() {
+        let typo = superagent_yaml().replacen(
+            "superagent:\n",
+            "superagent:\n  board:\n    enabeld: true\n",
+            1,
+        );
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "deny_unknown_fields must refuse a mistyped board key"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5967,6 +6448,158 @@ recovery:
         assert!(
             ServeConfig::parse(&spliced).is_ok(),
             "zero-endpoints dsh config boots exactly as before"
+        );
+    }
+
+    // -- superagent.roster: (R17-C1) --------------------------------
+
+    /// The superagent fixture plus a `research` agent (the roster's
+    /// resolution target) — the base every roster case splices onto.
+    fn roster_base_yaml() -> String {
+        superagent_yaml().replace(
+            "superagent:\n  router:",
+            "  research:\n    id: research\n    version: 1\n    model_slots:\n      \
+             main:\n        provider: openai\n        model: gpt-research\n    tools: \
+             [\"fs_read\", \"recall_event\"]\nsuperagent:\n  router:",
+        )
+    }
+
+    /// The base fixture with `roster_block` spliced under
+    /// `superagent:` (the caller indents to the entry level).
+    fn roster_yaml(roster_block: &str) -> String {
+        roster_base_yaml().replace(
+            "  worker:\n    agent: worker\n    pinned_version: 7\n",
+            &format!("  worker:\n    agent: worker\n    pinned_version: 7\n{roster_block}"),
+        )
+    }
+
+    /// One valid roster entry yaml (agent `research`, a leaf).
+    const VALID_ENTRY: &str = "  roster:\n    - id: researcher\n      description: Finds and \
+         cites sources\n      agent: research\n      mandate_template:\n        scope: read-only \
+         research\n        strength: inferred\n      tools_allow: [\"fs_read\"]\n      limits: \
+         {max_children: 0}\n";
+
+    #[test]
+    fn roster_absent_or_empty_converts_to_none_feature_off() {
+        // Pin P2-6: absent/empty roster ⇒ `None` ⇒ no `list_agents`,
+        // no validation, today's bytes.
+        let base = ServeConfig::parse(&roster_base_yaml()).expect("base config");
+        assert_eq!(base.roster_config().expect("absent roster"), None);
+        let empty = roster_yaml("  roster: []\n");
+        let cfg = ServeConfig::parse(&empty).expect("empty roster config");
+        assert_eq!(cfg.roster_config().expect("empty roster"), None);
+    }
+
+    #[test]
+    fn an_entry_naming_no_configured_agent_refuses_boot_naming_the_known_ids() {
+        // Pin P2-1: discovery is exactly `named_agent_def` — an
+        // unknown `agent` refuses boot, naming the known `agents:`
+        // ids (not the default `agent:`).
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Ghost\n      agent: nope\n      \
+             mandate_template: {scope: s, strength: inferred}\n      tools_allow: []\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("unknown agent refuses");
+        let text = err.to_string();
+        assert!(text.contains("nope"), "names the unknown id: {text}");
+        assert!(
+            text.contains("router") && text.contains("worker") && text.contains("research"),
+            "names the known agents: ids: {text}"
+        );
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_roster_ids_refuse_boot_at_the_config_gate() {
+        let block = format!(
+            "{VALID_ENTRY}    - id: researcher\n      description: Again\n      agent: research\n      \
+             mandate_template: {{scope: s, strength: inferred}}\n      tools_allow: []\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let err = cfg.roster_config().expect_err("duplicate ids refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("duplicate") && text.contains("researcher"),
+            "{text}"
+        );
+        assert!(text.contains("superagent.roster"), "{text}");
+    }
+
+    #[test]
+    fn a_widening_tools_allow_refuses_boot_at_the_config_gate() {
+        // M3 / §5.1:551-552 — `exec` is not on the `research` agent's
+        // surface, so listing it refuses boot.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Widening\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: [\"fs_read\", \"exec\"]\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("widening refuses");
+        let text = err.to_string();
+        assert!(text.contains("exec"), "names the tool: {text}");
+        assert!(
+            text.contains("superagent.roster[0]"),
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_subset_output_schema_refuses_boot_naming_the_key_and_keyword() {
+        // Pin P2-3: `oneOf` is outside the closed subset — the
+        // refusal names the keyword and the key.
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Scheming\n      agent: \
+             research\n      mandate_template: {scope: s, strength: inferred}\n      \
+             tools_allow: []\n      output_schema:\n        oneOf:\n          - type: string\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("parses");
+        let err = cfg.roster_config().expect_err("outside the subset refuses");
+        let text = err.to_string();
+        assert!(text.contains("oneOf"), "names the keyword: {text}");
+        assert!(
+            text.contains("superagent.roster[0].output_schema") || {
+                // the RosterError prefix composes as
+                // `superagent.roster[0]: … output_schema: …`
+                text.contains("superagent.roster[0]") && text.contains("output_schema")
+            },
+            "names the key: {text}"
+        );
+    }
+
+    #[test]
+    fn a_valid_roster_converts_in_config_order_with_leaf_legal() {
+        // §3.1:360-361: `max_children: 0` is a legal leaf; a missing
+        // `limits` takes the §5.3 default (4); config order holds.
+        let block = format!(
+            "{VALID_ENTRY}    - id: recaller\n      description: Recalls events\n      agent: \
+             research\n      mandate_template: {{scope: s, strength: explicit}}\n      \
+             tools_allow: [\"fs_read\", \"recall_event\"]\n      output_schema:\n        \
+             type: object\n        required: [summary]\n        properties:\n          summary: \
+             {{type: string}}\n"
+        );
+        let cfg = ServeConfig::parse(&roster_yaml(&block)).expect("parses");
+        let roster = cfg
+            .roster_config()
+            .expect("valid roster converts")
+            .expect("some");
+        assert_eq!(roster.known_ids(), vec!["researcher", "recaller"]);
+        let leaf = roster.resolve("researcher").expect("leaf resolves");
+        assert_eq!(leaf.limits.max_children, 0, "the leaf fact");
+        assert_eq!(leaf.agent, "research");
+        let defaulted = roster.resolve("recaller").expect("defaulted resolves");
+        assert_eq!(defaulted.limits.max_children, 4, "the §5.3 default");
+        assert_eq!(
+            defaulted.mandate_template.strength,
+            kian_superagent::MandateStrength::Explicit
+        );
+        assert!(
+            defaulted.output_schema.is_some(),
+            "the schema rides the entry"
         );
     }
 }

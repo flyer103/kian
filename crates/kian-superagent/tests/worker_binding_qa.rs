@@ -279,6 +279,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         mandate: None,
         exec_worker: None,
         identity: None,
+        output_schema: None,
     });
     let wrapper = legacy.task_message["content"].clone();
     assert_eq!(
@@ -307,6 +308,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         mandate: None,
         exec_worker: Some("qa-two".to_string()),
         identity: None,
+        output_schema: None,
     });
     let bound_wrapper = bound.task_message["content"].clone();
     let mut expected_keys = sorted_keys(&wrapper);
@@ -332,6 +334,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         mandate: Some(json!({"strength": "explicit", "scope": "qa"})),
         exec_worker: None,
         identity: None,
+        output_schema: None,
     });
     let composed_bound = spawner.prepare(&SpawnRequest {
         task,
@@ -340,6 +343,7 @@ fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
         mandate: Some(json!({"strength": "explicit", "scope": "qa"})),
         exec_worker: Some("qa-one".to_string()),
         identity: None,
+        output_schema: None,
     });
     let mut composed_expected = sorted_keys(&composed_legacy.task_message["content"]);
     composed_expected.push(EXEC_WORKER_KEY.to_string());
@@ -371,6 +375,7 @@ fn qa_thread_started_payload_additive_and_both_sides_agree() {
         mandate: None,
         exec_worker: Some("qa-two".to_string()),
         identity: None,
+        output_schema: None,
     });
     let task_message = spawned.task_message.clone();
 
@@ -404,6 +409,64 @@ fn qa_thread_started_payload_additive_and_both_sides_agree() {
         thread_started_worker_binding(&legacy),
         WorkerBinding::Unbound
     );
+
+    // (R17-C6, pin P4-2) re-pointed at WRAPPER equality: once the P4
+    // class-A keys land, the two sides' `thread/started` payloads are
+    // NO LONGER byte-identical to each other — the parent carries the
+    // bookkeeping (`attempt`, `depends_on[]`, `group?`) and the child
+    // the derivable subset — while the delegation wrapper (`task`)
+    // they embed stays byte-identical, and every frozen field keeps
+    // its value on both sides.
+    let uid = uuid::Uuid::new_v4();
+    let task_id = uuid::Uuid::new_v4();
+    let parent = kian_superagent::audit::parent_thread_started_payload(
+        bound.clone(),
+        &kian_superagent::audit::ParentThreadAudit {
+            spawn_uid: uid,
+            task_id,
+            assignee: Some("qa-entry".to_string()),
+            attempt: 2,
+            depends_on: vec!["upstream".to_string()],
+            group: None,
+        },
+    );
+    let child = kian_superagent::audit::child_thread_started_payload(
+        bound.clone(),
+        uid,
+        task_id,
+        Some("qa-entry"),
+    );
+    assert_eq!(parent["task"], child["task"], "wrapper identical (P4-2)");
+    assert_eq!(parent["task"], task_message, "wrapper untouched");
+    for key in ["thread_id", "parent", "worker", "pinned_version"] {
+        assert_eq!(parent[key], child[key], "frozen field {key} agrees");
+    }
+    let mut parent_group: Vec<String> = parent["multiagent"]
+        .as_object()
+        .expect("group object")
+        .keys()
+        .cloned()
+        .collect();
+    parent_group.sort();
+    let mut child_group: Vec<String> = child["multiagent"]
+        .as_object()
+        .expect("group object")
+        .keys()
+        .cloned()
+        .collect();
+    child_group.sort();
+    parent_group.retain(|k| !child_group.contains(k));
+    assert_eq!(
+        parent_group,
+        vec!["attempt".to_string(), "depends_on".to_string()],
+        "the parent-only keys are exactly the bookkeeping"
+    );
+    for key in ["depends_on", "group", "attempt"] {
+        assert!(
+            child["multiagent"].get(key).is_none(),
+            "`{key}` absent on the child, never null"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
