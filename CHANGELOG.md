@@ -10,6 +10,14 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Cron scheduler: declarative wall-clock turns (P0/P1)**. `superagent.cron.schedules` declares
+  five-field or `@`-alias expressions in an IANA zone; each due slot is claimed once in
+  `cron_firings` (migration v7, sqlite + postgres) and runs as an ordinary turn — on the resident
+  engine, or in a detached per-firing worktree when `worktree:` is declared, with disk guards and
+  `keep_on_failure`. Includes catch-up coalescing, DST-correct next-fire math, the
+  `kian cron list|run-now|logs|rm` CLI, and a non-context `cron` proof on the admitted input
+  (prompt bytes unchanged). Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md),
+  [ADR-034](design/decisions/ADR-034-cron-scheduler.md), [docs/SPEC.md](docs/SPEC.md) §5.
 - **Multiagent P4: `depends_on` + `group`, readiness gating (round 17, C7)**. With
   `superagent.board.gating: true`, `spawn_worker` grows `depends_on` (task keys) and `group`: the
   spawn is refused — before any side effect, from the primary only — until every named task has a

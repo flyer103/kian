@@ -356,8 +356,10 @@ Landed shape (P2b):
   identity is a first-class check), or an existing session id, and restores the events (under
   their own epoch/seq) and the full input rows — exactly the rows verification replayed, never a
   re-read — into the target store; the restored stream projects and re-exports identically.
-- **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass
-  (the round-9 plan's non-goal list keeps cron cadence out of scope).
+- **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass.
+  Wall-clock scheduling — retention cadence, dream cadence and every other cadence — is owned by
+  [CRON-MODEL.md](CRON-MODEL.md) (ADR-033), which supersedes the earlier "cadence out of scope"
+  statement; this document only defines the serving form.
 
 ## 8. Bounded staleness and degradation (P2/P3)
 

@@ -3683,15 +3683,11 @@ pub const CRON_SCHEDULE_ID_MAX_LEN: usize = 64;
 
 /// The `superagent.cron:` section (CRON-MODEL §3.1): the declared
 /// schedules, validated fail-closed at load and resolved into
-/// [`CronRuntimeSchedule`]s by [`CronSection::to_runtime`].
-///
-/// Absent (the default) = no cron schedules declared, nothing to fire.
-/// The tick loop (§7.3), the durable cursor (§4), the dsh execution path
-/// (§6) and the CLI (§10) are later increments — this section only
-/// declares and validates. `sandbox` (§8.2) and `worktree` (§6) are listed
-/// in §3.1 but land with those sections' increments: an unknown key still
-/// refuses boot here (`deny_unknown_fields`), never a silently ignored
-/// policy field.
+/// [`CronRuntimeSchedule`]s by [`CronSection::to_runtime`]. The tick loop
+/// (§7.3), the durable cursor (§4), the dsh/worktree execution path (§6) and
+/// the CLI (§10) consume these resolutions. `sandbox` (§8.2) is designed, not
+/// v1: an unknown key still refuses boot here (`deny_unknown_fields`), never a
+/// silently ignored policy field.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CronSection {

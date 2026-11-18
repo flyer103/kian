@@ -45,6 +45,9 @@ The same runtime also ships:
   of Recall, and untrusted-input marking.
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
+- **Scheduled turns** — declarative `superagent.cron` schedules execute as ordinary durable turns
+  (resident, or a detached per-firing git worktree), with a durable slot cursor, DST-correct
+  next-fire math, misfire coalescing, disk guards and a `kian cron list|run-now|logs|rm` surface.
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
@@ -112,6 +115,7 @@ The same runtime also ships:
 | [design/API-CONTRACT.md](design/API-CONTRACT.md) | The normative API contract: JSON-RPC surfaces, error codes, SSE/metrics/webhook, KiandProto |
 | [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) | The normative memory contract: notes, dreaming, creation-time injection, retrieval and representations |
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
+| [design/CRON-MODEL.md](design/CRON-MODEL.md) | The normative scheduling contract: expressions, timezones/DST, durable cursors, misfire/overlap, worktree firings, `kian cron` |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
@@ -745,6 +749,34 @@ target/debug/kian archive run    --config kian.yaml          # verify → marker
 target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes + replay offline
 ```
 
+### Scheduled turns (`superagent.cron`)
+
+```yaml
+superagent:
+  cron:
+    schedules:
+      - id: night-audit
+        expr: "30 3 * * 1-5"          # or an @alias: @daily, @weekly, ...
+        tz: Europe/Berlin
+        target: { channel: lark, topic: ops }
+        prompt: "audit the repo and summarise drift"
+        worktree: true                # detached per-firing git tree
+```
+
+Every due slot is claimed once in `cron_firings` and runs as an ordinary turn — on the resident
+engine, or in a detached worktree when `worktree:` is declared (disk guards and
+`keep_on_failure` apply). Inspect and drive it from the CLI:
+
+```bash
+target/debug/kian cron list   --config kian.yaml            # declarations, next fire, last outcome
+target/debug/kian cron logs   --schedule night-audit --limit 20
+target/debug/kian cron run-now night-audit --config kian.yaml   # one explicit slot
+target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store row
+```
+
+Semantics: [design/CRON-MODEL.md](design/CRON-MODEL.md); decision:
+[ADR-034](design/decisions/ADR-034-cron-scheduler.md).
+
 ### Operator surfaces
 
 | Surface | What it does |
@@ -792,6 +824,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
 | `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — the frozen creation-time index renderer, and the read-only search/map views |
+| `kian-cron` | Wall-clock scheduling core: cron grammar, IANA zones, DST-aware next-fire, misfire/coalescing |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
 | `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |

@@ -1597,6 +1597,7 @@ graph TB
  KC[kian-core<br/>concept model / state machine / invariants]
  KS[kian-store<br/>EventStore / Inbox / projection engine]
  KO[kian-orchestrator<br/>Admit→Wake→Drain→Promote<br/>+ recovery subsystem]
+ KCR[kian-cron<br/>grammar / next-fire / misfire]
  KL[kian-llm<br/>ModelProvider seam + openai-compat]
  KE[kian-exec<br/>KiandProto server half:<br/>ConnectionManager<br/>+ durable queue]
  KP[kian-plugin<br/>Ctx/Plugin/Disposer/dispatch]
@@ -1615,6 +1616,7 @@ graph TB
  KE --> KC & KS
  KSA --> KP & KO & KLD
  KCL --> KO
+ KCL --> KCR
  KDD --> KEP
  KE -.->|dials over TCP| KEP
  KSDK -.->| JSON-RPC + SSE over HTTP| KCL
@@ -1635,7 +1637,21 @@ graph TB
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
+| kian-cron | Wall-clock scheduling core (CRON-MODEL, ADR-033): five-field grammar and aliases, IANA zone resolution, DST gap/overlap-aware next-fire math, and misfire/coalescing plans. Pure — no I/O, no clock read, no store; the server and CLI own the loop | `CronExpr`, `next_fire_after`, `misfire::plan` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
+
+**Cron scheduling (CRON-MODEL — P0/P1 landed).** `kian-cli` owns the wall-clock loop: `kian
+serve` resolves `superagent.cron` at config load and, when the section is non-empty, arms one 1s
+ticker on a dedicated OS thread. Each tick walks the schedules; a due slot is claimed in
+`cron_firings` (the primary key is the idempotency lock) *before* anything is dispatched, and the
+cursor advances only after the claim, so a crash between the two re-claims nothing. Dispatch has
+two arms: the resident arm admits one durable inbox row for the target session (`{content, cron}`
+payload — the firing proof is additive and non-context — idempotency key `cron:<firing_id>`), and
+the worktree arm cuts a detached git tree under the resolved `worktree.root`, runs the configured
+harness under `timeout_ms`, then captures and cleans up (or keeps, `keep_on_failure`) the tree;
+the disk guards and the per-schedule slot ceiling live in `cron_worktree`. The ticker is not a
+plugin and not a second binary; it exits with the server. Semantics belong to
+[CRON-MODEL](CRON-MODEL.md).
 
 **Agent memory (MEMORY-MODEL Phases 1–2 — landed).** The `memory/note` kind and the pure fail-closed
 `parse_note`/`project_notes`/`verify_note` functions live in `kian-core::memory`; the dreamer

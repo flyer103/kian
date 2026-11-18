@@ -477,6 +477,24 @@ later channel inputs were admitted but never consumed.
 | Empty episode | A resident iteration with no eligible input and a context ending on an assistant message settles without a provider call (ADR-027); tool-result continuations and newly taken inputs proceed; non-resident loops unchanged. This removes the empty-batch `reasoning_content` 400 that could follow a no-reasoning assistant turn | landed |
 | Explicit terminal ends | cancel/fatal still end terminally; the boot-time re-arm remains the recovery. Runtime re-arm for explicit ends is a recorded deferred follow-up (needs a runtime-rebindable Router binding across subscriptions, driver, tools and worker reports) | landed (boundary) |
 
+### Scheduled turns (cron, P0–P1 landed)
+
+Scope: wall-clock scheduled work executes as ordinary durable turns — no schedule-execution
+engine, no new event kinds. The normative contract is
+[design/CRON-MODEL.md](../design/CRON-MODEL.md); the decision record is
+[ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-cron, kian-store, kian-cli | Five-field/`@`-alias grammar with IANA zones and DST gap/overlap rules; durable `cron_schedules`/`cron_firings` (sqlite + postgres, migration v7); claim-before-dispatch cursor; `kian cron list\|run-now\|logs\|rm`; config-only declarations, fail-closed at load | landed |
+| P1 | kian-cli | Worktree-backed firings: detached per-firing git tree, harness invocation, diff/stderr capture, `keep_on_failure`, free-space floor and total-cap GC; catch-up coalescing; one JSON tick report per decision | landed |
+| P2 | kian-cli, kian-store | Config-writing `kian cron add`, store-scoped schedules, per-firing `sandbox.*` knobs, `queue`/`kill-previous` overlap enforcement | designed |
+
+No new event kinds: a firing is an ordinary admitted turn. The admitted input carries the
+additive, non-context `cron` key plus a `cron:<firing_id>` idempotency key, so the model request
+bytes are the prompt alone. The tick loop and the durable adapter are exercised in-process (L2);
+the grammar, DST, misfire, store and worktree paths carry unit coverage (L1).
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

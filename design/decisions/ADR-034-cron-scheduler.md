@@ -1,6 +1,7 @@
-# ADR-033 — Cron scheduler: declarative schedules executed as dsh turns
+# ADR-034 — Cron scheduler: declarative schedules executed as dsh turns
 
-- **Status**: proposed (draft); supersedes the READ-MODEL §7 "cadence out of scope" statement.
+- **Status**: accepted (owner gate 2026-11-18; P0/P1 landed — see "Built shape" below); supersedes
+  the READ-MODEL §7 "cadence out of scope" statement.
 - **Date**: 2026-11-08
 - **Context**: [CRON-MODEL](../CRON-MODEL.md) §1–§12, [READ-MODEL](../READ-MODEL.md) §7,
   [ADR-004](ADR-004-cordis-inspired-plugin.md), [ADR-010](ADR-010-dsh-session-mapping.md),
@@ -94,13 +95,21 @@ the alternative. This ADR records the shape actually built on this branch and th
   unchanged; a firing is never retried inside its slot.
 - The worktree cost is real: one checkout per firing, and a 80 GiB floor can refuse to run on a
   small disk by design.
-- **Not yet implemented (seams, stated plainly):** the serve tick loop runs over the in-memory
-  store adapter, so a tick today records its intents and dispatches nothing — the durable-store
-  adapter and the resident-engine dispatcher are the next increment. The `cron_schedules` /
-  `cron_firings` tables and the claim/advance rules (D2) exist and are tested, but the serving loop
-  is not yet bound to them. Likewise the `WorktreeDispatcher` (dsh execution, D4) is reachable from
-  the CLI path only, not from a scheduled server tick, and per-schedule `worktree:` policy is not
-  yet plumbed from config into the dispatcher (defaults live in `WorktreePolicy`).
+- **Built shape (v1).** `kian serve` resolves `superagent.cron` and arms one 1s ticker on a
+  dedicated OS thread; the ticker claims `cron_firings` rows, advances the cursor, and dispatches
+  through `ScheduleDispatcher` — a resident arm that admits one durable inbox row (content
+  `{content, cron}`, idempotency key `cron:<firing_id>`) and a worktree arm that cuts a detached
+  git tree and runs the configured harness with `timeout_ms`. Disk guards (`min_free_gib` /
+  `min_free_percent` / `max_worktree_mib` / `total_cap_mib` / `max_output_kib`) and `keep_on_failure`
+  are enforced by `WorktreeDispatcher`. The CLI is `list` / `run-now` / `logs --schedule` / `rm`.
+- **Designed, not v1 (seams, stated plainly).** No config-writing `kian cron add`; no
+  per-firing `sandbox.*` knobs (tools are the target agent's, unchanged); no store-scoped
+  schedules; `queue` / `kill-previous` overlap policies are parsed and validated but behave as
+  `skip`; no `cron/*` event kinds and no cron metrics keys (the durable record is the
+  `cron_firings` row plus one JSON line per decision on the ticker's stream); no `--why`
+  diagnosis verb; the firing row does not yet persist `session_id` / `diff` / `missed` / `detail`;
+  the resident arm does not track a running-set (the session's single-flight drain serializes
+  overlapping slots).
 
 ## Alternatives considered
 

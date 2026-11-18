@@ -129,7 +129,7 @@ mutates projections directly. After a crash, replay rebuilds every in-memory str
 
 ## 4. Crate map
 
-Fourteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
+Fifteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
 `kian-orchestrator` depends only on core + store + seam traits, and no provider, channel or harness
 implementation ever enters its dependency tree.
 
@@ -141,6 +141,7 @@ implementation ever enters its dependency tree.
 | `kian-llm` | OpenAI-compatible `ModelProvider`, model slots, and the persist-before-send hook |
 | `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
 | `kian-memory` | The memory bundle: notes and dreaming, creation-time injection, and the read-only search/map representations |
+| `kian-cron` | Wall-clock scheduling core: five-field/`@`-alias grammar, IANA zones, DST-aware next-fire, misfire/coalescing — pure, no I/O |
 | `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, five-mode dispatch, `Disposer` |
 | `kian-endpoint` | KiandProto **endpoint-side** SDK library (embeddable in any process) |
 | `kian-exec` | KiandProto **server half**: connection manager, durable command queue with row leases, heartbeat watchdog |
