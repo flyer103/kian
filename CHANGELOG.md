@@ -10,6 +10,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Cron: the declaration reaches the store (CRON-MODEL §4.1/§12.3 fix)**. The resident ticker now
+  syncs each declared schedule into `cron_schedules` before it decides anything: a fresh deployment
+  writes its row instead of reporting `no row` on every tick, a store row deleted behind a running
+  server (`kian cron rm`) is re-created from the config on the next tick, and the upsert carries the
+  §4.1 declaration identity (sha256 over the normalized expression, the effective zone and the
+  target) so an edited declaration resets the cursor in the same atomic statement (both digests
+  logged) while policy-only edits (`prompt`, `overlap`, `catch_up`, timeouts) leave it untouched.
+  Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md) §4.1, §12.3.
+
 - **Durable confirmation plane — `ask`, `awaiting_input`, `control/confirm` (CONFIRMATION-MODEL
   phase 1, ADR-036)**. A tool call can be deferred to a person: `permissions.<tool>: ask` logs the
   call (a widened `permission.evaluated` value), never invokes it, and the drain ends with a fifth

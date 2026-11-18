@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use kian_core::model::SessionId;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::CronRuntimeSchedule;
 use crate::cron_tick::{
@@ -118,14 +119,78 @@ impl DurableCronTickStore {
     fn block<T>(&self, future: impl std::future::Future<Output = T>) -> T {
         self.handle.block_on(future)
     }
+
+    /// Syncs `cron_schedules` with the declaration (§4.1/§12.3). One
+    /// conditional upsert decides every case against the live row: absent ⇒
+    /// insert, same digest ⇒ cursor untouched, different digest ⇒ adopt the
+    /// declaration and reset the cursor. A reset is logged with both digests
+    /// so an edited schedule is never indistinguishable from a restart.
+    fn declare(&self, schedule: &CronRuntimeSchedule) -> Result<(), String> {
+        let digest = declaration_digest(schedule);
+        let updated = self.block(self.store.upsert_schedule(
+            &schedule.id,
+            &schedule.expr.to_string(),
+            &schedule.tz_name,
+            &digest,
+            schedule.enabled,
+            epoch_ms(Utc::now()),
+        ));
+        match updated {
+            Ok(kian_store::ScheduleUpsert::Redeclared { previous_digest }) => {
+                tracing::info!(
+                    schedule_id = %schedule.id,
+                    previous_digest = %previous_digest,
+                    digest = %digest,
+                    "cron declaration changed; cursor reset"
+                );
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(format!("cron_schedules `{}`: {error}", schedule.id)),
+        }
+    }
+}
+
+/// The declaration identity of §4.1 — sha256 over the normalized expression,
+/// the effective IANA zone and the resolved target. Everything else a
+/// schedule declares (`prompt`, `overlap`, `catch_up`, timeouts) is policy
+/// that must not restart the cursor (§12.3).
+pub fn declaration_digest(schedule: &CronRuntimeSchedule) -> String {
+    let target = match &schedule.target {
+        crate::config::CronTarget::Session { session } => format!("session:{session}"),
+        crate::config::CronTarget::Channel { channel, topic } => {
+            format!("channel:{channel}/{topic}")
+        }
+    };
+    let mut hasher = Sha256::new();
+    for part in [schedule.expr.to_string(), schedule.tz_name.clone(), target] {
+        hasher.update(part.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 impl CronTickStore for DurableCronTickStore {
     fn load_cursor(&self, schedule_id: &str) -> Result<Cursor, String> {
-        let row = self
+        // The declaration is synced on every tick, *before* anything is
+        // decided (§4.1/§12.3): the row is created from the config when it
+        // is absent (a fresh deployment, or a `kian cron rm` behind the
+        // running server), a changed declaration resets the cursor in the
+        // same atomic statement, and an unchanged one leaves it untouched.
+        // Reading a row that was never written was the old failure: no
+        // declaration ever reached the store, so every tick reported
+        // `no row` and no slot could be admitted.
+        let schedule = self
+            .schedules
+            .get(schedule_id)
+            .ok_or_else(|| format!("cron_schedules `{schedule_id}`: undeclared"))?;
+        self.declare(schedule)?;
+        let Some(row) = self
             .block(self.store.load_schedule(schedule_id))
             .map_err(|e| format!("cron_schedules `{schedule_id}`: {e}"))?
-            .ok_or_else(|| format!("cron_schedules `{schedule_id}`: no row"))?;
+        else {
+            return Ok(Cursor::default());
+        };
         let last_fire_at = match row.cursor_fire_at.as_deref() {
             Some(raw) => Some(parse_instant(raw, "cursor_fire_at")?),
             None => None,
@@ -149,10 +214,6 @@ impl CronTickStore for DurableCronTickStore {
                 last_fire_at,
             });
         }
-        let schedule = self
-            .schedules
-            .get(schedule_id)
-            .ok_or_else(|| format!("cron_schedules `{schedule_id}`: undeclared"))?;
         let seed = schedule
             .next_fire_after(Utc::now())
             .map_err(|e| format!("cron_schedules `{schedule_id}`: {e}"))?;
@@ -532,9 +593,6 @@ mod tests {
         let dir = TempDir::new("durable");
         let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
         let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
-        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
-        rt.block_on(store.upsert_schedule("audit", "* * * * *", "UTC", "digest-b7", true, now_ms))
-            .expect("the schedule is declared");
 
         let schedule = schedule("audit");
         let durable =
@@ -618,9 +676,6 @@ mod tests {
         let dir = TempDir::new("failed");
         let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
         let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
-        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
-        rt.block_on(store.upsert_schedule("audit", "* * * * *", "UTC", "digest-b7", true, now_ms))
-            .expect("the schedule is declared");
         let schedule = schedule("audit");
         let durable =
             DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
@@ -658,9 +713,6 @@ mod tests {
         let dir = TempDir::new("disk");
         let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
         let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
-        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0);
-        rt.block_on(store.upsert_schedule("audit", "* * * * *", "UTC", "digest-b7", true, now_ms))
-            .expect("the schedule is declared");
         let schedule = schedule("audit");
         let durable =
             DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
@@ -822,5 +874,148 @@ mod tests {
             "the fixture repo's worktree root was created: {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn declaration_digest_tracks_the_declaration_and_not_the_policy() {
+        let base = schedule("audit");
+        let digest = declaration_digest(&base);
+
+        let mut policy = base.clone();
+        policy.prompt = "a different prompt".to_string();
+        policy.timeout_ms += 1;
+        policy.coalesce_ms += 1;
+        assert_eq!(
+            declaration_digest(&policy),
+            digest,
+            "policy is not identity"
+        );
+
+        let mut expr = base.clone();
+        expr.expr = kian_cron::CronExpr::parse("*/5 * * * *").expect("expr parses");
+        assert_ne!(
+            declaration_digest(&expr),
+            digest,
+            "a new expr is a new declaration"
+        );
+
+        let mut zone = base.clone();
+        zone.tz_name = "Europe/Berlin".to_string();
+        assert_ne!(
+            declaration_digest(&zone),
+            digest,
+            "a new zone is a new declaration"
+        );
+
+        let mut target = base.clone();
+        target.target = crate::config::CronTarget::Channel {
+            channel: "cron-jobs".to_string(),
+            topic: "other".to_string(),
+        };
+        assert_ne!(
+            declaration_digest(&target),
+            digest,
+            "a new target is a new declaration"
+        );
+    }
+
+    #[test]
+    fn the_first_tick_declares_the_row_instead_of_failing_no_row() {
+        let rt = runtime();
+        let dir = TempDir::new("declare");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let schedule = schedule("audit");
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+
+        assert!(
+            rt.block_on(store.load_schedule("audit"))
+                .expect("the row reads")
+                .is_none(),
+            "nothing declares the schedule before the tick"
+        );
+
+        let cursor = durable
+            .load_cursor("audit")
+            .expect("the tick declares the row");
+        assert!(
+            cursor.next_fire_at.is_some(),
+            "a freshly declared schedule is seeded from its declaration"
+        );
+
+        let row = rt
+            .block_on(store.load_schedule("audit"))
+            .expect("the row reads")
+            .expect("the tick wrote the declaration row");
+        assert_eq!(row.expr, schedule.expr.to_string());
+        assert_eq!(row.tz, schedule.tz_name);
+        assert_eq!(row.declaration_digest, declaration_digest(&schedule));
+        assert!(row.enabled);
+        assert!(row.cursor_fire_at.is_none(), "a fresh row has no cursor");
+    }
+
+    #[test]
+    fn an_unchanged_declaration_keeps_the_cursor_and_a_changed_one_resets_it() {
+        let rt = runtime();
+        let dir = TempDir::new("redeclare");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let schedule = schedule("audit");
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        let fake = Arc::new(FakeResident::default());
+        let dispatcher =
+            ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(fake.clone())));
+
+        let anchor = schedule
+            .next_fire_after(Utc::now())
+            .expect("a minute-granular expression has a next fire");
+        let (report, _) = tick_and_dispatch_classified(
+            anchor + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &durable,
+            &dispatcher,
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.admitted.len(), 1);
+        let fired = rt
+            .block_on(store.load_schedule("audit"))
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(
+            fired.cursor_fire_at.as_deref(),
+            Some(fire_time_text(anchor).as_str())
+        );
+
+        // A restart with the same declaration: the cursor survives.
+        let same =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        same.load_cursor("audit").expect("the redeclare reads");
+        let kept = rt
+            .block_on(store.load_schedule("audit"))
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(
+            kept.cursor_fire_at, fired.cursor_fire_at,
+            "an unchanged declaration never moves the cursor"
+        );
+        assert_eq!(kept.next_fire_at, fired.next_fire_at);
+
+        // An edited expression: the row adopts it and the cursor resets.
+        let mut edited = schedule.clone();
+        edited.expr = kian_cron::CronExpr::parse("*/5 * * * *").expect("expr parses");
+        let changed = DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![edited]);
+        changed.load_cursor("audit").expect("the redeclare reads");
+        let reset = rt
+            .block_on(store.load_schedule("audit"))
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(reset.expr, "*/5 * * * *");
+        assert!(
+            reset.cursor_fire_at.is_none(),
+            "a changed declaration resets the cursor"
+        );
+        assert!(reset.next_fire_at.is_none());
     }
 }
