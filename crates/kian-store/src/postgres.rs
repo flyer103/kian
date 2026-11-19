@@ -883,7 +883,7 @@ pub(crate) const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WH
 
 pub(crate) const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES ($1::text, $2::text, $3::text, $4::bigint, $5::text, $6::text, $7::text, $8::bigint, $9::text)\nON CONFLICT DO NOTHING";
 
-pub(crate) const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = $2::text,\n    worktree_path = COALESCE($3::text, worktree_path),\n    finished_at = $4::bigint,\n    error = $5::text\nWHERE firing_id = $1::text AND state IN ('admitted', 'running')";
+pub(crate) const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = $2::text,\n    worktree_path = COALESCE($3::text, worktree_path),\n    finished_at = $4::bigint,\n    skip_reason = COALESCE($5::text, skip_reason),\n    error = $6::text\nWHERE firing_id = $1::text AND state IN ('admitted', 'running')";
 
 pub(crate) const CRON_ADVANCE_CURSOR_SQL: &str = "UPDATE cron_schedules\nSET cursor_fire_at = $2::text,\n    next_fire_at = $3::text,\n    updated_at = $4::bigint\nWHERE id = $1::text\n  AND (cursor_fire_at IS NULL OR cursor_fire_at < $2::text)\n  AND EXISTS (SELECT 1 FROM cron_firings WHERE firing_id = $5::text)";
 
@@ -966,6 +966,7 @@ pub(crate) async fn cron_finish_firing(
     state: &str,
     finished_at: Option<i64>,
     worktree_path: Option<&str>,
+    skip_reason: Option<&str>,
     error: Option<&str>,
 ) -> Result<bool, crate::cron::CronError> {
     let res = sqlx::query(CRON_FIRING_FINISH_SQL)
@@ -973,6 +974,7 @@ pub(crate) async fn cron_finish_firing(
         .bind(state)
         .bind(worktree_path)
         .bind(finished_at)
+        .bind(skip_reason)
         .bind(error)
         .execute(pool)
         .await?;

@@ -12,10 +12,13 @@
 > 2026-11-18; P2 partially: disk-cap GC landed, store-scoped rows designed). This document
 > **supersedes** the `READ-MODEL.md` §7 "Cadence" scope statement that keeps cron cadence out of
 > scope: retention cadence, schedule cadence and every other wall-clock cadence are owned here.
-> **P0** — config shape, next-fire math, durable cursor, `kian cron list|rm`, skip/queue overlap,
+> **P0** — config shape, next-fire math, durable cursor, `kian cron list|rm`, `skip` overlap,
 > restart-safe single-fire. **P1** — worktree-backed dsh firings, catch-up coalescing,
-> `cron logs`, `cron run-now`. **Designed, not v1** — a config-writing `kian cron add`,
-> per-firing `sandbox.*` knobs (§8.2–§8.3), store-scoped schedules.
+> `cron logs`, `cron run-now`, firing settlement (§9.1) and per-schedule isolation repos.
+> **Designed, not v1** — a config-writing `kian cron add`, `queue`/`kill-previous` overlap,
+> per-firing `sandbox.*` knobs (§8.2–§8.3), store-scoped schedules, a global concurrency
+> ceiling. A declaration that asks for an unimplemented policy **refuses load** (§3.3 rule 8):
+> the v1 contract does not accept a knob it cannot enforce.
 
 ## 0. Scope and relationship to the other contracts
 
@@ -147,22 +150,25 @@ Schedules live in a new `superagent.cron:` section, beside `channels:`, `watchdo
 | `enabled` | bool | no | `true` | Declared-but-off schedules are validated and listed, never fired. |
 | `target` | table | yes | — | Where the firing's turn lands (§3.2). |
 | `prompt` | string | yes | — | The turn's user message (§3.4 templates). |
-| `overlap` | `skip`\|`queue`\|`kill-previous` | no | `skip` | §5.1. |
+| `overlap` | `skip` | no | `skip` | §5.1. `queue`/`kill-previous` are designed, not v1: they **refuse load**. |
 | `catch_up` | `skip`\|`latest` | no | `latest` | §5.3. |
 | `coalesce_ms` | u64 | no | `900000` (15 min) | Lateness honored by `latest` (§5.3). |
-| `max_concurrent` | u32 | no | `1` | Ceiling for this schedule (§5.4). |
-| `timeout_ms` | u64 | no | `1800000` (30 min) | Per-firing ceiling (§5.5). |
-| `sandbox` | table | no | inherit | Per-firing exec surface (§8.2). |
-| `worktree` | table | no | inherit | Worktree policy (§6). |
+| `max_concurrent` | u32 | no | `1` | Ceiling for one schedule's worktree firings (§5.4); the resident arm is serialized by its session. |
+| `timeout_ms` | u64 | no | `1800000` (30 min) | Per-firing ceiling, **worktree arm only** (§5.5). An explicit value on a resident schedule refuses load. |
+| `worktree` | `true`\|table | no | absent (resident arm) | Worktree policy (§6). |
 
 ### 3.2 Target
 
 `target` is exactly one of `{session: <uuid>}` — fire into a fixed session (the watchdog-shaped
-pattern) — or `{channel: <name>, topic: <topic>}` — fire as a channel event so existing
-subscription rules decide the session (`route: router` spawns a worker per firing,
-`route: {session: …}` lands in the resident one). A target naming an undeclared channel, or a
-channel whose `type` is not `cron`, is a fail-closed config error — the same cross-reference
-discipline `superagent.subscriptions[*].channel` already enforces.
+pattern; the session must already exist or be bootstrapped by the first admit) — or
+`{channel: <name>, topic: <topic>}`, which names the **namespace** of a deterministic plain
+session: the id is derived from `cron:<channel>/<topic>`, so every firing of that channel/topic
+lands in the same conversation and a restart re-derives the same id. A channel target does
+**not** pass through the subscription pipeline in v1 (no Router spawn, no inference worker): the
+firing runs the plain session's default agent. The channel must be declared
+(`superagent.channels`), fail-closed — the same cross-reference discipline
+`superagent.subscriptions[*].channel` enforces. `{session}` targets are validated for shape; an
+id that does not exist yet is bootstrapped on first admit like any control-plane session.
 
 ### 3.3 Validation (all fail-closed at load)
 
@@ -170,47 +176,43 @@ discipline `superagent.subscriptions[*].channel` already enforces.
 2. `id` is unique across `superagent.cron` and does not collide with a channel name.
 3. `target` resolves (§3.2); `worktree.repo` (if given) is a git repository.
 4. `coalesce_ms > 0`, `max_concurrent >= 1`, `timeout_ms > 0`.
-5. `overlap: kill-previous` with `max_concurrent > 1` is rejected as contradictory.
-6. `sandbox.allow` / `exec_allowlist` entries outside the configured surface are errors, never
-   silently dropped.
+5. `overlap: kill-previous` with `max_concurrent > 1` is rejected as contradictory (and
+   `kill-previous` itself refuses load in v1 — rule 8).
+6. An explicit `timeout_ms` on a schedule without `worktree:` is rejected: the resident arm has
+   no cron-owned deadline in v1 (§5.5).
 7. A schedule targeting the watchdog session (§7.2) is rejected: `cron_targets_watchdog`.
+8. An unimplemented policy is rejected instead of accepted-and-ignored: `overlap: queue` /
+   `kill-previous` refuse load with a message naming the v1 scope. (The `sandbox` block is not a
+   config field at all in v1 — §8.2.)
 
 ### 3.4 Example
 
 ```yaml
 superagent:
   cron:
-    night-audit:
-      id: night-audit
-      expr: "30 3 * * 1-5"          # 03:30 Mon-Fri
-      tz: Europe/Berlin
-      enabled: true
-      target: { channel: cron-jobs, topic: audit }
-      prompt: "Audit .state/ for orphaned worktrees and stale locks; open a PR if you change anything."
-      overlap: skip
-      catch_up: latest
-      coalesce_ms: 900000
-      max_concurrent: 1
-      timeout_ms: 1800000
-      sandbox:
-        allow: ["fs_read", "exec"]
-        exec_allowlist: ["git", "rg"]
-        cpu_ms: 120000
-        mem_mb: 2048
-      worktree:
-        repo: "~/code/kian"
-        keep_on_failure: true
-        disk_cap_mb: 5120
+    schedules:
+      - id: night-audit
+        expr: "30 3 * * 1-5"          # 03:30 Mon-Fri
+        tz: Europe/Berlin
+        enabled: true
+        target: { channel: cron-jobs, topic: audit }
+        prompt: "Audit .state/ for orphaned worktrees and stale locks; open a PR if you change anything."
+        overlap: skip
+        catch_up: latest
+        coalesce_ms: 900000
+        max_concurrent: 1
+        worktree:
+          repo: "/srv/kian"            # absolute; a relative path resolves against the process cwd (no `~` expansion)
+          keep_on_failure: true
+        timeout_ms: 1800000            # legal: this schedule declares `worktree:`
   channels:
     cron-jobs:
-      type: cron
-      cron:
-        topic: audit       # the channel only carries firings; no cadence of its own
+      type: mock-im                  # any declared type; v1 does not route through it
 ```
 
-The channel declaration is required because every subscription must target a declared channel; a
-`type: cron` channel is inert without a schedule, and a schedule with a `channel` target is inert
-without a channel. Both directions are validated, exactly as `type: timer` is today.
+The channel declaration is required because a `channel` target must resolve in
+`superagent.channels`; the schedule's firings land in the deterministic plain session derived
+from `cron:<channel>/<topic>` (§3.2). A `{session: <uuid>}` target needs no channel.
 
 ## 4. Durable state
 
@@ -226,8 +228,10 @@ One row per schedule in the same store as the rest of kian state (`storage.sqlit
 | `last_fired_at` | TEXT NULL | UTC RFC 3339 of the last **committed** firing |
 | `next_fire_at` | TEXT NULL | UTC RFC 3339; `NULL` before first computation |
 | `last_firing_id` | TEXT NULL | idempotency key of the last firing (§4.3) |
-| `last_outcome` | TEXT NULL | `ok`\|`failed`\|`timeout`\|`skipped_overlap`\|`skipped_misfire`\|`worktree_unavailable` |
 | `updated_at` | TEXT | cursor write timestamp |
+
+The outcome is **not** a cursor column: it lives on the firing row (`cron_firings`, §9.1), and
+`kian cron list` derives the last outcome from the newest row.
 
 The cursor is derived state in the `READ-MODEL.md` sense — rebuildable in principle from firing
 records (§9.1) — but persisted so a restart never re-derives a fire time from the wall clock.
@@ -263,11 +267,12 @@ crash can re-attempt a slot but can neither skip nor duplicate one.
 useful work or stuck; overlapping two inspections of one repo produces duplicate PRs, the failure
 mode operators punish most.
 
-**v1 status.** The worktree arm enforces `skip` through the per-schedule slot ceiling
-(`max_concurrent`); the resident arm writes one inbox row and the session's single-flight drain
-serializes it, so an overlapping slot waits rather than being dropped. `queue` and `kill-previous`
-are parsed and validated but not yet differentiated — treat them as `skip` until the scheduler
-owns the running-set.
+**v1 status.** `skip` is enforced on both arms. The worktree arm enforces it through the
+per-schedule slot ceiling (`max_concurrent`); the resident arm asks the engine whether the target
+session has open work (`running`, unconsumed eligible input, or a pending decision) and records
+`skipped_overlap` instead of admitting the row — an overlapping slot used to wait behind the
+session's single-flight drain, which duplicated unattended runs. `queue` and `kill-previous` are
+**not** accepted in v1: they refuse load (§3.3 rule 8) rather than silently behaving as `skip`.
 
 ### 5.2 Due-ness and tick coalescing
 
@@ -291,35 +296,57 @@ were missed; the coalesce window is the only knob, and there is no unbounded rep
 
 ### 5.4 Concurrency
 
-Per schedule, `max_concurrent` (default 1). Globally, `superagent.cron.max_concurrent` (default
-4), keeping the resident server's memory and model-slot budget bounded. A firing that cannot
-start because the global ceiling is reached behaves as an overlap for that schedule — `skip` by
-default — so a storm of schedules at `0 0 * * *` degrades into fewer runs, never a thundering
-herd. Firings share the drain loop and are ordinary turns, so ADR-030 wait bounds apply unchanged.
+Per schedule, `max_concurrent` (default 1) bounds the worktree arm's concurrent turns. The
+resident arm is serialized by each target session's single-flight drain, and `skip` (§5.1) keeps
+a busy target from stacking slots. There is **no global concurrency ceiling in v1**: a storm of
+schedules at `0 0 * * *` can start one turn per distinct target session (the documented
+`superagent.cron.max_concurrent` knob is designed, not accepted). Resident firings share the drain
+loop and are ordinary turns, so ADR-030 wait bounds apply unchanged.
 
 ### 5.5 Timeout
 
-`timeout_ms` bounds one firing end to end (create + turn + capture + cleanup). On expiry the
-firing takes the ordinary interrupt path, settles as `timeout`, and — with
-`worktree.keep_on_failure` — leaves its worktree for inspection (§6.4). A timeout is never
-retried automatically within the same slot.
+`timeout_ms` bounds one **worktree** firing end to end (create + turn + capture + cleanup). On
+expiry the runner kills the child's process group, the firing settles `failed` with
+`timeout: killed after …`, and — with `worktree.keep_on_failure` — the worktree is left for
+inspection (§6.2). A timeout is never retried automatically within the same slot.
+
+The resident arm has **no** cron-owned deadline in v1: its firing is an ordinary admitted turn,
+bounded by `drain.max_iterations`, the exec timeout and ADR-030's wait bounds instead. An explicit
+`timeout_ms` on a resident schedule refuses load (§3.3 rule 6) rather than pretending to bound a
+turn the scheduler cannot interrupt.
+
+**v1 ticker behaviour.** The worktree arm runs its child synchronously inside the tick (the
+`CronDispatcher` contract notes it): one long worktree turn delays the *other* schedules' ticks by
+that turn's duration, and the 1s cadence is suspended meanwhile. Correctness does not depend on
+tick frequency (the cursor + catch-up decide), but latency does; a bounded execution pool is a P2
+item. The resident arm's dispatch is a single inbox write and never blocks.
 
 ## 6. Execution via the dsh harness
 
 ### 6.1 Path
 
-A firing is a normal turn; there is no cron-specific execution engine.
+Two execution arms, one decision record (the firing row, §9.1):
 
-1. The scheduler admits the prompt as an input row (durable-before-wake, A7) to the target
-   session, with the firing proof as an additive, non-context payload key
-   (`cron: {schedule_id, firing_id, fire_time, target}`) and the idempotency key
-   `cron:<firing_id>`; the model request carries the prompt alone.
-2. The session's harness is whatever `superagent.harness.dsh` configures
-   ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)); with no `dsh` section the firing runs on
-   the ReAct loop and §6.2-§6.5 degrade to a no-worktree turn — recorded as such, never silently.
-3. The dsh child is spawned with `cwd` = the per-firing worktree, inheriting the configured
-   `bin`, `args`, `slot`, `provider`, `model`, `max_steps`.
-4. On settlement the scheduler captures evidence (§6.2) and cleans up (§6.4).
+**Resident arm** (no `worktree:`): the firing is an ordinary admitted turn on an ordinary
+session. The scheduler admits the prompt as an input row (durable-before-wake, A7) to the target
+session, with the firing proof as an additive, non-context payload key
+(`cron: {schedule_id, firing_id, fire_time, target}`) and the idempotency key
+`cron:<firing_id>`; the model request carries the prompt alone. The session's harness is whatever
+`superagent.harness.dsh` configures ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)); the
+engine runs the turn and the firing settles from the session's end (§9.1).
+
+**Worktree arm** (`worktree:`) is an **isolated child run**, not a session turn: the
+scheduler does not create a session or events for it. This is deliberate isolation (a scheduled
+job must not mutate the operator's checkout, §6.5) and it is recorded honestly: the firing row
+carries the outcome, the worktree path, the exit code, the bounded output and the diff; the
+firing is **not** replayable from an event stream and does not contribute usage/recall. Choosing
+this arm is choosing a job, not a session ([ADR-034](decisions/ADR-034-cron-scheduler.md)).
+
+1. Resident: admit the prompt + `cron` proof + idempotency key; the model request is the prompt
+   alone. Worktree: create the per-firing tree, then spawn the harness.
+2. Resident: the session's harness (dsh bridge or the ReAct loop). Worktree: spawn the
+   configured `bin`/`args`/profile with `cwd` = the worktree.
+3. Worktree: on exit/timeout, capture stdout/stderr/diff (§6.2), settle the firing, clean up.
 
 ### 6.2 Worktree lifecycle: create → run → capture → cleanup
 
@@ -327,7 +354,7 @@ A firing is a normal turn; there is no cron-specific execution engine.
 |---|---|---|
 | **create** | `git worktree add --detach <root>/<slug> <base>`, `base` defaulting to `HEAD` of `worktree.repo`. | Any failure — not a repo, permission denied, ref lock, disk cap, `git` missing — is `worktree_unavailable`. The firing does not run and does not fall back to the primary checkout (§6.5). |
 | **run** | The dsh turn executes with `cwd` inside the worktree. | A turn failure is an ordinary failed firing; the worktree is preserved per policy. |
-| **capture** | `git status --porcelain`, `git diff --stat`, the full `git diff` and the tail of the dsh child's stderr are written to the firing record, diff capped at `worktree.max_diff_kb` (default 512, truncated with an explicit marker). | Capture errors are recorded, never fatal to a turn that already ran. |
+| **capture** | `git status --porcelain`, `git diff --stat`, the full `git diff` and the tail of the dsh child's stderr are written to the firing record, diff capped at `worktree.max_diff_kb` (default 512, truncated with an explicit marker). In v1 the **durable** row carries `state`, `worktree_path` and the bounded `error`; the captured diff/output detail rides the in-process firing record and is lost on restart (a P2 gap, recorded rather than over-claimed). | Capture errors are recorded, never fatal to a turn that already ran. |
 | **cleanup** | delete the worktree `target/` directory (where `CARGO_TARGET_DIR` points, §6.4) and record the freed bytes on the firing, then `git worktree remove --force <path>` and `git worktree prune`. Kept when `keep_on_failure: true` and outcome ≠ `ok`, or on `--keep`. | Cleanup is unconditional (success and failure alike) and failure-tolerant: a cleanup error is a note on the firing, the directory is enqueued for GC (§6.4), and the tick never fails. |
 
 ### 6.3 Naming
@@ -396,12 +423,14 @@ operator is editing is unacceptable, and isolation is the entire point of the wo
 | Trigger | monotonic interval from boot (`interval_ms`) | wall-clock fire time in a tz |
 | Phase | drifts from boot; no wall-clock meaning | fixed phase; survives restart |
 | Persistence | none — a restart restarts the cadence | cursor persisted (§4) |
+| Target | a subscription-routing channel | `{session}` or a derived `{channel, topic}` plain session (§3.2) |
 | Use | liveness/progress pings, the watchdog | calendar-meaningful work (nightly audit, weekday sweeps) |
 
 The timer channel stays byte-for-byte as documented in `config.rs` (`interval_ms`,
-`emit_on_start`, `topic`, `event_id: "tick-<n>"`). Cron adds a `type: cron` channel plus
-`superagent.cron`; both may be declared in one config and both route through the same
-subscription rules. Cron and timer are complementary, not versions of each other.
+`emit_on_start`, `topic`, `event_id: "tick-<n>"`). Cron adds `superagent.cron`; a `channel`
+target names a declared channel as its **namespace** (the derived session id, §3.2) and does not
+pass through the subscription pipeline in v1. Cron and timer are complementary, not versions of
+each other.
 
 ### 7.2 Relationship to the watchdog
 
@@ -473,7 +502,7 @@ non-context `cron: {schedule_id, firing_id, fire_time, target}` key plus the ide
 | `firing_id` | PK, `{schedule_id}@{fire_time}` — the idempotency key |
 | `schedule_id`, `fire_time` | logical identity; `fire_time` is UTC RFC 3339 whole seconds |
 | `admitted_at` | epoch ms the slot was recorded (it is the slot, not `now`: admission may be late) |
-| `state` | `admitted`\|`running`\|`succeeded`\|`failed`\|`skipped` |
+| `state` | `admitted`\|`running`\|`succeeded`\|`failed`\|`skipped` (settled by the worktree arm's known outcome, or by the resident-arm settlement sweep reading the target session's end) |
 | `skip_reason` | machine token for `skipped`: `skipped_overlap`, `superseded`, `outside_coalesce`, `policy_skip`, `queue_starved`, `disk_cap`, … |
 | `worktree_path` | the per-firing tree, when one was created (§6.2) |
 | `finished_at` | epoch ms at settlement; absent while `admitted`/`running` |
@@ -510,7 +539,7 @@ firing rows newest-first. The decisive answer is in those rows:
 | Command | Flags | Behaviour |
 |---|---|---|
 | `kian cron list` | `--config <path> --json` | Declared schedules (id, expr, tz, next fire, enabled, last outcome) plus store-only rows flagged as undeclared. Opens the store itself; no server required. |
-| `kian cron run-now <id>` | `--config <path> --json` | Admits one firing immediately for the current whole-second slot (the same `firing_id`, so a repeat is a recorded no-op); the worktree arm is used when the schedule declares `worktree:`. Refuses an unknown or disabled id. |
+| `kian cron run-now <id>` | `--config <path> --json` | Runs one worktree-isolated firing immediately for the current whole-second slot (the same `firing_id`, so a repeat is a recorded no-op), cut from that schedule's `worktree.repo`. Refuses an unknown or disabled id, and **refuses a resident-arm schedule**: this process cannot wake a running `kian serve`'s drain (sqlite has no notify transport), so pretending to run it would execute the payload in a tree the schedule never asked for. |
 | `kian cron logs --schedule <id>` | `--limit <n> --config <path> --json` | Firing rows newest-first: state, fire time, duration, skip reason, error. |
 | `kian cron rm <id>` | `--config <path> --json` | Drops the store row (cursor and history included); the declaration still needs editing out of the config, and the command prints that reminder. |
 
@@ -578,7 +607,10 @@ document does not trigger that path.
 | Integration (concurrency) | 8 schedules at one minute, global ceiling 4 | ≤ max_concurrent per schedule; the rest recorded as `skipped_overlap`, not errors |
 | Integration (sandbox) | prompt calling a non-allowlisted `exec` | designed, not v1 (§8.2) |
 | Integration (coexist) | cron + timer + watchdog in one config | all three fire; a cron target naming the watchdog session rejected at load |
-| Integration (CLI) | `list` → `run-now` → `logs --schedule` → `rm` | round-trip; logs names the state and skip reason |
+| Unit (overlap) | busy target session, `overlap: skip` | one `skipped_overlap` row with its reason; the payload never reaches the session (`a_busy_target_session_skips_the_slot_instead_of_queueing_it`) |
+| Unit (settlement) | resident firing, target session ends `completed` | the firing row settles `succeeded` with `finished_at` (`the_settlement_sweep_records_the_target_sessions_end`) |
+| Integration (config) | `overlap: queue` / resident `timeout_ms` / watchdog target | load refuses, naming the rule (§3.3 rules 6–8) |
+| Integration (CLI) | `list` → `run-now` → `logs --schedule` → `rm` | round-trip; logs names the state and skip reason; `run-now` refuses a resident schedule |
 | Regression | existing `examples/issue-watch` timer config | unchanged behaviour, no cron table created |
 
 ## 14. Open questions
@@ -604,7 +636,7 @@ document does not trigger that path.
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Duplicate turns after a crash (idempotency bug) | duplicate PRs/comments; trust loss | `firing_id` PK plus admit-then-advance ordering (§4.3, §7.4); restart-idempotency test is a gate |
-| Laptop sleep producing a burst on wake | thundering herd, cost spike | `catch_up: latest` + coalesce window + global ceiling (§5.3, §5.4) |
+| Laptop sleep producing a burst on wake | thundering herd, cost spike | `catch_up: latest` + coalesce window + the per-target `skip` judgement (§5.3, §5.4); a global ceiling is designed, not v1 |
 | Worktree disk growth on a busy repo | fills the operator's disk silently | `disk_cap_mb` with pre-create measurement and eviction; GC on the tick loop (§6.4) |
 | DST bugs | firings at the wrong hour, twice or never | pure `next_fire` with dedicated DST tests; skip-in-gap / run-once-on-overlap fixed in v1 (§2.4) |
 | Silent scheduler death (loop panic) | nothing runs, nothing complains | every skip is an event and a metric; `cron list` exposes stale `LAST`/`NEXT` (§9) |

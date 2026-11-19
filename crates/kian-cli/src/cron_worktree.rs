@@ -47,7 +47,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::config::{CronHarnessSection, CronHarnessSettings, CronRuntimeSchedule};
-use crate::cron_tick::CronDispatcher;
+use crate::cron_tick::{CronDispatcher, DispatchOutcome, FiringState};
 
 /// Default retention for *preserved* worktrees (§6.4), hours.
 pub const DEFAULT_RETAIN_HOURS: u64 = 72;
@@ -1057,6 +1057,32 @@ impl CronDispatcher for WorktreeDispatcher {
             None => Ok(()),
         }
     }
+
+    fn take_outcome(&self, firing_id: &str) -> Option<DispatchOutcome> {
+        let firing = self.firing(firing_id)?;
+        let (state, skip_reason) = match firing.outcome {
+            FiringOutcome::Ok => (FiringState::Succeeded, None),
+            FiringOutcome::SkippedOverlap => {
+                (FiringState::Skipped, Some("skipped_overlap".to_string()))
+            }
+            FiringOutcome::SkippedDiskPressure => (
+                FiringState::Skipped,
+                Some("skipped_disk_pressure".to_string()),
+            ),
+            FiringOutcome::Failed | FiringOutcome::Timeout | FiringOutcome::WorktreeUnavailable => {
+                (FiringState::Failed, None)
+            }
+        };
+        Some(DispatchOutcome {
+            state,
+            worktree_path: firing
+                .worktree_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            skip_reason,
+            error: firing.error.clone(),
+        })
+    }
 }
 
 /// One held concurrency slot (§5.4); releasing it is `Drop`.
@@ -1270,6 +1296,7 @@ mod tests {
         let yaml = format!(
             "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    \
              max_concurrent: {max_concurrent}\n    timeout_ms: {timeout_ms}\n    \
+             worktree: true\n    \
              target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit .state/\n"
         );
         let section: crate::config::CronSection =
@@ -1970,7 +1997,7 @@ mod tests_b4b {
     fn schedule(id: &str) -> CronRuntimeSchedule {
         let yaml = format!(
             "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    \
-             max_concurrent: 1\n    timeout_ms: 60000\n    \
+             max_concurrent: 1\n    timeout_ms: 60000\n    worktree: true\n    \
              target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit .state/\n"
         );
         let section: crate::config::CronSection =
@@ -2404,7 +2431,7 @@ mod tests_b4b {
         let bad: crate::config::CronSection =
             serde_yaml::from_str("disk:\n  total_cap_mib: 0\n").expect("it parses, then refuses");
         let error = bad
-            .validate(&channels())
+            .to_runtime(&channels(), chrono::Utc::now())
             .expect_err("a zero knob refuses boot");
         assert!(format!("{error}").contains("total_cap_mib"), "{error}");
 
@@ -2420,7 +2447,7 @@ mod tests_b4b {
             serde_yaml::from_str("disk:\n  max_worktree_mib: 4096\n  total_cap_mib: 1024\n")
                 .expect("it parses, then refuses");
         let error = contradictory
-            .validate(&channels())
+            .to_runtime(&channels(), chrono::Utc::now())
             .expect_err("a per-worktree cap above the total refuses boot");
         assert!(
             format!("{error}").contains("must be >= max_worktree_mib"),
@@ -2510,7 +2537,7 @@ mod tests_dsh_contract {
     fn schedule(id: &str) -> CronRuntimeSchedule {
         let yaml = format!(
             "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    \
-                    max_concurrent: 1\n    timeout_ms: 60000\n    \
+                    max_concurrent: 1\n    timeout_ms: 60000\n    worktree: true\n    \
                     target: {{ channel: cron-jobs, topic: audit }}\n    prompt: say hello\n"
         );
         let section: crate::config::CronSection =

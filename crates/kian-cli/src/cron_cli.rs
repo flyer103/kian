@@ -17,7 +17,7 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 
 use crate::config::{CronRuntimeSchedule, ServeConfig};
 use crate::cron_tick::{CronDispatcher, dispatch_payload};
-use crate::cron_worktree::{WorktreeDispatcher, WorktreePolicy};
+use crate::cron_worktree::WorktreeDispatcher;
 use kian_store::{CronFiringRow, EventStore, FiringState};
 
 /// `--limit` default for `kian cron logs`.
@@ -302,17 +302,21 @@ async fn open_store(config: &ServeConfig, read_only: bool) -> Result<EventStore,
     }
 }
 
-/// The production dispatcher: worktree-isolated `dsh`, `superagent.cron.disk`
-/// knobs applied, cut from the current directory (the repo `kian` runs in).
-fn default_dispatcher(config: &ServeConfig) -> WorktreeDispatcher {
-    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let policy = config
-        .superagent
+/// The production dispatcher for one isolated schedule: `dsh` in the
+/// schedule's own `worktree.repo` (never the process cwd — a `run-now`
+/// from another directory used to cut the tree from the wrong repo),
+/// with the `superagent.cron.disk` knobs applied.
+fn schedule_dispatcher(schedule: &crate::config::CronRuntimeSchedule) -> WorktreeDispatcher {
+    let plan = schedule
+        .worktree
         .as_ref()
-        .map_or_else(WorktreePolicy::default, |sa| {
-            WorktreePolicy::from_section(&sa.cron)
-        });
-    WorktreeDispatcher::new(repo).with_policy(policy)
+        .expect("only an isolated schedule reaches the production dispatcher");
+    let repo = plan
+        .repo
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    WorktreeDispatcher::new(repo).with_policy(plan.policy.clone())
 }
 
 fn fire_time_text(at: chrono::DateTime<Utc>) -> String {
@@ -430,6 +434,18 @@ async fn run_now(
             config_path.display()
         ));
     }
+    // A resident-arm firing is driven by the running server's drain; this
+    // process can write the inbox row but cannot wake another process's
+    // scheduler (sqlite has no notify transport). Refuse honestly rather
+    // than run the payload in a worktree the schedule never asked for —
+    // CRON-MODEL §10.
+    if injected.is_none() && schedule.worktree.is_none() {
+        return Err(format!(
+            "cron schedule `{id}` targets the resident engine; `kian cron run-now` can only \
+             run an isolated (`worktree:`) firing in v1 — the resident arm is driven by the \
+             running `kian serve` (CRON-MODEL §10)"
+        ));
+    }
     // The time check is bypassed; the *idempotency key* is not. The slot is
     // the current whole second, so `kian_cron::firing_id`'s shape
     // (`{schedule_id}@{fire_time}`) holds and a second `run-now` inside the
@@ -462,7 +478,7 @@ async fn run_now(
         let dispatcher: &dyn CronDispatcher = match injected {
             Some(dispatcher) => dispatcher,
             None => {
-                owned = default_dispatcher(&config);
+                owned = schedule_dispatcher(&schedule);
                 &owned
             }
         };
@@ -479,6 +495,7 @@ async fn run_now(
                         &firing_id,
                         FiringState::Failed,
                         Some(u64::try_from(now.timestamp_millis()).unwrap_or(0)),
+                        None,
                         None,
                         Some(&error),
                     )

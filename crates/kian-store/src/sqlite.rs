@@ -934,7 +934,7 @@ const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WHERE id = ?1
 const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)\nON CONFLICT DO NOTHING";
 
 /// Non-terminal rows only: a settled slot is never rewritten.
-const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = ?2,\n    worktree_path = COALESCE(?3, worktree_path),\n    finished_at = ?4,\n    error = ?5\nWHERE firing_id = ?1 AND state IN ('admitted', 'running')";
+const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = ?2,\n    worktree_path = COALESCE(?3, worktree_path),\n    finished_at = ?4,\n    skip_reason = COALESCE(?5, skip_reason),\n    error = ?6\nWHERE firing_id = ?1 AND state IN ('admitted', 'running')";
 
 /// The admit-then-advance guard (§4.3): the cursor only moves when it is
 /// unset or strictly behind the slot, and only when that slot has a
@@ -1023,6 +1023,7 @@ pub(crate) async fn cron_finish_firing(
     state: &str,
     finished_at: Option<i64>,
     worktree_path: Option<&str>,
+    skip_reason: Option<&str>,
     error: Option<&str>,
 ) -> Result<bool, crate::cron::CronError> {
     let res = sqlx::query(CRON_FIRING_FINISH_SQL)
@@ -1030,6 +1031,7 @@ pub(crate) async fn cron_finish_firing(
         .bind(state)
         .bind(worktree_path)
         .bind(finished_at)
+        .bind(skip_reason)
         .bind(error)
         .execute(pool)
         .await?;

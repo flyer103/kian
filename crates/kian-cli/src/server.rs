@@ -83,6 +83,17 @@ impl crate::cron_engine::ResidentTurn for EngineTurn {
             })
             .map_err(|e| format!("admit: {e}"))
     }
+
+    fn should_skip(&self, session: SessionId) -> Result<Option<String>, String> {
+        self.handle
+            .block_on(async {
+                self.engine
+                    .has_open_work(session)
+                    .await
+                    .map(|busy| busy.then(|| format!("session {} still has open work", session.0)))
+            })
+            .map_err(|e| format!("overlap check: {e}"))
+    }
 }
 
 /// The assembled single-machine server.
@@ -1257,10 +1268,13 @@ impl Server {
             // dispatched to the worktree-backed arm; every other schedule goes
             // to the resident engine.
             let mut selection = crate::cron_engine::ScheduleDispatcher::resident(resident);
-            if let Some((repo, policy)) = crate::config::cron_worktree_plan(&schedules) {
-                selection = selection.with_worktree(Arc::new(
-                    crate::cron_worktree::WorktreeDispatcher::new(repo).with_policy(policy),
-                ));
+            for (schedule_id, (repo, policy)) in crate::config::cron_worktree_plans(&schedules) {
+                selection = selection.with_schedule_worktree(
+                    schedule_id,
+                    Arc::new(
+                        crate::cron_worktree::WorktreeDispatcher::new(repo).with_policy(policy),
+                    ),
+                );
             }
             let dispatcher = Arc::new(selection);
             let started = std::thread::Builder::new()
@@ -1289,6 +1303,14 @@ impl Server {
                                     {
                                         eprintln!("{event}");
                                     }
+                                    // Resident firings accepted above settle
+                                    // asynchronously: record the terminal end
+                                    // the target session reached (CRON-MODEL
+                                    // §9.1). Throttled inside the adapter; a
+                                    // no-op for the worktree arm.
+                                    let _ = crate::cron_tick::CronTickStore::settle_from_target(
+                                        &store, schedule,
+                                    );
                                 }
                                 Err(_) => {
                                     eprintln!(

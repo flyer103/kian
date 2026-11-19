@@ -1568,6 +1568,7 @@ async fn pg_cron_claims_advance_and_restart() {
                 FiringState::Succeeded,
                 Some(T0 + 5_000),
                 Some("/tmp/wt/a"),
+                None,
                 None
             )
             .await
@@ -1579,6 +1580,7 @@ async fn pg_cron_claims_advance_and_restart() {
                 &slot.firing_id,
                 FiringState::Failed,
                 Some(T0 + 6_000),
+                None,
                 None,
                 Some("late")
             )

@@ -32,16 +32,18 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use kian_core::events::{EndReason, EventKind};
 use kian_core::model::SessionId;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::CronRuntimeSchedule;
 use crate::cron_tick::{
-    self, Admitted, CronDispatcher, CronTickStore, Cursor, Failed, FiringClaim, FiringState,
-    TickReport,
+    self, Admitted, CronDispatcher, CronTickStore, Cursor, DispatchOutcome, Failed, FiringClaim,
+    FiringState, TickReport,
 };
 use crate::cron_worktree::WorktreeDispatcher;
 use kian_store::EventStore;
@@ -97,6 +99,9 @@ pub struct DurableCronTickStore {
     /// recomputed per tick) so a schedule cannot slide its own due time
     /// forward and never fire.
     anchors: Mutex<BTreeMap<String, DateTime<Utc>>>,
+    /// Per-schedule last settlement sweep (CRON-MODEL §9.1): the target
+    /// session's stream is read at most once per window, not per tick.
+    sweeps: Mutex<BTreeMap<String, Instant>>,
 }
 
 impl DurableCronTickStore {
@@ -111,6 +116,7 @@ impl DurableCronTickStore {
             handle,
             schedules: schedules.into_iter().map(|s| (s.id.clone(), s)).collect(),
             anchors: Mutex::new(BTreeMap::new()),
+            sweeps: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -264,16 +270,111 @@ impl CronTickStore for DurableCronTickStore {
         firing_id: &str,
         state: FiringState,
         finished_at: Option<DateTime<Utc>>,
+        worktree_path: Option<&str>,
+        skip_reason: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool, String> {
         self.block(self.store.finish_firing(
             firing_id,
             store_state(state),
             finished_at.map(epoch_ms),
-            None,
+            worktree_path,
+            skip_reason,
             error,
         ))
         .map_err(|e| format!("cron_firings `{firing_id}` settle: {e}"))
+    }
+
+    fn settle_from_target(&self, schedule: &CronRuntimeSchedule) -> Result<(), String> {
+        // The worktree arm settles from its synchronous outcome; only the
+        // resident arm needs the session stream.
+        if schedule.worktree.is_some() {
+            return Ok(());
+        }
+        let session = match target_session(schedule) {
+            Ok(session) => session,
+            // A target that cannot resolve was rejected at load; a
+            // later regression settles nothing rather than mis-settling.
+            Err(_) => return Ok(()),
+        };
+        {
+            let mut sweeps = self
+                .sweeps
+                .lock()
+                .map_err(|_| "cron sweep map poisoned".to_string())?;
+            let now = Instant::now();
+            if let Some(last) = sweeps.get(&schedule.id)
+                && now.duration_since(*last) < Duration::from_secs(15)
+            {
+                return Ok(());
+            }
+            sweeps.insert(schedule.id.clone(), now);
+        }
+        let firings = self
+            .block(self.store.list_firings(Some(&schedule.id), 20))
+            .map_err(|e| format!("cron_firings `{}`: {e}", schedule.id))?;
+        let open: Vec<_> = firings
+            .into_iter()
+            .filter(|firing| {
+                matches!(
+                    firing.state,
+                    kian_store::FiringState::Admitted | kian_store::FiringState::Running
+                )
+            })
+            .collect();
+        if open.is_empty() {
+            return Ok(());
+        }
+        let events = match self.block(self.store.rebuild(session)) {
+            Ok(events) => events,
+            // A target session that does not exist yet has nothing to
+            // settle; the next sweep retries after the firing admits.
+            Err(_) => return Ok(()),
+        };
+        for firing in open {
+            let Some(admitted) = events.iter().find(|ev| {
+                ev.kind == EventKind::InputAdmitted
+                    && ev.bytes.pointer("/cron/firing_id").and_then(Value::as_str)
+                        == Some(firing.firing_id.as_str())
+            }) else {
+                continue;
+            };
+            let Some(end) = events.iter().find(|ev| {
+                ev.seq > admitted.seq && matches!(ev.kind, EventKind::SessionEnded { .. })
+            }) else {
+                continue;
+            };
+            let EventKind::SessionEnded { reason } = end.kind else {
+                continue;
+            };
+            let (state, error) = match reason {
+                EndReason::Completed => (kian_store::FiringState::Succeeded, None),
+                EndReason::Failed => (
+                    kian_store::FiringState::Failed,
+                    Some("the scheduled turn failed".to_string()),
+                ),
+                EndReason::Interrupted => (
+                    kian_store::FiringState::Failed,
+                    Some("the scheduled turn was interrupted".to_string()),
+                ),
+                EndReason::Cancelled => (
+                    kian_store::FiringState::Failed,
+                    Some("cancelled".to_string()),
+                ),
+                // The session waits for a person; the firing is still
+                // open, and the answer's end settles it later.
+                EndReason::AwaitingInput => continue,
+            };
+            let _ = self.block(self.store.finish_firing(
+                &firing.firing_id,
+                state,
+                Some(end.ts),
+                None,
+                None,
+                error.as_deref(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -288,6 +389,15 @@ pub trait ResidentTurn: Send + Sync {
         content: Value,
         idempotency_key: Option<String>,
     ) -> Result<(), String>;
+
+    /// The default `overlap: skip` judgement (CRON-MODEL §5.1): a firing
+    /// must not pile onto a session that is still working. `Ok(Some(reason))`
+    /// records the slot as `skipped_overlap`; `Err` is a real failure
+    /// (fail-closed: unattended work does not start when "is it busy?"
+    /// cannot be answered).
+    fn should_skip(&self, _session: SessionId) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// The deterministic resident session of a channel target.
@@ -344,6 +454,12 @@ impl CronDispatcher for ResidentDispatcher {
         payload: &str,
     ) -> Result<(), String> {
         let session = target_session(schedule)?;
+        // CRON-MODEL §5.1's default `skip`: an overlapping firing is a
+        // recorded skip, never a queued duplicate. The judgement is a
+        // pure projection of the target session (Engine::has_open_work).
+        if let Some(reason) = self.turn.should_skip(session)? {
+            return Err(format!("skipped_overlap: {reason}"));
+        }
         let cron: Value = serde_json::from_str(payload)
             .map_err(|e| format!("dispatch payload is not JSON: {e}"))?;
         // `content` is the turn's user message; `cron` carries the routing
@@ -363,6 +479,10 @@ impl CronDispatcher for ResidentDispatcher {
 pub struct ScheduleDispatcher {
     resident: Option<Arc<dyn CronDispatcher + Send + Sync>>,
     worktree: Option<Arc<WorktreeDispatcher>>,
+    /// Per-schedule isolated arms: a schedule with its own
+    /// `worktree.repo` gets its own dispatcher (CRON-MODEL §6, one repo
+    /// per declaration), keyed by schedule id.
+    per_schedule: BTreeMap<String, Arc<WorktreeDispatcher>>,
 }
 
 impl ScheduleDispatcher {
@@ -372,7 +492,11 @@ impl ScheduleDispatcher {
         resident: Option<Arc<dyn CronDispatcher + Send + Sync>>,
         worktree: Option<Arc<WorktreeDispatcher>>,
     ) -> Self {
-        Self { resident, worktree }
+        Self {
+            resident,
+            worktree,
+            per_schedule: BTreeMap::new(),
+        }
     }
 
     /// The resident-only selection (no schedule asked for isolation).
@@ -383,6 +507,16 @@ impl ScheduleDispatcher {
     /// Add the worktree-backed arm.
     pub fn with_worktree(mut self, worktree: Arc<WorktreeDispatcher>) -> Self {
         self.worktree = Some(worktree);
+        self
+    }
+
+    /// Add one schedule's isolated arm (its own `worktree.repo`).
+    pub fn with_schedule_worktree(
+        mut self,
+        schedule_id: impl Into<String>,
+        worktree: Arc<WorktreeDispatcher>,
+    ) -> Self {
+        self.per_schedule.insert(schedule_id.into(), worktree);
         self
     }
 
@@ -400,7 +534,11 @@ impl CronDispatcher for ScheduleDispatcher {
         payload: &str,
     ) -> Result<(), String> {
         if Self::selects_worktree(schedule) {
-            return match self.worktree.as_ref() {
+            let isolated = self
+                .per_schedule
+                .get(&schedule.id)
+                .or(self.worktree.as_ref());
+            return match isolated {
                 Some(worktree) => worktree.dispatch(schedule, firing_id, payload),
                 None => Err(format!(
                     "schedule `{}` asks for worktree isolation but no worktree dispatcher is \
@@ -417,6 +555,17 @@ impl CronDispatcher for ScheduleDispatcher {
             )),
         }
     }
+
+    fn take_outcome(&self, firing_id: &str) -> Option<DispatchOutcome> {
+        self.per_schedule
+            .values()
+            .find_map(|worktree| worktree.take_outcome(firing_id))
+            .or_else(|| {
+                self.worktree
+                    .as_ref()
+                    .and_then(|worktree| worktree.take_outcome(firing_id))
+            })
+    }
 }
 
 /// The §9.1 skip token a guard refusal maps to, or `None` for a real failure.
@@ -428,6 +577,19 @@ fn guard_skip_token(error: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// One `cron/skipped` audit line (CRON-MODEL §9.2): a slot consumed
+/// without a turn, naming the decisive reason.
+fn skip_event(entry: &Admitted, now: DateTime<Utc>, reason: &str) -> Value {
+    serde_json::json!({
+        "event": "cron/skipped",
+        "at": now.to_rfc3339(),
+        "schedule_id": entry.schedule_id,
+        "firing_id": entry.firing_id,
+        "fire_time": entry.fire_time.to_rfc3339(),
+        "reason": reason,
+    })
 }
 
 /// [`cron_tick::tick_and_dispatch`], with guard refusals classified as skips.
@@ -455,40 +617,81 @@ pub fn tick_and_dispatch_classified(
             admitted.push(entry);
             continue;
         };
+        // The worktree arm runs the turn synchronously and knows the
+        // terminal outcome (state + worktree path + failure detail); the
+        // resident arm accepts asynchronously. A known outcome is
+        // persisted on the firing row so `cron list`/`cron logs` answer
+        // "did it run" — CRON-MODEL §9.1.
+        let outcome = dispatcher.take_outcome(&entry.firing_id);
         match dispatcher.dispatch(schedule, &entry.firing_id, &entry.payload) {
-            Ok(()) => admitted.push(entry),
-            Err(error) => match guard_skip_token(&error) {
-                Some(token) => {
+            Ok(()) => match outcome {
+                Some(settled) => {
                     let _ = store.finish_firing(
                         &entry.firing_id,
-                        FiringState::Skipped,
+                        settled.state,
                         Some(now),
-                        Some(&error),
+                        settled.worktree_path.as_deref(),
+                        settled.skip_reason.as_deref(),
+                        settled.error.as_deref(),
                     );
-                    events.push(serde_json::json!({
-                        "event": "cron/skipped",
-                        "at": now.to_rfc3339(),
-                        "schedule_id": entry.schedule_id,
-                        "firing_id": entry.firing_id,
-                        "fire_time": entry.fire_time.to_rfc3339(),
-                        "reason": token,
-                    }));
+                    if settled.state == FiringState::Skipped {
+                        events.push(skip_event(
+                            &entry,
+                            now,
+                            settled.skip_reason.as_deref().unwrap_or("skipped"),
+                        ));
+                    } else {
+                        admitted.push(entry);
+                    }
                 }
-                None => {
-                    let _ = store.finish_firing(
-                        &entry.firing_id,
-                        FiringState::Failed,
-                        Some(now),
-                        Some(&error),
-                    );
+                None => admitted.push(entry),
+            },
+            Err(error) => {
+                let token = guard_skip_token(&error);
+                let state = outcome.as_ref().map_or_else(
+                    || {
+                        if token.is_some() {
+                            FiringState::Skipped
+                        } else {
+                            FiringState::Failed
+                        }
+                    },
+                    |settled| settled.state,
+                );
+                let error_text = outcome
+                    .as_ref()
+                    .and_then(|settled| settled.error.clone())
+                    .unwrap_or_else(|| error.clone());
+                let skip_reason = outcome
+                    .as_ref()
+                    .and_then(|settled| settled.skip_reason.clone())
+                    .or_else(|| token.map(str::to_owned));
+                let worktree_path = outcome
+                    .as_ref()
+                    .and_then(|settled| settled.worktree_path.as_deref());
+                let _ = store.finish_firing(
+                    &entry.firing_id,
+                    state,
+                    Some(now),
+                    worktree_path,
+                    skip_reason.as_deref(),
+                    Some(&error_text),
+                );
+                if state == FiringState::Skipped {
+                    events.push(skip_event(
+                        &entry,
+                        now,
+                        skip_reason.as_deref().unwrap_or("skipped"),
+                    ));
+                } else {
                     report.failed.push(Failed {
                         schedule_id: entry.schedule_id,
                         firing_id: entry.firing_id,
                         fire_time: entry.fire_time,
-                        error,
+                        error: error_text,
                     });
                 }
-            },
+            }
         }
     }
     report.admitted = admitted;
@@ -515,9 +718,7 @@ mod tests {
 
     fn schedule_yaml(id: &str, extra: &str) -> crate::config::CronRuntimeSchedule {
         let yaml = format!(
-            "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    max_concurrent: 1\n    \
-             timeout_ms: 60000\n{extra}    target: {{ channel: cron-jobs, topic: audit }}\n    \
-             prompt: audit .state/\n"
+            "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    max_concurrent: 1\n{extra}    target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit .state/\n"
         );
         let section: crate::config::CronSection =
             serde_yaml::from_str(&yaml).expect("the cron fixture parses");
@@ -662,6 +863,167 @@ mod tests {
             row.next_fire_at.is_some(),
             "the cursor advanced to the next fire"
         );
+    }
+
+    /// CRON-MODEL §9.1: a resident firing settles from its target
+    /// session's end — without this the row stayed `admitted` forever and
+    /// `cron list` could not answer "did it run".
+    #[test]
+    fn the_settlement_sweep_records_the_target_sessions_end() {
+        use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
+        use kian_core::model::Epoch;
+        use kian_store::AppendGuard;
+
+        let rt = runtime();
+        let dir = TempDir::new("settle");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("settle@{fire_time}");
+
+        let yaml = format!(
+            "schedules:\n  - id: settle\n    expr: \"*/5 * * * *\"\n    target: {{ session: \"{}\" }}\n    prompt: audit\n",
+            sid.0
+        );
+        let section: crate::config::CronSection = serde_yaml::from_str(&yaml).unwrap();
+        let schedule = section
+            .to_runtime(&channels(), Utc::now())
+            .expect("the sweep fixture resolves")
+            .remove(0);
+
+        let event = |seq: u64, epoch: Epoch, kind: EventKind, bytes: Value| Event {
+            seq,
+            session: sid,
+            epoch,
+            ts: 1_800_000_000_000 + seq,
+            kind,
+            bytes,
+            version: SCHEMA_VERSION,
+        };
+        rt.block_on(async {
+            store
+                .append(
+                    sid,
+                    event(1, Epoch::GENESIS, EventKind::SessionCreated, serde_json::json!({})),
+                    AppendGuard {
+                        epoch: Epoch::GENESIS,
+                        expected_seq: 1,
+                    },
+                )
+                .await
+                .expect("session/created");
+            store
+                .append(
+                    sid,
+                    event(
+                        2,
+                        Epoch(1),
+                        EventKind::InputAdmitted,
+                        serde_json::json!({"role": "user", "content": "audit",
+                                           "cron": {"firing_id": firing_id, "schedule_id": "settle"}}),
+                    ),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: 2,
+                    },
+                )
+                .await
+                .expect("input/admitted");
+            store
+                .append_end(
+                    sid,
+                    event(
+                        3,
+                        Epoch(1),
+                        EventKind::SessionEnded {
+                            reason: kian_core::events::EndReason::Completed,
+                        },
+                        serde_json::json!({}),
+                    ),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: 3,
+                    },
+                )
+                .await
+                .expect("session/ended");
+            assert!(
+                store
+                    .claim_firing(&kian_store::CronFiringRow {
+                        firing_id: firing_id.clone(),
+                        schedule_id: "settle".to_string(),
+                        fire_time: fire_time.to_string(),
+                        admitted_at: 1_800_000_000_000,
+                        state: kian_store::FiringState::Admitted,
+                        skip_reason: None,
+                        worktree_path: None,
+                        finished_at: None,
+                        error: None,
+                    })
+                    .await
+                    .expect("claim firing")
+            );
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep reads the session");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
+        assert!(row.finished_at.is_some(), "{row:?}");
+    }
+
+    /// CRON-MODEL §5.1's default `skip`: a firing whose target session is
+    /// still working is recorded `skipped_overlap` with its reason and is
+    /// never delivered (the resident arm used to queue it behind the
+    /// session's single-flight drain, producing a duplicate run).
+    #[test]
+    fn a_busy_target_session_skips_the_slot_instead_of_queueing_it() {
+        struct Busy;
+        impl ResidentTurn for Busy {
+            fn deliver(&self, _: SessionId, _: Value, _: Option<String>) -> Result<(), String> {
+                panic!("a busy target must not receive the firing");
+            }
+            fn should_skip(&self, _: SessionId) -> Result<Option<String>, String> {
+                Ok(Some("still running".to_string()))
+            }
+        }
+        let rt = runtime();
+        let dir = TempDir::new("busy");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let schedule = schedule("audit");
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        let dispatcher =
+            ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(Arc::new(Busy))));
+        let anchor = schedule.next_fire_after(Utc::now()).expect("next fire");
+        let (report, events) = tick_and_dispatch_classified(
+            anchor + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &durable,
+            &dispatcher,
+        );
+        assert!(report.admitted.is_empty(), "{:?}", report.admitted);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "cron/skipped");
+        assert_eq!(events[0]["reason"], SKIP_OVERLAP);
+
+        let firings = rt
+            .block_on(store.list_firings(Some("audit"), 10))
+            .expect("firing rows");
+        assert_eq!(firings.len(), 1, "{firings:?}");
+        assert_eq!(firings[0].state.as_str(), "skipped");
+        assert_eq!(firings[0].skip_reason.as_deref(), Some(SKIP_OVERLAP));
+        assert!(firings[0].finished_at.is_some(), "{firings:?}");
     }
 
     #[test]

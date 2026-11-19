@@ -497,7 +497,7 @@ pin them together.
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
-| P1 | kian-core, kian-loop, kian-orchestrator, kian-cli, kian-sdk | `ask` permission arm (a widened closed value, never invokes); `pending_calls` projection in `kian-core::confirmation`; the fifth end reason `awaiting_input` (`running → idle`); the `control/confirm` kind + reserved confirm row envelope; `confirm`/`pending` control-plane methods + SDK + CLI pair; lazy TTL expiry; the no-provider-request-while-pending resume rule; fail-closed config (unknown values, and `ask` refused on worker/resident agents) | landed |
+| P1 | kian-core, kian-loop, kian-orchestrator, kian-cli, kian-sdk | `ask` permission arm (a widened closed value, never invokes); `pending_calls` projection in `kian-core::confirmation`; the fifth end reason `awaiting_input` (`running → idle`); the `control/confirm` kind + reserved confirm row envelope; `confirm`/`pending` control-plane methods + SDK + CLI pair; lazy TTL expiry; the no-provider-request-while-pending resume rule; the **promotion gate** (no message row is promoted inside an open call, with the wake consequence) and the **open-call crash repair** (`kian-core::repair`, additive `recovered` marker, no fabricated permission); fail-closed config (unknown values, and `ask` refused on worker/resident agents) | landed |
 | P2 | kian-superagent | Worker integration: a deferred turn ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | not started |
 | P3 | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening); channel-side answers (an IM reply mapped to a `confirm`) | not started |
 | P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
@@ -519,13 +519,17 @@ engine, no new event kinds. The normative contract is
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P0 | kian-cron, kian-store, kian-cli | Five-field/`@`-alias grammar with IANA zones and DST gap/overlap rules; durable `cron_schedules`/`cron_firings` (sqlite + postgres, migration v7); claim-before-dispatch cursor; `kian cron list\|run-now\|logs\|rm`; config-only declarations, fail-closed at load | landed |
-| P1 | kian-cli | Worktree-backed firings: detached per-firing git tree, harness invocation, diff/stderr capture, `keep_on_failure`, free-space floor and total-cap GC; catch-up coalescing; one JSON tick report per decision | landed |
-| P2 | kian-cli, kian-store | Config-writing `kian cron add`, store-scoped schedules, per-firing `sandbox.*` knobs, `queue`/`kill-previous` overlap enforcement | designed |
+| P1 | kian-cli | Worktree-backed firings: detached per-firing git tree, harness invocation, diff/stderr capture, `keep_on_failure`, free-space floor and total-cap GC; catch-up coalescing; one JSON tick report per decision; per-schedule isolation repos; **firing settlement** (the worktree arm's known outcome, the resident arm's end-of-target-session sweep) so `cron list`/`cron logs` answer "did it run"; the resident arm's `skip` overlap judgement (`Engine::has_open_work`) | landed |
+| P2 | kian-cli, kian-store | Config-writing `kian cron add`, store-scoped schedules, per-firing `sandbox.*` knobs, `queue`/`kill-previous` overlap enforcement (refused at load in v1), a global concurrency ceiling, a non-blocking execution pool for the worktree arm | designed |
 
-No new event kinds: a firing is an ordinary admitted turn. The admitted input carries the
-additive, non-context `cron` key plus a `cron:<firing_id>` idempotency key, so the model request
-bytes are the prompt alone. The tick loop and the durable adapter are exercised in-process (L2);
-the grammar, DST, misfire, store and worktree paths carry unit coverage (L1).
+No new event kinds: a **resident** firing is an ordinary admitted turn. The admitted input carries
+the additive, non-context `cron` key plus a `cron:<firing_id>` idempotency key, so the model
+request bytes are the prompt alone. A **worktree** firing is an isolated child run by design (no
+session, no events): its record is the firing row, so it is not replayable and carries no
+usage/recall (CRON-MODEL §6.1). The tick loop and the durable adapter are exercised in-process
+(L1: real store + the real decision table); the grammar, DST, misfire, store, settlement and
+worktree paths carry unit coverage, and the confirmation plane's crash repair is exercised by the
+`kill -9` chaos suite (L2).
 
 ### Deferred (unchanged)
 | Item | Reason |

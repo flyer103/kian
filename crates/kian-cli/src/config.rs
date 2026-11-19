@@ -1019,10 +1019,10 @@ pub struct SuperAgentConfig {
     pub intake: IntakeConfig,
     /// (CRON-MODEL §3) the declared cron schedules (`superagent.cron`).
     /// Absent (the default) = no cron schedules declared, nothing to
-    /// fire; the tick loop, the durable cursor and the CLI are later
-    /// increments. Validated fail-closed at load by
-    /// [`CronSection::validate`] (expression, timezone, id uniqueness,
-    /// target cross-reference, bounds).
+    /// fire. Validated fail-closed at load by [`CronSection::to_runtime`]
+    /// (expression, timezone, id uniqueness, target cross-reference,
+    /// bounds, the unsupported-policy gates) and by
+    /// [`reject_cron_targeting_the_watchdog`].
     #[serde(default)]
     pub cron: CronSection,
 }
@@ -3312,9 +3312,15 @@ impl ServeConfig {
             }
             // (CRON-MODEL §3.3) the cron declarations validate
             // fail-closed at load: expression + horizon, timezone, id
-            // shape/uniqueness, target cross-reference, bounds. No loop
-            // is mounted in this increment.
-            sa.cron.validate(&sa.channels)?;
+            // shape/uniqueness, target cross-reference, bounds, the
+            // unsupported-policy gates, and the watchdog cross-reference
+            // (rule 7: a wall-clock judge must not fight the interval
+            // watchdog for the same session).
+            let resolved_cron = sa.cron.to_runtime(&sa.channels, chrono::Utc::now())?;
+            reject_cron_targeting_the_watchdog(
+                &resolved_cron,
+                sa.watchdog.as_ref().map(|w| w.session_id.as_str()),
+            )?;
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -4267,30 +4273,21 @@ fn is_valid_cron_id(id: &str) -> bool {
 }
 
 impl CronSection {
-    /// The load-time gate (§3.3): performs the full conversion and
-    /// discards the result. Every rejection is fail-closed and names the
-    /// schedule id.
-    pub fn validate(
-        &self,
-        channels: &std::collections::BTreeMap<String, ChannelConfig>,
-    ) -> Result<(), ConfigError> {
-        self.to_runtime(channels, chrono::Utc::now()).map(|_| ())
-    }
-
     /// Converts the declarations into resolved schedules (the timer's
     /// `to_runtime` pattern), fail-closed on every degenerate field
     /// (§3.3): a malformed expression, an unresolvable timezone, a
     /// duplicate or malformed id, a target that does not resolve, an
-    /// empty prompt, a zero bound or a contradictory overlap policy is a
-    /// config error — never a silent skip and never a silent default.
+    /// empty prompt, a zero bound or a contradictory or unsupported
+    /// policy is a config error — never a silent skip and never a silent
+    /// default.
     ///
     /// All *declaration* errors are collected (each naming its schedule
     /// id) and reported together, so an operator fixes one load rather
     /// than one error per restart.
     ///
-    /// §3.3 rule 7 (`cron_targets_watchdog`) is not enforced here yet: the
-    /// watchdog session is a `superagent.watchdog` cross-reference that
-    /// lands with the assembly increment.
+    /// §3.3 rule 7 (`cron_targets_watchdog`) is enforced by
+    /// [`reject_cron_targeting_the_watchdog`] at `ServeConfig` validation,
+    /// where the `superagent.watchdog` session is visible.
     pub fn to_runtime(
         &self,
         channels: &std::collections::BTreeMap<String, ChannelConfig>,
@@ -4443,6 +4440,42 @@ impl CronSection {
             if timeout_ms == 0 {
                 fail("timeout_ms must be > 0".to_string());
             }
+            // v1 honesty gate (CRON-MODEL §5.1/§5.5): `queue` and
+            // `kill-previous` are designed, not implemented — the v1
+            // scheduler has no running-set to queue behind and no
+            // cross-replica kill path, so accepting the key would lie
+            // about the policy. Fail closed at load instead.
+            if overlap != CronOverlap::Skip {
+                fail(format!(
+                    "overlap: {} is designed, not implemented in v1 (CRON-MODEL §5.1) — omit \
+                     the key or set `overlap: skip`",
+                    match overlap {
+                        CronOverlap::Queue => "queue",
+                        CronOverlap::KillPrevious => "kill-previous",
+                        CronOverlap::Skip => "skip",
+                    }
+                ));
+            }
+            // v1 scope gate (CRON-MODEL §5.5): the per-firing timeout is
+            // enforced only by the worktree arm's runner. A resident
+            // firing's turn has no cron-owned deadline (ADR-030 wait
+            // bounds and the exec timeout still apply), so an explicit
+            // `timeout_ms` on a resident schedule would be a silent no-op
+            // — refuse it. Omitting the key keeps the documented default
+            // for worktree schedules and means "no cron deadline" for a
+            // resident one.
+            let wants_worktree = matches!(
+                def.worktree.as_ref(),
+                Some(CronWorktreeDef::Policy(_)) | Some(CronWorktreeDef::Flag(true))
+            );
+            if def.timeout_ms.is_some() && !wants_worktree {
+                fail(
+                    "timeout_ms is only enforced for a worktree-isolated firing in v1 \
+                     (CRON-MODEL §5.5) — a resident-arm firing has no cron-owned deadline; \
+                     omit the key or declare `worktree:`"
+                        .to_string(),
+                );
+            }
             if overlap == CronOverlap::KillPrevious && max_concurrent > 1 {
                 fail(format!(
                     "overlap: kill-previous contradicts max_concurrent: {max_concurrent} \
@@ -4528,22 +4561,53 @@ impl CronSection {
     }
 }
 
-/// The worktree arm the resident ticker arms: the first schedule that asked
-/// for isolation decides the repo and the policy. `None` = no schedule wants
-/// isolation, so the ticker arms the resident engine alone.
-pub fn cron_worktree_plan(
+/// CRON-MODEL §3.3 rule 7 (`cron_targets_watchdog`): a wall-clock schedule
+/// must not fire into the interval watchdog's session — the two judge loops
+/// would fight over the same stream. Enforced at load with the resolved
+/// declarations (the watchdog session is a `superagent.watchdog`
+/// cross-reference).
+pub fn reject_cron_targeting_the_watchdog(
     schedules: &[CronRuntimeSchedule],
-) -> Option<(std::path::PathBuf, crate::cron_worktree::WorktreePolicy)> {
-    schedules.iter().find_map(|schedule| {
-        schedule.worktree.as_ref().map(|plan| {
-            let repo = plan
-                .repo
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            (repo, plan.policy.clone())
+    watchdog_session: Option<&str>,
+) -> Result<(), ConfigError> {
+    let Some(watchdog) = watchdog_session else {
+        return Ok(());
+    };
+    for schedule in schedules {
+        if let CronTarget::Session { session } = &schedule.target
+            && session == watchdog
+        {
+            return Err(invalid(format!(
+                "superagent.cron schedule `{}` targets the watchdog session `{watchdog}` \
+                 (cron_targets_watchdog, CRON-MODEL §3.3 rule 7)",
+                schedule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The worktree arm(s) the resident ticker arms: one dispatcher per
+/// schedule that asked for isolation, keyed by schedule id. Each schedule
+/// keeps its own `worktree.repo` — a global "first schedule wins" rule
+/// silently ran one repo's audit in another repo's tree.
+pub fn cron_worktree_plans(
+    schedules: &[CronRuntimeSchedule],
+) -> std::collections::BTreeMap<String, (std::path::PathBuf, crate::cron_worktree::WorktreePolicy)>
+{
+    schedules
+        .iter()
+        .filter_map(|schedule| {
+            schedule.worktree.as_ref().map(|plan| {
+                let repo = plan
+                    .repo
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                (schedule.id.clone(), (repo, plan.policy.clone()))
+            })
         })
-    })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -7823,7 +7887,7 @@ schedules:
     tz: Europe/Berlin
     target: { channel: cron-jobs, topic: audit }
     prompt: "Audit .state/ for orphaned worktrees."
-    overlap: queue
+    worktree: true
     catch_up: skip
     coalesce_ms: 60000
     max_concurrent: 2
@@ -7860,11 +7924,12 @@ schedules:
                 topic: "audit".into()
             }
         );
-        assert_eq!(audit.overlap, CronOverlap::Queue);
+        assert_eq!(audit.overlap, CronOverlap::Skip);
         assert_eq!(audit.catch_up, kian_cron::CatchUp::Skip);
         assert_eq!(audit.coalesce_ms, 60_000);
         assert_eq!(audit.max_concurrent, 2);
         assert_eq!(audit.timeout_ms, 120_000);
+        assert!(audit.worktree.is_some(), "worktree: true selects isolation");
         assert!(audit.next_fire_after(cron_now()).unwrap() > cron_now());
 
         // the second schedule freezes the host timezone (§2.3) and takes
@@ -8050,6 +8115,76 @@ schedules:
         assert!(err.contains("kill-previous"), "{err}");
         assert!(err.contains("timeout_ms"), "{err}");
         assert!(err.contains("Nowhere/Land"), "{err}");
+    }
+
+    /// v1 honesty gates (CRON-MODEL §5.1/§5.5): an unsupported overlap
+    /// policy or an explicit resident-arm timeout refuses at load instead
+    /// of being accepted and silently ignored.
+    #[test]
+    fn cron_unsupported_v1_policies_refuse_at_load() {
+        for (policy, needle) in [
+            ("queue", "queue is designed"),
+            ("kill-previous", "kill-previous is designed"),
+        ] {
+            let err = cron_section_from(&format!(
+                "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+                 target: {{ channel: cron-jobs, topic: audit }}\n    prompt: audit\n    \
+                 overlap: {policy}\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(needle), "{policy}: {err}");
+            assert!(err.contains("designed, not implemented"), "{policy}: {err}");
+            assert!(err.contains("`audit`"), "{policy}: {err}");
+        }
+
+        let resident_timeout = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: \"99999999-8888-7777-6666-555555555555\" }\n    prompt: audit\n    \
+             timeout_ms: 1000\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            resident_timeout.contains("timeout_ms"),
+            "{resident_timeout}"
+        );
+        assert!(
+            resident_timeout.contains("worktree-isolated"),
+            "{resident_timeout}"
+        );
+
+        // The same explicit timeout is legal once isolation selects the arm
+        // that enforces it.
+        let isolated = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: \"99999999-8888-7777-6666-555555555555\" }\n    prompt: audit\n    \
+             worktree: true\n    timeout_ms: 1000\n",
+        )
+        .expect("a worktree schedule may declare its per-firing timeout");
+        assert_eq!(isolated[0].timeout_ms, 1000);
+        assert!(isolated[0].worktree.is_some());
+    }
+
+    /// CRON-MODEL §3.3 rule 7 (`cron_targets_watchdog`): a wall-clock
+    /// schedule must not target the interval watchdog's session.
+    #[test]
+    fn cron_targeting_the_watchdog_session_refuses() {
+        let resolved = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: \"99999999-8888-7777-6666-555555555555\" }\n    prompt: audit\n",
+        )
+        .unwrap();
+        let err = reject_cron_targeting_the_watchdog(
+            &resolved,
+            Some("99999999-8888-7777-6666-555555555555"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cron_targets_watchdog"), "{err}");
+        assert!(err.contains("`audit`"), "{err}");
+        assert!(reject_cron_targeting_the_watchdog(&resolved, Some("other")).is_ok());
+        assert!(reject_cron_targeting_the_watchdog(&resolved, None).is_ok());
     }
 
     /// The schedule id shape is enforced (§3.1).

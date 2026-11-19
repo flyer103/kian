@@ -115,14 +115,44 @@ pub trait CronTickStore {
     ) -> Result<bool, String>;
 
     /// Settle a claimed firing (`Succeeded` / `Failed`, or a `Running`
-    /// progress write). `finished_at` is `None` only for non-terminal states.
+    /// progress write). `finished_at` is `None` only for non-terminal
+    /// states. `worktree_path` and `skip_reason` are additive: absent
+    /// keeps whatever the claim recorded (the skip reason is part of the
+    /// firing's public record — CRON-MODEL §9.1).
     fn finish_firing(
         &self,
         firing_id: &str,
         state: FiringState,
         finished_at: Option<DateTime<Utc>>,
+        worktree_path: Option<&str>,
+        skip_reason: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool, String>;
+
+    /// Settle resident-arm firings whose target session reached an end
+    /// (CRON-MODEL §9.1). The resident arm accepts asynchronously, so the
+    /// ticker reads the target session's stream and records the terminal
+    /// state. Called once per schedule per tick; implementations throttle
+    /// and the default is a no-op.
+    fn settle_from_target(&self, _schedule: &CronRuntimeSchedule) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A terminal outcome the dispatcher already knows and the ticker must
+/// persist on the firing row (CRON-MODEL §9.1). The worktree arm runs the
+/// turn synchronously, so it knows the outcome; the resident arm accepts
+/// asynchronously and settles through the target session's stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    /// The terminal state to record.
+    pub state: FiringState,
+    /// The worktree the turn ran in, when one was created.
+    pub worktree_path: Option<String>,
+    /// The machine skip reason, when `state == Skipped`.
+    pub skip_reason: Option<String>,
+    /// The bounded failure detail.
+    pub error: Option<String>,
 }
 
 /// What a dispatch is asked to do with an admitted firing.
@@ -148,8 +178,11 @@ pub trait CronTickStore {
 ///    here, so `CronDispatcher` stays impl-free and the tick loop is
 ///    unaware of which one it is talking to.
 ///
-/// Implementations must be cheap and must not block: the tick loop calls
-/// them inline, one admitted slot at a time, in id order.
+/// The resident arm must be cheap (it only writes an inbox row); the
+/// worktree arm runs its child **synchronously** in v1 — the tick loop
+/// calls implementations inline, one admitted slot at a time, so a long
+/// worktree turn delays the other schedules' ticks (CRON-MODEL §5.4/§7.3
+///; a non-blocking execution pool is a P2 item).
 pub trait CronDispatcher {
     /// Hand one admitted firing to the executor. `payload` is the JSON
     /// rendering of [`Admitted::payload`] — `{schedule_id, firing_id,
@@ -161,6 +194,13 @@ pub trait CronDispatcher {
         firing_id: &str,
         payload: &str,
     ) -> Result<(), String>;
+
+    /// The terminal outcome the last [`CronDispatcher::dispatch`] already
+    /// produced for `firing_id`, if it ran synchronously. `None` (the
+    /// resident arm, and the default) means "accepted, not settled".
+    fn take_outcome(&self, _firing_id: &str) -> Option<DispatchOutcome> {
+        None
+    }
 }
 
 /// A slot this tick admitted for execution.
@@ -266,6 +306,8 @@ pub fn tick_and_dispatch(
                     &entry.firing_id,
                     FiringState::Failed,
                     Some(now),
+                    None,
+                    None,
                     Some(&error),
                 );
                 report.failed.push(Failed {
@@ -631,6 +673,8 @@ impl CronTickStore for MemoryStore {
         firing_id: &str,
         state: FiringState,
         finished_at: Option<DateTime<Utc>>,
+        _worktree_path: Option<&str>,
+        _skip_reason: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool, String> {
         let terminal = matches!(

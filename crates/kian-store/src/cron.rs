@@ -563,6 +563,7 @@ impl EventStore {
         state: FiringState,
         finished_at: Option<u64>,
         worktree_path: Option<&str>,
+        skip_reason: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool, CronError> {
         if state.is_terminal() && finished_at.is_none() {
@@ -582,6 +583,7 @@ impl EventStore {
                     state.as_str(),
                     finished_at,
                     worktree_path,
+                    skip_reason,
                     error,
                 )
                 .await
@@ -593,6 +595,7 @@ impl EventStore {
                     state.as_str(),
                     finished_at,
                     worktree_path,
+                    skip_reason,
                     error,
                 )
                 .await
@@ -1065,6 +1068,7 @@ mod tests {
                     FiringState::Running,
                     None,
                     Some("/tmp/wt/run-1"),
+                    None,
                     None
                 )
                 .await
@@ -1086,6 +1090,7 @@ mod tests {
                     FiringState::Failed,
                     Some(T0 + 60_000),
                     None,
+                    None,
                     Some("turn timed out")
                 )
                 .await
@@ -1099,6 +1104,7 @@ mod tests {
                     &slot.firing_id,
                     FiringState::Succeeded,
                     Some(T0 + 99_000),
+                    None,
                     None,
                     None
                 )
@@ -1130,6 +1136,7 @@ mod tests {
                     &skipped.firing_id,
                     FiringState::Succeeded,
                     Some(T0 + 1),
+                    None,
                     None,
                     None
                 )

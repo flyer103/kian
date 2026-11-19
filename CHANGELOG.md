@@ -22,6 +22,43 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   running execution. No wire frame, protocol version or store schema changes. Contract:
   [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §4, §8.
 
+- **Confirmation plane: the promote gate and the open-call crash repair (CONFIRMATION-MODEL §7
+  R1b, §15.6)**. While an `ask` waits, an ordinary message row is no longer promoted into context:
+  promoting it interleaved a user message between the assistant `tool_calls` and its answered
+  `tool/result`, and the resumed request was rejected by strict endpoints (`kian-orchestrator
+  consume_inputs` skips message plans while `pending_calls` is non-empty; control/confirm rows still
+  consume). The wake follows the gate — a decision-blocked settle does not re-register the wake and
+  the startup inbox rebuild skips such sessions unless it also sees a control row, so the wait
+  cannot spin. A drain that died inside a tool batch is repaired at claim time, before any
+  promotion: `kian-core::repair` names every unpaired call that is not a logged `ask`, the engine
+  reconstructs a missing `tool/call` (additive non-context `recovered` marker; no fabricated
+  `permission`) and appends one honest-error `tool/result` (`not_dispatched` / `in_flight`). Logged
+  approvals stay on the at-least-once re-invoke path. Contract:
+  [design/CONFIRMATION-MODEL.md](design/CONFIRMATION-MODEL.md) §7, §15.6;
+  [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §4.2.
+
+- **Cron: firing settlement and the real `skip` judgement (CRON-MODEL §5.1, §9.1)**. A resident
+  firing now settles from its target session's end (a throttled sweep reading the stream:
+  `completed` → `succeeded`, `failed`/`interrupted`/`cancelled` → `failed`; `awaiting_input` keeps
+  it open), and the worktree arm persists its known outcome (state, worktree path, error) through
+  `finish_firing` — so `cron list` / `cron logs` answer "did it run" instead of showing `admitted`
+  forever. The default `overlap: skip` is now enforced on the resident arm too: the dispatcher asks
+  `Engine::has_open_work` (running drain / eligible input / pending decision) and records
+  `skipped_overlap` instead of admitting a duplicate run behind the single-flight drain. Each
+  schedule's `worktree.repo` is honoured per schedule (one dispatcher per isolated schedule; the
+  first-schedule-wins collapse is gone), and `kian cron run-now` cuts from that schedule's repo.
+  Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md) §5.1, §6, §9.1, §10.
+
+- **Cron: the v1 scope is fail-closed at load (CRON-MODEL §3.3 rules 6–8, §5.1, §5.5)**. A
+  declaration now refuses to boot when it asks for a policy v1 cannot enforce: `overlap: queue` /
+  `kill-previous` (no running-set queue and no cross-replica kill path), an explicit `timeout_ms` on
+  a resident-arm schedule (the scheduler cannot interrupt a turn it does not run), and a schedule
+  targeting the watchdog session (`cron_targets_watchdog`, rule 7 — previously documented but not
+  enforced). The undocumented `sandbox` block, the phantom `last_outcome` cursor column and the
+  `type: cron` channel are gone from the contract; a `{channel}` target is documented as the
+  deterministic plain-session namespace it is. `kian cron run-now` refuses a resident-arm schedule
+  instead of running its payload in a worktree the schedule never asked for. Contract:
+  [design/CRON-MODEL.md](design/CRON-MODEL.md) §3.2, §3.3, §5.1, §5.5, §10.
 - **Cron: the declaration reaches the store (CRON-MODEL §4.1/§12.3 fix)**. The resident ticker now
   syncs each declared schedule into `cron_schedules` before it decides anything: a fresh deployment
   writes its row instead of reporting `no row` on every tick, a store row deleted behind a running
