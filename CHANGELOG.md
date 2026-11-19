@@ -6,10 +6,22 @@ and [design/decisions/](design/decisions/). Entries are ordered **newest first**
 carries the functional change only: verification results, gates and test counts belong to the
 pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG policy).
 
----
-
 ## Unreleased
 
+- **iMessage channel through a macOS bridge (`type: imessage`, ADR-042)**. iMessage has no API, so
+  the channel speaks a narrow loopback HTTP ABI to `kian-imessage-bridge`, a new macOS-side daemon
+  (`imsg rpc` under Full Disk Access + Automation, run as a LaunchAgent in the signed-in Messages
+  user's session) reached over an SSH remote-forward or a mesh VPN. Receive is one bounded long
+  poll over `/v1/updates`: `guid` → `event_id` (durable idempotency), the config `topics` table is
+  both the receive and recipient allowlist, the bridge's `watch.participants` keeps non-allowlisted
+  conversations from leaving the Mac, and a replaced `chat.db` rotates the generation so both
+  cursors reset. Sends go to any allowlisted handle (not reply-only) with a deterministic
+  `client_id` that turns the outbox's bounded retry into effectively-once; `not_started` and
+  `may_have_completed` are reported honestly, never as a receipt. The bridge token is env-only
+  (`KIAN_IMESSAGE_BRIDGE_TOKEN`); `kian imessage check` is the read-only preflight. Text-only
+  direct chats, one channel per config, forced untrusted. Contract:
+  [design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md); setup:
+  [docs/runbook-imessage.md](docs/runbook-imessage.md).
 - **Bounded model calls and drain-crash containment: an abnormal interruption can delay freeing a
   worker, never prevent it (ADR-041)**. A model call is now bounded like every other wait: two
   additive `providers.<name>` keys — `connect_timeout_ms` (default 10 000) and `idle_timeout_ms`
@@ -23,6 +35,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   additive `crashed` payload instead of re-driving forever. No new event kind, state edge, table or
   wire byte; contract: [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §3, §6, §8,
   [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §4.
+
 
 - **Confirmation phase 2: workers can wait on a person (CONFIRMATION-MODEL §8 C2, §14b)**. `ask`
   is accepted on a superagent worker agent. A worker that stops on a pending `ask` now writes
@@ -45,6 +58,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `memory-inject:<session>`; with no `memory:` section every creator is byte-identical. Contract:
   [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) §6 I10;
   [design/decisions/ADR-038-memory-injection-for-internal-sessions.md](design/decisions/ADR-038-memory-injection-for-internal-sessions.md).
+
 
 - **Worker result retention: a re-dispatched command id is answered from the endpoint's record, not
   executed again (ADR-037)**. `kiand` records each result frame by command id before sending it and

@@ -89,6 +89,9 @@ const USAGE: &str = "usage:
   kian wechat login [--config <path>] [--channel <name>] [--json]
                                          WeChat QR login → the channel's 0600 credential file
                                          (prints account/user ids, never the token)
+  kian imessage check [--config <path>] [--channel <name>] [--json]
+                                         iMessage bridge preflight (read-only): protocol, imsg
+                                         rpc, Full Disk Access, automation, allowlist diff
   kian mock-channel-send <channel> [--text <text> | --payload <json>] [--topic <topic>]
                                   [--url <base>] [--config <path>] [--json]
                                          demo channel injection via ops
@@ -144,6 +147,7 @@ fn main() -> ExitCode {
         Some("agents") => agents(&args[2..]),
         Some("recovery") => recovery(&args[2..]),
         Some("wechat") => wechat(&args[2..]),
+        Some("imessage") => imessage(&args[2..]),
         Some("help") | Some("--help") | Some("-h") => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -1188,6 +1192,75 @@ fn wechat(args: &[String]) -> ExitCode {
                 eprintln!("kian: wechat login failed — {e}");
             }
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian imessage check [--config <path>] [--channel <name>] [--json]`
+/// — the read-only iMessage bridge preflight (CHANNEL-IMESSAGE §7.1):
+/// resolves the channel, proves the env-only bridge token, calls the
+/// bridge health, and reports the macOS gates (Full Disk Access, imsg
+/// rpc, Automation) plus the `watch.participants` ↔ `topics` diff. It
+/// never sends a message and never prints the token; any failed gate
+/// exits non-zero.
+fn imessage(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("kian: `imessage` requires a subcommand (check)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    if sub != "check" {
+        eprintln!("kian: unknown imessage subcommand `{sub}`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    let mut check_args = kian_cli::imessage_check::ImessageCheckArgs::default();
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => check_args.config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--channel" => match iter.next() {
+                Some(c) => check_args.channel = Some(c.clone()),
+                None => {
+                    eprintln!("kian: --channel requires a channel name\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => check_args.json = true,
+            other => {
+                eprintln!("kian: unknown imessage check option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("kian: cannot start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(kian_cli::imessage_check::run_check(&check_args)) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(report) => {
+            // Text mode already rendered a human report; JSON mode
+            // renders the machine-readable object (never the token).
+            if check_args.json {
+                println!("{report}");
+            } else {
+                eprint!("{report}");
+            }
+            ExitCode::from(1)
         }
     }
 }

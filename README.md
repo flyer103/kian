@@ -44,9 +44,9 @@ The same runtime also ships:
   default, postgres for replicas (`KIAN_PG_URL`).
 - **Super-agent bundle** — Router/Worker over Thread delegation, event subscriptions,
   evidence-gated completion, and channel output policies — all outside the core.
-- **Real channels and intake economics** — Lark IM, GitHub (webhook + poll) and WeChat iLink
-  (best-effort long-poll, QR login), two-level admission filtering, Inline/Spill shaping, Chain
-  of Recall, and untrusted-input marking.
+- **Real channels and intake economics** — Lark IM, GitHub (webhook + poll), WeChat iLink
+  (best-effort long-poll, QR login) and iMessage through a Mac-side bridge, two-level admission
+  filtering, Inline/Spill shaping, Chain of Recall, and untrusted-input marking.
 - **Bundle policy layer** — speak-rules, delegation Mandate, bounded outbox retry, policy
   versioning/drift marking, and the `kian tickets` stage board.
 - **Scheduled turns** — declarative `superagent.cron` schedules execute as ordinary durable turns
@@ -124,12 +124,14 @@ The same runtime also ships:
 | [design/READ-MODEL.md](design/READ-MODEL.md) | The normative serving-form contract: versions, deltas, snapshots, views, retention |
 | [design/CRON-MODEL.md](design/CRON-MODEL.md) | The normative scheduling contract: expressions, timezones/DST, durable cursors, misfire/overlap, worktree firings, `kian cron` |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
+| [design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md) | The normative iMessage channel contract: the macOS bridge ABI, allowlists, cursor/dedupe, degradation, acceptance |
 | [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Running postgres mode and the multi-replica replay |
 | [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md) | iPhone worker design, repo placement, enrollment and the verification matrix |
+| [docs/runbook-imessage.md](docs/runbook-imessage.md) | iMessage channel setup: the bot Apple ID, the two macOS grants, the bridge LaunchAgent, the tunnel and troubleshooting |
 | [docs/runbook-kian-vultr.md](docs/runbook-kian-vultr.md) | The vultr server: unit layout, config-write discipline, watchdog, deploy |
 | [a vendored archive/](a vendored archive/) | Frozen snapshots of the design inputs (read-only) |
 | [CHANGELOG.md](CHANGELOG.md) | What landed when, and what is env-gated |
@@ -382,7 +384,7 @@ superagent:
 cargo run -p kian-cli --bin kian -- agents   # list the delegation roster
 ```
 
-### Channels (GitHub, Lark, WeChat)
+### Channels (GitHub, Lark, WeChat, iMessage)
 
 Channels admit external events into subscriptions. `type: github` mounts the `POST /webhooks/github`
 receiver; the topic-mapping table doubles as the receive allowlist. The same channel can poll with
@@ -407,6 +409,11 @@ superagent:
       wechat:
         topics: { "oXXXX@im.wechat": "wechat" }     # sender → topic; also the allowlist
         credentials_file: ./.state/wechat-credentials.json   # written by `kian wechat login`
+    imessage:
+      type: imessage
+      imessage:
+        bridge_url: "http://127.0.0.1:7420"          # the Mac bridge, over an SSH -R / mesh VPN
+        topics: { "+14155551212": "imessage" }       # handle → topic; both allowlists
 ```
 
 `type: wechat` is **best-effort by contract**: one long-poll loop per channel over Tencent's
@@ -415,8 +422,17 @@ echo the latest inbound `context_token` — so it cannot message a user who has 
 first. A stale token (`errcode -14`) pauses that channel and resumes when the credential file
 changes ([design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md)).
 
+`type: imessage` needs a Mac signed into a dedicated Apple ID running
+`kian-imessage-bridge` (Full Disk Access + Automation → Messages), because iMessage has no API —
+the message must land on that Mac's `chat.db`. The adapter long-polls the bridge's loopback ABI;
+the bridge's `participants` list keeps non-allowlisted conversations from leaving the Mac.
+`kian imessage check` is the read-only preflight
+([design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md),
+[docs/runbook-imessage.md](docs/runbook-imessage.md)).
+
 Credentials are **env-only** (`KIAN_GITHUB_TOKEN`, `KIAN_GITHUB_WEBHOOK_SECRET`,
-`KIAN_LARK_APP_ID`/`*_SECRET`) and absent values refuse to start when the capability is configured
+`KIAN_LARK_APP_ID`/`*_SECRET`, `KIAN_IMESSAGE_BRIDGE_TOKEN`) and absent values refuse to start
+when the capability is configured
 — with one deliberate exception: the WeChat token is *issued* by a QR scan, so it lives in the
 local `0600` credential file named by `wechat.credentials_file`, never in an env var or
 `kian.yaml` ([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). The webhook receiver
@@ -848,6 +864,7 @@ Default CI needs none of these — every gated suite **skips with a log line, ne
 | `KIAN_GITHUB_TOKEN` | github channel send and poll reads | `send: true` refuses to start; public polls run tokenless |
 | `KIAN_GITHUB_WEBHOOK_SECRET` | webhook HMAC verification | a github webhook channel refuses to start |
 | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` / `KIAN_LARK_CHAT_ID` / `KIAN_LARK_POLL_CHAT` | lark channel and live smoke | skip |
+| `KIAN_IMESSAGE_BRIDGE_TOKEN` | imessage channel (the same secret as the Mac bridge's `token_file`) | a configured `type: imessage` channel refuses to start |
 | `KIAN_API_KEY` | live-provider smoke | skip |
 
 Secrets and URLs are env-only, never config values — the WeChat bot token is the one documented
@@ -874,6 +891,7 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-dsh` | The dsh bridge: a `LoopDriver` over a stdio child, mapping onto existing kinds |
 | `kian-cli` | The `kian` binary: serve assembly, operator CLI, inbound webhook receiver |
 | `kiand` | The endpoint daemon binary |
+| `kian-imessage-bridge` | The macOS-side iMessage bridge: loopback HTTP over `imsg rpc` for the `type: imessage` channel |
 
 ## Examples
 

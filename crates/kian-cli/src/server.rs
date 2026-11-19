@@ -622,6 +622,12 @@ impl Server {
             // `kian wechat login` (the token never lives in
             // kian.yaml and never in an env var — ADR-018).
             let mut wechat_channels = std::collections::BTreeMap::new();
+            // the imessage channels (config validation caps them at
+            // one — phase 1 is single-account). The bridge token is
+            // env-only at assembly: a configured channel without
+            // KIAN_IMESSAGE_BRIDGE_TOKEN refuses startup (the token
+            // never lives in kian.yaml — CHANNEL-IMESSAGE §7).
+            let mut imessage_channels = std::collections::BTreeMap::new();
             // the timer input sources (a channel like any other —
             // the system clock times the cadence).
             let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
@@ -701,6 +707,27 @@ impl Server {
                                 ServeError::Assembly(format!("wechat channel `{name}`: {e}"))
                             })?;
                         wechat_channels.insert(name.clone(), Arc::new(adapter));
+                    }
+                    "imessage" => {
+                        let section = channel.imessage.as_ref().ok_or_else(|| {
+                            ServeError::Config(crate::config::ConfigError::Invalid(format!(
+                                "superagent.channels `{name}` (type imessage) requires an `imessage:` section"
+                            )))
+                        })?;
+                        // Fail-closed on the env-only bridge token (the
+                        // error names the variable); the token is never
+                        // logged and never in kian.yaml.
+                        let runtime = section
+                            .to_runtime(
+                                name,
+                                env_credential(kian_superagent::IMESSAGE_BRIDGE_TOKEN_ENV),
+                            )
+                            .map_err(ServeError::Config)?;
+                        let adapter = kian_superagent::ImessageChannel::new(name.clone(), runtime)
+                            .map_err(|e| {
+                                ServeError::Assembly(format!("imessage channel `{name}`: {e}"))
+                            })?;
+                        imessage_channels.insert(name.clone(), Arc::new(adapter));
                     }
                     // Unknown types were rejected at parse time.
                     _ => {}
@@ -810,6 +837,7 @@ impl Server {
                 lark_channels,
                 github_channels,
                 wechat_channels,
+                imessage_channels,
                 timer_channels,
                 watchdog,
                 worker_gate,
