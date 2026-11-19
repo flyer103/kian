@@ -559,6 +559,7 @@ workers:
     mac-mini: KIAN_MAC_MINI_TOKEN
   queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
   queue_max_redrives: 1        # re-drive retries before an unacknowledgeable row is abandoned
+  queue_redrive_grace_ms: 5000 # postpone a re-drive that would race a running execution (ADR-037)
   release_after_ms: 300000     # idle-ended thread freed after 5 min; 0 = explicit release only
 ```
 
