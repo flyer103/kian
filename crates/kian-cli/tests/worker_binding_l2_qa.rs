@@ -104,6 +104,7 @@ impl Daemon {
                 "60000",
             ])
             .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("KIAND_DEDUPE", "0")
             .env("no_proxy", "127.0.0.1,localhost")
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -147,6 +148,7 @@ fn spawn_kian_serve(config: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_kian"))
         .args(["serve", "--config", config.to_str().unwrap()])
         .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("KIAND_DEDUPE", "0")
         .env("no_proxy", "127.0.0.1,localhost")
         .env(common::KEY_ENV, "test-key")
         .stdout(Stdio::null())

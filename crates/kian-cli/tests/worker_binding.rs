@@ -62,6 +62,7 @@ async fn backend_with(ids: &[&str]) -> (ExecStore, Arc<RemoteExecBackend>) {
             queue_timeout: Duration::from_millis(200),
             poll_interval: Duration::from_millis(50),
             max_redrives: 1,
+            redrive_grace: Duration::ZERO,
         },
         "test-holder",
         Duration::from_millis(200),

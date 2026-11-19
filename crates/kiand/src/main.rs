@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kian_endpoint::dedupe::{CacheOptions, ResultCache};
 use kian_endpoint::proto::RegisterToken;
 use kian_endpoint::{Endpoint, HeartbeatTap, RegisterBackoff, RegisterInfo, register_loop};
 use kiand::config::{Config, Flags};
@@ -26,17 +27,20 @@ const USAGE: &str = "usage:
   kiand [--config <path>] [--endpoint-id <id>] [--listen <host:port>]
         [--workspace-root <dir>]
         [--max-concurrent <n>] [--heartbeat-ms <n>] [--exec-timeout-ms <n>]
+        [--dedupe-dir <dir>] [--no-dedupe]
                                          run the endpoint daemon (default listen: 127.0.0.1:0;
                                          the bound address is printed on stdout)
   kiand --register-to <kian-host:port> [--endpoint-id <id>] [--description <text>]
         [--capability <name>]... [--heartbeat-ms <n>] [--token-env <NAME>]
+        [--dedupe-dir <dir>] [--no-dedupe]
                                          worker-dial register mode: dial kian, register with the
                                          token from the environment variable NAME
                                          (default KIAN_WORKER_TOKEN; only the NAME is on argv)
   kiand --version                        print the version
 
 configuration precedence: flags > environment (KIAND_ENDPOINT_ID, KIAND_LISTEN,
-KIAND_MAX_CONCURRENT, KIAND_HEARTBEAT_MS, KIAND_EXEC_TIMEOUT_MS) > optional
+KIAND_MAX_CONCURRENT, KIAND_HEARTBEAT_MS, KIAND_EXEC_TIMEOUT_MS, KIAND_DEDUPE,
+KIAND_DEDUPE_DIR) > optional
 ./kiand.yaml > defaults; malformed configuration refuses to start
 ";
 
@@ -114,6 +118,8 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--workspace-root" => {
                 flags.workspace_root = Some(next_value(&mut iter, "--workspace-root")?)
             }
+            "--dedupe-dir" => flags.dedupe_dir = Some(next_value(&mut iter, "--dedupe-dir")?),
+            "--no-dedupe" => flags.dedupe = Some(false),
             "--register-to" => flags.register_to = Some(next_value(&mut iter, "--register-to")?),
             "--description" => flags.description = Some(next_value(&mut iter, "--description")?),
             "--token-env" => flags.token_env = Some(next_value(&mut iter, "--token-env")?),
@@ -136,6 +142,38 @@ async fn run(config: Config) -> ExitCode {
         return run_worker(config).await;
     }
     run_server(config).await
+}
+
+/// The ADR-037 result record, when this daemon is configured with one. A
+/// missing directory degrades to no dedupe: delivery stays at-least-once
+/// and a re-dispatched command id simply executes again.
+fn result_cache(config: &Config) -> Option<Arc<ResultCache>> {
+    if !config.dedupe {
+        return None;
+    }
+    let Some(dir) = config.dedupe_dir.as_ref() else {
+        tracing::warn!(
+            "dedupe is enabled but no state directory resolved (set --dedupe-dir or \
+             KIAND_DEDUPE_DIR); results will not be recorded"
+        );
+        return None;
+    };
+    let cache = ResultCache::load(
+        dir.join(kiand::config::DEDUPE_FILE),
+        CacheOptions::default(),
+    );
+    tracing::info!(
+        path = %cache.path().display(),
+        "result record enabled: a re-dispatched command id is answered from it (ADR-037)"
+    );
+    Some(cache)
+}
+
+fn with_result_cache(endpoint: Endpoint, config: &Config) -> Endpoint {
+    match result_cache(config) {
+        Some(cache) => endpoint.with_result_cache(cache),
+        None => endpoint,
+    }
 }
 
 /// Read the worker token from the named environment variable. Only the
@@ -177,13 +215,13 @@ async fn run_worker(config: Config) -> ExitCode {
     };
 
     let (executor, _inflight) = DaemonExecutor::new(config.exec_timeout_ms);
-    let endpoint = Arc::new(
+    let endpoint = Arc::new(with_result_cache(
         Endpoint::new(config.endpoint_id.clone(), executor)
             .with_max_concurrent(config.max_concurrent)
             .with_workspace_root(config.workspace_root.clone())
-            .with_heartbeat(Duration::from_millis(config.heartbeat_ms))
-            .with_workspace_root(config.workspace_root.clone()),
-    );
+            .with_heartbeat(Duration::from_millis(config.heartbeat_ms)),
+        &config,
+    ));
     let info = RegisterInfo {
         endpoint_id: config.endpoint_id.clone(),
         description: config.description.clone(),
@@ -290,13 +328,14 @@ async fn run_server(config: Config) -> ExitCode {
             "heartbeat"
         );
     });
-    let endpoint = Arc::new(
+    let endpoint = Arc::new(with_result_cache(
         Endpoint::new(config.endpoint_id.clone(), executor)
             .with_max_concurrent(config.max_concurrent)
             .with_workspace_root(config.workspace_root.clone())
             .with_heartbeat(Duration::from_millis(config.heartbeat_ms))
             .with_heartbeat_tap(tap),
-    );
+        &config,
+    ));
     let serve = tokio::spawn(endpoint.clone().serve(listener));
     tracing::info!(
         %bound,
@@ -417,5 +456,17 @@ mod tests {
         assert_eq!(flags.endpoint_id.as_deref(), Some("box-a"));
         assert_eq!(flags.description.as_deref(), Some("build box"));
         assert_eq!(flags.token_env.as_deref(), Some("MY_SECRET_VAR"));
+    }
+
+    #[test]
+    fn dedupe_flags_parse() {
+        let args = vec![
+            "--no-dedupe".to_string(),
+            "--dedupe-dir".to_string(),
+            "/var/lib/kiand".to_string(),
+        ];
+        let flags = parse_flags(&args).unwrap();
+        assert_eq!(flags.dedupe, Some(false));
+        assert_eq!(flags.dedupe_dir.as_deref(), Some("/var/lib/kiand"));
     }
 }

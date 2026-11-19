@@ -108,6 +108,7 @@ impl Daemon {
                 &HEARTBEAT_MS.to_string(),
             ])
             .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("KIAND_DEDUPE", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .kill_on_drop(true);

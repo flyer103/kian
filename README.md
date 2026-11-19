@@ -130,6 +130,7 @@ The same runtime also ships:
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Running postgres mode and the multi-replica replay |
 | [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md) | iPhone worker design, repo placement, enrollment and the verification matrix |
+| [docs/runbook-kian-vultr.md](docs/runbook-kian-vultr.md) | The vultr server: unit layout, config-write discipline, watchdog, deploy |
 | [a vendored archive/](a vendored archive/) | Frozen snapshots of the design inputs (read-only) |
 | [CHANGELOG.md](CHANGELOG.md) | What landed when, and what is env-gated |
 
@@ -559,6 +560,7 @@ workers:
     mac-mini: KIAN_MAC_MINI_TOKEN
   queue_timeout_ms: 600000     # backend-level bound (global; see WORKER-MODEL §4)
   queue_max_redrives: 1        # re-drive retries before an unacknowledgeable row is abandoned
+  queue_redrive_grace_ms: 5000 # postpone a re-drive that would race a running execution (ADR-037)
   release_after_ms: 300000     # idle-ended thread freed after 5 min; 0 = explicit release only
 ```
 

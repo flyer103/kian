@@ -17,6 +17,7 @@
 //!
 //! Security boundary (DESIGN §4.4) is a future stake: no auth, no
 //! data-egress tiering, no credential-less use here yet.
+pub mod dedupe;
 pub mod endpoint;
 pub mod executor;
 pub mod fs;
@@ -24,6 +25,7 @@ pub mod proto;
 pub mod register;
 pub mod tcp;
 
+pub use dedupe::{CacheOptions, Claim, OwnerGuard, ResultCache};
 pub use endpoint::{Endpoint, EndpointError, HeartbeatInfo, HeartbeatTap, ServerPeer};
 pub use executor::LocalExecutor;
 pub use proto::{RefusalReason, RegisterToken};
@@ -43,6 +45,7 @@ mod tests {
             ("src/lib.rs", include_str!("lib.rs")),
             ("src/proto.rs", include_str!("proto.rs")),
             ("src/endpoint.rs", include_str!("endpoint.rs")),
+            ("src/dedupe.rs", include_str!("dedupe.rs")),
             ("src/executor.rs", include_str!("executor.rs")),
             ("src/tcp.rs", include_str!("tcp.rs")),
             ("src/register.rs", include_str!("register.rs")),

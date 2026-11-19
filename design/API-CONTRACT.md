@@ -546,8 +546,12 @@ it honestly; there is no cross-worker dispatch. At-least-once re-drive is **boun
 an endpoint may see the same command id at most `1 + workers.queue_max_redrives` times, after which
 the row converges to the terminal `abandoned` without a further frame — a command whose own side
 effect destroys the ack path (restarting the server or the worker) can therefore be received but
-never replayed forever. That semantics lives in [WORKER-MODEL](WORKER-MODEL.md) §4 and DESIGN §4.3;
-this section fixes only the frames.
+never replayed forever. A re-dispatch is additionally postponed by
+`workers.queue_redrive_grace_ms` when the row was dispatched more recently than the grace, and the
+endpoint answers a repeated command id from its recorded result instead of executing it again
+([ADR-037](decisions/ADR-037-endpoint-result-dedupe.md)) — the frames are unchanged, so a cached
+answer is byte-identical to a fresh one. That semantics lives in [WORKER-MODEL](WORKER-MODEL.md) §4
+and DESIGN §4.3; this section fixes only the frames.
 
 ### 8.5 Upgrade v0 → v1
 

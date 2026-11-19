@@ -32,6 +32,11 @@ pub const DEFAULT_TOKEN_ENV: &str = "KIAN_WORKER_TOKEN";
 /// Default root the v2 filesystem commands resolve under (ADR-023).
 pub const DEFAULT_WORKSPACE_ROOT: &str = ".";
 
+/// Default dedupe record directory, relative to `$HOME` (ADR-037).
+pub const DEFAULT_DEDUPE_DIR: &str = ".kian/kiand";
+/// File name of the dedupe record inside [`Config::dedupe_dir`].
+pub const DEDUPE_FILE: &str = "results.jsonl";
+
 /// Optional config file, looked up at `./kiand.yaml` unless overridden.
 pub const DEFAULT_CONFIG_FILE: &str = "kiand.yaml";
 
@@ -42,6 +47,8 @@ pub const ENV_MAX_CONCURRENT: &str = "KIAND_MAX_CONCURRENT";
 pub const ENV_HEARTBEAT_MS: &str = "KIAND_HEARTBEAT_MS";
 pub const ENV_EXEC_TIMEOUT_MS: &str = "KIAND_EXEC_TIMEOUT_MS";
 pub const ENV_WORKSPACE_ROOT: &str = "KIAND_WORKSPACE_ROOT";
+pub const ENV_DEDUPE: &str = "KIAND_DEDUPE";
+pub const ENV_DEDUPE_DIR: &str = "KIAND_DEDUPE_DIR";
 
 /// Every way loading the daemon configuration can refuse to start.
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +83,11 @@ pub struct Flags {
     pub description: Option<String>,
     pub token_env: Option<String>,
     pub workspace_root: Option<String>,
+    /// `--no-dedupe`: answer a re-dispatched command id by executing it
+    /// again instead of from the recorded result (ADR-037).
+    pub dedupe: Option<bool>,
+    /// `--dedupe-dir`: where the result records live.
+    pub dedupe_dir: Option<String>,
     /// Repeatable `--capability` (v3). The list is validated at startup
     /// and sent in the register frame; an empty list omits the wire key.
     pub capabilities: Vec<String>,
@@ -94,6 +106,10 @@ pub struct FileConfig {
     pub description: Option<String>,
     pub token_env: Option<String>,
     pub workspace_root: Option<String>,
+    /// ADR-037: record results by command id (default on) and answer a
+    /// re-dispatch from the record.
+    pub dedupe: Option<bool>,
+    pub dedupe_dir: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
@@ -115,6 +131,13 @@ pub struct Config {
     /// Root the v2 filesystem commands resolve under (ADR-023). Validated
     /// to exist and be a directory at startup.
     pub workspace_root: String,
+    /// Record each result by command id and answer a re-dispatched id from
+    /// the record instead of executing again (ADR-037).
+    pub dedupe: bool,
+    /// Directory holding the dedupe record (`results.jsonl`). `None` when
+    /// no home could be resolved and nothing configured one — dedupe then
+    /// degrades to disabled (a miss re-executes; the queue is unchanged).
+    pub dedupe_dir: Option<std::path::PathBuf>,
     /// Declared capabilities (v3, ADR-029): lowercase `[a-z0-9._-]`,
     /// 1..=64 bytes, at most 16, unique. Refuse startup on a bad entry so
     /// the worker never sends a declaration the server would sanitize.
@@ -196,6 +219,21 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         .or_else(|| env_get(ENV_WORKSPACE_ROOT))
         .or_else(|| file.as_ref().and_then(|f| f.workspace_root.clone()))
         .unwrap_or_else(|| DEFAULT_WORKSPACE_ROOT.to_string());
+    let dedupe = match flags.dedupe {
+        Some(value) => value,
+        None => match env(env_get, ENV_DEDUPE) {
+            Some(raw) => env_bool(ENV_DEDUPE, &raw)?,
+            None => file.as_ref().and_then(|f| f.dedupe).unwrap_or(true),
+        },
+    };
+    let dedupe_dir = flags
+        .dedupe_dir
+        .or_else(|| env(env_get, ENV_DEDUPE_DIR))
+        .or_else(|| file.as_ref().and_then(|f| f.dedupe_dir.clone()))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env(env_get, "HOME").map(|home| std::path::Path::new(&home).join(DEFAULT_DEDUPE_DIR))
+        });
     let mut capabilities = file
         .as_ref()
         .map(|f| f.capabilities.clone())
@@ -212,6 +250,8 @@ pub fn resolve_with(env_get: EnvGetter<'_>, flags: Flags) -> Result<Config, Conf
         description,
         token_env,
         workspace_root,
+        dedupe,
+        dedupe_dir,
         capabilities,
     };
     validate(config)
@@ -260,6 +300,16 @@ fn env_usize(env: EnvGetter<'_>, key: &str) -> Result<Option<usize>, ConfigError
             .parse::<usize>()
             .map(Some)
             .map_err(|_| ConfigError::Env(format!("{key}=`{raw}` is not a non-negative integer"))),
+    }
+}
+
+fn env_bool(key: &str, raw: &str) -> Result<bool, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::Env(format!(
+            "{key}=`{raw}` is not a boolean (use 1/0)"
+        ))),
     }
 }
 
@@ -690,5 +740,84 @@ mod tests {
         let dir = std::path::PathBuf::from(option_env!("CARGO_TARGET_TMPDIR").unwrap_or(&fallback));
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn dedupe_defaults_on_under_the_home_directory() {
+        let mut env = no_env();
+        env.insert("HOME", "/home/builder".to_string());
+        let config = resolve(env, Flags::default()).unwrap();
+        assert!(config.dedupe, "ADR-037 is on by default");
+        assert_eq!(
+            config.dedupe_dir,
+            Some(std::path::PathBuf::from("/home/builder/.kian/kiand"))
+        );
+    }
+
+    #[test]
+    fn no_dedupe_flag_disables_the_record() {
+        let config = resolve(
+            no_env(),
+            Flags {
+                dedupe: Some(false),
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert!(!config.dedupe);
+        assert!(
+            config.dedupe_dir.is_some() || config.dedupe_dir.is_none(),
+            "the directory is resolved independently of the switch"
+        );
+    }
+
+    #[test]
+    fn dedupe_env_is_honored_and_fail_closed() {
+        let mut env = no_env();
+        env.insert(ENV_DEDUPE, "0".into());
+        env.insert(ENV_DEDUPE_DIR, "/var/lib/kiand".into());
+        let config = resolve(env, Flags::default()).unwrap();
+        assert!(!config.dedupe);
+        assert_eq!(
+            config.dedupe_dir,
+            Some(std::path::PathBuf::from("/var/lib/kiand"))
+        );
+
+        let mut env = no_env();
+        env.insert(ENV_DEDUPE, "maybe".into());
+        let err = resolve(env, Flags::default()).unwrap_err();
+        assert!(err.to_string().contains(ENV_DEDUPE), "was: {err}");
+    }
+
+    #[test]
+    fn dedupe_file_value_applies_and_flags_win() {
+        let dir = tmp_dir();
+        let path = dir.join("kiand-dedupe.yaml");
+        std::fs::write(&path, "dedupe: false\ndedupe_dir: /srv/kiand-cache\n").unwrap();
+        let config = resolve(
+            no_env(),
+            Flags {
+                config: Some(path),
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert!(!config.dedupe);
+        assert_eq!(
+            config.dedupe_dir,
+            Some(std::path::PathBuf::from("/srv/kiand-cache"))
+        );
+
+        let mut env = no_env();
+        env.insert(ENV_DEDUPE, "0".into());
+        let overridden = resolve(
+            env,
+            Flags {
+                dedupe: Some(true),
+                ..Flags::default()
+            },
+        )
+        .unwrap();
+        assert!(overridden.dedupe, "the flag wins over the environment");
     }
 }

@@ -160,11 +160,15 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   `pending` and `inflight` rows; detaching a route leaves the rows durable and parked. Static
   workers keep their boot-created routes.
 - **At-least-once with command-id dedupe.** Delivery is ADR-007's: a row may be dispatched more than
-  once across a crash or a reconnect (the endpoint may therefore execute a command twice), but it
-  **settles once** — the command id is the dedupe key and a settled row answers every re-execution
-  from the durable record. For the v2 filesystem family the same rule is recorded explicitly:
-  `fs_list`/`fs_read` are idempotent, and a repeated `fs_write` writes the same path and content
-  again (mtime may move) — never a different payload.
+  once across a crash or a reconnect, but it **settles once** — the command id is the dedupe key and
+  a settled row answers every re-execution from the durable record. The dispatch side dedupes too
+  ([ADR-037](decisions/ADR-037-endpoint-result-dedupe.md)): the worker records each result frame by
+  command id before sending it (bounded, 24 h TTL) and answers a re-dispatched id from that record
+  instead of running the command again; a duplicate that arrives while the first execution is still
+  running joins it. A cache miss, an oversized result or a disabled cache means *execute again* —
+  at-least-once is unchanged, and no result is ever fabricated. For the v2 filesystem family the
+  same rule is recorded explicitly: `fs_list`/`fs_read` are idempotent, and a repeated `fs_write`
+  writes the same path and content again (mtime may move) — never a different payload.
 - **Re-drive is bounded** ([ADR-033](decisions/ADR-033-bounded-queue-redrive.md)). At-least-once
   must also terminate, so every dispatch counts an attempt: a `pending` row always dispatches,
   while an `inflight` row re-drives only while its `dispatch_attempts` are below
@@ -176,7 +180,10 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   line naming command id, endpoint, attempt count and `tool_call_ref`. No result is fabricated, no
   row is deleted, no new status or event exists; a caller re-attaching after the fact reads
   `abandoned` and gets the honest timeout. The bound is a recovery cap, not a retry policy: a row
-  abandoned here may have run — the audit line says so.
+  abandoned here may have run — the audit line says so. A re-dispatch is additionally delayed by
+  `workers.queue_redrive_grace_ms` (default 5 s, `0` disables) when the row was dispatched more
+  recently than the grace, so a reconnect cannot race an execution that may still be running on the
+  worker; the grace only postpones the dispatch and never settles a row.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
 - **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being
@@ -292,6 +299,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 |---|---|---|---|
 | Worker absent (never registered yet, or offline) | no route / no member | spawn is allowed only for a **known** id; commands park durably; the honest queue timeout is the bound | that worker's sessions, parked — nothing else |
 | Worker transport loss mid-command | connection closed | route detached, member offline, row stays `inflight`; re-drive on re-registration (at-least-once, dedupe at settlement) | that worker |
+| Re-dispatch of a command the worker already ran | command id present in the worker's result cache | answered from the cache (one audit line), the command does **not** run again — a crash-replayed `systemctl restart` cannot restart twice; a miss, an oversized result or a disabled cache re-executes | that command only |
 | Heartbeat silence on a live connection | `offline_after_ms` of staleness | state offline; the existing watchdog admits the ordinary `endpoint_health` input to affected live sessions (it reads the last-heartbeat column only and never writes); the route stays attached | that worker |
 | Duplicate id, newer registration | authenticated `register` while online | replace: old connection closed, route swapped, generation incremented, audited | that id only |
 | Duplicate id vs static pin | registration | refused and audited; static pin unchanged | that id only |

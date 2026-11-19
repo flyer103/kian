@@ -169,10 +169,11 @@ pub(crate) async fn claim_queue_row(
     max_dispatches: i64,
 ) -> Result<bool, sqlx::Error> {
     let claimed: Option<String> = sqlx::query_scalar(
-        "UPDATE exec_queue SET claimed_by = ?, claimed_until_ms = ?, dispatch_attempts = dispatch_attempts + 1 WHERE command_id = ? AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < ? OR claimed_by = ?) AND (status = 'pending' OR dispatch_attempts < ?) RETURNING command_id",
+        "UPDATE exec_queue SET claimed_by = ?, claimed_until_ms = ?, updated_at = ?, dispatch_attempts = dispatch_attempts + 1 WHERE command_id = ? AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < ? OR claimed_by = ?) AND (status = 'pending' OR dispatch_attempts < ?) RETURNING command_id",
     )
     .bind(holder)
     .bind(now + ttl_ms)
+    .bind(now)
     .bind(command_id.to_string())
     .bind(now)
     .bind(holder)

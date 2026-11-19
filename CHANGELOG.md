@@ -10,6 +10,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Worker result retention: a re-dispatched command id is answered from the endpoint's record, not
+  executed again (ADR-037)**. `kiand` records each result frame by command id before sending it and
+  answers a duplicate dispatch from that record; a duplicate that arrives while the first execution
+  is still running joins it. A crash-replayed `systemctl restart kian` can therefore no longer
+  restart the server twice. The record is bounded (24 h TTL, 512 entries, 256 KiB per entry,
+  64 MiB file), lives in the worker's state directory (`--dedupe-dir` / `KIAND_DEDUPE_DIR`, on by
+  default, `--no-dedupe` / `KIAND_DEDUPE=0` opts out), and a miss still re-executes — at-least-once
+  is unchanged and no result is fabricated. Re-drive of a row dispatched within
+  `workers.queue_redrive_grace_ms` (default 5 s, `0` disables) is postponed instead of racing a
+  running execution. No wire frame, protocol version or store schema changes. Contract:
+  [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §4, §8.
+
 - **Cron: the declaration reaches the store (CRON-MODEL §4.1/§12.3 fix)**. The resident ticker now
   syncs each declared schedule into `cron_schedules` before it decides anything: a fresh deployment
   writes its row instead of reporting `no row` on every tick, a store row deleted behind a running

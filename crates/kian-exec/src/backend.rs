@@ -213,6 +213,14 @@ pub struct RemoteExecConfig {
     /// dispatches instead of replaying it forever. `0` disables re-drive
     /// entirely (first dispatch only).
     pub max_redrives: u32,
+    /// How recently a row must have been dispatched for its re-drive to be
+    /// postponed (ADR-037). A route attach re-drives `inflight` rows
+    /// immediately (ADR-007); when the row's last dispatch is younger than
+    /// this grace, the driver waits instead of racing an execution that may
+    /// still be running on the worker. The grace only postpones a dispatch:
+    /// it never settles a row and never changes the caller's bound. `0`
+    /// disables it (every `inflight` row re-drives on attach, as before).
+    pub redrive_grace: Duration,
 }
 
 impl Default for RemoteExecConfig {
@@ -221,6 +229,7 @@ impl Default for RemoteExecConfig {
             queue_timeout: Duration::from_secs(60),
             poll_interval: Duration::from_millis(250),
             max_redrives: 1,
+            redrive_grace: Duration::from_secs(5),
         }
     }
 }
@@ -1117,8 +1126,18 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
         };
         let fresh: Vec<QueuedCommand> = {
             let mut dispatching = route.dispatching.lock().unwrap();
+            let now = now_ms();
+            let grace_ms = duration_ms_i64(core.config.redrive_grace);
             rows.into_iter()
-                .filter(|row| dispatching.insert(row.command_id))
+                .filter(|row| {
+                    // ADR-037: an `inflight` row dispatched within the grace
+                    // may still be running on the worker; re-driving it now
+                    // would race that execution. Wait for a later loop turn.
+                    let young = row.status == QueueStatus::Inflight
+                        && grace_ms > 0
+                        && now.saturating_sub(row.updated_at) < grace_ms;
+                    !young && dispatching.insert(row.command_id)
+                })
                 .collect()
         };
         if fresh.is_empty() {

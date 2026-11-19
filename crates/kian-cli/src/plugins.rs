@@ -394,10 +394,20 @@ impl Plugin for RemoteExecPlugin {
             .map_or(RemoteExecConfig::default().max_redrives, |workers| {
                 workers.queue_max_redrives
             });
+        // ADR-037: postpone a re-drive that would race an execution still
+        // running on the worker. Same `workers:`-only surface as the
+        // re-drive bound: static pins keep the backend default.
+        let redrive_grace = self
+            .workers
+            .as_ref()
+            .map_or(RemoteExecConfig::default().redrive_grace, |workers| {
+                Duration::from_millis(workers.queue_redrive_grace_ms)
+            });
         let config = RemoteExecConfig {
             queue_timeout: Duration::from_millis(max_timeout),
             poll_interval: Duration::from_millis(250),
             max_redrives,
+            redrive_grace,
         };
         // The dynamic-membership half (when `workers:` is configured):
         // read the env-only tokens (fail-closed — values never travel
@@ -1784,6 +1794,7 @@ mod backend_queue_timeout_tests {
             allow_public: false,
             queue_timeout_ms: timeout,
             queue_max_redrives: 1,
+            queue_redrive_grace_ms: crate::config::DEFAULT_WORKER_QUEUE_REDRIVE_GRACE_MS,
             release_after_ms: crate::config::DEFAULT_WORKER_RELEASE_AFTER_MS,
             enrolled_only: false,
             tokens: Default::default(),

@@ -382,6 +382,7 @@ async fn qa_backend(ids: &[&str]) -> (ExecStore, Arc<RemoteExecBackend>) {
             queue_timeout: Duration::from_millis(200),
             poll_interval: Duration::from_millis(50),
             max_redrives: 1,
+            redrive_grace: Duration::ZERO,
         },
         "qa-holder",
         Duration::from_millis(200),

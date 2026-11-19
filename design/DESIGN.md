@@ -904,7 +904,12 @@ graph LR
     re-drives only below `1 + workers.queue_max_redrives`, and a spent bound converges the row to
     `abandoned` once no live lease is held — one audit line, no fabricated result. That is what
     keeps at-least-once terminating for a command whose own side effect destroys its ack path
-    (restarting the server or killing its worker).
+    (restarting the server or killing its worker). The endpoint side dedupes the replay
+    (ADR-037): `kiand` records each result by command id before sending it and answers a
+    re-dispatched id from that bounded cache instead of executing it again, so a crash-replayed
+    `systemctl restart kian` cannot restart the server twice; a miss still re-executes
+    (at-least-once unchanged). A re-dispatch of a row younger than
+    `workers.queue_redrive_grace_ms` is postponed until the grace elapses.
   - **Per-worker sides become runtime-provided.** Instead of one prebuilt `WorkerLoopDriver` per
     configured worker, the assembly keeps a **lazy per-id side cache** built from a factory and never
     evicts it (an offline worker's side still enqueues by id); the per-drive selection rule from the

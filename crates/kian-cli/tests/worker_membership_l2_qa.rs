@@ -63,6 +63,7 @@ fn child_env(command: &mut Command) {
     command
         .env(common::KEY_ENV, "test-key")
         .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("KIAND_DEDUPE", "0")
         .env("no_proxy", "127.0.0.1,localhost");
     force_no_proxy();
 }
@@ -487,6 +488,7 @@ async fn qa_runtime_membership_over_real_processes() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("KIAND_DEDUPE", "0")
         .env(common::KEY_ENV, "test-key")
         .output()
         .await
