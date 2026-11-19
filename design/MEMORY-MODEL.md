@@ -256,6 +256,14 @@ consumes the row into ONE `input/admitted` carrying the message plus the additiv
   explicit "create as memory session" discriminator on the create call (a wire change,
   API-CONTRACT scope) and is deferred beyond P2.
 
+  **Reachability gap (recorded 2026-11-19).** The injection call site is the control plane's
+  `create_session` only; every **internally created** session — the resident Router/watchdog
+  (bootstrapped by the first admit), delegated workers (`child_session_id`), cron targets
+  (`channel_session`) — bypasses it, so those families receive no index. Closing the gap needs a
+  bootstrap seam that runs *before* each creator admits its triggering input and accepts a
+  caller-chosen (derived) id; the decision record is
+  [ADR-038](decisions/ADR-038-memory-injection-for-internal-sessions.md) (**proposed**, owner gate).
+
 **Cost note (updated P3b-1; originally kian-104 review I1):** the fresh session's rebuild is a
 single `session/created` event. The source memory session's history is no longer read in full:
 since P3b-1 the fold input is the index-accelerated kind scan (`EventStore::scan_kind` over the
