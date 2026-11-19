@@ -256,13 +256,16 @@ consumes the row into ONE `input/admitted` carrying the message plus the additiv
   explicit "create as memory session" discriminator on the create call (a wire change,
   API-CONTRACT scope) and is deferred beyond P2.
 
-  **Reachability gap (recorded 2026-11-19).** The injection call site is the control plane's
-  `create_session` only; every **internally created** session — the resident Router/watchdog
-  (bootstrapped by the first admit), delegated workers (`child_session_id`), cron targets
-  (`channel_session`) — bypasses it, so those families receive no index. Closing the gap needs a
-  bootstrap seam that runs *before* each creator admits its triggering input and accepts a
-  caller-chosen (derived) id; the decision record is
-  [ADR-038](decisions/ADR-038-memory-injection-for-internal-sessions.md) (**proposed**, owner gate).
+  **Reachability (closed 2026-11-19, ADR-038).** The injection call site used to be the control
+  plane's `create_session` only, so every **internally created** session — the resident
+  Router/watchdog (bootstrapped by the first admit), delegated workers (`child_session_id`), cron
+  targets (`channel_session`) — bypassed it. The memory bundle now hosts on either assembly (the
+  `MemoryLoopDriver` wraps the plain loop or the three-way super-agent driver; the `memory:` +
+  `superagent:` config refusal is gone), and a bundle-level `SessionBootstrap` seam runs before
+  each internal creator admits its triggering input (fresh-only, `memory-inject:<session>`
+  idempotent, no-op without a `memory:` section), so the index is the session's first
+  context-bearing event in every family. Decision record:
+  [ADR-038](decisions/ADR-038-memory-injection-for-internal-sessions.md) (accepted).
 
 **Cost note (updated P3b-1; originally kian-104 review I1):** the fresh session's rebuild is a
 single `session/created` event. The source memory session's history is no longer read in full:

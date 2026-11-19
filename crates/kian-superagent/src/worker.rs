@@ -693,6 +693,10 @@ pub struct WorkerSpawner {
     /// policy resolves per-template scope text against.
     worker_template_id: String,
     inbox: Arc<dyn InboxWriter>,
+    /// ADR-038: the session-bootstrap seam, installed by the assembly
+    /// once the engine exists (the spawner itself is built before it).
+    /// `None` (the default, all tests) keeps every byte unchanged.
+    bootstrap: std::sync::OnceLock<Option<Arc<dyn crate::bootstrap::SessionBootstrap>>>,
 }
 
 impl WorkerSpawner {
@@ -703,7 +707,14 @@ impl WorkerSpawner {
             pinned_version: worker_template.version,
             worker_template_id: worker_template.id.clone(),
             inbox,
+            bootstrap: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Installs the session-bootstrap seam (ADR-038). Idempotent: the
+    /// first install wins, later calls are no-ops.
+    pub fn install_bootstrap(&self, bootstrap: Arc<dyn crate::bootstrap::SessionBootstrap>) {
+        let _ = self.bootstrap.set(Some(bootstrap));
     }
 
     /// The worker template's id — the mandate scope key (
@@ -877,6 +888,18 @@ impl WorkerSpawner {
     /// double-admits), then wake. Durable row first, wake strictly
     /// after (invariant 1).
     pub async fn admit(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
+        // ADR-038: the bootstrap runs BEFORE the triggering row, so the
+        // index is the worker session's first context-bearing event.
+        // A failure is recorded and never fails the spawn.
+        if let Some(bootstrap) = self.bootstrap.get().and_then(|b| b.as_ref())
+            && let Err(error) = bootstrap.bootstrap(spawned.worker_session).await
+        {
+            tracing::warn!(
+                session = %spawned.worker_session.0,
+                %error,
+                "worker session bootstrap skipped"
+            );
+        }
         let wrapper = spawned.task_message["content"].clone();
         self.inbox
             .admit(
@@ -2617,6 +2640,52 @@ mod tests {
         // The task message embedded in both streams' thread/started
         // carries the marker too (audit-visible forever).
         assert!(delegation_is_speculative(&spawned.task_message["content"]));
+    }
+
+    /// ADR-038: the session bootstrap runs BEFORE the triggering row —
+    /// the injected index must be the worker session's first
+    /// context-bearing event.
+    #[tokio::test]
+    async fn the_session_bootstrap_precedes_the_worker_admit() {
+        struct OrderingBootstrap {
+            inbox: Arc<CapturingInbox>,
+            seen: Arc<std::sync::Mutex<Option<SessionId>>>,
+        }
+
+        impl crate::bootstrap::SessionBootstrap for OrderingBootstrap {
+            fn bootstrap(
+                &self,
+                session: SessionId,
+            ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+                // The triggering row must not exist yet.
+                assert!(
+                    self.inbox.admits.lock().unwrap().is_empty(),
+                    "the bootstrap must run before the spawner admits the wrapper"
+                );
+                *self.seen.lock().unwrap() = Some(session);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        spawner.install_bootstrap(Arc::new(OrderingBootstrap {
+            inbox: Arc::clone(&inbox),
+            seen: Arc::clone(&seen),
+        }));
+
+        let spawned = spawner
+            .spawn(json!("inject then admit"), None)
+            .await
+            .expect("spawn");
+        assert_eq!(*seen.lock().unwrap(), Some(spawned.worker_session));
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

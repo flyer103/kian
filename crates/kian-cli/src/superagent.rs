@@ -52,8 +52,8 @@ use kian_store::EventStore;
 use kian_superagent::{
     AdmitReceipt, InboxWriteError, InboxWriter, LineagePlan, MockChannel, PassthroughRegistry,
     PortFor, RouterDriver, RouterInbox, RouterMetrics, RouterProfile, StreamPort, StreamPortError,
-    SubscriptionService, WorkerBinding, WorkerLoopDriver, WorkerStreamsError, lineage_plan,
-    worker_binding_of, worker_sessions,
+    SubscriptionService, WorkerBinding, WorkerLoopDriver, WorkerSpawner, WorkerStreamsError,
+    lineage_plan, worker_binding_of, worker_sessions,
 };
 
 use crate::config::EndpointConfig;
@@ -1914,6 +1914,9 @@ pub struct SuperAgentServices {
     /// The mounted router inbox (residency signal; also the spawner's
     /// and the worker wrapper's port).
     pub router_inbox: Arc<RouterInbox>,
+    /// The delegation spawner (ADR-038: `start_services` installs the
+    /// session-bootstrap seam here before the first dispatch).
+    pub spawner: Arc<WorkerSpawner>,
     /// The resident Router profile (bootstrap is called post-rebuild).
     pub profile: RouterProfile,
     /// The subscription service (registry installed post-rebuild).
@@ -1999,8 +2002,15 @@ pub async fn start_services(
     engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
     order: StartupOrder,
+    session_bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
 ) -> Result<SuperAgentRuntime, String> {
     let router = services.profile.session;
+    // ADR-038: the spawner is built by the plugin (before the engine
+    // exists), so the seam is installed late here; every worker admit
+    // after this point bootstraps before its triggering row.
+    if let Some(bootstrap) = session_bootstrap.as_ref() {
+        services.spawner.install_bootstrap(Arc::clone(bootstrap));
+    }
 
     // 1. Rebuild the passthrough registry from event streams (the
     //    NoLostWork analog for subscriptions; nothing authoritative
@@ -2293,7 +2303,14 @@ pub async fn start_services(
     }
 
     // 4. Bootstrap the resident Router (idempotent admit + wake; the
-    //    first hold appends `session/created`).
+    //    first hold appends `session/created`). ADR-038: the session
+    //    bootstrap runs first, so a fresh Router's first context-bearing
+    //    event is the memory index, not the judge prompt.
+    if let Some(bootstrap) = session_bootstrap.as_ref()
+        && let Err(error) = bootstrap.bootstrap(router).await
+    {
+        tracing::warn!(session = %router.0, %error, "router session bootstrap skipped");
+    }
     services
         .profile
         .bootstrap(services.router_inbox.as_ref())
@@ -2310,6 +2327,15 @@ pub async fn start_services(
     //     after this point every emitted tick reaches a live consumer
     //     and a bootstrapped judge.
     if let Some(watchdog_profile) = &services.watchdog {
+        if let Some(bootstrap) = session_bootstrap.as_ref()
+            && let Err(error) = bootstrap.bootstrap(watchdog_profile.session).await
+        {
+            tracing::warn!(
+                session = %watchdog_profile.session.0,
+                %error,
+                "watchdog session bootstrap skipped"
+            );
+        }
         watchdog_profile
             .bootstrap(services.router_inbox.as_ref())
             .await

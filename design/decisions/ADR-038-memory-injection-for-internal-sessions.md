@@ -1,6 +1,6 @@
 # ADR-038: Memory injection reaches internally created sessions through a bootstrap seam
 
-- **Status**: proposed (owner gate; append-only — ADR-001…037 immutable)
+- **Status**: accepted (owner directive 2026-11-19; append-only — ADR-001…037 immutable)
 - **Date**: 2026-11-19
 - **Related**: [design/MEMORY-MODEL.md](../MEMORY-MODEL.md) §6 (the injection contract), §11
   (open questions); [design/DESIGN.md](../DESIGN.md) §4.1/§4.6/§4.7 (resident sessions,
@@ -32,6 +32,11 @@ the memory index. Dreaming writes notes that only client-created sessions can se
 "parallel features compose wrongly" case the review discipline asks for, and it is invisible in the
 per-feature tests (each family passes its own suite).
 
+The implementation exposed a second, harder blocker: `ServeConfig::validate` **refused
+`memory:` alongside `superagent:`** ("the Phase-1 bundle assembles on the built-in assembly"),
+because `MemoryLoopDriver` wrapped a concrete `ReActLoop` and the super-agent assembly resolves a
+`SuperAgentDriver`. Hosting, not injection, was the gate.
+
 Two constraints make the obvious fixes wrong:
 
 1. **The index must be the session's first context-bearing event.** It is a prompt prefix
@@ -45,26 +50,31 @@ Two constraints make the obvious fixes wrong:
 
 ## Decision
 
-1. **A `SessionBootstrap` seam, owned by the bundle, implemented by the assembly.** The trait
+1. **Host the memory bundle on the super-agent assembly.** `MemoryLoopDriver` now wraps
+   `Arc<dyn LoopDriver<Ctx = DrainCtx>>` (the built-in plain loop *or* the three-way
+   `SuperAgentDriver`); dream sessions still route to the dream side, everything else is
+   unchanged. `ServeConfig::validate` no longer refuses the mix, and the assembly builds the
+   memory driver over whichever driver it resolved.
+2. **A `SessionBootstrap` seam, owned by the bundle, implemented by the assembly.** The trait
    lives in `kian-superagent` (it is Router/Worker/cron policy, not core — constraint 10), with
    one method: `bootstrap(&self, session: SessionId) -> Result<(), String>`. The `kian-cli`
    assembly implements it over the memory assembly (`inject_memory_index`) and passes it to the
    three internal creators: `superagent::start_services` (resident boot), the `WorkerSpawner`
    (spawn), and the cron `EngineTurn` (firing dispatch).
-2. **Ordering is the contract.** Each creator calls `bootstrap(session)` **before** it admits the
+3. **Ordering is the contract.** Each creator calls `bootstrap(session)` **before** it admits the
    triggering row (the router/watchdog bootstrap prompt, the delegation wrapper, the cron firing).
    The index therefore becomes the first `input/admitted`, and the triggering input follows it in
    inbox order — exactly the order the create handler produces today.
-3. **Fresh-only, idempotent, no-op by default.** The seam checks `version(session) == 0` before
+4. **Fresh-only, idempotent, no-op by default.** The seam checks `version(session) == 0` before
    injecting; an existing session is never touched (a restart must not rewrite a live prefix —
    I2's spirit). The quiet admit keeps `memory-inject:<session>` as its key, so a retry or a race
    between two creators dedupes at the store. With no `memory:` section the seam is `None` and
    every call is a no-op (`Ok(())`), leaving streams byte-identical.
-4. **The exclusion list is unchanged.** I10's identity exclusions still run inside the injection
+5. **The exclusion list is unchanged.** I10's identity exclusions still run inside the injection
    (`inject_memory_index` already checks them); the bootstrap adds no new authority. The
    `injected_skips` counter and the fail-open-on-error rule (I8) apply unchanged — a failed
    bootstrap never fails the creator.
-5. **The seam is observable, not invisible.** Each bootstrap appends nothing when it skips; when it
+6. **The seam is observable, not invisible.** Each bootstrap appends nothing when it skips; when it
    injects, the existing `memory` provenance on the first `input/admitted` is the audit record.
    No new event kind, no new payload key.
 
@@ -91,6 +101,8 @@ Two constraints make the obvious fixes wrong:
 
 ## Consequences
 
+- `memory:` and `superagent:` compose: the index reaches client-created sessions (already), the
+  resident Router/watchdog at boot, delegated workers at spawn and cron targets at dispatch.
 - Resident Router/watchdog sessions, delegated workers and cron firings receive the index at
   creation. For a deployment with `memory:` configured, the first provider request of each of
   these sessions gains the index (a **one-time, first-position** prefix extension: no existing

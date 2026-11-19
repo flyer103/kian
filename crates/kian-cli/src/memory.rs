@@ -29,7 +29,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use kian_core::events::Event;
 use kian_core::seams::{LoopDriver, LoopOutcome};
-use kian_loop::ReActLoop;
 use kian_memory::{DreamDriver, MemoryConfig, dream_request_in};
 use kian_orchestrator::DrainCtx;
 
@@ -48,22 +47,25 @@ use kian_orchestrator::DrainCtx;
 /// session that reaches the dream side by operator error still settles
 /// normally.
 pub struct MemoryLoopDriver {
-    plain: Arc<ReActLoop>,
+    /// The inner driver for every ordinary session (the built-in plain
+    /// loop, or the super-agent three-way driver — ADR-038 allows the
+    /// memory bundle on either assembly).
+    plain: Arc<dyn LoopDriver<Ctx = DrainCtx>>,
     dream: Arc<DreamDriver>,
 }
 
 impl MemoryLoopDriver {
-    /// Builds the router over the two sides. `plain` is the exact loop
-    /// the built-in assembly would have run (unchanged for ordinary
-    /// sessions); `dream` wraps the configured dreamer agent's loop.
+    /// Builds the router over the two sides. `plain` is the exact driver
+    /// the assembly would have run (unchanged for ordinary sessions);
+    /// `dream` wraps the configured dreamer agent's loop.
     #[must_use]
-    pub fn new(plain: Arc<ReActLoop>, dream: Arc<DreamDriver>) -> Self {
+    pub fn new(plain: Arc<dyn LoopDriver<Ctx = DrainCtx>>, dream: Arc<DreamDriver>) -> Self {
         Self { plain, dream }
     }
 
-    /// The plain side (every ordinary session).
+    /// The inner side (every non-dream session).
     #[must_use]
-    pub fn plain(&self) -> &Arc<ReActLoop> {
+    pub fn plain(&self) -> &Arc<dyn LoopDriver<Ctx = DrainCtx>> {
         &self.plain
     }
 
@@ -538,7 +540,7 @@ mod tests {
         let plain = react_loop("plain-agent", Arc::clone(&model));
         let dreamer = react_loop("dreamer-agent", Arc::clone(&model));
         let router = MemoryLoopDriver::new(
-            Arc::clone(&plain),
+            Arc::clone(&plain) as Arc<dyn LoopDriver<Ctx = DrainCtx>>,
             Arc::new(kian_memory::DreamDriver::new(
                 (*dreamer).clone(),
                 MemoryConfig::default(),

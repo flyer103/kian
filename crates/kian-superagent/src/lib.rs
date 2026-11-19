@@ -102,6 +102,7 @@
 //!   `InboxWriter`; `escalate` under the IM policy)
 
 pub mod audit;
+pub mod bootstrap;
 pub mod directory;
 pub mod dsh;
 pub mod github;
@@ -136,6 +137,7 @@ pub use audit::{
     EvidenceRef, MULTIAGENT_KEY, ParentThreadAudit, attempt_of, child_thread_started_payload,
     parent_thread_started_payload, thread_completed_payload_keyed,
 };
+pub use bootstrap::SessionBootstrap;
 pub use directory::{MemberState, MemberView, WorkerDirectoryError, WorkerDirectoryPort};
 pub use dsh::{
     BRIDGE_CONTRACT_VERSION, ContractError, ControlFrame, DshEvent, DshMapper, MapCtx, Mapped,

@@ -2971,13 +2971,9 @@ impl ServeConfig {
         // fail-closed and cross-references configured agents. Absent is
         // memory off — nothing below runs.
         if let Some(memory) = &self.memory {
-            if self.superagent.is_some() {
-                return Err(invalid(
-                    "memory: the agent-memory bundle (Phase 1) assembles on the \
-                     built-in assembly; a `superagent:` section alongside `memory:` \
-                     is refused — fail-closed, never half-assembled",
-                ));
-            }
+            // ADR-038: the memory bundle now hosts on either assembly (the
+            // driver wraps the plain loop or the super-agent three-way
+            // driver), so the section composes with `superagent:`.
             if memory.scope.trim().is_empty() || memory.scope.contains('"') {
                 return Err(invalid(
                     "memory.scope must be a non-empty agent id without double quotes \
@@ -7177,21 +7173,19 @@ recovery:
         }
     }
 
-    /// `memory:` alongside `superagent:` refuses (the P1 bundle
-    /// assembles on the built-in assembly only — fail-closed, never
-    /// half-assembled).
+    /// ADR-038: `memory:` and `superagent:` compose. The memory driver
+    /// wraps the super-agent driver (dream sessions route to the dream
+    /// side, everything else to Router/worker/plain).
     #[test]
-    fn memory_refuses_the_superagent_mix() {
+    fn memory_and_superagent_compose() {
         // Append the memory block to a full superagent config.
         let yaml = format!(
-            "{}\nmemory:\n  scope: kian-router\n  dreamer:\n    agent: kian-router\n",
+            "{}\nmemory:\n  scope: router\n  dreamer:\n    agent: worker\n",
             superagent_yaml()
         );
-        let err = ServeConfig::parse(&yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("superagent"),
-            "the mix must refuse: {err}"
-        );
+        let cfg = ServeConfig::parse(&yaml).expect("the mix is allowed");
+        assert!(cfg.memory.is_some());
+        assert!(cfg.superagent.is_some());
     }
 
     // -- memory injection config (P2, kian-101) ----------------------
