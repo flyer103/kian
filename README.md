@@ -130,6 +130,7 @@ The same runtime also ships:
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Running postgres mode and the multi-replica replay |
 | [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md) | iPhone worker design, repo placement, enrollment and the verification matrix |
+| [docs/runbook-kian-vultr.md](docs/runbook-kian-vultr.md) | The vultr server: unit layout, config-write discipline, watchdog, deploy |
 | [a vendored archive/](a vendored archive/) | Frozen snapshots of the design inputs (read-only) |
 | [CHANGELOG.md](CHANGELOG.md) | What landed when, and what is env-gated |
 
