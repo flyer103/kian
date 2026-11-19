@@ -696,6 +696,10 @@ landed vocabulary already gives us:
 
 ### 6.3 Rules
 
+- **A waiting worker writes no completion.** When a worker ends `awaiting_input`
+  (CONFIRMATION-MODEL phase 2), the worker driver suppresses `thread/completed` and the parent
+  report: the ticket stays outstanding and the worker stays live, so follow-ups route to the same
+  session and the answer resumes it. The join sees "outstanding", never "failed".
 - **The completion gate lives in the parent's join**, evaluated against the primary before promotion —
   never in the board view and never in the child's prose. Schema validation runs once, in the child
   (§3.2.1); the join reads the committed verdict rather than re-deciding it.

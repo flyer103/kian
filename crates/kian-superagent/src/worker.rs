@@ -1763,6 +1763,24 @@ where
                                     // pass-through of the terminal outcome.
                                     None => Some((outcome, Phase::Done)),
                                     Some(thread_id) => {
+                                        // CONFIRMATION-MODEL phase 2: a
+                                        // worker that stopped on a
+                                        // pending `ask` is waiting, not
+                                        // completed. No `thread/completed`
+                                        // and no parent report: the
+                                        // answer's wake resumes the same
+                                        // session, which completes the
+                                        // pair later. The pending set is
+                                        // the stream's own fact (the ask
+                                        // was appended before this
+                                        // settle), never process state.
+                                        if matches!(&outcome, LoopOutcome::Settled)
+                                            && let Ok(events) = port.read_stream().await
+                                            && !kian_core::confirmation::pending_calls(&events)
+                                                .is_empty()
+                                        {
+                                            return Some((outcome, Phase::Done));
+                                        }
                                         // Port (e) — `settle/pre`
                                         // (§4.6 step 2): consulted ONLY
                                         // for `LoopOutcome::Settled` (the
@@ -4285,6 +4303,45 @@ mod tests {
             });
         }
 
+        /// Seeds an unanswered `ask`: the assistant turn's `tool_calls`
+        /// plus the logged `tool/call` with the ask provenance, and no
+        /// `tool/result`. This is exactly the stream a worker leaves
+        /// when it ends `awaiting_input` (CONFIRMATION-MODEL phase 2).
+        fn seed_pending_ask(&self) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind: EventKind::AssistantMessage,
+                bytes: json!({
+                    "role": "assistant",
+                    "content": {"text": "", "tool_calls": [{
+                        "id": "call-ask", "name": "exec",
+                        "arguments": {"argv": ["echo", "approve-me"]}
+                    }]},
+                }),
+                version: 0,
+            });
+            events.push(Event {
+                seq: seq + 1,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq + 1,
+                kind: EventKind::ToolCall,
+                bytes: json!({
+                    "role": "assistant",
+                    "content": {"id": "call-ask", "name": "exec",
+                                "arguments": {"argv": ["echo", "approve-me"]}},
+                    "permission": {"evaluated": "ask", "policy": "configured",
+                                   "matched": "exec"},
+                }),
+                version: 0,
+            });
+        }
+
         /// A **bound** delegation (D4): the wrapper carries the additive
         /// `exec_worker` key naming `exec_worker` — the durable binding
         /// §7.3/§8.2 frames derive.
@@ -4861,5 +4918,44 @@ mod tests {
         );
         assert_eq!(*hits.lock().unwrap(), 1);
         drop(keep_gate);
+    }
+
+    /// CONFIRMATION-MODEL phase 2: a worker that ends on a pending `ask`
+    /// writes NO completion pair (`thread/completed` + parent report) —
+    /// it is waiting on a person, not done — and the same session later
+    /// completes the pair after the answer.
+    #[tokio::test]
+    async fn a_worker_waiting_on_an_ask_writes_no_completion_pair() {
+        let worker_session = sid(0x88);
+        let port = FakePort::new(worker_session);
+        port.seed_delegation();
+        port.seed_pending_ask();
+        let inbox = CapturingInbox::shared();
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::new(
+            Arc::new(SettledDriver),
+            inbox.clone(),
+            gate_config(),
+            port_for,
+        );
+
+        let outcomes: Vec<LoopOutcome> = driver.drive(()).collect().await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled], "{outcomes:?}");
+        assert!(
+            inbox.admits.lock().unwrap().is_empty(),
+            "a waiting worker writes no parent completion report"
+        );
+        assert!(
+            port.events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|ev| ev.kind != EventKind::ThreadCompleted),
+            "a waiting worker writes no thread/completed"
+        );
     }
 }

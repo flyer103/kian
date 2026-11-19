@@ -10,6 +10,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Confirmation phase 2: workers can wait on a person (CONFIRMATION-MODEL §8 C2, §14b)**. `ask`
+  is accepted on a superagent worker agent. A worker that stops on a pending `ask` now writes
+  **no** `thread/completed` and no parent report (it is waiting, not done); the engine still settles
+  `awaiting_input`, the worker stays **live** in the passthrough registry (follow-ups keep routing
+  to the same session), and the ticket stage gains `awaiting-confirmation` (ranked above the
+  structured `waiting` report). Resident Router/watchdog agents still refuse `ask` (a judge waiting
+  on itself cannot answer itself). Contract: [design/CONFIRMATION-MODEL.md](design/CONFIRMATION-MODEL.md)
+  §8, §14b; [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md).
+
 - **Memory: the bundle hosts on the super-agent assembly and reaches internally created sessions
   (ADR-038)**. `memory:` and `superagent:` now compose: `MemoryLoopDriver` wraps
   `Arc<dyn LoopDriver<Ctx = DrainCtx>>` (the built-in plain loop or the three-way

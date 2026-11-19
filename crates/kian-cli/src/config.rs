@@ -3357,23 +3357,6 @@ impl ServeConfig {
                     sa.worker.agent
                 ))
             })?;
-            // CONFIRMATION-MODEL C2 (ADR-033): phase 1 has no waiting
-            // path for a worker — ending one `awaiting_input` without
-            // `thread/completed` would strand its ticket, so `ask` on a
-            // worker agent refuses boot (fail-closed, never silently
-            // ignored). Phase 2 removes this refusal.
-            if worker_agent
-                .permissions
-                .values()
-                .any(|p| matches!(p, Permission::Ask))
-            {
-                return Err(invalid(format!(
-                    "agents.{}: `permissions: ask` is not supported on a superagent worker agent \
-                     in phase 1 (the worker has no waiting path yet — CONFIRMATION-MODEL C2); \
-                     use it on the default agent or wait for phase 2",
-                    sa.worker.agent
-                )));
-            }
             if let Some(pin) = sa.worker.pinned_version
                 && pin != worker_agent.version
             {
@@ -5231,27 +5214,26 @@ recovery:
         }
     }
 
-    /// The confirmation arm parses, but `ask` on a superagent worker
-    /// agent refuses boot in phase 1 (CONFIRMATION-MODEL C2) — the
-    /// worker has no waiting path yet.
+    /// CONFIRMATION-MODEL phase 2: `ask` is accepted on a superagent
+    /// worker agent (the worker has a waiting path: it ends
+    /// `awaiting_input` without `thread/completed`, and the answer
+    /// resumes the same session).
     #[test]
-    fn ask_on_a_worker_agent_refuses_boot() {
+    fn ask_on_a_worker_agent_parses_in_phase_2() {
         // The default agent accepts `ask` (plain sessions).
         let sa = valid_yaml().replace(
             "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n",
             "  tools: [\"fs_read\", \"fs_write\", \"exec\"]\n  permissions:\n    fs_read: ask\n",
         );
         ServeConfig::parse(&sa).expect("ask on the default agent parses");
-        // A superagent worker agent refuses it.
+        // A superagent worker agent accepts it too.
         let worker = superagent_yaml().replace(
             "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    evidence_gate:",
             "    tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    permissions:\n      fs_read: ask\n    evidence_gate:",
         );
-        let err = ServeConfig::parse(&worker).expect_err("ask on a worker agent must refuse boot");
-        assert!(
-            err.to_string().contains("ask") && err.to_string().contains("worker"),
-            "unexpected error: {err}"
-        );
+        let cfg = ServeConfig::parse(&worker).expect("ask on a worker agent parses");
+        let agent = cfg.agents.get("worker").expect("worker agent");
+        assert_eq!(agent.permissions.get("fs_read"), Some(&Permission::Ask));
     }
 
     /// (fail-closed): a permission key not present in the agent's
