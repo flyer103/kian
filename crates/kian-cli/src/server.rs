@@ -298,6 +298,8 @@ impl Server {
                 base_url: pcfg.base_url.clone(),
                 api_key,
                 chat_completions_path: pcfg.chat_completions_path.clone(),
+                connect_timeout_ms: pcfg.connect_timeout_ms,
+                idle_timeout_ms: pcfg.idle_timeout_ms,
             });
         }
 

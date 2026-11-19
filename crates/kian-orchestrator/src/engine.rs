@@ -59,8 +59,8 @@ use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, Entry};
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -279,6 +279,51 @@ impl DrainHandle {
 /// the stream head between our read and append. Epoch-stale writes are
 /// never retried.
 const APPEND_ATTEMPTS: usize = 4;
+
+/// Consecutive un-ended `drain/claimed` events a takeover chain tolerates
+/// before it is closed honestly as `failed` (ADR-041). One claim is the
+/// episode's own; every further un-ended claim is a crashed predecessor,
+/// so `3` = the original attempt plus at most one retry. The count is
+/// derived from the committed stream, never stored.
+const MAX_UNENDED_CLAIMS: u64 = 3;
+
+/// Removes this drain's in-process handle on every exit path — the normal
+/// return, a panic unwind and task cancellation (ADR-041). Without it a
+/// panicking drain leaves `drains` occupied forever, so every later `wake`
+/// folds and every release answers `Busy` until the process restarts.
+struct DrainSlotGuard<D: LoopDriver<Ctx = DrainCtx> + 'static> {
+    engine: Arc<Engine<D>>,
+    session: SessionId,
+}
+
+impl<D> DrainSlotGuard<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    fn new(engine: Arc<Engine<D>>, session: SessionId) -> Self {
+        Self { engine, session }
+    }
+}
+
+impl<D> Drop for DrainSlotGuard<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    fn drop(&mut self) {
+        self.engine.drains.remove(&self.session);
+    }
+}
+
+/// Stops the heartbeat task on every exit path (ADR-041): a dead episode
+/// must stop refreshing its lease, otherwise no replica can ever detect it
+/// and the session (and any worker slot it binds) is unrecoverable.
+struct HeartbeatStop(Arc<Notify>);
+
+impl Drop for HeartbeatStop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
 
 /// Shared mutable drain state: the fencing epoch, the next free seq,
 /// and the provider-turn boundary flag. One core per drain attempt; the
@@ -812,9 +857,20 @@ impl DrainCtx {
     /// The end write (constraint 4): `session/ended` as one atomic
     /// append via `append_end`.
     pub async fn end_session(&self, reason: EndReason) -> Result<Event, EngineError> {
+        self.end_session_with(reason, json!({})).await
+    }
+
+    /// [`DrainCtx::end_session`] with an additive audit payload on the end
+    /// event (ADR-041's crash-loop close). The transition is identical:
+    /// one `session/ended` + transition append.
+    pub async fn end_session_with(
+        &self,
+        reason: EndReason,
+        bytes: Value,
+    ) -> Result<Event, EngineError> {
         let ev = self
             .core
-            .append_event(EventKind::SessionEnded { reason }, json!({}))
+            .append_event(EventKind::SessionEnded { reason }, bytes)
             .await?;
         self.core.in_turn.store(false, Ordering::Release);
         Ok(ev)
@@ -1569,7 +1625,28 @@ where
         let mut terminal_seen = false;
         let mut claim_rejected = false;
         loop {
-            match self.drain_once(&session, &interrupt).await {
+            // ADR-041: the in-process handle is released on every exit
+            // path. The unwind is caught at this boundary for one
+            // structured line and a settled drain metric; cleanup ran
+            // through the drop guard, and the lease will expire so the
+            // recovery sweep can take over — the panic never leaks the
+            // session.
+            let attempt = {
+                let _slot = DrainSlotGuard::new(Arc::clone(&self), session);
+                std::panic::AssertUnwindSafe(self.drain_once(&session, &interrupt))
+                    .catch_unwind()
+                    .await
+                    .ok()
+            };
+            let Some(outcome) = attempt else {
+                tracing::error!(
+                    session = %session.0,
+                    "drain panicked: handle released and heartbeat stopped — the lease \
+                     will expire and the recovery sweep will take over"
+                );
+                break;
+            };
+            match outcome {
                 Ok(DrainOutcome::Terminal) => terminal_seen = true,
                 Ok(_) => {}
                 Err(e) => {
@@ -1605,7 +1682,6 @@ where
                 // spurious (its inputs stay explicitly pending).
                 self.wakes.take(&session);
             }
-            self.drains.remove(&session);
             if interrupt.load(Ordering::Acquire) {
                 break; // keep pendingWake registered for the resumer
             }
@@ -1649,8 +1725,12 @@ where
                 heartbeat_loop(store, s, clock, interval, stop).await;
             })
         };
+        // ADR-041: the guard fires on the normal return *and* on a panic
+        // unwind or cancellation, so the lease is never refreshed by a
+        // heartbeat that outlived its episode.
+        let stop_guard = HeartbeatStop(Arc::clone(&hb_stop));
         let result = self.drain_episode(session, lease, interrupt).await;
-        hb_stop.notify_one();
+        drop(stop_guard);
         let _ = heartbeat.await;
         result
     }
@@ -1756,6 +1836,41 @@ where
                 if interrupt.load(Ordering::Acquire) {
                     end_reason = EndReason::Interrupted;
                     break 'episodes;
+                }
+                // ADR-041: a takeover chain is bounded. The claims since
+                // the last end are a projection of the committed stream
+                // (never a stored counter); when the third one lands, the
+                // predecessor(s) crashed without progress, so this taker
+                // writes the honest failed end instead of driving a
+                // deterministically crashing episode again.
+                if takeover {
+                    let events = ctx.events().await?;
+                    let unended = events
+                        .iter()
+                        .rev()
+                        .take_while(|e| !matches!(e.kind, EventKind::SessionEnded { .. }))
+                        .filter(|e| matches!(e.kind, EventKind::DrainClaimed))
+                        .count() as u64;
+                    if unended >= MAX_UNENDED_CLAIMS {
+                        let bytes = json!({
+                            "crashed": {
+                                "takeovers": unended.saturating_sub(1),
+                                "reason": format!(
+                                    "drain crash loop: {unended} claims without an intervening end"
+                                ),
+                            }
+                        });
+                        let ev = ctx.end_session_with(EndReason::Failed, bytes).await?;
+                        tracing::warn!(
+                            session = %session.0,
+                            seq = ev.seq,
+                            unended,
+                            "drain crash loop: takeover chain closed honestly as failed"
+                        );
+                        return Ok(DrainOutcome::Ended {
+                            reason: EndReason::Failed,
+                        });
+                    }
                 }
                 // CONFIRMATION-MODEL §15.6 / DESIGN §2.3: a drain that
                 // died inside a tool batch left an assistant
@@ -5092,6 +5207,236 @@ mod tests {
         );
 
         store.close().await;
+        cleanup(&path);
+    }
+
+    // -- ADR-041: crash containment ---------------------------------------
+
+    /// A driver that panics on its first poll — the shape a bundle driver,
+    /// a tool or a provider parser produces when it hits a defect.
+    struct PanicDriver;
+
+    impl LoopDriver for PanicDriver {
+        type Ctx = DrainCtx;
+
+        fn drive(&self, _ctx: DrainCtx) -> futures::stream::BoxStream<'static, LoopOutcome> {
+            futures::stream::poll_fn(|_cx| -> std::task::Poll<Option<LoopOutcome>> {
+                panic!("deliberate test panic: drain driver")
+            })
+            .boxed()
+        }
+    }
+
+    async fn seed_append(
+        store: &EventStore,
+        sid: SessionId,
+        seq: u64,
+        epoch: Epoch,
+        kind: EventKind,
+        bytes: serde_json::Value,
+    ) {
+        store
+            .append(
+                sid,
+                Event {
+                    seq,
+                    session: sid,
+                    epoch,
+                    ts: T0,
+                    kind,
+                    bytes,
+                    version: SCHEMA_VERSION,
+                },
+                AppendGuard {
+                    epoch,
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("seed append");
+    }
+
+    /// Seeds `session/created` plus `crashes` un-ended `drain/claimed`
+    /// events (each under the epoch its own claim issued), leaving the
+    /// claims row lease expired — a stream that already crashed `crashes`
+    /// times without ever ending.
+    async fn seed_crash_chain(store: &EventStore, crashes: u64, now_ms: u64) -> SessionId {
+        let sid = SessionId::new();
+        // seq starts at 1 (the store's CAS fence treats an empty stream as
+        // max(seq) == 0).
+        seed_append(
+            store,
+            sid,
+            1,
+            Epoch::GENESIS,
+            EventKind::SessionCreated,
+            json!({}),
+        )
+        .await;
+        for (seq, i) in (2u64..).zip(0..crashes) {
+            let lease = store
+                .claim(sid, "dead-holder", 100, now_ms + i * 1_000)
+                .await
+                .expect("seed claim");
+            seed_append(
+                store,
+                sid,
+                seq,
+                lease.epoch,
+                EventKind::DrainClaimed,
+                json!({"holder": "dead-holder"}),
+            )
+            .await;
+        }
+        sid
+    }
+
+    /// A panicking drain unwinds its bookkeeping: the in-process handle is
+    /// released (so a wake can start a drain again), the heartbeat stops
+    /// (so the lease can expire) and the recovery sweep takes over — and
+    /// the bounded takeover chain ends the session honestly instead of
+    /// re-driving the crash forever.
+    #[tokio::test]
+    async fn a_panicking_drain_releases_its_handle_and_ends_in_a_bounded_chain() {
+        let (store, path) = open_store().await;
+        let clock = Arc::new(ManualClock::new(T0));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::new(PanicDriver),
+            EngineConfig {
+                holder: "panic-holder".into(),
+                lease_ttl_ms: 100,
+                heartbeat_interval_ms: 10,
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        let sid = SessionId::new();
+        eng.create_session().await.expect("create");
+        eng.admit(sid, json!("task"), None).await.expect("admit");
+        eng.wake(sid);
+
+        // 1st crash: the drop guard releases the handle despite the unwind.
+        assert!(
+            wait_for(5_000, || async { !eng.is_draining(&sid) }).await,
+            "the panicked drain must release its in-process handle"
+        );
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::DrainClaimed))
+                .count(),
+            1,
+            "one claim, no end yet"
+        );
+
+        // The heartbeat stopped: past the TTL the lease is expirable again.
+        // The short real sleep lets a heartbeat that was already in flight
+        // observe the stop notify, so the clock move cannot be re-armed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        clock.advance(10_000);
+        let expired = store
+            .expired_leases(clock.now_ms())
+            .await
+            .expect("expired leases");
+        assert!(
+            expired.iter().any(|lease| lease.session == sid),
+            "the panicked drain must stop refreshing its lease"
+        );
+
+        // 2nd attempt (takeover) drives and crashes again.
+        assert_eq!(eng.recovery_sweep().await.expect("sweep"), vec![sid]);
+        assert!(
+            wait_for(5_000, || async { !eng.is_draining(&sid) }).await,
+            "second crash released its handle"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        clock.advance(10_000);
+
+        // 3rd claim: the chain is bounded — one honest failed end, no drive.
+        assert_eq!(eng.recovery_sweep().await.expect("sweep"), vec![sid]);
+        assert!(
+            wait_for(5_000, || async {
+                let events = events_of(&store, sid).await;
+                matches!(
+                    events.last().map(|e| &e.kind),
+                    Some(EventKind::SessionEnded {
+                        reason: EndReason::Failed
+                    })
+                )
+            })
+            .await,
+            "the bounded takeover chain must end the session honestly as failed"
+        );
+        let events = events_of(&store, sid).await;
+        let last = events.last().expect("end event");
+        assert_eq!(
+            last.bytes["crashed"]["takeovers"],
+            json!(2),
+            "the payload names the crashed predecessors: {last:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::TurnStart))
+                .count(),
+            0,
+            "a crash-looping episode never reaches a provider turn"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::SessionEnded { .. }))
+                .count(),
+            1,
+            "exactly one end write"
+        );
+        cleanup(&path);
+    }
+
+    /// A committed chain of two crashed claims is closed on the third claim
+    /// without driving the episode at all — the deterministic shape of a
+    /// crash loop (derived from the stream, no stored counter).
+    #[tokio::test]
+    async fn a_takeover_chain_is_bounded_by_an_honest_failed_end() {
+        let (store, path) = open_store().await;
+        let sid = seed_crash_chain(&store, 2, T0).await;
+        let driver = Arc::new(ScriptedDriver::scripted(vec![]));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::clone(&driver),
+            EngineConfig {
+                holder: "recoverer".into(),
+                lease_ttl_ms: 100,
+                heartbeat_interval_ms: 10,
+            },
+            Arc::new(ManualClock::new(T0 + 10_000)),
+        );
+        assert_eq!(eng.recovery_sweep().await.expect("sweep"), vec![sid]);
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Idle
+            })
+            .await,
+            "the bounded chain ends the session"
+        );
+        let events = events_of(&store, sid).await;
+        let last = events.last().expect("end event");
+        assert!(matches!(
+            last.kind,
+            EventKind::SessionEnded {
+                reason: EndReason::Failed
+            }
+        ));
+        assert_eq!(last.bytes["crashed"]["takeovers"], json!(2));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, EventKind::TurnStart))
+                .count(),
+            0,
+            "the bounded taker must not drive the crashed episode"
+        );
         cleanup(&path);
     }
 }

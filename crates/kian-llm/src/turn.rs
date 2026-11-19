@@ -229,8 +229,9 @@ mod tests {
 
     use super::{ProviderRegistry, SlotEventSink, complete_turn};
     use crate::provider::{
-        ChatMessage, OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink,
-        PersistedRequest, build_chat_body,
+        ChatMessage, DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+        OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink, PersistedRequest,
+        build_chat_body,
     };
     use crate::slots::SlotResolver;
 
@@ -292,6 +293,8 @@ mod tests {
             base_url: base.into(),
             api_key: "test-key".into(),
             chat_completions_path: chat_path.into(),
+            connect_timeout_ms: DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
+            idle_timeout_ms: DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
         }
     }
 

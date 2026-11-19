@@ -134,6 +134,14 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   `released` object on the end event). No-ops and refusals are honest: `already_released` for a
   terminal thread, `session_busy` for a running one, `worker_not_bound` for an unknown id or no
   live binding.
+- **Abnormal interruption converges.** The slot is never held by a thread that can no longer end.
+  A drain that dies (panic / task cancellation) unwinds its bookkeeping so the lease expires and the
+  existing takeover path re-drives it, and a takeover chain is bounded at three un-ended claims
+  (`MAX_UNENDED_CLAIMS`) before it writes one honest `session/ended{failed}` instead of re-driving
+  forever; the model call itself is bounded by `providers.<name>.connect_timeout_ms` /
+  `idle_timeout_ms` (a per-gap idle bound), so a provider that stops sending ends the turn honestly
+  instead of parking the drain. Both roads end in the idle-ended shape the release/reclaim path
+  closes (ADR-041): an abnormal interruption can delay the freeing of a worker but never prevent it.
 - **Offline is a valid binding state.** A spawn may bind a known-but-offline worker: the command is
   enqueued durably, parks, and runs when the worker returns or ends in the honest queue timeout. The
   spawn result and one audit line say `offline — commands will queue`.
@@ -195,6 +203,12 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
     is honest because nothing ran. The bound is global by construction: raising it for an
     intermittent device also lengthens every queued command's dispatch wait and shifts the
     execution bound below by the same amount.
+  - *Model call* — a drain's provider request is bounded by the provider's own
+    `connect_timeout_ms` (default 10 000) and `idle_timeout_ms` (default 300 000, `0` disables): the
+    idle bound covers the wait for response headers and each gap between body chunks, never the total
+    request, so a long generation (or a long reasoning silence) is not killed but a stalled stream is.
+    Expiry is a `provider_down`-class transport error, so the turn settles honestly and the ADR-035
+    release/reclaim path frees the worker ([ADR-041](decisions/ADR-041-bounded-model-calls-and-crash-containment.md)).
   - *Execution wait* — the row is `inflight`: a worker is executing it. The command's own
     `timeout_ms` (the worker-side kill bound) is what bounds it, so the wait bound is
     `2 * exec_bound + queue_timeout` (`exec_bound = timeout_ms`, or `queue_timeout` when absent) —
@@ -313,6 +327,7 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 | Fs path escapes the root (`..`) | server-side lexical check before enqueue; worker-side re-check | honest `InvalidCall` (no row) or a typed `io` error result — never a write outside the intended path | that call |
 | Fs body over 1 MiB / non-UTF-8 read | worker-side bound / decode | typed `io` error surfaced as the local `{"error": …}` tool result; no truncation, no partial write | that call |
 | Queue timeout | timer | row abandoned honestly, caller gets a timeout; a duplicate command id answers with the same timeout | that command |
+| Bound session's drain died (panic / cancellation) or its model call stalled | lease expiry, or the provider's `idle_timeout_ms` | the drain's bookkeeping unwinds so the sweep takes over (one honest `failed` end at most `MAX_UNENDED_CLAIMS` claims — audited with `crashed`), and a stalled turn settles `failed`; the ADR-035 release/reclaim then frees the worker | that thread; the worker is freed, no command moves |
 | Bound thread ended `interrupted`/`failed` | projection `idle` + last end non-terminal + no live queue row | holds the worker until `release_worker` / the `workers.release_after_ms` tick closes it (`cancelled` after a claim; audited) | that thread; the worker is freed, no command moves |
 | Release refused (running / eligible input / live queue row) | the release gates | honest refusal (`session_busy`), no append; the operator interrupts/waits and retries; the tick skips this beat | that thread |
 
@@ -386,6 +401,12 @@ seam.
 - Binding release/reclaim (ADR-035) is exercised at L1/L2 (state gates, claim+batch, tick, CLI/RPC);
   no real two-machine interrupt→release run exists, and the check→append window against a
   concurrent public `submit` is reasoned rather than race-tested.
+- Abnormal-interruption convergence (ADR-041) is exercised at L1 (provider stall bounds, drain
+  panic cleanup, the bounded takeover chain) and L2 (real `kian serve` + a stalling provider, a
+  seeded crash chain, plus the crash→reclaim composition that frees a bound worker with no operator
+  call). No real provider-proxy stall on a deployed worker exists, and `connect_timeout_ms` has no
+  deterministic test (a blackholed peer needs network shaping); the crash bound is driven by real
+  panics plus a seeded chain, not by three live process kills.
 
 ## 11. Change protocol
 
