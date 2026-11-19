@@ -47,6 +47,7 @@ fn queue_config(queue_timeout_ms: u64) -> RemoteExecConfig {
         queue_timeout: Duration::from_millis(queue_timeout_ms),
         poll_interval: Duration::from_millis(40),
         max_redrives: 1,
+        redrive_grace: Duration::ZERO,
     }
 }
 
@@ -819,6 +820,7 @@ async fn redrive_bound_converges_a_row_whose_result_is_never_delivered() {
             queue_timeout: Duration::from_millis(3_000),
             poll_interval: Duration::from_millis(40),
             max_redrives: 1,
+            redrive_grace: Duration::ZERO,
         },
         "kian-test",
         Duration::from_millis(300),
@@ -922,6 +924,93 @@ async fn redrive_bound_converges_a_row_whose_result_is_never_delivered() {
     // The caller's honest answer: Timeout — never a fabricated result.
     let err = caller.await.expect("caller task").unwrap_err();
     assert!(matches!(err, ExecError::Timeout), "was: {err:?}");
+
+    backend.shutdown().await;
+}
+
+/// ADR-037: a row whose last dispatch is younger than `redrive_grace` is
+/// not re-driven the moment a route re-attaches — the driver waits, so it
+/// cannot race an execution that may still be running on the worker. The
+/// replay lands once the grace elapses; nothing is settled by the wait.
+#[tokio::test]
+async fn redrive_grace_postpones_a_recent_replay() {
+    let store = ExecStore::open(temp_db()).await.expect("exec store");
+    let backend = RemoteExecBackend::with_membership(
+        store.clone(),
+        Vec::new(),
+        DefaultRoute::Dynamic,
+        RemoteExecConfig {
+            queue_timeout: Duration::from_millis(5_000),
+            poll_interval: Duration::from_millis(40),
+            max_redrives: 1,
+            redrive_grace: Duration::from_millis(800),
+        },
+        "kian-test",
+        Duration::from_millis(300),
+        kian_core::secrets::SecretRedactor::patterns_only(),
+        Some(kian_exec::MembershipConfig {
+            directory: WorkerDirectory::new(),
+            offline_after_ms: 30_000,
+        }),
+    )
+    .expect("membership backend");
+
+    let id = Uuid::new_v4();
+    store
+        .enqueue(
+            id,
+            "builder-1",
+            &cmd(&["echo", "grace"]),
+            Some("call-grace"),
+        )
+        .await
+        .unwrap();
+
+    // Attempt 1: dispatched, then the worker dies before replying.
+    let (worker, mut fake) = registered("builder-1", 1);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+            1,
+        )
+        .await;
+    let frame = tokio::time::timeout(Duration::from_secs(3), fake.writer_rx.recv())
+        .await
+        .expect("first dispatch within 3s")
+        .expect("a command frame");
+    let ServerFrame::Command { id: wire_id, .. } = frame else {
+        panic!("expected a command frame, got {frame:?}");
+    };
+    assert_eq!(wire_id, id);
+    drop(fake);
+
+    // A reconnect right after the dispatch must NOT replay it: the grace
+    // postpones the re-drive instead of racing the executing worker.
+    let (worker, mut fake) = registered("builder-1", 2);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+            2,
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fake.writer_rx.recv())
+            .await
+            .is_err(),
+        "a row dispatched within the grace must not be re-driven immediately"
+    );
+
+    // Once the grace elapses the replay lands (at-least-once is intact).
+    let frame = tokio::time::timeout(Duration::from_secs(3), fake.writer_rx.recv())
+        .await
+        .expect("the replay lands after the grace")
+        .expect("a command frame");
+    let ServerFrame::Command { id: wire_id, .. } = frame else {
+        panic!("expected a command frame, got {frame:?}");
+    };
+    assert_eq!(wire_id, id);
 
     backend.shutdown().await;
 }

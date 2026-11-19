@@ -120,6 +120,7 @@ async fn rig_with(db: &PathBuf, queue_timeout: Duration) -> TestRig {
                 queue_timeout,
                 poll_interval: Duration::from_millis(40),
                 max_redrives: 1,
+                redrive_grace: Duration::ZERO,
             },
         )
         .unwrap(),
@@ -621,6 +622,7 @@ async fn queue_timeout_settles_abandoned_and_delivers_honestly() {
                 queue_timeout: Duration::from_millis(400),
                 poll_interval: Duration::from_millis(40),
                 max_redrives: 1,
+                redrive_grace: Duration::ZERO,
             },
         )
         .unwrap(),

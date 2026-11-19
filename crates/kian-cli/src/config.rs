@@ -2462,6 +2462,14 @@ pub struct WorkersConfig {
     /// construction, like the queue timeout: no per-endpoint override.
     #[serde(default = "default_workers_queue_max_redrives")]
     pub queue_max_redrives: u32,
+    /// How recently a row must have been dispatched for its re-drive to be
+    /// postponed (ADR-037). A route attach re-drives `inflight` rows
+    /// immediately; within this grace the driver waits instead, so it does
+    /// not race an execution that may still be running on the worker. The
+    /// grace only postpones a dispatch — it never settles a row and never
+    /// changes the honest queue timeout. `0` disables it.
+    #[serde(default = "default_workers_queue_redrive_grace_ms")]
+    pub queue_redrive_grace_ms: u64,
     /// How long a worker thread that already ended `interrupted`/`failed`
     /// keeps holding its 1:1 worker slot before the maintenance tick closes
     /// it (`session/ended{cancelled}`, ADR-035). The explicit
@@ -2497,6 +2505,14 @@ fn default_workers_queue_max_redrives() -> u32 {
     1
 }
 
+/// The default `workers.queue_redrive_grace_ms` (ADR-037): a row
+/// dispatched within the last 5 seconds is not re-driven yet.
+pub const DEFAULT_WORKER_QUEUE_REDRIVE_GRACE_MS: u64 = 5_000;
+
+fn default_workers_queue_redrive_grace_ms() -> u64 {
+    DEFAULT_WORKER_QUEUE_REDRIVE_GRACE_MS
+}
+
 /// The default `workers.release_after_ms` (ADR-035): an idle-ended worker
 /// thread is closed after five minutes. `0` disables the automatic reclaim.
 pub const DEFAULT_WORKER_RELEASE_AFTER_MS: u64 = 300_000;
@@ -2508,6 +2524,10 @@ fn default_workers_release_after_ms() -> u64 {
 /// The ceiling on `workers.queue_max_redrives`: the knob bounds a recovery
 /// loop, so a typo must not quietly restore unbounded replay.
 const MAX_QUEUE_REDRIVES: u32 = 16;
+
+/// The ceiling on `workers.queue_redrive_grace_ms`: a large value would
+/// delay every recovery re-drive, so a typo must not quietly park rows.
+const MAX_QUEUE_REDRIVE_GRACE_MS: u64 = 60_000;
 
 impl WorkersConfig {
     /// The parsed listener bind (validated fail-closed).
@@ -2533,6 +2553,11 @@ impl WorkersConfig {
         }
         if self.queue_timeout_ms == 0 {
             return Err(invalid("workers.queue_timeout_ms must be > 0"));
+        }
+        if self.queue_redrive_grace_ms > MAX_QUEUE_REDRIVE_GRACE_MS {
+            return Err(invalid(format!(
+                "workers.queue_redrive_grace_ms must be <= {MAX_QUEUE_REDRIVE_GRACE_MS} (it delays every recovery re-drive)"
+            )));
         }
         if self.queue_max_redrives > MAX_QUEUE_REDRIVES {
             return Err(invalid(format!(
@@ -4684,6 +4709,10 @@ recovery:
         assert_eq!(workers.offline_after_ms, 30_000, "default");
         assert_eq!(workers.queue_timeout_ms, 60_000, "default");
         assert_eq!(workers.queue_max_redrives, 1, "default");
+        assert_eq!(
+            workers.queue_redrive_grace_ms, DEFAULT_WORKER_QUEUE_REDRIVE_GRACE_MS,
+            "default"
+        );
         assert_eq!(workers.release_after_ms, DEFAULT_WORKER_RELEASE_AFTER_MS);
         assert_eq!(workers.release_after_ms, 300_000, "5-minute default");
         assert!(!workers.allow_public, "default");
@@ -4782,6 +4811,7 @@ recovery:
                 allow_public: false,
                 queue_timeout_ms: queue,
                 queue_max_redrives: 1,
+                queue_redrive_grace_ms: DEFAULT_WORKER_QUEUE_REDRIVE_GRACE_MS,
                 release_after_ms: DEFAULT_WORKER_RELEASE_AFTER_MS,
                 enrolled_only: false,
                 tokens: BTreeMap::new(),
@@ -8053,5 +8083,37 @@ schedules:
         // fail-closed at load: an unknown alias refuses boot from parse().
         let bad = good.replace("expr: \"@daily\"", "expr: \"@reboot\"");
         assert!(ServeConfig::parse(&bad).is_err());
+    }
+
+    /// ADR-037: `workers.queue_redrive_grace_ms` parses, defaults to 5 s and
+    /// is fail-closed at its ceiling (a large value delays every recovery
+    /// re-drive).
+    #[test]
+    fn workers_queue_redrive_grace_ms_parses_and_is_fail_closed() {
+        let base = valid_yaml();
+        let with = |grace: u64| {
+            format!(
+                "{base}plugins: [\"openai-compat\", \"local-tools\", \"remote-exec\"]\n\
+                 workers:\n  listen: \"127.0.0.1:7400\"\n  token_env: KIAN_WORKER_TOKEN\n  \
+                 queue_redrive_grace_ms: {grace}\n"
+            )
+        };
+        let cfg = ServeConfig::parse(&with(0)).expect("explicit zero parses");
+        assert_eq!(
+            cfg.workers.expect("section present").queue_redrive_grace_ms,
+            0
+        );
+        let cfg = ServeConfig::parse(&with(2_500)).expect("a positive grace parses");
+        assert_eq!(
+            cfg.workers.expect("section present").queue_redrive_grace_ms,
+            2_500
+        );
+        let err = ServeConfig::parse(&with(60_001)).expect_err("over the ceiling refuses");
+        assert!(
+            err.to_string().contains("queue_redrive_grace_ms"),
+            "was: {err}"
+        );
+        let cfg = ServeConfig::parse(&base).expect("valid config");
+        assert!(cfg.workers.is_none());
     }
 }

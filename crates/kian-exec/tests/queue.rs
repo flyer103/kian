@@ -94,6 +94,7 @@ fn queue_config(queue_timeout_ms: u64) -> RemoteExecConfig {
         queue_timeout: Duration::from_millis(queue_timeout_ms),
         poll_interval: Duration::from_millis(40),
         max_redrives: 1,
+        redrive_grace: Duration::ZERO,
     }
 }
 

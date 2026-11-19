@@ -111,6 +111,7 @@ async fn setup_with(
                 queue_timeout,
                 poll_interval: Duration::from_millis(40),
                 max_redrives: 1,
+                redrive_grace: Duration::ZERO,
             },
         )
         .unwrap(),
@@ -328,6 +329,7 @@ async fn remote_tool_duplicate_call_id_is_deduped_at_the_row() {
                 queue_timeout: Duration::from_secs(8),
                 poll_interval: Duration::from_millis(40),
                 max_redrives: 1,
+                redrive_grace: Duration::ZERO,
             },
         )
         .unwrap(),
