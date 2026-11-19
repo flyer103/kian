@@ -153,6 +153,9 @@ pub struct DispatchOutcome {
     pub skip_reason: Option<String>,
     /// The bounded failure detail.
     pub error: Option<String>,
+    /// When the turn actually settled, epoch ms. `None` = the ticker
+    /// stamps `now` (a synchronous outcome recorded at decision time).
+    pub finished_at_ms: Option<u64>,
 }
 
 /// What a dispatch is asked to do with an admitted firing.
@@ -200,6 +203,14 @@ pub trait CronDispatcher {
     /// resident arm, and the default) means "accepted, not settled".
     fn take_outcome(&self, _firing_id: &str) -> Option<DispatchOutcome> {
         None
+    }
+
+    /// Every terminal outcome the dispatcher has produced since the last
+    /// drain, for the asynchronous worktree arm (the ticker settles them
+    /// on a later tick). The default is empty — the resident arm settles
+    /// from the target session's stream instead.
+    fn drain_settled(&self) -> Vec<(String, DispatchOutcome)> {
+        Vec::new()
     }
 }
 

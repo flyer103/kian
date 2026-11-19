@@ -236,6 +236,10 @@ The outcome is **not** a cursor column: it lives on the firing row (`cron_firing
 The cursor is derived state in the `READ-MODEL.md` sense — rebuildable in principle from firing
 records (§9.1) — but persisted so a restart never re-derives a fire time from the wall clock.
 
+The ticker syncs a declaration **read-first**: it loads the row and writes only when the row is
+absent, the `expr_hash` changed, or `enabled` flipped (§12.3). The steady state performs no write,
+so the 1s tick cannot race the drain/assembly writers on sqlite (`database is locked`).
+
 ### 4.2 Single-writer rule
 
 The **firing-row primary key is the lock**: two servers ticking the same slot both attempt the
@@ -298,10 +302,16 @@ were missed; the coalesce window is the only knob, and there is no unbounded rep
 
 Per schedule, `max_concurrent` (default 1) bounds the worktree arm's concurrent turns. The
 resident arm is serialized by each target session's single-flight drain, and `skip` (§5.1) keeps
-a busy target from stacking slots. There is **no global concurrency ceiling in v1**: a storm of
-schedules at `0 0 * * *` can start one turn per distinct target session (the documented
-`superagent.cron.max_concurrent` knob is designed, not accepted). Resident firings share the drain
-loop and are ordinary turns, so ADR-030 wait bounds apply unchanged.
+a busy target from stacking slots. Globally, `superagent.cron.max_concurrent` (default 4) bounds
+the process-wide number of concurrent **worktree** turns: the production ticker hands each turn
+to its own thread and the slot is held for the turn's whole lifecycle, so a firing over the
+ceiling is a recorded `skipped_overlap` (`global concurrency ceiling N reached`), never a burst.
+An explicit `0` refuses boot. Resident firings share the drain loop and are ordinary turns, so
+ADR-030 wait bounds apply unchanged.
+
+The ticker itself never runs a worktree turn: `dispatch` claims the slot, takes a global slot and
+spawns the turn, returning immediately (CRON-MODEL §7.3). The turn's outcome is drained by a
+later tick (CRON-MODEL §9.1).
 
 ### 5.5 Timeout
 
@@ -315,11 +325,12 @@ bounded by `drain.max_iterations`, the exec timeout and ADR-030's wait bounds in
 `timeout_ms` on a resident schedule refuses load (§3.3 rule 6) rather than pretending to bound a
 turn the scheduler cannot interrupt.
 
-**v1 ticker behaviour.** The worktree arm runs its child synchronously inside the tick (the
-`CronDispatcher` contract notes it): one long worktree turn delays the *other* schedules' ticks by
-that turn's duration, and the 1s cadence is suspended meanwhile. Correctness does not depend on
-tick frequency (the cursor + catch-up decide), but latency does; a bounded execution pool is a P2
-item. The resident arm's dispatch is a single inbox write and never blocks.
+**v1 ticker behaviour.** The resident arm's dispatch is a single inbox write and never blocks.
+The worktree arm runs on a spawned OS thread (bounded by §5.4's ceiling): the tick only claims
+and hands off, so one long turn delays only the schedules that are over their own ceilings, not
+every tick. The async turn's outcome is drained on a later tick and settled on the firing row
+(§9.1); a synchronous dispatch is still available for `kian cron run-now` and tests, where the
+outcome is returned inline.
 
 ## 6. Execution via the dsh harness
 
@@ -354,7 +365,7 @@ this arm is choosing a job, not a session ([ADR-034](decisions/ADR-034-cron-sche
 |---|---|---|
 | **create** | `git worktree add --detach <root>/<slug> <base>`, `base` defaulting to `HEAD` of `worktree.repo`. | Any failure — not a repo, permission denied, ref lock, disk cap, `git` missing — is `worktree_unavailable`. The firing does not run and does not fall back to the primary checkout (§6.5). |
 | **run** | The dsh turn executes with `cwd` inside the worktree. | A turn failure is an ordinary failed firing; the worktree is preserved per policy. |
-| **capture** | `git status --porcelain`, `git diff --stat`, the full `git diff` and the tail of the dsh child's stderr are written to the firing record, diff capped at `worktree.max_diff_kb` (default 512, truncated with an explicit marker). In v1 the **durable** row carries `state`, `worktree_path` and the bounded `error`; the captured diff/output detail rides the in-process firing record and is lost on restart (a P2 gap, recorded rather than over-claimed). | Capture errors are recorded, never fatal to a turn that already ran. |
+| **capture** | `git status --porcelain`, `git diff --stat`, the full `git diff` and the tail of the dsh child's stderr are captured on the in-process firing record, diff capped at `worktree.max_diff_kb` (default 512, truncated with an explicit marker). In v1 the **durable** row carries `state`, `worktree_path` and the bounded `error` only; the captured diff/output is not persisted, and the ledger entry is drained once the outcome is settled (a P2 gap, recorded rather than over-claimed). | Capture errors are recorded, never fatal to a turn that already ran. |
 | **cleanup** | delete the worktree `target/` directory (where `CARGO_TARGET_DIR` points, §6.4) and record the freed bytes on the firing, then `git worktree remove --force <path>` and `git worktree prune`. Kept when `keep_on_failure: true` and outcome ≠ `ok`, or on `--keep`. | Cleanup is unconditional (success and failure alike) and failure-tolerant: a cleanup error is a note on the firing, the directory is enqueued for GC (§6.4), and the tick never fails. |
 
 ### 6.3 Naming
@@ -510,13 +521,14 @@ non-context `cron: {schedule_id, firing_id, fire_time, target}` key plus the ide
 
 ### 9.2 Tick reports
 
-The tick loop emits one JSON line per decision — `cron/fired`, `cron/skipped`, `cron/failed` —
+The tick loop emits one JSON line per **decision** — `cron/fired`, `cron/skipped`, `cron/failed` —
 carrying `schedule_id`, `firing_id`, `fire_time` and the outcome (plus the worktree path or the
-skip reason); a panicking schedule is reported as `cron/failed` without killing the ticker. No
-new event kinds and no new metrics keys are introduced in v1: the durable record is the
-`cron_firings` row, and `cron list` / `cron logs` are the operator read surface. A scheduler that
-silently does nothing is indistinguishable from a broken one, so every skip writes its row and
-its line.
+skip reason); a panicking schedule is reported as `cron/failed` without killing the ticker. An
+**asynchronous settlement** (a worktree turn that finished since the last tick) writes the firing
+row and no extra line: the row is the durable record, and `cron logs` names the state, duration
+and error. No new event kinds and no new metrics keys are introduced in v1; `cron list` /
+`cron logs` are the operator read surface. A scheduler that silently does nothing is
+indistinguishable from a broken one, so every skip writes its row and its line.
 
 ### 9.3 The "why didn't it run" path
 
@@ -604,7 +616,8 @@ document does not trigger that path.
 | Integration (worktree) | success / failure / timeout / `keep_on_failure` | full lifecycle verified; kept trees survive and are GC'd after `retain_hours` |
 | Integration (worktree) | not a git dir; ref lock; `git` absent | `worktree_unavailable`, no run, no fallback, stderr captured |
 | Integration (disk cap) | fill `total_cap_mib` with kept worktrees | oldest non-running evicted first; cap never exceeded; refusal when nothing evictable |
-| Integration (concurrency) | 8 schedules at one minute, global ceiling 4 | ≤ max_concurrent per schedule; the rest recorded as `skipped_overlap`, not errors |
+| Integration (concurrency) | 8 schedules at one minute, global ceiling 4 | ≤ max_concurrent per schedule and ≤ 4 worktree turns; the rest recorded as `skipped_overlap`, not errors (`the_global_worktree_ceiling_refuses_a_second_turn`) |
+| Unit (async dispatch) | worktree turn slower than the tick | `dispatch` returns before the turn finishes; the outcome is drained on a later tick (`async_worktree_dispatch_returns_before_the_turn_finishes`) |
 | Integration (sandbox) | prompt calling a non-allowlisted `exec` | designed, not v1 (§8.2) |
 | Integration (coexist) | cron + timer + watchdog in one config | all three fire; a cron target naming the watchdog session rejected at load |
 | Unit (overlap) | busy target session, `overlap: skip` | one `skipped_overlap` row with its reason; the payload never reaches the session (`a_busy_target_session_skips_the_slot_instead_of_queueing_it`) |

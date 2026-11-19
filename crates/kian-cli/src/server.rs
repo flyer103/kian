@@ -140,6 +140,8 @@ pub struct Server {
     /// spawns the cron ticker only when this is non-empty — feature-off
     /// arms no timer at all (M8).
     cron_schedules: Vec<crate::config::CronRuntimeSchedule>,
+    /// The §5.4 process-wide worktree concurrency ceiling (global config).
+    cron_max_concurrent: u32,
     /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
     /// plan pin P5): present iff the superagent bundle configures
     /// `superagent.multiagent` limits. [`Server::serve`] spawns its
@@ -973,6 +975,11 @@ impl Server {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
+        let cron_max_concurrent = superagent_cfg
+            .as_ref()
+            .map_or(crate::config::DEFAULT_CRON_GLOBAL_MAX_CONCURRENT, |sa| {
+                sa.cron.global_max_concurrent()
+            });
 
         let server = Self {
             engine,
@@ -992,6 +999,7 @@ impl Server {
             // inbox rebuild).
             hooks,
             cron_schedules,
+            cron_max_concurrent,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -1267,7 +1275,8 @@ impl Server {
             // Selection rule: a schedule that declares `worktree:` is
             // dispatched to the worktree-backed arm; every other schedule goes
             // to the resident engine.
-            let mut selection = crate::cron_engine::ScheduleDispatcher::resident(resident);
+            let mut selection = crate::cron_engine::ScheduleDispatcher::resident(resident)
+                .with_async_worktree(self.cron_max_concurrent);
             for (schedule_id, (repo, policy)) in crate::config::cron_worktree_plans(&schedules) {
                 selection = selection.with_schedule_worktree(
                     schedule_id,

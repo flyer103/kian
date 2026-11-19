@@ -190,11 +190,30 @@ impl CronTickStore for DurableCronTickStore {
             .schedules
             .get(schedule_id)
             .ok_or_else(|| format!("cron_schedules `{schedule_id}`: undeclared"))?;
-        self.declare(schedule)?;
-        let Some(row) = self
+        // Read-first: the steady state does not write. A tick used to
+        // upsert the declaration every second; under sqlite that write
+        // raced the drain/assembly writers and one boot tick failed with
+        // `database is locked`. Only an absent row, a changed digest or a
+        // changed `enabled` needs the upsert (which is still the same
+        // atomic statement: same digest = cursor untouched, changed =
+        // cursor reset).
+        let digest = declaration_digest(schedule);
+        let existing = self
             .block(self.store.load_schedule(schedule_id))
-            .map_err(|e| format!("cron_schedules `{schedule_id}`: {e}"))?
-        else {
+            .map_err(|e| format!("cron_schedules `{schedule_id}`: {e}"))?;
+        let needs_declare = existing
+            .as_ref()
+            .is_none_or(|row| row.declaration_digest != digest || row.enabled != schedule.enabled);
+        if needs_declare {
+            self.declare(schedule)?;
+        }
+        let row = if needs_declare || existing.is_none() {
+            self.block(self.store.load_schedule(schedule_id))
+                .map_err(|e| format!("cron_schedules `{schedule_id}`: {e}"))?
+        } else {
+            existing
+        };
+        let Some(row) = row else {
             return Ok(Cursor::default());
         };
         let last_fire_at = match row.cursor_fire_at.as_deref() {
@@ -483,6 +502,34 @@ pub struct ScheduleDispatcher {
     /// `worktree.repo` gets its own dispatcher (CRON-MODEL §6, one repo
     /// per declaration), keyed by schedule id.
     per_schedule: BTreeMap<String, Arc<WorktreeDispatcher>>,
+    /// Run worktree turns off the ticker thread (production): the tick
+    /// only claims and hands off, so one long turn cannot stall every
+    /// other schedule (CRON-MODEL §5.4/§7.3).
+    async_worktree: bool,
+    /// The §5.4 global ceiling: concurrent worktree turns across all
+    /// schedules. Held by a spawned thread for the turn's duration.
+    global: Arc<GlobalCap>,
+}
+
+/// The process-wide worktree concurrency ceiling (§5.4). A slot is taken
+/// only when a turn is *spawned* and released when its thread finishes;
+/// an over-ceiling slot is a recorded `skipped_overlap`, never a burst.
+struct GlobalCap {
+    cap: u32,
+    running: Mutex<u32>,
+}
+
+/// One held global slot; released on drop (the spawned turn's end).
+struct GlobalSlot {
+    cap: Arc<GlobalCap>,
+}
+
+impl Drop for GlobalSlot {
+    fn drop(&mut self) {
+        if let Ok(mut running) = self.cap.running.lock() {
+            *running = running.saturating_sub(1);
+        }
+    }
 }
 
 impl ScheduleDispatcher {
@@ -496,6 +543,11 @@ impl ScheduleDispatcher {
             resident,
             worktree,
             per_schedule: BTreeMap::new(),
+            async_worktree: false,
+            global: Arc::new(GlobalCap {
+                cap: 4,
+                running: Mutex::new(0),
+            }),
         }
     }
 
@@ -520,6 +572,30 @@ impl ScheduleDispatcher {
         self
     }
 
+    /// Run worktree turns on their own threads, bounded by `cap`
+    /// (CRON-MODEL §5.4). The tick then only claims and hands off.
+    pub fn with_async_worktree(mut self, cap: u32) -> Self {
+        self.async_worktree = true;
+        self.global = Arc::new(GlobalCap {
+            cap: cap.max(1),
+            running: Mutex::new(0),
+        });
+        self
+    }
+
+    /// Try to take one global worktree slot (§5.4); `None` = over the
+    /// ceiling.
+    fn try_global_slot(&self) -> Option<GlobalSlot> {
+        let mut running = self.global.running.lock().ok()?;
+        if *running >= self.global.cap {
+            return None;
+        }
+        *running += 1;
+        Some(GlobalSlot {
+            cap: Arc::clone(&self.global),
+        })
+    }
+
     /// Which arm `schedule` selects.
     pub fn selects_worktree(schedule: &CronRuntimeSchedule) -> bool {
         schedule.worktree.is_some()
@@ -538,14 +614,38 @@ impl CronDispatcher for ScheduleDispatcher {
                 .per_schedule
                 .get(&schedule.id)
                 .or(self.worktree.as_ref());
-            return match isolated {
-                Some(worktree) => worktree.dispatch(schedule, firing_id, payload),
-                None => Err(format!(
+            let Some(worktree) = isolated else {
+                return Err(format!(
                     "schedule `{}` asks for worktree isolation but no worktree dispatcher is \
                      armed (no `worktree.repo` resolved)",
                     schedule.id
-                )),
+                ));
             };
+            if !self.async_worktree {
+                return worktree.dispatch(schedule, firing_id, payload);
+            }
+            // Production: hand the turn to its own thread so the ticker
+            // keeps ticking (CRON-MODEL §5.4/§7.3). The global slot is
+            // held for the turn's whole lifecycle (run + capture +
+            // cleanup) and released by `GlobalSlot::drop`.
+            let Some(slot) = self.try_global_slot() else {
+                return Err(format!(
+                    "skipped_overlap: global concurrency ceiling {} reached (CRON-MODEL §5.4)",
+                    self.global.cap
+                ));
+            };
+            let worktree = Arc::clone(worktree);
+            let schedule = schedule.clone();
+            let firing_id = firing_id.to_owned();
+            let payload = payload.to_owned();
+            return std::thread::Builder::new()
+                .name("kian-cron-turn".to_string())
+                .spawn(move || {
+                    let _slot = slot;
+                    let _ = worktree.dispatch(&schedule, &firing_id, &payload);
+                })
+                .map(|_| ())
+                .map_err(|error| format!("cannot spawn the cron turn: {error}"));
         }
         match self.resident.as_ref() {
             Some(resident) => resident.dispatch(schedule, firing_id, payload),
@@ -565,6 +665,17 @@ impl CronDispatcher for ScheduleDispatcher {
                     .as_ref()
                     .and_then(|worktree| worktree.take_outcome(firing_id))
             })
+    }
+
+    fn drain_settled(&self) -> Vec<(String, DispatchOutcome)> {
+        let mut settled = Vec::new();
+        for worktree in self.per_schedule.values() {
+            settled.extend(worktree.drain_settled());
+        }
+        if let Some(worktree) = self.worktree.as_ref() {
+            settled.extend(worktree.drain_settled());
+        }
+        settled
     }
 }
 
@@ -592,6 +703,11 @@ fn skip_event(entry: &Admitted, now: DateTime<Utc>, reason: &str) -> Value {
     })
 }
 
+/// Epoch milliseconds as a `DateTime<Utc>` (the store's settlement unit).
+fn from_epoch_ms(ms: u64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(i64::try_from(ms).ok()?)
+}
+
 /// [`cron_tick::tick_and_dispatch`], with guard refusals classified as skips.
 ///
 /// A dispatch error settles the slot `failed` with the error text (and is
@@ -611,25 +727,38 @@ pub fn tick_and_dispatch_classified(
 ) -> (TickReport, Vec<Value>) {
     let mut report = cron_tick::tick_once(now, schedules, store);
     let mut events: Vec<Value> = Vec::new();
+    // Settle the outcomes the asynchronous worktree turns produced since
+    // the last tick (CRON-MODEL §5.4/§9.1). The firing row is the record;
+    // no extra log line is invented for a settlement.
+    for (firing_id, settled) in dispatcher.drain_settled() {
+        let finished = settled.finished_at_ms.and_then(from_epoch_ms).or(Some(now));
+        let _ = store.finish_firing(
+            &firing_id,
+            settled.state,
+            finished,
+            settled.worktree_path.as_deref(),
+            settled.skip_reason.as_deref(),
+            settled.error.as_deref(),
+        );
+    }
     let mut admitted: Vec<Admitted> = Vec::with_capacity(report.admitted.len());
     for entry in report.admitted.drain(..) {
         let Some(schedule) = schedules.iter().find(|s| s.id == entry.schedule_id) else {
             admitted.push(entry);
             continue;
         };
-        // The worktree arm runs the turn synchronously and knows the
-        // terminal outcome (state + worktree path + failure detail); the
-        // resident arm accepts asynchronously. A known outcome is
-        // persisted on the firing row so `cron list`/`cron logs` answer
-        // "did it run" — CRON-MODEL §9.1.
-        let outcome = dispatcher.take_outcome(&entry.firing_id);
+        // The worktree arm may run the turn synchronously (tests,
+        // `run-now`) and know the terminal outcome immediately; the async
+        // production arm records it later and the drain above settles it.
+        // A known outcome is persisted on the firing row so
+        // `cron list`/`cron logs` answer "did it run" — CRON-MODEL §9.1.
         match dispatcher.dispatch(schedule, &entry.firing_id, &entry.payload) {
-            Ok(()) => match outcome {
+            Ok(()) => match dispatcher.take_outcome(&entry.firing_id) {
                 Some(settled) => {
                     let _ = store.finish_firing(
                         &entry.firing_id,
                         settled.state,
-                        Some(now),
+                        settled.finished_at_ms.and_then(from_epoch_ms).or(Some(now)),
                         settled.worktree_path.as_deref(),
                         settled.skip_reason.as_deref(),
                         settled.error.as_deref(),
@@ -647,6 +776,7 @@ pub fn tick_and_dispatch_classified(
                 None => admitted.push(entry),
             },
             Err(error) => {
+                let outcome = dispatcher.take_outcome(&entry.firing_id);
                 let token = guard_skip_token(&error);
                 let state = outcome.as_ref().map_or_else(
                     || {
@@ -1238,6 +1368,227 @@ mod tests {
         );
     }
 
+    /// CRON-MODEL §9.1: a *synchronous* worktree turn (tests, `run-now`)
+    /// settles on the same tick through `take_outcome` — the immediate
+    /// outcome must not be silently dropped, or the row would stay
+    /// `admitted` until the next tick's drain (and the async arm's
+    /// contract would hide a synchronous regression).
+    #[test]
+    fn a_synchronous_worktree_tick_settles_the_firing_succeeded() {
+        let rt = runtime();
+        let dir = TempDir::new("sync-settle");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let schedule = schedule_yaml("iso", "    worktree: true\n");
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        let worktree = Arc::new(
+            WorktreeDispatcher::new(repo.clone())
+                .with_policy(WorktreePolicy {
+                    min_free_mib: 0,
+                    min_free_percent: 0,
+                    ..WorktreePolicy::default()
+                })
+                .with_runner(Box::new(SharedRunner(Arc::new(CountingRunner {
+                    calls: AtomicUsize::new(0),
+                })))),
+        );
+        let dispatcher = ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(Arc::new(
+            FakeResident::default(),
+        ))))
+        .with_worktree(worktree);
+        let anchor = schedule.next_fire_after(Utc::now()).expect("next fire");
+        let (report, _) = tick_and_dispatch_classified(
+            anchor + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &durable,
+            &dispatcher,
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(report.admitted.len(), 1, "{:?}", report.admitted);
+        let firings = rt
+            .block_on(store.list_firings(Some("iso"), 5))
+            .expect("firing rows");
+        assert_eq!(firings.len(), 1, "{firings:?}");
+        assert_eq!(firings[0].state.as_str(), "succeeded", "{firings:?}");
+        assert!(firings[0].finished_at.is_some(), "{firings:?}");
+        assert!(firings[0].worktree_path.is_some(), "{firings:?}");
+    }
+
+    /// A turn runner that holds its slot for a moment, so the async
+    /// dispatch's non-blocking property and the global ceiling are
+    /// observable.
+    struct SlowRunner {
+        delay: std::time::Duration,
+        calls: AtomicUsize,
+    }
+
+    impl TurnRunner for SlowRunner {
+        fn run(&self, request: &TurnRequest) -> Result<TurnOutput, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                request.worktree.exists(),
+                "the turn runs in a real worktree: {}",
+                request.worktree.display()
+            );
+            std::thread::sleep(self.delay);
+            Ok(TurnOutput {
+                stdout: "slow turn done\n".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                timed_out: false,
+                too_large: false,
+            })
+        }
+    }
+
+    struct SharedSlowRunner(Arc<SlowRunner>);
+
+    impl TurnRunner for SharedSlowRunner {
+        fn run(&self, request: &TurnRequest) -> Result<TurnOutput, String> {
+            self.0.run(request)
+        }
+    }
+
+    /// CRON-MODEL §5.4/§7.3: the production ticker hands a worktree turn
+    /// to its own thread, so one long turn cannot stall every other
+    /// schedule. `dispatch` returns before the turn finishes and the
+    /// outcome is drained (and settled) on a later tick.
+    #[test]
+    fn async_worktree_dispatch_returns_before_the_turn_finishes() {
+        let dir = TempDir::new("async-worktree");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let schedule = schedule_yaml("isolated", "    worktree: { root: kian-worktrees }\n");
+        let runner = Arc::new(SlowRunner {
+            delay: std::time::Duration::from_millis(300),
+            calls: AtomicUsize::new(0),
+        });
+        let worktree = Arc::new(
+            WorktreeDispatcher::new(repo.clone())
+                .with_policy(WorktreePolicy {
+                    min_free_mib: 0,
+                    min_free_percent: 0,
+                    ..WorktreePolicy::default()
+                })
+                .with_runner(Box::new(SharedSlowRunner(Arc::clone(&runner)))),
+        );
+        let dispatcher = ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(Arc::new(
+            FakeResident::default(),
+        ))))
+        .with_worktree(Arc::clone(&worktree))
+        .with_async_worktree(4);
+
+        let fire_time = DateTime::parse_from_rfc3339("2024-06-03T12:00:00Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let firing_id = kian_cron::firing_id("isolated", fire_time);
+        let payload = cron_tick::dispatch_payload(&schedule, &firing_id, fire_time);
+
+        let started = std::time::Instant::now();
+        dispatcher
+            .dispatch(&schedule, &firing_id, &payload)
+            .expect("the async arm accepts the firing");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "dispatch returned after {:?}, not before the turn finished",
+            started.elapsed()
+        );
+        assert!(
+            dispatcher.drain_settled().is_empty(),
+            "the turn is still running, so nothing settled yet"
+        );
+
+        // The spawned thread records its outcome; the ticker drains it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let settled = loop {
+            let settled = dispatcher.drain_settled();
+            if !settled.is_empty() {
+                break settled;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the async turn never recorded an outcome"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        assert_eq!(settled[0].0, firing_id);
+        assert_eq!(settled[0].1.state, FiringState::Succeeded, "{settled:?}");
+        assert!(settled[0].1.worktree_path.is_some(), "{settled:?}");
+        assert!(settled[0].1.finished_at_ms.is_some(), "{settled:?}");
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// CRON-MODEL §5.4: the process-wide ceiling refuses an over-cap
+    /// firing as a recorded overlap, never a burst.
+    #[test]
+    fn the_global_worktree_ceiling_refuses_a_second_turn() {
+        let dir = TempDir::new("global-cap");
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let first = schedule_yaml("cap-a", "    worktree: { root: kian-worktrees }\n");
+        let second = schedule_yaml("cap-b", "    worktree: { root: kian-worktrees }\n");
+        let runner = Arc::new(SlowRunner {
+            delay: std::time::Duration::from_millis(250),
+            calls: AtomicUsize::new(0),
+        });
+        let worktree = Arc::new(
+            WorktreeDispatcher::new(repo.clone())
+                .with_policy(WorktreePolicy {
+                    min_free_mib: 0,
+                    min_free_percent: 0,
+                    ..WorktreePolicy::default()
+                })
+                .with_runner(Box::new(SharedSlowRunner(Arc::clone(&runner)))),
+        );
+        let dispatcher = ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(Arc::new(
+            FakeResident::default(),
+        ))))
+        .with_worktree(Arc::clone(&worktree))
+        .with_async_worktree(1);
+
+        let fire_time = DateTime::parse_from_rfc3339("2024-06-03T12:00:00Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let first_id = kian_cron::firing_id("cap-a", fire_time);
+        let second_id = kian_cron::firing_id("cap-b", fire_time);
+        dispatcher
+            .dispatch(
+                &first,
+                &first_id,
+                &cron_tick::dispatch_payload(&first, &first_id, fire_time),
+            )
+            .expect("the first turn takes the only global slot");
+        let refused = dispatcher
+            .dispatch(
+                &second,
+                &second_id,
+                &cron_tick::dispatch_payload(&second, &second_id, fire_time),
+            )
+            .expect_err("the ceiling refuses the second turn");
+        assert!(refused.contains("global concurrency ceiling"), "{refused}");
+        assert!(refused.starts_with("skipped_overlap"), "{refused}");
+
+        // Let the first turn finish and drain its outcome before the temp
+        // repo is removed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let settled = dispatcher.drain_settled();
+            if !settled.is_empty() {
+                assert_eq!(settled.len(), 1, "{settled:?}");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first async turn never recorded an outcome"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn declaration_digest_tracks_the_declaration_and_not_the_policy() {
         let base = schedule("audit");
@@ -1350,7 +1701,10 @@ mod tests {
             Some(fire_time_text(anchor).as_str())
         );
 
-        // A restart with the same declaration: the cursor survives.
+        // A restart with the same declaration: the cursor survives, and
+        // the steady-state tick writes nothing (read-first declaration
+        // sync — the per-tick upsert used to race sqlite writers).
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let same =
             DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
         same.load_cursor("audit").expect("the redeclare reads");
@@ -1363,6 +1717,10 @@ mod tests {
             "an unchanged declaration never moves the cursor"
         );
         assert_eq!(kept.next_fire_at, fired.next_fire_at);
+        assert_eq!(
+            kept.updated_at, fired.updated_at,
+            "an unchanged declaration writes nothing per tick"
+        );
 
         // An edited expression: the row adopts it and the cursor resets.
         let mut edited = schedule.clone();

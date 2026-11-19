@@ -22,6 +22,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   running execution. No wire frame, protocol version or store schema changes. Contract:
   [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §4, §8.
 
+- **Cron: the declaration sync is read-first (CRON-MODEL §4.1)**. The ticker loads the schedule
+  row and upserts only when it is absent, the declaration digest changed, or `enabled` flipped; the
+  steady state performs no write. The per-tick upsert raced the drain/assembly writers on sqlite
+  (a real boot tick failed with `database is locked`) and amplified write-lock contention for no
+  data change.
+
+- **Cron: worktree turns stop blocking the ticker (CRON-MODEL §5.4, §7.3)**. The production
+  dispatcher now spawns each worktree turn on its own OS thread, bounded by a process-wide
+  `superagent.cron.max_concurrent` ceiling (default 4; an explicit `0` refuses boot) and by the
+  existing per-schedule `max_concurrent`. A turn over the ceiling is a recorded `skipped_overlap`
+  (`global concurrency ceiling N reached`), and a long turn no longer suspends every other
+  schedule's tick. The turn's outcome (state, worktree path, error, real finish time) is drained
+  by a later tick and settled on the firing row; the in-process ledger is cleared as it drains, so
+  the ticker's memory stays bounded. `kian cron run-now` and the unit suites keep the synchronous
+  arm. Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md) §5.4, §6.2, §7.3, §9.1, §9.2;
+  [docs/SPEC.md](docs/SPEC.md) cron P1.
 - **Confirmation plane: the promote gate and the open-call crash repair (CONFIRMATION-MODEL §7
   R1b, §15.6)**. While an `ask` waits, an ordinary message row is no longer promoted into context:
   promoting it interleaved a user message between the assistant `tool_calls` and its answered

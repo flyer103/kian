@@ -3756,6 +3756,8 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
 /// Default `coalesce_ms` (CRON-MODEL §3.1): 15 minutes of lateness honored
 /// by `catch_up: latest`.
 pub const DEFAULT_CRON_COALESCE_MS: u64 = 900_000;
+/// Default process-wide worktree concurrency (CRON-MODEL §5.4): four turns.
+pub const DEFAULT_CRON_GLOBAL_MAX_CONCURRENT: u32 = 4;
 /// Default `max_concurrent` (CRON-MODEL §3.1): one firing at a time.
 pub const DEFAULT_CRON_MAX_CONCURRENT: u32 = 1;
 /// Default `timeout_ms` (CRON-MODEL §3.1): a 30-minute per-firing ceiling.
@@ -3778,6 +3780,13 @@ pub struct CronSection {
     /// schedule's own fire time (§2.5).
     #[serde(default)]
     pub schedules: Vec<CronScheduleDef>,
+
+    /// The §5.4 process-wide ceiling on concurrent worktree turns,
+    /// across every schedule. Absent = four; an explicit `0` refuses
+    /// boot. A slot over the ceiling is a recorded `skipped_overlap`,
+    /// never a burst.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
 
     /// The §6.4 disk guards: cron must never fill the host disk. Absent = the
     /// documented defaults; an explicit `0` refuses boot rather than silently
@@ -4273,6 +4282,15 @@ fn is_valid_cron_id(id: &str) -> bool {
 }
 
 impl CronSection {
+    /// The §5.4 process-wide worktree ceiling (default 4). Load-time
+    /// validation already refused an explicit `0`.
+    #[must_use]
+    pub fn global_max_concurrent(&self) -> u32 {
+        self.max_concurrent
+            .unwrap_or(DEFAULT_CRON_GLOBAL_MAX_CONCURRENT)
+            .max(1)
+    }
+
     /// Converts the declarations into resolved schedules (the timer's
     /// `to_runtime` pattern), fail-closed on every degenerate field
     /// (§3.3): a malformed expression, an unresolvable timezone, a
@@ -4297,6 +4315,12 @@ impl CronSection {
         let mut errors: Vec<String> = Vec::new();
         self.disk.collect_errors(&mut errors);
         self.harness.collect_errors(&mut errors);
+        if self.max_concurrent == Some(0) {
+            errors.push(
+                "superagent.cron.max_concurrent must be >= 1 (omit it for the default 4)"
+                    .to_string(),
+            );
+        }
         let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
         let mut resolved = Vec::with_capacity(self.schedules.len());
 
@@ -8164,6 +8188,31 @@ schedules:
         .expect("a worktree schedule may declare its per-firing timeout");
         assert_eq!(isolated[0].timeout_ms, 1000);
         assert!(isolated[0].worktree.is_some());
+    }
+
+    /// CRON-MODEL §5.4: the process-wide worktree ceiling defaults to
+    /// four and an explicit zero refuses load (never a silent disable).
+    #[test]
+    fn cron_global_max_concurrent_parses_and_is_fail_closed() {
+        let default: CronSection = serde_yaml::from_str("schedules: []\n").unwrap();
+        assert_eq!(
+            default.global_max_concurrent(),
+            DEFAULT_CRON_GLOBAL_MAX_CONCURRENT
+        );
+        let explicit: CronSection =
+            serde_yaml::from_str("max_concurrent: 8\nschedules: []\n").unwrap();
+        assert_eq!(explicit.global_max_concurrent(), 8);
+        assert!(explicit.to_runtime(&cron_channels(), cron_now()).is_ok());
+
+        let zero: CronSection = serde_yaml::from_str("max_concurrent: 0\nschedules: []\n").unwrap();
+        let err = zero
+            .to_runtime(&cron_channels(), cron_now())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_concurrent"), "{err}");
+        // The accessor still floors at one, so a caller that somehow holds
+        // an unvalidated section cannot divide by zero or disable the cap.
+        assert_eq!(zero.global_max_concurrent(), 1);
     }
 
     /// CRON-MODEL §3.3 rule 7 (`cron_targets_watchdog`): a wall-clock

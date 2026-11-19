@@ -176,6 +176,8 @@ pub struct WorktreeFiring {
     pub exit_code: Option<i32>,
     /// Wall time of the turn, milliseconds.
     pub duration_ms: u64,
+    /// Epoch ms the firing was recorded (the settlement's `finished_at`).
+    pub finished_at_ms: u64,
     /// Tail of the turn's stdout.
     pub stdout_tail: String,
     /// Tail of the turn's stderr.
@@ -211,6 +213,7 @@ impl WorktreeFiring {
             outcome,
             exit_code: None,
             duration_ms: 0,
+            finished_at_ms: 0,
             stdout_tail: String::new(),
             stderr_tail: String::new(),
             status: String::new(),
@@ -768,7 +771,8 @@ impl WorktreeDispatcher {
         Some(self.gc(now))
     }
 
-    fn record(&self, firing: WorktreeFiring) {
+    fn record(&self, mut firing: WorktreeFiring) {
+        firing.finished_at_ms = now_ms();
         lock(&self.ledger).push(firing);
     }
 
@@ -1060,29 +1064,51 @@ impl CronDispatcher for WorktreeDispatcher {
 
     fn take_outcome(&self, firing_id: &str) -> Option<DispatchOutcome> {
         let firing = self.firing(firing_id)?;
-        let (state, skip_reason) = match firing.outcome {
-            FiringOutcome::Ok => (FiringState::Succeeded, None),
-            FiringOutcome::SkippedOverlap => {
-                (FiringState::Skipped, Some("skipped_overlap".to_string()))
-            }
-            FiringOutcome::SkippedDiskPressure => (
-                FiringState::Skipped,
-                Some("skipped_disk_pressure".to_string()),
-            ),
-            FiringOutcome::Failed | FiringOutcome::Timeout | FiringOutcome::WorktreeUnavailable => {
-                (FiringState::Failed, None)
-            }
-        };
-        Some(DispatchOutcome {
-            state,
-            worktree_path: firing
-                .worktree_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            skip_reason,
-            error: firing.error.clone(),
-        })
+        Some(outcome_of(&firing))
     }
+
+    fn drain_settled(&self) -> Vec<(String, DispatchOutcome)> {
+        let mut ledger = lock(&self.ledger);
+        ledger
+            .drain(..)
+            .map(|firing| (firing.firing_id.clone(), outcome_of(&firing)))
+            .collect()
+    }
+}
+
+/// One recorded firing's terminal outcome, as the ticker persists it.
+fn outcome_of(firing: &WorktreeFiring) -> DispatchOutcome {
+    let (state, skip_reason) = match firing.outcome {
+        FiringOutcome::Ok => (FiringState::Succeeded, None),
+        FiringOutcome::SkippedOverlap => {
+            (FiringState::Skipped, Some("skipped_overlap".to_string()))
+        }
+        FiringOutcome::SkippedDiskPressure => (
+            FiringState::Skipped,
+            Some("skipped_disk_pressure".to_string()),
+        ),
+        FiringOutcome::Failed | FiringOutcome::Timeout | FiringOutcome::WorktreeUnavailable => {
+            (FiringState::Failed, None)
+        }
+    };
+    DispatchOutcome {
+        state,
+        worktree_path: firing
+            .worktree_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        skip_reason,
+        error: firing.error.clone(),
+        finished_at_ms: (firing.finished_at_ms > 0).then_some(firing.finished_at_ms),
+    }
+}
+
+/// Epoch milliseconds.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// One held concurrency slot (§5.4); releasing it is `Drop`.
