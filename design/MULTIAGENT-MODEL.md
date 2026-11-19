@@ -89,7 +89,7 @@ durable citation and the line range is the evidence of record.
 | A missing `thread/completed` already means `outstanding`, not `failed` | `design/DESIGN.md:964-966` |
 | The existing board-like surface is a disposable projection with a read-only CLI | `design/DESIGN.md:1057-1073` |
 | Footprint Ladder order: config → plugin → seam → core primitive | `design/DESIGN.md` §6.3 (`:1500-1507`) |
-| 22 kinds, additions-only; the three facts we lean on (`thread/started`, `thread/completed`, `evidence/verdict`) | `design/EVENT-MODEL.md:94,116-118` |
+| 23 kinds, additions-only; the three facts we lean on (`thread/started`, `thread/completed`, `evidence/verdict`) | `design/EVENT-MODEL.md:94,116-118` |
 | Two-copy additive-key discipline (top-level audit vs wrapper `content`) | `design/EVENT-MODEL.md:168-186` |
 | An additive key must leave legacy bytes byte-identical and must not change `derive_model_context` | `design/EVENT-MODEL.md:188-190,194-197` |
 | Idempotent inbox admission per `(session, idempotency_key)`; derived event id precedent | `design/EVENT-MODEL.md:201-206` |

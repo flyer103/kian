@@ -551,3 +551,181 @@ async fn a_late_answer_degrades_to_expired_and_resumes() {
         Some("reject")
     );
 }
+
+/// A message that arrives while a decision is pending must NOT be promoted
+/// into the stream: doing so would interleave a user message between the
+/// unanswered `tool/call` and its `tool/result`, and the resumed provider
+/// request would carry a tool block broken by a user message (strict
+/// OpenAI-compatible endpoints reject it). After the answer, the queued
+/// message is promoted at the next safe boundary, after the tool result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_during_the_wait_is_promoted_after_the_answer_in_call_order() {
+    force_no_proxy();
+    let dir = temp_dir("confirm-interleave");
+    let sqlite = dir.join("kian.sqlite");
+    let (provider_base, _mock) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::ToolCall {
+                id: "call-wait".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({"argv": ["echo", "confirmation-waited"]}),
+            },
+            ScriptedResponse::Text("Approved and done.".into()),
+            ScriptedResponse::Text("Yes, still here.".into()),
+        ],
+        0,
+    )
+    .await;
+    let config = write_ask_config(&dir, &sqlite, &provider_base, "127.0.0.1:7332", None);
+    let (base, _server) = spawn_server(&config).await;
+    let client = reqwest::Client::new();
+
+    let out = rpc(&client, &base, "create_session", serde_json::json!({})).await;
+    let sid: String = result(&out)["session"].as_str().expect("sid").into();
+    rpc(
+        &client,
+        &base,
+        "submit",
+        serde_json::json!({"session": sid, "content": "Send the mail.",
+                           "idempotency_key": "interleave-1"}),
+    )
+    .await;
+    wait_awaiting(&sqlite, &sid).await;
+
+    // A plain message arrives while the ask waits. It is admitted
+    // durably but must stay unpromoted (no `input/admitted`).
+    rpc(
+        &client,
+        &base,
+        "submit",
+        serde_json::json!({"session": sid, "content": "Are you there?",
+                           "idempotency_key": "interleave-2"}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ev = events_of(&sqlite, &sid).await;
+        let awaits = ev
+            .iter()
+            .filter(|e| {
+                e.kind
+                    == EventKind::SessionEnded {
+                        reason: EndReason::AwaitingInput,
+                    }
+            })
+            .count();
+        if awaits >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the blocked message's no-op episode never settled: {awaits} awaits"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ev = events_of(&sqlite, &sid).await;
+    assert!(
+        !ev.iter().any(|e| {
+            e.kind == EventKind::InputAdmitted
+                && e.bytes.get("content").and_then(serde_json::Value::as_str)
+                    == Some("Are you there?")
+        }),
+        "the waiting message must not be promoted into the call's open window"
+    );
+    assert_eq!(state(&client, &base, &sid).await, "idle");
+
+    // Approve; the queued message promotes after the tool result.
+    let out = rpc(
+        &client,
+        &base,
+        "confirm",
+        serde_json::json!({"session": sid, "call_id": "call-wait", "decision": "approve",
+                           "requested_by": "e2e"}),
+    )
+    .await;
+    assert_eq!(result(&out)["outcome"], "accepted");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while state(&client, &base, &sid).await != "completed" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the answered session did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let ev = events_of(&sqlite, &sid).await;
+    let result_seq = ev
+        .iter()
+        .find(|e| {
+            e.kind == EventKind::ToolResult
+                && e.bytes
+                    .pointer("/content/call_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("call-wait")
+        })
+        .map(|e| e.seq)
+        .expect("the answered call has a result");
+    let queued_seq = ev
+        .iter()
+        .find(|e| {
+            e.kind == EventKind::InputAdmitted
+                && e.bytes.get("content").and_then(serde_json::Value::as_str)
+                    == Some("Are you there?")
+        })
+        .map(|e| e.seq)
+        .expect("the queued message is eventually promoted");
+    assert!(
+        result_seq < queued_seq,
+        "the tool result ({result_seq}) must precede the queued message ({queued_seq})"
+    );
+
+    // The resumed request's message order is provider-legal: the
+    // assistant turn carrying `tool_calls` is answered immediately.
+    let resumed = ev
+        .iter()
+        .filter(|e| e.kind == EventKind::StepRequest)
+        .filter_map(|e| {
+            e.bytes
+                .pointer("/body/messages")
+                .and_then(serde_json::Value::as_array)
+        })
+        .find(|messages| {
+            messages.iter().any(|m| {
+                m.get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|c| {
+                            c.get("id").and_then(serde_json::Value::as_str) == Some("call-wait")
+                        })
+                    })
+            })
+        })
+        .expect("a request carried the tool call");
+    let at = resumed
+        .iter()
+        .position(|m| {
+            m.get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|c| {
+                        c.get("id").and_then(serde_json::Value::as_str) == Some("call-wait")
+                    })
+                })
+        })
+        .expect("the assistant tool-call turn");
+    assert_eq!(
+        resumed[at + 1]
+            .get("role")
+            .and_then(serde_json::Value::as_str),
+        Some("tool"),
+        "the tool message must immediately follow its assistant turn: {resumed:?}"
+    );
+    assert_eq!(
+        resumed[at + 1]
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str),
+        Some("call-wait"),
+        "and answer that call id: {resumed:?}"
+    );
+}

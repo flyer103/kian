@@ -895,6 +895,48 @@ fn assert_recovered(
         ctx("no unexpected input contents consumed")
     );
 
+    // CONFIRMATION-MODEL §15.6 / DESIGN §2.3: no provider request may
+    // carry an unanswered tool call. A drain that died mid-tool leaves
+    // an assistant `tool_calls` entry with no result; the takeover's
+    // open-call repair must close it (with an honest recovered result)
+    // before the next request — otherwise the request is rejected by
+    // strict endpoints (this assertion is the red-test for that path).
+    let mut open: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for ev in events {
+        match &ev.kind {
+            EventKind::AssistantMessage => {
+                if let Some(calls) = ev
+                    .bytes
+                    .pointer("/content/tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for call in calls {
+                        if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                            open.insert(id.to_owned());
+                        }
+                    }
+                }
+            }
+            EventKind::ToolResult => {
+                if let Some(id) = ev
+                    .bytes
+                    .pointer("/content/call_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    open.remove(id);
+                }
+            }
+            EventKind::StepRequest => {
+                assert!(
+                    open.is_empty(),
+                    "{}: provider request with unanswered call(s) {open:?}",
+                    point.name()
+                );
+            }
+            _ => {}
+        }
+    }
+
     // Epochs monotone; the takeover claim when recovery happened.
     let epochs: Vec<u64> = events.iter().map(|e| e.epoch.0).collect();
     assert!(

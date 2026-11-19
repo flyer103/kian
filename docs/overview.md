@@ -135,7 +135,7 @@ implementation ever enters its dependency tree.
 
 | Crate | One line |
 |-------|----------|
-| `kian-core` | Concept model, the 22 event kinds, session state machine, projection engine, model-context derivation, seam traits |
+| `kian-core` | Concept model, the 23 event kinds, session state machine, projection engine, model-context derivation, seam traits |
 | `kian-store` | EventStore with `expectedSeq` CAS + epoch fencing, inbox, claims/leases, dual backend (`sqlite` default, `postgres` optional) |
 | `kian-orchestrator` | The Admit → Wake → Drain → Promote engine and the three-layer recovery subsystem (pure classification + declarative policy table + budget) |
 | `kian-llm` | OpenAI-compatible `ModelProvider`, model slots, and the persist-before-send hook |

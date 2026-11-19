@@ -29,6 +29,7 @@ pub mod fs;
 pub mod invariants;
 pub mod memory;
 pub mod model;
+pub mod repair;
 pub mod seams;
 pub mod secrets;
 pub mod state;

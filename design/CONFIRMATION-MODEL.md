@@ -232,6 +232,17 @@ needed if a hook must defer *before* the call is appended (phase 3, ADR-028 inte
 pending set is empty. A turn whose context ends with an unanswered tool call is never sent to a
 provider (it would be rejected, and it would be a lie).
 
+**R1b — No context-bearing promote inside an open call.** The same rule applies one level down:
+while the pending set is non-empty, an ordinary message row may **not** be promoted (the drain's
+`consume_inputs` skips message plans; control and confirm rows still consume). Promoting there
+would interleave a user message between the assistant `tool_calls` and the answered `tool/result`;
+the tool block would be broken and the resumed request rejected — the message ordering is the
+invariant, not only the request timing. The gate has a wake consequence: a settle whose only
+eligible rows are decision-blocked does **not** re-register the wake (otherwise claim → deferred
+settle → claim spins), and the startup inbox rebuild skips such sessions unless it also sees a
+control row. The confirm row's own admission is the wake that releases the wait; the blocked rows
+stay durable and are promoted, in order, after the answer's result.
+
 **R2 — Claim → consume answers → decide.**
 
 1. On claim of an `awaiting_input` session, consume every eligible confirm row first, appending
@@ -251,7 +262,8 @@ bytes before and after an answer differ only by the appended result.
 rows; the drain write carries the claim epoch; a stale drain cannot apply an answer
 (NoSplitBrainWrite). The only new exposure is the existing tool-invocation window (invoke → append
 result): a crash there re-invokes on takeover — the same at-least-once class as any built-in tool
-call, not a new guarantee.
+call, not a new guarantee. An approved-but-unresolved call is therefore left to this approval
+path; the open-call recovery (§15.6) never synthesizes a result for an `ask`.
 
 ## 8. Configuration
 
@@ -405,7 +417,7 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 
 | Phase | Content | Status |
 |---|---|---|
-| 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions | designed |
+| 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions, the R1b promote gate, the §15.6 crash repair | landed |
 | 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | not started |
 | 3 | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening; channel-side answers (an IM reply mapped to a `confirm`) | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
@@ -429,12 +441,15 @@ the request (the request is the stream; a delivery row is the bundle's business)
 5. **Effect ordering vs. out-of-order answers.** F3 chooses call-ordered effects at the cost of a
    delayed execution for an approved-but-not-yet-releasable call. Is that the right product
    behavior, or should the UI warn "waiting for an earlier decision"? (Phase 1: the rule only.)
-6. **Pre-existing tool-batch crash window (not introduced here).** The loop appends the assistant
-   message (carrying `tool_calls`) and then one `tool/call` per call. A drain that dies between the
-   two leaves a context ending in assistant `tool_calls` with no logged call — the next resume
-   would send a malformed request. This window exists for every tool batch, ask or not; the
-   confirmation plane neither widens nor closes it. Candidate fix (its own change): on resume, a
-   missing logged call for a carried `tool_calls` entry gets an honest synthetic error result, in
-   call order. Recorded so the crash-recovery claim is not overstated.
+6. **Tool-batch crash window — closed (landed).** The loop appends the assistant message
+   (carrying `tool_calls`) and then one `tool/call` per call; a drain that dies in between left a
+   context ending in assistant `tool_calls` with no resolution, and the next resume sent a
+   malformed request. The drain now repairs the batch at claim time, before any promotion: the
+   `kian-core::repair` projection names every unpaired call that is not a logged `ask`
+   (`not_dispatched` when no `tool/call` was logged, `in_flight` when one was), and the engine
+   reconstructs the missing call (additive `recovered` marker, no fabricated permission) plus one
+   honest-error `tool/result`. Logged approvals stay on R4's re-invoke path. The chaos suite's
+   mid-tool kill point now asserts that no provider request carries an unanswered call; with the
+   repair disabled that assertion fails, which is the red test for this rule.
 7. **Worker waiting path.** Does the completion gate's `waiting` report become the durable marker,
    or does the stage derive it from the end reason directly? (Phase 2.)

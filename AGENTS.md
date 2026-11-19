@@ -118,7 +118,7 @@ when the owner asks. Negative results commit documentation only — never broken
 - `design/DESIGN.md` — the blueprint (HOW). Any crate/seam/invariant change updates it in the same
   change.
 - `design/EVENT-MODEL.md` — the normative event contract (source of truth): envelope, the complete
-  22-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
+  23-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
   and updates this file first; code/tests must be reconciled in the same change.
 - `design/API-CONTRACT.md` — the normative external API contract (source of truth): endpoints,
   JSON-RPC methods/params/results, error codes, SSE frames, metrics keys, the webhook status matrix

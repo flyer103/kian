@@ -651,6 +651,16 @@ impl DrainCtx {
             });
         }
         let mut report = TakeReport::default();
+        // CONFIRMATION-MODEL §7 (promotion gate): while a decision is
+        // pending, an ordinary message row may NOT be promoted. The
+        // stream may rest between an unanswered `tool/call` and its
+        // `tool/result`; promoting a message there would interleave a
+        // context-bearing event into that pair, and the resumed
+        // provider request would carry a tool block broken by a user
+        // message (strict OpenAI-compatible endpoints reject it). The
+        // decision is the release: control and confirm rows still
+        // consume so the answer wakes the wait.
+        let decision_pending = !pending_calls(&self.events().await?).is_empty();
         let now = self.core.clock.now_ms();
         let rows = self
             .core
@@ -703,8 +713,11 @@ impl DrainCtx {
                     report.control_confirm = true;
                 }
                 plan => {
-                    if control_only {
-                        continue; // the final take leaves message rows eligible
+                    if control_only || decision_pending {
+                        // The final take leaves message rows eligible; a
+                        // pending decision blocks them too (the row stays
+                        // durable and unconsumed until the answer lands).
+                        continue;
                     }
                     let admitted_seq = match plan {
                         Consumption::Single(payload) => {
@@ -1103,6 +1116,33 @@ where
             .expect("a changed versioned read always carries state"))
     }
 
+    /// Whether a new turn would have to wait behind work already in
+    /// this session: a running drain, unconsumed eligible input, or a
+    /// pending confirmation decision. The cron scheduler's default
+    /// `overlap: skip` judgement (CRON-MODEL §5.1) reads this before it
+    /// admits a firing — a scheduled inspection must not pile onto a
+    /// session that is still working.
+    ///
+    /// Pure over the stream + inbox (no in-memory scheduler state), so a
+    /// second replica reaches the same answer.
+    pub async fn has_open_work(&self, session: SessionId) -> Result<bool, EngineError> {
+        if self.store.version(session).await? == 0 {
+            return Ok(false);
+        }
+        let events = self.store.rebuild(session).await?;
+        if !pending_calls(&events).is_empty() {
+            return Ok(true);
+        }
+        if matches!(project(&events)?, SessionState::Running) {
+            return Ok(true);
+        }
+        Ok(!self
+            .store
+            .eligible_inputs(session, self.clock.now_ms())
+            .await?
+            .is_empty())
+    }
+
     /// The versioned projection read (READ-MODEL §3, P0): `version`
     /// is the last committed seq (`head.next_seq - 1`); `since ==
     /// version` answers `unchanged` with no state and no scan beyond
@@ -1466,7 +1506,24 @@ where
     /// input, then drains them. Returns the number of sessions found.
     pub async fn startup_rebuild(&self) -> Result<usize, EngineError> {
         let inboxes = self.store.startup_scan(self.clock.now_ms()).await?;
-        let sessions: Vec<SessionId> = inboxes.iter().map(|i| i.session).collect();
+        let mut sessions: Vec<SessionId> = Vec::with_capacity(inboxes.len());
+        for inbox in &inboxes {
+            // A decision-blocked session keeps its ordinary rows
+            // eligible on purpose (the promotion gate); waking it here
+            // would spin claim → deferred settle. Its wake is the pending
+            // confirm row, which the same scan sees as a control row.
+            let has_control_row = inbox.eligible.iter().any(|row| {
+                ConfirmIntent::parse(&row.payload).is_some()
+                    || kian_core::control::InterruptIntent::parse(&row.payload).is_some()
+            });
+            if !has_control_row {
+                let events = self.store.rebuild(inbox.session).await?;
+                if !pending_calls(&events).is_empty() {
+                    continue;
+                }
+            }
+            sessions.push(inbox.session);
+        }
         let count = sessions.len();
         for s in &sessions {
             self.wakes.register(s);
@@ -1598,6 +1655,29 @@ where
         result
     }
 
+    /// Closes the open tool calls a crashed drain left behind
+    /// (CONFIRMATION-MODEL §15.6): a reconstructed `tool/call` for a call
+    /// that was never logged, plus one honest error `tool/result` per
+    /// open call. Idempotent — a stream with no open call writes nothing,
+    /// and a crash between the two appends converges on the next claim.
+    async fn repair_open_calls(&self, ctx: &DrainCtx) -> Result<(), EngineError> {
+        for call in kian_core::repair::recoverable_calls(&ctx.events().await?) {
+            if !call.logged {
+                ctx.append(
+                    EventKind::ToolCall,
+                    kian_core::repair::recovered_tool_call_payload(&call),
+                )
+                .await?;
+            }
+            ctx.append(
+                EventKind::ToolResult,
+                kian_core::repair::recovered_tool_result_payload(&call),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// The drain loop body (DESIGN §2.3): take eligible inputs only at
     /// safe boundaries, run driver episodes, promote only at
     /// provider-turn boundaries (each folded wake batch resets the
@@ -1677,6 +1757,15 @@ where
                     end_reason = EndReason::Interrupted;
                     break 'episodes;
                 }
+                // CONFIRMATION-MODEL §15.6 / DESIGN §2.3: a drain that
+                // died inside a tool batch left an assistant
+                // `tool_calls` entry without its resolution. Close it
+                // with an honest recovered result BEFORE any promotion —
+                // a later promote would interleave a user message into
+                // the tool block, and the next provider request would be
+                // rejected (and a silent re-run would duplicate an
+                // effect).
+                self.repair_open_calls(&ctx).await?;
             }
             let report = ctx.take_eligible_inputs_report().await?;
             let took_confirm = report.control_confirm;
@@ -1738,7 +1827,15 @@ where
         }
         // Settle on abort (invariant 6): re-evaluate the inbox BEFORE
         // releasing ownership; pending work keeps pendingWake registered.
-        if ctx.has_eligible_inputs().await? {
+        //
+        // A decision-blocked session is the exception: its eligible rows
+        // are message rows the promotion gate refused (a pending ask with
+        // no answer), and re-registering the wake here would spin
+        // claim → deferred settle → claim forever. The confirm row's own
+        // admission is the wake that releases the wait (CONFIRMATION-MODEL
+        // §7); the rows stay durable, so NoLostWork is untouched.
+        let decision_pending = !pending_calls(&ctx.events().await?).is_empty();
+        if !decision_pending && ctx.has_eligible_inputs().await? {
             self.wakes.register(session);
         }
         // final take: one last control-only pass before the end

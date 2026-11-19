@@ -241,8 +241,19 @@ stale-epoch rejection abandons the drain — it never fights the fence). The "st
 allowance once per steer batch" invariant reads: a newly eligible batch observed at a settle
 point grants exactly one more driver episode. An end write with reason
 `interrupted`/`failed` returns the session to `idle` with pendingWake deliberately kept
-registered for the resumer (invariants 5/6); a drain that finds the projection terminal
+registered for the resumer (invariants 5/6) — except for a decision-blocked session (a pending
+`ask`), whose blocked message rows deliberately do not re-register the wake until the confirm
+row lands (CONFIRMATION-MODEL R1b); a drain that finds the projection terminal
 releases without appending anything (terminal streams freeze).
+
+Two stream-repair rules complete the boundary model. **Promotion gate**: while a decision is
+pending, ordinary message rows are not consumed into context — promoting one would interleave a
+user message into the open `tool/call`…`tool/result` pair and the resumed request would be
+rejected (R1b). **Open-call repair**: at claim time, before the first promotion, a batch the
+previous drain died inside is closed with one honest-error result per unpaired call
+(`kian-core::repair`; reconstructed `tool/call` when it was never logged, additive `recovered`
+marker, no fabricated permission) — EVENT-MODEL §4.2. Logged `ask` calls are never repaired;
+their approval path owns them (CONFIRMATION-MODEL R4/§15.6).
 
 ### 2.4 Three-layer recovery (A4/A5)
 
