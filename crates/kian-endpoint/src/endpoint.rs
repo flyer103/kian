@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use kian_core::fs::{FsCommand, FsResult};
 use kian_core::seams::{ExecBackend, ExecCommand, ExecResult};
 
+use crate::dedupe::{Claim, ResultCache};
 use crate::proto::{CommandError, CommandId, EndpointFrame, PROTOCOL_VERSION, ServerFrame};
 
 /// Concurrency cap applied when [`Endpoint::new`] is not followed by
@@ -98,6 +99,9 @@ pub struct Endpoint {
     heartbeat: Duration,
     heartbeat_tap: Option<HeartbeatTap>,
     semaphore: Arc<Semaphore>,
+    /// Recorded results (ADR-037), when the caller opted in: a duplicate
+    /// dispatch is answered from here instead of being executed again.
+    result_cache: Option<Arc<ResultCache>>,
 }
 
 impl Endpoint {
@@ -112,7 +116,17 @@ impl Endpoint {
             heartbeat: DEFAULT_HEARTBEAT,
             heartbeat_tap: None,
             semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
+            result_cache: None,
         }
+    }
+
+    /// Answer a re-dispatched command id from the recorded result instead
+    /// of executing it again (ADR-037). Without a cache the endpoint keeps
+    /// its historical at-least-once behavior: every dispatch executes.
+    #[must_use]
+    pub fn with_result_cache(mut self, cache: Arc<ResultCache>) -> Self {
+        self.result_cache = Some(cache);
+        self
     }
 
     /// Root the v2 filesystem commands resolve under. Defaults to the
@@ -349,6 +363,10 @@ impl Endpoint {
     /// Acquire a concurrency permit and spawn the execution of one
     /// command. The permit is held until the result has been delivered
     /// (or dropped with a warning after connection loss).
+    ///
+    /// A duplicate command id is served from the result record instead of
+    /// being executed again (ADR-037): a hit answers immediately, and a
+    /// duplicate of a still-running execution waits for that one result.
     async fn spawn_execution(
         self: &Arc<Self>,
         id: CommandId,
@@ -356,6 +374,36 @@ impl Endpoint {
         outbound: &mpsc::Sender<EndpointFrame>,
         inflight: &Arc<AtomicUsize>,
     ) {
+        let owner = match self.result_cache.as_ref() {
+            Some(cache) => match cache.claim(id) {
+                Claim::Cached(frame) => {
+                    tracing::info!(
+                        command_id = %id,
+                        "re-dispatch answered from the recorded result; not executing again"
+                    );
+                    let _ = outbound.send(frame).await;
+                    return;
+                }
+                Claim::Follower(mut rx) => {
+                    tracing::info!(
+                        command_id = %id,
+                        "duplicate dispatch joined the running execution"
+                    );
+                    // Never block this connection on another execution: the
+                    // duplicate's frame flies from its own task when the
+                    // owner lands it (correlation is by command id).
+                    let outbound = outbound.clone();
+                    tokio::spawn(async move {
+                        if let Ok(frame) = rx.recv().await {
+                            let _ = outbound.send(frame).await;
+                        }
+                    });
+                    return;
+                }
+                Claim::Owner(guard) => Some((Arc::clone(cache), guard)),
+            },
+            None => None,
+        };
         // Awaiting here applies backpressure: while saturated, this
         // connection stops reading further commands until a permit frees.
         let permit = match self.semaphore.clone().acquire_owned().await {
@@ -371,6 +419,10 @@ impl Endpoint {
                 Ok(result) => EndpointFrame::command_ok(id, result),
                 Err(error) => EndpointFrame::command_failed(id, error.into()),
             };
+            if let Some((cache, mut guard)) = owner {
+                cache.record(id, frame.clone()).await;
+                guard.disarm();
+            }
             inflight.fetch_sub(1, Ordering::SeqCst);
             if outbound.send(frame).await.is_err() {
                 tracing::warn!(
@@ -384,7 +436,8 @@ impl Endpoint {
 
     /// Execute one filesystem command under the workspace root and answer
     /// with the v2 result frame. The permit is held until the result has
-    /// been delivered (same backpressure discipline as `exec`).
+    /// been delivered (same backpressure discipline as `exec`), and the
+    /// same ADR-037 record answers a duplicate id.
     async fn spawn_fs(
         self: &Arc<Self>,
         id: CommandId,
@@ -392,6 +445,36 @@ impl Endpoint {
         outbound: &mpsc::Sender<EndpointFrame>,
         inflight: &Arc<AtomicUsize>,
     ) {
+        let owner = match self.result_cache.as_ref() {
+            Some(cache) => match cache.claim(id) {
+                Claim::Cached(frame) => {
+                    tracing::info!(
+                        command_id = %id,
+                        "re-dispatch answered from the recorded result; not executing again"
+                    );
+                    let _ = outbound.send(frame).await;
+                    return;
+                }
+                Claim::Follower(mut rx) => {
+                    tracing::info!(
+                        command_id = %id,
+                        "duplicate dispatch joined the running execution"
+                    );
+                    // Never block this connection on another execution: the
+                    // duplicate's frame flies from its own task when the
+                    // owner lands it (correlation is by command id).
+                    let outbound = outbound.clone();
+                    tokio::spawn(async move {
+                        if let Ok(frame) = rx.recv().await {
+                            let _ = outbound.send(frame).await;
+                        }
+                    });
+                    return;
+                }
+                Claim::Owner(guard) => Some((Arc::clone(cache), guard)),
+            },
+            None => None,
+        };
         let permit = match self.semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return,
@@ -413,6 +496,10 @@ impl Endpoint {
                         },
                     ),
                 };
+            if let Some((cache, mut guard)) = owner {
+                cache.record(id, frame.clone()).await;
+                guard.disarm();
+            }
             inflight.fetch_sub(1, Ordering::SeqCst);
             if outbound.send(frame).await.is_err() {
                 tracing::warn!(command_id = %id, "fs result dropped: connection closed");
@@ -843,6 +930,141 @@ mod tests {
         assert!(
             observed.iter().all(|b| b.inflight == 0),
             "idle endpoint reports zero in-flight"
+        );
+        peer.bye().await.unwrap();
+    }
+
+    /// Executor that counts executions (the dedupe assertions need it);
+    /// optionally gates them so a duplicate can arrive mid-execution.
+    #[derive(Clone)]
+    struct CountingExecutor {
+        calls: Arc<AtomicUsize>,
+        gate: Option<watch::Receiver<bool>>,
+    }
+
+    impl CountingExecutor {
+        fn plain() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                gate: None,
+            }
+        }
+
+        fn gated(gate: watch::Receiver<bool>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                gate: Some(gate),
+            }
+        }
+    }
+
+    impl ExecBackend for CountingExecutor {
+        fn exec(&self, _cmd: ExecCommand) -> BoxFuture<'static, Result<ExecResult, ExecError>> {
+            let calls = self.calls.clone();
+            let mut gate = self.gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate.as_mut() {
+                    let _ = gate.wait_for(|open| *open).await;
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ok_result("once"))
+            })
+        }
+    }
+
+    async fn result_for(peer: &mut ServerPeer, id: uuid::Uuid) -> EndpointFrame {
+        loop {
+            let frame = peer.next_frame().await.expect("endpoint stays open");
+            if frame.command_id() == Some(id) {
+                return frame;
+            }
+        }
+    }
+
+    /// ADR-037: a duplicate dispatch of the same command id is answered
+    /// from the recorded result — the command runs exactly once.
+    #[tokio::test]
+    async fn duplicate_command_id_executes_once() {
+        let executor = CountingExecutor::plain();
+        let calls = executor.calls.clone();
+        let dir = std::env::temp_dir().join(format!("kian-endpoint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = crate::dedupe::ResultCache::load(
+            dir.join("results.jsonl"),
+            crate::dedupe::CacheOptions::default(),
+        );
+        let endpoint =
+            Arc::new(Endpoint::new("dev-box", Arc::new(executor)).with_result_cache(cache));
+        let mut peer = endpoint.embed();
+        peer.handshake(None).await.unwrap();
+
+        let id = uuid::Uuid::new_v4();
+        peer.send(ServerFrame::Command {
+            id,
+            cmd: cmd(&["echo", "hi"]),
+        })
+        .await
+        .unwrap();
+        let first = result_for(&mut peer, id).await;
+        peer.send(ServerFrame::Command {
+            id,
+            cmd: cmd(&["echo", "hi"]),
+        })
+        .await
+        .unwrap();
+        let second = result_for(&mut peer, id).await;
+
+        assert_eq!(first, second, "both dispatches get the same recorded frame");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a re-dispatched command id must not execute again"
+        );
+        peer.bye().await.unwrap();
+    }
+
+    /// ADR-037: a duplicate that arrives while the first execution is still
+    /// running joins it — one execution, two result frames, and the
+    /// connection keeps serving other frames meanwhile.
+    #[tokio::test]
+    async fn duplicate_while_running_joins_the_execution() {
+        let (gate_tx, gate_rx) = watch::channel(false);
+        let executor = CountingExecutor::gated(gate_rx);
+        let calls = executor.calls.clone();
+        let dir = std::env::temp_dir().join(format!("kian-endpoint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = crate::dedupe::ResultCache::load(
+            dir.join("results.jsonl"),
+            crate::dedupe::CacheOptions::default(),
+        );
+        let endpoint =
+            Arc::new(Endpoint::new("dev-box", Arc::new(executor)).with_result_cache(cache));
+        let mut peer = endpoint.embed();
+        peer.handshake(None).await.unwrap();
+
+        let id = uuid::Uuid::new_v4();
+        peer.send(ServerFrame::Command {
+            id,
+            cmd: cmd(&["echo", "hi"]),
+        })
+        .await
+        .unwrap();
+        // The duplicate lands while the first execution is still gated.
+        peer.send(ServerFrame::Command {
+            id,
+            cmd: cmd(&["echo", "hi"]),
+        })
+        .await
+        .unwrap();
+        gate_tx.send(true).unwrap();
+
+        let first = result_for(&mut peer, id).await;
+        let second = result_for(&mut peer, id).await;
+        assert_eq!(first, second, "the duplicate receives the same frame");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the duplicate must join the running execution, not start another"
         );
         peer.bye().await.unwrap();
     }

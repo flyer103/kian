@@ -61,6 +61,7 @@ impl Daemon {
         command
             .args(args)
             .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("KIAND_DEDUPE", "0")
             .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

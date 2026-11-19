@@ -34,6 +34,7 @@ fn kiand(addr: std::net::SocketAddr, token_env: &str) -> Command {
         .arg("--heartbeat-ms")
         .arg("60000")
         .env("KIAND_ENDPOINT_ID", "proc-box")
+        .env("KIAND_DEDUPE", "0")
         .env(token_env, TOKEN)
         .kill_on_drop(true);
     command
@@ -92,6 +93,7 @@ async fn spawn_register(
         .arg("--endpoint-id")
         .arg(endpoint_id)
         .env("KIAN_WORKER_TOKEN", TOKEN)
+        .env("KIAND_DEDUPE", "0")
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if let Some(description) = description {

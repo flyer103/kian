@@ -144,6 +144,7 @@ fn free_port() -> u16 {
 fn child_env(command: &mut Command) {
     command
         .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("KIAND_DEDUPE", "0")
         .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::null())
         .kill_on_drop(true);
@@ -1785,6 +1786,7 @@ async fn refusals_bad_token_version_mismatch_static_collision() {
             "200",
         ])
         .env(KIAND_TOKEN_ENV, "definitely-the-wrong-token")
+        .env("KIAND_DEDUPE", "0")
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1870,6 +1872,7 @@ async fn refusals_bad_token_version_mismatch_static_collision() {
             "200",
         ])
         .env(KIAND_TOKEN_ENV, WORKER_TOKEN)
+        .env("KIAND_DEDUPE", "0")
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
