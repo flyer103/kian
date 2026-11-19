@@ -65,6 +65,9 @@ pub enum ServeError {
 struct EngineTurn {
     engine: Arc<Engine<ServeLoopDriver>>,
     handle: tokio::runtime::Handle,
+    /// ADR-038: the session bootstrap runs before the firing row, so a
+    /// fresh cron target's first context event is the memory index.
+    bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
 }
 
 impl crate::cron_engine::ResidentTurn for EngineTurn {
@@ -76,6 +79,15 @@ impl crate::cron_engine::ResidentTurn for EngineTurn {
     ) -> Result<(), String> {
         self.handle
             .block_on(async {
+                if let Some(bootstrap) = &self.bootstrap
+                    && let Err(error) = bootstrap.bootstrap(session).await
+                {
+                    tracing::warn!(
+                        session = %session.0,
+                        %error,
+                        "cron target session bootstrap skipped"
+                    );
+                }
                 self.engine
                     .admit(session, content, idempotency_key)
                     .await
@@ -117,6 +129,11 @@ pub struct Server {
     /// dream driver the `memory_dream` ops method and the `memory`
     /// metrics fragment read.
     memory: Option<Arc<MemoryAssembly>>,
+    /// ADR-038: the session bootstrap installed by the internal creators
+    /// (resident boot, worker spawn, cron dispatch). `None` when no
+    /// memory section is configured — every creator then runs
+    /// byte-identically.
+    session_bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
     /// The webhook receiver secret (present iff a `type: github`
     /// channel is configured — the route is configured). Env-only:
     /// `KIAN_GITHUB_WEBHOOK_SECRET`, fail-closed at assembly.
@@ -844,8 +861,8 @@ impl Server {
         // keep the exact plain-loop handle above — the router only
         // adds the dream side for streams carrying a dream request
         // (config-gated; with no section the driver is untouched).
-        let memory = match (&config.memory, driver.as_ref()) {
-            (Some(section), ServeLoopDriver::Plain(plain)) => {
+        let memory = match &config.memory {
+            Some(section) => {
                 let dream = build_dream_driver(
                     &config,
                     section,
@@ -884,17 +901,28 @@ impl Server {
                 };
                 let assembly =
                     Arc::new(MemoryAssembly::new(scope, caps, Arc::clone(&dream), inject));
-                let router = Arc::new(MemoryLoopDriver::new(Arc::clone(plain), dream));
+                // ADR-038: the memory driver wraps whichever assembly is
+                // in force — the built-in plain loop or the super-agent
+                // three-way driver. Dream sessions still route to the
+                // dream driver; everything else is unchanged.
+                let inner: Arc<
+                    dyn kian_core::seams::LoopDriver<Ctx = kian_orchestrator::DrainCtx>,
+                > = match driver.as_ref() {
+                    ServeLoopDriver::Plain(plain) => Arc::clone(plain)
+                        as Arc<dyn kian_core::seams::LoopDriver<Ctx = kian_orchestrator::DrainCtx>>,
+                    ServeLoopDriver::SuperAgent(superagent) => Arc::clone(superagent)
+                        as Arc<dyn kian_core::seams::LoopDriver<Ctx = kian_orchestrator::DrainCtx>>,
+                    ServeLoopDriver::Memory(memory_driver) => {
+                        // Already wrapped (a duplicate section cannot
+                        // exist — validation refuses it): keep it.
+                        memory_driver.plain().clone()
+                    }
+                };
+                let router = Arc::new(MemoryLoopDriver::new(inner, dream));
                 driver = Arc::new(ServeLoopDriver::Memory(router));
                 Some(assembly)
             }
-            (Some(_), _) => {
-                // Unreachable: validation refuses memory + superagent.
-                return Err(ServeError::Assembly(
-                    "memory: the section is only supported on the built-in assembly".into(),
-                ));
-            }
-            (None, _) => None,
+            None => None,
         };
         let _ = superagent_services;
 
@@ -981,6 +1009,14 @@ impl Server {
                 sa.cron.global_max_concurrent()
             });
 
+        let session_bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>> =
+            memory.as_ref().map(|memory| {
+                Arc::new(MemorySessionBootstrap {
+                    memory: Arc::clone(memory),
+                    store: store.clone(),
+                    engine: Arc::clone(&engine),
+                }) as Arc<dyn kian_superagent::SessionBootstrap>
+            });
         let server = Self {
             engine,
             store,
@@ -989,6 +1025,7 @@ impl Server {
             pg_pool: pg_pool.clone(),
             superagent: None,
             memory,
+            session_bootstrap,
             webhook_secret,
             webhook_limits,
             startup_order: Arc::clone(&startup_order),
@@ -1056,6 +1093,7 @@ impl Server {
                     Arc::clone(&server.engine),
                     server.store.clone(),
                     Arc::clone(&startup_order),
+                    server.session_bootstrap.clone(),
                 )
                 .await
                 .map_err(ServeError::Assembly)?,
@@ -1269,6 +1307,7 @@ impl Server {
             let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn {
                 engine: Arc::clone(&self.engine),
                 handle: tokio::runtime::Handle::current(),
+                bootstrap: self.session_bootstrap.clone(),
             });
             let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
                 Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
@@ -1552,106 +1591,164 @@ impl Server {
     /// receives its own index, and a stream carrying a dream request
     /// runs the dreamer (dream prompts, not memory injection).
     async fn inject_memory_index(&self, session: SessionId) {
-        let Some(memory) = self.memory.as_ref() else {
-            return; // memory off — nothing to do
-        };
-        let Some(plan) = memory.inject() else {
-            return; // injection off (I9: byte-identical sessions)
-        };
-        let skip = |reason: &str| {
-            plan.counters().record_skip();
-            tracing::warn!(
-                session = %session.0,
-                reason,
-                "memory injection skipped (inject nothing, creation proceeds)"
-            );
-        };
+        inject_memory_index_with(
+            self.memory.as_ref(),
+            &self.store,
+            &self.engine,
+            session,
+            false,
+        )
+        .await;
+    }
+}
 
-        // A5: classify the new session from its own stream (constraint
-        // 1). A freshly created stream carries only `session/created`,
-        // so in practice this is the source-identity check plus defense
-        // in depth against any future path that admits before us.
-        let new_events = match self.store.rebuild(session).await {
-            Ok(events) => events,
-            Err(e) => {
-                skip(&format!("new-session stream unreadable: {e}"));
-                return;
-            }
-        };
-        if crate::memory::injection_excluded(*plan.source(), session, &new_events) {
-            skip("excluded: the source session or a dreamer session never receives an index");
-            return;
-        }
-
-        // The source snapshot (I7): rendered from the stream alone —
-        // but the fold only ever consumed the `memory/note` events
-        // (`project_notes` ignores non-note events by contract), so
-        // P3b-1 (kian-117) reads exactly those via the index-
-        // accelerated `scan_kind` (READ-MODEL §6) instead of loading
-        // the whole stream. The stream stays the sole truth; the read
-        // is narrower, the fold and the injected payload are
-        // byte-identical.
-        let source_note_events = match self
-            .store
-            .scan_kind(*plan.source(), EventKind::MemoryNote)
-            .await
-        {
-            Ok(events) => events,
-            Err(e) => {
-                skip(&format!("source stream unreadable: {e}"));
-                return;
-            }
-        };
-        if source_note_events.is_empty() {
-            // The pre-change distinction, kept without loading the
-            // stream: an empty note set is an unknown source only when
-            // the stream itself is empty (`head()` — one indexed
-            // lookup, no rows read).
-            let known = matches!(self.store.head(*plan.source()).await, Ok(h) if h.next_seq > 1);
-            if !known {
-                skip("unknown source memory session (no events)");
-                return;
-            }
-        }
-        let notes = kian_core::memory::project_notes(&source_note_events);
-        let eligible = kian_memory::eligible_notes(&notes);
-        let Some(rendered) =
-            kian_memory::render_memory_index_with(&notes, plan.caps(), plan.redactor())
-        else {
-            // I4: zero eligible notes (or a budget too tight to carry
-            // even one entry) admits nothing — byte-identical session.
-            skip("nothing renderable (no verified notes or budget too tight)");
-            return;
-        };
-        let payload = crate::memory::injection_admit_payload(
-            memory.scope(),
-            *plan.source(),
-            &rendered,
-            &eligible,
+/// The creation-time memory injection (MEMORY-MODEL §6), shared by the
+/// control plane's `create_session` and the ADR-038 session bootstrap.
+///
+/// `fresh_only` is the bootstrap's guard: an internally created session
+/// may already exist (a resident re-arm successor's predecessor, a
+/// worker replay, a cron target reused across firings), and an index
+/// must never be appended mid-stream.
+async fn inject_memory_index_with(
+    memory: Option<&Arc<MemoryAssembly>>,
+    store: &EventStore,
+    engine: &Arc<Engine<ServeLoopDriver>>,
+    session: SessionId,
+    fresh_only: bool,
+) {
+    let Some(memory) = memory else {
+        return; // memory off — nothing to do
+    };
+    let Some(plan) = memory.inject() else {
+        return; // injection off (I9: byte-identical sessions)
+    };
+    let skip = |reason: &str| {
+        plan.counters().record_skip();
+        tracing::warn!(
+            session = %session.0,
+            reason,
+            "memory injection skipped (inject nothing, creation proceeds)"
         );
-        let key = crate::memory::memory_inject_key(&session);
-        match self.engine.admit_quiet(session, payload, Some(key)).await {
-            Ok(outcome) => {
-                plan.counters().record_injected(&rendered);
-                tracing::info!(
-                    session = %session.0,
-                    source = %plan.source().0,
-                    deduplicated = outcome.deduplicated,
-                    items = rendered.items,
-                    bytes = rendered.bytes,
-                    truncated = rendered.truncated,
-                    "memory index injected at session creation"
-                );
+    };
+
+    if fresh_only {
+        match store.version(session).await {
+            Ok(0) => {}
+            // An existing session must never receive a second index: a
+            // restart, a re-arm successor's predecessor or a duplicate
+            // creator call must not rewrite a live prefix (I2's spirit).
+            Ok(_) => return,
+            Err(error) => {
+                // An unreadable stream cannot prove freshness — inject
+                // nothing rather than risk a mid-stream index.
+                skip(&format!("freshness check failed: {error}"));
+                return;
             }
-            Err(e) => {
-                // A1: the session exists without memory — honest
-                // degradation, never a failed creation.
-                skip(&format!("quiet admit failed: {e}"));
-            }
+        }
+    }
+
+    // A5: classify the new session from its own stream (constraint
+    // 1). A freshly created stream carries only `session/created`,
+    // so in practice this is the source-identity check plus defense
+    // in depth against any future path that admits before us.
+    let new_events = match store.rebuild(session).await {
+        Ok(events) => events,
+        Err(e) => {
+            skip(&format!("new-session stream unreadable: {e}"));
+            return;
+        }
+    };
+    if crate::memory::injection_excluded(*plan.source(), session, &new_events) {
+        skip("excluded: the source session or a dreamer session never receives an index");
+        return;
+    }
+
+    // The source snapshot (I7): rendered from the stream alone —
+    // but the fold only ever consumed the `memory/note` events
+    // (`project_notes` ignores non-note events by contract), so
+    // P3b-1 (kian-117) reads exactly those via the index-
+    // accelerated `scan_kind` (READ-MODEL §6) instead of loading
+    // the whole stream. The stream stays the sole truth; the read
+    // is narrower, the fold and the injected payload are
+    // byte-identical.
+    let source_note_events = match store.scan_kind(*plan.source(), EventKind::MemoryNote).await {
+        Ok(events) => events,
+        Err(e) => {
+            skip(&format!("source stream unreadable: {e}"));
+            return;
+        }
+    };
+    if source_note_events.is_empty() {
+        // The pre-change distinction, kept without loading the
+        // stream: an empty note set is an unknown source only when
+        // the stream itself is empty (`head()` — one indexed
+        // lookup, no rows read).
+        let known = matches!(store.head(*plan.source()).await, Ok(h) if h.next_seq > 1);
+        if !known {
+            skip("unknown source memory session (no events)");
+            return;
+        }
+    }
+    let notes = kian_core::memory::project_notes(&source_note_events);
+    let eligible = kian_memory::eligible_notes(&notes);
+    let Some(rendered) =
+        kian_memory::render_memory_index_with(&notes, plan.caps(), plan.redactor())
+    else {
+        // I4: zero eligible notes (or a budget too tight to carry
+        // even one entry) admits nothing — byte-identical session.
+        skip("nothing renderable (no verified notes or budget too tight)");
+        return;
+    };
+    let payload = crate::memory::injection_admit_payload(
+        memory.scope(),
+        *plan.source(),
+        &rendered,
+        &eligible,
+    );
+    let key = crate::memory::memory_inject_key(&session);
+    match engine.admit_quiet(session, payload, Some(key)).await {
+        Ok(outcome) => {
+            plan.counters().record_injected(&rendered);
+            tracing::info!(
+                session = %session.0,
+                source = %plan.source().0,
+                deduplicated = outcome.deduplicated,
+                items = rendered.items,
+                bytes = rendered.bytes,
+                truncated = rendered.truncated,
+                "memory index injected at session creation"
+            );
+        }
+        Err(e) => {
+            // A1: the session exists without memory — honest
+            // degradation, never a failed creation.
+            skip(&format!("quiet admit failed: {e}"));
         }
     }
 }
 
+/// ADR-038: the assembly's implementation of the bundle's
+/// [`kian_superagent::SessionBootstrap`] seam.
+struct MemorySessionBootstrap {
+    memory: Arc<MemoryAssembly>,
+    store: EventStore,
+    engine: Arc<Engine<ServeLoopDriver>>,
+}
+
+impl kian_superagent::SessionBootstrap for MemorySessionBootstrap {
+    fn bootstrap(
+        &self,
+        session: SessionId,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let memory = Arc::clone(&self.memory);
+        let store = self.store.clone();
+        let engine = Arc::clone(&self.engine);
+        Box::pin(async move {
+            inject_memory_index_with(Some(&memory), &store, &engine, session, true).await;
+            Ok(())
+        })
+    }
+}
 impl ControlPlane for Server {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
         Box::pin(async move {

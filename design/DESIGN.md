@@ -1071,7 +1071,9 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
  a tool-result continuation and every newly taken input still proceed. Explicit terminal ends
  (cancel/fatal) still re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
  runtime-rebindable Router binding shared by subscriptions, driver routing, tools and worker
- completion reports, which is a separate semantic change.
+ completion reports, which is a separate semantic change. The design for that change (a shared
+ `ResidentBinding`, an idle-boundary rotation, a bounded handoff and a proposed `rotated` end
+ reason) is [ADR-040](decisions/ADR-040-runtime-resident-rotation.md) (**proposed**, owner gate).
 
 ### 4.7 Bundle domain-policy layer
 

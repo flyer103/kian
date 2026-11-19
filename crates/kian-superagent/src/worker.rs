@@ -693,6 +693,10 @@ pub struct WorkerSpawner {
     /// policy resolves per-template scope text against.
     worker_template_id: String,
     inbox: Arc<dyn InboxWriter>,
+    /// ADR-038: the session-bootstrap seam, installed by the assembly
+    /// once the engine exists (the spawner itself is built before it).
+    /// `None` (the default, all tests) keeps every byte unchanged.
+    bootstrap: std::sync::OnceLock<Option<Arc<dyn crate::bootstrap::SessionBootstrap>>>,
 }
 
 impl WorkerSpawner {
@@ -703,7 +707,14 @@ impl WorkerSpawner {
             pinned_version: worker_template.version,
             worker_template_id: worker_template.id.clone(),
             inbox,
+            bootstrap: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Installs the session-bootstrap seam (ADR-038). Idempotent: the
+    /// first install wins, later calls are no-ops.
+    pub fn install_bootstrap(&self, bootstrap: Arc<dyn crate::bootstrap::SessionBootstrap>) {
+        let _ = self.bootstrap.set(Some(bootstrap));
     }
 
     /// The worker template's id — the mandate scope key (
@@ -877,6 +888,18 @@ impl WorkerSpawner {
     /// double-admits), then wake. Durable row first, wake strictly
     /// after (invariant 1).
     pub async fn admit(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
+        // ADR-038: the bootstrap runs BEFORE the triggering row, so the
+        // index is the worker session's first context-bearing event.
+        // A failure is recorded and never fails the spawn.
+        if let Some(bootstrap) = self.bootstrap.get().and_then(|b| b.as_ref())
+            && let Err(error) = bootstrap.bootstrap(spawned.worker_session).await
+        {
+            tracing::warn!(
+                session = %spawned.worker_session.0,
+                %error,
+                "worker session bootstrap skipped"
+            );
+        }
         let wrapper = spawned.task_message["content"].clone();
         self.inbox
             .admit(
@@ -1740,6 +1763,24 @@ where
                                     // pass-through of the terminal outcome.
                                     None => Some((outcome, Phase::Done)),
                                     Some(thread_id) => {
+                                        // CONFIRMATION-MODEL phase 2: a
+                                        // worker that stopped on a
+                                        // pending `ask` is waiting, not
+                                        // completed. No `thread/completed`
+                                        // and no parent report: the
+                                        // answer's wake resumes the same
+                                        // session, which completes the
+                                        // pair later. The pending set is
+                                        // the stream's own fact (the ask
+                                        // was appended before this
+                                        // settle), never process state.
+                                        if matches!(&outcome, LoopOutcome::Settled)
+                                            && let Ok(events) = port.read_stream().await
+                                            && !kian_core::confirmation::pending_calls(&events)
+                                                .is_empty()
+                                        {
+                                            return Some((outcome, Phase::Done));
+                                        }
                                         // Port (e) — `settle/pre`
                                         // (§4.6 step 2): consulted ONLY
                                         // for `LoopOutcome::Settled` (the
@@ -2617,6 +2658,52 @@ mod tests {
         // The task message embedded in both streams' thread/started
         // carries the marker too (audit-visible forever).
         assert!(delegation_is_speculative(&spawned.task_message["content"]));
+    }
+
+    /// ADR-038: the session bootstrap runs BEFORE the triggering row —
+    /// the injected index must be the worker session's first
+    /// context-bearing event.
+    #[tokio::test]
+    async fn the_session_bootstrap_precedes_the_worker_admit() {
+        struct OrderingBootstrap {
+            inbox: Arc<CapturingInbox>,
+            seen: Arc<std::sync::Mutex<Option<SessionId>>>,
+        }
+
+        impl crate::bootstrap::SessionBootstrap for OrderingBootstrap {
+            fn bootstrap(
+                &self,
+                session: SessionId,
+            ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+                // The triggering row must not exist yet.
+                assert!(
+                    self.inbox.admits.lock().unwrap().is_empty(),
+                    "the bootstrap must run before the spawner admits the wrapper"
+                );
+                *self.seen.lock().unwrap() = Some(session);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let router = sid(10);
+        let inbox = CapturingInbox::shared();
+        let spawner = WorkerSpawner::new(
+            router,
+            &crate::templates::worker_template("mock", "mock-worker", 7),
+            inbox.clone(),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        spawner.install_bootstrap(Arc::new(OrderingBootstrap {
+            inbox: Arc::clone(&inbox),
+            seen: Arc::clone(&seen),
+        }));
+
+        let spawned = spawner
+            .spawn(json!("inject then admit"), None)
+            .await
+            .expect("spawn");
+        assert_eq!(*seen.lock().unwrap(), Some(spawned.worker_session));
+        assert_eq!(inbox.admits.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4216,6 +4303,45 @@ mod tests {
             });
         }
 
+        /// Seeds an unanswered `ask`: the assistant turn's `tool_calls`
+        /// plus the logged `tool/call` with the ask provenance, and no
+        /// `tool/result`. This is exactly the stream a worker leaves
+        /// when it ends `awaiting_input` (CONFIRMATION-MODEL phase 2).
+        fn seed_pending_ask(&self) {
+            let mut events = self.events.lock().unwrap();
+            let seq = events.len() as u64 + 1;
+            events.push(Event {
+                seq,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq,
+                kind: EventKind::AssistantMessage,
+                bytes: json!({
+                    "role": "assistant",
+                    "content": {"text": "", "tool_calls": [{
+                        "id": "call-ask", "name": "exec",
+                        "arguments": {"argv": ["echo", "approve-me"]}
+                    }]},
+                }),
+                version: 0,
+            });
+            events.push(Event {
+                seq: seq + 1,
+                session: self.session,
+                epoch: Epoch(1),
+                ts: seq + 1,
+                kind: EventKind::ToolCall,
+                bytes: json!({
+                    "role": "assistant",
+                    "content": {"id": "call-ask", "name": "exec",
+                                "arguments": {"argv": ["echo", "approve-me"]}},
+                    "permission": {"evaluated": "ask", "policy": "configured",
+                                   "matched": "exec"},
+                }),
+                version: 0,
+            });
+        }
+
         /// A **bound** delegation (D4): the wrapper carries the additive
         /// `exec_worker` key naming `exec_worker` — the durable binding
         /// §7.3/§8.2 frames derive.
@@ -4792,5 +4918,44 @@ mod tests {
         );
         assert_eq!(*hits.lock().unwrap(), 1);
         drop(keep_gate);
+    }
+
+    /// CONFIRMATION-MODEL phase 2: a worker that ends on a pending `ask`
+    /// writes NO completion pair (`thread/completed` + parent report) —
+    /// it is waiting on a person, not done — and the same session later
+    /// completes the pair after the answer.
+    #[tokio::test]
+    async fn a_worker_waiting_on_an_ask_writes_no_completion_pair() {
+        let worker_session = sid(0x88);
+        let port = FakePort::new(worker_session);
+        port.seed_delegation();
+        port.seed_pending_ask();
+        let inbox = CapturingInbox::shared();
+        let port_for = {
+            let port = port.clone();
+            Arc::new(move |_: &()| Arc::new(port.clone()) as Arc<dyn super::StreamPort>)
+                as Arc<dyn Fn(&()) -> Arc<dyn super::StreamPort> + Send + Sync>
+        };
+        let driver = super::WorkerLoopDriver::new(
+            Arc::new(SettledDriver),
+            inbox.clone(),
+            gate_config(),
+            port_for,
+        );
+
+        let outcomes: Vec<LoopOutcome> = driver.drive(()).collect().await;
+        assert_eq!(outcomes, vec![LoopOutcome::Settled], "{outcomes:?}");
+        assert!(
+            inbox.admits.lock().unwrap().is_empty(),
+            "a waiting worker writes no parent completion report"
+        );
+        assert!(
+            port.events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|ev| ev.kind != EventKind::ThreadCompleted),
+            "a waiting worker writes no thread/completed"
+        );
     }
 }

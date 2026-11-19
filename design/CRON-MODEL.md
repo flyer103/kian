@@ -346,7 +346,7 @@ session, with the firing proof as an additive, non-context payload key
 `superagent.harness.dsh` configures ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)); the
 engine runs the turn and the firing settles from the session's end (§9.1).
 
-**Worktree arm** (`worktree:`) is an **isolated child run**, not a session turn: the
+**Worktree arm** (`worktree:`) is an **isolated external job** ([ADR-039](decisions/ADR-039-cron-worktree-firing-is-an-external-job.md)), not a session turn: the
 scheduler does not create a session or events for it. This is deliberate isolation (a scheduled
 job must not mutate the operator's checkout, §6.5) and it is recorded honestly: the firing row
 carries the outcome, the worktree path, the exit code, the bounded output and the diff; the

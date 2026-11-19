@@ -9,6 +9,7 @@
 //! | # | Stage | Condition (first match wins) |
 //! |---|------------------|----------------------------------------------------------------------------------------------|
 //! | 1 | `delivery-retry` | the outbox view reports a pending/parked delivery for the thread (wires the real view) |
+//! | 1b | `awaiting-confirmation` | the worker stream has an unanswered `ask` (a durable `tool/call` with `permission.evaluated:"ask"` and no result) |
 //! | 2 | `awaiting-answer`| latest structured report state `waiting`, the thread still outstanding, no input since |
 //! | 3 | `awaiting-review`| latest structured report state `ready` (result delivered, human review pending) |
 //! | 4 | `blocked-failed` | `thread/completed{failed}` or `session/ended{failed}`, and no input admitted since |
@@ -56,6 +57,11 @@ pub enum TicketStage {
     /// wires a real [`OutboxView`]; the stub is empty.
     #[serde(rename = "delivery-retry")]
     DeliveryRetry,
+    /// The worker asked for a person's approval (`ask`) and the call is
+    /// still unanswered (person/confirmation). The answer is a durable
+    /// control row on the same session; the ticket does not end.
+    #[serde(rename = "awaiting-confirmation")]
+    AwaitingConfirmation,
     /// The worker asked a question (report state `waiting`) and the
     /// thread is still outstanding (person/answer).
     #[serde(rename = "awaiting-answer")]
@@ -88,6 +94,7 @@ impl TicketStage {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DeliveryRetry => "delivery-retry",
+            Self::AwaitingConfirmation => "awaiting-confirmation",
             Self::AwaitingAnswer => "awaiting-answer",
             Self::AwaitingReview => "awaiting-review",
             Self::BlockedFailed => "blocked-failed",
@@ -104,6 +111,7 @@ impl TicketStage {
     pub fn from_str_name(name: &str) -> Option<Self> {
         match name {
             "delivery-retry" => Some(Self::DeliveryRetry),
+            "awaiting-confirmation" => Some(Self::AwaitingConfirmation),
             "awaiting-answer" => Some(Self::AwaitingAnswer),
             "awaiting-review" => Some(Self::AwaitingReview),
             "blocked-failed" => Some(Self::BlockedFailed),
@@ -165,6 +173,14 @@ pub fn project_stage(
         && outbox.has_pending_delivery(thread_id)
     {
         return TicketStage::DeliveryRetry;
+    }
+
+    // Arm 1b — awaiting-confirmation: a durable `ask` is unanswered.
+    // The pending set is a pure fold of this stream (CONFIRMATION-MODEL
+    // §4); the answer is a control row on the same session, so the
+    // ticket is waiting on a person without ever ending.
+    if !kian_core::confirmation::pending_calls(events).is_empty() {
+        return TicketStage::AwaitingConfirmation;
     }
 
     // Arm 2 — awaiting-answer: waiting question, thread still

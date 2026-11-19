@@ -34,9 +34,12 @@ use crate::provenance::{correlation_topic, parse_channel_marker, parse_channel_m
 use crate::worker::delegation_mandate;
 
 /// A worker's liveness: `Live` until its own stream carries
-/// `thread/completed` or `session/ended`, then `Ended` — terminal for
-/// a kian Ticket v1 (one worker session's life; resumption is a fresh
-/// Eval, never a same-session resume). A pure projection of the
+/// `thread/completed` or a non-waiting `session/ended`, then `Ended` —
+/// terminal for a kian Ticket v1 (one worker session's life; resumption
+/// is a fresh Eval, never a same-session resume). An
+/// `awaiting_input` end is **not** ended: the worker is waiting on a
+/// person and the answer's wake resumes the same session, so follow-ups
+/// keep routing to it (CONFIRMATION-MODEL phase 2). A pure projection of the
 /// stream: the runtime registry holds the same fact `register` /
 /// [`PassthroughRegistry::mark_ended`] write, and a rebuild re-derives
 /// it, so the two can be asserted equal.
@@ -236,7 +239,11 @@ impl PassthroughRegistry {
                 EventKind::ThreadCompleted => {
                     ended.insert(ev.session);
                 }
-                EventKind::SessionEnded { .. } => {
+                // A waiting worker is live: its end is resumable and
+                // the answer resumes the same session (phase 2).
+                EventKind::SessionEnded { reason }
+                    if !matches!(reason, kian_core::events::EndReason::AwaitingInput) =>
+                {
                     ended.insert(ev.session);
                 }
                 _ => {}
@@ -401,6 +408,39 @@ mod tests {
                 "task": task,
             }),
         )
+    }
+
+    /// CONFIRMATION-MODEL phase 2: a worker waiting on a person is still
+    /// live — follow-ups keep routing to its session, and the answer's
+    /// wake resumes it. Only a non-waiting end marks it ended.
+    #[test]
+    fn a_waiting_worker_stays_live_and_keeps_its_topic() {
+        let router = sid(1);
+        let waiting = sid(9);
+        let marker = wrap_channel_event(&kian_core::seams::ChannelEvent {
+            channel: "ci".into(),
+            event_id: "evt-wait".into(),
+            topic: Some("pr-9".into()),
+            sender: None,
+            group: None,
+            payload: json!({"build": "ok"}),
+            ts_ms: 1,
+        });
+        let task = json!({"role": "user", "content": marker});
+        let events = vec![
+            thread_started(router, waiting, task),
+            event(
+                waiting,
+                4,
+                EventKind::SessionEnded {
+                    reason: kian_core::events::EndReason::AwaitingInput,
+                },
+                json!({}),
+            ),
+        ];
+        let registry = PassthroughRegistry::rebuild(&events);
+        assert_eq!(registry.status(&waiting), super::WorkerStatus::Live);
+        assert_eq!(registry.live_owner("pr-9"), Some(waiting));
     }
 
     #[test]

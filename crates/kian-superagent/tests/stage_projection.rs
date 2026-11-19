@@ -363,12 +363,60 @@ fn first_match_awaiting_answer_wins_over_blocked_failed() {
     assert_eq!(stage(&events), TicketStage::AwaitingAnswer);
 }
 
+/// Arm 1b — `awaiting-confirmation`: an unanswered `ask` on the
+/// worker's stream (CONFIRMATION-MODEL phase 2). It outranks the
+/// structured `waiting` report: the permission wait is the specific
+/// fact, and the answer is a control row on the same session.
+#[test]
+fn arm1b_awaiting_confirmation_comes_from_the_pending_ask() {
+    let worker = sid(1);
+    let thread = tid(0xaaa);
+    let mut events = claimed(worker_base(worker, thread));
+    stated_report(&mut events, ReportState::Waiting);
+    assert_eq!(stage(&events), TicketStage::AwaitingAnswer);
+
+    let seq = events.len() as u64 + 1;
+    events.push(event(
+        worker,
+        seq,
+        EventKind::AssistantMessage,
+        json!({"role": "assistant",
+        "content": {"text": "", "tool_calls": [{
+            "id": "call-ask", "name": "exec", "arguments": {"argv": ["echo", "x"]}
+        }]}}),
+    ));
+    events.push(event(
+        worker,
+        seq + 1,
+        EventKind::ToolCall,
+        json!({"role": "assistant",
+               "content": {"id": "call-ask", "name": "exec",
+                           "arguments": {"argv": ["echo", "x"]}},
+               "permission": {"evaluated": "ask", "policy": "configured",
+                              "matched": "exec"}}),
+    ));
+    assert_eq!(stage(&events), TicketStage::AwaitingConfirmation);
+
+    // The answer (a durable result) releases the confirmation arm; the
+    // earlier structured waiting report is the next specific fact.
+    events.push(event(
+        worker,
+        seq + 2,
+        EventKind::ToolResult,
+        json!({"role": "tool",
+               "content": {"call_id": "call-ask", "output": {"ok": true},
+                           "is_error": false}}),
+    ));
+    assert_eq!(stage(&events), TicketStage::AwaitingAnswer);
+}
+
 /// The serde names and display text are the stable wire contract of
 /// `kian tickets --json`.
 #[test]
 fn stage_names_are_stable() {
     let all = [
         (TicketStage::DeliveryRetry, "delivery-retry"),
+        (TicketStage::AwaitingConfirmation, "awaiting-confirmation"),
         (TicketStage::AwaitingAnswer, "awaiting-answer"),
         (TicketStage::AwaitingReview, "awaiting-review"),
         (TicketStage::BlockedFailed, "blocked-failed"),

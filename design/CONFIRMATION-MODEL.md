@@ -280,10 +280,13 @@ confirmation:
 **C1 — Fail-closed parse.** An unknown permission value refuses boot (existing discipline); `ask`
 outside a permission table is invalid; `ttl_ms` is a non-negative integer.
 
-**C2 — Phase-1 agent boundary.** `ask` is refused at boot for any agent driven by the superagent
-worker loop or a resident loop (Router, watchdog): those drivers have no waiting path yet, and
-silently ending a worker session `awaiting_input` would strand its ticket. The refusal names the
-phase. Phase 2 removes it.
+**C2 — Agent boundary.** Phase 1 refused `ask` at boot for any agent driven by the superagent
+worker loop or a resident loop, because those drivers had no waiting path. **Phase 2 removed the
+worker half**: the worker loop now ends `awaiting_input` without writing `thread/completed` (or its
+parent report), the worker stays **live** in the passthrough/liveness projection (so follow-ups
+keep routing to the same session), and the ticket stage reports `awaiting-confirmation`. The
+**resident** half stays refused: a Router/watchdog that waits would freeze the judge that is
+supposed to answer it, so a config carrying `ask` on a resident agent still refuses boot.
 
 ## 9. Wire delta (normative — owned by API-CONTRACT)
 
@@ -418,7 +421,7 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 | Phase | Content | Status |
 |---|---|---|
 | 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions, the R1b promote gate, the §15.6 crash repair | landed |
-| 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | not started |
+| 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | **landed** (the waiting end writes no completion pair; the liveness projection keeps the worker live; the ticket stage arm is `awaiting-confirmation`; `ask` parses on a worker agent. The completed/failed ticket "fresh Eval only" deviation is unchanged — it applies to ended tickets, not waiting ones) |
 | 3 | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening; channel-side answers (an IM reply mapped to a `confirm`) | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
 
@@ -426,6 +429,22 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 no IM/channel answering (free text is not a decision — the mapping needs semantic judgment); no automatic expiry; no `ask` on worker/resident
 agents; no UI card; no new session state; no change to `LoopDriver`/`LoopOutcome`; no outbox row for
 the request (the request is the stream; a delivery row is the bundle's business).
+
+## 14b. Phase-2 semantics (worker integration, landed)
+
+- **No completion pair while waiting.** The worker driver reads its own stream at the terminal
+  outcome: when `LoopOutcome::Settled` coincides with a non-empty pending set, it yields the
+  outcome unchanged and writes **neither** `thread/completed` nor the parent inbox report. The
+  engine still derives `awaiting_input` (the existing §6 rule), so the session is idle and
+  resumable. A later turn that finishes with an empty pending set writes the pair as today.
+- **A waiting worker is live.** The passthrough registry's liveness projection no longer treats a
+  `session/ended{awaiting_input}` as ended: follow-up fan-out keeps routing the topic to the same
+  worker session (the release-to-fresh-Eval rule still applies to genuinely ended tickets).
+- **Ticket stage.** `project_stage` gains arm 1b: a non-empty pending set on the worker stream →
+  `awaiting-confirmation` (ranked above the structured `waiting` report). The answer is a control
+  row on the same session; the stage returns to the ordinary arms when the result lands.
+- **Resident agents stay refused.** A Router/watchdog waiting on itself cannot answer itself; the
+  C2 boundary above keeps that a boot error.
 
 ## 15. Open questions
 

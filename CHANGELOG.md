@@ -10,6 +10,28 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Confirmation phase 2: workers can wait on a person (CONFIRMATION-MODEL §8 C2, §14b)**. `ask`
+  is accepted on a superagent worker agent. A worker that stops on a pending `ask` now writes
+  **no** `thread/completed` and no parent report (it is waiting, not done); the engine still settles
+  `awaiting_input`, the worker stays **live** in the passthrough registry (follow-ups keep routing
+  to the same session), and the ticket stage gains `awaiting-confirmation` (ranked above the
+  structured `waiting` report). Resident Router/watchdog agents still refuse `ask` (a judge waiting
+  on itself cannot answer itself). Contract: [design/CONFIRMATION-MODEL.md](design/CONFIRMATION-MODEL.md)
+  §8, §14b; [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md).
+
+- **Memory: the bundle hosts on the super-agent assembly and reaches internally created sessions
+  (ADR-038)**. `memory:` and `superagent:` now compose: `MemoryLoopDriver` wraps
+  `Arc<dyn LoopDriver<Ctx = DrainCtx>>` (the built-in plain loop or the three-way
+  `SuperAgentDriver`), dream sessions still route to the dream side, and the config refusal ("the
+  Phase-1 bundle assembles on the built-in assembly") is removed. A bundle-level
+  `SessionBootstrap` seam runs before each internal creator admits its triggering input — the
+  resident Router/watchdog at boot, delegated workers at spawn, cron targets at dispatch — so the
+  creation-time index is the session's first context-bearing event there too. The seam is
+  fresh-only (an existing session is never rewritten) and idempotent by
+  `memory-inject:<session>`; with no `memory:` section every creator is byte-identical. Contract:
+  [design/MEMORY-MODEL.md](design/MEMORY-MODEL.md) §6 I10;
+  [design/decisions/ADR-038-memory-injection-for-internal-sessions.md](design/decisions/ADR-038-memory-injection-for-internal-sessions.md).
+
 - **Worker result retention: a re-dispatched command id is answered from the endpoint's record, not
   executed again (ADR-037)**. `kiand` records each result frame by command id before sending it and
   answers a duplicate dispatch from that record; a duplicate that arrives while the first execution

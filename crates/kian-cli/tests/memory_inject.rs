@@ -755,3 +755,159 @@ async fn injection_payload_byte_identical_on_a_mixed_source_stream() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// ADR-038: the resident Router is created by the first *admit*, not by
+/// the control-plane `create_session`, so before this change it never
+/// received the memory index. The session bootstrap now runs in
+/// `start_services` before the judge prompt is admitted: the index is
+/// the Router's first `input/admitted`, the bootstrap prompt the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resident_router_receives_the_index_before_its_bootstrap_prompt() {
+    common::force_no_proxy();
+    let dir = common::temp_dir("boot-inject");
+    let sqlite = dir.join("kian.sqlite");
+    let memory_source = SessionId::new();
+
+    let store = EventStore::open(&sqlite).await.expect("store opens");
+    direct_append(
+        &store,
+        memory_source,
+        1,
+        Epoch::GENESIS,
+        EventKind::SessionCreated,
+        serde_json::json!({}),
+    )
+    .await;
+    direct_append(
+        &store,
+        memory_source,
+        2,
+        Epoch(1),
+        EventKind::MemoryNote,
+        serde_json::json!({
+            "subject": "deploy path",
+            "text": "Deploys go through the dsh bridge.",
+            "status": "verified",
+            "verified_by": {"method": "transcript", "ref": "2"},
+            "derived_from": [{"session": memory_source.0, "start_seq": 1, "end_seq": 2}],
+        }),
+    )
+    .await;
+    store.close().await;
+
+    let provider_base = scripted_answer_provider("ok").await;
+    let router = "00000000-0000-4000-8000-00000000c0aa";
+    let yaml = format!(
+        r#"listen: "127.0.0.1:0"
+plugins: ["openai-compat", "local-tools", "superagent"]
+storage:
+  sqlite: "{sqlite}"
+agent:
+  id: e2e-agent
+  model_slots:
+    main: {{ provider: mock, model: mock-model }}
+  tools: ["fs_read"]
+agents:
+  dreamer:
+    id: dreamer
+    model_slots:
+      main: {{ provider: mock, model: mock-model }}
+  router:
+    id: router
+    version: 1
+    model_slots:
+      router: {{ provider: mock, model: mock-model }}
+    tools: ["spawn_worker", "reply", "deliver_structured"]
+  worker-agent:
+    id: worker-agent
+    version: 1
+    model_slots:
+      main: {{ provider: mock, model: mock-model }}
+    tools: ["exec"]
+providers:
+  mock:
+    base_url: "{provider_base}"
+    api_key_env: KIAN_E2E_API_KEY
+drain:
+  max_iterations: 8
+memory:
+  scope: e2e-agent
+  dreamer:
+    agent: dreamer
+    max_bytes_read: 262144
+  session: "{memory_source}"
+superagent:
+  router:
+    session_id: "{router}"
+    agent: router
+    slot: router
+  worker:
+    agent: worker-agent
+  channels:
+    mock:
+      type: mock-im
+recovery:
+  budget:
+    tokens: 64
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+        sqlite = sqlite.display(),
+        provider_base = provider_base,
+        memory_source = memory_source.0,
+        router = router,
+    );
+    let path = dir.join("kian.yaml");
+    std::fs::write(&path, yaml).expect("write kian.yaml");
+    let config = kian_cli::config::ServeConfig::load(&path).expect("config loads");
+    let _server = Server::from_config(config).await.expect("server boots");
+
+    let store = EventStore::open_read_only(&sqlite).await.expect("reader");
+    let router_sid = SessionId(router.parse().expect("router uuid"));
+    let reader = store.clone();
+    assert!(
+        wait_for_async(15_000, || {
+            let reader = reader.clone();
+            async move {
+                reader
+                    .rebuild(router_sid)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|ev| ev.kind == EventKind::InputAdmitted)
+                    .count()
+                    >= 2
+            }
+        })
+        .await,
+        "the resident Router never bootstrapped (index + judge prompt)"
+    );
+    let events = store.rebuild(router_sid).await.expect("router stream");
+    let inputs: Vec<_> = events
+        .iter()
+        .filter(|ev| ev.kind == EventKind::InputAdmitted)
+        .collect();
+    assert!(inputs.len() >= 2, "{:?}", inputs.len());
+    assert!(
+        inputs[0].bytes.get("memory").is_some(),
+        "the Router's first input must be the memory index: {}",
+        inputs[0].bytes
+    );
+    assert!(
+        inputs[1].bytes.get("memory").is_none(),
+        "the second input is the bootstrap prompt: {}",
+        inputs[1].bytes
+    );
+    let text = inputs[0]
+        .bytes
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        text.starts_with(kian_memory::INDEX_HEADER.lines().next().unwrap_or_default()),
+        "the first input is the frozen index header: {text:?}"
+    );
+}

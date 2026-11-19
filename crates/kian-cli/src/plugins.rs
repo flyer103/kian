@@ -906,12 +906,17 @@ impl Plugin for SuperAgentPlugin {
                 channels.clone(),
             ))
         });
-        let mut router_tools = RouterTools::new(spawner, channels.clone(), &profile, hold.clone())
-            .with_followup_registry(Arc::clone(&followup_registry))
-            // (R17-C6, pin P4-1): the class-A emission switch rides
-            // the tool surface — the parent-side `thread/started`
-            // keys are written only when it is on.
-            .with_board_gating(self.board_gating);
+        let mut router_tools = RouterTools::new(
+            Arc::clone(&spawner),
+            channels.clone(),
+            &profile,
+            hold.clone(),
+        )
+        .with_followup_registry(Arc::clone(&followup_registry))
+        // (R17-C6, pin P4-1): the class-A emission switch rides
+        // the tool surface — the parent-side `thread/started`
+        // keys are written only when it is on.
+        .with_board_gating(self.board_gating);
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }
@@ -1733,6 +1738,7 @@ impl Plugin for SuperAgentPlugin {
             driver,
             inbox: self.inbox,
             router_inbox,
+            spawner: Arc::clone(&spawner),
             profile,
             subscriptions,
             mock_channels: self.mock_channels,
