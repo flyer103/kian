@@ -650,6 +650,11 @@ pub struct SuperAgentPlugin {
     /// consumers (`subscribe` starts it); nothing here knows WeChat
     /// exists beyond the registry entry.
     pub wechat_channels: BTreeMap<String, Arc<kian_superagent::WechatChannel>>,
+    /// iMessage channels by configured name: the macOS-bridge adapters
+    /// built by the server over the env-only bridge token (fail-closed
+    /// at assembly). Their receive driver self-starts with the
+    /// subscription consumers; nothing here knows iMessage exists.
+    pub imessage_channels: BTreeMap<String, Arc<kian_superagent::ImessageChannel>>,
     /// The worker's evidence gate (mounts on the worker wrapper).
     pub worker_gate: EvidenceGateConfig,
     /// The default agent's evidence gate (mounts on the plain loop).
@@ -859,6 +864,7 @@ impl Plugin for SuperAgentPlugin {
                 + self.lark_channels.len()
                 + self.github_channels.len()
                 + self.wechat_channels.len()
+                + self.imessage_channels.len()
                 + self.timer_channels.len(),
         );
         for (name, mock) in &self.mock_channels {
@@ -887,6 +893,16 @@ impl Plugin for SuperAgentPlugin {
         for (name, wechat) in &self.wechat_channels {
             channels.register(name.clone(), Arc::clone(wechat) as Arc<dyn ChannelAdapter>);
             adapters.push(Arc::clone(wechat) as Arc<dyn ChannelAdapter>);
+        }
+        // the imessage adapter rides the same registry + consumer
+        // spawn; its receive half is its own bridge long-poll (started
+        // by `subscribe` inside the consumer spawn).
+        for (name, imessage) in &self.imessage_channels {
+            channels.register(
+                name.clone(),
+                Arc::clone(imessage) as Arc<dyn ChannelAdapter>,
+            );
+            adapters.push(Arc::clone(imessage) as Arc<dyn ChannelAdapter>);
         }
         // the timers ride the same registry + consumer spawn (a
         // timer is a channel — nothing here knows a watchdog exists).
@@ -1754,6 +1770,7 @@ impl Plugin for SuperAgentPlugin {
             lark_channels: self.lark_channels,
             github_channels: self.github_channels,
             wechat_channels: self.wechat_channels,
+            imessage_channels: self.imessage_channels,
             adapters,
             worker_gate: self.worker_gate,
             subscription_metrics,

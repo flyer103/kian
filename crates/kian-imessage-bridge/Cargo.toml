@@ -1,0 +1,29 @@
+[package]
+name = "kian-imessage-bridge"
+description = "macOS-side iMessage bridge: a loopback HTTP ABI over `imsg rpc` for the kian imessage channel"
+version.workspace = true
+edition.workspace = true
+
+# CHANNEL-IMESSAGE §3: this binary is the only component that touches
+# macOS (chat.db under Full Disk Access, Messages.app under Automation).
+# It depends on nothing kian: the ABI is JSON over HTTP, so a future
+# bridge (a hosted Mac, a VM) can replace it without touching the server.
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lib]
+name = "kian_imessage_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kian-imessage-bridge"
+path = "src/main.rs"

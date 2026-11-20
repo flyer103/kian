@@ -146,6 +146,11 @@ when the owner asks. Negative results commit documentation only — never broken
   best-effort by contract): protocol mapping, credential file, config/CLI, receive allowlist,
   dedupe and the cursor bound, degradation. **Any WeChat channel change starts here**; a protocol
   break degrades this channel only (ADR-018).
+- `design/CHANNEL-IMESSAGE.md` — the normative iMessage channel contract (source of truth,
+  best-effort by construction): the macOS bridge ABI (health/updates/send), the two allowlists,
+  the privacy filter, cursor/generation discipline, degradation, acceptance. **Any iMessage
+  channel change starts here**; the `kian-imessage-bridge` crate and `kian-cli` config/CLI carry
+  no semantics of their own (ADR-042).
 - `design/WORKER-MODEL.md` — the normative worker-domain contract (source of truth): membership
   lifecycle, binding/dispatch, catalog/discovery, security boundary, version policy and
   degradation. **Any worker-membership semantic change starts here**; wire shapes stay in

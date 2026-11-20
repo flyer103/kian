@@ -18,6 +18,7 @@ members = [
     "crates/kian-codex",
     "crates/kian-cron",
     "crates/kian-cli",
+    "crates/kian-imessage-bridge",
     "crates/kiand",
 ]
 
