@@ -261,7 +261,7 @@ session's durable stream, resumable per connection via `Last-Event-ID` (READ-MOD
 ### 5.2 Termination and resumption
 
 The stream closes after the first `session/ended` event, whatever its reason. Terminal ends
-(`completed`, `cancelled`) freeze the projection. An `interrupted`/`failed`/`awaiting_input` end is
+(`completed`, `cancelled`, `rotated`) freeze the projection. An `interrupted`/`failed`/`awaiting_input` end is
 state-preserving (`running → idle`), so a resumed session appends later events; those are observed
 on a **new connection**.
 

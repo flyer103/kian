@@ -383,6 +383,13 @@ impl CronTickStore for DurableCronTickStore {
                 // The session waits for a person; the firing is still
                 // open, and the answer's end settles it later.
                 EndReason::AwaitingInput => continue,
+                // A rotated resident firing never happens (rotation is a
+                // boot-time Router action, not a cron target); record an
+                // honest failure if it ever does.
+                EndReason::Rotated => (
+                    kian_store::FiringState::Failed,
+                    Some("the target session was rotated".to_string()),
+                ),
             };
             let _ = self.block(self.store.finish_firing(
                 &firing.firing_id,

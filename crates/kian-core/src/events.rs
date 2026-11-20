@@ -88,6 +88,11 @@ pub enum EndReason {
     /// stopped the drain) and `failed` (a failure).
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
+    /// A resident session was retired by rotation (ADR-040): a
+    /// deliberate, operator-policy retirement (`running -> rotated`,
+    /// terminal, frozen), never a failure and never an "it finished its
+    /// job" claim. Deliberately distinct from `completed`.
+    Rotated,
 }
 
 /// The durable event set (DESIGN §3.1). Live events (streaming chunks,
@@ -767,6 +772,7 @@ mod tests {
             (EndReason::Interrupted, "interrupted"),
             (EndReason::Failed, "failed"),
             (EndReason::AwaitingInput, "awaiting_input"),
+            (EndReason::Rotated, "rotated"),
         ] {
             let kind = EventKind::SessionEnded { reason };
             let ser = serde_json::to_string(&kind).unwrap();

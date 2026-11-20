@@ -74,6 +74,7 @@ impl EndedResident {
             EndReason::Interrupted => "interrupted",
             EndReason::Failed => "failed",
             EndReason::AwaitingInput => "awaiting_input",
+            EndReason::Rotated => "rotated",
         }
     }
 }

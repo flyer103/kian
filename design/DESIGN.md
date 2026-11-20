@@ -145,6 +145,7 @@ stateDiagram-v2
  recoverable --> running: new claim takeover
  running --> completed: end_reason=intentional<br/>atomic append
  running --> cancelled: end_reason=cancelled
+ running --> rotated: end_reason=rotated<br/>(ADR-040 rotation)
  idle --> archived
  running --> archived
 ```
@@ -163,7 +164,7 @@ Rules:
 through an explicit transition table. `session/created`→create; `drain/claimed`→claim — initial,
 resume, or takeover: a second claim with no end write in between is the crash-recovery stream
 shape and projects `running→running` (safety against true double-claims is the store's epoch
-fence, not the projection); `session/ended{reason}`→end write, where `completed`/`cancelled` are
+fence, not the projection); `session/ended{reason}`→end write, where `completed`/`cancelled`/`rotated` are
 terminal and freeze the stream, while `interrupted`/`failed` release ownership cleanly and return
 the session to `idle` (honest labeling lives in the events; resume = new claim; the final end
 write records the final outcome); `input/admitted` and `thread/started` 
@@ -1048,6 +1049,14 @@ never a second truth. Contract: [MEMORY-MODEL.md](MEMORY-MODEL.md) §7.
 
 ### 4.6 Resident re-arm
 
+A resident session can also be **rotated** (ADR-040): a deliberate, policy-driven retirement that
+ends it `rotated` (terminal, frozen) and moves the deployment onto the deterministic successor. The
+first phase is boot-time (`superagent.router.rotate_after_events`): assembly retires the live Router
+before any service binds, so the successor is bound everywhere with no runtime rebind; the successor
+receives the memory index, the predecessor's pending message rows, a bounded handoff, then the judge
+prompt. Runtime rotation (a shared `ResidentBinding`, a control row serialized inside the drain, and
+input migration for rotations between restarts) remains ADR-040 phase 1/2.
+
 A resident session (the Router, the watchdog) can end **terminally** — `session/ended{completed}`
 (freeze) — from an explicit cancel or a fatal error. Routine budget exhaustion no longer ends a
 resident: resident loops are budgeted **per episode** ([ADR-024](decisions/ADR-024-resident-per-episode-budget.md)):
@@ -1089,9 +1098,10 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
  a tool-result continuation and every newly taken input still proceed. Explicit terminal ends
  (cancel/fatal) still re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
  runtime-rebindable Router binding shared by subscriptions, driver routing, tools and worker
- completion reports, which is a separate semantic change. The design for that change (a shared
- `ResidentBinding`, an idle-boundary rotation, a bounded handoff and a proposed `rotated` end
- reason) is [ADR-040](decisions/ADR-040-runtime-resident-rotation.md) (**proposed**, owner gate).
+ completion reports, which is a separate semantic change. [ADR-040](decisions/ADR-040-runtime-resident-rotation.md)
+ accepts it: **phase 0 (boot-time rotation) is landed** (the `rotated` end reason and terminal state,
+ the atomic close, the chain re-resolution and the successor's ordered context); phases 1/2 (the
+ shared `ResidentBinding` and runtime rotation at an idle boundary) remain open.
 
 ### 4.7 Bundle domain-policy layer
 

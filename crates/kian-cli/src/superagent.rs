@@ -2131,6 +2131,7 @@ pub async fn start_services(
     store: EventStore,
     order: StartupOrder,
     session_bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
+    rotation: Option<crate::rotation::BootRotation>,
 ) -> Result<SuperAgentRuntime, String> {
     let router = services.profile.session;
     // ADR-038: the spawner is built by the plugin (before the engine
@@ -2438,6 +2439,33 @@ pub async fn start_services(
         && let Err(error) = bootstrap.bootstrap(router).await
     {
         tracing::warn!(session = %router.0, %error, "router session bootstrap skipped");
+    }
+    // ADR-040 phase 0: the rotated successor's context order is
+    // memory index (above) → the predecessor's pending message rows →
+    // the bounded handoff → the judge prompt (below). The rows are
+    // quiet admits; the profile bootstrap's admit is the wake.
+    if let Some(rotation) = rotation.as_ref() {
+        if rotation.successor != router {
+            return Err(format!(
+                "rotation successor {} does not match the live router {}",
+                rotation.successor.0, router.0
+            ));
+        }
+        for (payload, key) in &rotation.migrated {
+            if let Err(error) = engine
+                .admit_quiet(router, payload.clone(), key.clone())
+                .await
+            {
+                tracing::warn!(session = %router.0, %error, "rotated input migration skipped");
+            }
+        }
+        let key = Some(format!("rotate-handoff:{}", rotation.predecessor.0));
+        if let Err(error) = engine
+            .admit_quiet(router, rotation.handoff.clone(), key)
+            .await
+        {
+            tracing::warn!(session = %router.0, %error, "rotation handoff skipped");
+        }
     }
     services
         .profile
