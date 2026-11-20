@@ -37,10 +37,12 @@ async fn live_codex_turn_is_mapped_and_honest() {
             approval_policy: "on-request".to_owned(),
             env: Vec::new(),
             startup_timeout: Duration::from_secs(90),
+            capture_base: None,
         })),
         BridgeDriverConfig {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 8,
+            labels: Default::default(),
         },
     );
     let outcomes = tokio::time::timeout(

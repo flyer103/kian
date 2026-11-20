@@ -813,6 +813,10 @@ pub struct HarnessConfig {
     /// The Codex bridge (HARNESS-BRIDGE §5.2 / ADR-037): the shared driver over `codex app-server`.
     #[serde(default)]
     pub codex: Option<CodexHarnessConfig>,
+    /// The loopback request-capture proxy (HARNESS-BRIDGE §5.4, ADR-046). Present = the mounted
+    /// Claude/Codex session captures exact `step/request` bytes and is class `exact`.
+    #[serde(default)]
+    pub capture: Option<HarnessCaptureConfig>,
 }
 
 impl HarnessConfig {
@@ -853,21 +857,30 @@ impl HarnessConfig {
     }
 
     /// The `session/created` payload for a bridged worker session (HARNESS-BRIDGE §4.7):
-    /// `{"bridge":{"name":…,"request_bytes":"exact"|"unavailable"}}`.
+    /// `{"bridge":{"name":…,"request_bytes":"exact"|"unavailable"}}`. With the capture proxy
+    /// (ADR-046) the class is `exact`.
     #[must_use]
     pub fn bridge_marker(&self) -> Option<serde_json::Value> {
+        let captured = self.capture.is_some();
+        let request_bytes = if captured { "exact" } else { "unavailable" };
         match self.config_key()? {
             "dsh" => Some(serde_json::json!({
                 "bridge": {"name": "dsh", "request_bytes": "exact"}
             })),
             "claude" => Some(serde_json::json!({
-                "bridge": {"name": "claude-code", "request_bytes": "unavailable"}
+                "bridge": {"name": "claude-code", "request_bytes": request_bytes}
             })),
             "codex" => Some(serde_json::json!({
-                "bridge": {"name": "codex", "request_bytes": "unavailable"}
+                "bridge": {"name": "codex", "request_bytes": request_bytes}
             })),
             _ => None,
         }
+    }
+
+    /// The capture proxy settings, when configured.
+    #[must_use]
+    pub fn capture_settings(&self) -> Option<CaptureSettings> {
+        self.capture.as_ref().map(HarnessCaptureConfig::resolved)
     }
 
     /// Resolves the non-dsh bridge mount (factory + approval policy + budget); `None` when no
@@ -883,16 +896,23 @@ impl HarnessConfig {
     }
 }
 
-/// The resolved bridge mount handed to assembly (HARNESS-BRIDGE §7).
+/// The resolved bridge mount handed to assembly (HARNESS-BRIDGE §7). Assembly builds the
+/// adapter (the capture base URL is only known there, ADR-046).
 pub struct BridgeMountSpec {
     /// The harness name (audit label).
     pub name: &'static str,
-    /// The adapter's session factory.
-    pub factory: std::sync::Arc<dyn kian_harness::SessionFactory>,
+    /// The adapter's resolved config.
+    pub kind: BridgeKind,
     /// The allow/deny policy answering the harness's tool gate.
     pub policy: kian_harness::ApprovalPolicy,
     /// Mapped turns per session.
     pub max_steps: u64,
+}
+
+/// One resolved adapter config.
+pub enum BridgeKind {
+    Claude(kian_claude::ClaudeConfig),
+    Codex(kian_codex::CodexConfig),
 }
 
 impl std::fmt::Debug for BridgeMountSpec {
@@ -952,6 +972,66 @@ impl ApprovalsConfig {
     }
 }
 
+/// The `superagent.harness.capture:` section (HARNESS-BRIDGE §5.4, ADR-046).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessCaptureConfig {
+    /// Bound on one captured body (the proxy answers 502 without forwarding above it). Default
+    /// 8 MiB; `0` refuses boot.
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+    /// The Anthropic upstream the proxy forwards to (default `https://api.anthropic.com`).
+    #[serde(default)]
+    pub anthropic_upstream: Option<String>,
+    /// The OpenAI upstream (default `https://api.openai.com`).
+    #[serde(default)]
+    pub openai_upstream: Option<String>,
+}
+
+impl HarnessCaptureConfig {
+    /// The section with defaults applied.
+    #[must_use]
+    pub fn resolved(&self) -> CaptureSettings {
+        CaptureSettings {
+            max_body_bytes: self.max_body_bytes.unwrap_or(8 * 1024 * 1024) as usize,
+            anthropic_upstream: self
+                .anthropic_upstream
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_owned()),
+            openai_upstream: self
+                .openai_upstream
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com".to_owned()),
+        }
+    }
+
+    fn collect_errors(&self, errors: &mut Vec<String>) {
+        if self.max_body_bytes == Some(0) {
+            errors.push("superagent.harness.capture.max_body_bytes must be > 0".to_owned());
+        }
+        for (name, value) in [
+            ("anthropic_upstream", &self.anthropic_upstream),
+            ("openai_upstream", &self.openai_upstream),
+        ] {
+            if let Some(url) = value
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                errors.push(format!(
+                    "superagent.harness.capture.{name} must be an http(s) URL"
+                ));
+            }
+        }
+    }
+}
+
+/// The capture proxy settings assembly starts the hub from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSettings {
+    pub max_body_bytes: usize,
+    pub anthropic_upstream: String,
+    pub openai_upstream: String,
+}
+
 /// The `superagent.harness.claude:` section (HARNESS-BRIDGE §6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -992,10 +1072,11 @@ impl ClaudeHarnessConfig {
             args: self.args.clone(),
             model: self.model.clone(),
             env: resolve_harness_env(&self.env)?,
+            capture_base: None,
         };
         Ok(BridgeMountSpec {
             name: "claude-code",
-            factory: std::sync::Arc::new(kian_claude::ClaudeAdapter::new(config)),
+            kind: BridgeKind::Claude(config),
             policy: resolve_bridge_policy(self.approvals.as_ref())?,
             max_steps: self.max_steps.unwrap_or(32),
         })
@@ -1071,10 +1152,11 @@ impl CodexHarnessConfig {
             startup_timeout: std::time::Duration::from_millis(
                 self.startup_timeout_ms.unwrap_or(15_000),
             ),
+            capture_base: None,
         };
         Ok(BridgeMountSpec {
             name: "codex",
-            factory: std::sync::Arc::new(kian_codex::CodexAdapter::new(config)),
+            kind: BridgeKind::Codex(config),
             policy: resolve_bridge_policy(self.approvals.as_ref())?,
             max_steps: self.max_steps.unwrap_or(32),
         })
@@ -3384,6 +3466,24 @@ impl ServeConfig {
         // `exec` tool, so a worker binding could not route any command (recording one there
         // would be audit fiction). Zero-endpoint harness configs boot exactly as before.
         if let Some(sa) = self.superagent.as_ref() {
+            if let Some(capture) = sa.harness.capture.as_ref() {
+                let mut capture_errors = Vec::new();
+                capture.collect_errors(&mut capture_errors);
+                if let Some(first) = capture_errors.into_iter().next() {
+                    return Err(invalid(first));
+                }
+                if sa.harness.dsh.is_some() {
+                    return Err(invalid(
+                        "`superagent.harness.capture` applies to `claude`/`codex` only: the dsh \
+                         bridge already persists exact request bytes (ADR-010)",
+                    ));
+                }
+                if sa.harness.count() == 0 {
+                    return Err(invalid(
+                        "`superagent.harness.capture` requires a `claude` or `codex` harness",
+                    ));
+                }
+            }
             if sa.harness.count() > 1 {
                 return Err(invalid(
                     "`superagent.harness` configures at most one harness (dsh | claude | codex): \
@@ -9331,5 +9431,55 @@ schedules:
         );
         let err = ServeConfig::parse(&empty_arg).unwrap_err().to_string();
         assert!(err.contains("args entries must be non-empty"), "{err}");
+    }
+
+    // -- harness request capture (HARNESS-BRIDGE §5.4, ADR-046) ------
+
+    #[test]
+    fn capture_parses_and_marks_the_session_exact() {
+        let yaml = with_harness(
+            "    claude:\n      command: /usr/bin/true\n    capture:\n      max_body_bytes: 4096\n      anthropic_upstream: http://127.0.0.1:9\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("capture parses");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        let settings = sa.harness.capture_settings().expect("capture settings");
+        assert_eq!(settings.max_body_bytes, 4096);
+        assert_eq!(settings.anthropic_upstream, "http://127.0.0.1:9");
+        assert_eq!(
+            settings.openai_upstream, "https://api.openai.com",
+            "the default upstream is unchanged"
+        );
+        assert_eq!(
+            sa.harness
+                .bridge_marker()
+                .expect("marker")
+                .pointer("/bridge/request_bytes"),
+            Some(&serde_json::json!("exact"))
+        );
+    }
+
+    #[test]
+    fn capture_misconfigurations_refuse_boot() {
+        let with_dsh = with_harness(
+            "    dsh:\n      command: /usr/bin/true\n    capture:\n      max_body_bytes: 4096\n",
+        );
+        let err = ServeConfig::parse(&with_dsh).unwrap_err().to_string();
+        assert!(err.contains("claude`/`codex` only"), "{err}");
+
+        let zero = with_harness(
+            "    claude:\n      command: /usr/bin/true\n    capture:\n      max_body_bytes: 0\n",
+        );
+        let err = ServeConfig::parse(&zero).unwrap_err().to_string();
+        assert!(err.contains("max_body_bytes"), "{err}");
+
+        let bad_upstream = with_harness(
+            "    claude:\n      command: /usr/bin/true\n    capture:\n      openai_upstream: api.openai.com\n",
+        );
+        let err = ServeConfig::parse(&bad_upstream).unwrap_err().to_string();
+        assert!(err.contains("http(s) URL"), "{err}");
+
+        let no_harness = with_harness("    capture:\n      max_body_bytes: 4096\n");
+        let err = ServeConfig::parse(&no_harness).unwrap_err().to_string();
+        assert!(err.contains("requires a `claude` or `codex`"), "{err}");
     }
 }

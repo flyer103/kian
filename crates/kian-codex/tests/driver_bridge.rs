@@ -26,6 +26,7 @@ fn adapter(mode: &str) -> CodexAdapter {
         approval_policy: "on-request".to_owned(),
         env: Vec::new(),
         startup_timeout: Duration::from_secs(5),
+        capture_base: None,
     })
 }
 
@@ -135,6 +136,7 @@ async fn a_tool_pre_deny_flips_an_allowed_command_to_policy_hook() {
         BridgeDriverConfig {
             policy,
             max_steps: 32,
+            labels: Default::default(),
         },
     )
     .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)

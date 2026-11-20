@@ -813,6 +813,14 @@ impl Server {
                 );
             }
 
+            let mut capture_hub: Option<std::sync::Arc<crate::capture::CaptureHub>> = None;
+            if let Some(settings) = sa.harness.capture_settings() {
+                capture_hub = Some(
+                    crate::capture::CaptureHub::start(settings)
+                        .await
+                        .map_err(ServeError::Assembly)?,
+                );
+            }
             plugins.register(SuperAgentPlugin {
                 router_binding: Arc::clone(&router_binding),
                 router_agent,
@@ -903,17 +911,58 @@ impl Server {
                     .map(DshHarnessConfig::to_runtime)
                     .transpose()?,
                 bridge_harness: sa.harness.bridge_mount()?.map(|mount| {
-                    let driver = kian_harness::BridgeDriver::new(
-                        mount.factory,
+                    let capture_base = capture_hub.as_ref().map(|hub| hub.base_url());
+                    let (factory, labels): (
+                        std::sync::Arc<dyn kian_harness::SessionFactory>,
+                        kian_harness::MapLabels,
+                    ) = match mount.kind {
+                        crate::config::BridgeKind::Claude(mut config) => {
+                            config.capture_base = capture_base;
+                            let labels = kian_harness::MapLabels {
+                                slot: "main".to_owned(),
+                                provider: "claude-code".to_owned(),
+                                model: config
+                                    .model
+                                    .clone()
+                                    .unwrap_or_else(|| "harness-default".to_owned()),
+                            };
+                            (
+                                std::sync::Arc::new(kian_claude::ClaudeAdapter::new(config)),
+                                labels,
+                            )
+                        }
+                        crate::config::BridgeKind::Codex(mut config) => {
+                            config.capture_base = capture_base;
+                            let labels = kian_harness::MapLabels {
+                                slot: "main".to_owned(),
+                                provider: "codex".to_owned(),
+                                model: config
+                                    .model
+                                    .clone()
+                                    .unwrap_or_else(|| "harness-default".to_owned()),
+                            };
+                            (
+                                std::sync::Arc::new(kian_codex::CodexAdapter::new(config)),
+                                labels,
+                            )
+                        }
+                    };
+                    let mut driver = kian_harness::BridgeDriver::new(
+                        factory,
                         kian_harness::BridgeDriverConfig {
                             policy: mount.policy,
                             max_steps: mount.max_steps,
+                            labels,
                         },
                     )
                     .with_tool_pre_port(std::sync::Arc::new(
                         crate::harness_hooks::BusToolPre::new(hooks.clone()),
                     )
                         as std::sync::Arc<dyn kian_harness::ToolPrePort>);
+                    if let Some(hub) = &capture_hub {
+                        driver = driver.with_capture_source(std::sync::Arc::clone(hub)
+                            as std::sync::Arc<dyn kian_harness::CaptureSource>);
+                    }
                     std::sync::Arc::new(driver)
                 }),
                 event_store: store.clone(),

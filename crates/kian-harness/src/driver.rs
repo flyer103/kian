@@ -49,6 +49,8 @@ pub struct BridgeDriverConfig {
     pub policy: ApprovalPolicy,
     /// Mapped turns per session (default 32, the dsh budget).
     pub max_steps: u64,
+    /// The audit labels stamped on captured `step/request` payloads (HARNESS-BRIDGE §5.4).
+    pub labels: MapLabels,
 }
 
 impl Default for BridgeDriverConfig {
@@ -56,6 +58,7 @@ impl Default for BridgeDriverConfig {
         Self {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 32,
+            labels: MapLabels::default(),
         }
     }
 }
@@ -116,6 +119,37 @@ pub trait ToolPrePort: Send + Sync {
     fn tool_pre(&self, call: ToolPreCall) -> BoxFuture<'static, ToolPreVerdict>;
 }
 
+/// The audit labels a captured `step/request` carries (`slot`/`provider`/`model`): the bridge
+/// session's binding, from config (HARNESS-BRIDGE §5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapLabels {
+    pub slot: String,
+    pub provider: String,
+    pub model: String,
+}
+
+impl Default for MapLabels {
+    fn default() -> Self {
+        Self {
+            slot: "main".to_owned(),
+            provider: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+/// The session's captured request bodies (ADR-046): byte-exact JSON bodies, fed before the proxy
+/// forwards them.
+pub trait CaptureStream: Send {
+    /// Every capture that arrived since the last call (non-blocking).
+    fn drain(&mut self) -> Vec<Vec<u8>>;
+}
+
+/// Opens the per-session capture stream (assembly implements it over the loopback proxy).
+pub trait CaptureSource: Send + Sync {
+    fn open(&self, session: SessionId) -> Option<Box<dyn CaptureStream>>;
+}
+
 /// The bridge `LoopDriver`.
 pub struct BridgeDriver {
     inner: Arc<Inner>,
@@ -127,6 +161,7 @@ struct Inner {
     table: Mutex<HashMap<SessionId, Option<LiveSession>>>,
     tool_post: Option<Arc<dyn ToolPostPort>>,
     tool_pre: Option<Arc<dyn ToolPrePort>>,
+    capture: Option<Arc<dyn CaptureSource>>,
 }
 
 impl BridgeDriver {
@@ -139,6 +174,7 @@ impl BridgeDriver {
                 table: Mutex::new(HashMap::new()),
                 tool_post: None,
                 tool_pre: None,
+                capture: None,
             }),
         }
     }
@@ -156,6 +192,14 @@ impl BridgeDriver {
     pub fn with_tool_pre_port(mut self, port: Arc<dyn ToolPrePort>) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("unique at construction");
         inner.tool_pre = Some(port);
+        self
+    }
+
+    /// Mounts the request-capture source (HARNESS-BRIDGE §5.4, ADR-046). Call before serving.
+    #[must_use]
+    pub fn with_capture_source(mut self, source: Arc<dyn CaptureSource>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("unique at construction");
+        inner.capture = Some(source);
         self
     }
 
@@ -196,6 +240,9 @@ struct LiveSession {
     pending_inputs: usize,
     interrupt_sent: bool,
     tool_names: BTreeMap<String, String>,
+    /// The session's capture stream, opened before the child spawns (a request must have a sink
+    /// before it can be forwarded).
+    capture: Option<Box<dyn CaptureStream>>,
 }
 
 impl LiveSession {
@@ -210,6 +257,7 @@ impl LiveSession {
             pending_inputs: 0,
             interrupt_sent: false,
             tool_names: BTreeMap::new(),
+            capture: None,
         }
     }
 }
@@ -364,10 +412,16 @@ impl BridgeDriver {
                 St::Done,
             );
         }
+        let capture = self
+            .inner
+            .capture
+            .as_ref()
+            .and_then(|source| source.open(session));
         let mut live = match self.inner.factory.spawn(session).await {
             Ok(session) => LiveSession::new(session, &events),
             Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
         };
+        live.capture = capture;
         // The engine promotes the batch into `input/admitted` before `drive`; deliver those
         // (the drain's own take at the first safe boundary would find an empty inbox).
         for payload in fresh_promotions(&events) {
@@ -458,6 +512,35 @@ impl BridgeDriver {
                 }
             }
 
+            if let Some(stream) = live.capture.as_mut() {
+                for body in stream.drain() {
+                    let parsed: Value = match serde_json::from_slice(&body) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return (
+                                LoopOutcome::SoftFailed {
+                                    reason: format!(
+                                        "capture: request body is not JSON ({e}) — not forwarded"
+                                    ),
+                                },
+                                St::Done,
+                            );
+                        }
+                    };
+                    let iteration = live.turn_iteration;
+                    let labels = &self.inner.config.labels;
+                    let payload = json!({
+                        "slot": labels.slot,
+                        "provider": labels.provider,
+                        "model": labels.model,
+                        "iteration": iteration,
+                        "body": parsed,
+                    });
+                    if let Err(e) = ctx.append(EventKind::StepRequest, payload).await {
+                        return (soft("capture append", e), St::Done);
+                    }
+                }
+            }
             let event = if live.turn_open {
                 live.session.next().await
             } else {

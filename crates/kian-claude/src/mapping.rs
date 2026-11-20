@@ -19,6 +19,9 @@ pub struct ClaudeConfig {
     pub model: Option<String>,
     /// Extra environment (credential *names* resolved by assembly; never logged).
     pub env: Vec<(String, String)>,
+    /// The loopback capture proxy's base URL (ADR-046); the child gets
+    /// `ANTHROPIC_BASE_URL=<base>/<session>`. `None` = no capture.
+    pub capture_base: Option<String>,
 }
 
 impl Default for ClaudeConfig {
@@ -28,6 +31,7 @@ impl Default for ClaudeConfig {
             args: Vec::new(),
             model: None,
             env: Vec::new(),
+            capture_base: None,
         }
     }
 }

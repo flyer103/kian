@@ -1,6 +1,6 @@
 # ADR-046: Capture the harness's exact model request at a loopback proxy
 
-- **Status**: proposed for the owner gate (2026-11-20).
+- **Status**: accepted (owner gate, 2026-11-20).
 - **Context**: Claude Code and Codex bridges are projection-only: kian observes the harness's
   inputs/outputs but not the assembled request, so those sessions claim no `step/request`, no
   cache accounting and no byte-request replay ([HARNESS-BRIDGE](../HARNESS-BRIDGE.md) §2). The
@@ -22,7 +22,7 @@
   3. **Record before forward, fail closed.** The proxy buffers the exact body (bounded by
      `max_body_bytes`, default 8 MiB), enqueues it to the session's capture queue, then forwards
      and streams the upstream response back verbatim (status, headers, chunks). If the body
-     exceeds the cap or the queue is gone, it answers `502` **without forwarding** (A2: an
+     exceeds the cap or the queue is gone, it answers a fail-closed `413`/`502` **without forwarding** (A2: an
      unrecorded model-visible input must not be sent). Auth headers are forwarded but never
      persisted or logged.
   4. **The bridge driver appends `step/request`.** At the top of every loop it drains the

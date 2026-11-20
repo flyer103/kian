@@ -316,7 +316,7 @@ driver drains that queue at the top of every loop and appends `step/request{slot
 iteration,body}` through the fenced ctx, so the request event always precedes the response event
 (the harness cannot answer before the response returns). Every forwarded attempt is captured
 (retries are attempts, not dropped sends); a body over `max_body_bytes`, a closed queue or a
-non-JSON body fails the turn (502 / contract error) rather than sending unrecorded input. Auth
+non-JSON body fails the turn (413/502, never forwarded) rather than sending unrecorded input. Auth
 headers are forwarded but never persisted; the proxy is loopback-only, per-session-token and
 pinned to one upstream. With `capture:` on the session class is `"exact"`; without it both the
 class and the bytes are unchanged.
@@ -417,7 +417,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
-| A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers 502 **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
+| A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers a fail-closed `413`/`502` **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
 
 ## 10. Phases

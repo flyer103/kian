@@ -43,12 +43,19 @@ impl SessionFactory for ClaudeAdapter {
 
     fn spawn(
         &self,
-        _session: SessionId,
+        session: SessionId,
     ) -> BoxFuture<'static, Result<Box<dyn HarnessSession>, String>> {
         let config = self.config.clone();
         Box::pin(async move {
             let argv = config.argv();
-            let peer = LinePeer::spawn(&config.command, &argv, &config.env).await?;
+            let mut env = config.env.clone();
+            if let Some(base) = &config.capture_base {
+                env.push((
+                    "ANTHROPIC_BASE_URL".to_owned(),
+                    format!("{base}/{}", session.0),
+                ));
+            }
+            let peer = LinePeer::spawn(&config.command, &argv, &env).await?;
             let mapper = ClaudeMapper::new();
             // The CLI has no explicit ready frame, and it may emit nothing until it receives the
             // first input (session hooks are not guaranteed). Readiness is therefore the spawn

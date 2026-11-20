@@ -31,10 +31,12 @@ async fn live_claude_turn_is_mapped_and_honest() {
             args: Vec::new(),
             model: None,
             env: Vec::new(),
+            capture_base: None,
         })),
         BridgeDriverConfig {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 8,
+            labels: Default::default(),
         },
     );
     let outcomes = tokio::time::timeout(

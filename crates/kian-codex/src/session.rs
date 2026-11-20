@@ -44,11 +44,11 @@ impl SessionFactory for CodexAdapter {
 
     fn spawn(
         &self,
-        _session: SessionId,
+        session: SessionId,
     ) -> BoxFuture<'static, Result<Box<dyn HarnessSession>, String>> {
         let config = self.config.clone();
         Box::pin(async move {
-            let argv = config.argv();
+            let argv = config.argv(&session);
             let peer = LinePeer::spawn(&config.command, &argv, &config.env).await?;
             let mut session = CodexSession {
                 peer,

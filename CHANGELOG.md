@@ -8,6 +8,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness request capture: bridged sessions can be `exact` (HARNESS-BRIDGE §5.4, ADR-046)**.
+  With `superagent.harness.capture:` on, kian starts a loopback recording proxy and points the
+  mounted Claude Code (`ANTHROPIC_BASE_URL`) or Codex (`model_providers.kian-capture`) at it. Each
+  request body is recorded **before** it is forwarded (fail-closed: an oversized/unknown route or
+  an unavailable queue answers 413/502 and nothing is sent), the bridge driver appends it as
+  `step/request` before the assistant event, and the session's `session/created.bridge` class
+  becomes `"exact"` — enabling cache/cost audit and byte-request replay for that session. Retries
+  are recorded per attempt; auth headers are forwarded but never persisted or logged; the proxy
+  binds loopback only and is pinned to the configured Anthropic/OpenAI upstreams. Live probes
+  confirmed the two routes (claude 2.1.318 honors `ANTHROPIC_BASE_URL`, codex-cli 0.166.0 honors a
+  generated provider config); both were API-key routes, so OAuth-only routes remain unverified.
+  Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §5.4; config in README.
+
 - **Harness approvals dispatch at `tool/pre` (HARNESS-BRIDGE §4.4, PLUGIN-SPEC §3.2.5,
   ADR-045)**. A Claude Code/Codex tool that the harness gates is now consulted on kian's plugin
   bus before the answer: a `veto:tool` sidecar can deny it, deny wins over a declarative allow,

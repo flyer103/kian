@@ -37,6 +37,7 @@ fn adapter(script: &Path) -> ClaudeAdapter {
         args: vec![script.display().to_string()],
         model: None,
         env: Vec::new(),
+        capture_base: None,
     })
 }
 
@@ -198,6 +199,7 @@ async fn an_allowed_approval_carries_the_matching_rule() {
         BridgeDriverConfig {
             policy,
             max_steps: 32,
+            labels: Default::default(),
         },
     )
     .drive(ctx.clone())
@@ -279,6 +281,7 @@ async fn the_step_budget_stops_before_a_turn_opens() {
         BridgeDriverConfig {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 0,
+            labels: Default::default(),
         },
     )
     .drive(ctx.clone())
@@ -397,6 +400,7 @@ async fn a_tool_pre_deny_flips_an_allowed_call_to_policy_hook() {
         BridgeDriverConfig {
             policy,
             max_steps: 32,
+            labels: Default::default(),
         },
     )
     .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)
@@ -470,4 +474,100 @@ async fn a_tool_pre_allow_cannot_widen_a_config_deny() {
         call.bytes.pointer("/content/permission/matched"),
         Some(&json!("default"))
     );
+}
+
+struct PreloadedCapture {
+    bodies: Vec<Vec<u8>>,
+}
+
+struct PreloadedStream {
+    pending: Vec<Vec<u8>>,
+}
+
+impl kian_harness::CaptureStream for PreloadedStream {
+    fn drain(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+impl kian_harness::CaptureSource for PreloadedCapture {
+    fn open(&self, _session: SessionId) -> Option<Box<dyn kian_harness::CaptureStream>> {
+        Some(Box::new(PreloadedStream {
+            pending: self.bodies.clone(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn captured_requests_are_appended_before_the_assistant_event() {
+    let dir = scratch("capture");
+    let script = write_script(
+        &dir,
+        "capture.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let driver = BridgeDriver::new(Arc::new(adapter(&script)), BridgeDriverConfig::default())
+        .with_capture_source(Arc::new(PreloadedCapture {
+            bodies: vec![br#"{"attempt":1}"#.to_vec(), br#"{"attempt":2}"#.to_vec()],
+        }) as Arc<dyn kian_harness::CaptureSource>);
+    let outcomes: Vec<LoopOutcome> = driver.drive(ctx.clone()).collect().await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+
+    let events = ctx.committed();
+    let kinds: Vec<EventKind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EventKind::InputAdmitted,
+            EventKind::TurnStart,
+            EventKind::StepRequest,
+            EventKind::StepRequest,
+            EventKind::AssistantMessage,
+            EventKind::TurnEnd,
+        ],
+        "each captured attempt is a step/request before the answer"
+    );
+    assert_eq!(
+        events[2].bytes.pointer("/body/attempt"),
+        Some(&json!(1)),
+        "the exact body is persisted"
+    );
+    assert_eq!(events[2].bytes["iteration"], 0);
+    assert_eq!(events[3].bytes.pointer("/body/attempt"), Some(&json!(2)));
+}
+
+#[tokio::test]
+async fn a_non_json_capture_is_an_honest_soft_failure() {
+    let dir = scratch("capture-bad");
+    let script = write_script(
+        &dir,
+        "capture-bad.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let driver = BridgeDriver::new(Arc::new(adapter(&script)), BridgeDriverConfig::default())
+        .with_capture_source(Arc::new(PreloadedCapture {
+            bodies: vec![b"not json".to_vec()],
+        }) as Arc<dyn kian_harness::CaptureSource>);
+    let outcomes: Vec<LoopOutcome> = driver.drive(ctx.clone()).collect().await;
+    match outcomes.as_slice() {
+        [LoopOutcome::SoftFailed { reason }] => {
+            assert!(reason.contains("not JSON"), "{reason}")
+        }
+        other => panic!("expected SoftFailed, got {other:?}"),
+    }
 }
