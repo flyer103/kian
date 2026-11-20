@@ -4,7 +4,9 @@
   session whose loop is owned by an external harness. The dsh wire contract stays
   [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document generalizes the
   *kian-side* contract and adds Claude Code and Codex bridges
-  ([ADR-043](decisions/ADR-043-multi-harness-bridge.md)).
+  ([ADR-043](decisions/ADR-043-multi-harness-bridge.md)). The open-step inactivity bound is
+  designed in [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (**proposed**, owner
+  gate).
 - **Owners**: `kian-harness` (shared skeleton), `kian-claude` (Claude Code adapter),
   `kian-codex` (Codex adapter). `kian-dsh` keeps its v0 contract; convergence is phase 3.
 - **Read this with**: [SPEC](../docs/SPEC.md) §2.2 C, [DESIGN](DESIGN.md) §6.2/§7/§16,
@@ -192,6 +194,10 @@ recorded because it is the phase-2 `ask` problem in miniature (§10).
 - step budget (`max_steps`, default 32) → `Stopped`, exactly like the built-in loop's
   iteration budget;
 - startup deadline (default 10s) → `SoftFailed` naming the deadline;
+- open-step inactivity (`step_timeout_ms`, default 30 min, `0` disables) → `SoftFailed` naming
+  the bound: a live but silent child (a deadlocked CLI, a hung internal tool) would otherwise park
+  the drain forever and hold the worker slot — the same class ADR-041 closed for model calls
+  ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md));
 - an idle safe boundary re-checks inputs on a bounded interval (the dsh fix for folded wakes,
   [`driver.rs`](../crates/kian-dsh/src/driver.rs) lines 606–626) so a late admit cannot
   deadlock the episode.
@@ -291,6 +297,7 @@ superagent:
       model: claude-sonnet-4-5           # passed to the harness; audit label for the stream
       max_steps: 32
       startup_timeout_ms: 10000
+      step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044)
       approvals:                          # §6.3
         default: deny
         allow: ["Read", "Bash(git status*)"]
@@ -380,6 +387,10 @@ policy, durable marker, config, capability matrix, fixtures, conformance tests, 
 untouched. Cron worktree firings keep the dsh-shaped `superagent.cron.harness` (a `command` +
 `profile`); running Claude Code/Codex under cron needs the phase-2 argv extension.
 
+**Phase 1.5 (ADR-044, proposed).** Bound the open-step wait (event read and control write) in
+both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
+end and the worker slot is reclaimed instead of parked forever.
+
 **Phase 2.** Harness hooks → kian plugin bus (Claude Code `PreToolUse`/`PostToolUse` via a
 kian-provided hook shim; Codex approvals as `tool/pre` verdicts), durable interactive `ask`
 (with the restart semantics designed), interrupt forwarded to a live child, `harness/<name>/*`
@@ -418,3 +429,6 @@ smoke exists.
    separate event in phase 2.
 5. Should the two new crates ship behind a `harness-bridges` feature flag, or as plain workspace
    members like `kian-dsh`?
+6. ADR-044 (proposed): is the 30-minute `step_timeout_ms` default right for real harness tools, and
+   should the knob be per harness (`harness.<name>`) or per worker template (a deployment may run
+   one long-build bridge beside a short interactive one)?
