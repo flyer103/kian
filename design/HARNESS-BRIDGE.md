@@ -51,7 +51,7 @@ durable fact of the session:
 
 | Class | Meaning | `request_bytes` | Sessions today |
 |---|---|---|---|
-| **exact** | the assembled model request is observable before the call settles; kian persists it as `step/request` and byte-replays it | `"exact"` | dsh via contract v0 (ADR-010) |
+| **exact** | the assembled model request is observable before the call settles; kian persists it as `step/request` and byte-replays it | `"exact"` | dsh via contract v0 (ADR-010); Claude Code / Codex with the request-capture proxy (ADR-046) |
 | **projection-only** | the harness assembles and sends the request itself; kian observes inputs/outputs but **not** the assembled bytes | `"unavailable"` | Claude Code, Codex |
 
 **Why the second class exists.** The A2 rule (persist-what-you-send) is kian's property over
@@ -86,8 +86,8 @@ phase.
 
 | Capability | dsh (v0) | Claude Code | Codex |
 |---|---|---|---|
-| model request bytes (`step/request`) | ✔ (peer contract) | — (P3 proxy) | — (P3 proxy) |
-| cache accounting / prefix audit | ✔ | — | — |
+| model request bytes (`step/request`) | ✔ (peer contract) | ✔ with `capture:` (ADR-046), else — | ✔ with `capture:`, else — |
+| cache accounting / prefix audit | ✔ | ✔ with `capture:`, else — | ✔ with `capture:`, else — |
 | steer (strippable, injected at the next safe boundary) | ✔ | ◐ queued as the next user message | ◐ `turn/steer` when the pinned protocol supports it |
 | interrupt (stop the in-flight turn) | ◐ frame exists; mounted driver does not forward mid-episode | ✔ `control_request{interrupt}` | ✔ `turn/interrupt` |
 | pre-execution tool gate answered by kian | — | ✔ `can_use_tool` control request | ✔ server-initiated approval request |
@@ -307,6 +307,20 @@ The dsh bridge keeps contract v0 (ADR-010) in phase 1: same wire, same mapping, 
 Phase 3 converges it onto `kian-harness` without changing the wire contract; until then two
 skeletons exist and that duplication is a recorded, bounded debt (§10).
 
+### 5.4 Request capture (ADR-046)
+
+With `capture:` on, the adapter points the harness's provider route at a loopback proxy
+(Claude `ANTHROPIC_BASE_URL`, Codex a generated `model_providers.kian-capture`), and the proxy
+records each exact request body before forwarding it to the configured upstream. The bridge
+driver drains that queue at the top of every loop and appends `step/request{slot,provider,model,
+iteration,body}` through the fenced ctx, so the request event always precedes the response event
+(the harness cannot answer before the response returns). Every forwarded attempt is captured
+(retries are attempts, not dropped sends); a body over `max_body_bytes`, a closed queue or a
+non-JSON body fails the turn (502 / contract error) rather than sending unrecorded input. Auth
+headers are forwarded but never persisted; the proxy is loopback-only, per-session-token and
+pinned to one upstream. With `capture:` on the session class is `"exact"`; without it both the
+class and the bytes are unchanged.
+
 ## 6. Config grammar
 
 ### 6.1 Harness selection
@@ -325,6 +339,7 @@ superagent:
         default: deny
         allow: ["Read", "Bash(git status*)"]
       env: ["ANTHROPIC_API_KEY"]          # names passed through; never logged
+      # capture: { upstream: https://api.anthropic.com, max_body_bytes: 8388608 }  # ADR-046
 ```
 
 `harness.{dsh,claude,codex}` are mutually exclusive (one inner loop per worker template);
@@ -402,6 +417,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
+| A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers 502 **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
 
 ## 10. Phases
@@ -421,9 +437,11 @@ end and the worker slot is reclaimed instead of parked forever.
 `PreToolUse`/`PostToolUse` shim — the only way to cover auto-approved harness tools — remains
 phase 3.
 
-**Phase 3.** Request-capture proxy (turn projection-only sessions into `exact` ones), an ACP
-client driver if ACP coverage holds for both, and `kian-dsh` convergence onto `kian-harness`
-(deleting the duplicated skeleton).
+**Phase 3 (this change).** Request-capture proxy
+([ADR-046](decisions/ADR-046-harness-request-capture.md)): point the harness's provider route at a
+loopback recording proxy so a bridged session persists the exact `step/request` and becomes
+`exact`. Remaining phase 3: an ACP client driver if ACP coverage holds for both, and `kian-dsh`
+convergence onto `kian-harness` (deleting the duplicated skeleton).
 
 ## 11. Verification required before coding each adapter
 
