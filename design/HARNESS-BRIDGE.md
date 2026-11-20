@@ -331,9 +331,10 @@ superagent:
    the harness's known bypass flag (`--dangerously-skip-permissions` / `bypassPermissions`, Codex
    `--dangerously-bypass-approvals-and-sandbox`) **refuses boot** — a bypassed harness never asks,
    so kian's approval policy would be a claim with no decision behind it;
-6. `superagent.cron.harness` stays dsh-shaped (`--profile <name> <payload>`) in phase 1 and is not
-   a bridge config; pointing it at Claude Code/Codex is a misconfiguration that fails honestly at
-   the firing, and the generic argv extension is phase 2 (§10).
+6. `superagent.cron.harness` is the cron runner, not the worker bridge: its default shape is dsh
+   (`args --profile <name> <payload>`), and `raw: true` runs any harness as `args <payload>`
+   (`claude --print … "<task>"`, `codex exec "<task>"`). A raw config needs an explicit `command`
+   and refuses a `profile`; the argv contract is [CRON-MODEL](CRON-MODEL.md) §6.2.
 
 ### 6.3 Approval policy
 
@@ -392,8 +393,8 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 
 **Phase 1 (this change).** Shared skeleton, Claude Code and Codex bridges, allow/deny approval
 policy, durable marker, config, capability matrix, fixtures, conformance tests, docs. dsh
-untouched. Cron worktree firings keep the dsh-shaped `superagent.cron.harness` (a `command` +
-`profile`); running Claude Code/Codex under cron needs the phase-2 argv extension.
+untouched. Cron worktree firings run the configured harness: the dsh profile shape by default, or
+raw argv (`raw: true`) for Claude Code/Codex ([CRON-MODEL](CRON-MODEL.md) §6.2).
 
 **Phase 1.5 (ADR-044, proposed).** Bound the open-step wait (event read and control write) in
 both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
@@ -402,7 +403,7 @@ end and the worker slot is reclaimed instead of parked forever.
 **Phase 2.** Harness hooks → kian plugin bus (Claude Code `PreToolUse`/`PostToolUse` via a
 kian-provided hook shim; Codex approvals as `tool/pre` verdicts), durable interactive `ask`
 (with the restart semantics designed), interrupt forwarded to a live child, `harness/<name>/*`
-hook registry entries, cron per-schedule harness + generic argv.
+hook registry entries, cron per-schedule harness selection.
 
 **Phase 3.** Request-capture proxy (turn projection-only sessions into `exact` ones), an ACP
 client driver if ACP coverage holds for both, and `kian-dsh` convergence onto `kian-harness`

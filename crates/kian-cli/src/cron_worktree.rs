@@ -274,8 +274,9 @@ pub trait TurnRunner: Send + Sync {
     fn run(&self, request: &TurnRequest) -> Result<TurnOutput, String>;
 }
 
-/// The production runner: spawn the `dsh` harness in the worktree, argv-direct
-/// (no shell), killing the whole process group on the per-firing ceiling.
+/// The production runner: spawn the configured harness in the worktree, argv-direct (no shell),
+/// killing the whole process group on the per-firing ceiling. The argv shape is CRON-MODEL
+/// §6.2's: `args --profile <name> <payload>` (dsh) or `args <payload>` (raw mode).
 #[derive(Debug, Clone)]
 pub struct DshTurnRunner {
     /// The harness binary: `superagent.cron.harness.command`, else
@@ -313,8 +314,8 @@ impl DshTurnRunner {
         let settings: CronHarnessSettings = section.resolved();
         Self {
             program: settings.command,
-            args: Vec::new(),
-            profile: Some(settings.profile),
+            args: settings.args,
+            profile: settings.profile,
             env: settings.env,
         }
     }
@@ -2638,6 +2639,29 @@ mod tests_dsh_contract {
     }
 
     #[test]
+    fn raw_mode_argv_is_the_fixed_args_plus_the_payload() {
+        let runner = DshTurnRunner {
+            program: "claude".to_owned(),
+            args: vec![
+                "--print".to_owned(),
+                "--output-format".to_owned(),
+                "text".to_owned(),
+            ],
+            profile: None,
+            env: BTreeMap::new(),
+        };
+        assert_eq!(
+            runner.harness_argv("audit the repo"),
+            vec![
+                "--print".to_owned(),
+                "--output-format".to_owned(),
+                "text".to_owned(),
+                "audit the repo".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn dsh_argv_is_the_profile_flag_plus_a_positional_prompt() {
         let tmp = TempDir::new("argv");
         let script = fake_dsh(tmp.path(), 0, "");
@@ -2723,8 +2747,11 @@ mod tests_dsh_contract {
         let empty: crate::config::CronHarnessSection =
             serde_yaml::from_str("{}\n").expect("an empty harness section parses");
         let settings = empty.resolved();
-        assert_eq!(settings.profile, crate::config::CRON_DEFAULT_DSH_PROFILE);
-        assert_eq!(settings.profile, "headless");
+        assert_eq!(
+            settings.profile.as_deref(),
+            Some(crate::config::CRON_DEFAULT_DSH_PROFILE)
+        );
+        assert_eq!(settings.profile.as_deref(), Some("headless"));
         assert!(settings.env.is_empty());
 
         let wired: crate::config::CronHarnessSection = serde_yaml::from_str(
@@ -2732,7 +2759,7 @@ mod tests_dsh_contract {
         )
         .expect("the harness knobs parse");
         let settings = wired.resolved();
-        assert_eq!(settings.profile, "sdk");
+        assert_eq!(settings.profile.as_deref(), Some("sdk"));
         assert_eq!(settings.command, "/usr/local/bin/dsh");
         assert_eq!(
             settings.env.get("KIAN_DSH_PEER").map(String::as_str),

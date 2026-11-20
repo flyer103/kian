@@ -8,6 +8,14 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Cron: the worktree arm can run any harness (CRON-MODEL §6.2)**. `superagent.cron.harness`
+  gains `args` and `raw: true`: the default stays the dsh shape (`args --profile <name> <payload>`,
+  profile `headless`), while raw mode appends the scheduled payload to the fixed args
+  (`claude --print … "<task>"`, `codex exec "<task>"`). Raw mode requires an explicit `command`,
+  refuses a `profile`, and rejects empty args — all fail-closed at load. The firing record, worktree
+  isolation, ceilings and capture are unchanged. Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md)
+  §6.2.
+
 - **Harness bridges: live verification and the first protocol fixes (HARNESS-BRIDGE phase 1,
   ADR-043)**. Live suites now ship for both adapters (skip without `KIAN_CLAUDE_BIN` /
   `KIAN_CODEX_BIN`). Running them against `codex-cli 0.166.0` fixed the real handshake: the pinned
