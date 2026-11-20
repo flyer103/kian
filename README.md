@@ -692,7 +692,7 @@ whether the model request is byte-replayable. Phase-1 limits are the contract's,
 fresh harness conversation), and `ask` approvals refuse boot until the phase-2 confirmation
 design. Start the harness with a gated
 approval mode — a bypass flag refuses boot. Contracts, mappings and the capability matrix:
-[HARNESS-BRIDGE](design/HARNESS-BRIDGE.md), [ADR-041](design/decisions/ADR-041-multi-harness-bridge.md);
+[HARNESS-BRIDGE](design/HARNESS-BRIDGE.md), [ADR-042](design/decisions/ADR-042-multi-harness-bridge.md);
 live smokes: [docs/runbook-harness.md](docs/runbook-harness.md).
 
 ### Tool permissions (per-call governance)

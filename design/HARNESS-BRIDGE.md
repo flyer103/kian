@@ -4,7 +4,7 @@
   session whose loop is owned by an external harness. The dsh wire contract stays
   [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document generalizes the
   *kian-side* contract and adds Claude Code and Codex bridges
-  ([ADR-041](decisions/ADR-041-multi-harness-bridge.md)).
+  ([ADR-042](decisions/ADR-042-multi-harness-bridge.md)).
 - **Owners**: `kian-harness` (shared skeleton), `kian-claude` (Claude Code adapter),
   `kian-codex` (Codex adapter). `kian-dsh` keeps its v0 contract; convergence is phase 3.
 - **Read this with**: [SPEC](../docs/SPEC.md) §2.2 C, [DESIGN](DESIGN.md) §6.2/§7/§16,

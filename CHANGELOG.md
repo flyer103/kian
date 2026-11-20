@@ -10,7 +10,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
-- **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-041)**. The worker
+- **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-042)**. The worker
   template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code
   `stream-json` adapter (`kian-claude`) or the Codex `app-server` JSON-RPC adapter
   (`kian-codex`): `session/prompt`-style input delivery, steer/interrupt, the harness's own
@@ -19,7 +19,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `completed`). These are *projection-only* sessions — no `step/request`, no cache or byte-request
   replay — and phase 1 has no cross-process harness resume; the capability matrix states both.
   Contract, mappings and limits: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md),
-  [ADR-041](design/decisions/ADR-041-multi-harness-bridge.md). Spawned worker sessions record the
+  [ADR-042](design/decisions/ADR-042-multi-harness-bridge.md). Spawned worker sessions record the
   class durably: `session/created` carries the additive `bridge:{name,request_bytes}` key through
   the eager creation seam (HARNESS-BRIDGE §4.7).
 

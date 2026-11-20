@@ -2,7 +2,7 @@
 
 What phase 1 proves in default CI, what is **not yet verified**, and the exact commands to run
 the live legs. The contract lives in [HARNESS-BRIDGE](../design/HARNESS-BRIDGE.md) and
-[ADR-041](../design/decisions/ADR-041-multi-harness-bridge.md); this file is operational only.
+[ADR-042](../design/decisions/ADR-042-multi-harness-bridge.md); this file is operational only.
 
 ## Status
 
