@@ -893,6 +893,8 @@ pub struct BridgeMountSpec {
     pub policy: kian_harness::ApprovalPolicy,
     /// Mapped turns per session.
     pub max_steps: u64,
+    /// Open-step inactivity bound in milliseconds (HARNESS-BRIDGE §4.5, ADR-044); `0` disables.
+    pub step_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for BridgeMountSpec {
@@ -970,6 +972,9 @@ pub struct ClaudeHarnessConfig {
     /// Mapped turns per session. Default 32.
     #[serde(default)]
     pub max_steps: Option<u64>,
+    /// Open-step inactivity bound (ADR-044). Default 30 min; `0` disables; below 10 s refuses.
+    #[serde(default)]
+    pub step_timeout_ms: Option<u64>,
     /// The allow/deny policy for the harness's tool gate.
     #[serde(default)]
     pub approvals: Option<ApprovalsConfig>,
@@ -998,6 +1003,7 @@ impl ClaudeHarnessConfig {
             factory: std::sync::Arc::new(kian_claude::ClaudeAdapter::new(config)),
             policy: resolve_bridge_policy(self.approvals.as_ref())?,
             max_steps: self.max_steps.unwrap_or(32),
+            step_timeout_ms: resolve_step_timeout_ms(self.step_timeout_ms)?,
         })
     }
 }
@@ -1028,6 +1034,9 @@ pub struct CodexHarnessConfig {
     /// The handshake deadline. Default 15s.
     #[serde(default)]
     pub startup_timeout_ms: Option<u64>,
+    /// Open-step inactivity bound (ADR-044). Default 30 min; `0` disables; below 10 s refuses.
+    #[serde(default)]
+    pub step_timeout_ms: Option<u64>,
     /// The allow/deny policy for the harness's tool gate.
     #[serde(default)]
     pub approvals: Option<ApprovalsConfig>,
@@ -1077,7 +1086,24 @@ impl CodexHarnessConfig {
             factory: std::sync::Arc::new(kian_codex::CodexAdapter::new(config)),
             policy: resolve_bridge_policy(self.approvals.as_ref())?,
             max_steps: self.max_steps.unwrap_or(32),
+            step_timeout_ms: resolve_step_timeout_ms(self.step_timeout_ms)?,
         })
+    }
+}
+
+/// Resolves the open-step inactivity bound (HARNESS-BRIDGE §4.5, ADR-044): absent = the driver
+/// default (30 min), `0` = disabled, anything below 10 s refuses boot (fail-closed — the knob
+/// exists to end a dead bridge, not to reintroduce a livelock at a smaller scale).
+fn resolve_step_timeout_ms(configured: Option<u64>) -> Result<u64, ConfigError> {
+    const MIN_STEP_TIMEOUT_MS: u64 = 10_000;
+    match configured {
+        None => Ok(kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS),
+        Some(0) => Ok(0),
+        Some(value) if value < MIN_STEP_TIMEOUT_MS => Err(invalid(format!(
+            "`superagent.harness.<name>.step_timeout_ms` is {value}; it must be 0 (disabled) or \
+             at least {MIN_STEP_TIMEOUT_MS} ms"
+        ))),
+        Some(value) => Ok(value),
     }
 }
 
@@ -1169,6 +1195,9 @@ pub struct DshHarnessConfig {
     /// Mapped-step budget across the whole session.
     #[serde(default = "default_dsh_max_steps")]
     pub max_steps: u64,
+    /// Open-step inactivity bound (ADR-044). Default 30 min; `0` disables; below 10 s refuses.
+    #[serde(default)]
+    pub step_timeout_ms: Option<u64>,
 }
 
 fn default_dsh_args() -> Vec<String> {
@@ -1222,6 +1251,7 @@ impl DshHarnessConfig {
             },
             max_steps: self.max_steps,
             startup_timeout: kian_dsh::driver::DEFAULT_STARTUP_TIMEOUT,
+            step_timeout_ms: resolve_step_timeout_ms(self.step_timeout_ms)?,
         })
     }
 }
@@ -9183,6 +9213,83 @@ schedules:
             .bridge_mount()
             .expect_err("never removes the gate");
         assert!(err.to_string().contains("removes the tool gate"), "{err}");
+    }
+
+    /// ADR-044: the open-step inactivity bound defaults on (30 min), parses explicitly, `0`
+    /// disables it, and anything below 10 s refuses instead of reintroducing a smaller livelock.
+    #[test]
+    fn harness_step_timeout_defaults_parses_and_refuses_too_small() {
+        let mount = |block: &str| {
+            let yaml = with_harness(block);
+            let cfg = ServeConfig::parse(&yaml).expect("parse");
+            let sa = cfg.superagent.as_ref().expect("superagent section");
+            sa.harness.bridge_mount()
+        };
+        let default = mount("    claude:\n      command: /usr/bin/true\n")
+            .expect("mount resolves")
+            .expect("claude mount");
+        assert_eq!(
+            default.step_timeout_ms,
+            kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS
+        );
+        assert_eq!(default.step_timeout_ms, 1_800_000, "30 min default");
+
+        let explicit =
+            mount("    claude:\n      command: /usr/bin/true\n      step_timeout_ms: 60000\n")
+                .expect("mount resolves")
+                .expect("claude mount");
+        assert_eq!(explicit.step_timeout_ms, 60_000);
+
+        let disabled =
+            mount("    claude:\n      command: /usr/bin/true\n      step_timeout_ms: 0\n")
+                .expect("mount resolves")
+                .expect("claude mount");
+        assert_eq!(disabled.step_timeout_ms, 0, "0 = bound disabled");
+
+        let too_small =
+            mount("    claude:\n      command: /usr/bin/true\n      step_timeout_ms: 5000\n")
+                .expect_err("below the minimum must refuse boot");
+        assert!(
+            too_small.to_string().contains("step_timeout_ms"),
+            "{too_small}"
+        );
+    }
+
+    /// ADR-044 reaches the dsh bridge too: same default, same refusal below the minimum.
+    #[test]
+    fn dsh_harness_steps_are_bounded_by_default() {
+        let yaml = with_harness("    dsh:\n      command: /usr/bin/true\n");
+        let cfg = ServeConfig::parse(&yaml).expect("parse");
+        let runtime = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent section")
+            .harness
+            .dsh
+            .as_ref()
+            .expect("dsh section")
+            .to_runtime()
+            .expect("dsh runtime");
+        assert_eq!(
+            runtime.step_timeout_ms,
+            kian_dsh::driver::DEFAULT_STEP_TIMEOUT_MS
+        );
+        assert_eq!(runtime.step_timeout_ms, 1_800_000);
+
+        let yaml =
+            with_harness("    dsh:\n      command: /usr/bin/true\n      step_timeout_ms: 9999\n");
+        let cfg = ServeConfig::parse(&yaml).expect("parse");
+        let err = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent section")
+            .harness
+            .dsh
+            .as_ref()
+            .expect("dsh section")
+            .to_runtime()
+            .expect_err("below the minimum must refuse boot");
+        assert!(err.to_string().contains("step_timeout_ms"), "{err}");
     }
 
     #[test]

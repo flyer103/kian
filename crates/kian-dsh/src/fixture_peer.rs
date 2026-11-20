@@ -10,6 +10,8 @@
 //!   require JSON equality (any mismatch is a hard failure with a
 //!   diagnostic on stderr and exit code 1 — the peer never best-efforts
 //!   past an unexpected control frame);
+//! - `{"op":"sleep","ms":N}` — stay silent for N milliseconds while staying
+//!   alive (the stalled child shape, ADR-044: no frame, no exit);
 //! - `{"op":"exit","code":N}` — stop immediately with exit code N
 //!   (the honest child-crash shape — mid-script, no cleanup);
 //! - `{"op":"eof"}` — stop and exit 0.
@@ -93,6 +95,10 @@ pub fn run_ops(
                     )
                     .into());
                 }
+            }
+            "sleep" => {
+                let ms = op.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             "exit" => {
                 let code = op.get("code").and_then(|v| v.as_i64()).unwrap_or(1);

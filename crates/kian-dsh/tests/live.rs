@@ -149,6 +149,7 @@ async fn live_dsh_smoke_env_gated() {
         },
         max_steps: 8,
         startup_timeout: Duration::from_secs(30),
+        step_timeout_ms: 1_800_000,
     });
 
     let stream = driver.drive(ctx.clone() as Arc<dyn DshCtx>);
@@ -219,6 +220,7 @@ async fn live_dsh_peer_positive_env_gated() {
         },
         max_steps: 8,
         startup_timeout: Duration::from_secs(30),
+        step_timeout_ms: 1_800_000,
     });
 
     let stream = driver.drive(ctx.clone() as Arc<dyn DshCtx>);

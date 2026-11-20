@@ -38,6 +38,7 @@ fn driver(script: &str) -> DshDriver {
         map: map_ctx(),
         max_steps: 32,
         startup_timeout: Duration::from_secs(10),
+        step_timeout_ms: 1_800_000,
     })
 }
 
@@ -406,6 +407,7 @@ async fn takeover_replay_appends_only_new_events() {
             },
             max_steps: 32,
             startup_timeout: Duration::from_secs(10),
+            step_timeout_ms: 1_800_000,
         })
     }
 
@@ -684,4 +686,34 @@ async fn dedupe_path_dispatches_nothing() {
         appended_after_first,
         "the dedupe path appends nothing either"
     );
+}
+
+/// ADR-044: a dsh step that opens and then goes silent costs one honest soft failure at the
+/// bound, never a parked drain.
+#[tokio::test]
+async fn an_open_dsh_step_that_goes_silent_ends_in_a_soft_failure_at_the_bound() {
+    let ctx = FakeCtx::seeded(deploy());
+    let driver = DshDriver::new(DshDriverConfig {
+        command: PEER.to_owned(),
+        args: vec![format!("{FIXTURE_DIR}/stall_mid_step.jsonl")],
+        map: map_ctx(),
+        max_steps: 32,
+        startup_timeout: Duration::from_secs(10),
+        step_timeout_ms: 300,
+    });
+    let started = std::time::Instant::now();
+    let outcomes = drive_to_end(&driver, ctx.clone()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the bound must fire promptly"
+    );
+    match outcomes.as_slice() {
+        [LoopOutcome::SoftFailed { reason }] => {
+            assert!(reason.contains("step bound"), "{reason}");
+        }
+        other => panic!("expected one SoftFailed, got {other:?}"),
+    }
+    // The step opened before the silence; no turn/end, no completion.
+    assert!(ctx.kinds().contains(&EventKind::TurnStart));
+    assert!(!ctx.kinds().contains(&EventKind::TurnEnd));
 }
