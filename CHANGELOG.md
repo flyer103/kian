@@ -50,6 +50,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   direct chats, one channel per config, forced untrusted. Contract:
   [design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md); setup:
   [docs/runbook-imessage.md](docs/runbook-imessage.md).
+
+- **Resident rotation phase 0: the Router can be retired at boot (ADR-040)**. A new sixth end
+  reason `rotated` (terminal, frozen) and a terminal `rotated` session state; the
+  `superagent.router.rotate_after_events` switch (absent = off, explicit `0` refuses boot) makes
+  `kian serve` assembly retire a live Router over the threshold with one atomic `drain/claimed` +
+  `session/ended{rotated}` batch, bind the deterministic uuid5 successor everywhere the pinned id
+  was, and give the successor its context in a fixed order: the ADR-038 memory index, the
+  predecessor's pending message rows, a bounded synthetic handoff, then the judge prompt. Only an
+  `idle` live session rotates (a crashed turn is a takeover), and a live lease wins. Runtime
+  rotation between restarts is ADR-040 phase 1/2. Contract:
+  [design/DESIGN.md](design/DESIGN.md) §2.2/§4.6, [docs/SPEC.md](docs/SPEC.md).
+
 - **Bounded model calls and drain-crash containment: an abnormal interruption can delay freeing a
   worker, never prevent it (ADR-041)**. A model call is now bounded like every other wait: two
   additive `providers.<name>` keys — `connect_timeout_ms` (default 10 000) and `idle_timeout_ms`

@@ -1496,6 +1496,9 @@ pub fn thread_liveness(worker_events: &[Event]) -> ThreadLiveness {
                     kian_core::events::EndReason::Failed
                     | kian_core::events::EndReason::Interrupted
                     | kian_core::events::EndReason::AwaitingInput => ThreadLiveness::Live,
+                    // A rotated session is frozen (ADR-040): nothing can
+                    // resume it, so the thread is released.
+                    kian_core::events::EndReason::Rotated => ThreadLiveness::Released,
                 };
             }
             _ => {}

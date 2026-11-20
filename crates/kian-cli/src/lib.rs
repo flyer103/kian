@@ -72,6 +72,7 @@ pub mod memory;
 pub mod multiagent_tick;
 pub mod ops;
 pub mod plugins;
+pub mod rotation;
 pub mod server;
 pub mod sidecars;
 pub mod superagent;

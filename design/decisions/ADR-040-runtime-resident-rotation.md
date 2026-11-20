@@ -1,6 +1,6 @@
 # ADR-040: Runtime resident rotation — a shared binding, an idle-boundary rotation, and a handoff
 
-- **Status**: proposed (owner gate; not implemented; append-only — ADR-001…039 immutable)
+- **Status**: accepted (owner directive 2026-11-20 — phase 0 landed; phases 1/2 remain; append-only — ADR-001…039 immutable)
 - **Date**: 2026-11-19
 - **Related**: [design/DESIGN.md](../DESIGN.md) §2.2/§4.6/§4.7, [design/MEMORY-MODEL.md](../MEMORY-MODEL.md)
   §6, [design/WORKER-MODEL.md](../WORKER-MODEL.md) §3, [ADR-024](ADR-024-resident-per-episode-budget.md),
@@ -31,7 +31,25 @@ tools and worker completion reports, which is a separate semantic change." This 
 change's design, and it stops at the owner gate because two decisions are genuinely open (the
 rotation trigger and the end reason).
 
-## Decision (proposed)
+## Implementation status
+
+- **Phase 0 — landed (2026-11-20).** Boot-time rotation: `superagent.router.rotate_after_events`
+  (absent = off; explicit `0` refuses boot); the sixth end reason `rotated` and the terminal
+  `rotated` session state; the atomic `drain/claimed` + `session/ended{rotated}` close in assembly
+  (before any drain or service exists); the chain re-resolution onto the uuid5 successor; migration
+  of the predecessor's pending *message* rows; the bounded synthetic handoff; and the successor's
+  fixed context order (ADR-038 memory index → migrated rows → handoff → judge prompt). Gates: only
+  an `idle` live session rotates, and a live lease wins. This bounds context across restarts and
+  refreshes the memory index without any runtime rebind. Deployment assumption: a single serving
+  process (or all replicas restart together) — a second live replica keeps the retired id in
+  memory; safe rotation across live replicas is phase 2's shared binding.
+- **Phase 1 — not started.** The shared `ResidentBinding` refactor (every surface resolves the live
+  session through one binding), behavior-identical.
+- **Phase 2 — not started.** Runtime rotation at a proven-idle boundary, serialized by a reserved
+  control row inside the drain, with the input-migration rule and the successor re-point of every
+  surface.
+
+## Decision (the phase-2 design)
 
 1. **A shared `ResidentBinding`.** Every surface that resolves the live resident session reads one
    `Arc<ResidentBinding>` (`ArcSwap<SessionId>` + generation) instead of capturing a `SessionId` at

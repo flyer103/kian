@@ -480,6 +480,12 @@ impl Server {
             kian_core::model::SessionId,
             kian_superagent::MultiagentLimits,
         )> = None;
+        // ADR-040 phase 0: the boot-time rotation, if one happened.
+        // Captured here (the plugin assembles before the engine exists)
+        // and handed to `start_services`, which admits the migrated rows
+        // and the handoff AFTER the memory index and BEFORE the judge
+        // prompt.
+        let mut resident_rotation: Option<crate::rotation::BootRotation> = None;
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
             // Super-agent mode: the bundle plugin builds all three
             // loops (router/worker/plain); `react-loop` is absent.
@@ -516,7 +522,8 @@ impl Server {
             // everywhere the pinned id used to go. Soft-failed sessions
             // project idle and stay generation 0 — the next admitted
             // input re-opens them, no successor needed.
-            let router_re_arm = kian_superagent::rearm::resolve_re_arm(router_session, {
+            let router_pinned = router_session;
+            let mut router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
                 let store = store.clone();
                 move |session| {
                     let store = store.clone();
@@ -527,9 +534,42 @@ impl Server {
             .map_err(|e| {
                 ServeError::Assembly(format!(
                     "router re-arm resolution (pinned {}): {e}",
-                    router_session.0
+                    router_pinned.0
                 ))
             })?;
+            // ADR-040 phase 0: retire the live Router at boot when its
+            // stream grew past the configured threshold. The close is one
+            // atomic claim+end batch; the walk then resolves the fresh
+            // successor, and every surface below binds it as usual.
+            if sa.router.rotate_after_events.is_some() {
+                let rotation = crate::rotation::rotate_at_boot(
+                    &store,
+                    sa.router.rotate_after_events,
+                    router_re_arm.live,
+                    &config.drain.holder,
+                    config.drain.lease_ttl_ms,
+                    &memory_redactor,
+                )
+                .await
+                .map_err(ServeError::Assembly)?;
+                if rotation.is_some() {
+                    router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
+                        let store = store.clone();
+                        move |session| {
+                            let store = store.clone();
+                            Box::pin(async move { store.rebuild(session).await })
+                        }
+                    })
+                    .await
+                    .map_err(|e| {
+                        ServeError::Assembly(format!(
+                            "router re-arm resolution after rotation (pinned {}): {e}",
+                            router_pinned.0
+                        ))
+                    })?;
+                    resident_rotation = rotation;
+                }
+            }
             let router_session = router_re_arm.live;
             // (R15-C5): with the block present, the child inactivity
             // plan carries the live Router session (pin P5's walk
@@ -1136,6 +1176,7 @@ impl Server {
                     server.store.clone(),
                     Arc::clone(&startup_order),
                     server.session_bootstrap.clone(),
+                    resident_rotation,
                 )
                 .await
                 .map_err(ServeError::Assembly)?,
