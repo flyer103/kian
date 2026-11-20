@@ -30,6 +30,9 @@ pub struct CodexConfig {
     pub env: Vec<(String, String)>,
     /// The handshake deadline.
     pub startup_timeout: Duration,
+    /// The loopback capture proxy's base URL (ADR-046); the child gets `-c
+    /// model_providers.kian-capture.base_url=<base>/<session>/v1`. `None` = no capture.
+    pub capture_base: Option<String>,
 }
 
 impl Default for CodexConfig {
@@ -42,16 +45,33 @@ impl Default for CodexConfig {
             approval_policy: "on-request".to_owned(),
             env: Vec::new(),
             startup_timeout: Duration::from_secs(15),
+            capture_base: None,
         }
     }
 }
 
 impl CodexConfig {
-    /// The child argv: `codex app-server`, then extras.
+    /// The child argv: `codex app-server`, then extras, then the capture provider overrides.
     #[must_use]
-    pub fn argv(&self) -> Vec<String> {
+    pub fn argv(&self, session: &kian_core::model::SessionId) -> Vec<String> {
         let mut argv = vec!["app-server".to_owned()];
         argv.extend(self.args.iter().cloned());
+        if let Some(base) = &self.capture_base {
+            let provider = "kian-capture".to_owned();
+            argv.push("-c".to_owned());
+            argv.push(format!("model_provider={provider}"));
+            argv.push("-c".to_owned());
+            argv.push(format!("model_providers.{provider}.name={provider}"));
+            argv.push("-c".to_owned());
+            argv.push(format!(
+                "model_providers.{provider}.base_url={base}/{}/v1",
+                session.0
+            ));
+            argv.push("-c".to_owned());
+            argv.push(format!("model_providers.{provider}.wire_api=responses"));
+            argv.push("-c".to_owned());
+            argv.push(format!("model_providers.{provider}.env_key=OPENAI_API_KEY"));
+        }
         argv
     }
 

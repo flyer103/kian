@@ -12,6 +12,7 @@ the live legs. The contract lives in [HARNESS-BRIDGE](../design/HARNESS-BRIDGE.m
 | Codex mapping + driver | **fixture-proven, default CI** | `crates/kian-codex/tests/driver_bridge.rs` (scripted `app-server` child: initialize/thread/turn, approval request → decline, crash) + `crates/kian-codex/src/codec.rs` unit tests |
 | Config / mount | **default CI** | `crates/kian-cli/src/config.rs` tests: mount resolution, defaults, one-harness rule, worker-surface exclusion, `ask` and bypass-flag refusals |
 | Durable bridge marker | **default CI (L1)** | `crates/kian-orchestrator` `create_session_with` (payload written once, idempotent) + `crates/kian-superagent/tests/spawn_session_creation.rs` (create → admit → wake ordering, failed create admits nothing) + config `bridge_marker()` derivation |
+| Request capture | **default CI (unit/integration)** | `crates/kian-cli/src/capture.rs` (record-before-forward, response passthrough, oversize/unknown-session fail-closed, never forwarded) + `kian-claude/tests/driver_bridge.rs` (captured attempts append `step/request` before the assistant event, non-JSON is an honest soft failure) |
 | Mounted `kian serve` e2e | **default CI** | `crates/kian-cli/tests/harness_bridge.rs`: real `kian serve`, worker template over the scripted Claude peer — mapped turn, no `step/request`, honest end. (Includes a kill -9 mid-turn takeover: the restarted server ends the session `failed`, never `completed`, with no re-run.) |
 | Claude Code live | **protocol-verified; model turn UNVERIFIED** — `claude 2.1.318`, not logged in on this host (`Not logged in · Please run /login`) | `KIAN_CLAUDE_BIN=… cargo test -p kian-claude --test live -- --nocapture`: observed `InputAdmitted → TurnStart → TurnEnd(error)` and `Settled` — the error is reported honestly, no fabricated answer |
 | Codex live | **positive, 2026-11-20** — `codex-cli 0.166.0`, one real turn, reply `pong`, `Settled` | `KIAN_CODEX_BIN=… cargo test -p kian-codex --test live -- --nocapture`: observed `InputAdmitted → TurnStart → AssistantMessage("pong") → TurnEnd(final_answer)` |
@@ -62,6 +63,15 @@ production with `superagent.harness.{claude,codex}` (see README).
 A live run is **recorded here** with: the CLI version, the model, the mapped chain observed, the
 outcome (`Settled`/`SoftFailed` and why), and any protocol drift. A green fixture run is not a
 substitute.
+
+## Request capture (ADR-046)
+
+Enable with `superagent.harness.capture:`; kian starts a loopback proxy and points the harness at
+it. Probes (local stub upstream, no model call): `claude 2.1.318` honors `ANTHROPIC_BASE_URL`
+(`POST /v1/messages?beta=true`, 91 KB body, 3 retries on 5xx); `codex-cli 0.166.0` ignores
+`OPENAI_BASE_URL` but honors a generated provider config (`CODEX_HOME`/`-c`, `POST
+/v1/responses`, 52 KB body, 5 reconnects). Both used API-key auth; **OAuth-only routes are
+unverified**. A full live captured turn (proxy → real model) is not recorded yet.
 
 ## Known limits (phase 1, by contract)
 

@@ -60,6 +60,7 @@ pub mod api;
 pub mod archive;
 pub mod async_bridge;
 pub mod cache_metrics;
+mod capture;
 pub mod client;
 pub mod commands;
 pub mod config;

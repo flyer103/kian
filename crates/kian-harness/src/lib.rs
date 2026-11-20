@@ -34,8 +34,8 @@ pub mod testing;
 pub use approval::{ApprovalPolicy, Decision, Rule};
 pub use ctx::{BridgeCtx, BridgeCtxError};
 pub use driver::{
-    BridgeDriver, BridgeDriverConfig, SessionFactory, ToolPostPort, ToolPostView, ToolPreCall,
-    ToolPrePort, ToolPreVerdict,
+    BridgeDriver, BridgeDriverConfig, CaptureSource, CaptureStream, MapLabels, SessionFactory,
+    ToolPostPort, ToolPostView, ToolPreCall, ToolPrePort, ToolPreVerdict,
 };
 pub use event::{
     ApprovalAnswer, ApprovalRequest, Capabilities, ContractError, Control, HarnessSession, Mapped,
