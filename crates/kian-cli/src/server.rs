@@ -908,6 +908,7 @@ impl Server {
                         kian_harness::BridgeDriverConfig {
                             policy: mount.policy,
                             max_steps: mount.max_steps,
+                            step_timeout_ms: mount.step_timeout_ms,
                         },
                     )
                     .with_tool_pre_port(std::sync::Arc::new(

@@ -8,6 +8,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness bridge: an open step is bounded (ADR-044)**. `superagent.harness.<name>` gains
+  `step_timeout_ms` (default `1_800_000` = 30 min; `0` disables; below `10_000` refuses boot),
+  bounding how long an open harness step may pass with neither a protocol event from the child nor
+  a completed control write. Expiry is `SoftFailed` naming the bound — the engine settles `failed`,
+  the episode-end kill path kills the child, and the ADR-035 release/reclaim frees the worker —
+  instead of a live-but-silent child parking the drain forever. Applies to both bridge drivers
+  (`kian-harness`: Claude Code/Codex; `kian-dsh`); no new event kind, state edge or wire byte.
+  Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §4.5, §6.1, §6.2, §9.
+
 - **Harness approvals dispatch at `tool/pre` (HARNESS-BRIDGE §4.4, PLUGIN-SPEC §3.2.5,
   ADR-045)**. A Claude Code/Codex tool that the harness gates is now consulted on kian's plugin
   bus before the answer: a `veto:tool` sidecar can deny it, deny wins over a declarative allow,
@@ -19,7 +28,6 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   Auto-approved harness tools, subagents and background jobs stay outside the contract (the
   deferred `PreToolUse` shim is phase 3). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
   §4.4; [design/PLUGIN-SPEC.md](design/PLUGIN-SPEC.md) §3.2.5, §3.4.1.
-
 - **Cron: the worktree arm can run any harness (CRON-MODEL §6.2)**. `superagent.cron.harness`
   gains `args` and `raw: true`: the default stays the dsh shape (`args --profile <name> <payload>`,
   profile `headless`), while raw mode appends the scheduled payload to the fixed args
@@ -27,7 +35,6 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   refuses a `profile`, and rejects empty args — all fail-closed at load. The firing record, worktree
   isolation, ceilings and capture are unchanged. Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md)
   §6.2.
-
 - **Harness bridges: live verification and the first protocol fixes (HARNESS-BRIDGE phase 1,
   ADR-043)**. Live suites now ship for both adapters (skip without `KIAN_CLAUDE_BIN` /
   `KIAN_CODEX_BIN`). Running them against `codex-cli 0.166.0` fixed the real handshake: the pinned
@@ -48,7 +55,6 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   dispositions — landed in `imsg` 0.14.0; `0.11.x` answers `-32601 Method not found` and the bridge
   refuses startup. The contract pins the floor and the runbook upgrades the dependency. Contract:
   [design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md) §2.5; the first live L3 evidence is §12.
-
 - **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-043)**. The worker
   template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code
   `stream-json` adapter (`kian-claude`) or the Codex `app-server` JSON-RPC adapter

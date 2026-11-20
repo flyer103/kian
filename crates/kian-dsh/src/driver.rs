@@ -89,6 +89,12 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// interval so a late-admitted input still lands.
 pub const IDLE_INPUT_RECHECK: Duration = Duration::from_millis(50);
 
+/// Default open-step inactivity bound (HARNESS-BRIDGE §4.5, ADR-044): how long an open dsh step
+/// may produce no progress (no protocol line, no completed control write) before the child is
+/// declared unresponsive. Generous on purpose — the bound ends a dead bridge, it does not police a
+/// slow one. `0` disables the bound.
+pub const DEFAULT_STEP_TIMEOUT_MS: u64 = 1_800_000;
+
 /// Driver configuration (assembly-owned; `superagent.harness.dsh`).
 #[derive(Debug, Clone)]
 pub struct DshDriverConfig {
@@ -103,6 +109,8 @@ pub struct DshDriverConfig {
     pub max_steps: u64,
     /// How long the first frame (`ready`) may take. Default 10s.
     pub startup_timeout: Duration,
+    /// Open-step inactivity bound (ADR-044). `0` disables the bound.
+    pub step_timeout_ms: u64,
 }
 
 impl DshDriverConfig {
@@ -114,6 +122,7 @@ impl DshDriverConfig {
             map,
             max_steps: DEFAULT_MAX_STEPS,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            step_timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
         }
     }
 }
@@ -379,6 +388,12 @@ impl DshDriver {
             .expect("DshDriver is constructed with a config")
     }
 
+    /// The configured open-step inactivity bound; `None` when disabled (`0`).
+    fn step_bound(&self) -> Option<Duration> {
+        (self.config().step_timeout_ms > 0)
+            .then(|| Duration::from_millis(self.config().step_timeout_ms))
+    }
+
     #[must_use]
     pub fn config_ref(&self) -> &DshDriverConfig {
         self.config()
@@ -498,6 +513,7 @@ impl DshDriver {
                 St::Done,
             );
         }
+        let bound = self.step_bound();
         let mut sess = match self.spawn(&events).await {
             Ok(sess) => sess,
             Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
@@ -512,7 +528,7 @@ impl DshDriver {
         let fresh = fresh_promotions(&events);
         for payload in fresh {
             if let Err(reason) =
-                deliver_admitted(&mut sess.peer, &mut sess.delivered, &payload).await
+                deliver_admitted(&mut sess.peer, &mut sess.delivered, &payload, bound).await
             {
                 return (LoopOutcome::SoftFailed { reason }, St::Done);
             }
@@ -553,9 +569,13 @@ impl DshDriver {
     }
 
     /// Delivers every persisted-but-unechoed user input to the child.
-    async fn deliver_undelivered(&self, sess: &mut BridgeSession) -> Result<(), String> {
+    async fn deliver_undelivered(
+        &self,
+        sess: &mut BridgeSession,
+        bound: Option<Duration>,
+    ) -> Result<(), String> {
         for payload in sess.dedup.undelivered_user_inputs(&sess.delivered) {
-            deliver_admitted(&mut sess.peer, &mut sess.delivered, &payload).await?;
+            deliver_admitted(&mut sess.peer, &mut sess.delivered, &payload, bound).await?;
         }
         Ok(())
     }
@@ -567,6 +587,7 @@ impl DshDriver {
         mut sess: BridgeSession,
         steps_in_stream: u64,
     ) -> (LoopOutcome, St) {
+        let bound = self.step_bound();
         loop {
             // Safe boundary: no dsh step is open (mapper state — the
             // authoritative boundary here, since replayed turn events
@@ -574,14 +595,16 @@ impl DshDriver {
             if !sess.mapper.step_open() {
                 if ctx.interrupt_requested() && !sess.interrupt_sent {
                     sess.interrupt_sent = true;
-                    if sess
-                        .peer
-                        .ctrl_tx
-                        .send(ControlFrame::Interrupt)
-                        .await
-                        .is_err()
+                    match within_step_bound(
+                        bound,
+                        "dsh interrupt control write",
+                        sess.peer.ctrl_tx.send(ControlFrame::Interrupt),
+                    )
+                    .await
                     {
-                        return (control_closed(), St::Done);
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return (control_closed(), St::Done),
+                        Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
                     }
                 }
                 match ctx.take_eligible_inputs().await {
@@ -592,9 +615,13 @@ impl DshDriver {
                             // payload so the child's echo de-duplicates.
                             let payload = consumption_payload(&row.payload);
                             sess.dedup.add(EventKind::InputAdmitted, payload.clone());
-                            if let Err(reason) =
-                                deliver_admitted(&mut sess.peer, &mut sess.delivered, &payload)
-                                    .await
+                            if let Err(reason) = deliver_admitted(
+                                &mut sess.peer,
+                                &mut sess.delivered,
+                                &payload,
+                                bound,
+                            )
+                            .await
                             {
                                 return (LoopOutcome::SoftFailed { reason }, St::Done);
                             }
@@ -613,7 +640,16 @@ impl DshDriver {
             // an input admitted after the boundary check deadlocks the
             // episode (peer blocked on `expect`, driver on the line).
             let msg = if sess.mapper.step_open() {
-                sess.peer.line_rx.recv().await
+                match within_step_bound(
+                    bound,
+                    "dsh step (no protocol line)",
+                    sess.peer.line_rx.recv(),
+                )
+                .await
+                {
+                    Ok(msg) => msg,
+                    Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
+                }
             } else {
                 tokio::select! {
                     m = sess.peer.line_rx.recv() => m,
@@ -645,7 +681,8 @@ impl DshDriver {
                             // window's closure; the echo of a late
                             // delivery then matches the multiset).
                             if absorbed_turn_end(&text)
-                                && let Err(reason) = self.deliver_undelivered(&mut sess).await
+                                && let Err(reason) =
+                                    self.deliver_undelivered(&mut sess, bound).await
                             {
                                 return (LoopOutcome::SoftFailed { reason }, St::Done);
                             }
@@ -886,6 +923,7 @@ async fn deliver_admitted(
     peer: &mut PeerHandle,
     delivered: &mut BTreeSet<String>,
     admitted: &Value,
+    bound: Option<Duration>,
 ) -> Result<(), String> {
     let key = canon(admitted);
     if delivered.contains(&key) {
@@ -897,12 +935,41 @@ async fn deliver_admitted(
     } else {
         ControlFrame::Input { content }
     };
-    peer.ctrl_tx
-        .send(frame)
-        .await
-        .map_err(|e| format!("deliver input: {e}"))?;
+    match within_step_bound(
+        bound,
+        "dsh input delivery (control write)",
+        peer.ctrl_tx.send(frame),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("deliver input: {e}")),
+        Err(reason) => return Err(reason),
+    }
     delivered.insert(key);
     Ok(())
+}
+
+/// Bounds one wait on the dsh child by the configured open-step inactivity bound (ADR-044).
+///
+/// `step_timeout_ms = 0` disables the bound (the pre-ADR wait). The `Err` is the driver's honest
+/// `SoftFailed` reason: the child is unresponsive, never "completed".
+async fn within_step_bound<T>(
+    bound: Option<Duration>,
+    what: &'static str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let Some(bound) = bound else {
+        return Ok(fut.await);
+    };
+    match tokio::time::timeout(bound, fut).await {
+        Ok(value) => Ok(value),
+        Err(_) => Err(format!(
+            "harness {what}: no progress within the step bound ({} ms, HARNESS-BRIDGE §4.5, \
+             ADR-044) — the child is unresponsive; ending honestly",
+            bound.as_millis()
+        )),
+    }
 }
 
 #[cfg(test)]

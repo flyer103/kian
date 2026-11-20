@@ -35,6 +35,7 @@ async fn live_claude_turn_is_mapped_and_honest() {
         BridgeDriverConfig {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 8,
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     );
     let outcomes = tokio::time::timeout(

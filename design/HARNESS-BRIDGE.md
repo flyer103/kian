@@ -5,8 +5,7 @@
   [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document generalizes the
   *kian-side* contract and adds Claude Code and Codex bridges
   ([ADR-043](decisions/ADR-043-multi-harness-bridge.md)). The open-step inactivity bound is
-  designed in [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (**proposed**, owner
-  gate).
+  [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (accepted, owner gate 2026-11-20).
 - **Owners**: `kian-harness` (shared skeleton), `kian-claude` (Claude Code adapter),
   `kian-codex` (Codex adapter). `kian-dsh` keeps its v0 contract; convergence is phase 3.
 - **Read this with**: [SPEC](../docs/SPEC.md) §2.2 C, [DESIGN](DESIGN.md) §6.2/§7/§16,
@@ -214,7 +213,7 @@ recorded because it is the phase-2 `ask` problem in miniature (§10).
 - open-step inactivity (`step_timeout_ms`, default 30 min, `0` disables) → `SoftFailed` naming
   the bound: a live but silent child (a deadlocked CLI, a hung internal tool) would otherwise park
   the drain forever and hold the worker slot — the same class ADR-041 closed for model calls
-  ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md), proposed);
+  ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md));
 - an idle safe boundary re-checks inputs on a bounded interval (the dsh fix for folded wakes,
   [`driver.rs`](../crates/kian-dsh/src/driver.rs) lines 606–626) so a late admit cannot
   deadlock the episode.
@@ -319,7 +318,7 @@ superagent:
       args: ["--permission-mode", "default"]   # fixed at spawn; defaults documented
       model: claude-sonnet-4-5           # passed to the harness; audit label for the stream
       max_steps: 32
-      step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044, proposed)
+      step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044)
       # startup_timeout_ms applies to harnesses with an explicit handshake (codex, dsh), not Claude.
       approvals:                          # §6.3
         default: deny
@@ -349,7 +348,10 @@ superagent:
 6. `superagent.cron.harness` is the cron runner, not the worker bridge: its default shape is dsh
    (`args --profile <name> <payload>`), and `raw: true` runs any harness as `args <payload>`
    (`claude --print … "<task>"`, `codex exec "<task>"`). A raw config needs an explicit `command`
-   and refuses a `profile`; the argv contract is [CRON-MODEL](CRON-MODEL.md) §6.2.
+   and refuses a `profile`; the argv contract is [CRON-MODEL](CRON-MODEL.md) §6.2;
+7. `harness.<name>.step_timeout_ms` is `0` (disabled) or at least `10_000`; anything smaller
+   **refuses boot** — the knob ends a dead bridge, it must not reintroduce a smaller livelock
+   ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)).
 
 ### 6.3 Approval policy
 
@@ -403,6 +405,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
+| A12 | open-step silence → SoftFailed naming `step_timeout_ms` (never `completed`, no fabricated `turn/end`); a step that keeps emitting is not cut; `0` disables; below 10 s refuses boot; the mounted bridge ends a stalled session within the bound ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)) | L1/L2 |
 
 ## 10. Phases
 
@@ -411,9 +414,9 @@ policy, durable marker, config, capability matrix, fixtures, conformance tests, 
 untouched. Cron worktree firings run the configured harness: the dsh profile shape by default, or
 raw argv (`raw: true`) for Claude Code/Codex ([CRON-MODEL](CRON-MODEL.md) §6.2).
 
-**Phase 1.5 (ADR-044, proposed).** Bound the open-step wait (event read and control write) in
+**Phase 1.5 (ADR-044, landed).** The open-step wait (event read and control write) is bounded in
 both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
-end and the worker slot is reclaimed instead of parked forever.
+end and the worker slot is reclaimed instead of parked forever — see §9 A12.
 
 **Phase 2.** Harness approvals dispatch at `tool/pre` (ADR-045; landed), durable interactive
 `ask` (with the restart semantics designed), interrupt forwarded to a live child,
@@ -454,6 +457,3 @@ smoke exists.
    separate event in phase 2.
 5. Should the two new crates ship behind a `harness-bridges` feature flag, or as plain workspace
    members like `kian-dsh`?
-6. ADR-044 (proposed): is the 30-minute `step_timeout_ms` default right for real harness tools, and
-   should the knob be per harness (`harness.<name>`) or per worker template (a deployment may run
-   one long-build bridge beside a short interactive one)?
