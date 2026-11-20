@@ -8,6 +8,21 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness bridges: live verification and the first protocol fixes (HARNESS-BRIDGE phase 1,
+  ADR-043)**. Live suites now ship for both adapters (skip without `KIAN_CLAUDE_BIN` /
+  `KIAN_CODEX_BIN`). Running them against `codex-cli 0.166.0` fixed the real handshake: the pinned
+  `unlessTrusted` approval policy is rejected by app-server (the variants are `untrusted`,
+  `on-request`, `granular`, `never`; the bridge pins `on-request`, `never` still refuses boot),
+  and advisory notification namespaces (MCP lifecycle, account, skills, config, thread/usage,
+  diffs/plans, item deltas) are absorbed instead of failing the turn. Running against
+  `claude 2.1.318` fixed readiness and error honesty: the CLI has no ready frame and may stay
+  silent until the first input, emits `system/hook_*` before `system/init`, and reports
+  provider/auth failures as a synthetic `is_api_error_message` assistant message (absorbed —
+  the `result`'s error turn end is the honest record). Codex ran a real live turn (`pong`;
+  `Settled`); Claude is protocol-verified but its model turn was not exercised (the local CLI is
+  not logged in). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §5.1, §5.2, §11;
+  run log: [docs/runbook-harness.md](docs/runbook-harness.md).
+
 - **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-043)**. The worker
   template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code
   `stream-json` adapter (`kian-claude`) or the Codex `app-server` JSON-RPC adapter

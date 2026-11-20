@@ -3,12 +3,10 @@
 //! Pure line-in / event-out logic plus the kian→Claude frame builders. The adapter owns no I/O
 //! here, so every mapping rule is unit-testable without a child.
 
-use std::collections::VecDeque;
-use std::time::Duration;
-
 use kian_core::events::EventKind;
 use kian_harness::event::{ApprovalAnswer, ApprovalRequest, ContractError, Mapped, SessionEvent};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 
 /// The adapter's spawn recipe.
 #[derive(Debug, Clone)]
@@ -21,8 +19,6 @@ pub struct ClaudeConfig {
     pub model: Option<String>,
     /// Extra environment (credential *names* resolved by assembly; never logged).
     pub env: Vec<(String, String)>,
-    /// The handshake deadline.
-    pub startup_timeout: Duration,
 }
 
 impl Default for ClaudeConfig {
@@ -32,7 +28,6 @@ impl Default for ClaudeConfig {
             args: Vec::new(),
             model: None,
             env: Vec::new(),
-            startup_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -141,6 +136,17 @@ impl ClaudeMapper {
         &mut self,
         obj: &serde_json::Map<String, Value>,
     ) -> Result<(), ContractError> {
+        // The CLI reports some provider/auth failures as a *synthetic* assistant message
+        // (`"model":"<synthetic>"`, `"is_api_error_message":true`, `"error":...`). That text is
+        // not model output; the honest record is the `result`'s error turn end. Absorb it.
+        if obj.get("is_api_error_message").and_then(Value::as_bool) == Some(true)
+            || obj.get("error").is_some()
+        {
+            self.held.push_back(SessionEvent::Mapped(Mapped::Absorbed {
+                kind: "claude/api_error",
+            }));
+            return Ok(());
+        }
         let content = obj
             .get("message")
             .and_then(|m| m.get("content"))

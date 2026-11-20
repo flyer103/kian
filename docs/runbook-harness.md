@@ -13,12 +13,13 @@ the live legs. The contract lives in [HARNESS-BRIDGE](../design/HARNESS-BRIDGE.m
 | Config / mount | **default CI** | `crates/kian-cli/src/config.rs` tests: mount resolution, defaults, one-harness rule, worker-surface exclusion, `ask` and bypass-flag refusals |
 | Durable bridge marker | **default CI (L1)** | `crates/kian-orchestrator` `create_session_with` (payload written once, idempotent) + `crates/kian-superagent/tests/spawn_session_creation.rs` (create → admit → wake ordering, failed create admits nothing) + config `bridge_marker()` derivation |
 | Mounted `kian serve` e2e | **default CI** | `crates/kian-cli/tests/harness_bridge.rs`: real `kian serve`, worker template over the scripted Claude peer — mapped turn, no `step/request`, honest end. (Includes a kill -9 mid-turn takeover: the restarted server ends the session `failed`, never `completed`, with no re-run.) |
-| Claude Code live | **UNVERIFIED** — no real `claude` binary in this environment, so no live run is recorded | run the command below |
-| Codex live | **UNVERIFIED** — no real `codex` binary in this environment | run the command below |
+| Claude Code live | **protocol-verified; model turn UNVERIFIED** — `claude 2.1.318`, not logged in on this host (`Not logged in · Please run /login`) | `KIAN_CLAUDE_BIN=… cargo test -p kian-claude --test live -- --nocapture`: observed `InputAdmitted → TurnStart → TurnEnd(error)` and `Settled` — the error is reported honestly, no fabricated answer |
+| Codex live | **positive, 2026-11-20** — `codex-cli 0.166.0`, one real turn, reply `pong`, `Settled` | `KIAN_CODEX_BIN=… cargo test -p kian-codex --test live -- --nocapture`: observed `InputAdmitted → TurnStart → AssistantMessage("pong") → TurnEnd(final_answer)` |
 
-The fixture children speak the *native* protocol shapes pinned below; an unverified live leg means
-the shapes may drift with the CLI version. Until a live run is recorded, the capability matrix's
-`◐` rows stay `◐`.
+The fixture children speak the *native* protocol shapes pinned below. Codex's live leg is recorded;
+Claude's protocol is live-verified but its model turn is blocked by the local login, and neither
+live run exercised tool approvals — the capability matrix's `◐` rows for approvals and
+`tool/call`-before-execution stay `◐` until a tool-using live run is recorded.
 
 ## Protocol pins
 
@@ -42,25 +43,21 @@ upstream `codex-rs/app-server/README.md`):
 - notifications: `turn/started`, `item/started`, `item/completed`, `turn/completed`
 - approvals: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`; answer
   `{"decision":"accept"|"decline"}`
+- `thread/start.approvalPolicy`: `untrusted | on-request | granular | never` (0.166.0 rejects the
+  old `unlessTrusted`); the bridge pins `on-request`
 
 ## Running the live legs
 
-Claude Code (needs a real `claude` and a working credential):
+Both live suites ship and skip cleanly when the env var is absent:
 
 ```bash
-export KIAN_CLAUDE_BIN="$(command -v claude)"
-# No live suite ships in phase 1; drive it through a worker session with
-# `superagent.harness.claude.command` set to the same path, or point the fixture tests'
-# adapter at the real binary in a scratch harness config.
+KIAN_CLAUDE_BIN="$(command -v claude)" cargo test -p kian-claude --test live -- --nocapture
+KIAN_CODEX_BIN="$(command -v codex)"   cargo test -p kian-codex   --test live -- --nocapture
 ```
 
-Codex:
-
-```bash
-export KIAN_CODEX_BIN="$(command -v codex)"
-# Same shape: mount `superagent.harness.codex` with `command: $KIAN_CODEX_BIN` and
-# `approval_policy: unlessTrusted`, then run one worker turn.
-```
+The Claude CLI must be logged in (`claude` then `/login`, or `ANTHROPIC_API_KEY`) for a model round
+trip; without it the run records the honest `TurnEnd(error)`. The same adapters are mounted in
+production with `superagent.harness.{claude,codex}` (see README).
 
 A live run is **recorded here** with: the CLI version, the model, the mapped chain observed, the
 outcome (`Settled`/`SoftFailed` and why), and any protocol drift. A green fixture run is not a

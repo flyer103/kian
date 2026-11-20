@@ -191,7 +191,10 @@ recorded because it is the phase-2 `ask` problem in miniature (§10).
   counter only when they carry no model-visible content, otherwise an error;
 - step budget (`max_steps`, default 32) → `Stopped`, exactly like the built-in loop's
   iteration budget;
-- startup deadline (default 10s) → `SoftFailed` naming the deadline;
+- a harness with an explicit handshake (Codex `initialize`/`thread/start`) has a startup
+  deadline → `SoftFailed` naming it; Claude Code has no ready frame — readiness is the spawn
+  plus the first input, and a silent child is bounded only by the drain's interrupt/lease, like
+  an in-flight provider call;
 - an idle safe boundary re-checks inputs on a bounded interval (the dsh fix for folded wakes,
   [`driver.rs`](../crates/kian-dsh/src/driver.rs) lines 606–626) so a late admit cannot
   deadlock the episode.
@@ -231,8 +234,10 @@ introduce (no new kinds), and it participates in no plugin resolution or model-s
 
 ### 5.1 Claude Code — `claude --print --input-format stream-json --output-format stream-json --verbose`
 
-Long-lived child; one JSON object per line each way. The adapter must pin the exact CLI
-version it was verified against (§11).
+Long-lived child; one JSON object per line each way. The CLI has **no ready frame**: readiness is
+the spawn plus the first input (the stream may stay silent until then), and it emits advisory
+`system/hook_*` lines before `system/init`. The adapter pins the exact CLI version it was
+verified against (§11).
 
 | Claude event | kian mapping | notes |
 |---|---|---|
@@ -245,7 +250,8 @@ version it was verified against (§11).
 | `result` (`success` / `error_*` / interrupted) | `turn/end` outcome `final_answer` / `error` / `cancelled` | interrupts are `cancelled`, never `final` |
 | `stream_event` (partial deltas) | absorbed (counter) | never mapped; the final message is the truth |
 | unknown top-level `type` | `ContractError` → `SoftFailed` | forward-compat is a contract amendment |
-| `rate_limit_event` / other advisory system messages | absorbed (counter) | audit-only |
+| `rate_limit_event` / `system/hook_*` / other advisory system messages | absorbed (counter) | audit-only |
+| `assistant` with `is_api_error_message: true` or `error` (a synthetic provider/auth failure) | absorbed (counter) | not model output; the `result`'s error turn end is the honest record |
 
 Turn boundaries: the driver opens a `turn/start` when it delivers an input at a safe boundary
 and closes it on `turn/end`; a steer queued mid-turn does **not** open a second turn. A child
@@ -257,7 +263,9 @@ assistant message).
 Client role. Handshake: `initialize` (capabilities negotiated; a version mismatch is a
 `ContractError`). Thread: `thread/start` for a new session, `thread/resume` on a continuation.
 Turn: `turn/start`; new user input during a turn is `turn/steer` when supported, otherwise a
-queued next turn; `turn/interrupt` for interrupt.
+queued next turn; `turn/interrupt` for interrupt. `thread/start` pins `approvalPolicy`; app-server
+**0.166.0** accepts `untrusted | on-request | granular | never` (the older `unlessTrusted` spelling
+is rejected). The bridge pins `on-request`; `never` refuses boot because it removes the gate.
 
 | Codex event | kian mapping |
 |---|---|
@@ -267,7 +275,8 @@ queued next turn; `turn/interrupt` for interrupt.
 | server→client approval request (exec/patch/…), answered by kian | approval (§4.4) |
 | `turn/completed` (status completed/interrupted/failed) | `turn/end` `final_answer` / `cancelled` / `error` |
 | `turn/diff`, plan/usage notifications | absorbed (counter), audit-only |
-| unknown method/notification | `ContractError` → `SoftFailed` |
+| advisory namespaces (`mcpServer/`, `account/`, `skills/`, `app/`, `config/`, `thread/`, `turn/diff|plan/`, `item/*` deltas) | absorbed (counter), audit-only |
+| unknown method/notification outside those namespaces | `ContractError` → `SoftFailed` |
 
 Exact method and notification names, item variants and approval shapes are pinned per Codex
 version in §11; an unverified name is a boot-time preflight refusal, never a runtime guess.
@@ -290,7 +299,6 @@ superagent:
       args: ["--permission-mode", "default"]   # fixed at spawn; defaults documented
       model: claude-sonnet-4-5           # passed to the harness; audit label for the stream
       max_steps: 32
-      startup_timeout_ms: 10000
       approvals:                          # §6.3
         default: deny
         allow: ["Read", "Bash(git status*)"]
@@ -371,7 +379,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
-| A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook | L3 (env-gated, CI-excluded) |
+| A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
 
 ## 10. Phases
 
@@ -396,9 +404,9 @@ with a live smoke before an adapter claims the capability:
 
 | Fact to pin | Why it matters | Where it bites |
 |---|---|---|
-| Claude Code stream-json message set, `can_use_tool` shape, interrupt control request, `--resume` semantics | the adapter's whole mapping | `kian-claude` codec, §5.1 |
+| Claude Code stream-json message set, `can_use_tool` shape, interrupt control request, `--resume` semantics | the adapter's whole mapping | `kian-claude` codec, §5.1 — **2.1.318 verified**: `system/hook_*` precede `init`, no ready frame, synthetic API-error assistant messages; `can_use_tool`/`--resume` still unverified live |
 | whether Claude Code re-emits history on `--resume` | dedup correctness on takeover | A4 |
-| Codex app-server method/notification names, item variants, approval request/response shapes, `thread/resume`, `turn/steer` | the adapter's whole mapping | `kian-codex` codec, §5.2 |
+| Codex app-server method/notification names, item variants, approval request/response shapes, `thread/resume`, `turn/steer` | the adapter's whole mapping | `kian-codex` codec, §5.2 — **0.166.0 verified**: handshake, `thread/start`, `turn/start`, `item/*` agent message, `turn/completed`; approval shapes and `turn/steer` still unverified live |
 | whether either CLI exposes the assembled request anywhere (debug/telemetry) | whether phase 3's proxy is the only route to exact | §2 |
 | exit codes and mid-turn kill behaviour of both CLIs | honesty mapping (A3) | §4.5 |
 

@@ -24,7 +24,7 @@ pub struct CodexConfig {
     pub model: Option<String>,
     /// The working directory for the thread.
     pub cwd: Option<String>,
-    /// The approval policy pinned for the thread (`unlessTrusted` keeps the gate live).
+    /// The approval policy pinned for the thread (`on-request` keeps the gate live).
     pub approval_policy: String,
     /// Extra environment (credential names resolved by assembly; never logged).
     pub env: Vec<(String, String)>,
@@ -39,7 +39,7 @@ impl Default for CodexConfig {
             args: Vec::new(),
             model: None,
             cwd: None,
-            approval_policy: "unlessTrusted".to_owned(),
+            approval_policy: "on-request".to_owned(),
             env: Vec::new(),
             startup_timeout: Duration::from_secs(15),
         }
@@ -231,6 +231,14 @@ impl CodexMapper {
                 self.absorbed("codex/advisory");
                 Ok(())
             }
+            other if is_advisory_notification(other) => {
+                // Advisory namespaces carry no model-visible content (MCP lifecycle, account,
+                // skills, config, token usage, diffs, plans, deltas). Absorbed with a counter; a
+                // genuinely unknown method is still drift.
+                tracing::debug!(target: "kian::codex", method = other, "absorbed advisory notification");
+                self.absorbed("codex/advisory");
+                Ok(())
+            }
             other => Err(ContractError::Drift(format!(
                 "unknown codex notification `{other}`"
             ))),
@@ -392,6 +400,26 @@ impl CodexMapper {
     }
 }
 
+/// Advisory notification namespaces: lifecycle/telemetry that never carry the turn's content.
+/// A method outside these prefixes is still a contract error.
+fn is_advisory_notification(method: &str) -> bool {
+    const PREFIXES: [&str; 12] = [
+        "mcpServer/",
+        "account/",
+        "skills/",
+        "app/",
+        "config/",
+        "experimentalFeature/",
+        "thread/",
+        "turn/diff/",
+        "turn/plan/",
+        "item/",
+        "remoteControl/",
+        "window/",
+    ];
+    PREFIXES.iter().any(|p| method.starts_with(p))
+}
+
 fn tool_shape(item_type: &str, item: &Value) -> (String, Value) {
     match item_type {
         "commandExecution" => (
@@ -518,6 +546,25 @@ mod tests {
             }
             other => panic!("expected tool/call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn advisory_namespaces_are_absorbed_but_unknown_methods_are_still_drift() {
+        let mut mapper = CodexMapper::new();
+        mapper
+            .ingest(r#"{"method":"mcpServer/startupStatus/updated","params":{}}"#)
+            .expect("advisory absorbed");
+        assert_eq!(
+            mapper.pop(),
+            Some(SessionEvent::Mapped(Mapped::Absorbed {
+                kind: "codex/advisory"
+            }))
+        );
+
+        let err = mapper
+            .ingest(r#"{"method":"mystery/thing","params":{}}"#)
+            .unwrap_err();
+        assert!(matches!(err, ContractError::Drift(_)), "{err:?}");
     }
 
     #[test]

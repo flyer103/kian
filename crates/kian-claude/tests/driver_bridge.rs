@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use kian_claude::ClaudeAdapter;
@@ -38,7 +37,6 @@ fn adapter(script: &Path) -> ClaudeAdapter {
         args: vec![script.display().to_string()],
         model: None,
         env: Vec::new(),
-        startup_timeout: Duration::from_secs(5),
     })
 }
 
@@ -297,21 +295,17 @@ async fn the_step_budget_stops_before_a_turn_opens() {
 }
 
 #[tokio::test]
-async fn a_silent_child_times_out_at_the_handshake() {
-    let dir = scratch("silent");
-    let script = write_script(&dir, "silent.jsonl", &[r#"{"op":"expect_any"}"#]);
+async fn an_early_child_exit_is_a_soft_failure() {
+    let dir = scratch("early-exit");
+    let script = write_script(&dir, "early-exit.jsonl", &[r#"{"op":"exit","code":9}"#]);
     let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
     ctx.push_input(json!({"text": "hi"}));
-    let mut config = adapter(&script);
-    config.config.startup_timeout = Duration::from_millis(200);
-    let outcomes: Vec<LoopOutcome> = driver(config, BridgeDriverConfig::default())
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), BridgeDriverConfig::default())
         .drive(ctx.clone())
         .collect()
         .await;
     match outcomes.as_slice() {
-        [LoopOutcome::SoftFailed { reason }] => {
-            assert!(reason.contains("within"), "reason: {reason}")
-        }
+        [LoopOutcome::SoftFailed { .. }] => {}
         other => panic!("expected SoftFailed, got {other:?}"),
     }
 }
