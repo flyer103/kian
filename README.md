@@ -695,7 +695,7 @@ superagent:
   harness:
     codex:
       command: /usr/local/bin/codex # or export KIAN_CODEX_BIN
-      approval_policy: unlessTrusted # `never` refuses boot (it removes the gate)
+      approval_policy: on-request # `never` refuses boot (it removes the gate)
       approvals:
         default: deny
         allow: ["commandExecution(*git *)"]

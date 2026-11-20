@@ -48,18 +48,12 @@ impl SessionFactory for ClaudeAdapter {
         let config = self.config.clone();
         Box::pin(async move {
             let argv = config.argv();
-            let mut peer = LinePeer::spawn(&config.command, &argv, &config.env).await?;
-            let first = peer
-                .next_line_within(config.startup_timeout)
-                .await
-                .map_err(|e| format!("claude handshake: {e}"))?;
-            let mut mapper = ClaudeMapper::new();
-            mapper
-                .ingest(&first)
-                .map_err(|e| format!("claude handshake: {e}"))?;
-            if !mapper.init_seen() {
-                return Err("claude handshake: first line was not system/init".to_owned());
-            }
+            let peer = LinePeer::spawn(&config.command, &argv, &config.env).await?;
+            let mapper = ClaudeMapper::new();
+            // The CLI has no explicit ready frame, and it may emit nothing until it receives the
+            // first input (session hooks are not guaranteed). Readiness is therefore the spawn
+            // itself; `system/init` is absorbed by the mapper when it arrives. A child that dies
+            // early surfaces as `Exit` on the first read (honest `SoftFailed`).
             Ok(Box::new(ClaudeSession {
                 peer,
                 mapper,

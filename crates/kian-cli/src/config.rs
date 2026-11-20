@@ -970,9 +970,6 @@ pub struct ClaudeHarnessConfig {
     /// Mapped turns per session. Default 32.
     #[serde(default)]
     pub max_steps: Option<u64>,
-    /// The handshake deadline. Default 10s.
-    #[serde(default)]
-    pub startup_timeout_ms: Option<u64>,
     /// The allow/deny policy for the harness's tool gate.
     #[serde(default)]
     pub approvals: Option<ApprovalsConfig>,
@@ -995,9 +992,6 @@ impl ClaudeHarnessConfig {
             args: self.args.clone(),
             model: self.model.clone(),
             env: resolve_harness_env(&self.env)?,
-            startup_timeout: std::time::Duration::from_millis(
-                self.startup_timeout_ms.unwrap_or(10_000),
-            ),
         };
         Ok(BridgeMountSpec {
             name: "claude-code",
@@ -1024,7 +1018,8 @@ pub struct CodexHarnessConfig {
     /// The thread's working directory.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// The app-server approval policy. `never` refuses boot (no gate); default `unlessTrusted`.
+    /// The app-server approval policy (`untrusted` | `on-request` | `granular`; `never` refuses
+    /// boot because it removes the gate). Default `on-request`.
     #[serde(default)]
     pub approval_policy: Option<String>,
     /// Mapped turns per session. Default 32.
@@ -1046,16 +1041,24 @@ impl CodexHarnessConfig {
         let command = resolve_harness_command(
             self.command.as_deref(),
             "KIAN_CODEX_BIN",
-            "`superagent.harness.codex` needs a `command` or the `KIAN_CODEX_BIN` env var              (fail-closed)",
+            "`superagent.harness.codex` needs a `command` or the `KIAN_CODEX_BIN` env var (fail-closed)",
         )?;
         refuse_bypass_flags(&self.args)?;
         let approval_policy = self
             .approval_policy
             .clone()
-            .unwrap_or_else(|| "unlessTrusted".to_owned());
+            .unwrap_or_else(|| "on-request".to_owned());
+        const ALLOWED: [&str; 4] = ["untrusted", "on-request", "granular", "never"];
+        if !ALLOWED.contains(&approval_policy.as_str()) {
+            return Err(invalid(format!(
+                "unknown `superagent.harness.codex.approval_policy` `{approval_policy}` (use \
+                 untrusted|on-request|granular)"
+            )));
+        }
         if approval_policy == "never" {
             return Err(invalid(
-                "`superagent.harness.codex.approval_policy: never` removes the tool gate;                  phase 1 requires a gated policy (default unlessTrusted)",
+                "`superagent.harness.codex.approval_policy: never` removes the tool gate; phase 1 \
+                 requires a gated policy (default on-request)",
             ));
         }
         let config = kian_codex::CodexConfig {

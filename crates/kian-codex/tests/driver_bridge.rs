@@ -23,7 +23,7 @@ fn adapter(mode: &str) -> CodexAdapter {
         args: vec![mode.to_owned()],
         model: None,
         cwd: None,
-        approval_policy: "unlessTrusted".to_owned(),
+        approval_policy: "on-request".to_owned(),
         env: Vec::new(),
         startup_timeout: Duration::from_secs(5),
     })
