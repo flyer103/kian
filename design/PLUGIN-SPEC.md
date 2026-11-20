@@ -340,7 +340,7 @@ same audit object the event already carries. `usage` is the provider's verbatim 
 | `arguments` | JSON \| string | the parsed arguments (redacted) when their serialization fits the frame bound; when it does not, a **string** — the longest UTF-8 character-boundary prefix of that serialization that fits — with `arguments_truncated:true` |
 | `arguments_bytes`,`arguments_sha256` | u64, hex | exact size and digest of the unredacted serialized arguments |
 | `permission` | object | the declarative gate's decision, which has **already** run (§4.4 ordering) |
-| `surface` | `"react"` | the only value in v1 (§3.5) |
+| `surface` | `"react"` \| `"harness"` | `"react"` for the built-in loop; `"harness"` for a tool the external-harness bridge gates before execution (ADR-045, §3.5) |
 
 The two forms are exhaustive and unambiguous, which is what makes a closed ABI parseable: with
 `arguments_truncated:false`, `arguments` **is** the complete parsed value; with
@@ -455,7 +455,7 @@ but the view does not.
 | `admit/pre`, `admit/post` | yes | yes | harness-independent: they fire before the drain, at the admission boundary in the bundle (§4.1) |
 | `turn/request` | yes — `timing:"pre_send"` | **no** | the bridge's only request-shaped site is a mapping function that runs *before* the driver appends `step/request` (`mapping.rs:411` → append at `driver.rs:650`), and three of §3.2.3's normative fields (`message_count`, `tool_names`, `tool_schema_sha256`) cannot be derived from an opaque child body. Removed from v1 rather than approximated (§16.17) |
 | `turn/response` | yes | **no** | there is no settled-response site that can fill §3.2.4: the bridge never sees provider `usage` or an `error{class,action}` pair (no classifier on that path, §16.5). `mapping.rs:447` is `map_tool_call`, not a settled assistant turn. Removed from v1 (§16.17) |
-| `tool/pre` | yes (`surface:"react"`) | **no** | every tool under dsh runs inside the child; no pre-effect port exists (§4.4, §16.4) |
+| `tool/pre` | yes (`surface:"react"`) | **no** for dsh | every dsh tool runs inside the child with no pre-effect port (§16.4); the harness bridges (`kian-claude`/`kian-codex`) fire `tool/pre` for tools the harness gates, with `surface:"harness"` (ADR-045) |
 | `tool/post` | yes | yes — retrospective, via a crate-local port at the driver's post-append site (§3.5) | dsh maps the child's tool record after the effect; observe-only, honest about sequencing |
 | `recover/decided` | yes | **no in v1** | the only registered resolution site today is the ReAct path (§4.5); a bridge-side site is a future owner task (§16.5) |
 | `settle/pre` | yes — worker lineage only (§3.4.4) | yes — worker lineage only (§3.4.4) | the gate sits in `WorkerLoopDriver`, which wraps the inner `LoopDriver` **of a worker-lineage session**; which sessions those are is a separate dimension with its own matrix (§3.4.4) |
@@ -546,7 +546,10 @@ Consequences, stated rather than implied:
 
 ### 3.5 `surface` and the dsh boundary
 
-`tool/pre`'s `surface` field is `"react"` in v1 and is closed. The dsh bridge runs a `dsh --profile
+`tool/pre`'s `surface` field is `"react"` for the built-in loop and `"harness"` for a
+harness-gated tool that reaches kian's approval path (Claude `can_use_tool`, Codex `on-request`
+actions; [ADR-045](decisions/ADR-045-harness-approvals-at-tool-pre.md)). Auto-approved harness
+tools never reach the port. The dsh bridge runs a `dsh --profile
 sdk` child which executes its own tools ([ADR-010](decisions/ADR-010-dsh-session-mapping.md));
 [`crates/kian-dsh/src/mapping.rs`](../crates/kian-dsh/src/mapping.rs) consumes the child's
 already-emitted tool records, and `kian-dsh` has no tool provider and no invocation port. Therefore:

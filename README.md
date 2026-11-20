@@ -746,8 +746,9 @@ sessions — `ask` on a superagent worker agent refuses to start until phase 2.
 ### Hook plugins (`sidecars:`)
 
 Operator-trusted sidecar processes subscribe to harness hooks over a stdio JSON-lines ABI
-([PLUGIN-SPEC](design/PLUGIN-SPEC.md)): `tool/pre` can deny a side effect before it happens (the
-honest error says which plugin and why), and every port is observable. Deadlines, digest-pinned
+([PLUGIN-SPEC](design/PLUGIN-SPEC.md)): `tool/pre` can deny a side effect before it happens — a ReAct tool or a harness-gated Claude
+Code/Codex tool alike (the honest error says which plugin and why) — and every port is
+observable. Deadlines, digest-pinned
 spawns, quarantine and fail-closed defaults are the contract's own. Any language works — the
 in-tree [approval-gate reference](examples/hook-approval-gate/README.md) is a Python stdlib script:
 

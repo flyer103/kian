@@ -336,3 +336,138 @@ async fn an_unknown_message_is_a_named_soft_failure() {
         other => panic!("expected SoftFailed, got {other:?}"),
     }
 }
+
+struct DenyAll;
+impl kian_harness::ToolPrePort for DenyAll {
+    fn tool_pre(
+        &self,
+        _call: kian_harness::ToolPreCall,
+    ) -> futures::future::BoxFuture<'static, kian_harness::ToolPreVerdict> {
+        Box::pin(async {
+            kian_harness::ToolPreVerdict::Deny {
+                plugin: "gate".into(),
+                reason: "blocked by policy".into(),
+            }
+        })
+    }
+}
+
+struct AllowAll;
+impl kian_harness::ToolPrePort for AllowAll {
+    fn tool_pre(
+        &self,
+        _call: kian_harness::ToolPreCall,
+    ) -> futures::future::BoxFuture<'static, kian_harness::ToolPreVerdict> {
+        Box::pin(async { kian_harness::ToolPreVerdict::Allow })
+    }
+}
+
+fn driver_with_port(
+    adapter: ClaudeAdapter,
+    port: std::sync::Arc<dyn kian_harness::ToolPrePort>,
+) -> BridgeDriver {
+    BridgeDriver::new(Arc::new(adapter), BridgeDriverConfig::default()).with_tool_pre_port(port)
+}
+
+#[tokio::test]
+async fn a_tool_pre_deny_flips_an_allowed_call_to_policy_hook() {
+    let dir = scratch("hook-deny");
+    let script = write_script(
+        &dir,
+        "hook-deny.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"x"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"path":"x"}}}}"#,
+            r#"{"op":"expect","line":{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny","message":"denied by kian approval policy"}}}}"#,
+            r#"{"op":"send","line":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"denied","is_error":true}]}}}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "read"}));
+    let policy = ApprovalPolicy {
+        default: Decision::Deny,
+        rules: vec![Rule::parse("Read", Decision::Allow).expect("rule")],
+    };
+    let outcomes: Vec<LoopOutcome> = BridgeDriver::new(
+        Arc::new(adapter(&script)),
+        BridgeDriverConfig {
+            policy,
+            max_steps: 32,
+        },
+    )
+    .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)
+    .drive(ctx.clone())
+    .collect()
+    .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+
+    let call = ctx
+        .committed()
+        .into_iter()
+        .find(|e| e.kind == EventKind::ToolCall)
+        .expect("tool/call");
+    assert_eq!(
+        call.bytes.pointer("/content/permission/evaluated"),
+        Some(&json!("deny"))
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/policy"),
+        Some(&json!("hook"))
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/matched"),
+        Some(&json!("gate:tool/pre"))
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/reason"),
+        Some(&json!("blocked by policy"))
+    );
+}
+
+#[tokio::test]
+async fn a_tool_pre_allow_cannot_widen_a_config_deny() {
+    let dir = scratch("hook-allow");
+    let script = write_script(
+        &dir,
+        "hook-allow.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rm -rf /"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf /"}}}}"#,
+            r#"{"op":"expect","line":{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny","message":"denied by kian approval policy"}}}}"#,
+            r#"{"op":"send","line":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"denied","is_error":true}]}}}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "rm"}));
+    let outcomes: Vec<LoopOutcome> = driver_with_port(
+        adapter(&script),
+        Arc::new(AllowAll) as Arc<dyn kian_harness::ToolPrePort>,
+    )
+    .drive(ctx.clone())
+    .collect()
+    .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+
+    let call = ctx
+        .committed()
+        .into_iter()
+        .find(|e| e.kind == EventKind::ToolCall)
+        .expect("tool/call");
+    assert_eq!(
+        call.bytes.pointer("/content/permission/policy"),
+        Some(&json!("configured")),
+        "an allow verdict never widens the declarative deny"
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/matched"),
+        Some(&json!("default"))
+    );
+}

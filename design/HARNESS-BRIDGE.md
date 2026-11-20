@@ -94,7 +94,7 @@ phase.
 | approval provenance on `tool/call` | — | ✔ (`policy:"configured"`) | ✔ |
 | `tool/call` appended before execution | ✔ (log-before-execute contract) | ◐ requires the pre-execution `tool_use` block (verified per pin, §11) | ◐ same question for `item/started` |
 | `tool/post` observation (hook port) | ✔ (port; test-mounted) | ◐ port exists, bus wiring P2 | ◐ same |
-| kian `tool/pre` veto (plugin bus) | — | P2 (PreToolUse → bus) | — (approvals only) |
+| kian `tool/pre` veto (plugin bus) | — | ✔ gated tools (`surface:"harness"`, ADR-045) | ✔ gated tools |
 | harness hooks bridged to the kian bus | — | P2 | — |
 | session resume after process death | ✔ child log replay + dedup | — (P2: takeover ends honestly interrupted) | — (P2: same) |
 | model selection | harness-owned (labels only) | kian passes `--model` | kian passes the model field |
@@ -162,19 +162,34 @@ The engine's consumption write is the durable record of every admitted input; th
 depends on the harness echoing it. Echoes are deduplicated when present, and an absent echo
 changes nothing — the steer marker survives on the kian side regardless.
 
-### 4.4 Approvals (phase 1: allow/deny)
+### 4.4 Approvals (allow/deny, and the `tool/pre` consultation)
 
 A harness-initiated approval is a kian decision with a durable record:
 
-1. The adapter surfaces `ApprovalRequest{id, tool, input, matched_hint}`.
-2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` is refused at
-   boot in phase 1 (no silent downgrade, no deadlocked child).
-3. The driver answers the harness (`ApprovalAnswer{id, allow}`) and, on `allow`, appends the
-   pending `tool/call` with `permission:{evaluated,policy:"configured",matched}`; on `deny`, the
-   harness's own error result is mapped to `tool/result{is_error:true}` and the call record says
-   `deny`. A request that matches no rule is **denied** (fail-closed) with `matched:"default"`.
-4. If the child dies before the answer is written, the episode ends `SoftFailed`; no fabricated
+1. The adapter surfaces `ApprovalRequest{id, call_id, tool, input}` (the call id is the harness's
+   own: Claude `tool_use` id, Codex `itemId`).
+2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` is refused at boot
+   (no silent downgrade, no deadlocked child).
+3. The driver dispatches `tool/pre` through its port (HARNESS-BRIDGE §4, ADR-045) with a view whose
+   `surface` is `"harness"`, `call_id`/`name`/`arguments` from the request, `permission` carrying
+   the declarative decision and `iteration` the mapped turn. A `veto:tool` denial — or the bus's
+   fail-closed default — flips the answer to deny; otherwise the declarative decision stands
+   (a hook can only narrow, never widen).
+4. The driver answers the harness (`ApprovalAnswer{id, allow, policy, matched, reason}`): on
+   `allow` the adapter appends the pending `tool/call` with
+   `permission:{evaluated:"allow",policy:"configured",matched,…}`; on a declarative `deny` it says
+   `policy:"configured"`; on a hook `deny` it says `policy:"hook"`, `matched:"<plugin>:tool/pre"`
+   and the hook's `reason`. The harness's own error result is mapped to
+   `tool/result{is_error:true}` and the tool never runs. A request that matches no rule is
+   **denied** (fail-closed) with `matched:"default"`.
+5. If the child dies before the answer is written, the episode ends `SoftFailed`; no fabricated
    call record is appended.
+
+The consultation happens before the answer is written, so the harness is blocked on it: the call
+record stays log-before-execute, and a deny means the tool never runs. Without a mounted hook bus
+the behavior is byte-identical to phase 1. Only tools the harness itself gates reach this path
+(Claude `can_use_tool`, Codex `on-request` actions); auto-approved harness tools, subagents and
+background jobs stay outside the contract until the deferred `PreToolUse` shim ([ADR-045](decisions/ADR-045-harness-approvals-at-tool-pre.md)).
 
 No approval is ever logged with its input payload — only tool name, rule name and decision.
 
@@ -382,7 +397,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A3 | child killed mid-turn → SoftFailed → session end `failed`/`interrupted`, never `completed`; the open `turn/start` has no `assistant/message` | L2 (kill) |
 | A4 | `kian serve` killed -9 mid-drain → takeover ends the session honestly (`failed`, the mapping for a lost turn; never `completed`), no re-run of consumed inputs, no duplicate mapped events, exactly one end write; a new input afterwards starts a fresh harness child | L2 |
 | A5 | steer delivered at the next safe boundary → mapped `input/admitted{synthetic:true}`, strippable, no extra turn opened | L2 |
-| A6 | approval deny: harness receives deny, `tool/call.permission` records `evaluated:"deny"`, no execution effect, result is an honest error | L2 (script asserts both sides) |
+| A6 | approval deny: harness receives deny, `tool/call.permission` records `evaluated:"deny"`, no execution effect, result is an honest error; a `tool/pre` veto flips an allowed request to `policy:"hook"` with the plugin's reason, and a declarative allow without a hook keeps `policy:"configured"` | L2 (script asserts both sides) |
 | A7 | step budget exceeded → `Stopped`; startup deadline → SoftFailed naming the deadline | L1 |
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
@@ -400,10 +415,11 @@ raw argv (`raw: true`) for Claude Code/Codex ([CRON-MODEL](CRON-MODEL.md) §6.2)
 both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
 end and the worker slot is reclaimed instead of parked forever.
 
-**Phase 2.** Harness hooks → kian plugin bus (Claude Code `PreToolUse`/`PostToolUse` via a
-kian-provided hook shim; Codex approvals as `tool/pre` verdicts), durable interactive `ask`
-(with the restart semantics designed), interrupt forwarded to a live child, `harness/<name>/*`
-hook registry entries, cron per-schedule harness selection.
+**Phase 2.** Harness approvals dispatch at `tool/pre` (ADR-045; landed), durable interactive
+`ask` (with the restart semantics designed), interrupt forwarded to a live child,
+`harness/<name>/*` hook registry entries, cron per-schedule harness selection. A Claude
+`PreToolUse`/`PostToolUse` shim — the only way to cover auto-approved harness tools — remains
+phase 3.
 
 **Phase 3.** Request-capture proxy (turn projection-only sessions into `exact` ones), an ACP
 client driver if ACP coverage holds for both, and `kian-dsh` convergence onto `kian-harness`

@@ -279,8 +279,16 @@ impl ClaudeMapper {
                     .ok_or_else(|| ContractError::Drift("can_use_tool without tool_name".into()))?;
                 let input = request.get("input").cloned().unwrap_or(Value::Null);
                 self.awaiting = Some(tool.to_owned());
+                // The harness's call id for the held `tool_use` block (matched by name; the
+                // approval request itself carries no tool_use id).
+                let call_id = self
+                    .pending
+                    .iter()
+                    .find(|c| c.name == tool)
+                    .map(|c| c.id.clone());
                 self.held.push_back(SessionEvent::Approval(ApprovalRequest {
                     id: id.to_owned(),
+                    call_id,
                     tool: tool.to_owned(),
                     input,
                 }));
@@ -309,11 +317,15 @@ impl ClaudeMapper {
                 "name": call.name,
                 "arguments": call.input,
             });
-            content["permission"] = json!({
+            let mut permission = json!({
                 "evaluated": if answer.allow { "allow" } else { "deny" },
-                "policy": "configured",
+                "policy": answer.policy,
                 "matched": answer.matched,
             });
+            if let Some(reason) = &answer.reason {
+                permission["reason"] = json!(reason);
+            }
+            content["permission"] = permission;
             self.held.push_back(SessionEvent::Mapped(Mapped::Event {
                 kind: EventKind::ToolCall,
                 payload: json!({"role": "assistant", "content": content}),
@@ -335,11 +347,15 @@ impl ClaudeMapper {
                 "arguments": call.input,
             });
             if let Some(answer) = permission {
-                content["permission"] = json!({
+                let mut permission = json!({
                     "evaluated": if answer.allow { "allow" } else { "deny" },
-                    "policy": "configured",
+                    "policy": answer.policy,
                     "matched": answer.matched,
                 });
+                if let Some(reason) = &answer.reason {
+                    permission["reason"] = json!(reason);
+                }
+                content["permission"] = permission;
             }
             self.held.push_back(SessionEvent::Mapped(Mapped::Event {
                 kind: EventKind::ToolCall,
@@ -501,6 +517,7 @@ mod tests {
             mapper.pop(),
             Some(SessionEvent::Approval(ApprovalRequest {
                 id: "r1".into(),
+                call_id: Some("t1".into()),
                 tool: "Bash".into(),
                 input: json!({"command": "rm -rf /"}),
             }))
@@ -509,7 +526,9 @@ mod tests {
         let answer = ApprovalAnswer {
             id: "r1".into(),
             allow: false,
+            policy: "configured",
             matched: "default".into(),
+            reason: None,
         };
         let wire = mapper.answer(&answer).expect("answer line");
         let parsed: Value = serde_json::from_str(&wire).unwrap();

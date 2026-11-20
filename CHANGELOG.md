@@ -8,6 +8,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness approvals dispatch at `tool/pre` (HARNESS-BRIDGE §4.4, PLUGIN-SPEC §3.2.5,
+  ADR-045)**. A Claude Code/Codex tool that the harness gates is now consulted on kian's plugin
+  bus before the answer: a `veto:tool` sidecar can deny it, deny wins over a declarative allow,
+  and an allow never widens a declarative deny. The call record carries
+  `permission:{policy:"hook", matched:"<plugin>:tool/pre", reason}` for a veto (otherwise
+  `policy:"configured"` as before); the view is `surface:"harness"` with the harness's own call
+  id (Claude `tool_use` id, Codex `itemId`), bounded arguments and the declarative decision.
+  No new config, event kind or wire change; without a mounted bus the behavior is byte-identical.
+  Auto-approved harness tools, subagents and background jobs stay outside the contract (the
+  deferred `PreToolUse` shim is phase 3). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
+  §4.4; [design/PLUGIN-SPEC.md](design/PLUGIN-SPEC.md) §3.2.5, §3.4.1.
+
 - **Cron: the worktree arm can run any harness (CRON-MODEL §6.2)**. `superagent.cron.harness`
   gains `args` and `raw: true`: the default stays the dsh shape (`args --profile <name> <payload>`,
   profile `headless`), while raw mode appends the scheduled payload to the fixed args
