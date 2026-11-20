@@ -669,6 +669,19 @@ VPS. Recorded evidence:
   successfully — no extra model-side enforcement is needed beyond the prompt sentence.
 - **First-boot replay.** The adapter's first start tail-replayed the earlier test messages and
   admitted them once each (four `input/admitted` rows); admission idempotency then held.
+- **Restart recovery.** A `kian serve` restart while the resident drain was mid-turn closed the
+  takeover chain honestly as `failed` (bounded, resumable) and the next input re-claimed the **same**
+  session (`drain/claimed` → `input/admitted` → `channel/delivered` in **3.2 s**) — no re-arm, no
+  lost work.
+- **Send idempotency.** The same `client_id` posted twice produced one Apple `guid`; the second
+  response was `deduplicated: true` and the bridge's send counter advanced once.
+- **Long text.** One 2616-character message was accepted as a single native send (`verified: true`),
+  so the adapter's 2000-character split has margin. (The end-to-end `详情` full-delivery split was
+  not exercised.)
+- **Burst.** Six back-to-back sends all succeeded with `verified: true` and no rate-limit or
+  uncertain disposition (4.4 s cold, then 0.12–0.97 s each).
+- **Latency samples.** Two end-to-end round trips measured **6.4 s** and **3.2 s** (model turn
+  included); the 250 ms poll cadence is not the dominant term.
 - **Observed fields.** Inbound rows carried `service: null` and `chat_guid: "any;-;…"`; the channel
   depends on neither (§2.5 rule 10).
 - **Personal SMS shares the database.** Because the Mac's iCloud account stayed personal, Text
@@ -677,7 +690,8 @@ VPS. Recorded evidence:
   **before** the server is wired (the L3 run did).
 
 Not executed in this run: a sleeping/logged-out Mac delivery, a revoked-FDA recovery, a `-1743`
-recovery, a 3000-character reply split, and the SMS-thread question — they stay in §13.
+recovery, the `详情` full-delivery split (adapter-side, >2000 characters), and the SMS-thread
+question — they stay in §13.
 
 ## 13. UNVERIFIED (must stay visible)
 
@@ -695,12 +709,14 @@ recovery, a 3000-character reply split, and the SMS-thread question — they sta
    Message Forwarding needs the same Apple Account as the iPhone), so SMS as a *channel* stays
    phase 2. The L3 Mac did receive personal SMS through the owner's iCloud account; those rows were
    excluded by the participant filter, and the SMS reply path was not measured.
-5. **Real text length and rate limits** — iMessage has no documented per-message text limit for
-   automation sends; the 2000-character defensive split is a bound, not a measurement.
-6. **Duplicate window** — two byte-identical replies to the same handle within the bridge's 10-minute
-   `client_id` window are collapsed into one. The window is a retry-protection trade-off; the
-   residual duplicate case (bridge restart between an uncertain attempt and its retry) is
-   at-least-once.
+5. **Real text length and rate limits** — partially measured: a **2616-character** single message
+   was accepted natively (`verified: true`) and a **6-message burst** was not limited (L3,
+   2026-11-20). The true ceiling and any sustained-rate limits remain unmetered; the adapter's
+   2000-character split keeps every production part below the observed acceptance point.
+6. **Duplicate window** — the positive path is verified (same `client_id` posted twice → one Apple
+   `guid`, second response `deduplicated: true`, L3 2026-11-20). Two byte-identical replies to the
+   same handle inside the 10-minute window are collapsed by design; the residual duplicate case
+   (bridge restart between an uncertain attempt and its retry) remains at-least-once.
 7. **`imsg` version drift** — the pinned floor `0.14.0` (§2.5; L3 used `0.21.1`) is a third-party
    surface and may change; a breaking RPC change degrades this channel only (bridge refuses,
    adapter parks) and is recorded here with a date.
@@ -714,12 +730,14 @@ recovery, a 3000-character reply split, and the SMS-thread question — they sta
    not exercised (Automation was granted on the first send); the runbook keeps the escape hatch
    (grant `/opt/homebrew/bin/imsg` itself) for the case it is ever misattributed.
 10. **L3 gaps** — the 2026-11-20 run did not exercise: a sleeping/logged-out Mac delivery, a
-    revoked-FDA recovery, a `-1743` recovery, a 3000-character reply split, or the SMS-thread
-    question. Each keeps its named verification step in the runbook (§7).
+    revoked-FDA recovery, a `-1743` recovery, the `详情` full-delivery split (adapter-side, >2000
+    characters), or the SMS-thread question. Each keeps its named verification step in the runbook
+    (§7).
 11. **Poll cadence latency** — the reference bridge polls `messages.after` every 250 ms
-    (`watch.poll_interval_ms`); the 2026-11-20 L3 run measured **6.4 s** end to end (one sample,
-    model turn included), so the cadence is not the dominant term. Not measured under load;
-    `imsg`'s `watch.subscribe` would remove the cadence and stays deliberately unused in phase 1.
+    (`watch.poll_interval_ms`); the 2026-11-20 L3 run measured **6.4 s** and **3.2 s** end to end
+    (model turn included), so the cadence is not the dominant term. Not measured under sustained
+    load; `imsg`'s `watch.subscribe` would remove the cadence and stays deliberately unused in
+    phase 1.
 
 ## 14. Delivery slices
 
