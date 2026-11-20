@@ -27,8 +27,11 @@ kian-superagent.workspace = true
 # the memory bundle (round 8): the dream prompt, parser and DreamDriver
 # the `memory:` section assembles.
 kian-memory.workspace = true
-# the dsh bridge mount (worker template, config-gated).
+# the harness bridges (worker template, config-gated; HARNESS-BRIDGE).
 kian-dsh.workspace = true
+kian-harness.workspace = true
+kian-claude.workspace = true
+kian-codex.workspace = true
 kian-exec.workspace = true
 # the cron scheduling core (CRON-MODEL §2): `superagent.cron`
 # declarations parse their expressions and timezones through it.

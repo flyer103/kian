@@ -604,6 +604,9 @@ impl Server {
             // channel (real channels are untrusted by default).
             let untrusted_channels = sa.runtime_untrusted_set().map_err(ServeError::Config)?;
             let inbox = crate::superagent::EngineInbox::new();
+            if let Some(marker) = sa.harness.bridge_marker() {
+                inbox.set_bridge_marker(marker);
+            }
 
             // Mock channels by configured name; lark channels read
             // their credentials from the environment here (fail-closed:
@@ -852,6 +855,15 @@ impl Server {
                     .as_ref()
                     .map(DshHarnessConfig::to_runtime)
                     .transpose()?,
+                bridge_harness: sa.harness.bridge_mount()?.map(|mount| {
+                    std::sync::Arc::new(kian_harness::BridgeDriver::new(
+                        mount.factory,
+                        kian_harness::BridgeDriverConfig {
+                            policy: mount.policy,
+                            max_steps: mount.max_steps,
+                        },
+                    ))
+                }),
                 event_store: store.clone(),
             });
             None // services resolve from the Ctx after activation

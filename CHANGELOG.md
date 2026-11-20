@@ -8,6 +8,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-043)**. The worker
+  template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code
+  `stream-json` adapter (`kian-claude`) or the Codex `app-server` JSON-RPC adapter
+  (`kian-codex`): `session/prompt`-style input delivery, steer/interrupt, the harness's own
+  pre-execution approval gate answered by a declarative allow/deny policy and recorded as
+  `tool/call.permission`, and honest outcomes (a mid-turn child death is a soft failure, never
+  `completed`). These are *projection-only* sessions — no `step/request`, no cache or byte-request
+  replay — and phase 1 has no cross-process harness resume; the capability matrix states both.
+  Contract, mappings and limits: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md),
+  [ADR-043](design/decisions/ADR-043-multi-harness-bridge.md). Spawned worker sessions record the
+  class durably: `session/created` carries the additive `bridge:{name,request_bytes}` key through
+  the eager creation seam (HARNESS-BRIDGE §4.7).
+
 - **iMessage channel through a macOS bridge (`type: imessage`, ADR-042)**. iMessage has no API, so
   the channel speaks a narrow loopback HTTP ABI to `kian-imessage-bridge`, a new macOS-side daemon
   (`imsg rpc` under Full Disk Access + Automation, run as a LaunchAgent in the signed-in Messages

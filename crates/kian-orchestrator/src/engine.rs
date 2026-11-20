@@ -1016,6 +1016,21 @@ where
     /// Appends `session/created` (epoch genesis — no claim involved).
     pub async fn create_session(&self) -> Result<SessionId, EngineError> {
         let sid = SessionId::new();
+        self.create_session_with(sid, json!({})).await
+    }
+
+    /// Appends `session/created` for `sid` with a caller payload — the BEGIN-only metadata a
+    /// bridge marker needs (HARNESS-BRIDGE §4.7). Idempotent for a retried spawn: a stream that
+    /// already exists is left untouched, so a replayed spawn never rewrites its first event.
+    pub async fn create_session_with(
+        &self,
+        sid: SessionId,
+        payload: Value,
+    ) -> Result<SessionId, EngineError> {
+        // `version` is `head.next_seq - 1` (0 for a session with no events).
+        if self.store.version(sid).await? > 0 {
+            return Ok(sid);
+        }
         let head = self.store.head(sid).await?;
         let event = Event {
             seq: head.next_seq,
@@ -1023,7 +1038,7 @@ where
             epoch: Epoch::GENESIS,
             ts: self.clock.now_ms(),
             kind: EventKind::SessionCreated,
-            bytes: json!({}),
+            bytes: payload,
             version: SCHEMA_VERSION,
         };
         self.store
@@ -5207,6 +5222,47 @@ mod tests {
         );
 
         store.close().await;
+        cleanup(&path);
+    }
+
+    // -- bridge marker (HARNESS-BRIDGE §4.7) --------------------------------
+
+    /// `create_session_with` writes the BEGIN-only bridge marker as the first event, and a
+    /// retried creation leaves that first event untouched (idempotent spawn replay).
+    #[tokio::test]
+    async fn create_session_with_writes_the_bridge_marker_once() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = SessionId::new();
+        eng.create_session_with(
+            sid,
+            json!({"bridge": {"name": "claude-code", "request_bytes": "unavailable"}}),
+        )
+        .await
+        .expect("create with marker");
+
+        let events = events_of(&store, sid).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::SessionCreated);
+        assert_eq!(
+            events[0].bytes.pointer("/bridge/name"),
+            Some(&json!("claude-code"))
+        );
+        assert_eq!(
+            events[0].bytes.pointer("/bridge/request_bytes"),
+            Some(&json!("unavailable"))
+        );
+
+        // A replayed spawn must not rewrite the first event.
+        eng.create_session_with(sid, json!({"bridge": {"name": "other"}}))
+            .await
+            .expect("idempotent");
+        let events = events_of(&store, sid).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].bytes.pointer("/bridge/name"),
+            Some(&json!("claude-code"))
+        );
         cleanup(&path);
     }
 

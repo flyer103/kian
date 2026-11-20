@@ -99,7 +99,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 
 | Kind | Ctx | State | Payload (payload = `bytes`) | Emitter | Notes |
 |---|---|---|---|---|---|
-| `session/created` | — | Created | `{}` | orchestrator | First event of a stream. |
+| `session/created` | — | Created | `{}`; additive (BEGIN-only, [HARNESS-BRIDGE](HARNESS-BRIDGE.md) §4.7): `"bridge":{"name":<str>,"request_bytes":"exact"\|"unavailable"}` | orchestrator (spawn seam) | First event of a stream. `bridge` marks a spawned worker session whose loop is an external harness and states whether the assembled model request is observable (`exact`, persisted as `step/request`) or not (`unavailable`, projection-only). Absent on kian-owned loops and on the API's plain sessions, so those streams stay byte-identical. Audit metadata only. |
 | `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}`; additive: `"dream":{"source_session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>,"scope":<str>}`, `"memory":{"scope":<str>,"notes":[<event-id>...],"bytes":<u64>,"items":<u64>,"truncated":<bool>,"source_seq":<u64>,"redactions":[{"kind","name","count"}]}` (the creation-time injection marker, §4.2) | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). `dream` (§4.2) is the ops-set dream marker — trusted routing/provenance, never read from content. |
 | `drain/claimed` | — | Claimed | `{"holder":<str>,"epoch":<u64>}` | orchestrator | Claim audit. Epoch is the fencing token; claim admission is conditional (ADR-009). |
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |

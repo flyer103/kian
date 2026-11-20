@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// Authored markdown surfaces of the docs map (AGENTS.md §Docs map).
 /// `design/EVENT-MODEL.md` is the normative event contract, so its
 /// outbound links are part of the enforced set too.
-const AUTHORED: [&str; 15] = [
+const AUTHORED: [&str; 16] = [
     "README.md",
     "AGENTS.md",
     "docs/SPEC.md",
@@ -24,6 +24,7 @@ const AUTHORED: [&str; 15] = [
     "design/CHANNEL-WECHAT.md",
     "design/CHANNEL-IMESSAGE.md",
     "design/WORKER-MODEL.md",
+    "design/HARNESS-BRIDGE.md",
     "design/MULTIAGENT-MODEL.md",
     "the design notes",
 ];

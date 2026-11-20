@@ -806,6 +806,340 @@ pub struct HarnessConfig {
     /// model, kian owns durability.
     #[serde(default)]
     pub dsh: Option<DshHarnessConfig>,
+    /// The Claude Code bridge (HARNESS-BRIDGE §5.1 / ADR-037): the worker template's inner loop
+    /// becomes a shared `BridgeDriver` over the Claude Code stream-json adapter.
+    #[serde(default)]
+    pub claude: Option<ClaudeHarnessConfig>,
+    /// The Codex bridge (HARNESS-BRIDGE §5.2 / ADR-037): the shared driver over `codex app-server`.
+    #[serde(default)]
+    pub codex: Option<CodexHarnessConfig>,
+}
+
+impl HarnessConfig {
+    /// How many harnesses are configured (at most one inner loop).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        usize::from(self.dsh.is_some())
+            + usize::from(self.claude.is_some())
+            + usize::from(self.codex.is_some())
+    }
+
+    /// The configured harness name (the audit label).
+    #[must_use]
+    pub fn name(&self) -> Option<&'static str> {
+        if self.dsh.is_some() {
+            Some("dsh")
+        } else if self.claude.is_some() {
+            Some("claude-code")
+        } else if self.codex.is_some() {
+            Some("codex")
+        } else {
+            None
+        }
+    }
+
+    /// The YAML key of the configured harness (`dsh` | `claude` | `codex`).
+    #[must_use]
+    pub fn config_key(&self) -> Option<&'static str> {
+        if self.dsh.is_some() {
+            Some("dsh")
+        } else if self.claude.is_some() {
+            Some("claude")
+        } else if self.codex.is_some() {
+            Some("codex")
+        } else {
+            None
+        }
+    }
+
+    /// The `session/created` payload for a bridged worker session (HARNESS-BRIDGE §4.7):
+    /// `{"bridge":{"name":…,"request_bytes":"exact"|"unavailable"}}`.
+    #[must_use]
+    pub fn bridge_marker(&self) -> Option<serde_json::Value> {
+        match self.config_key()? {
+            "dsh" => Some(serde_json::json!({
+                "bridge": {"name": "dsh", "request_bytes": "exact"}
+            })),
+            "claude" => Some(serde_json::json!({
+                "bridge": {"name": "claude-code", "request_bytes": "unavailable"}
+            })),
+            "codex" => Some(serde_json::json!({
+                "bridge": {"name": "codex", "request_bytes": "unavailable"}
+            })),
+            _ => None,
+        }
+    }
+
+    /// Resolves the non-dsh bridge mount (factory + approval policy + budget); `None` when no
+    /// such bridge is configured. dsh keeps its own mount in `DshHarnessConfig`.
+    pub fn bridge_mount(&self) -> Result<Option<BridgeMountSpec>, ConfigError> {
+        if let Some(claude) = &self.claude {
+            return Ok(Some(claude.to_mount()?));
+        }
+        if let Some(codex) = &self.codex {
+            return Ok(Some(codex.to_mount()?));
+        }
+        Ok(None)
+    }
+}
+
+/// The resolved bridge mount handed to assembly (HARNESS-BRIDGE §7).
+pub struct BridgeMountSpec {
+    /// The harness name (audit label).
+    pub name: &'static str,
+    /// The adapter's session factory.
+    pub factory: std::sync::Arc<dyn kian_harness::SessionFactory>,
+    /// The allow/deny policy answering the harness's tool gate.
+    pub policy: kian_harness::ApprovalPolicy,
+    /// Mapped turns per session.
+    pub max_steps: u64,
+}
+
+impl std::fmt::Debug for BridgeMountSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeMountSpec")
+            .field("name", &self.name)
+            .field("max_steps", &self.max_steps)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `approvals:` table shared by the Claude Code and Codex sections (HARNESS-BRIDGE §6.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalsConfig {
+    /// `allow` | `deny`; absent = `deny`. `ask` refuses boot in phase 1.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Ordered allow rules (`Tool` or `Tool(args-glob)`; the glob matches the canonical JSON of
+    /// the tool input, so write `Bash(*git status*)`).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Ordered deny rules, evaluated after the allow list.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl ApprovalsConfig {
+    fn to_policy(&self) -> Result<kian_harness::ApprovalPolicy, ConfigError> {
+        use kian_harness::approval::{Decision, Rule};
+        let default = match self.default.as_deref().map(str::trim) {
+            None | Some("") | Some("deny") => Decision::Deny,
+            Some("allow") => Decision::Allow,
+            Some("ask") => {
+                return Err(invalid(
+                    "`approvals.default: ask` is phase 2 (HARNESS-BRIDGE §10): a durable human                      answer cannot be delivered to a harness process that died with the drain",
+                ));
+            }
+            Some(other) => {
+                return Err(invalid(format!(
+                    "unknown `approvals.default` `{other}` (use allow|deny)"
+                )));
+            }
+        };
+        let mut rules = Vec::new();
+        for (texts, decision) in [(&self.allow, Decision::Allow), (&self.deny, Decision::Deny)] {
+            for text in texts {
+                if text.trim().eq_ignore_ascii_case("ask") {
+                    return Err(invalid(
+                        "`ask` approval rules are phase 2 (HARNESS-BRIDGE §10); use allow or deny",
+                    ));
+                }
+                rules.push(Rule::parse(text, decision).map_err(invalid)?);
+            }
+        }
+        Ok(kian_harness::ApprovalPolicy { default, rules })
+    }
+}
+
+/// The `superagent.harness.claude:` section (HARNESS-BRIDGE §6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeHarnessConfig {
+    /// The `claude` binary. Absent = `KIAN_CLAUDE_BIN`; neither refuses boot.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra argv (the adapter prepends its fixed stream-json flags). A known bypass flag
+    /// refuses boot: a bypassed harness never asks, so the policy would be a claim with no
+    /// decision behind it.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Passed to the harness as `--model` (the harness owns the call).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Mapped turns per session. Default 32.
+    #[serde(default)]
+    pub max_steps: Option<u64>,
+    /// The handshake deadline. Default 10s.
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    /// The allow/deny policy for the harness's tool gate.
+    #[serde(default)]
+    pub approvals: Option<ApprovalsConfig>,
+    /// Environment variable names passed to the child (credentials). A listed name that is
+    /// absent from the environment refuses boot (fail-closed).
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+impl ClaudeHarnessConfig {
+    fn to_mount(&self) -> Result<BridgeMountSpec, ConfigError> {
+        let command = resolve_harness_command(
+            self.command.as_deref(),
+            "KIAN_CLAUDE_BIN",
+            "`superagent.harness.claude` needs a `command` or the `KIAN_CLAUDE_BIN` env var              (fail-closed)",
+        )?;
+        refuse_bypass_flags(&self.args)?;
+        let config = kian_claude::ClaudeConfig {
+            command,
+            args: self.args.clone(),
+            model: self.model.clone(),
+            env: resolve_harness_env(&self.env)?,
+            startup_timeout: std::time::Duration::from_millis(
+                self.startup_timeout_ms.unwrap_or(10_000),
+            ),
+        };
+        Ok(BridgeMountSpec {
+            name: "claude-code",
+            factory: std::sync::Arc::new(kian_claude::ClaudeAdapter::new(config)),
+            policy: resolve_bridge_policy(self.approvals.as_ref())?,
+            max_steps: self.max_steps.unwrap_or(32),
+        })
+    }
+}
+
+/// The `superagent.harness.codex:` section (HARNESS-BRIDGE §6.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CodexHarnessConfig {
+    /// The `codex` binary. Absent = `KIAN_CODEX_BIN`; neither refuses boot.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra argv (the adapter prepends `app-server`).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The model override passed to `thread/start`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The thread's working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The app-server approval policy. `never` refuses boot (no gate); default `unlessTrusted`.
+    #[serde(default)]
+    pub approval_policy: Option<String>,
+    /// Mapped turns per session. Default 32.
+    #[serde(default)]
+    pub max_steps: Option<u64>,
+    /// The handshake deadline. Default 15s.
+    #[serde(default)]
+    pub startup_timeout_ms: Option<u64>,
+    /// The allow/deny policy for the harness's tool gate.
+    #[serde(default)]
+    pub approvals: Option<ApprovalsConfig>,
+    /// Environment variable names passed to the child (credentials).
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+impl CodexHarnessConfig {
+    fn to_mount(&self) -> Result<BridgeMountSpec, ConfigError> {
+        let command = resolve_harness_command(
+            self.command.as_deref(),
+            "KIAN_CODEX_BIN",
+            "`superagent.harness.codex` needs a `command` or the `KIAN_CODEX_BIN` env var              (fail-closed)",
+        )?;
+        refuse_bypass_flags(&self.args)?;
+        let approval_policy = self
+            .approval_policy
+            .clone()
+            .unwrap_or_else(|| "unlessTrusted".to_owned());
+        if approval_policy == "never" {
+            return Err(invalid(
+                "`superagent.harness.codex.approval_policy: never` removes the tool gate;                  phase 1 requires a gated policy (default unlessTrusted)",
+            ));
+        }
+        let config = kian_codex::CodexConfig {
+            command,
+            args: self.args.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            approval_policy,
+            env: resolve_harness_env(&self.env)?,
+            startup_timeout: std::time::Duration::from_millis(
+                self.startup_timeout_ms.unwrap_or(15_000),
+            ),
+        };
+        Ok(BridgeMountSpec {
+            name: "codex",
+            factory: std::sync::Arc::new(kian_codex::CodexAdapter::new(config)),
+            policy: resolve_bridge_policy(self.approvals.as_ref())?,
+            max_steps: self.max_steps.unwrap_or(32),
+        })
+    }
+}
+
+fn resolve_harness_command(
+    configured: Option<&str>,
+    env_name: &str,
+    message: &str,
+) -> Result<String, ConfigError> {
+    configured
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var(env_name)
+                .ok()
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty())
+        })
+        .ok_or_else(|| invalid(message))
+}
+
+fn resolve_harness_env(names: &[String]) -> Result<Vec<(String, String)>, ConfigError> {
+    let mut pairs = Vec::new();
+    for name in names {
+        if name.trim().is_empty() {
+            return Err(invalid("`harness.env` names must be non-empty"));
+        }
+        let value = std::env::var(name).map_err(|_| {
+            invalid(format!(
+                "`harness.env` names `{name}` but the environment does not define it"
+            ))
+        })?;
+        pairs.push((name.clone(), value));
+    }
+    Ok(pairs)
+}
+
+/// A bypassed harness never asks for approval: refuse the known flags rather than record a
+/// policy that can never fire (HARNESS-BRIDGE §6.2).
+fn refuse_bypass_flags(args: &[String]) -> Result<(), ConfigError> {
+    const BYPASS: [&str; 6] = [
+        "--dangerously-skip-permissions",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "bypassPermissions",
+        "--permission-mode=bypassPermissions",
+        "--permission-mode=acceptEdits",
+        "acceptEdits",
+    ];
+    for arg in args {
+        if BYPASS.iter().any(|flag| arg == flag) {
+            return Err(invalid(format!(
+                "harness arg `{arg}` bypasses the harness's approval gate; the kian approval                  policy cannot fire under it (HARNESS-BRIDGE §6.2)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bridge_policy(
+    approvals: Option<&ApprovalsConfig>,
+) -> Result<kian_harness::ApprovalPolicy, ConfigError> {
+    match approvals {
+        Some(config) => config.to_policy(),
+        None => Ok(kian_harness::ApprovalPolicy::deny_all()),
+    }
 }
 
 /// The `superagent.harness.dsh:` section.
@@ -3033,24 +3367,27 @@ impl ServeConfig {
                  remote-exec queue)",
             ));
         }
-        // (ADR-020, D12; C6): the dsh harness and a worker surface are
-        // mutually exclusive — the dsh child never mounts the kian
-        // `exec` tool, so a worker binding could not route any command
-        // (recording one there would be audit fiction). Zero-endpoint
-        // dsh configs boot exactly as before.
-        if self
-            .superagent
-            .as_ref()
-            .is_some_and(|sa| sa.harness.dsh.is_some())
-            && has_workers_surface
-        {
-            return Err(invalid(
-                "`superagent.harness.dsh` and a worker surface (a non-empty `endpoints:` \
-                 list or a `workers:` section) are mutually exclusive: the dsh harness \
-                 runs the worker loop inside the dsh child and never uses the kian \
-                 `exec` tool, so a worker binding could not route any command — drop \
-                 one of the two sections",
-            ));
+        // (ADR-020, D12; C6; HARNESS-BRIDGE §6.2): a harness bridge and a worker surface are
+        // mutually exclusive — the harness child owns its tools and never mounts the kian
+        // `exec` tool, so a worker binding could not route any command (recording one there
+        // would be audit fiction). Zero-endpoint harness configs boot exactly as before.
+        if let Some(sa) = self.superagent.as_ref() {
+            if sa.harness.count() > 1 {
+                return Err(invalid(
+                    "`superagent.harness` configures at most one harness (dsh | claude | codex): \
+                     the worker template has one inner loop",
+                ));
+            }
+            if sa.harness.count() == 1 && has_workers_surface {
+                let name = sa.harness.config_key().unwrap_or("harness");
+                return Err(invalid(format!(
+                    "`superagent.harness.{name}` and a worker surface (a non-empty `endpoints:` \
+                     list or a `workers:` section) are mutually exclusive: the {name} harness \
+                     runs the worker loop inside its own child process and never uses the kian \
+                     `exec` tool, so a worker binding could not route any command — drop \
+                     one of the two sections"
+                )));
+            }
         }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
             return Err(invalid(
@@ -8695,5 +9032,148 @@ schedules:
         );
         let cfg = ServeConfig::parse(&base).expect("valid config");
         assert!(cfg.workers.is_none());
+    }
+
+    // -- harness bridges (HARNESS-BRIDGE phase 1) ------------------
+
+    fn with_harness(block: &str) -> String {
+        let base = superagent_yaml()
+            .replace(
+                "endpoints:\n  - id: ep1\n    addr: \"127.0.0.1:7341\"\n    queue_timeout_ms: 5000\n    offline_after_ms: 500\n",
+                "",
+            )
+            .replace(", \"remote-exec\"", "");
+        base.replacen(
+            "superagent:\n",
+            &format!("superagent:\n  harness:\n{block}"),
+            1,
+        )
+    }
+
+    #[test]
+    fn a_claude_harness_resolves_to_a_deny_by_default_mount() {
+        let yaml = with_harness("    claude:\n      command: /usr/bin/true\n");
+        let cfg = ServeConfig::parse(&yaml).expect("claude harness config");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        assert_eq!(sa.harness.name(), Some("claude-code"));
+        let mount = sa
+            .harness
+            .bridge_mount()
+            .expect("mount resolves")
+            .expect("claude mount");
+        assert_eq!(mount.name, "claude-code");
+        assert_eq!(mount.max_steps, 32);
+        assert_eq!(
+            mount
+                .policy
+                .decide("Bash", &serde_json::json!({"command": "rm -rf /"}))
+                .0,
+            kian_harness::approval::Decision::Deny
+        );
+    }
+
+    #[test]
+    fn a_codex_harness_resolves_and_refuses_the_never_policy() {
+        let yaml = with_harness("    codex:\n      command: /usr/bin/true\n");
+        let cfg = ServeConfig::parse(&yaml).expect("codex harness config");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        let mount = sa
+            .harness
+            .bridge_mount()
+            .expect("mount resolves")
+            .expect("codex mount");
+        assert_eq!(mount.name, "codex");
+
+        let never = with_harness(
+            "    codex:\n      command: /usr/bin/true\n      approval_policy: never\n",
+        );
+        let cfg = ServeConfig::parse(&never).expect("parses");
+        let err = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent")
+            .harness
+            .bridge_mount()
+            .expect_err("never removes the gate");
+        assert!(err.to_string().contains("removes the tool gate"), "{err}");
+    }
+
+    #[test]
+    fn two_harnesses_refuse_boot() {
+        let yaml = with_harness(
+            "    claude:\n      command: /usr/bin/true\n    codex:\n      command: /usr/bin/true\n",
+        );
+        let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("at most one harness"), "was: {err}");
+    }
+
+    #[test]
+    fn a_harness_with_a_worker_surface_refuses_boot() {
+        let yaml = with_harness("    claude:\n      command: /usr/bin/true\n").replace(
+            "plugins: [\"openai-compat\", \"local-tools\", \"superagent\"]",
+            "plugins: [\"openai-compat\", \"local-tools\", \"superagent\", \"remote-exec\"]",
+        );
+        let yaml = format!(
+            "{yaml}endpoints:\n  - id: dev-box\n    addr: \"127.0.0.1:7401\"\n    queue_timeout_ms: 5000\n    offline_after_ms: 500\n"
+        );
+        let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "was: {err}");
+    }
+
+    #[test]
+    fn ask_approvals_and_bypass_flags_refuse_boot() {
+        let ask = with_harness(
+            "    claude:\n      command: /usr/bin/true\n      approvals:\n        default: ask\n",
+        );
+        let err = ServeConfig::parse(&ask)
+            .expect("parses")
+            .superagent
+            .as_ref()
+            .unwrap()
+            .harness
+            .bridge_mount()
+            .unwrap_err();
+        assert!(err.to_string().contains("phase 2"), "{err}");
+
+        let bypass = with_harness(
+            "    claude:\n      command: /usr/bin/true\n      args: [\"--permission-mode=bypassPermissions\"]\n",
+        );
+        let err = ServeConfig::parse(&bypass)
+            .expect("parses")
+            .superagent
+            .as_ref()
+            .unwrap()
+            .harness
+            .bridge_mount()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bypasses the harness's approval gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn approval_rules_parse_into_ordered_policy_rules() {
+        let yaml = with_harness(
+            "    claude:\n      command: /usr/bin/true\n      approvals:\n        default: deny\n        allow: [\"Read\", \"Bash(*git status*)\"]\n        deny: [\"Bash\"]\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("config");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        let mount = sa.harness.bridge_mount().expect("mount").expect("claude");
+        assert_eq!(
+            mount
+                .policy
+                .decide("Bash", &serde_json::json!({"command": "git status"}))
+                .0,
+            kian_harness::approval::Decision::Allow
+        );
+        assert_eq!(
+            mount
+                .policy
+                .decide("Bash", &serde_json::json!({"command": "rm -rf /"}))
+                .0,
+            kian_harness::approval::Decision::Deny
+        );
     }
 }
