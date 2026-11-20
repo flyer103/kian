@@ -13,6 +13,9 @@ members = [
     "crates/kian-superagent",
     "crates/kian-sdk",
     "crates/kian-dsh",
+    "crates/kian-harness",
+    "crates/kian-claude",
+    "crates/kian-codex",
     "crates/kian-cron",
     "crates/kian-cli",
     "crates/kiand",
@@ -75,6 +78,9 @@ kian-superagent = { path = "crates/kian-superagent" }
 kian-sdk = { path = "crates/kian-sdk" }
 # the dsh bridge — depends on kian-core only (narrow waist).
 kian-dsh = { path = "crates/kian-dsh" }
+kian-harness = { path = "crates/kian-harness" }
+kian-claude = { path = "crates/kian-claude" }
+kian-codex = { path = "crates/kian-codex" }
 # the cron scheduling core (CRON-MODEL §2, §5) — pure: no I/O, no clock.
 kian-cron = { path = "crates/kian-cron" }
 kian-cli = { path = "crates/kian-cli" }

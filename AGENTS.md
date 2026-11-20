@@ -155,6 +155,11 @@ when the owner asks. Negative results commit documentation only — never broken
   catalog, interception ports, capability grants, manifest and stdio ABI, per-worker resolution,
   session consistency, failure policy and trust model. **Any harness-hook plugin change starts
   here**; event kinds stay in EVENT-MODEL, wire shapes in API-CONTRACT, placement in DESIGN.
+- `design/HARNESS-BRIDGE.md` — the normative external-harness bridge contract (source of truth,
+  phase 1): bridge classes (exact vs projection-only), the capability matrix, per-harness mapping
+  (Claude Code stream-json, Codex app-server, dsh v0), the approval policy, the config grammar and
+  the phase plan. **Any bridge semantic change starts here**; the one event change
+  (`session/created.bridge`) lands in EVENT-MODEL, crates in DESIGN's crate map.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 - `the design notes` — research synthesis; update when a new design input is added.

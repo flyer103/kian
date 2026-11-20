@@ -25,8 +25,10 @@ machines you choose, and the loop you already run. Kian ships each as a product 
   choose, over a durable at-least-once queue with a heartbeat watchdog, bound 1:1 to its worker
   session for that session's whole life; offline work parks and resumes honestly.
 - **Harness integration** — bring your own loop: the built-in ReAct loop, or an existing harness
-  such as dsh, behind the same `LoopDriver` seam and event kinds — durability does not force a
-  rewrite of the loop that already works.
+  (dsh, Claude Code, Codex) behind the same `LoopDriver` seam and event kinds — durability does
+  not force a rewrite of the loop that already works. A harness-owned loop is a *projection-only*
+  session: durable control and audit, but no byte-level model-request replay, and the capability
+  matrix says exactly what each harness supports ([HARNESS-BRIDGE](design/HARNESS-BRIDGE.md)).
 
 The same runtime also ships:
 
@@ -125,9 +127,11 @@ The same runtime also ships:
 | [design/CRON-MODEL.md](design/CRON-MODEL.md) | The normative scheduling contract: expressions, timezones/DST, durable cursors, misfire/overlap, worktree firings, `kian cron` |
 | [design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md) | The normative WeChat iLink channel contract: protocol mapping, credential file, config/CLI, dedupe, degradation |
 | [design/WORKER-MODEL.md](design/WORKER-MODEL.md) | The normative worker-domain contract: membership lifecycle, binding/dispatch, catalog, security boundary |
+| [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) | The normative external-harness bridge contract: bridge classes, capability matrix, per-harness mapping, approvals |
 | [design/decisions/](design/decisions/) | ADRs (append-only): each decision with alternatives and trade-offs |
 | [the design notes](the design notes) | Synthesis of the design inputs |
 | [docs/runbook-dsh.md](docs/runbook-dsh.md) | Running the dsh bridge |
+| [docs/runbook-harness.md](docs/runbook-harness.md) | Running the Claude Code / Codex bridges (live smokes, protocol pins) |
 | [docs/runbook-postgres.md](docs/runbook-postgres.md) | Running postgres mode and the multi-replica replay |
 | [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md) | iPhone worker design, repo placement, enrollment and the verification matrix |
 | [docs/runbook-kian-vultr.md](docs/runbook-kian-vultr.md) | The vultr server: unit layout, config-write discipline, watchdog, deploy |
@@ -653,6 +657,44 @@ contract-v0 fixture peer. The live leg ran green on 2026-11-02 via
 `deepseek-chat` — full mapped chain, honest `Settled`. Re-run commands and the survey:
 [docs/runbook-dsh.md](docs/runbook-dsh.md).
 
+### Harness bridges (Claude Code / Codex)
+
+The same mount point runs Claude Code (`stream-json`) or Codex (`app-server`) as the worker
+template's inner loop; the harness keeps its tools, sandbox and model, kian keeps the session,
+control and audit. Exactly one harness per worker template; default off.
+
+```yaml
+superagent:
+  harness:
+    claude:                         # or codex:
+      command: /usr/local/bin/claude # or export KIAN_CLAUDE_BIN
+      model: claude-sonnet-4-5      # passed to the harness; the harness owns the call
+      approvals:                    # the harness's own tool gate, answered by kian
+        default: deny
+        allow: ["Read", "Bash(*git status*)"]
+```
+
+```yaml
+superagent:
+  harness:
+    codex:
+      command: /usr/local/bin/codex # or export KIAN_CODEX_BIN
+      approval_policy: unlessTrusted # `never` refuses boot (it removes the gate)
+      approvals:
+        default: deny
+        allow: ["commandExecution(*git *)"]
+```
+
+The stream records the session's class: a spawned worker's `session/created` carries
+`bridge:{name,request_bytes}` ([EVENT-MODEL](design/EVENT-MODEL.md)), so an audit export states
+whether the model request is byte-replayable. Phase-1 limits are the contract's, not a bug: no
+`step/request` (no cache/cost audit), no cross-process harness resume (a later input starts a
+fresh harness conversation), and `ask` approvals refuse boot until the phase-2 confirmation
+design. Start the harness with a gated
+approval mode — a bypass flag refuses boot. Contracts, mappings and the capability matrix:
+[HARNESS-BRIDGE](design/HARNESS-BRIDGE.md), [ADR-041](design/decisions/ADR-041-multi-harness-bridge.md);
+live smokes: [docs/runbook-harness.md](docs/runbook-harness.md).
+
 ### Tool permissions (per-call governance)
 
 ```yaml
@@ -845,6 +887,8 @@ Default CI needs none of these — every gated suite **skips with a log line, ne
 |---------|---------|-----------------|
 | `KIAN_PG_URL` | postgres store/exec suites and the multi-replica e2e | skip with a log line |
 | `KIAN_DSH_BIN` | the dsh live smoke; default command source for a configured dsh harness | smoke skips; a mounted harness without a command refuses to start |
+| `KIAN_CLAUDE_BIN` | the Claude Code live smoke; default command source for a configured `harness.claude` | smoke skips; a mounted harness without a command refuses to start |
+| `KIAN_CODEX_BIN` | the Codex live smoke; default command source for a configured `harness.codex` | smoke skips; a mounted harness without a command refuses to start |
 | `KIAN_GITHUB_TOKEN` | github channel send and poll reads | `send: true` refuses to start; public polls run tokenless |
 | `KIAN_GITHUB_WEBHOOK_SECRET` | webhook HMAC verification | a github webhook channel refuses to start |
 | `KIAN_LARK_APP_ID` / `KIAN_LARK_APP_SECRET` / `KIAN_LARK_CHAT_ID` / `KIAN_LARK_POLL_CHAT` | lark channel and live smoke | skip |
@@ -872,6 +916,9 @@ exception: it is issued by a QR scan and kept in a `0600` file
 | `kian-superagent` | The bundle: Router/Worker templates, subscriptions, channels, output policies, recall, watchdog |
 | `kian-sdk` | Wire-only embedded client (frozen JSON-RPC + SSE surface, typed errors) |
 | `kian-dsh` | The dsh bridge: a `LoopDriver` over a stdio child, mapping onto existing kinds |
+| `kian-harness` | Shared bridge skeleton: session trait, driver state machine, approval policy, fixtures |
+| `kian-claude` | Claude Code adapter: `stream-json` child, approvals, interrupt |
+| `kian-codex` | Codex adapter: `app-server` JSON-RPC child, approvals, interrupt |
 | `kian-cli` | The `kian` binary: serve assembly, operator CLI, inbound webhook receiver |
 | `kiand` | The endpoint daemon binary |
 

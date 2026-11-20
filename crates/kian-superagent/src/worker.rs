@@ -681,6 +681,16 @@ pub enum SpawnError {
     },
 }
 
+/// The optional eager-creation seam for a spawned worker session (HARNESS-BRIDGE §4.7).
+///
+/// Kept **off** [`InboxWriter`] on purpose: that port is exactly admit+wake (the iron-rule
+/// invariant). A deployment with a mounted harness bridge supplies this port so
+/// `session/created` can carry the bridge marker the first drain cannot derive.
+pub trait SpawnSessionWriter: Send + Sync {
+    fn create_session(&self, session: SessionId)
+    -> BoxFuture<'static, Result<(), InboxWriteError>>;
+}
+
 /// Mints a `Thread` and creates the worker session by admitting its
 /// task input (a fresh session id; the first hold appends
 /// `session/created`), wakes it, and returns the thread id. The
@@ -697,6 +707,8 @@ pub struct WorkerSpawner {
     /// once the engine exists (the spawner itself is built before it).
     /// `None` (the default, all tests) keeps every byte unchanged.
     bootstrap: std::sync::OnceLock<Option<Arc<dyn crate::bootstrap::SessionBootstrap>>>,
+    /// HARNESS-BRIDGE §4.7: the eager-creation seam (absent = the historical lazy creation).
+    session_creation: Option<Arc<dyn SpawnSessionWriter>>,
 }
 
 impl WorkerSpawner {
@@ -708,6 +720,7 @@ impl WorkerSpawner {
             worker_template_id: worker_template.id.clone(),
             inbox,
             bootstrap: std::sync::OnceLock::new(),
+            session_creation: None,
         }
     }
 
@@ -715,6 +728,14 @@ impl WorkerSpawner {
     /// first install wins, later calls are no-ops.
     pub fn install_bootstrap(&self, bootstrap: Arc<dyn crate::bootstrap::SessionBootstrap>) {
         let _ = self.bootstrap.set(Some(bootstrap));
+    }
+
+    /// Mounts the eager-creation seam (HARNESS-BRIDGE §4.7); absent = the historical lazy
+    /// creation by the first drain.
+    #[must_use]
+    pub fn with_session_creation(mut self, port: Arc<dyn SpawnSessionWriter>) -> Self {
+        self.session_creation = Some(port);
+        self
     }
 
     /// The worker template's id — the mandate scope key (
@@ -888,6 +909,11 @@ impl WorkerSpawner {
     /// double-admits), then wake. Durable row first, wake strictly
     /// after (invariant 1).
     pub async fn admit(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
+        // Eager creation (HARNESS-BRIDGE §4.7): the first event can then carry the bridge marker
+        // the first drain could not derive. Absent the port, the lazy path is unchanged.
+        if let Some(port) = &self.session_creation {
+            port.create_session(spawned.worker_session).await?;
+        }
         // ADR-038: the bootstrap runs BEFORE the triggering row, so the
         // index is the worker session's first context-bearing event.
         // A failure is recorded and never fails the spawn.

@@ -92,7 +92,7 @@ graph LR
  SDK[kian-sdk crate] --> API
  subgraph workers["drain executors"]
  FIBER[tokio task/fiber]
- LOOP[agent loop<br/>pluggable: built-in/dsh]
+ LOOP[agent loop<br/>pluggable: built-in/harness bridges]
  end
  API --> ORCH --> FIBER --> LOOP
  ORCH --> ES
@@ -1552,7 +1552,7 @@ Every seam names three roles: **Service Definition** (the trait) / **Provider** 
 |------|----------------------|-------------------|-----------------------|
 | `ModelProvider` | `complete(req: ModelRequest) -> Stream<ModelChunk>` | openai-compat (covers OR/kimi/ds) | any |
 | `ExecBackend` | `exec(cmd, env) -> ExecResult` | local / remote-endpoint (kiand, endpoint SDK) | sandbox/cloud machines |
-| `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | **dsh bridge (`kian-dsh`,: a `dsh --profile sdk` child over stdio JSON-lines, ADR-010 mapping)**, custom loops |
+| `LoopDriver` | `drive(drain_ctx) -> Stream<LoopOutcome>` | built-in ReAct loop | **harness bridges** — `kian-dsh` (a `dsh --profile sdk` child over stdio JSON-lines, ADR-010 mapping), `kian-claude` and `kian-codex` (phase 1, [HARNESS-BRIDGE](HARNESS-BRIDGE.md), [ADR-041](decisions/ADR-041-multi-harness-bridge.md)) — and custom loops |
 | `ChannelAdapter` | `subscribe -> Stream<ChannelEvent>`; `send(out) -> Future<SendReceipt>` | — | lark/im/github/wechat (the wechat adapter is best-effort: reverse-documented iLink protocol, [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md), ADR-018) |
 | `ToolProvider` | `schemas -> Vec<ToolSchema>`; `invoke(call)` | built-in fs/exec/kiand | any |
 | `RecoveryPolicySource` | `table -> Vec<PolicyRule>` | config file | any |
@@ -1670,6 +1670,9 @@ graph TB
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
+| kian-harness (planned, phase 1) | The shared bridge skeleton ([HARNESS-BRIDGE](HARNESS-BRIDGE.md), [ADR-041](decisions/ADR-041-multi-harness-bridge.md)): the session trait, the driver state machine (episode spawn/park, safe boundaries, takeover dedup, step budget, honesty outcomes), the declarative approval policy, the `tool/post` port shape and the capability declarations. Narrow waist: depends on `kian-core` only; the drain surface is a crate-local ctx port implemented by assembly | `HarnessSession`, `BridgeDriver`, `Capabilities`, `ApprovalPolicy` |
+| kian-claude (planned, phase 1) | Claude Code adapter: spawns `claude --print --input-format stream-json --output-format stream-json --verbose`, decodes the stream-json message set, maps text/tool blocks onto existing kian kinds, translates `can_use_tool` into a kian approval decision and `control_request{interrupt}` into an interrupt. `request_bytes: unavailable` (projection-only) | `ClaudeAdapter`, `ClaudeSession` |
+| kian-codex (planned, phase 1) | Codex adapter: spawns `codex app-server` and speaks its JSON-RPC (initialize, thread start/resume, turn start/steer/interrupt, item notifications, server-initiated approval requests). `request_bytes: unavailable` (projection-only) | `CodexAdapter`, `CodexSession` |
 | kian-cron | Wall-clock scheduling core (CRON-MODEL, ADR-034): five-field grammar and aliases, IANA zone resolution, DST gap/overlap-aware next-fire math, and misfire/coalescing plans. Pure — no I/O, no clock read, no store; the server and CLI own the loop | `CronExpr`, `next_fire_after`, `misfire::plan` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
 
@@ -1919,6 +1922,18 @@ wake transport is an advisory accelerator — availability never depends on it.
  Node/dsh dependency) proves both mapping directions, the steer/interrupt translation and the
  pre-flight ordering rule in default CI; `kian-dsh` driver implements the same contract,
  which is also the bar any dsh-side plugin must clear to be kian-compatible.
+- Multi-harness bridges (phase 1): Claude Code (`stream-json`) and Codex (`app-server`) join
+ dsh behind one kian-side contract, [HARNESS-BRIDGE](HARNESS-BRIDGE.md) + [ADR-041](decisions/ADR-041-multi-harness-bridge.md).
+ The shared skeleton (`kian-harness`) owns the state machine; each harness contributes a
+ protocol adapter and a spawn recipe (`kian-claude`, `kian-codex`), both on the same
+ `kian-core`-only waist as `kian-dsh`. Because neither exposes the assembled model request,
+ those sessions are **projection-only**: no `step/request`, no cache accounting, no
+ byte-request replay — the class is a durable, machine-checkable fact on `session/created`
+ (`bridge.request_bytes`), not a documentation caveat. Tool execution gates through the
+ harness's own approval channel, answered by kian's declarative allow/deny policy and
+ recorded as `tool/call.permission`; `ask` is deferred to phase 2 because a human answer
+ cannot be delivered to a harness process that died with the drain. dsh's contract v0 and
+ mapping stay frozen; convergence onto the shared skeleton is phase 3.
 - Sync with the Feishu design doc: this document is its Rust implementation design; the upstream
  doc's "why the agent loop is not enough" TODO section is argued by this document's §1/§2
  (write-back to upstream is the owner's call).

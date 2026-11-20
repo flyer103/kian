@@ -97,13 +97,23 @@ pub fn record_rebuild_done(order: &StartupOrder) {
 /// the first wake can fire.
 pub struct EngineInbox {
     engine: OnceLock<Arc<Engine<ServeLoopDriver>>>,
+    /// The `session/created` payload for spawned worker sessions (HARNESS-BRIDGE §4.7).
+    /// Unset = the historical `{}` bytes.
+    bridge: OnceLock<serde_json::Value>,
 }
 
 impl EngineInbox {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             engine: OnceLock::new(),
+            bridge: OnceLock::new(),
         })
+    }
+
+    /// Installs the bridge marker written on a spawned worker session's `session/created`
+    /// (first write only; a later call is ignored).
+    pub fn set_bridge_marker(&self, payload: serde_json::Value) {
+        let _ = self.bridge.set(payload);
     }
 
     /// Installs the engine. Fails (returns the engine back) if one is
@@ -120,7 +130,33 @@ impl Default for EngineInbox {
     fn default() -> Self {
         Self {
             engine: OnceLock::new(),
+            bridge: OnceLock::new(),
         }
+    }
+}
+
+impl kian_superagent::SpawnSessionWriter for EngineInbox {
+    fn create_session(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'static, Result<(), kian_superagent::InboxWriteError>> {
+        let engine = self
+            .engine
+            .get()
+            .expect("engine installed before the first spawn")
+            .clone();
+        let payload = self
+            .bridge
+            .get()
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        Box::pin(async move {
+            engine
+                .create_session_with(session, payload)
+                .await
+                .map(|_| ())
+                .map_err(|e| kian_superagent::InboxWriteError::Write(e.to_string()))
+        })
     }
 }
 
@@ -903,13 +939,97 @@ impl kian_dsh::DshCtx for DrainDshCtx {
     // exercised by the kian-dsh driver suite.
 }
 
+/// The `kian_harness::BridgeCtx` impl over the real `DrainCtx` (HARNESS-BRIDGE §4): the shared
+/// skeleton's drain port, mirroring the dsh port above.
+pub struct DrainBridgeCtx(pub DrainCtx);
+
+impl kian_harness::BridgeCtx for DrainBridgeCtx {
+    fn session(&self) -> SessionId {
+        self.0.session()
+    }
+
+    fn epoch(&self) -> kian_core::model::Epoch {
+        self.0.epoch()
+    }
+
+    fn in_turn(&self) -> bool {
+        self.0.in_turn()
+    }
+
+    fn events(&self) -> BoxFuture<'_, Result<Vec<Event>, kian_harness::BridgeCtxError>> {
+        let fut = self.0.events();
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn append(
+        &self,
+        kind: EventKind,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_harness::BridgeCtxError>> {
+        let fut = self.0.append(kind, bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn begin_turn(
+        &self,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_harness::BridgeCtxError>> {
+        let fut = self.0.begin_turn_with(bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn end_turn(
+        &self,
+        bytes: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Event, kian_harness::BridgeCtxError>> {
+        let fut = self.0.end_turn_with(bytes);
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))
+        })
+    }
+
+    fn take_eligible_inputs(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<kian_core::model::InputRow>, kian_harness::BridgeCtxError>> {
+        let fut = self.0.take_eligible_inputs();
+        Box::pin(async move {
+            fut.await.map_err(|e| match e {
+                kian_orchestrator::EngineError::NotAtSafeBoundary { .. } => {
+                    kian_harness::BridgeCtxError::NotAtSafeBoundary
+                }
+                other => kian_harness::BridgeCtxError::Failure(other.to_string()),
+            })
+        })
+    }
+
+    fn has_eligible_inputs(&self) -> BoxFuture<'_, Result<bool, kian_harness::BridgeCtxError>> {
+        let fut = self.0.has_eligible_inputs();
+        Box::pin(async move {
+            fut.await
+                .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))
+        })
+    }
+}
+
 /// The worker template's inner loop, config-gated: the built-in
-/// ReAct loop (default), or the dsh bridge when
-/// `superagent.harness.dsh` is on. The decorator (`WorkerLoopDriver`)
-/// and the plain/router sides are unchanged either way.
+/// ReAct loop (default), the dsh bridge when `superagent.harness.dsh`
+/// is on, or the shared bridge driver when `harness.claude`/`harness.codex`
+/// is on. The decorator (`WorkerLoopDriver`) and the plain/router sides
+/// are unchanged either way.
 pub enum WorkerInnerDriver {
     React(Arc<ReActLoop>),
     Dsh(Arc<kian_dsh::DshDriver>),
+    Bridge(Arc<kian_harness::BridgeDriver>),
 }
 
 impl LoopDriver for WorkerInnerDriver {
@@ -920,6 +1040,9 @@ impl LoopDriver for WorkerInnerDriver {
             Self::React(loop_) => loop_.drive(ctx),
             Self::Dsh(driver) => {
                 driver.drive(Arc::new(DrainDshCtx(ctx)) as Arc<dyn kian_dsh::DshCtx>)
+            }
+            Self::Bridge(driver) => {
+                driver.drive(Arc::new(DrainBridgeCtx(ctx)) as Arc<dyn kian_harness::BridgeCtx>)
             }
         }
     }

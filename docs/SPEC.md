@@ -70,6 +70,10 @@ Kian is **not**:
 2. The harness's models/tools/sandboxes mount as seam providers
 3. Kian provides durable state, recovery, control plane, audit
    This line composes with B: a harness loop can serve as a Kian Worker wholesale.
+4. Bridges under this line: dsh (ADR-010), plus Claude Code and Codex (phase 1,
+   design/HARNESS-BRIDGE.md, ADR-041). A harness-owned loop is a projection-only session
+   unless the harness exposes the assembled model request; the class bounds what the session
+   may claim (audit, cache accounting) and is durable on `session/created` for spawned workers.
 ```
 
 ### 2.3 Configuration interface (v0.1 draft)

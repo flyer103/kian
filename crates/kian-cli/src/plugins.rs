@@ -671,6 +671,9 @@ pub struct SuperAgentPlugin {
     /// (`superagent.harness.dsh`, default off). When present the
     /// worker template's inner loop is the `DshDriver`.
     pub dsh_harness: Option<kian_dsh::DshDriverConfig>,
+    /// the resolved Claude Code / Codex bridge (HARNESS-BRIDGE §7, default off). When present the
+    /// worker template's inner loop is the shared `BridgeDriver`.
+    pub bridge_harness: Option<Arc<kian_harness::BridgeDriver>>,
     /// The timer input sources, built by the server over the
     /// system clock; registered into the channel registry and the
     /// consumer spawn exactly like mocks. Their run tasks start in
@@ -840,11 +843,16 @@ impl Plugin for SuperAgentPlugin {
         );
 
         // Dispatch tools over the spawner + channel registry + hold.
-        let spawner = Arc::new(WorkerSpawner::new(
-            self.router_session,
-            &self.worker_agent,
-            Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
-        ));
+        let spawner = Arc::new(
+            WorkerSpawner::new(
+                self.router_session,
+                &self.worker_agent,
+                Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+            )
+            .with_session_creation(
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::SpawnSessionWriter>
+            ),
+        );
         let mut channels = kian_superagent::ChannelRegistry::new();
         let mut adapters = Vec::with_capacity(
             self.mock_channels.len()
@@ -1131,11 +1139,12 @@ impl Plugin for SuperAgentPlugin {
         // The config is resolved fail-closed by the server assembly
         // (`DshHarnessConfig::to_runtime`: command from config or
         // `KIAN_DSH_BIN`); the mount just builds the driver from it.
-        let worker_inner = match &self.dsh_harness {
-            Some(config) => crate::superagent::WorkerInnerDriver::Dsh(Arc::new(
+        let worker_inner = match (&self.bridge_harness, &self.dsh_harness) {
+            (Some(driver), _) => crate::superagent::WorkerInnerDriver::Bridge(Arc::clone(driver)),
+            (None, Some(config)) => crate::superagent::WorkerInnerDriver::Dsh(Arc::new(
                 kian_dsh::DshDriver::new(config.clone()),
             )),
-            None => crate::superagent::WorkerInnerDriver::React(worker_loop),
+            (None, None) => crate::superagent::WorkerInnerDriver::React(worker_loop),
         };
 
         // Plain-session loop: the default agent, with its own gate. The

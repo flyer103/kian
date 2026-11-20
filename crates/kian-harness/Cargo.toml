@@ -1,0 +1,21 @@
+[package]
+name = "kian-harness"
+description = "Shared skeleton for external-harness bridges (LoopDriver state machine, approvals, fixtures)"
+version.workspace = true
+edition.workspace = true
+
+# HARNESS-BRIDGE §4: the shared skeleton sits on the narrow waist — its
+# ONLY kian dependency is `kian-core` (the seam types plus the event
+# vocabulary the adapters select from). The drain surface is the
+# crate-local `BridgeCtx` port, implemented over the real `DrainCtx` by
+# assembly (`kian-cli`). Enforced by tests/narrow_waist.rs.
+
+[dependencies]
+kian-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true

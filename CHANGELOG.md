@@ -10,6 +10,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-041)**. The worker
+  template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code
+  `stream-json` adapter (`kian-claude`) or the Codex `app-server` JSON-RPC adapter
+  (`kian-codex`): `session/prompt`-style input delivery, steer/interrupt, the harness's own
+  pre-execution approval gate answered by a declarative allow/deny policy and recorded as
+  `tool/call.permission`, and honest outcomes (a mid-turn child death is a soft failure, never
+  `completed`). These are *projection-only* sessions — no `step/request`, no cache or byte-request
+  replay — and phase 1 has no cross-process harness resume; the capability matrix states both.
+  Contract, mappings and limits: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md),
+  [ADR-041](design/decisions/ADR-041-multi-harness-bridge.md). Spawned worker sessions record the
+  class durably: `session/created` carries the additive `bridge:{name,request_bytes}` key through
+  the eager creation seam (HARNESS-BRIDGE §4.7).
+
 - **Confirmation phase 2: workers can wait on a person (CONFIRMATION-MODEL §8 C2, §14b)**. `ask`
   is accepted on a superagent worker agent. A worker that stops on a pending `ask` now writes
   **no** `thread/completed` and no parent report (it is waiting, not done); the engine still settles
