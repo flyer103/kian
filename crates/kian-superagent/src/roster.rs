@@ -87,6 +87,13 @@ pub struct RosterEntry {
     pub limits: RosterLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// (ADR-049) whether this entry's worker loop is an external harness bridge
+    /// (`claude`/`codex`/`dsh`) rather than the built-in kian loop — stamped by the config
+    /// conversion (`superagent.roster[].harness`). A bridged entry owns its tools in the child
+    /// process, so `spawn_worker` refuses an `exec_worker` binding for it. Serde-skipped: a
+    /// conversion product, not a config field — the wire form is unchanged.
+    #[serde(skip)]
+    pub harness_bridged: bool,
     /// (R17-C2, pin P2-1) the resolved `AgentDef` identity this entry's
     /// `agent` names — stamped by the config conversion through
     /// `ServeConfig::named_agent_def` (never the default `agent:`),
@@ -787,6 +794,7 @@ mod tests {
             tools_allow: tools.iter().map(|t| t.to_string()).collect(),
             limits: RosterLimits { max_children: 0 },
             output_schema: None,
+            harness_bridged: false,
             resolved_agent: None,
         }
     }

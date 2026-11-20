@@ -1409,6 +1409,10 @@ impl RouterTools {
         // block (pin P2-6's refusal clause; a spawn the capability
         // cannot honour is never silently degraded).
         let mut declared_output_schema = None;
+        // (ADR-049) the roster entry's recorded bridged class, when the spawn resolved one: a
+        // bridged worker owns its tools in the child process, so a kian `exec_worker` binding on
+        // it is refused below (before any side effect).
+        let mut bridged_assignee: Option<String> = None;
         let mut declared_depends_on: Vec<String> = Vec::new();
         let mut declared_group: Option<String> = None;
         let multiagent_identity = match self.multiagent {
@@ -1507,6 +1511,9 @@ impl RouterTools {
                         ))
                     })?;
                     assignee = Some(entry.id.clone());
+                    if entry.harness_bridged {
+                        bridged_assignee = Some(entry.id.clone());
+                    }
                     agent_def = resolved.def_id.clone();
                     agent_def_version = resolved.version;
                     // §3.2.1: the entry's default expectation applies
@@ -1667,6 +1674,18 @@ impl RouterTools {
         // view). An offline-known worker is allowed here — the result
         // and audit carry the queue note (step 5).
         let (exec_worker, worker_state) = self.resolve_exec_worker(&call.arguments).await?;
+        // (ADR-049) a bridged roster entry owns its tools inside the harness child: binding it to
+        // an execution worker would record a kian exec route that never runs (audit fiction).
+        // Refused before the busy/ownership checks and before any mint/lineage/admit.
+        if let Some(id) = &bridged_assignee
+            && exec_worker.is_some()
+        {
+            return Err(ToolError::Execution(format!(
+                "spawn refused: roster entry `{id}` runs an external harness bridge that owns \
+                 its tools, so `exec_worker` cannot be bound to it (ADR-049) — drop one of the \
+                 two"
+            )));
+        }
         // follow-up ownership — the topic correlation of this
         // spawn, derived exactly the way the registry rebuild derives
         // topic bindings (the channel-event wrapper the Router judged),

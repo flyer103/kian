@@ -861,20 +861,8 @@ impl HarnessConfig {
     /// (ADR-046) the class is `exact`.
     #[must_use]
     pub fn bridge_marker(&self) -> Option<serde_json::Value> {
-        let captured = self.capture.is_some();
-        let request_bytes = if captured { "exact" } else { "unavailable" };
-        match self.config_key()? {
-            "dsh" => Some(serde_json::json!({
-                "bridge": {"name": "dsh", "request_bytes": "exact"}
-            })),
-            "claude" => Some(serde_json::json!({
-                "bridge": {"name": "claude-code", "request_bytes": request_bytes}
-            })),
-            "codex" => Some(serde_json::json!({
-                "bridge": {"name": "codex", "request_bytes": request_bytes}
-            })),
-            _ => None,
-        }
+        let key = HarnessKey::parse(self.config_key()?).ok()?;
+        self.bridge_marker_for(key)
     }
 
     /// The capture proxy settings, when configured.
@@ -893,6 +881,100 @@ impl HarnessConfig {
             return Ok(Some(codex.to_mount()?));
         }
         Ok(None)
+    }
+
+    /// (ADR-049) every declared non-dsh bridge mount, in declaration order (claude, codex).
+    pub fn bridge_mounts(&self) -> Result<Vec<BridgeMountSpec>, ConfigError> {
+        let mut mounts = Vec::new();
+        if let Some(claude) = &self.claude {
+            mounts.push(claude.to_mount()?);
+        }
+        if let Some(codex) = &self.codex {
+            mounts.push(codex.to_mount()?);
+        }
+        Ok(mounts)
+    }
+
+    /// (ADR-049) whether one harness is declared (`kian` is always available).
+    #[must_use]
+    pub fn declared(&self, key: HarnessKey) -> bool {
+        match key {
+            HarnessKey::Kian => true,
+            HarnessKey::Dsh => self.dsh.is_some(),
+            HarnessKey::Claude => self.claude.is_some(),
+            HarnessKey::Codex => self.codex.is_some(),
+        }
+    }
+
+    /// (ADR-049) the `session/created` bridge marker for one spawn's resolved harness; `None` for
+    /// the built-in kian loop (the historical `{}` bytes).
+    #[must_use]
+    pub fn bridge_marker_for(&self, key: HarnessKey) -> Option<serde_json::Value> {
+        let request_bytes = if self.capture.is_some() {
+            "exact"
+        } else {
+            "unavailable"
+        };
+        match key {
+            HarnessKey::Kian => None,
+            HarnessKey::Dsh => Some(serde_json::json!({
+                "bridge": {"name": "dsh", "request_bytes": "exact"}
+            })),
+            HarnessKey::Claude => Some(serde_json::json!({
+                "bridge": {"name": "claude-code", "request_bytes": request_bytes}
+            })),
+            HarnessKey::Codex => Some(serde_json::json!({
+                "bridge": {"name": "codex", "request_bytes": request_bytes}
+            })),
+        }
+    }
+}
+
+/// (ADR-049) One worker inner-loop choice: the built-in kian loop or one external harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HarnessKey {
+    /// The built-in kian loop (the default; also the plain/Router loop).
+    Kian,
+    /// The dsh bridge (`superagent.harness.dsh`).
+    Dsh,
+    /// The Claude Code bridge (`superagent.harness.claude`).
+    Claude,
+    /// The Codex bridge (`superagent.harness.codex`).
+    Codex,
+}
+
+impl HarnessKey {
+    /// Every selection value, in the grammar's order.
+    pub const ALL: [HarnessKey; 4] = [Self::Kian, Self::Dsh, Self::Claude, Self::Codex];
+
+    /// Parses one selection value, naming the closed set on a typo.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.trim() {
+            "kian" => Ok(Self::Kian),
+            "dsh" => Ok(Self::Dsh),
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            other => Err(format!(
+                "unknown harness `{other}` (use kian | dsh | claude | codex)"
+            )),
+        }
+    }
+
+    /// The YAML key (`superagent.harness.<key>`): `kian` | `dsh` | `claude` | `codex`.
+    #[must_use]
+    pub fn config_key(self) -> &'static str {
+        match self {
+            Self::Kian => "kian",
+            Self::Dsh => "dsh",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Whether this choice is an external harness bridge (own child process, owns its tools).
+    #[must_use]
+    pub fn is_bridged(self) -> bool {
+        !matches!(self, Self::Kian)
     }
 }
 
@@ -1501,6 +1583,89 @@ fn default_followup_ownership() -> bool {
 }
 
 impl SuperAgentConfig {
+    /// (ADR-049) the default worker template's inner loop: an explicit
+    /// `superagent.worker.harness`, else the legacy single declared harness (which replaced the
+    /// template for every worker side), else the built-in kian loop.
+    pub fn worker_harness_key(&self) -> Result<HarnessKey, ConfigError> {
+        if let Some(text) = self.worker.harness.as_deref() {
+            return HarnessKey::parse(text)
+                .map_err(|e| invalid(format!("superagent.worker.harness: {e}")));
+        }
+        // In the per-agent shape an unselected template is the built-in loop; only the legacy
+        // shape (no selection anywhere) lets the single declared harness replace the template.
+        if self.per_agent_harness() {
+            return Ok(HarnessKey::Kian);
+        }
+        match self.harness.count() {
+            1 => HarnessKey::parse(self.harness.config_key().unwrap_or("kian")).map_err(invalid),
+            _ => Ok(HarnessKey::Kian),
+        }
+    }
+
+    /// (ADR-049) the per-spawn `session/created` class markers: the default worker template's
+    /// choice plus one per roster assignee. Legacy mode (no explicit selection) keeps the
+    /// historical global marker for non-roster spawns; a roster child is always kian-loop in that
+    /// mode, so it writes `{}` (the pre-ADR-049 mixed-config lie this ADR fixes).
+    pub fn harness_markers(&self) -> Result<crate::superagent::BridgeMarkers, ConfigError> {
+        let per_agent = self.per_agent_harness();
+        let worker = self.worker_harness_key()?;
+        let assignees: std::collections::BTreeMap<String, HarnessKey> = if per_agent {
+            self.roster_harness_keys()?
+        } else {
+            self.roster
+                .iter()
+                .map(|entry| (entry.id.clone(), HarnessKey::Kian))
+                .collect()
+        };
+        let mut by_assignee = std::collections::BTreeMap::new();
+        for (id, key) in &assignees {
+            let marker = if per_agent {
+                self.harness.bridge_marker_for(*key)
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                by_assignee.insert(id.clone(), marker);
+            }
+        }
+        let default = if per_agent {
+            self.harness.bridge_marker_for(worker)
+        } else {
+            self.harness.bridge_marker()
+        };
+        Ok(crate::superagent::BridgeMarkers {
+            default,
+            by_assignee,
+        })
+    }
+
+    /// (ADR-049) each roster entry's inner loop, keyed by entry id (absent = `kian`).
+    pub fn roster_harness_keys(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, HarnessKey>, ConfigError> {
+        let mut keys = std::collections::BTreeMap::new();
+        for entry in &self.roster {
+            let key = match entry.harness.as_deref() {
+                None => HarnessKey::Kian,
+                Some(text) => HarnessKey::parse(text).map_err(|e| {
+                    invalid(format!(
+                        "superagent.roster entry `{}`.harness: {e}",
+                        entry.id
+                    ))
+                })?,
+            };
+            keys.insert(entry.id.clone(), key);
+        }
+        Ok(keys)
+    }
+
+    /// (ADR-049) whether any worker template/roster entry selects its harness explicitly
+    /// (the per-agent mode; absent = the legacy single-harness shape).
+    #[must_use]
+    pub fn per_agent_harness(&self) -> bool {
+        self.worker.harness.is_some() || self.roster.iter().any(|entry| entry.harness.is_some())
+    }
+
     /// Converts the speak-rule table to the bundle policy,
     /// fail-closed: an unknown condition spelling or an empty channel
     /// refuses to start, never silently defaults. Errors carry the
@@ -1746,6 +1911,11 @@ pub struct RosterEntryDef {
     /// entry's children.
     #[serde(default)]
     pub output_schema: Option<serde_json::Value>,
+    /// (ADR-049) this entry's worker inner loop: `kian` (the default) | `dsh` | `claude` |
+    /// `codex`. A bridged choice requires `superagent.harness.<key>`, an agent with no `tools:`,
+    /// an empty `tools_allow`, and refuses `exec_worker` at spawn.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 /// The `mandate_template` block of a roster entry: the advisory
@@ -2251,6 +2421,11 @@ pub struct SuperAgentWorkerConfig {
     /// agent's `version`. An explicit value that contradicts the agent's
     /// version refuses to start (the `AgentDef.version` **is** the pin).
     pub pinned_version: Option<u64>,
+    /// (ADR-049) the default worker template's inner loop: `kian` (the built-in loop, the
+    /// default) | `dsh` | `claude` | `codex`. A bridged choice requires the matching
+    /// `superagent.harness.<key>` section, an empty `tools:` on the agent, and no worker surface.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 /// One channel entry. The map key is the channel name (`mock-im` in
@@ -3514,21 +3689,115 @@ impl ServeConfig {
                     ));
                 }
             }
-            if sa.harness.count() > 1 {
-                return Err(invalid(
-                    "`superagent.harness` configures at most one harness (dsh | claude | codex): \
-                     the worker template has one inner loop",
-                ));
-            }
-            if sa.harness.count() == 1 && has_workers_surface {
-                let name = sa.harness.config_key().unwrap_or("harness");
-                return Err(invalid(format!(
-                    "`superagent.harness.{name}` and a worker surface (a non-empty `endpoints:` \
-                     list or a `workers:` section) are mutually exclusive: the {name} harness \
-                     runs the worker loop inside its own child process and never uses the kian \
-                     `exec` tool, so a worker binding could not route any command — drop \
-                     one of the two sections"
-                )));
+            // (ADR-049) no explicit per-agent selection = the legacy shape, byte-compatible:
+            // one harness at most, and a harness cannot coexist with a worker surface.
+            let per_agent = sa.per_agent_harness();
+            let worker_harness = sa.worker_harness_key()?;
+            if !per_agent {
+                if sa.harness.count() > 1 {
+                    return Err(invalid(
+                        "`superagent.harness` configures at most one harness (dsh | claude | \
+                         codex) unless a worker template selects one per agent via \
+                         `superagent.worker.harness` / `superagent.roster[].harness` (ADR-049): \
+                         the legacy worker template has one inner loop",
+                    ));
+                }
+                if sa.harness.count() == 1 && has_workers_surface {
+                    let name = sa.harness.config_key().unwrap_or("harness");
+                    return Err(invalid(format!(
+                        "`superagent.harness.{name}` and a worker surface (a non-empty \
+                         `endpoints:` list or a `workers:` section) are mutually exclusive: the \
+                         {name} harness runs the worker loop inside its own child process and \
+                         never uses the kian `exec` tool, so a worker binding could not route any \
+                         command — drop one of the two sections"
+                    )));
+                }
+            } else {
+                // Every explicit bridged selection must name a declared section.
+                let roster_keys = sa.roster_harness_keys()?;
+                let mut selections: Vec<(String, HarnessKey)> = Vec::new();
+                if sa.worker.harness.is_some() {
+                    selections.push(("`superagent.worker.harness`".to_owned(), worker_harness));
+                }
+                for entry in &sa.roster {
+                    if entry.harness.is_some() {
+                        selections.push((
+                            format!("`superagent.roster` entry `{}`", entry.id),
+                            roster_keys
+                                .get(&entry.id)
+                                .copied()
+                                .unwrap_or(HarnessKey::Kian),
+                        ));
+                    }
+                }
+                for (label, key) in &selections {
+                    if key.is_bridged() && !sa.harness.declared(*key) {
+                        return Err(invalid(format!(
+                            "{label} selects harness `{}` but `superagent.harness.{}` is not \
+                             declared",
+                            key.config_key(),
+                            key.config_key()
+                        )));
+                    }
+                }
+                // A bridged default worker template owns its tools: the agent declares none and
+                // no worker surface may exist (every non-roster bound spawn would be unroutable).
+                if worker_harness.is_bridged() {
+                    if let Some(agent) = self.agents.get(&sa.worker.agent)
+                        && !agent.tools.is_empty()
+                    {
+                        return Err(invalid(format!(
+                            "`superagent.worker.harness` selects `{}`: the harness child owns \
+                             the tools, so agent `{}` (`superagent.worker.agent`) must declare \
+                             no `tools:` (found {:?})",
+                            worker_harness.config_key(),
+                            agent.id,
+                            agent.tools
+                        )));
+                    }
+                    if has_workers_surface {
+                        return Err(invalid(format!(
+                            "`superagent.worker.harness` selects `{}`: a bridged default worker \
+                             template cannot be bound to an execution worker surface (a \
+                             non-empty `endpoints:` list or a `workers:` section) — set the \
+                             default template to `kian` or drop the surface",
+                            worker_harness.config_key()
+                        )));
+                    }
+                }
+                // A bridged roster entry owns its tools: no agent `tools:`, no `tools_allow`.
+                for entry in &sa.roster {
+                    let key = roster_keys
+                        .get(&entry.id)
+                        .copied()
+                        .unwrap_or(HarnessKey::Kian);
+                    if !key.is_bridged() {
+                        continue;
+                    }
+                    if let Some(agent) = self.agents.get(&entry.agent)
+                        && !agent.tools.is_empty()
+                    {
+                        return Err(invalid(format!(
+                            "`superagent.roster` entry `{}` selects harness `{}`: the harness \
+                             child owns the tools, so agent `{}` must declare no `tools:` \
+                             (found {:?})",
+                            entry.id,
+                            key.config_key(),
+                            agent.id,
+                            agent.tools
+                        )));
+                    }
+                    if !entry.tools_allow.is_empty() {
+                        return Err(invalid(format!(
+                            "`superagent.roster` entry `{}` selects harness `{}`: a bridged entry \
+                             runs no kian tool surface, so `tools_allow` must be empty (found \
+                             {:?})",
+                            entry.id,
+                            key.config_key(),
+                            entry.tools_allow
+                        )));
+                    }
+                }
             }
         }
         if has_superagent_plugin && self.plugins.iter().any(|p| p == "react-loop") {
@@ -4360,6 +4629,15 @@ impl ServeConfig {
                         version: agent.version,
                     }
                 }),
+                // (ADR-049) the spawn-side refusal reads this recorded fact: an entry whose
+                // worker loop is an external harness owns its tools and must never be bound to
+                // a kian execution worker. Absent selection = the built-in loop (not bridged).
+                harness_bridged: match def.harness.as_deref() {
+                    None => false,
+                    Some(text) => HarnessKey::parse(text)
+                        .map(HarnessKey::is_bridged)
+                        .map_err(|e| invalid(format!("superagent.roster[{i}].harness: {e}")))?,
+                },
             };
             kian_superagent::Roster {
                 entries: vec![entry.clone()],
@@ -9498,6 +9776,160 @@ schedules:
         );
         let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "was: {err}");
+    }
+
+    // -- ADR-049: per-agent harness selection ----------------------
+
+    /// The per-agent fixture: two declared harnesses, a kian default template and a bridged
+    /// roster entry (`codex-agent` → `codex` on the tool-free `codex-w` agent).
+    fn per_agent_yaml() -> String {
+        with_harness(
+            "    claude:\n      command: /usr/bin/true\n    codex:\n      command: /usr/bin/true\n",
+        )
+        .replace(
+            "agents:\n  router:",
+            "agents:\n  codex-w:\n    id: codex-w\n    version: 1\n    model_slots:\n      \
+             main:\n        provider: openai\n        model: gpt-codex\n    tools: []\n  router:",
+        )
+        .replace(
+            "  worker:\n    agent: worker\n    pinned_version: 7\n",
+            "  worker:\n    agent: worker\n    pinned_version: 7\n    harness: kian\n  \
+             roster:\n    - id: codex-agent\n      description: A Codex worker\n      agent: \
+             codex-w\n      harness: codex\n      mandate_template:\n        scope: delegate\n        \
+             strength: inferred\n      tools_allow: []\n      limits: {max_children: 0}\n",
+        )
+    }
+
+    #[test]
+    fn per_agent_harness_declarations_boot_and_resolve_per_template() {
+        let yaml = per_agent_yaml();
+        let cfg = ServeConfig::parse(&yaml).expect("per-agent config boots");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert_eq!(sa.harness.count(), 2);
+        assert!(sa.per_agent_harness());
+        assert_eq!(sa.worker_harness_key().expect("worker"), HarnessKey::Kian);
+        let keys = sa.roster_harness_keys().expect("roster keys");
+        assert_eq!(keys.get("codex-agent"), Some(&HarnessKey::Codex));
+        // The class markers are per spawn: the kian default template writes `{}`, the bridged
+        // roster entry writes its own bridge marker.
+        let markers = sa.harness_markers().expect("markers");
+        assert!(markers.default.is_none());
+        assert_eq!(markers.for_spawn(None), serde_json::json!({}));
+        assert_eq!(
+            markers.for_spawn(Some("codex-agent"))["bridge"]["name"],
+            "codex"
+        );
+        assert_eq!(
+            markers.for_spawn(Some("an-unknown-assignee")),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn a_legacy_bridged_config_marks_non_roster_spawns_and_leaves_roster_children_kian() {
+        // No explicit selections = the legacy single-harness shape: the global marker still
+        // covers non-roster spawns (byte-compatible), while a roster child runs the kian loop and
+        // therefore writes `{}` (the pre-ADR-049 marker lie).
+        let yaml = roster_yaml(
+            "  roster:\n    - id: researcher\n      description: Finds sources\n      agent: \
+             research\n      mandate_template:\n        scope: read only\n        strength: \
+             inferred\n      tools_allow: [\"fs_read\"]\n      limits: {max_children: 0}\n",
+        )
+        .replace(
+            "endpoints:\n  - id: ep1\n    addr: \"127.0.0.1:7341\"\n    queue_timeout_ms: 5000\n    offline_after_ms: 500\n",
+            "",
+        )
+        .replace(", \"remote-exec\"", "");
+        let with_claude = yaml.replace(
+            "superagent:\n",
+            "superagent:\n  harness:\n    claude:\n      command: /usr/bin/true\n",
+        );
+        let cfg = ServeConfig::parse(&with_claude).expect("legacy config");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert!(!sa.per_agent_harness());
+        let markers = sa.harness_markers().expect("markers");
+        assert_eq!(
+            markers.for_spawn(None)["bridge"]["name"],
+            "claude-code",
+            "the legacy global marker still covers non-roster spawns"
+        );
+        assert_eq!(
+            markers.for_spawn(Some("researcher")),
+            serde_json::json!({}),
+            "a roster child is kian-loop in legacy mode and must not claim the bridge"
+        );
+    }
+
+    #[test]
+    fn per_agent_harness_misconfigurations_refuse_boot() {
+        // An explicit selection of an undeclared harness names the missing section.
+        let undeclared = per_agent_yaml().replace("    codex:\n      command: /usr/bin/true\n", "");
+        let err = ServeConfig::parse(&undeclared).unwrap_err().to_string();
+        assert!(err.contains("is not declared"), "{err}");
+
+        // A bridged default template must not declare kian tools.
+        let tools = per_agent_yaml().replace("    harness: kian\n", "    harness: codex\n");
+        let err = ServeConfig::parse(&tools).unwrap_err().to_string();
+        assert!(err.contains("must declare no `tools:`"), "{err}");
+
+        // A bridged roster entry's tools_allow must be empty.
+        let allow = per_agent_yaml().replace(
+            "      tools_allow: []\n",
+            "      tools_allow: [\"fs_read\"]\n",
+        );
+        let err = ServeConfig::parse(&allow).unwrap_err().to_string();
+        assert!(err.contains("must be empty"), "{err}");
+
+        // An unknown harness value names the closed set.
+        let unknown = per_agent_yaml().replace("    harness: kian\n", "    harness: gemini\n");
+        let err = ServeConfig::parse(&unknown).unwrap_err().to_string();
+        assert!(err.contains("unknown harness"), "{err}");
+
+        // A bridged default template cannot be bound to a worker surface.
+        let yaml = per_agent_yaml()
+            .replace("    harness: kian\n", "    harness: codex\n")
+            .replace(
+                "tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    evidence_gate:",
+                "tools: []\n    evidence_gate:",
+            )
+            .replace(
+                "plugins: [\"openai-compat\", \"local-tools\", \"superagent\"]",
+                "plugins: [\"openai-compat\", \"local-tools\", \"superagent\", \"remote-exec\"]",
+            );
+        let yaml = format!(
+            "{yaml}endpoints:\n  - id: dev-box\n    addr: \"127.0.0.1:7401\"\n    \
+             queue_timeout_ms: 5000\n    offline_after_ms: 500\n"
+        );
+        let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("cannot be bound"), "{err}");
+    }
+
+    #[test]
+    fn a_roster_only_selection_keeps_the_default_template_on_the_builtin_loop() {
+        // Per-agent mode does not let the single declared harness capture the default template:
+        // with no `superagent.worker.harness`, an unselected template is `kian` (ADR-049).
+        let yaml = per_agent_yaml().replace("    harness: kian\n", "");
+        let cfg = ServeConfig::parse(&yaml).expect("roster-only selection boots");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert!(sa.per_agent_harness());
+        assert_eq!(sa.worker_harness_key().expect("worker"), HarnessKey::Kian);
+    }
+
+    #[test]
+    fn a_per_agent_bridged_template_boots_without_a_worker_surface() {
+        // Same fixture with the worker template switched to codex and its tools emptied: the
+        // bridged default is legal as long as no worker surface exists.
+        let yaml = per_agent_yaml()
+            .replace("    harness: kian\n", "    harness: codex\n")
+            .replace(
+                "tools: [\"fs_read\", \"fs_write\", \"exec\"]\n    evidence_gate:",
+                "tools: []\n    evidence_gate:",
+            );
+        let cfg = ServeConfig::parse(&yaml).expect("bridged default template boots");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert_eq!(sa.worker_harness_key().expect("worker"), HarnessKey::Codex);
+        let markers = sa.harness_markers().expect("markers");
+        assert_eq!(markers.for_spawn(None)["bridge"]["name"], "codex");
     }
 
     #[test]

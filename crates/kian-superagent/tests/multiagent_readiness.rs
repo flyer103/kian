@@ -244,6 +244,7 @@ fn router_rig<S: kian_superagent::WorkerStreamsPort + 'static>(
             tools_allow: vec!["fs_read".to_string()],
             limits: kian_superagent::RosterLimits { max_children: 2 },
             output_schema: None,
+            harness_bridged: false,
             resolved_agent: Some(kian_superagent::ResolvedAgent {
                 def_id: "kian-research".to_string(),
                 version: 3,
@@ -490,6 +491,7 @@ fn gating_on_adds_exactly_two_properties() {
                 tools_allow: vec!["fs_read".to_string()],
                 limits: kian_superagent::RosterLimits { max_children: 2 },
                 output_schema: None,
+                harness_bridged: false,
                 resolved_agent: Some(kian_superagent::ResolvedAgent {
                     def_id: "kian-research".to_string(),
                     version: 3,

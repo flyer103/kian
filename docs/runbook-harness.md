@@ -81,6 +81,9 @@ unverified**. A full live captured turn (proxy → real model) is not recorded y
   undelivered input ends `failed` (the engine's mapping for a lost turn) with a named reason,
   never `completed`, and the next input continues the same conversation;
 - `ask` approvals refuse boot (phase 2): an allow/deny policy answers the harness's own gate;
-- one harness per worker template; a bridge and `endpoints:`/`workers:` are mutually exclusive;
+- one harness **per worker agent** (ADR-049): a deployment may declare several and select one per
+  `superagent.worker.harness` / `superagent.roster[].harness`; a bridged agent owns its tools (no
+  `tools:`, no `tools_allow`, no `exec_worker`), and a bridged default template cannot coexist with
+  `endpoints:`/`workers:`; with no explicit selection the legacy single-harness rules apply;
 - cron's worktree arm is still dsh-shaped (`--profile <name> <payload>`); running Claude Code or
   Codex under cron needs the phase-2 argv extension.

@@ -42,6 +42,7 @@ impl SpawnSessionWriter for RecordingInbox {
     fn create_session(
         &self,
         session: SessionId,
+        _assignee: Option<&str>,
     ) -> BoxFuture<'static, Result<(), InboxWriteError>> {
         self.calls
             .lock()

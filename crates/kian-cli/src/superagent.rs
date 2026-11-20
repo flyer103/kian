@@ -97,23 +97,23 @@ pub fn record_rebuild_done(order: &StartupOrder) {
 /// the first wake can fire.
 pub struct EngineInbox {
     engine: OnceLock<Arc<Engine<ServeLoopDriver>>>,
-    /// The `session/created` payload for spawned worker sessions (HARNESS-BRIDGE §4.7).
-    /// Unset = the historical `{}` bytes.
-    bridge: OnceLock<serde_json::Value>,
+    /// (ADR-049) The per-spawn `session/created` class marker (HARNESS-BRIDGE §4.7): the default
+    /// worker template's harness marker plus one per roster assignee. Unset = the historical `{}`.
+    markers: OnceLock<BridgeMarkers>,
 }
 
 impl EngineInbox {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             engine: OnceLock::new(),
-            bridge: OnceLock::new(),
+            markers: OnceLock::new(),
         })
     }
 
-    /// Installs the bridge marker written on a spawned worker session's `session/created`
+    /// Installs the per-spawn marker map written on spawned worker sessions' `session/created`
     /// (first write only; a later call is ignored).
-    pub fn set_bridge_marker(&self, payload: serde_json::Value) {
-        let _ = self.bridge.set(payload);
+    pub fn set_bridge_markers(&self, markers: BridgeMarkers) {
+        let _ = self.markers.set(markers);
     }
 
     /// Installs the engine. Fails (returns the engine back) if one is
@@ -130,7 +130,7 @@ impl Default for EngineInbox {
     fn default() -> Self {
         Self {
             engine: OnceLock::new(),
-            bridge: OnceLock::new(),
+            markers: OnceLock::new(),
         }
     }
 }
@@ -139,17 +139,21 @@ impl kian_superagent::SpawnSessionWriter for EngineInbox {
     fn create_session(
         &self,
         session: SessionId,
+        assignee: Option<&str>,
     ) -> BoxFuture<'static, Result<(), kian_superagent::InboxWriteError>> {
         let engine = self
             .engine
             .get()
             .expect("engine installed before the first spawn")
             .clone();
+        // (ADR-049) the marker is resolved from the same spawn identity the side selection uses:
+        // a resolved roster entry always carries its own class (a kian-loop child stays `{}`).
         let payload = self
-            .bridge
+            .markers
             .get()
             .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
+            .unwrap_or_default()
+            .for_spawn(assignee);
         Box::pin(async move {
             engine
                 .create_session_with(session, payload)
@@ -1043,6 +1047,79 @@ impl LoopDriver for WorkerInnerDriver {
             }
             Self::Bridge(driver) => {
                 driver.drive(Arc::new(DrainBridgeCtx(ctx)) as Arc<dyn kian_harness::BridgeCtx>)
+            }
+        }
+    }
+}
+
+/// (ADR-049) The per-spawn `session/created` class markers: the default worker template's choice
+/// plus one per roster assignee (absent = the built-in kian loop's historical `{}`).
+#[derive(Debug, Clone, Default)]
+pub struct BridgeMarkers {
+    /// The marker for a spawn with no roster entry (the default worker template).
+    pub default: Option<serde_json::Value>,
+    /// The marker for a spawn that resolved through a roster entry, keyed by entry id.
+    pub by_assignee: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl BridgeMarkers {
+    /// The `session/created` payload for one spawn. A resolved roster entry always decides its own
+    /// class — a kian-loop child writes `{}`, never the default template's bridge marker (the
+    /// pre-ADR-049 mixed-config lie this ADR fixes).
+    #[must_use]
+    pub fn for_spawn(&self, assignee: Option<&str>) -> serde_json::Value {
+        match assignee {
+            Some(id) => self
+                .by_assignee
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            None => self
+                .default
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
+        }
+    }
+}
+
+/// (ADR-049) The assembled worker-loop mounts: the built-in kian loop plus every declared
+/// external harness, the default worker template's choice and each roster entry's choice.
+#[derive(Clone)]
+pub struct HarnessMounts {
+    /// Every declared non-dsh bridge driver, keyed by the harness the templates select.
+    pub bridges:
+        std::collections::BTreeMap<crate::config::HarnessKey, Arc<kian_harness::BridgeDriver>>,
+    /// The declared dsh driver (shared across every side that selects it).
+    pub dsh: Option<Arc<kian_dsh::DshDriver>>,
+    /// The default worker template's inner loop.
+    pub worker: crate::config::HarnessKey,
+    /// Each roster entry's inner loop, keyed by entry id.
+    pub assignees: std::collections::BTreeMap<String, crate::config::HarnessKey>,
+    /// The per-spawn class markers riding `session/created`.
+    pub markers: BridgeMarkers,
+    /// Whether any selection was explicit (per-agent mode; absent = the legacy single-harness
+    /// shape, byte-compatible).
+    pub per_agent: bool,
+}
+
+impl HarnessMounts {
+    /// The external harness inner loop for one choice; `None` = the built-in kian loop (the
+    /// caller supplies the per-side `ReActLoop`).
+    #[must_use]
+    pub fn bridged_inner(&self, key: crate::config::HarnessKey) -> Option<WorkerInnerDriver> {
+        match key {
+            crate::config::HarnessKey::Kian => None,
+            crate::config::HarnessKey::Dsh => Some(WorkerInnerDriver::Dsh(Arc::clone(
+                self.dsh
+                    .as_ref()
+                    .expect("a selected dsh harness has a build mount"),
+            ))),
+            crate::config::HarnessKey::Claude | crate::config::HarnessKey::Codex => {
+                Some(WorkerInnerDriver::Bridge(Arc::clone(
+                    self.bridges
+                        .get(&key)
+                        .expect("a selected bridge has a built mount"),
+                )))
             }
         }
     }

@@ -983,3 +983,284 @@ async fn a_narrowed_entry_runs_with_exactly_the_intersected_tool_surface() {
     assert_eq!(model, "mock-research", "pin P2-1: the entry's agent serves");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// ADR-049: per-agent harness selection — the class marker rides each spawn
+// ---------------------------------------------------------------------------
+
+/// The Codex app-server fixture peer (a workspace sibling of the `kian` bin).
+fn codex_fixture_peer() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_kian"))
+        .parent()
+        .expect("target dir")
+        .join("kian-codex-fixture-peer")
+}
+
+/// (ADR-049) A super-agent config with two roster agents selecting different worker loops:
+/// `kian-agent` runs the built-in loop (the scripted worker provider), `codex-agent` runs the
+/// Codex bridge over the scripted fixture peer.
+fn write_per_agent_config(
+    dir: &std::path::Path,
+    router_provider: &str,
+    worker_provider: &str,
+) -> std::path::PathBuf {
+    let sqlite = dir.join("kian.sqlite");
+    let yaml = format!(
+        r#"listen: "127.0.0.1:7343"
+storage:
+  sqlite: "{sqlite}"
+agent:
+  id: default
+  model_slots:
+    main:
+      provider: router-mock
+      model: mock-model
+agents:
+  router:
+    id: router
+    version: 3
+    model_slots:
+      router:
+        provider: router-mock
+        model: mock-router
+    tools: ["spawn_worker", "reply"]
+  worker:
+    id: worker
+    version: 7
+    model_slots:
+      main:
+        provider: worker-mock
+        model: mock-worker
+    tools: ["fs_read", "fs_write", "exec"]
+  kian-w:
+    id: kian-w
+    version: 1
+    model_slots:
+      main:
+        provider: worker-mock
+        model: mock-kian
+    tools: []
+  codex-w:
+    id: codex-w
+    version: 1
+    model_slots:
+      main:
+        provider: worker-mock
+        model: mock-codex
+    tools: []
+superagent:
+  router:
+    session_id: "{ROUTER_SESSION}"
+    agent: router
+    slot: router
+  worker:
+    agent: worker
+    harness: kian
+  roster:
+    - id: kian-agent
+      description: A built-in-loop worker
+      agent: kian-w
+      harness: kian
+      mandate_template:
+        scope: local work
+        strength: inferred
+      tools_allow: []
+      limits: {{max_children: 0}}
+    - id: codex-agent
+      description: A Codex worker
+      agent: codex-w
+      harness: codex
+      mandate_template:
+        scope: codex work
+        strength: inferred
+      tools_allow: []
+      limits: {{max_children: 0}}
+  subscriptions:
+    - channel: mock-im
+      match: always
+      route: router
+  channels:
+    mock-im:
+      type: mock-im
+  harness:
+    codex:
+      command: "{peer}"
+      args: ["simple"]
+  multiagent:
+    max_children: 2
+    max_depth: 2
+    child_timeout_ms: 60000
+providers:
+  router-mock:
+    base_url: "{router_provider}"
+    api_key_env: KIAN_E2E_API_KEY
+  worker-mock:
+    base_url: "{worker_provider}"
+    api_key_env: KIAN_E2E_API_KEY
+plugins: ["openai-compat", "local-tools", "superagent"]
+drain:
+  max_iterations: 8
+tools:
+  root: "{dir}"
+  exec_timeout_ms: 5000
+recovery:
+  budget:
+    tokens: 64
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+"#,
+        sqlite = sqlite.display(),
+        dir = dir.display(),
+        peer = codex_fixture_peer().display(),
+    );
+    let path = dir.join("kian.yaml");
+    std::fs::write(&path, yaml).expect("write config");
+    path
+}
+
+/// Sends one mock-im message through the ops RPC on a throwaway listener.
+async fn send_mock_im(server: &Arc<Server>) {
+    let client = reqwest::Client::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let router = server.router();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    let resp = client
+        .post(format!("http://{addr}/ops/rpc"))
+        .json(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "mock_channel_send",
+            "params": {"channel": "mock-im", "payload": {"text": "dispatch the two workers"}}}),
+        )
+        .send()
+        .await
+        .expect("ops send");
+    assert_eq!(resp.status(), 200);
+}
+
+/// (ADR-049) Each spawn's `session/created` marker is resolved from that spawn's own harness
+/// selection: the kian-loop child carries `{}`, the Codex child carries the bridge marker — in
+/// the same serve, through the same Router entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_agent_harness_markers_ride_each_spawn() {
+    force_no_proxy();
+    let dir = temp_dir("adr47-per-agent");
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            ScriptedResponse::ToolCall {
+                id: "call-spawn-kian".into(),
+                name: "spawn_worker".into(),
+                arguments: json!({"task": "reply with alpha", "agent": "kian-agent"}),
+            },
+            ScriptedResponse::ToolCall {
+                id: "call-spawn-codex".into(),
+                name: "spawn_worker".into(),
+                arguments: json!({"task": "reply with pong", "agent": "codex-agent"}),
+            },
+            ScriptedResponse::Text("dispatched".into()),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("alpha".into())], 0).await;
+    let config = write_per_agent_config(&dir, &router_base, &worker_base);
+    let server = boot(&config).await;
+    let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
+        .await
+        .expect("read-only store");
+    wait_for_router(&read_only, "bootstrap judge turn", |events| {
+        count_kind(events, EventKind::AssistantMessage) >= 1
+    })
+    .await;
+
+    send_mock_im(&server).await;
+    let events = wait_for_router(&read_only, "both spawn results", |events| {
+        events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolResult)
+            .count()
+            >= 2
+    })
+    .await;
+    let worker_of = |call_id: &str| {
+        let result = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::ToolResult && event.bytes["content"]["call_id"] == call_id
+            })
+            .unwrap_or_else(|| panic!("no tool result for {call_id}"));
+        assert_eq!(
+            result.bytes["content"]["is_error"], false,
+            "spawn {call_id} refused: {}",
+            result.bytes["content"]["output"]
+        );
+        SessionId(
+            Uuid::parse_str(
+                result.bytes["content"]["output"]["worker"]
+                    .as_str()
+                    .expect("worker id"),
+            )
+            .expect("uuid"),
+        )
+    };
+    let kian_worker = worker_of("call-spawn-kian");
+    let codex_worker = worker_of("call-spawn-codex");
+
+    for (name, session) in [("kian-agent", kian_worker), ("codex-agent", codex_worker)] {
+        let ended = wait_for_session(&read_only, session, "worker ended", |events| {
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::SessionEnded { .. }))
+        })
+        .await;
+        let created = ended
+            .iter()
+            .find(|event| event.kind == EventKind::SessionCreated)
+            .expect("session/created");
+        if name == "codex-agent" {
+            assert_eq!(
+                created.bytes["bridge"]["name"], "codex",
+                "the Codex child's marker: {:?}",
+                created.bytes
+            );
+            assert_eq!(
+                count_kind(&ended, EventKind::StepRequest),
+                0,
+                "projection-only: no step/request may appear"
+            );
+            assert!(
+                ended.iter().any(|event| {
+                    event.kind == EventKind::AssistantMessage
+                        && event.bytes.to_string().contains("pong")
+                }),
+                "the Codex peer's answer maps into the child stream"
+            );
+        } else {
+            assert_eq!(
+                created.bytes,
+                json!({}),
+                "the kian-loop child must not claim a bridge"
+            );
+            assert!(
+                count_kind(&ended, EventKind::StepRequest) >= 1,
+                "the kian loop persists its request bytes"
+            );
+            assert!(
+                ended.iter().any(|event| {
+                    event.kind == EventKind::AssistantMessage
+                        && event.bytes.to_string().contains("alpha")
+                }),
+                "the kian loop mapped the scripted worker provider's answer"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

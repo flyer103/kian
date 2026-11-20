@@ -517,6 +517,7 @@ fn p2_entry(id: &str, def_id: &str, version: u64, schema: Option<Value>) -> Rost
         tools_allow: vec!["fs_read".to_string()],
         limits: RosterLimits { max_children: 2 },
         output_schema: schema,
+        harness_bridged: false,
         resolved_agent: Some(ResolvedAgent {
             def_id: def_id.to_string(),
             version,

@@ -687,8 +687,15 @@ pub enum SpawnError {
 /// invariant). A deployment with a mounted harness bridge supplies this port so
 /// `session/created` can carry the bridge marker the first drain cannot derive.
 pub trait SpawnSessionWriter: Send + Sync {
-    fn create_session(&self, session: SessionId)
-    -> BoxFuture<'static, Result<(), InboxWriteError>>;
+    /// Creates the worker session eagerly (HARNESS-BRIDGE §4.7), so the first event can carry the
+    /// class marker the spawn resolved. `assignee` is the roster entry id the spawn resolved
+    /// through (`None` on a non-roster spawn) — (ADR-049) the marker is per spawn, so the writer
+    /// resolves the bridged class from the same identity the side selection uses.
+    fn create_session(
+        &self,
+        session: SessionId,
+        assignee: Option<&str>,
+    ) -> BoxFuture<'static, Result<(), InboxWriteError>>;
 }
 
 /// Mints a `Thread` and creates the worker session by admitting its
@@ -919,7 +926,11 @@ impl WorkerSpawner {
         // Eager creation (HARNESS-BRIDGE §4.7): the first event can then carry the bridge marker
         // the first drain could not derive. Absent the port, the lazy path is unchanged.
         if let Some(port) = &self.session_creation {
-            port.create_session(spawned.worker_session).await?;
+            // (ADR-049) the resolved roster entry rides the wrapper; the writer resolves the
+            // per-spawn class marker from it (a kian-loop spawn stays the historical `{}`).
+            let assignee = spawned.task_message["content"]["assignee"].as_str();
+            port.create_session(spawned.worker_session, assignee)
+                .await?;
         }
         // ADR-038: the bootstrap runs BEFORE the triggering row, so the
         // index is the worker session's first context-bearing event.
