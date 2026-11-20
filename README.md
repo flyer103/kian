@@ -860,6 +860,10 @@ superagent:
         target: { channel: lark, topic: ops }
         prompt: "audit the repo and summarise drift"
         worktree: true                # detached per-firing git tree
+    harness:                          # optional; default is `dsh --profile headless "<prompt>"`
+      raw: true                       # any harness: argv = args + "<prompt>" (no --profile)
+      command: /usr/local/bin/claude
+      args: ["--print", "--output-format", "text"]
 ```
 
 Every due slot is claimed once in `cron_firings` and runs as an ordinary turn — on the resident

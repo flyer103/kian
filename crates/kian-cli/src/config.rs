@@ -4465,9 +4465,18 @@ pub const CRON_DEFAULT_DSH_PROFILE: &str = "headless";
 #[serde(deny_unknown_fields)]
 pub struct CronHarnessSection {
     /// The dsh profile to boot — `dsh --profile <name>`. Default `headless`.
+    /// Refused with `raw: true`.
     #[serde(default)]
     pub profile: Option<String>,
-    /// The dsh binary. Absent = `KIAN_DSH_BIN`, then `dsh` on `PATH`.
+    /// Fixed leading arguments (before the profile flag and the payload).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Raw argv mode for a non-dsh harness: argv is `args <payload>`, with no `--profile`
+    /// flag (`claude --print … "<task>"`, `codex exec "<task>"`). Requires an explicit
+    /// `command`; pairs with `profile` as a boot refusal.
+    #[serde(default)]
+    pub raw: bool,
+    /// The harness binary. Absent = `KIAN_DSH_BIN`, then `dsh` on `PATH` (the dsh shape).
     #[serde(default)]
     pub command: Option<String>,
     /// Extra environment for the harness child: peer/model/session selects and
@@ -4481,13 +4490,18 @@ impl CronHarnessSection {
     /// The section with the documented defaults applied — what
     /// [`crate::cron_worktree::DshTurnRunner`] is built from.
     pub fn resolved(&self) -> CronHarnessSettings {
-        let profile = self
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(CRON_DEFAULT_DSH_PROFILE)
-            .to_owned();
+        let profile = if self.raw {
+            None
+        } else {
+            Some(
+                self.profile
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(CRON_DEFAULT_DSH_PROFILE)
+                    .to_owned(),
+            )
+        };
         let command = self
             .command
             .as_deref()
@@ -4504,6 +4518,7 @@ impl CronHarnessSection {
         CronHarnessSettings {
             profile,
             command,
+            args: self.args.clone(),
             env: self.env.clone(),
         }
     }
@@ -4531,6 +4546,29 @@ impl CronHarnessSection {
                     .to_owned(),
             );
         }
+        if self.raw {
+            if self.profile.is_some() {
+                errors.push(
+                    "superagent.cron.harness.raw: true does not take a `profile` (the profile is                      the dsh argv shape; omit one)"
+                        .to_owned(),
+                );
+            }
+            if self
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .is_none()
+            {
+                errors.push(
+                    "superagent.cron.harness.raw: true needs an explicit `command` (no dsh default)"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.args.iter().any(|arg| arg.trim().is_empty()) {
+            errors.push("superagent.cron.harness.args entries must be non-empty".to_owned());
+        }
         for name in self.env.keys() {
             if name.trim().is_empty() {
                 errors.push("superagent.cron.harness.env keys must be non-empty".to_owned());
@@ -4542,10 +4580,12 @@ impl CronHarnessSection {
 /// [`CronHarnessSection`] with the documented defaults applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronHarnessSettings {
-    /// The dsh profile to boot.
-    pub profile: String,
-    /// The dsh binary.
+    /// The dsh profile to boot (`None` = raw argv mode, no `--profile`).
+    pub profile: Option<String>,
+    /// The harness binary.
     pub command: String,
+    /// Fixed leading arguments (before the profile flag and the payload).
+    pub args: Vec<String>,
     /// Extra environment for the harness child (never logged).
     pub env: std::collections::BTreeMap<String, String>,
 }
@@ -9222,5 +9262,74 @@ schedules:
                 .0,
             kian_harness::approval::Decision::Deny
         );
+    }
+
+    // -- cron harness argv (CRON-MODEL §6.2) -----------------------
+
+    fn with_cron_harness(block: &str) -> String {
+        superagent_yaml().replacen(
+            "superagent:\n",
+            &format!("superagent:\n  cron:\n    harness:\n{block}"),
+            1,
+        )
+    }
+
+    #[test]
+    fn a_raw_cron_harness_carries_its_argv_and_no_profile() {
+        let yaml = with_cron_harness(
+            "      raw: true\n      command: /usr/local/bin/claude\n      args: [\"--print\", \"--output-format\", \"text\"]\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("raw cron harness parses");
+        let settings = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent")
+            .cron
+            .harness
+            .resolved();
+        assert_eq!(settings.profile, None, "raw mode has no --profile flag");
+        assert_eq!(settings.command, "/usr/local/bin/claude");
+        assert_eq!(
+            settings.args,
+            vec![
+                "--print".to_owned(),
+                "--output-format".to_owned(),
+                "text".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dsh_cron_harness_keeps_the_profile_shape() {
+        let yaml = with_cron_harness("      profile: headless\n");
+        let cfg = ServeConfig::parse(&yaml).expect("dsh cron harness parses");
+        let settings = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent")
+            .cron
+            .harness
+            .resolved();
+        assert_eq!(settings.profile.as_deref(), Some("headless"));
+        assert!(settings.args.is_empty());
+    }
+
+    #[test]
+    fn raw_cron_harness_misconfigurations_refuse_boot() {
+        let with_profile = with_cron_harness(
+            "      raw: true\n      profile: headless\n      command: /usr/bin/true\n",
+        );
+        let err = ServeConfig::parse(&with_profile).unwrap_err().to_string();
+        assert!(err.contains("does not take a `profile`"), "{err}");
+
+        let no_command = with_cron_harness("      raw: true\n");
+        let err = ServeConfig::parse(&no_command).unwrap_err().to_string();
+        assert!(err.contains("needs an explicit `command`"), "{err}");
+
+        let empty_arg = with_cron_harness(
+            "      raw: true\n      command: /usr/bin/true\n      args: [\"  \"]\n",
+        );
+        let err = ServeConfig::parse(&empty_arg).unwrap_err().to_string();
+        assert!(err.contains("args entries must be non-empty"), "{err}");
     }
 }

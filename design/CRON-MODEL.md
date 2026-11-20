@@ -332,7 +332,7 @@ every tick. The async turn's outcome is drained on a later tick and settled on t
 (§9.1); a synchronous dispatch is still available for `kian cron run-now` and tests, where the
 outcome is returned inline.
 
-## 6. Execution via the dsh harness
+## 6. Execution via the harness
 
 ### 6.1 Path
 
@@ -356,8 +356,17 @@ this arm is choosing a job, not a session ([ADR-034](decisions/ADR-034-cron-sche
 1. Resident: admit the prompt + `cron` proof + idempotency key; the model request is the prompt
    alone. Worktree: create the per-firing tree, then spawn the harness.
 2. Resident: the session's harness (dsh bridge or the ReAct loop). Worktree: spawn the
-   configured `bin`/`args`/profile with `cwd` = the worktree.
+   configured harness argv (§6.2) with `cwd` = the worktree.
 3. Worktree: on exit/timeout, capture stdout/stderr/diff (§6.2), settle the firing, clean up.
+
+The worktree arm spawns the harness argv-direct (no shell). Two shapes exist, both owned here:
+
+- **dsh (default)**: `args --profile <name> <payload>` — the documented
+  `dsh [--profile] <name> [options] [app-args...]` form, default profile `headless`.
+- **raw** (`superagent.cron.harness.raw: true`): `args <payload>`, with no `--profile` flag —
+  e.g. `claude --print --output-format text "<task>"` or `codex exec "<task>"`. Raw mode requires
+  an explicit `command` and refuses a `profile`; the scheduled payload is always the last
+  positional argument.
 
 ### 6.2 Worktree lifecycle: create → run → capture → cleanup
 
