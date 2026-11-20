@@ -1,9 +1,9 @@
-# Kian — iMessage Channel (normative draft)
+# Kian — iMessage Channel (normative)
 
-> **Status: normative; phase 1a landed (2026-11-19), L3 not run.** The contract, the adapter
-> (`kian-superagent::imessage`), the macOS-side `kian-imessage-bridge` crate, the config/CLI
-> surfaces and the L1/L2 suites landed after the owner gate; **L3 — a real Mac signed into a
-> dedicated Apple ID and a real iPhone — has not been executed** (§13). Rationale:
+> **Status: normative; phase 1a landed (2026-11-19); first live L3 run 2026-11-20.** The contract,
+> the adapter (`kian-superagent::imessage`), the macOS-side `kian-imessage-bridge` crate, the
+> config/CLI surfaces, the L1/L2 suites and a real Mac + dedicated Apple ID + iPhone round trip are
+> in place: §12 records the L3 evidence and §13 keeps the items still unverified. Rationale:
 > [ADR-042](decisions/ADR-042-imessage-channel.md); operator setup:
 > [runbook-imessage](../docs/runbook-imessage.md).
 >
@@ -147,7 +147,7 @@ handle (or an existing chat). The channel therefore uses:
 |---|---|---|---|---|
 | **A. Dedicated Mac (or VM) + dedicated Apple ID** | yes | yes | no | **supported, recommended** — bot traffic isolated from the personal Messages profile |
 | **B. Same Mac, separate macOS user + dedicated Apple ID** | yes when that user session is logged in | yes | no | supported with a caveat: fast-user-switched sessions must stay alive; verify before relying on it ([§13.2](#13-unverified-must-stay-visible)) |
-| **C. Same macOS user, Messages signed into a *second* Apple ID** | yes (iMessage account may differ from the iCloud account; Messages-in-iCloud then reports a mismatch and stays off) | yes | no | possible; costs the user's personal Messages on that Mac |
+| **C. Same macOS user, Messages signed into a *second* Apple ID** | yes — **verified 2026-11-20** (the iMessage account may differ from the iCloud account; the personal iCloud/SMS forwarding keeps running, and the bridge `participants` filter isolates kian) | yes | no | **verified** (L3, §12): the bot account is iMessage-only while the Mac stays the owner's personal iCloud device |
 | **D. Personal Apple ID, user texts themselves** | **not supported** — a message from the same account appears as `is_from_me=1`, which §4 rule 1 drops, and its echo would make a bot loop | — | — | rejected |
 | **E. No Mac at all (pypush, iOS app)** | — | — | — | rejected for phase 1 (§14, ADR-042 D5) |
 
@@ -157,10 +157,17 @@ therefore phase 2, and only where an operator can prove Text Message Forwarding 
 identity shape (unverified, §13.4); phase 1 is iMessage-only, and a reply to an SMS thread is
 honestly unsupported.
 
-### 2.5 Frozen `imsg` surfaces (pinned `0.11.x`)
+### 2.5 Frozen `imsg` surfaces (minimum `0.14.0`; L3 verified `0.21.1`)
 
 Only these `imsg rpc` methods are used; version-pinned because the bridge is a thin supervisor, not
 a re-implementation.
+
+**Version floor.** `0.14.0` is the first release with the protocol-v1 `initialize`/`status` methods,
+the `messages.after` ROWID pagination and the typed delivery dispositions this bridge depends on.
+`0.11.x` predates all three: its RPC child answers `-32601 Method not found` and the bridge refuses
+startup. Operators upgrade with `brew upgrade imsg`; on Homebrew 5 the third-party tap must be
+trusted first (`brew trust steipete/tap`). The floor is a contract fact: changing it changes this
+section first.
 
 | Step | Method | Request (the fields used) | Result (fields used) |
 |---|---|---|---|
@@ -192,8 +199,16 @@ Frozen semantics the bridge relies on:
    discarded (the bridge detects a generation change, §3.4).
 7. **Private-API features are unavailable with SIP enabled** (typing, read receipts, rich sends,
    tapbacks) — phase 1 does not request them and must not fail when they are absent.
-8. **`imsg` needs macOS 14+**; the bridge refuses to start on anything without a working
-   `imsg rpc` (§10).
+8. **`imsg` needs macOS 14+ and `imsg rpc` protocol v1 (≥ `0.14.0`)**; the bridge refuses to start
+   on anything without it (§10), and the startup error names the upgrade.
+9. **`status` opens the database.** With Full Disk Access revoked, *every* RPC method — including
+   `initialize`/`status` — fails (`-32603`, `authorization denied`), so the bridge cannot start at
+   all: FDA is a startup precondition, not a degraded-mode flag. `database.ready:false` in
+   `/v1/health` covers a database that becomes unreadable **after** a successful start (§10).
+10. **`service` may be absent on inbound rows.** The L3 run observed `service: null` and
+    `chat_guid: "any;-;…"` on inbound rows while the round trip worked; the channel never keys
+    admission or routing on `service` (it admits on text/sender/`is_from_me`/`guid` and sets the
+    service explicitly on send), so a missing field is harmless.
 
 ## 3. The bridge
 
@@ -254,8 +269,10 @@ All requests carry `Authorization: Bearer <token>`. Bodies are JSON; every respo
 }
 ```
 
-- `database.ready` false ⇒ Full Disk Access is missing/revoked or the DB is unreadable; the bridge
-  still answers and may still send (§2.5 rule 4).
+- `database.ready` false ⇒ the database became unreadable **after** a successful start (e.g. the
+  grant was revoked); the bridge still answers and may still send (§2.5 rule 4). A missing grant at
+  launch is a startup error instead — the RPC child cannot serve `status` without the database
+  (§2.5 rule 9).
 - `automation` is the **last observed** Automation state: `unknown` until a send proves it,
   `granted` after a successful send, `denied` after `-1743`. It is never probed proactively
   (a probe would itself raise a TCC prompt).
@@ -264,7 +281,9 @@ All requests carry `Authorization: Bearer <token>`. Bodies are JSON; every respo
 - `watch.participants` = the effective read filter; `kian imessage check` diffs it against the
   configured `topics` (§7) so a silent-drop mismatch is visible.
 - HTTP `200` whenever the bridge process itself is alive; `503` only for a poisoned child (no
-  restartable `imsg rpc`). Receivers must not treat `database.ready: false` as "bridge down".
+  restartable `imsg rpc`). `database.ready: false` covers a database that becomes unreadable after
+  startup (§2.5 rule 9): with FDA missing at launch the bridge does not start at all, so it never
+  serves that state — the operator sees the startup error naming the grant.
 
 **`GET /v1/updates?since_rowid=<u64>&limit=<1..500>&wait_ms=<0..25000>`** — exclusive cursor;
 long-poll until at least one row arrives or `wait_ms` elapses:
@@ -576,9 +595,10 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
 |---|---|---|---|
 | Bridge unreachable (refused, reset, tunnel down) | connect error / 5xx without a body | receive loop backoff 2 s doubling to a 30 s cap, audit line; sends return `Unavailable` naming the bridge and the tunnel; resume automatically | this channel only |
 | Bridge 401 / token mismatch | 401 | pause sends with `Unavailable` naming `KIAN_IMESSAGE_BRIDGE_TOKEN` and the bridge's `token_file`; keep polling health; no retry storm | this channel only |
-| Full Disk Access missing/revoked (`database.ready:false`) | health | receive paused (no input can exist), sends still attempted (the bridge can send `to`/`chat_guid` without the DB); a `verified:false` receipt is minted from the client id with an audit line; health names the System Settings path | this channel only |
+| Full Disk Access missing **at launch** | `imsg rpc` preflight fails (`-32603`, authorization denied) | bridge refuses startup, naming the System Settings entry — the RPC child cannot serve any method without the database (§2.5 rule 9) | this channel only |
+| Full Disk Access revoked **after a successful start** (`database.ready:false`) | `/v1/health` | receive paused (no input can exist), sends still attempted (the bridge can send `to`/`chat_guid` without the DB); a `verified:false` receipt is minted from the client id with an audit line; health names the System Settings path | this channel only |
 | Automation denied (`-1743`) | send failure | sends `Unavailable` naming **System Settings → Privacy & Security → Automation → Messages** and the exact process path; receive unaffected; `automation: denied` until a send succeeds | this channel only |
-| `imsg` missing / too old / no RPC | bridge startup / health | bridge refuses startup (fail-closed) with the install command; the adapter sees `bridge_unavailable` and parks honestly | this channel only |
+| `imsg` missing / older than `0.14.0` / no RPC | bridge startup / health | bridge refuses startup (fail-closed) naming the install/upgrade (`brew upgrade imsg`; §2.5 floor); an old child answers `-32601`; the adapter sees `bridge_unavailable` and parks honestly | this channel only |
 | Messages signed out / not running | send failure (no health field can prove sign-in) | sends `not_started` → `DeliveryFailed` (retry-safe); receive silent; runbook has the `launchctl kickstart` recovery | this channel only |
 | `watch.overflow` | terminal notification | re-subscribe at `resume_after_rowid`, counter + audit; a duplicate is absorbed by `guid` dedupe | this channel only |
 | `chat.db` replaced/restored | generation change | reset cursors, audit, replay bounded; no merge claimed | this channel only |
@@ -629,57 +649,81 @@ log line, config file or fixture; `NO_PROXY=127.0.0.1,localhost` for the local l
 proxy); `kian imessage check` fails closed on a missing token and on a bridge that answers
 `database.ready:false`, and warns on a `watch.participants`/`topics` mismatch.
 
-**L3 — owner-run on the real Mac, never faked**: create/sign in the bot Apple ID; grant FDA +
-Automation; install the LaunchAgent; open the SSH remote-forward; start `kian serve`; text the bot
-from the iPhone; record — the accepted `input/admitted` event, the `channel/delivered` receipt, the
-observed sender handle and service, end-to-end latency, the sleep/wake behaviour, a 3000-character
-reply split, a revoked-FDA run, a `-1743` run and its recovery, and whether replies thread into the
-same conversation. Results belong in the round's QA record and CHANGELOG, stated as unverified
-until executed.
+**L3 — owner-run on the real Mac, executed 2026-11-20.** Setup: macOS 27.2; a dedicated bot Apple ID
+signed into Messages while the Mac's iCloud account stayed personal (shape C, §2.4); a LaunchAgent
+bridge at a stable binary path, reached through a LaunchAgent
+`ssh -N -R 7420:127.0.0.1:7420 <server>` remote-forward; `imsg 0.21.1`; `kian serve` on a Linux
+VPS. Recorded evidence:
+
+- **The floor came from the run.** `imsg 0.11.1` failed the bridge preflight with `-32601`; after
+  `brew upgrade imsg` (0.21.1) the preflight passed (§2.5).
+- **Grants.** Full Disk Access was granted to the bridge **binary path**; tccd attributed the
+  database request to that responsible process, and the `imsg` **child inherited** the grant (no
+  separate grant on `imsg`). Automation → Messages was granted on the first send
+  (`automation: granted`).
+- **Round trip.** iPhone text `现在几点` → one `input/admitted` (`channel: imessage`,
+  `untrusted: true`, `event_id` = the Apple `guid`) → `channel/delivered`
+  (`target: {"handle": "<owner>"}`, 40 units) in **6.4 s**; the reply content was correct.
+- **The honest-error loop.** The Router's first reply attempt used a malformed target; the adapter
+  returned `DeliveryFailed` naming the expected `{"handle": …}` shape and the Router retried
+  successfully — no extra model-side enforcement is needed beyond the prompt sentence.
+- **First-boot replay.** The adapter's first start tail-replayed the earlier test messages and
+  admitted them once each (four `input/admitted` rows); admission idempotency then held.
+- **Observed fields.** Inbound rows carried `service: null` and `chat_guid: "any;-;…"`; the channel
+  depends on neither (§2.5 rule 10).
+- **Personal SMS shares the database.** Because the Mac's iCloud account stayed personal, Text
+  Message Forwarding keeps writing the owner's personal SMS into the same `chat.db`. The bridge's
+  `watch.participants` filter is what keeps them from transiting: lock it to the allowlisted handle
+  **before** the server is wired (the L3 run did).
+
+Not executed in this run: a sleeping/logged-out Mac delivery, a revoked-FDA recovery, a `-1743`
+recovery, a 3000-character reply split, and the SMS-thread question — they stay in §13.
 
 ## 13. UNVERIFIED (must stay visible)
 
-1. **A dedicated Apple ID in the same macOS user** — Messages may be signed into an iMessage
-   account that differs from the iCloud account (the known "iCloud and iMessage accounts do not
-   match" state), but the resulting Messages-in-iCloud behaviour and any macOS 27 restrictions are
-   not measured here. Shape C in §2.4 must be verified before it is recommended over shape A.
+1. **RESOLVED (2026-11-20)** — a dedicated Apple ID in the same macOS user: Messages signed into a
+   bot iMessage account while the Mac's iCloud account stayed personal (shape C, §2.4). The
+   Messages-in-iCloud mismatch is accepted (the account's own iCloud sync is simply off) and the
+   iPhone ↔ kian round trip works.
 2. **Fast-user-switched background sessions** (shape B) — whether Messages and a LaunchAgent in a
    non-active macOS session keep receiving and sending is not verified on macOS 27.
 3. **Delivery to a sleeping Mac** — community evidence says iMessages addressed while a Mac is asleep
    are cached by iCloud and delivered on wake; whether every message appears in `chat.db` on wake is
    **not** verified. The channel claims "no loss" only for rows that land in `chat.db`; it does not
    claim iCloud completeness.
-4. **SMS with a dedicated Apple ID** — Text Message Forwarding requires the same Apple Account as
-   the iPhone, so SMS is expected to be unavailable in the recommended shape; measured only if an
-   operator runs shape C.
+4. **SMS with a dedicated Apple ID** — the bot iMessage account itself is iMessage-only (Text
+   Message Forwarding needs the same Apple Account as the iPhone), so SMS as a *channel* stays
+   phase 2. The L3 Mac did receive personal SMS through the owner's iCloud account; those rows were
+   excluded by the participant filter, and the SMS reply path was not measured.
 5. **Real text length and rate limits** — iMessage has no documented per-message text limit for
    automation sends; the 2000-character defensive split is a bound, not a measurement.
 6. **Duplicate window** — two byte-identical replies to the same handle within the bridge's 10-minute
    `client_id` window are collapsed into one. The window is a retry-protection trade-off; the
    residual duplicate case (bridge restart between an uncertain attempt and its retry) is
    at-least-once.
-7. **`imsg` version drift** — the pinned `0.11.x` surfaces are third-party and may change; a
-   breaking RPC change degrades this channel only (bridge refuses, adapter parks) and is recorded
-   here with a date.
+7. **`imsg` version drift** — the pinned floor `0.14.0` (§2.5; L3 used `0.21.1`) is a third-party
+   surface and may change; a breaking RPC change degrades this channel only (bridge refuses,
+   adapter parks) and is recorded here with a date.
 8. **iOS-side shapes** — Shortcuts "message received" automations and a custom iOS app are not
    evaluated: neither can reply into the triggering conversation in a supported way today (an iOS
    app is the separate `kian-ios-worker` route in
    [runbook-ios-worker](../docs/runbook-ios-worker.md), which is about *workers*, not channels).
-9. **`-1743`/`-1712` attribution for a LaunchAgent** — expected to work (the grant attaches to the
-   binary path, and a child such as `imsg` inherits the responsible process), but whether the grant
-   reaches the `imsg` **child** of the bridge is verified only by the L3 run. The runbook records
-   the escape hatch (grant `/opt/homebrew/bin/imsg` itself) if parent attribution misbehaves.
-10. **L3 has not been executed** — no real Mac, Apple ID, iPhone, TCC grant or SSH remote-forward
-    has been exercised. Every device-side claim above is a hypothesis with the named verification
-    step; the runbook is the script for closing this item.
+9. **RESOLVED (2026-11-20)** — `-1743`/`-1712` attribution for a LaunchAgent: the grant on the
+   bridge binary path reaches the `imsg` **child** (tccd attributes to the responsible process =
+   the bridge path; no separate grant on `imsg` was needed). The `-1743` failure path itself was
+   not exercised (Automation was granted on the first send); the runbook keeps the escape hatch
+   (grant `/opt/homebrew/bin/imsg` itself) for the case it is ever misattributed.
+10. **L3 gaps** — the 2026-11-20 run did not exercise: a sleeping/logged-out Mac delivery, a
+    revoked-FDA recovery, a `-1743` recovery, a 3000-character reply split, or the SMS-thread
+    question. Each keeps its named verification step in the runbook (§7).
 11. **Poll cadence latency** — the reference bridge polls `messages.after` every 250 ms
-    (`watch.poll_interval_ms`), so an inbound message reaches kian after one cadence plus the
-    adapter's long-poll wake; the exact end-to-end latency is unmeasured (L3). `imsg`'s
-    `watch.subscribe` would remove the cadence; it is deliberately unused in phase 1.
+    (`watch.poll_interval_ms`); the 2026-11-20 L3 run measured **6.4 s** end to end (one sample,
+    model turn included), so the cadence is not the dominant term. Not measured under load;
+    `imsg`'s `watch.subscribe` would remove the cadence and stays deliberately unused in phase 1.
 
 ## 14. Delivery slices
 
-**1a (the slice, all that phase 1 claims) — landed 2026-11-19.** The bridge crate
+**1a (the slice, all that phase 1 claims) — landed 2026-11-19; L3 verified 2026-11-20 (§12).** The bridge crate
 (`status`/`messages.after`/`send` over `imsg rpc`,
 cursor file, `client_id` cache, loopback + token, LaunchAgent packaging); the `imessage` adapter
 (§4 receive, §5 send, §6 normalization); config + validation + assembly + `kian imessage check`;

@@ -427,8 +427,8 @@ first. A stale token (`errcode -14`) pauses that channel and resumes when the cr
 changes ([design/CHANNEL-WECHAT.md](design/CHANNEL-WECHAT.md)).
 
 `type: imessage` needs a Mac signed into a dedicated Apple ID running
-`kian-imessage-bridge` (Full Disk Access + Automation → Messages), because iMessage has no API —
-the message must land on that Mac's `chat.db`. The adapter long-polls the bridge's loopback ABI;
+`kian-imessage-bridge` (Full Disk Access + Automation → Messages, `imsg` ≥ 0.14), because iMessage
+has no API — the message must land on that Mac's `chat.db`. The adapter long-polls the bridge's loopback ABI;
 the bridge's `participants` list keeps non-allowlisted conversations from leaving the Mac.
 `kian imessage check` is the read-only preflight
 ([design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md),
