@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage: the bridge requires `imsg` ≥ 0.14.0 (ADR-042)**. The RPC surface the bridge calls —
+  protocol-v1 `status`/`initialize`, `messages.after` ROWID pagination and typed delivery
+  dispositions — landed in `imsg` 0.14.0; `0.11.x` answers `-32601 Method not found` and the bridge
+  refuses startup. The contract pins the floor and the runbook upgrades the dependency. Contract:
+  [design/CHANNEL-IMESSAGE.md](design/CHANNEL-IMESSAGE.md) §2.5; the first live L3 evidence is §12.
+
 
 - **Harness bridges: Claude Code and Codex (HARNESS-BRIDGE phase 1, ADR-043)**. The worker
   template's inner loop can now be a shared `kian-harness` `BridgeDriver` over the Claude Code

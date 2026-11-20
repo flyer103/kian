@@ -1,7 +1,7 @@
 # ADR-042: An iMessage channel through a macOS bridge, not a server-side adapter
 
-- **Status**: **Accepted** (owner gate 2026-11-19) — implemented as slice 1a; L3 not run (the
-  contract's §13)
+- **Status**: **Accepted** (owner gate 2026-11-19) — implemented as slice 1a; first live L3 run
+  2026-11-20 (the contract's §12)
 - **Date**: 2026-11-19
 - **Scope**: a new crate (`kian-imessage-bridge`), the bundle (`kian-superagent`), CLI/assembly
   (`kian-cli`), docs — no core, no store, no orchestrator, no wire surface, no event kind
@@ -158,6 +158,15 @@ contract (§2.5, §13):
 2. **The first boot bootstraps the cursor at the tail** by paging `messages.after` from rowid 1
    once (bounded by `watch.page_limit`/a page cap). That keeps the honest "before this bridge
    existed" gap while never replaying history into a new install.
+3. **The `imsg` floor is `0.14.0`.** `0.11.x` lacks protocol-v1 `status`/`initialize`,
+   `messages.after` and the typed dispositions; the first L3 attempt failed with `-32601`. The
+   bridge is unchanged — the contract pins the floor (§2.5) and the runbook upgrades the
+   dependency (L3 used `0.21.1`).
+4. **First L3 run (2026-11-20).** Shape C (a bot iMessage account with the Mac's iCloud left
+   personal) works end to end on macOS 27.2: the iPhone message was admitted once, the reply was
+   delivered in 6.4 s, and the child-inheritance TCC question was answered (the grant on the
+   bridge binary covers its `imsg` child). The contract's §12 records the evidence; §13 keeps the
+   remaining gaps.
 
 Shipped pieces: `crates/kian-imessage-bridge` (config, `imsg rpc` supervisor, cursor store, ABI
 router with the `client_id` cache, 22 unit tests); `crates/kian-superagent/src/imessage{,/bridge,/handle}.rs`
