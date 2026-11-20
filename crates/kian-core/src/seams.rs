@@ -224,6 +224,13 @@ pub enum LoopOutcome {
 /// the session (ADR-024); it is an in-process contract, not an event or a
 /// wire value.
 pub const EPISODE_BUDGET_STOP_REASON_PREFIX: &str = "episode iteration budget exhausted";
+/// Stop reason a resident loop (the Router) emits when its rotation
+/// threshold is met at a park boundary: the engine ends the session
+/// `rotated` (ADR-040 phase 2). The **hold owner** ends its own session
+/// — a parked resident holds the drain, so an outside closer cannot
+/// claim an idle session. In-process contract only, not an event or wire
+/// value.
+pub const ROTATION_STOP_REASON: &str = "resident rotation requested";
 
 /// Seam (DESIGN §6.2): the agent loop as control flow inside a drain.
 /// Built-in: the async ReAct loop (kian-loop). The context type is
