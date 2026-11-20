@@ -131,4 +131,9 @@ pub trait HarnessSession: Send {
     fn send(&mut self, control: Control) -> BoxFuture<'_, Result<(), ContractError>>;
     /// Answer a gated tool the harness is waiting on.
     fn answer(&mut self, answer: ApprovalAnswer) -> BoxFuture<'_, Result<(), ContractError>>;
+    /// The harness's continuation handle (HARNESS-BRIDGE §4.6, ADR-047): Claude's `session_id`
+    /// from `system/init`, Codex's thread id. The driver persists it on the turn's `turn/end`.
+    fn resume_handle(&self) -> Option<String> {
+        None
+    }
 }

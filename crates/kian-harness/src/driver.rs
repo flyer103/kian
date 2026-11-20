@@ -76,10 +76,12 @@ impl Default for BridgeDriverConfig {
 pub trait SessionFactory: Send + Sync {
     /// The harness's declared capabilities (drift-tested against HARNESS-BRIDGE §3).
     fn capabilities(&self) -> Capabilities;
-    /// Spawns and performs the protocol handshake within the adapter's own deadline.
+    /// Spawns and performs the protocol handshake within the adapter's own deadline. `resume`
+    /// is the persisted harness handle to continue (ADR-047); `None` starts fresh.
     fn spawn(
         &self,
         session: SessionId,
+        resume: Option<String>,
     ) -> BoxFuture<'static, Result<Box<dyn HarnessSession>, String>>;
 }
 
@@ -433,7 +435,8 @@ impl BridgeDriver {
             .capture
             .as_ref()
             .and_then(|source| source.open(session));
-        let mut live = match self.inner.factory.spawn(session).await {
+        let resume = resume_handle_of(&events);
+        let mut live = match self.inner.factory.spawn(session, resume).await {
             Ok(session) => LiveSession::new(session, &events),
             Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
         };
@@ -588,7 +591,10 @@ impl BridgeDriver {
                         );
                     }
                     if kind == EventKind::TurnEnd {
-                        let payload = turn_end_payload(&payload, live.turn_iteration);
+                        let mut payload = turn_end_payload(&payload, live.turn_iteration);
+                        if let Some(handle) = live.session.resume_handle() {
+                            payload["harness"] = json!({"resume": handle});
+                        }
                         live.turn_open = false;
                         if let Err(e) = ctx.end_turn(payload).await {
                             return (soft("turn end", e), St::Done);
@@ -816,6 +822,21 @@ fn turn_end_payload(payload: &Value, iteration: u64) -> Value {
     } else {
         json!({"iteration": iteration})
     }
+}
+
+/// The latest persisted harness continuation handle (ADR-047): the last `turn/end` carrying
+/// `harness.resume`. Absent = a fresh harness conversation.
+fn resume_handle_of(events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.kind != EventKind::TurnEnd {
+            return None;
+        }
+        event
+            .bytes
+            .pointer("/harness/resume")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
 }
 
 /// The `input/admitted` events appended after the last `drain/claimed` — this drain's promoted
