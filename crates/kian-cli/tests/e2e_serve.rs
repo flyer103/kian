@@ -70,6 +70,8 @@ async fn mock_provider_speaks_the_real_wire_format() {
             base_url: base,
             api_key: "test".into(),
             chat_completions_path: "/chat/completions".into(),
+            connect_timeout_ms: kian_llm::provider::DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
+            idle_timeout_ms: kian_llm::provider::DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
         },
         std::sync::Arc::new(|_r: PersistedRequest| async { Ok::<(), PersistError>(()) }),
     );
