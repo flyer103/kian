@@ -839,6 +839,7 @@ same answer at the intent's `tool/call` seq and re-sends the intent's exact byte
 | Mock (in-memory) | built-in first-class bundle adapter (production code, not a test stub): the IM stand-in, same ImPolicy/StructuredPolicy enforcement through the Router's dispatch tools |
 | Lark/Feishu | the first *real* adapter: IM row — same ImPolicy (≤100-unit normal replies, details-request full mode) through the Router's dispatch tools; receive is an adapter-side chat-history poll mapped to provenance-carrying `ChannelEvent`s (chat id → group, sender → sender), send resolves only on API acceptance; credentials env-only (`KIAN_LARK_APP_ID`/`KIAN_LARK_APP_SECRET`, fail-closed at startup); the channel is untrusted by default |
 | WeChat (iLink) | the third *real* adapter, **best-effort by contract** (ADR-018; [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md)): receive is one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink Bot API (`POST /ilink/bot/getupdates`, server-held ~35 s) mapping each text message to one provenance-carrying `ChannelEvent` (`message_id` → `event_id` as a lossless decimal string, `from_user_id` → `sender.user_id`, `group` always `None`, text only); the config `topics` table doubles as the receive allowlist (unknown sender → honest drop + audit); send is `POST /ilink/bot/sendmessage` echoing the **latest inbound `context_token`** for that user — reply-only, since with no token there is no deliverable send, so no proactive push — resolving only on `ret == 0`; the credential is a QR-issued session token in a local 0600 file written by `kian wechat login` (explicit config path, never in `kian.yaml`, never logged — the one deliberate deviation from the env-only static-secret rule), and `errcode -14` pauses the channel for an hour and resumes on a credentials-file change; no position table (empty cursor, honest idempotent re-poll), no new surface, no new event kind; a protocol break degrades this channel only |
+| iMessage (macOS bridge) | the fourth *real* adapter, **best-effort by construction** (ADR-042; [CHANNEL-IMESSAGE](CHANNEL-IMESSAGE.md)): iMessage has no API, so the channel speaks HTTP to a Mac-side `kian-imessage-bridge` (a LaunchAgent in the signed-in Messages user session, supervising `imsg rpc`). Receive is one bounded long poll per channel over `GET /v1/updates` mapping each text row to one provenance-carrying `ChannelEvent` (`guid` → `event_id`, `sender` handle → `sender.handle`, `group` always `None`, text only); the config `topics` table doubles as the receive **and** recipient allowlist, and the bridge's `watch.participants` is a privacy filter applied on the Mac. Send is `POST /v1/send` (any allowlisted handle — not reply-only), resolving on the observed Apple `guid`/rowid, with a deterministic `client_id` that makes the outbox retry effectively once. The bridge token is env-only (`KIAN_IMESSAGE_BRIDGE_TOKEN`, never `kian.yaml`, never logged); a revoked Full Disk Access pauses receive while sends continue, `-1743` denies sends while receive continues, and a replaced `chat.db` rotates the generation so both cursors reset. No new surface, no new event kind, no kian-side position table; a break degrades this channel only |
 
 ### 4.3 BYOM endpoint (kiand daemon / endpoint SDK)
 
@@ -1656,6 +1657,7 @@ graph TB
  KM[kian-memory<br/>dreaming drain bundle:<br/>prompt/parser/DreamDriver]
  KEP[kian-endpoint<br/>endpoint SDK library (KiandProto endpoint side)]
  KSA[kian-superagent<br/>Router/Worker bundle + channel templates]
+ KIB[kian-imessage-bridge<br/>macOS iMessage bridge: loopback HTTP over imsg rpc]
  KCL[kian-cli<br/>serve/run/inspect/replay/export]
  KSDK[kian-sdk<br/>wire-only embedded SDK]
  KDD[kiand<br/>endpoint daemon = kian-endpoint + main]
@@ -1671,6 +1673,7 @@ graph TB
  KDD --> KEP
  KE -.->|dials over TCP| KEP
  KSDK -.->| JSON-RPC + SSE over HTTP| KCL
+ KSA -.->|HTTP over an SSH -R / mesh VPN| KIB
 ```
 
 | crate | Responsibility | Key interfaces |
@@ -1690,6 +1693,7 @@ graph TB
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kian-cron | Wall-clock scheduling core (CRON-MODEL, ADR-034): five-field grammar and aliases, IANA zone resolution, DST gap/overlap-aware next-fire math, and misfire/coalescing plans. Pure — no I/O, no clock read, no store; the server and CLI own the loop | `CronExpr`, `next_fire_after`, `misfire::plan` |
 | kiand | Endpoint stateless daemon (kian-endpoint + thin main) + watchdog | command execution + health events |
+| kian-imessage-bridge | macOS-side iMessage bridge (CHANNEL-IMESSAGE §3, ADR-042): supervises one `imsg rpc` child (the only component that touches `chat.db` under Full Disk Access and Messages.app under Automation), persists a disposable `rowid` cursor, and serves a bearer-authenticated loopback ABI — `/v1/health`, `/v1/updates` (bounded long poll), `/v1/send` (with a `client_id` idempotency cache). Depends on no kian crate; the adapter reaches it over HTTP | `/v1/updates`, `/v1/send` |
 
 **Cron scheduling (CRON-MODEL — P0/P1 landed).** `kian-cli` owns the wall-clock loop: `kian
 serve` resolves `superagent.cron` at config load and, when the section is non-empty, arms one 1s

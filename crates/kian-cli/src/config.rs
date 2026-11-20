@@ -1824,6 +1824,97 @@ pub struct ChannelConfig {
     /// credential file written by `kian wechat login` — never here.
     #[serde(default)]
     pub wechat: Option<WechatChannelSection>,
+    /// The imessage section — required when (and only when)
+    /// `type: imessage` (fail-closed both directions, validated in
+    /// [`ServeConfig::parse`]). The bridge token is env-only
+    /// (`KIAN_IMESSAGE_BRIDGE_TOKEN`), checked at assembly — never here.
+    #[serde(default)]
+    pub imessage: Option<ImessageChannelSection>,
+}
+
+/// The `superagent.channels.<name>.imessage:` section
+/// (CHANNEL-IMESSAGE §7): the macOS bridge base URL, the topic table
+/// that is both allowlists, the service selector and the timing knobs.
+/// The bridge token is deliberately absent: `KIAN_IMESSAGE_BRIDGE_TOKEN`
+/// is read at assembly (the secrets discipline).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImessageChannelSection {
+    /// The macOS bridge base URL (`http(s)://`, loopback/tunnel).
+    pub bridge_url: String,
+    /// Handle → routing topic. The keys are the receive allowlist and
+    /// the only handles a delivery may target.
+    pub topics: BTreeMap<String, String>,
+    /// Send service selection: `auto` | `imessage` (phase 1).
+    #[serde(default = "default_imessage_service")]
+    pub service: String,
+    /// Client long-poll deadline, ms (above the bridge's 25 s hold).
+    #[serde(default = "default_imessage_poll_timeout_ms")]
+    pub poll_timeout_ms: u64,
+    /// Long-poll hold requested from the bridge, ms (0 = short poll).
+    #[serde(default = "default_imessage_wait_ms")]
+    pub wait_ms: u64,
+    /// One-shot send deadline, ms.
+    #[serde(default = "default_imessage_send_timeout_ms")]
+    pub send_timeout_ms: u64,
+    /// Defensive split point for outbound text.
+    #[serde(default = "default_imessage_max_send_chars")]
+    pub max_send_chars: usize,
+}
+
+fn default_imessage_service() -> String {
+    "auto".into()
+}
+
+fn default_imessage_poll_timeout_ms() -> u64 {
+    kian_superagent::IMESSAGE_DEFAULT_POLL_TIMEOUT.as_millis() as u64
+}
+
+fn default_imessage_wait_ms() -> u64 {
+    kian_superagent::imessage::DEFAULT_WAIT.as_millis() as u64
+}
+
+fn default_imessage_send_timeout_ms() -> u64 {
+    kian_superagent::imessage::DEFAULT_SEND_TIMEOUT.as_millis() as u64
+}
+
+fn default_imessage_max_send_chars() -> usize {
+    kian_superagent::IMESSAGE_SEND_SPLIT_CHARS
+}
+
+impl ImessageChannelSection {
+    /// Converts to the bundle's runtime config. The bridge token is an
+    /// assembly input (env-only): a configured `type: imessage` channel
+    /// without `KIAN_IMESSAGE_BRIDGE_TOKEN` refuses startup — the token
+    /// never lives in `kian.yaml` and is never logged.
+    pub fn to_runtime(
+        &self,
+        name: &str,
+        token: Option<String>,
+    ) -> Result<kian_superagent::ImessageConfig, ConfigError> {
+        let token = token.ok_or_else(|| {
+            invalid(format!(
+                "superagent.channels `{name}` (type imessage) requires                  KIAN_IMESSAGE_BRIDGE_TOKEN in the environment — the bridge token never lives                  in kian.yaml"
+            ))
+        })?;
+        let mut config = kian_superagent::ImessageConfig::new(
+            self.bridge_url.trim(),
+            token,
+            self.topics.clone(),
+        );
+        config.service = kian_superagent::ImessageService::parse(&self.service).map_err(|e| {
+            invalid(format!(
+                "superagent.channels `{name}`.imessage.service: {e}"
+            ))
+        })?;
+        config.poll_timeout = std::time::Duration::from_millis(self.poll_timeout_ms);
+        config.wait = std::time::Duration::from_millis(self.wait_ms);
+        config.send_timeout = std::time::Duration::from_millis(self.send_timeout_ms);
+        config.max_send_chars = self.max_send_chars;
+        config
+            .validate()
+            .map_err(|e| invalid(format!("superagent.channels `{name}` (type imessage): {e}")))
+    }
 }
 
 /// The `superagent.channels.<name>.github:` section (adapter +
@@ -2424,6 +2515,7 @@ impl SuperAgentConfig {
             if channel.channel_type == kian_superagent::LARK_CHANNEL_TYPE
                 || channel.channel_type == kian_superagent::GITHUB_CHANNEL_TYPE
                 || channel.channel_type == kian_superagent::WECHAT_CHANNEL_TYPE
+                || channel.channel_type == kian_superagent::IMESSAGE_CHANNEL_TYPE
             {
                 set.insert(name.clone());
             }
@@ -2433,10 +2525,11 @@ impl SuperAgentConfig {
 }
 
 /// Every channel adapter type `serve` knows how to build (v1:
-/// the first-class mock; adds the real lark adapter; the
-/// timer input source; the github channel + webhook
-/// receiver; the wechat iLink channel).
-pub const KNOWN_CHANNEL_TYPES: [&str; 5] = ["mock-im", "lark", "timer", "github", "wechat"];
+/// the first-class mock; the real lark adapter; the timer input source;
+/// the github channel + webhook receiver; the wechat iLink channel; the
+/// imessage channel over its macOS bridge).
+pub const KNOWN_CHANNEL_TYPES: [&str; 6] =
+    ["mock-im", "lark", "timer", "github", "wechat", "imessage"];
 
 /// The `workers:` section (R12, spec C1): the dynamic-membership
 /// registration listener. Workers dial in and self-register; joining or
@@ -3295,6 +3388,86 @@ impl ServeConfig {
                     }
                     (None, _) => {}
                 }
+                // the `imessage:` section is presence-locked to
+                // `type: imessage` in both directions; its shape
+                // validates fail-closed. The bridge token is env-only
+                // and checked at assembly (`to_runtime`) — never here.
+                match (&channel.imessage, channel.channel_type.as_str()) {
+                    (Some(section), "imessage") => {
+                        if section.bridge_url.trim().is_empty() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.bridge_url is required \
+                                 (the macOS bridge base URL; loopback/tunnel)"
+                            )));
+                        }
+                        if !kian_superagent::is_http_base(section.bridge_url.trim()) {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.bridge_url must be an \
+                                 http(s):// URL with a non-empty host, got `{}`",
+                                section.bridge_url
+                            )));
+                        }
+                        if section.topics.is_empty() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.topics must declare at \
+                                 least one handle → topic entry (the receive and send allowlist)"
+                            )));
+                        }
+                        for (handle, topic) in &section.topics {
+                            if handle.trim().is_empty() || topic.trim().is_empty() {
+                                return Err(invalid(format!(
+                                    "superagent.channels `{name}`.imessage.topics entries must \
+                                     be non-empty (`{handle}`)"
+                                )));
+                            }
+                        }
+                        if let Err(error) =
+                            kian_superagent::ImessageService::parse(&section.service)
+                        {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.service: {error}"
+                            )));
+                        }
+                        if section.wait_ms > kian_superagent::imessage::bridge::MAX_WAIT_MS {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.wait_ms must be at most \
+                                 {} (the bridge's long-poll cap)",
+                                kian_superagent::imessage::bridge::MAX_WAIT_MS
+                            )));
+                        }
+                        if section.poll_timeout_ms <= section.wait_ms.saturating_add(5_000) {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.poll_timeout_ms must \
+                                 exceed wait_ms by more than 5 s"
+                            )));
+                        }
+                        if section.send_timeout_ms == 0 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.send_timeout_ms must be \
+                                 > 0"
+                            )));
+                        }
+                        if section.max_send_chars < 100 {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.max_send_chars must be \
+                                 at least 100"
+                            )));
+                        }
+                    }
+                    (Some(_), other) => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}`: the `imessage:` section belongs to \
+                             `type: imessage` channels only (this channel is `type: {other}`)"
+                        )));
+                    }
+                    (None, "imessage") => {
+                        return Err(invalid(format!(
+                            "superagent.channels `{name}` (type imessage) requires an \
+                             `imessage:` section (bridge_url, topics, service?, timing?)"
+                        )));
+                    }
+                    (None, _) => {}
+                }
             }
             // at most one `type: github` channel — the single
             // `POST /webhooks/github` route feeds exactly one channel
@@ -3322,6 +3495,19 @@ impl ServeConfig {
                 return Err(invalid(
                     "superagent.channels may declare at most one `type: wechat` channel \
                      (phase 1 is single-account: one credential file, one bot token)",
+                ));
+            }
+            // at most one `type: imessage` channel — one bridge is one
+            // Messages account in phase 1 (CHANNEL-IMESSAGE §7).
+            let imessage_count = sa
+                .channels
+                .values()
+                .filter(|channel| channel.channel_type == kian_superagent::IMESSAGE_CHANNEL_TYPE)
+                .count();
+            if imessage_count > 1 {
+                return Err(invalid(
+                    "superagent.channels may declare at most one `type: imessage` channel \
+                     (phase 1 is single-account: one bridge, one Messages account)",
                 ));
             }
             // (CRON-MODEL §3.3) the cron declarations validate
@@ -6662,6 +6848,183 @@ recovery:
         std::fs::remove_file(&path).ok();
     }
 
+    // -----------------------------------------------------------------------
+    // the imessage channel wire layer (CHANNEL-IMESSAGE §7)
+    // -----------------------------------------------------------------------
+
+    const IMESSAGE_TOKEN_ENV: &str = "KIAN_IMESSAGE_BRIDGE_TOKEN";
+
+    fn imessage_yaml(extra: &str) -> String {
+        superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            &format!("  channels:\n    imessage:\n      type: imessage\n{extra}    mock-im:"),
+            1,
+        )
+    }
+
+    const IMESSAGE_SECTION: &str = "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1 (415) 555-1212\": imessage\n";
+
+    #[test]
+    fn imessage_channel_config_parses_with_defaults() {
+        let cfg =
+            ServeConfig::parse(&imessage_yaml(IMESSAGE_SECTION)).expect("imessage config parses");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let section = sa.channels["imessage"].imessage.as_ref().expect("section");
+        assert_eq!(section.bridge_url, "http://127.0.0.1:7420");
+        assert_eq!(section.service, "auto");
+        assert_eq!(section.wait_ms, 20_000);
+        assert_eq!(section.poll_timeout_ms, 35_000);
+        assert_eq!(section.send_timeout_ms, 30_000);
+        assert_eq!(section.max_send_chars, 2_000);
+        assert_eq!(
+            section.topics,
+            BTreeMap::from([("+1 (415) 555-1212".to_string(), "imessage".to_string())])
+        );
+
+        // The env-only bridge token is the fail-closed assembly gate.
+        let err = section
+            .to_runtime("imessage", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(IMESSAGE_TOKEN_ENV), "names the env var: {err}");
+
+        let runtime = section
+            .to_runtime("imessage", Some("fake-bridge-token-0123456789".to_string()))
+            .expect("converts");
+        assert_eq!(runtime.bridge_url, "http://127.0.0.1:7420");
+        assert_eq!(runtime.service, kian_superagent::ImessageService::Auto);
+        assert_eq!(runtime.wait.as_millis(), 20_000);
+        assert_eq!(runtime.poll_timeout.as_millis(), 35_000);
+        assert_eq!(
+            runtime.topics.keys().cloned().collect::<Vec<_>>(),
+            vec!["+14155551212".to_string()],
+            "config keys normalize (CHANNEL-IMESSAGE §6)"
+        );
+
+        // Explicit overrides reach the runtime config.
+        let overrides = IMESSAGE_SECTION.replace(
+            "        bridge_url: http://127.0.0.1:7420\n",
+            "        bridge_url: https://bridge.example:7420\n        service: imessage\n        wait_ms: 1000\n        poll_timeout_ms: 7000\n        send_timeout_ms: 5000\n        max_send_chars: 500\n",
+        );
+        let cfg = ServeConfig::parse(&imessage_yaml(&overrides)).expect("overrides parse");
+        let runtime = cfg.superagent.as_ref().unwrap().channels["imessage"]
+            .imessage
+            .as_ref()
+            .unwrap()
+            .to_runtime("imessage", Some("fake-bridge-token-0123456789".to_string()))
+            .expect("converts");
+        assert_eq!(runtime.service, kian_superagent::ImessageService::Imessage);
+        assert_eq!(runtime.max_send_chars, 500);
+    }
+
+    #[test]
+    fn imessage_channel_section_is_fail_closed() {
+        // `type: imessage` without an `imessage:` section.
+        let err = ServeConfig::parse(&imessage_yaml("")).unwrap_err();
+        assert!(
+            err.to_string().contains("requires an `imessage:` section"),
+            "{err}"
+        );
+
+        // A section on a non-imessage channel.
+        let misplaced = superagent_yaml().replacen(
+            "    mock-im:\n      type: mock-im",
+            "    mock-im:\n      type: mock-im\n      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage",
+            1,
+        );
+        let err = ServeConfig::parse(&misplaced).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("belongs to `type: imessage` channels only"),
+            "{err}"
+        );
+
+        // Degenerate shapes refuse (fail-closed, never defaults).
+        for (extra, needle) in [
+            (
+                "      imessage:\n        topics:\n          \"+1\": imessage\n",
+                "bridge_url",
+            ),
+            (
+                "      imessage:\n        bridge_url: \"  \"\n        topics:\n          \"+1\": imessage\n",
+                "bridge_url",
+            ),
+            (
+                "      imessage:\n        bridge_url: \"ftp://bad\"\n        topics:\n          \"+1\": imessage\n",
+                "http(s):// URL",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics: {}\n",
+                "at least one handle",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"\": imessage\n",
+                "must be non-empty",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n        service: sms\n",
+                "phase 1",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n        service: carrier-pigeon\n",
+                "auto or imessage",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n        wait_ms: 26000\n",
+                "at most 25000",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n        wait_ms: 20000\n        poll_timeout_ms: 20000\n",
+                "must exceed wait_ms",
+            ),
+            (
+                "      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n        max_send_chars: 10\n",
+                "at least 100",
+            ),
+        ] {
+            let err = ServeConfig::parse(&imessage_yaml(extra)).unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn at_most_one_imessage_channel_per_config() {
+        let doubled = superagent_yaml().replacen(
+            "  channels:\n    mock-im:",
+            "  channels:\n    im1:\n      type: imessage\n      imessage:\n        bridge_url: http://127.0.0.1:7420\n        topics:\n          \"+1\": imessage\n    im2:\n      type: imessage\n      imessage:\n        bridge_url: http://127.0.0.1:7421\n        topics:\n          \"+2\": imessage\n    mock-im:",
+            1,
+        );
+        let err = ServeConfig::parse(&doubled).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most one `type: imessage` channel"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn imessage_channels_are_untrusted_by_default_and_cross_reference() {
+        let yaml = imessage_yaml(IMESSAGE_SECTION).replace(
+            "  subscriptions:",
+            "  subscriptions:\n    - channel: imessage\n      match: always\n      route: router",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("cross-references validate");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let set = sa.runtime_untrusted_set().expect("set converts");
+        assert!(set.contains("imessage"), "imessage is forced untrusted");
+
+        let bad = imessage_yaml(IMESSAGE_SECTION).replace(
+            "  subscriptions:",
+            "  subscriptions:\n    - channel: imessage-ghost\n      match: always\n      route: router",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not declared in superagent.channels"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn superagent_rule_referencing_undeclared_channel_is_rejected() {
         // Remove the `ci` channel entry; the passthrough rule now dangles.
@@ -7909,6 +8272,7 @@ recovery:
             "cron-jobs".to_string(),
             ChannelConfig {
                 channel_type: "mock-im".into(),
+                imessage: None,
                 lark: None,
                 timer: None,
                 github: None,

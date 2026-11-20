@@ -1935,6 +1935,11 @@ pub struct SuperAgentServices {
     /// (paused/stale counters); the receive drivers self-start with
     /// the subscription consumers.
     pub wechat_channels: BTreeMap<String, Arc<kian_superagent::WechatChannel>>,
+    /// iMessage channels by configured name — the macOS-bridge
+    /// adapters (phase 1: single account). Exposed for observability
+    /// (paused/gap/uncertain-send counters); the receive drivers
+    /// self-start with the subscription consumers.
+    pub imessage_channels: BTreeMap<String, Arc<kian_superagent::ImessageChannel>>,
     /// Adapters in config order (consumer spawn order).
     pub adapters: Vec<Arc<dyn ChannelAdapter>>,
     /// The worker's evidence gate config (shared counters).

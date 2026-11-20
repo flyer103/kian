@@ -15,6 +15,7 @@ members = [
     "crates/kian-dsh",
     "crates/kian-cron",
     "crates/kian-cli",
+    "crates/kian-imessage-bridge",
     "crates/kiand",
 ]
 

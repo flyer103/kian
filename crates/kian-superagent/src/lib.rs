@@ -106,6 +106,7 @@ pub mod bootstrap;
 pub mod directory;
 pub mod dsh;
 pub mod github;
+pub mod imessage;
 pub mod inbox;
 pub mod intake;
 pub mod lark;
@@ -149,6 +150,15 @@ pub use github::{
     SUBSCRIBER_CAPACITY as GITHUB_SUBSCRIBER_CAPACITY, SUPPORTED_EVENT_TYPES, payload_since_cursor,
     poll_author_is_human, poll_comment_body, poll_event_id, poll_issue_body, poll_item_since,
     poll_items_to_events, poll_thread_key_rule, rfc3339_ms,
+};
+pub use imessage::{
+    BRIDGE_TOKEN_ENV as IMESSAGE_BRIDGE_TOKEN_ENV,
+    DEFAULT_POLL_TIMEOUT as IMESSAGE_DEFAULT_POLL_TIMEOUT, ECHO_RING_CAPACITY,
+    IMESSAGE_CHANNEL_TYPE, ImessageChannel, ImessageConfig, ImessageDrop, ImessageError,
+    ImessageService, SEND_SPLIT_CHARS as IMESSAGE_SEND_SPLIT_CHARS,
+    SUBSCRIBER_CAPACITY as IMESSAGE_SUBSCRIBER_CAPACITY, delivery_client_id, is_http_base,
+    map_message as imessage_map_message, message_to_event as imessage_message_to_event,
+    split_text as imessage_split_text,
 };
 pub use inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
 pub use intake::{
