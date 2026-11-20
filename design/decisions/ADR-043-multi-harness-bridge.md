@@ -1,4 +1,4 @@
-# ADR-042: Multi-harness bridges — Claude Code and Codex behind one kian-side contract
+# ADR-043: Multi-harness bridges — Claude Code and Codex behind one kian-side contract
 
 - **Status**: proposed for the confirmation gate (2026-11-19). Implements phase 1 of
   [HARNESS-BRIDGE](../HARNESS-BRIDGE.md); leaves [ADR-010](ADR-010-dsh-session-mapping.md)
