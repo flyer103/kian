@@ -76,9 +76,10 @@ unverified**. A full live captured turn (proxy → real model) is not recorded y
 ## Known limits (phase 1, by contract)
 
 - projection-only: no `step/request`, no cache accounting, no byte-request replay;
-- no cross-process harness resume: a later input starts a fresh harness conversation; a takeover
-  with no undelivered input ends `failed` (the engine's mapping for a lost turn) with a named
-  reason, never `completed`;
+- the conversation resumes across drains from the persisted handle on `turn/end`
+  (`harness.resume`, ADR-047); an interrupted turn is not re-driven — a takeover with no
+  undelivered input ends `failed` (the engine's mapping for a lost turn) with a named reason,
+  never `completed`, and the next input continues the same conversation;
 - `ask` approvals refuse boot (phase 2): an allow/deny policy answers the harness's own gate;
 - one harness per worker template; a bridge and `endpoints:`/`workers:` are mutually exclusive;
 - cron's worktree arm is still dsh-shaped (`--profile <name> <payload>`); running Claude Code or

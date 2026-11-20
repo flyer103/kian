@@ -45,6 +45,7 @@ impl SessionFactory for CodexAdapter {
     fn spawn(
         &self,
         session: SessionId,
+        resume: Option<String>,
     ) -> BoxFuture<'static, Result<Box<dyn HarnessSession>, String>> {
         let config = self.config.clone();
         Box::pin(async move {
@@ -65,9 +66,16 @@ impl SessionFactory for CodexAdapter {
                 .await?;
             session.read_until_response(1).await?;
             session.notify("initialized", json!({})).await?;
-            session
-                .request("thread/start", config.thread_params())
-                .await?;
+            if let Some(thread) = resume.as_deref() {
+                // ADR-047: continue the same app-server thread.
+                session
+                    .request("thread/resume", json!({"threadId": thread}))
+                    .await?;
+            } else {
+                session
+                    .request("thread/start", config.thread_params())
+                    .await?;
+            }
             let response = session.read_until_response(2).await?;
             let thread = response
                 .pointer("/result/thread/id")
@@ -217,6 +225,10 @@ impl HarnessSession for CodexSession {
             self.next_id += 1;
             self.peer.send(line).await
         })
+    }
+
+    fn resume_handle(&self) -> Option<String> {
+        self.thread_id.clone()
     }
 
     fn answer(&mut self, answer: ApprovalAnswer) -> BoxFuture<'_, Result<(), ContractError>> {

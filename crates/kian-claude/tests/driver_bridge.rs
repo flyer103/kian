@@ -690,3 +690,36 @@ async fn zero_step_timeout_disables_the_bound() {
         .await;
     assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
 }
+
+#[tokio::test]
+async fn the_cli_session_id_is_persisted_as_the_resume_handle() {
+    let dir = scratch("resume");
+    let script = write_script(
+        &dir,
+        "resume.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init","session_id":"sess-1"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), BridgeDriverConfig::default())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+    let end = ctx
+        .committed()
+        .into_iter()
+        .find(|e| e.kind == EventKind::TurnEnd)
+        .expect("turn/end");
+    assert_eq!(
+        end.bytes.pointer("/harness/resume"),
+        Some(&json!("sess-1")),
+        "the CLI session id is the durable handle"
+    );
+}

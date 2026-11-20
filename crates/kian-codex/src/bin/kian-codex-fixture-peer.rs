@@ -25,7 +25,7 @@ fn main() -> ExitCode {
     let mode = args
         .iter()
         .rev()
-        .find(|a| matches!(a.as_str(), "simple" | "approval" | "crash"))
+        .find(|a| matches!(a.as_str(), "simple" | "approval" | "crash" | "resume"))
         .cloned()
         .unwrap_or_else(|| "simple".to_owned());
 
@@ -62,15 +62,27 @@ fn run(
             None => return Err("expected initialize".to_owned()),
         }
     }
-    // thread/start.
+    // thread/start (or thread/resume when continuing, ADR-047).
     let value = read_value(lines)?;
-    if value.get("method").and_then(Value::as_str) != Some("thread/start") {
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if mode == "resume" {
+        if method != "thread/resume" {
+            return Err(format!("expected thread/resume, got `{method}`"));
+        }
+        if value.pointer("/params/threadId").and_then(Value::as_str) != Some("thr_1") {
+            return Err("thread/resume carried the wrong threadId".to_owned());
+        }
+    } else if method != "thread/start" {
         return Err("expected thread/start".to_owned());
     }
     emit(
         out,
         json!({"id": value["id"], "result": {"thread": {"id": "thr_1"}}}),
     )?;
+    if mode == "resume" {
+        // The adapter test stops after the handshake; exit cleanly.
+        return Ok(());
+    }
     emit(
         out,
         json!({"method": "thread/started", "params": {"thread": {"id": "thr_1"}}}),

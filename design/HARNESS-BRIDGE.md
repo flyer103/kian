@@ -95,7 +95,7 @@ phase.
 | `tool/post` observation (hook port) | ✔ (port; test-mounted) | ◐ port exists, bus wiring P2 | ◐ same |
 | kian `tool/pre` veto (plugin bus) | — | ✔ gated tools (`surface:"harness"`, ADR-045) | ✔ gated tools |
 | harness hooks bridged to the kian bus | — | P2 | — |
-| session resume after process death | ✔ child log replay + dedup | — (P2: takeover ends honestly interrupted) | — (P2: same) |
+| conversation resume across drains | ✔ child log replay + dedup | ✔ `--resume` from the persisted handle (ADR-047) | ✔ `thread/resume` from the persisted handle |
 | model selection | harness-owned (labels only) | kian passes `--model` | kian passes the model field |
 | multi-turn within one drain | ✔ | ✔ stream-json input | ✔ app-server |
 | tool execution sandbox | harness | harness | harness |
@@ -220,21 +220,23 @@ recorded because it is the phase-2 `ask` problem in miniature (§10).
 
 ### 4.6 Crash, takeover, resume
 
-Each episode of a Claude Code or Codex bridge spawns a **fresh** child. Phase 1 has no
-cross-process harness resume: the harness's conversation handle is not durable in kian (there is
-no event to carry it, and inventing a side table would violate constraint 1), so a takeover
-cannot re-enter the dead child's conversation. A takeover drain therefore does **not** re-deliver
-consumed inputs (that would re-run side effects); with no fresh input it ends the session
-honestly as a soft failure (`failed`, the engine's mapping for a lost turn) with a named reason —
-never `completed`. A later user input starts a new drain and a new
-harness child — continuation of the *session* (durable kian state, control, audit) without
-continuation of the *harness conversation*.
+Each episode of a Claude Code or Codex bridge spawns a child, but the **conversation** is
+resumable: the adapter exposes the harness's continuation handle (`HarnessSession::resume_handle`
+— Claude's `session_id` from `system/init`, Codex's thread id from `thread/start`), the driver
+stamps it onto the turn's `turn/end` payload as `"harness":{"resume":<id>}` (additive,
+[EVENT-MODEL](EVENT-MODEL.md) §3), and at the next episode start it passes the latest such handle
+to `SessionFactory::spawn`, which maps it to `--resume <id>` (Claude) or `thread/resume` (Codex).
+Replay of the stream therefore carries the pointer; the harness's own log remains the
+conversation's truth ([ADR-047](decisions/ADR-047-harness-conversation-resume.md)).
 
-Within one live episode the driver still de-duplicates echoes against the persisted stream
-(multiset, the dsh rule: [`driver.rs`](../crates/kian-dsh/src/driver.rs) lines 213–284) and
-never re-delivers an already-echoed input. dsh is unchanged in phase 1 (its own log replay +
-dedup). Resume for the new bridges is phase 2 and needs a durable harness-handle record. A
-dropped drain never leaks a child (the pump kills it).
+A takeover with no undelivered input still ends `SoftFailed`: the interrupted *turn* is not
+re-driven (unobservable side effects would replay), but the *conversation* survives, so the next
+input continues it. A harness that rejects the resume is a named `SoftFailed` — never a silent
+fall back to a fresh conversation. A turn that died before its first `turn/end` has no handle, so
+the next input starts fresh (recorded, not guessed). Within one live episode the driver still
+de-duplicates echoes against the persisted stream and never re-delivers an already-echoed input;
+a dropped drain never leaks a child (the pump kills it). dsh is unchanged (its own log replay +
+dedup).
 
 ### 4.7 The durable marker (landed)
 
@@ -412,7 +414,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A1 | config: `harness.claude` alone boots; missing command, two harnesses, `ask` approval, or `endpoints:` present → **refuses boot** with the offending key named | L1 |
 | A2 | worker session with `harness.claude` against a scripted child: assistant text + tool call/result map to the existing kinds (no new kind), no `step/request`, stream replays byte-identically at export; a spawned worker's `session/created` carries the bridge marker (L1: engine + spawner-seam tests) | L1/L2 |
 | A3 | child killed mid-turn → SoftFailed → session end `failed`/`interrupted`, never `completed`; the open `turn/start` has no `assistant/message` | L2 (kill) |
-| A4 | `kian serve` killed -9 mid-drain → takeover ends the session honestly (`failed`, the mapping for a lost turn; never `completed`), no re-run of consumed inputs, no duplicate mapped events, exactly one end write; a new input afterwards starts a fresh harness child | L2 |
+| A4 | `kian serve` killed -9 mid-drain → takeover ends the session honestly (`failed`, the mapping for a lost turn; never `completed`), no re-run of consumed inputs, no duplicate mapped events, exactly one end write; a new input afterwards resumes the same harness conversation from the persisted handle | L2 |
 | A5 | steer delivered at the next safe boundary → mapped `input/admitted{synthetic:true}`, strippable, no extra turn opened | L2 |
 | A6 | approval deny: harness receives deny, `tool/call.permission` records `evaluated:"deny"`, no execution effect, result is an honest error; a `tool/pre` veto flips an allowed request to `policy:"hook"` with the plugin's reason, and a declarative allow without a hook keeps `policy:"configured"` | L2 (script asserts both sides) |
 | A7 | step budget exceeded → `Stopped`; startup deadline → SoftFailed naming the deadline | L1 |
@@ -434,7 +436,8 @@ raw argv (`raw: true`) for Claude Code/Codex ([CRON-MODEL](CRON-MODEL.md) §6.2)
 both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
 end and the worker slot is reclaimed instead of parked forever — see §9 A12.
 
-**Phase 2.** Harness approvals dispatch at `tool/pre` (ADR-045; landed), durable interactive
+**Phase 2.** Harness approvals dispatch at `tool/pre` (ADR-045; landed), conversation resume
+across drains (ADR-047; this change), durable interactive
 `ask` (with the restart semantics designed), interrupt forwarded to a live child,
 `harness/<name>/*` hook registry entries, cron per-schedule harness selection. A Claude
 `PreToolUse`/`PostToolUse` shim — the only way to cover auto-approved harness tools — remains

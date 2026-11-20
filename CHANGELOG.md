@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness conversation resume across drains (HARNESS-BRIDGE §4.6, ADR-047)**. A bridged
+  session now remembers its harness conversation: the adapter reports the harness's continuation
+  handle (Claude `session_id` from `system/init`, Codex thread id from `thread/start`), the driver
+  stamps it onto the turn's `turn/end` (`harness.resume`, an additive payload key — no new kind,
+  no side table), and the next episode passes the latest handle to the factory, which resumes with
+  `claude --resume <id>` or Codex `thread/resume`. A takeover still ends an interrupted turn
+  honestly `failed` (it is not re-driven), but the following input continues the same
+  conversation; a rejected resume is a named `SoftFailed` — never a silent fresh conversation.
+  No config or class change; dsh is unchanged. Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
+  §4.6; [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §3.
+
 - **Harness request capture: bridged sessions can be `exact` (HARNESS-BRIDGE §5.4, ADR-046)**.
   With `superagent.harness.capture:` on, kian starts a loopback recording proxy and points the
   mounted Claude Code (`ANTHROPIC_BASE_URL`) or Codex (`model_providers.kian-capture`) at it. Each

@@ -44,10 +44,11 @@ impl SessionFactory for ClaudeAdapter {
     fn spawn(
         &self,
         session: SessionId,
+        resume: Option<String>,
     ) -> BoxFuture<'static, Result<Box<dyn HarnessSession>, String>> {
         let config = self.config.clone();
         Box::pin(async move {
-            let argv = config.argv();
+            let argv = config.argv(resume.as_deref());
             let mut env = config.env.clone();
             if let Some(base) = &config.capture_base {
                 env.push((
@@ -109,6 +110,10 @@ impl HarnessSession for ClaudeSession {
             };
             self.peer.send(line).await
         })
+    }
+
+    fn resume_handle(&self) -> Option<String> {
+        self.mapper.session_id()
     }
 
     fn answer(

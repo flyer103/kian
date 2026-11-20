@@ -37,9 +37,9 @@ impl Default for ClaudeConfig {
 }
 
 impl ClaudeConfig {
-    /// The child argv: the fixed stream-json shape first, then `--model`, then extras.
+    /// The child argv: the fixed stream-json shape first, then `--model`/`--resume`, then extras.
     #[must_use]
-    pub fn argv(&self) -> Vec<String> {
+    pub fn argv(&self, resume: Option<&str>) -> Vec<String> {
         let mut argv: Vec<String> = vec![
             "--print".to_owned(),
             "--input-format".to_owned(),
@@ -53,6 +53,10 @@ impl ClaudeConfig {
         if let Some(model) = &self.model {
             argv.push("--model".to_owned());
             argv.push(model.clone());
+        }
+        if let Some(session) = resume {
+            argv.push("--resume".to_owned());
+            argv.push(session.to_owned());
         }
         argv.extend(self.args.iter().cloned());
         argv
@@ -77,6 +81,8 @@ pub struct ClaudeMapper {
     awaiting: Option<String>,
     interrupt_sent: bool,
     init_seen: bool,
+    /// The CLI's session id from `system/init` (the resume handle, ADR-047).
+    session_id: Option<String>,
 }
 
 impl ClaudeMapper {
@@ -89,6 +95,12 @@ impl ClaudeMapper {
     #[must_use]
     pub fn init_seen(&self) -> bool {
         self.init_seen
+    }
+
+    /// The harness's continuation handle, learned from `system/init` (ADR-047).
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id.clone()
     }
 
     /// Takes the next queued event.
@@ -113,6 +125,10 @@ impl ClaudeMapper {
                 let subtype = obj.get("subtype").and_then(Value::as_str).unwrap_or("");
                 if subtype == "init" {
                     self.init_seen = true;
+                    self.session_id = obj
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
                 }
                 self.held.push_back(SessionEvent::Mapped(Mapped::Absorbed {
                     kind: "claude/system",
@@ -422,6 +438,18 @@ mod tests {
 
     fn line(value: Value) -> String {
         serde_json::to_string(&value).unwrap()
+    }
+
+    #[test]
+    fn argv_resumes_only_when_a_handle_is_given() {
+        let fresh = ClaudeConfig::default().argv(None);
+        assert!(!fresh.contains(&"--resume".to_owned()));
+        let resumed = ClaudeConfig::default().argv(Some("sess-1"));
+        let pos = resumed
+            .iter()
+            .position(|arg| arg == "--resume")
+            .expect("--resume");
+        assert_eq!(resumed[pos + 1], "sess-1");
     }
 
     #[test]

@@ -164,3 +164,27 @@ async fn a_tool_pre_deny_flips_an_allowed_command_to_policy_hook() {
         Some(&json!("blocked by policy"))
     );
 }
+
+#[tokio::test]
+async fn a_resume_handle_uses_thread_resume() {
+    let config = CodexConfig {
+        command: PathBuf::from(env!("CARGO_BIN_EXE_kian-codex-fixture-peer"))
+            .display()
+            .to_string(),
+        args: vec!["resume".to_owned()],
+        model: None,
+        cwd: None,
+        approval_policy: "on-request".to_owned(),
+        env: Vec::new(),
+        startup_timeout: Duration::from_secs(5),
+        capture_base: None,
+    };
+    let session = kian_harness::SessionFactory::spawn(
+        &CodexAdapter::new(config),
+        SessionId::new(),
+        Some("thr_1".to_owned()),
+    )
+    .await
+    .expect("thread/resume handshake");
+    assert_eq!(session.resume_handle().as_deref(), Some("thr_1"));
+}
