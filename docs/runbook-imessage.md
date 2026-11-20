@@ -276,8 +276,17 @@ personal, `imsg 0.21.1`, bridge + tunnel as LaunchAgents, `kian serve` on the VP
 - `kian imessage check` reported the bridge and failed closed without the token.
 - A malformed reply target produced an honest `DeliveryFailed`, and the Router retried with the
   correct `{"handle": …}` shape — the error loop works without extra model-side machinery.
+- **Restart recovery**: restarting `kian serve` mid-turn closed the drain honestly and the next input
+  re-claimed the same session (`drain/claimed` → reply in 3.2 s); no re-arm, no lost work.
+- **Send idempotency**: posting the same `client_id` twice sent once and returned
+  `deduplicated: true` on the second response.
+- **Long text**: a 2616-character single send was accepted natively (`verified: true`); production
+  parts stay ≤2000 by the adapter's split.
+- **Burst**: six back-to-back sends all delivered, in order, with no rate-limit and zero uncertain
+  dispositions (4.4 s cold, then 0.12–0.97 s).
 
 **Remaining** (contract §13): sleeping/logged-out Mac delivery completeness (§13.3), SMS as a
-channel (§13.4), real text limits (§13.5), the duplicate window (§13.6), fast-user-switched sessions
-(§13.2), the `-1743` recovery path (§13.9 resolved for attribution only), latency under load
-(§13.11), and the private-API features (typing/read receipts) which stay out of scope.
+channel (§13.4), the `详情` full-delivery split and sustained rate limits (§13.5 partially measured),
+fast-user-switched sessions (§13.2), the `-1743` recovery path (§13.9 resolved for attribution
+only), latency under load (§13.11), and the private-API features (typing/read receipts) which stay
+out of scope.
