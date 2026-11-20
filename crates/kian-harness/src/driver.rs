@@ -85,6 +85,37 @@ pub trait ToolPostPort: Send + Sync {
     fn tool_post(&self, view: ToolPostView) -> BoxFuture<'static, ()>;
 }
 
+/// The `tool/pre` consultation for a harness-gated tool (HARNESS-BRIDGE §4.4, ADR-045).
+///
+/// The driver evaluates its declarative policy first and passes that decision along; the port
+/// adapts the call to the plugin bus and returns its verdict. A deny can only narrow the
+/// declarative gate, never widen it.
+#[derive(Debug, Clone)]
+pub struct ToolPreCall {
+    pub session: SessionId,
+    pub call_id: String,
+    pub name: String,
+    pub iteration: u64,
+    pub arguments: Value,
+    /// The declarative decision the hook may veto (never widen).
+    pub config_allow: bool,
+    pub config_matched: String,
+}
+
+/// The plugin bus's verdict, reduced to what the driver needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPreVerdict {
+    /// No valid denial: the declarative decision stands.
+    Allow,
+    /// A `veto:tool` denial (or the bus's fail-closed default).
+    Deny { plugin: String, reason: String },
+}
+
+/// The `tool/pre` port (assembly adapts it to `kian-plugin`'s bus).
+pub trait ToolPrePort: Send + Sync {
+    fn tool_pre(&self, call: ToolPreCall) -> BoxFuture<'static, ToolPreVerdict>;
+}
+
 /// The bridge `LoopDriver`.
 pub struct BridgeDriver {
     inner: Arc<Inner>,
@@ -95,6 +126,7 @@ struct Inner {
     config: BridgeDriverConfig,
     table: Mutex<HashMap<SessionId, Option<LiveSession>>>,
     tool_post: Option<Arc<dyn ToolPostPort>>,
+    tool_pre: Option<Arc<dyn ToolPrePort>>,
 }
 
 impl BridgeDriver {
@@ -106,6 +138,7 @@ impl BridgeDriver {
                 config,
                 table: Mutex::new(HashMap::new()),
                 tool_post: None,
+                tool_pre: None,
             }),
         }
     }
@@ -115,6 +148,14 @@ impl BridgeDriver {
     pub fn with_tool_post_port(mut self, port: Arc<dyn ToolPostPort>) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("unique at construction");
         inner.tool_post = Some(port);
+        self
+    }
+
+    /// Mounts the `tool/pre` port (HARNESS-BRIDGE §4.4). Call before serving.
+    #[must_use]
+    pub fn with_tool_pre_port(mut self, port: Arc<dyn ToolPrePort>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("unique at construction");
+        inner.tool_pre = Some(port);
         self
     }
 
@@ -513,10 +554,42 @@ impl BridgeDriver {
                         .config
                         .policy
                         .decide(&request.tool, &request.input);
+                    let mut allow = decision == Decision::Allow;
+                    let mut policy = "configured";
+                    let mut matched = matched;
+                    let mut reason = None;
+                    if let Some(port) = self.inner.tool_pre.clone() {
+                        let verdict = port
+                            .tool_pre(ToolPreCall {
+                                session: ctx.session(),
+                                call_id: request
+                                    .call_id
+                                    .clone()
+                                    .unwrap_or_else(|| request.id.clone()),
+                                name: request.tool.clone(),
+                                iteration: live.turn_iteration,
+                                arguments: request.input.clone(),
+                                config_allow: allow,
+                                config_matched: matched.clone(),
+                            })
+                            .await;
+                        if let ToolPreVerdict::Deny {
+                            plugin,
+                            reason: hook_reason,
+                        } = verdict
+                        {
+                            allow = false;
+                            policy = "hook";
+                            matched = format!("{plugin}:tool/pre");
+                            reason = Some(hook_reason);
+                        }
+                    }
                     let answer = ApprovalAnswer {
                         id: request.id.clone(),
-                        allow: decision == Decision::Allow,
+                        allow,
+                        policy,
                         matched,
+                        reason,
                     };
                     if let Err(e) = live.session.answer(answer).await {
                         return (

@@ -896,13 +896,18 @@ impl Server {
                     .map(DshHarnessConfig::to_runtime)
                     .transpose()?,
                 bridge_harness: sa.harness.bridge_mount()?.map(|mount| {
-                    std::sync::Arc::new(kian_harness::BridgeDriver::new(
+                    let driver = kian_harness::BridgeDriver::new(
                         mount.factory,
                         kian_harness::BridgeDriverConfig {
                             policy: mount.policy,
                             max_steps: mount.max_steps,
                         },
-                    ))
+                    )
+                    .with_tool_pre_port(std::sync::Arc::new(
+                        crate::harness_hooks::BusToolPre::new(hooks.clone()),
+                    )
+                        as std::sync::Arc<dyn kian_harness::ToolPrePort>);
+                    std::sync::Arc::new(driver)
                 }),
                 event_store: store.clone(),
             });

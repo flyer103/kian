@@ -105,3 +105,59 @@ async fn a_child_that_dies_mid_turn_is_a_soft_failure() {
         vec![EventKind::InputAdmitted, EventKind::TurnStart]
     );
 }
+
+struct DenyAll;
+impl kian_harness::ToolPrePort for DenyAll {
+    fn tool_pre(
+        &self,
+        _call: kian_harness::ToolPreCall,
+    ) -> futures::future::BoxFuture<'static, kian_harness::ToolPreVerdict> {
+        Box::pin(async {
+            kian_harness::ToolPreVerdict::Deny {
+                plugin: "gate".into(),
+                reason: "blocked by policy".into(),
+            }
+        })
+    }
+}
+
+/// A `tool/pre` deny flips an allowed Codex command approval to a denial with hook provenance.
+#[tokio::test]
+async fn a_tool_pre_deny_flips_an_allowed_command_to_policy_hook() {
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "rm please"}));
+    let policy = ApprovalPolicy {
+        default: kian_harness::Decision::Allow,
+        rules: Vec::new(),
+    };
+    let outcomes: Vec<LoopOutcome> = BridgeDriver::new(
+        Arc::new(adapter("approval")),
+        BridgeDriverConfig {
+            policy,
+            max_steps: 32,
+        },
+    )
+    .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)
+    .drive(ctx.clone())
+    .collect()
+    .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+
+    let call = ctx
+        .committed()
+        .into_iter()
+        .find(|e| e.kind == EventKind::ToolCall)
+        .expect("tool/call");
+    assert_eq!(
+        call.bytes.pointer("/content/permission/policy"),
+        Some(&json!("hook"))
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/matched"),
+        Some(&json!("gate:tool/pre"))
+    );
+    assert_eq!(
+        call.bytes.pointer("/content/permission/reason"),
+        Some(&json!("blocked by policy"))
+    );
+}

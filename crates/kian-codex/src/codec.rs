@@ -340,9 +340,10 @@ impl CodexMapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        self.awaiting = Some((id, item_id));
+        self.awaiting = Some((id, item_id.clone()));
         self.held.push_back(SessionEvent::Approval(ApprovalRequest {
             id: id.to_string(),
+            call_id: Some(item_id.clone()),
             tool: tool.to_owned(),
             input,
         }));
@@ -375,11 +376,15 @@ impl CodexMapper {
             "arguments": item.arguments,
         });
         if let Some(answer) = permission {
-            content["permission"] = json!({
+            let mut provenance = json!({
                 "evaluated": if answer.allow { "allow" } else { "deny" },
-                "policy": "configured",
+                "policy": answer.policy,
                 "matched": answer.matched,
             });
+            if let Some(reason) = &answer.reason {
+                provenance["reason"] = json!(reason);
+            }
+            content["permission"] = provenance;
         }
         self.held.push_back(SessionEvent::Mapped(Mapped::Event {
             kind: EventKind::ToolCall,
@@ -521,6 +526,7 @@ mod tests {
             mapper.pop(),
             Some(SessionEvent::Approval(ApprovalRequest {
                 id: "100".into(),
+                call_id: Some("i2".into()),
                 tool: "commandExecution".into(),
                 input: json!({"command": "rm -rf /", "cwd": "/"}),
             }))
@@ -529,7 +535,9 @@ mod tests {
             .answer(&ApprovalAnswer {
                 id: "100".into(),
                 allow: false,
+                policy: "configured",
                 matched: "default".into(),
+                reason: None,
             })
             .expect("answer");
         let parsed: Value = serde_json::from_str(&wire).unwrap();

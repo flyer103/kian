@@ -36,6 +36,9 @@ pub enum Control {
 pub struct ApprovalRequest {
     /// The harness-side request id (echoed in the answer).
     pub id: String,
+    /// The harness's own call id (Claude `tool_use` id, Codex `itemId`), when the protocol
+    /// exposes one — the `tool/pre` correlation key.
+    pub call_id: Option<String>,
     /// The harness's own tool name.
     pub tool: String,
     /// The tool input, kept only for matching (never logged, never persisted).
@@ -48,8 +51,12 @@ pub struct ApprovalRequest {
 pub struct ApprovalAnswer {
     pub id: String,
     pub allow: bool,
-    /// The rule that decided (a configured pattern or `"default"`).
+    /// `"configured"` (the declarative policy) or `"hook"` (a `tool/pre` veto).
+    pub policy: &'static str,
+    /// The rule that decided: a configured pattern, `"default"`, or `"<plugin>:tool/pre"`.
     pub matched: String,
+    /// The hook's denial reason (a hook deny only).
+    pub reason: Option<String>,
 }
 
 /// What one poll of a live harness session produced.
