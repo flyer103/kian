@@ -90,6 +90,7 @@ phase.
 | steer (strippable, injected at the next safe boundary) | ✔ | ◐ queued as the next user message | ◐ `turn/steer` when the pinned protocol supports it |
 | interrupt (stop the in-flight turn) | ◐ frame exists; mounted driver does not forward mid-episode | ✔ `control_request{interrupt}` | ✔ `turn/interrupt` |
 | pre-execution tool gate answered by kian | — | ✔ `can_use_tool` control request | ✔ server-initiated approval request |
+| durable `ask` (human decision across a restart) | — | ◐ experimental (opt-in, identical re-issue only) | ◐ same |
 | approval provenance on `tool/call` | — | ✔ (`policy:"configured"`) | ✔ |
 | `tool/call` appended before execution | ✔ (log-before-execute contract) | ◐ requires the pre-execution `tool_use` block (verified per pin, §11) | ◐ same question for `item/started` |
 | `tool/post` observation (hook port) | ✔ (port; test-mounted) | ◐ port exists, bus wiring P2 | ◐ same |
@@ -197,6 +198,19 @@ re-derived identically on the takeover (`allow` → the tool may run again under
 idempotency; `deny` → the same denial). Phase 1 accepts that re-derivation instead of persisting
 an in-flight approval: the harness owns the effect, and kian cannot resume a process. This is
 recorded because it is the phase-2 `ask` problem in miniature (§10).
+
+#### 4.4.1 Durable ask (ADR-048, experimental, opt-in)
+
+With `approvals.durable_ask: true`, a policy `ask` records the pending `tool/call`
+(`permission.evaluated:"ask"`) and ends the drain — no answer to the harness, no lease, the engine
+derives `awaiting_input`. A `confirm` row is read at the next episode: the driver admits a
+synthetic decision nudge (model-visible, persisted) and resumes the conversation (ADR-047); it
+auto-answers a **re-issued** request only when the tool name and canonical arguments digest match
+the pending call (one-shot), keeping one call record and stamping `confirmation` on the result.
+Anything else follows the policy; a resumed turn that never re-issues the call closes the pending
+call with an honest error result (never a fabricated execution, never a stranded pending call).
+The harness's re-issue behaviour is unverified live: the capability matrix marks this `◐` and the
+opt-in is explicit.
 
 ### 4.5 Honesty rules
 
@@ -421,6 +435,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
+| A13 | `approvals.durable_ask: true`: an `ask` records a pending `tool/call` (`permission.evaluated:"ask"`), ends `awaiting_input`, and answers nothing to the harness; a confirm resumes the conversation with a persisted synthetic nudge and auto-answers only an identical re-issue once (one call record, `tool/result.confirmation`); a different call follows policy; a turn that never re-issues closes the pending call with an honest error result; expiry denies | L2 |
 | A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers a fail-closed `413`/`502` **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
 | A12 | open-step silence → SoftFailed naming `step_timeout_ms` (never `completed`, no fabricated `turn/end`); a step that keeps emitting is not cut; `0` disables; below 10 s refuses boot; the mounted bridge ends a stalled session within the bound ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)) | L1/L2 |
