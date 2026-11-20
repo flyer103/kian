@@ -41,6 +41,10 @@ pub enum SessionState {
     Completed,
     /// Terminal: ended with `end_reason=cancelled`. Frozen.
     Cancelled,
+    /// Terminal: ended with `end_reason=rotated` — a resident session
+    /// deliberately retired by rotation (ADR-040). Frozen; the
+    /// deterministic successor takes over.
+    Rotated,
     /// Retired by an ops action. Frozen.
     Archived,
 }
@@ -49,7 +53,10 @@ impl SessionState {
     /// Terminal states freeze the stream: no event may follow them.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled | Self::Archived)
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Rotated | Self::Archived
+        )
     }
 }
 
@@ -189,6 +196,9 @@ pub fn transition(
         }
         (Some(S::Running), T::Ended(R::Completed)) => Ok(S::Completed),
         (Some(S::Running), T::Ended(R::Cancelled)) => Ok(S::Cancelled),
+        // ADR-040: a rotated resident freezes terminally; its successor
+        // is derived (uuid5 chain), never a resumption of this stream.
+        (Some(S::Running), T::Ended(R::Rotated)) => Ok(S::Rotated),
         (Some(S::Running), T::Ended(R::Interrupted) | T::Ended(R::Failed)) => Ok(S::Idle),
         // CONFIRMATION-MODEL / ADR-033: a drain that stopped on a pending
         // ask is resumable — the answer's arrival re-opens the turn.
@@ -373,12 +383,13 @@ pub(crate) mod test_support {
         &[EventKind::ToolCall, EventKind::ToolResult],
     ];
 
-    const END_REASONS: [EndReason; 5] = [
+    const END_REASONS: [EndReason; 6] = [
         EndReason::Completed,
         EndReason::Cancelled,
         EndReason::Interrupted,
         EndReason::Failed,
         EndReason::AwaitingInput,
+        EndReason::Rotated,
     ];
 
     /// Generates a random *legal* stream by rejection-sampling triggers
@@ -437,6 +448,7 @@ pub(crate) mod test_support {
                 SessionState::Recoverable
                 | SessionState::Completed
                 | SessionState::Cancelled
+                | SessionState::Rotated
                 | SessionState::Archived => break,
             }
         }
@@ -606,6 +618,11 @@ mod tests {
             (Some(Running), DrainActivity, Running),
             (Some(Running), Ended(EndReason::Completed), Completed),
             (Some(Running), Ended(EndReason::Cancelled), Cancelled),
+            (
+                Some(Running),
+                Ended(EndReason::Rotated),
+                SessionState::Rotated,
+            ),
             (Some(Running), Ended(EndReason::Interrupted), Idle),
             (Some(Running), Ended(EndReason::Failed), Idle),
             (Some(Running), LeaseExpired, Recoverable),
@@ -622,6 +639,7 @@ mod tests {
             Some(Recoverable),
             Some(Completed),
             Some(Cancelled),
+            Some(SessionState::Rotated),
             Some(Archived),
         ];
         let triggers = [
@@ -1236,7 +1254,7 @@ mod tests {
                 let terminal_end = matches!(
                     last,
                     EventKind::SessionEnded {
-                        reason: EndReason::Completed | EndReason::Cancelled
+                        reason: EndReason::Completed | EndReason::Cancelled | EndReason::Rotated
                     }
                 );
                 assert_eq!(

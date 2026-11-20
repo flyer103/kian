@@ -132,6 +132,8 @@ enum EndReasonSerde {
     Failed,
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
+    /// ADR-040: the resident session was retired by rotation.
+    Rotated,
 }
 
 impl From<EndReason> for EndReasonSerde {
@@ -142,6 +144,7 @@ impl From<EndReason> for EndReasonSerde {
             EndReason::Interrupted => Self::Interrupted,
             EndReason::Failed => Self::Failed,
             EndReason::AwaitingInput => Self::AwaitingInput,
+            EndReason::Rotated => Self::Rotated,
         }
     }
 }
@@ -154,6 +157,7 @@ impl From<EndReasonSerde> for EndReason {
             EndReasonSerde::Interrupted => Self::Interrupted,
             EndReasonSerde::Failed => Self::Failed,
             EndReasonSerde::AwaitingInput => Self::AwaitingInput,
+            EndReasonSerde::Rotated => Self::Rotated,
         }
     }
 }

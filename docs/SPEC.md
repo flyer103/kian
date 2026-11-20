@@ -508,6 +508,25 @@ pin them together.
 | P3 | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening); channel-side answers (an IM reply mapped to a `confirm`) | not started |
 | P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
 
+### Resident rotation (ADR-040)
+
+Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it
+at creation) without a runtime rebind of every surface. `superagent.router.rotate_after_events: <n>`
+(absent = off; an explicit `0` refuses boot) makes `kian serve` assembly retire a live Router whose
+stream holds at least `n` events: the predecessor ends `session/ended{rotated}` (terminal, one atomic
+`drain/claimed` + end batch, the payload naming the successor), the deterministic uuid5 successor is
+bound everywhere the pinned id was, and the successor's context order is the ADR-038 memory index, the
+predecessor's pending *message* rows, a bounded synthetic handoff, then the judge prompt. Only an
+`idle` live session rotates (a crashed in-flight turn is a takeover, never a rotation), and a live
+lease wins. The normative contract is [design/DESIGN.md](../design/DESIGN.md) §2.2/§4.6; the decision
+record is [ADR-040](../design/decisions/ADR-040-runtime-resident-rotation.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-cli | The sixth end reason `rotated` + the terminal `rotated` state; `superagent.router.rotate_after_events`; the boot rotation (atomic close, chain re-resolution, pending-message migration, bounded handoff, successor bootstrap ordering) | landed (single serving process, or all replicas restart together) |
+| P1 | kian-superagent, kian-cli | The shared `ResidentBinding` refactor (driver routing, subscriptions, tools, spawner, completion reports, watchdog) — behavior-identical, the prerequisite for rotation between restarts | not started |
+| P2 | kian-orchestrator, bundle | Runtime rotation at a proven-idle boundary serialized by a reserved control row, with the input-migration rule and the successor re-point of every surface | not started |
+
 Acceptance criteria are named in CONFIRMATION-MODEL §13 (L1 contract tests; L2 on a real server
 covering the ask→idle→answer→resume round trip, duplicate answers, TTL expiry and a terminal end
 while waiting). No L3 claim in phase 1 (no UI card; the `pending` read is its seam).

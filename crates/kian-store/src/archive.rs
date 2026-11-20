@@ -184,6 +184,7 @@ fn terminal_state(reason: &EndReason) -> &'static str {
         EndReason::Interrupted => "interrupted",
         EndReason::Failed => "failed",
         EndReason::AwaitingInput => "awaiting_input",
+        EndReason::Rotated => "rotated",
     }
 }
 

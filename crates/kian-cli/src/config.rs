@@ -2064,6 +2064,15 @@ pub struct SuperAgentRouterConfig {
     /// `speculative: true` is refused with an honest tool error.
     #[serde(default)]
     pub speculation: Option<SpeculationDef>,
+    /// ADR-040 phase 0 (boot-time resident rotation): rotate the live
+    /// Router at boot when its stream holds at least this many events.
+    /// The predecessor ends `rotated` (terminal) and the deterministic
+    /// successor receives the memory index, the predecessor's pending
+    /// message rows, a bounded handoff, then the judge prompt. Absent =
+    /// never rotate; an explicit `0` refuses boot (a silent disable is
+    /// not accepted).
+    #[serde(default)]
+    pub rotate_after_events: Option<u64>,
 }
 
 /// The `superagent.router.speculation` section:
@@ -3864,6 +3873,12 @@ impl ServeConfig {
                     sa.router.session_id
                 ))
             })?;
+            if sa.router.rotate_after_events == Some(0) {
+                return Err(invalid(
+                    "superagent.router.rotate_after_events must be >= 1 (omit the key to \
+                     disable boot-time rotation)",
+                ));
+            }
             let router_agent = self.agents.get(&sa.router.agent).ok_or_else(|| {
                 invalid(format!(
                     "superagent.router.agent `{}` is not defined in agents",
@@ -7924,6 +7939,35 @@ recovery:
         let cfg = ServeConfig::parse(&yaml).expect("the mix is allowed");
         assert!(cfg.memory.is_some());
         assert!(cfg.superagent.is_some());
+    }
+
+    /// ADR-040 phase 0: `superagent.router.rotate_after_events` parses
+    /// through (a threshold of 1+), and an explicit 0 refuses boot (a
+    /// silent disable is not accepted).
+    #[test]
+    fn router_boot_rotation_config_parses_and_zero_refuses() {
+        let yaml = superagent_yaml().replace(
+            "    slot: router\n",
+            "    slot: router\n    rotate_after_events: 5\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("valid rotation threshold");
+        assert_eq!(
+            cfg.superagent
+                .as_ref()
+                .expect("superagent on")
+                .router
+                .rotate_after_events,
+            Some(5)
+        );
+        let zero = superagent_yaml().replace(
+            "    slot: router\n",
+            "    slot: router\n    rotate_after_events: 0\n",
+        );
+        let err = ServeConfig::parse(&zero).expect_err("an explicit 0 must refuse");
+        assert!(
+            err.to_string().contains("rotate_after_events"),
+            "unexpected error: {err}"
+        );
     }
 
     // -- memory injection config (P2, kian-101) ----------------------
