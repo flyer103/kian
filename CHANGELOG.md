@@ -23,6 +23,20 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   class durably: `session/created` carries the additive `bridge:{name,request_bytes}` key through
   the eager creation seam (HARNESS-BRIDGE §4.7).
 
+- **Bounded model calls and drain-crash containment: an abnormal interruption can delay freeing a
+  worker, never prevent it (ADR-041)**. A model call is now bounded like every other wait: two
+  additive `providers.<name>` keys — `connect_timeout_ms` (default 10 000) and `idle_timeout_ms`
+  (default 300 000, `0` disables) — where the idle bound covers the wait for response headers and
+  each gap between streamed body chunks (never the total request, so a long generation is not
+  killed). A stalled provider therefore settles the turn `failed` (`provider_down` class) instead of
+  parking the drain forever, and the ADR-035 release/reclaim path frees the worker. A drain that
+  dies (panic or task cancellation) now unwinds its in-process handle and heartbeat so the lease
+  expires and the existing takeover path re-drives it; a takeover chain is bounded at three
+  un-ended claims (`MAX_UNENDED_CLAIMS`) before writing one honest `session/ended{failed}` with an
+  additive `crashed` payload instead of re-driving forever. No new event kind, state edge, table or
+  wire byte; contract: [design/WORKER-MODEL.md](design/WORKER-MODEL.md) §3, §6, §8,
+  [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §4.
+
 - **Confirmation phase 2: workers can wait on a person (CONFIRMATION-MODEL §8 C2, §14b)**. `ask`
   is accepted on a superagent worker agent. A worker that stops on a pending `ask` now writes
   **no** `thread/completed` and no parent report (it is waiting, not done); the engine still settles

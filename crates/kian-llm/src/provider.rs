@@ -8,6 +8,7 @@
 use std::future::{Future, ready};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
@@ -211,6 +212,15 @@ pub fn serialize_request_body(body: &Value) -> Result<Vec<u8>, ProviderError> {
 // Provider
 // ---------------------------------------------------------------------------
 
+/// Default connect bound for one model call (ADR-041): TCP connect plus
+/// the TLS handshake. `0` in the config disables the explicit bound.
+pub const DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS: u64 = 10_000;
+
+/// Default idle bound for one model call (ADR-041): the wait for response
+/// headers and each gap between streamed body chunks — never the total
+/// request. `0` in the config disables the bound.
+pub const DEFAULT_PROVIDER_IDLE_TIMEOUT_MS: u64 = 300_000;
+
 /// Endpoint configuration for one openai-compatible provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatConfig {
@@ -222,12 +232,19 @@ pub struct OpenAiCompatConfig {
     /// Chat-completions path appended to `base_url`
     /// (default `/chat/completions`).
     pub chat_completions_path: String,
+    /// Connect bound in milliseconds (TCP + TLS). `0` = no explicit bound.
+    pub connect_timeout_ms: u64,
+    /// Idle bound in milliseconds: the wait for headers and each gap between
+    /// body chunks, never the total request (ADR-041). `0` = disabled.
+    pub idle_timeout_ms: u64,
 }
 
 struct Inner {
     config: OpenAiCompatConfig,
     client: reqwest::Client,
     sink: Arc<dyn PersistSink>,
+    /// `idle_timeout_ms` as a duration; `None` when disabled (`0`).
+    idle_timeout: Option<Duration>,
 }
 
 impl Inner {
@@ -262,13 +279,20 @@ impl OpenAiCompatProvider {
         // Builder configuration here is static; a build failure is a
         // process-level misconfiguration (no TLS backend), not a runtime
         // condition.
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        if config.connect_timeout_ms > 0 {
+            builder = builder.connect_timeout(Duration::from_millis(config.connect_timeout_ms));
+        }
+        let client = builder
             .build()
             .expect("reqwest client construction cannot fail with rustls-tls");
+        let idle_timeout =
+            (config.idle_timeout_ms > 0).then(|| Duration::from_millis(config.idle_timeout_ms));
         Self(Arc::new(Inner {
             config,
             client,
             sink,
+            idle_timeout,
         }))
     }
 
@@ -305,8 +329,20 @@ impl ModelProvider for OpenAiCompatProvider {
                     "persist-before-send failed, request NOT sent: {e}"
                 )));
             }
-            match inner.post(body).await {
-                Ok(resp) => response_stream(resp),
+            // ADR-030 rule for the model call: the wait for response
+            // headers is bounded by the same idle bound as each body gap.
+            let posted = match inner.idle_timeout {
+                Some(idle) => match tokio::time::timeout(idle, inner.post(body)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(ProviderError::Transport(format!(
+                        "model request idle timeout: no response headers within {} ms",
+                        idle.as_millis()
+                    ))),
+                },
+                None => inner.post(body).await,
+            };
+            match posted {
+                Ok(resp) => response_stream(resp, inner.idle_timeout),
                 Err(e) => error_stream(e),
             }
         })
@@ -332,8 +368,45 @@ struct TailState {
     done: bool,
 }
 
+/// Bounds every `next()` of the raw SSE byte stream by `idle` (ADR-041).
+/// The bound is per gap, never a total-request cap: a stream that keeps
+/// producing bytes is never cut. An expiry ends the stream with one
+/// transport error (the `provider_down` class), so the turn settles
+/// honestly instead of parking the drain.
+fn idle_bounded<T, E>(
+    stream: impl futures::Stream<Item = Result<T, E>> + Send + 'static,
+    idle: Option<Duration>,
+) -> BoxStream<'static, Result<T, ProviderError>>
+where
+    T: 'static,
+    E: std::fmt::Display + 'static,
+{
+    let Some(idle) = idle else {
+        return stream
+            .map_err(|e| ProviderError::Transport(e.to_string()))
+            .boxed();
+    };
+    futures::stream::unfold(Some(stream.boxed()), move |state| async move {
+        let mut stream = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(Ok(item))) => Some((Ok(item), Some(stream))),
+            Ok(Some(Err(e))) => Some((Err(ProviderError::Transport(e.to_string())), None)),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(ProviderError::Transport(format!(
+                    "model stream idle timeout: no chunk within {} ms",
+                    idle.as_millis()
+                ))),
+                None,
+            )),
+        }
+    })
+    .boxed()
+}
+
 fn response_stream(
     resp: reqwest::Response,
+    idle: Option<Duration>,
 ) -> BoxStream<'static, Result<ModelChunk, ProviderError>> {
     let status = resp.status();
     if !status.is_success() {
@@ -347,9 +420,7 @@ fn response_stream(
     let decoder = Arc::new(std::sync::Mutex::new(SseDecoder::new()));
     let scan_flags = Arc::clone(&flags);
     let scan_dec = Arc::clone(&decoder);
-    let main = resp
-        .bytes_stream()
-        .map_err(|e| ProviderError::Transport(e.to_string()))
+    let main = idle_bounded(resp.bytes_stream(), idle)
         .scan((), move |(), res| {
             let mut items: Vec<Result<ModelChunk, ProviderError>> = Vec::new();
             match res {
@@ -570,6 +641,7 @@ use sse::SseFrame;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -583,9 +655,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        ChatMessage, OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink,
-        PersistedRequest, ProviderError, WireFunctionCall, WireToolCall, build_chat_body,
-        serialize_request_body,
+        ChatMessage, DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+        OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink, PersistedRequest,
+        ProviderError, WireFunctionCall, WireToolCall, build_chat_body, serialize_request_body,
     };
 
     /// AGENTS gotcha: the macOS system proxy intercepts localhost — every
@@ -674,6 +746,8 @@ mod tests {
             base_url: base.into(),
             api_key: "test-key".into(),
             chat_completions_path: chat_path.into(),
+            connect_timeout_ms: DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
+            idle_timeout_ms: DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
         }
     }
 
@@ -708,6 +782,196 @@ mod tests {
             out.push(item);
         }
         out
+    }
+
+    fn config_with_timeouts(
+        base: &str,
+        chat_path: &str,
+        connect_ms: u64,
+        idle_ms: u64,
+    ) -> OpenAiCompatConfig {
+        OpenAiCompatConfig {
+            name: "openai-compat".into(),
+            base_url: base.into(),
+            api_key: "test-key".into(),
+            chat_completions_path: chat_path.into(),
+            connect_timeout_ms: connect_ms,
+            idle_timeout_ms: idle_ms,
+        }
+    }
+
+    /// How the raw stall server below behaves after accepting a request.
+    #[derive(Clone, Copy)]
+    enum StallScript {
+        /// Never write a byte (the wait for response headers never ends).
+        Silent,
+        /// SSE headers + one partial content frame, then silence (a
+        /// mid-stream stall after real progress).
+        OneFrameThenSilence,
+        /// Three frames 60 ms apart (180 ms total, above a 100 ms idle
+        /// bound), then a clean close — slow but progressing.
+        SlowButProgressing,
+    }
+
+    /// A raw HTTP/1.1 server for the ADR-041 stall tests: it reads the
+    /// request, counts it, then performs the script. Deliberately raw
+    /// (not wiremock) so a body can be *held open* with no further bytes.
+    async fn spawn_stall_server(script: StallScript) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stall server");
+        let addr = listener.local_addr().expect("stall server addr");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = socket.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    match script {
+                        StallScript::Silent => {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                        }
+                        StallScript::OneFrameThenSilence => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+                                )
+                                .await;
+                            let _ = socket
+                                .write_all(
+                                    b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                                )
+                                .await;
+                            let _ = socket.flush().await;
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                        }
+                        StallScript::SlowButProgressing => {
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+                                )
+                                .await;
+                            for _ in 0..3 {
+                                let _ = socket
+                                    .write_all(
+                                        b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                                    )
+                                    .await;
+                                let _ = socket.flush().await;
+                                tokio::time::sleep(Duration::from_millis(60)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    fn sink() -> Arc<dyn PersistSink> {
+        Arc::new(|_record: PersistedRequest| async { Ok::<(), PersistError>(()) })
+    }
+
+    // -- ADR-041: the model call is bounded --------------------------------
+
+    /// A provider that accepts the request and never sends response headers
+    /// is ended by the idle bound instead of parking the caller forever.
+    #[tokio::test]
+    async fn an_idle_bound_ends_a_provider_that_never_sends_headers() {
+        ensure_no_proxy();
+        let (base, requests) = spawn_stall_server(StallScript::Silent).await;
+        let provider = OpenAiCompatProvider::new(
+            config_with_timeouts(&base, "/chat/completions", 1_000, 120),
+            sink(),
+        );
+        let started = std::time::Instant::now();
+        let out = collect(provider.complete(sample_request("m1"))).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the idle bound must fire promptly"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the request was sent");
+        assert_eq!(out.len(), 1, "one terminal item: {out:?}");
+        let err = format!("{:?}", out[0]);
+        assert!(out[0].is_err(), "{err}");
+        assert!(err.contains("idle timeout"), "{err}");
+    }
+
+    /// A stream that produced a chunk and then stalls is ended by the
+    /// per-gap bound; the delivered chunk is not retracted.
+    #[tokio::test]
+    async fn an_idle_bound_ends_a_stream_that_stalls_mid_flight() {
+        ensure_no_proxy();
+        let (base, _requests) = spawn_stall_server(StallScript::OneFrameThenSilence).await;
+        let provider = OpenAiCompatProvider::new(
+            config_with_timeouts(&base, "/chat/completions", 1_000, 120),
+            sink(),
+        );
+        let started = std::time::Instant::now();
+        let out = collect(provider.complete(sample_request("m1"))).await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            out.iter().any(|item| item.is_ok()),
+            "the first chunk must be delivered before the gap bound fires: {out:?}"
+        );
+        let last = out
+            .last()
+            .expect("terminal item")
+            .as_ref()
+            .expect_err("ends in an error");
+        assert!(format!("{last:?}").contains("idle timeout"), "{last:?}");
+    }
+
+    /// The bound is per gap, not a total-request cap: a stream whose total
+    /// duration exceeds the bound but never goes silent is not cut.
+    #[tokio::test]
+    async fn the_idle_bound_does_not_cut_a_slow_but_progressing_stream() {
+        ensure_no_proxy();
+        let (base, _requests) = spawn_stall_server(StallScript::SlowButProgressing).await;
+        let provider = OpenAiCompatProvider::new(
+            config_with_timeouts(&base, "/chat/completions", 1_000, 100),
+            sink(),
+        );
+        let out = collect(provider.complete(sample_request("m1"))).await;
+        assert!(
+            out.iter().all(|item| item.is_ok()),
+            "no error for a progressing stream: {out:?}"
+        );
+        assert!(
+            out.len() >= 3,
+            "all three frames are delivered (total > the 100 ms gap bound): {out:?}"
+        );
+    }
+
+    /// `idle_timeout_ms: 0` is the explicit opt-out: the pre-ADR behavior,
+    /// no idle bound is applied.
+    #[tokio::test]
+    async fn idle_timeout_zero_disables_the_bound() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_ok(&[
+                r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+                "[DONE]",
+            ]))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(
+            config_with_timeouts(&server.uri(), "/chat/completions", 1_000, 0),
+            sink(),
+        );
+        let out = collect(provider.complete(sample_request("m1"))).await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].is_ok(), "{out:?}");
     }
 
     // ------------------------------------------------------------------

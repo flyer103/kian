@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use kian_core::model::{AgentDef, Budgets, Permission, SlotName, SlotSpec, SlotTarget};
+use kian_llm::provider::{DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS};
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_orchestrator::recovery::PolicyConfig;
 use kian_superagent::rules::{
@@ -272,10 +273,27 @@ pub struct ProviderConfig {
     /// Chat-completions path appended to `base_url`.
     #[serde(default = "default_chat_path")]
     pub chat_completions_path: String,
+    /// Connect bound for one model call (TCP + TLS), milliseconds. `0`
+    /// disables the explicit bound (ADR-041).
+    #[serde(default = "default_provider_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Idle bound for one model call, milliseconds: the wait for response
+    /// headers and each gap between streamed body chunks — never the total
+    /// request. `0` disables the bound (ADR-041).
+    #[serde(default = "default_provider_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
 }
 
 fn default_chat_path() -> String {
     "/chat/completions".into()
+}
+
+fn default_provider_connect_timeout_ms() -> u64 {
+    DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS
+}
+
+fn default_provider_idle_timeout_ms() -> u64 {
+    DEFAULT_PROVIDER_IDLE_TIMEOUT_MS
 }
 
 // ---------------------------------------------------------------------------
@@ -5052,6 +5070,44 @@ recovery:
         assert_eq!(agent.model_slots.len(), 1);
         let policy = cfg.policy().unwrap();
         assert_eq!(policy.rules.len(), 2);
+    }
+
+    /// ADR-041: the provider's model-call bounds default on (10 s connect /
+    /// 5 min idle), parse explicitly, and `0` is the documented opt-out;
+    /// the provider block stays fail-closed on unknown keys.
+    #[test]
+    fn provider_timeout_keys_default_and_parse() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("defaults");
+        let openai = cfg.providers.get("openai").expect("provider");
+        assert_eq!(
+            openai.connect_timeout_ms,
+            kian_llm::provider::DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            openai.idle_timeout_ms,
+            kian_llm::provider::DEFAULT_PROVIDER_IDLE_TIMEOUT_MS
+        );
+        assert_eq!(openai.connect_timeout_ms, 10_000, "10 s connect default");
+        assert_eq!(openai.idle_timeout_ms, 300_000, "5 min idle default");
+
+        let explicit = valid_yaml().replace(
+            "    api_key_env: KIAN_API_KEY\n",
+            "    api_key_env: KIAN_API_KEY\n    connect_timeout_ms: 2500\n    idle_timeout_ms: 0\n",
+        );
+        let cfg = ServeConfig::parse(&explicit).expect("explicit timeouts parse");
+        let openai = cfg.providers.get("openai").expect("provider");
+        assert_eq!(openai.connect_timeout_ms, 2_500);
+        assert_eq!(openai.idle_timeout_ms, 0, "0 = bound disabled");
+        assert!(cfg.validate().is_ok());
+
+        let unknown = valid_yaml().replace(
+            "    api_key_env: KIAN_API_KEY\n",
+            "    api_key_env: KIAN_API_KEY\n    idle_timeout: 1\n",
+        );
+        assert!(
+            ServeConfig::parse(&unknown).is_err(),
+            "an unknown provider key is still refused"
+        );
     }
 
     // -- workers: (R12, C1–C6) -------------------------------------

@@ -326,6 +326,20 @@ never projects `completed`/`failed` across the kill window (only `running`, over
 `recoverable` by the lease query), and the final end write lands exactly once, after the re-drive
 actually settles.
 
+ Refinement (crash containment, ADR-041): detection only helps if a dead drain *looks* dead. The
+drain task's bookkeeping is unwound on every exit — a drop guard removes the in-process `drains`
+entry (so a later `wake` starts a drain again) and a drop guard stops the heartbeat (so the lease
+can expire and the sweep can detect the death), and the task catches its own unwind for one
+`tracing::error!` line and settled drain metrics. The takeover chain is bounded by construction: a
+takeover claim counts the `drain/claimed` events since the last `session/ended` in the committed
+stream (derived, never a stored counter), and the third un-ended claim appends one honest
+`session/ended{failed}` with additive `crashed` bytes instead of driving again — a deterministic
+crash loop terminates instead of re-driving forever (constraint 8). The same refinement closes the
+last unbounded wait: the model call itself is bounded by `providers.<name>.connect_timeout_ms` and
+`providers.<name>.idle_timeout_ms` (a per-gap idle bound, never a total-request cap), so a provider
+that stops sending becomes an honest `failed` end that the ADR-035 reclaim can free, instead of a
+permanently `running` drain that no timer can detect.
+
  Refinement (multi-replica claim admission, ADR-009): claiming is *conditional* — the claim lands only when no
 claims row exists, the row's lease is expired, or the claiming holder already owns the row; a fresh lease held by a
 different holder is refused with the typed `InboxError::ClaimRejected` (nothing written, epoch floor unchanged) and the
@@ -672,7 +686,10 @@ graph TB
   `300_000`, `0` disables) reclaims stale idle-ended threads through the same primitive. Gates:
   idle projection, non-terminal last end, no eligible inbox row, no live drain, no live
   `pending`/`inflight` queue row for the worker. The bundle is untouched (no tool, no prompt byte);
-  a spawn-time fast path is deferred.
+  a spawn-time fast path is deferred. **Abnormal interruption converges**: a drain that dies
+  (panic, cancellation, lease-expiry takeover) or a model call that stalls now reaches an honest
+  end first (ADR-041's bounded model call and crash containment), so the slot is always freed by
+  the documented release/reclaim path rather than held forever by a thread that never ends.
   Tests: L1 byte-identical legacy wrapper/payload/schema/
   prompt, the spawn matrix (unknown/busy/missing/defaulted/feature-off) with no side effects on
   refusal, routing as a pure function of (stream, catalog), and the release table; L2 two real
@@ -1456,7 +1473,8 @@ execution symbols. `queue` and `submit` share the admit path (identical durable 
 flight folds the wake — the same-sweep batch semantics); `steer` wraps the payload with the
 strippable `synthetic` marker. Assembly: `kian.yaml` (listen, storage.sqlite, agent model
 slots/tools/budgets, providers with `api_key_env` — secrets only ever read from the environment at
-startup, fail-closed; drain lease/heartbeat/iteration/slot tuning; tools root; SSE poll; the
+startup, fail-closed — and their model-call bounds `connect_timeout_ms`/`idle_timeout_ms` (ADR-041);
+drain lease/heartbeat/iteration/slot tuning; tools root; SSE poll; the
 `recovery:` section parsed by `PolicyConfig`) loads via the `kian-cli` config module with
 `deny_unknown_fields` everywhere; the three built-in plugins (`openai-compat`, `local-tools`,
 `react-loop` — the loop declares the other two as dependencies) activate through

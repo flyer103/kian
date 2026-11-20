@@ -62,6 +62,7 @@ systemctl reset-failed kian && systemctl start kian   # leave a crash loop
 | `register refused reason=VersionMismatch` | a worker on another KiandProto revision; upgrade it, no shim exists |
 | workers `offline` while the service is active | worker-side tunnel (`ssh -N -L 7400:127.0.0.1:7400 vultr`) or registration refusals in `journalctl -u kian` |
 | `queue row abandoned: re-drive bound exhausted` | expected for a command whose side effect is its own ack path (ADR-033); the command may have run |
+| a delegated task failed/interrupted and `kian workers` shows it holding the worker | not permanent since ADR-035: the slot is reclaimed after `workers.release_after_ms` (default 5 min) or immediately with `kian workers release <id>`; an abnormally interrupted drain (crash/stall) now reaches an honest end first (ADR-041 — a stalled model call is bounded by `providers.<name>.idle_timeout_ms`, default 5 min). Only a `running` drain that is still making progress, or one that ended `awaiting_input` awaiting a person (CONFIRMATION-MODEL phase 2 — answer it to release), legitimately holds the slot; `kian workers release` refuses both by design |
 
 ## Deploy
 
