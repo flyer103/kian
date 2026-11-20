@@ -266,7 +266,10 @@ async fn harness() -> Harness {
         engine: OnceLock::new(),
     });
     // The mounted inbox: admits counted for Router residency parking.
-    let router_inbox = RouterInbox::new(Arc::clone(&inbox) as Arc<dyn InboxWriter>, router);
+    let router_inbox = RouterInbox::new(
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
     let router_side = RouterDriver::with_park_tick(
         make_loop(),
         RouterHold::shared(),

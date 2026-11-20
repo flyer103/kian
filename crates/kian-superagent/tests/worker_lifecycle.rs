@@ -513,7 +513,7 @@ fn build_harness(
     });
 
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         probe.clone() as Arc<dyn InboxWriter>,
     ));
@@ -525,7 +525,7 @@ fn build_harness(
     });
 
     let wrapper_config = WorkerLoopConfig {
-        router,
+        router: kian_superagent::ResidentBinding::new(router),
         worker_version: 7,
         gate,
         multiagent: None,

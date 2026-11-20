@@ -102,7 +102,9 @@ impl Default for RecallToolConfig {
 /// under its own caps, and mutates nothing. Clone shares the port.
 pub struct RecallTools {
     port: Arc<dyn RecallPort>,
-    router: SessionId,
+    /// ADR-040 binding: threads/spills resolve the live resident session
+    /// at tool-call time.
+    router: Arc<crate::binding::ResidentBinding>,
     shaping: ShapingConfig,
     config: RecallToolConfig,
 }
@@ -114,7 +116,7 @@ impl RecallTools {
     #[must_use]
     pub fn new(
         port: Arc<dyn RecallPort>,
-        router: SessionId,
+        router: Arc<crate::binding::ResidentBinding>,
         shaping: ShapingConfig,
         config: RecallToolConfig,
     ) -> Self {
@@ -161,7 +163,7 @@ impl RecallTools {
         {
             return Ok(Some(hit));
         }
-        let router_events = self.read_all(self.router).await?;
+        let router_events = self.read_all(self.router.load()).await?;
         if let Some(hit) = find_spill(&router_events, event_id) {
             return Ok(Some(hit));
         }
@@ -384,7 +386,7 @@ impl RecallTools {
         let thread_id = str_arg(&call.arguments, "thread_id", RECALL_THREAD_TOOL)?;
         let threads = self
             .port
-            .list_threads(self.router)
+            .list_threads(self.router.load())
             .await
             .map_err(Self::port_error)?;
         let Some(worker) = threads
@@ -400,7 +402,7 @@ impl RecallTools {
 
         // The task is the Router-side thread/started payload's task
         // message content (the delegation wrapper).
-        let router_events = self.read_all(self.router).await?;
+        let router_events = self.read_all(self.router.load()).await?;
         let task = router_events
             .iter()
             .find(|ev| {
@@ -529,7 +531,7 @@ impl Clone for RecallTools {
     fn clone(&self) -> Self {
         Self {
             port: Arc::clone(&self.port),
-            router: self.router,
+            router: Arc::clone(&self.router),
             shaping: self.shaping.clone(),
             config: self.config.clone(),
         }
@@ -774,7 +776,7 @@ mod tests {
     fn tools() -> RecallTools {
         RecallTools::new(
             std::sync::Arc::new(EmptyPort),
-            SessionId::new(),
+            crate::binding::ResidentBinding::new(SessionId::new()),
             crate::provenance::ShapingConfig::default(),
             RecallToolConfig::default(),
         )

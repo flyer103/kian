@@ -66,7 +66,7 @@ fn router_tools(roster: Option<Roster>) -> Arc<RouterTools> {
     let router = sid(1);
     let inbox: Arc<dyn InboxWriter> = Arc::new(NullInbox);
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         inbox,
     ));
@@ -76,6 +76,7 @@ fn router_tools(roster: Option<Roster>) -> Arc<RouterTools> {
         ChannelRegistry::new(),
         &profile,
         RouterHold::shared(),
+        kian_superagent::ResidentBinding::new(profile.session),
     );
     let tools = match roster {
         Some(roster) => tools.with_roster(roster),

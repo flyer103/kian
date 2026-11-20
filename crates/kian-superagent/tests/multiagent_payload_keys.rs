@@ -187,7 +187,7 @@ fn router_rig(gating: bool, parent_events: Vec<Event>) -> RouterRig {
     let router = router_session();
     let inbox = CaptureInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         inbox.clone(),
     ));
@@ -199,6 +199,7 @@ fn router_rig(gating: bool, parent_events: Vec<Event>) -> RouterRig {
         kian_superagent::ChannelRegistry::new(),
         &profile,
         hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
     );
     tools = tools.with_board_gating(BoardGating(gating));
     tools = tools.with_worker_streams(Arc::new(NullStreams));
@@ -324,7 +325,7 @@ fn child_identity() -> SpawnIdentity {
 
 fn wrapper_message(identity: &SpawnIdentity) -> Value {
     let spawner = WorkerSpawner::new(
-        router_session(),
+        kian_superagent::ResidentBinding::new(router_session()),
         &worker_template("mock", "mock-worker", 7),
         CaptureInbox::shared(),
     );
@@ -371,7 +372,7 @@ fn child_join(gating: bool, inner: LoopOutcome, extra: Vec<Event>) -> ChildJoin 
         }) as Arc<dyn StreamPort>
     });
     let config = kian_superagent::WorkerLoopConfig {
-        router: router_session(),
+        router: kian_superagent::ResidentBinding::new(router_session()),
         worker_version: 7,
         gate: EvidenceGateConfig::default(),
         multiagent: Some(limits()),

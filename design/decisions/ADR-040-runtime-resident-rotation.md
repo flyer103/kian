@@ -43,8 +43,13 @@ rotation trigger and the end reason).
   refreshes the memory index without any runtime rebind. Deployment assumption: a single serving
   process (or all replicas restart together) — a second live replica keeps the retired id in
   memory; safe rotation across live replicas is phase 2's shared binding.
-- **Phase 1 — not started.** The shared `ResidentBinding` refactor (every surface resolves the live
-  session through one binding), behavior-identical.
+- **Phase 1 — landed (2026-11-20).** The shared `ResidentBinding` (an `RwLock<SessionId>` with
+  `load`/`store`) is read at use time by every router-facing surface: driver routing, the mounted
+  residency inbox, the spawner's thread parent, the worker completion-report target, the
+  subscription `router` route (and its reason codes), the Router tools (mandate `granted_by`,
+  spawn identity, task ids), the recall reader, the runtime's metrics view and the child-timeout
+  walk root. Behavior-identical: with no rotation the id never changes; the bundle tests construct
+  the binding from the same session they always passed.
 - **Phase 2 — not started.** Runtime rotation at a proven-idle boundary, serialized by a reserved
   control row inside the drain, with the input-migration rule and the successor re-point of every
   surface.

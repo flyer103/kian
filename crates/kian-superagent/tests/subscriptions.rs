@@ -322,7 +322,7 @@ async fn inbox_row_is_durable_before_wake_fires() {
     let inbox = OrderingInbox::new(store.clone());
     let router = SessionId::new();
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     );
@@ -400,7 +400,7 @@ async fn passthrough_routes_to_the_worker_not_the_router() {
     assert_eq!(registry.resolve("pr-9"), BTreeSet::from([worker]));
 
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     );
@@ -474,7 +474,7 @@ async fn unmatched_event_dropped_with_audit_log_and_no_row() {
     let inbox = OrderingInbox::new(store.clone());
     let router = SessionId::new();
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     );
@@ -519,7 +519,7 @@ async fn admit_is_idempotent_per_event_id_key() {
     let inbox = OrderingInbox::new(store.clone());
     let router = SessionId::new();
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     );
@@ -598,7 +598,7 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
     // The worker serves one passthrough CI event; its stream then
     // carries the wrapper — the durable trace of the binding.
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     );
@@ -658,7 +658,7 @@ async fn restart_rebuilds_the_passthrough_registry_from_streams() {
     // process-global log capture; this file's per-test buffer fixture
     // is order-parasitic, so this test stays outcome-observable only.)
     let fresh = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     );
@@ -703,7 +703,7 @@ async fn router_bootstraps_via_admit_to_a_not_yet_existing_session() {
 
     let channel = Arc::new(MockChannel::new("mock-im"));
     let service = Arc::new(SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     ));
@@ -761,7 +761,7 @@ async fn mock_channel_round_trip_through_the_subscription_pipeline() {
 
     let channel = Arc::new(MockChannel::new("mock-im"));
     let service = Arc::new(SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     ));
@@ -934,7 +934,7 @@ async fn fanout_one_topic_two_workers_both_get_durable_rows() {
     );
 
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,
     );
@@ -1044,7 +1044,7 @@ async fn fanout_partial_write_failure_is_retried_per_subscriber() {
         fail_for: Mutex::new(Some(worker_a)),
     });
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         router_rules(),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     );

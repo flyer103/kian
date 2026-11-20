@@ -1072,7 +1072,9 @@ impl LoopDriver for ServeLoopDriver {
 /// resident routing state), so a restarted server classifies a
 /// takeover hold identically.
 pub struct SuperAgentDriver {
-    router: SessionId,
+    /// ADR-040 phase 1: the live resident binding (routing reads it per
+    /// drive, so a rotation routes the successor to the Router side).
+    router: Arc<kian_superagent::ResidentBinding>,
     worker_version: u64,
     router_side: RouterDriver<ReActLoop>,
     worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
@@ -1136,7 +1138,7 @@ pub struct SuperAgentDriver {
 impl SuperAgentDriver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        router: SessionId,
+        router: Arc<kian_superagent::ResidentBinding>,
         worker_version: u64,
         router_side: RouterDriver<ReActLoop>,
         worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
@@ -1222,7 +1224,7 @@ impl LoopDriver for SuperAgentDriver {
     type Ctx = DrainCtx;
 
     fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
-        if ctx.session() == self.router {
+        if ctx.session() == self.router.load() {
             return self.router_side.drive(ctx);
         }
         if let (Some(watchdog), Some(side)) = (self.watchdog, &self.watchdog_side)
@@ -1247,7 +1249,7 @@ impl LoopDriver for SuperAgentDriver {
         // byte-identical.
         let worker = self.worker_side.clone();
         let default = Arc::clone(&self.default_side);
-        let router = self.router;
+        let router = self.router.load();
         let worker_version = self.worker_version;
         let session = ctx.session();
         let sides = Arc::clone(&self.worker_sides);
@@ -1898,8 +1900,9 @@ pub type AsyncJobsFactory = Arc<dyn Fn(&str) -> Arc<kian_exec::AsyncJobs> + Send
 /// through this handle (mock-channel injection needs the channel map;
 /// `/metrics` needs the counters).
 pub struct SuperAgentRuntime {
-    /// The configured resident Router session.
-    pub router: SessionId,
+    /// ADR-040: the live resident binding (reads at use time; a rotation
+    /// re-points the runtime's own views).
+    pub router: Arc<kian_superagent::ResidentBinding>,
     /// Channel name → mock adapter (the injection surface; v1 only
     /// mock channels exist).
     pub channels: BTreeMap<String, Arc<MockChannel>>,
@@ -1961,7 +1964,7 @@ impl SuperAgentRuntime {
         let mut im = 0u64;
         let mut structured = 0u64;
         let mut truncated = 0u64;
-        if let Ok(events) = store.rebuild(self.router).await {
+        if let Ok(events) = store.rebuild(self.router.load()).await {
             for event in &events {
                 if event.kind != EventKind::ChannelDelivered {
                     continue;
@@ -2004,7 +2007,7 @@ impl SuperAgentRuntime {
         });
 
         serde_json::json!({
-            "router_session": self.router.0,
+            "router_session": self.router.load().0,
             "evidence_verdicts": {
                 "passed": verdicts.passed,
                 "failed": verdicts.failed,
@@ -2032,6 +2035,9 @@ impl SuperAgentRuntime {
 pub struct SuperAgentServices {
     /// The assembled three-way driver.
     pub driver: Arc<SuperAgentDriver>,
+    /// ADR-040: the shared live-resident binding (the rotation re-points
+    /// it; every consumer reads it at use time).
+    pub router_binding: Arc<kian_superagent::ResidentBinding>,
     /// The late-bound engine slot (server installs the engine).
     pub inbox: Arc<EngineInbox>,
     /// The mounted router inbox (residency signal; also the spawner's
@@ -2218,7 +2224,7 @@ pub async fn start_services(
             // . The Router's and the watchdog's mounted
             // inboxes; anything else falls back to the raw engine
             // inbox.
-            if session == router {
+            if session == services.router_binding.load() {
                 Arc::clone(&services.router_inbox) as Arc<dyn kian_superagent::InboxWriter>
             } else if services
                 .watchdog
@@ -2555,7 +2561,7 @@ pub async fn start_services(
 
     tasks.extend(bridge);
     Ok(SuperAgentRuntime {
-        router,
+        router: Arc::clone(&services.router_binding),
         channels: services.mock_channels.clone(),
         worker_gate: clone_gate(&services.worker_gate),
         subscription_metrics: Arc::clone(&services.subscription_metrics),
@@ -2737,7 +2743,7 @@ mod tests {
             class: AdmissionClass::ExplicitOnly,
         }]);
         let service = Arc::new(kian_superagent::SubscriptionService::with_classes(
-            SessionId::new(),
+            kian_superagent::ResidentBinding::new(SessionId::new()),
             rules,
             classes,
             Arc::new(CountingInbox) as Arc<dyn InboxWriter>,
@@ -2768,7 +2774,7 @@ mod tests {
         // Now an Ignore channel: the ignore counter bumps instead.
         let ignored_channel = Arc::new(kian_superagent::MockChannel::new("mock-im"));
         let ignored_service = Arc::new(kian_superagent::SubscriptionService::with_classes(
-            SessionId::new(),
+            kian_superagent::ResidentBinding::new(SessionId::new()),
             SubscriptionRuleSet::new(vec![]),
             kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
                 channel: "mock-im".into(),
@@ -3178,7 +3184,7 @@ mod assignee_selection_tests {
             Arc::new(crate::superagent::WorkerInnerDriver::React(minimal_loop())),
             inbox as Arc<dyn InboxWriter>,
             WorkerLoopConfig {
-                router: SessionId::new(),
+                router: kian_superagent::ResidentBinding::new(SessionId::new()),
                 worker_version: 1,
                 gate: kian_loop::EvidenceGateConfig::default(),
                 multiagent: None,
@@ -3207,7 +3213,7 @@ mod assignee_selection_tests {
             Some(assignee.to_string()),
         );
         let spawner = WorkerSpawner::new(
-            SessionId::new(),
+            kian_superagent::ResidentBinding::new(SessionId::new()),
             &worker_template("none", "none", 1),
             Arc::new(NoopInbox) as Arc<dyn InboxWriter>,
         );
@@ -3262,12 +3268,21 @@ mod assignee_selection_tests {
             loop_,
             RouterHold::shared(),
             crate::superagent::port_for_ctx(),
-            RouterInbox::new(Arc::new(NoopInbox) as Arc<dyn InboxWriter>, router_session),
+            RouterInbox::new(
+                Arc::new(NoopInbox) as Arc<dyn InboxWriter>,
+                kian_superagent::ResidentBinding::new(router_session),
+            ),
         );
         let worker_side = tagged_side(worker_inbox);
         Arc::new(
-            SuperAgentDriver::new(router_session, 1, router_side, worker_side, minimal_loop())
-                .with_assignee_sides(factory),
+            SuperAgentDriver::new(
+                kian_superagent::ResidentBinding::new(router_session),
+                1,
+                router_side,
+                worker_side,
+                minimal_loop(),
+            )
+            .with_assignee_sides(factory),
         )
     }
 

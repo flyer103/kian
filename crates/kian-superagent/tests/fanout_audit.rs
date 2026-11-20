@@ -176,8 +176,11 @@ async fn audit_log_names_every_fanout_admission_and_drop() {
     // --- Two subscribers: one line per admission, each naming its
     // session and the shared event id. ---
     let inbox = RecordingInbox::new(None);
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    );
     service.register_topic("pr-9", worker_a);
     service.register_topic("pr-9", worker_b);
 
@@ -210,8 +213,11 @@ async fn audit_log_names_every_fanout_admission_and_drop() {
     // --- Mid-set failure: the drop names the failed subscriber; the
     // other's admission is still named. ---
     let flaky = RecordingInbox::new(Some(worker_a));
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&flaky) as Arc<dyn InboxWriter>);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&flaky) as Arc<dyn InboxWriter>,
+    );
     service.register_topic("pr-9", worker_a);
     service.register_topic("pr-9", worker_b);
 
@@ -254,8 +260,11 @@ async fn audit_log_names_every_fanout_admission_and_drop() {
 
     // --- Empty set: the fallback to the Router is named. ---
     let inbox = RecordingInbox::new(None);
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    );
     let outcome = service
         .handle_event(ci_event("evt-fallback", "pr-unbound"))
         .await

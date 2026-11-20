@@ -70,7 +70,7 @@ fn make_child(seq: u64, with_identity: bool) -> Child {
     let parent = sid(0x100 + u128::from(seq));
     let identity = with_identity.then(|| SpawnIdentity::derive(parent, seq, "mock-worker", 7));
     let spawner = WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         noop_inbox(),
     );
@@ -384,7 +384,7 @@ fn assemble(
         }) as Arc<dyn StreamPort>
     });
     let config = WorkerLoopConfig {
-        router: sid(AMBIENT_ROUTER),
+        router: kian_superagent::ResidentBinding::new(sid(AMBIENT_ROUTER)),
         worker_version: 7,
         gate: EvidenceGateConfig::default(),
         multiagent,

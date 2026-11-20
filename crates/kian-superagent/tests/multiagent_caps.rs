@@ -224,7 +224,7 @@ fn rig_for(
 ) -> Rig {
     let inbox = CaptureInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        session,
+        kian_superagent::ResidentBinding::new(session),
         &worker_template("mock", "mock-worker", 7),
         inbox.clone(),
     ));
@@ -232,7 +232,13 @@ fn rig_for(
     profile.multiagent = limits;
     profile.mandate = mandate;
     let hold = RouterHold::shared();
-    let tools = RouterTools::new(spawner, ChannelRegistry::new(), &profile, hold.clone());
+    let tools = RouterTools::new(
+        spawner,
+        ChannelRegistry::new(),
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    );
     let tools = if install_streams {
         tools.with_worker_streams(MapStreams::shared(child_streams))
     } else {

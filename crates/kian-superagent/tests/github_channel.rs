@@ -685,7 +685,7 @@ async fn github_event_flows_through_classes_rules_and_provenance_untrusted() {
     let inbox = RecordingInbox::new();
     let service = Arc::new(
         SubscriptionService::with_classes(
-            router,
+            kian_superagent::ResidentBinding::new(router),
             SubscriptionRuleSet::new(vec![SubscriptionRule {
                 channel: "github".into(),
                 matcher: RuleMatcher::Topic("ci".into()),
@@ -1065,7 +1065,7 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
     let inbox = RecordingInbox::new();
     let service = Arc::new(
         SubscriptionService::with_classes(
-            router,
+            kian_superagent::ResidentBinding::new(router),
             SubscriptionRuleSet::new(vec![SubscriptionRule {
                 channel: "github".into(),
                 matcher: RuleMatcher::Always,

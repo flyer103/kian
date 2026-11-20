@@ -697,7 +697,10 @@ pub trait SpawnSessionWriter: Send + Sync {
 /// `pinned_version` comes from the worker template's `AgentDef`
 /// version (ADR-006: pinned for the thread's lifetime, never swapped).
 pub struct WorkerSpawner {
-    router: SessionId,
+    /// ADR-040: the live resident session (the thread parent for new
+    /// workers and the completion-report target). Read at use time so a
+    /// rotation re-points new workers; phase 1 never changes it.
+    router: Arc<crate::binding::ResidentBinding>,
     pinned_version: u64,
     /// The worker template's id: the key the Router's mandate
     /// policy resolves per-template scope text against.
@@ -713,7 +716,11 @@ pub struct WorkerSpawner {
 
 impl WorkerSpawner {
     /// `worker_template` supplies the pinned `AgentDef` version.
-    pub fn new(router: SessionId, worker_template: &AgentDef, inbox: Arc<dyn InboxWriter>) -> Self {
+    pub fn new(
+        router: Arc<crate::binding::ResidentBinding>,
+        worker_template: &AgentDef,
+        inbox: Arc<dyn InboxWriter>,
+    ) -> Self {
         Self {
             router,
             pinned_version: worker_template.version,
@@ -844,7 +851,7 @@ impl WorkerSpawner {
         };
         let thread = Thread {
             id: thread_id,
-            parent_session: self.router,
+            parent_session: self.router.load(),
             pinned_version: self.pinned_version,
         };
         // The wrapper composes the public builders: the mandate
@@ -1585,9 +1592,10 @@ pub async fn busy_owner(
 /// Tuning for [`WorkerLoopDriver`].
 #[derive(Debug, Clone)]
 pub struct WorkerLoopConfig {
-    /// The resident Router session: where completion reports are
-    /// admitted (the configured id from assembly, single-Router v1).
-    pub router: SessionId,
+    /// The live resident session: where completion reports are admitted
+    /// (ADR-040 binding; read at report time so a rotation re-points an
+    /// in-flight worker's report to the successor).
+    pub router: Arc<crate::binding::ResidentBinding>,
     /// The worker template's pinned `AgentDef` version (ADR-006) —
     /// stamped into the worker-side `thread/started`.
     pub worker_version: u64,
@@ -1889,7 +1897,7 @@ where
     match lineage_plan(
         &events,
         port.session(),
-        core.config.router,
+        core.config.router.load(),
         core.config.worker_version,
         core.config.board_gating,
     ) {
@@ -2290,7 +2298,7 @@ where
             Phase::Done,
         );
     }
-    let target = join.unwrap_or(core.config.router);
+    let target = join.unwrap_or(core.config.router.load());
     // Derived once, before the reconciliation block and the fresh path
     // below, which both consume it (the reconciliation's unwrap_or
     // fallback and the fresh emit read the same pair).
@@ -2661,7 +2669,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -2717,7 +2725,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -2740,7 +2748,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -2841,7 +2849,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -2868,7 +2876,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -3355,7 +3363,7 @@ mod tests {
         let router = sid(10);
         let inbox = CapturingInbox::shared();
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         );
@@ -4022,7 +4030,7 @@ mod tests {
     fn identity_wrapper_is_exactly_the_composed_form_plus_four_keys() {
         let router = sid(11);
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             CapturingInbox::shared(),
         );
@@ -4161,7 +4169,7 @@ mod tests {
         let router = sid(13);
         let identity = crate::multiagent::SpawnIdentity::derive(router, 5, "mock-worker", 7);
         let spawner = WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &crate::templates::worker_template("mock", "mock-worker", 7),
             CapturingInbox::shared(),
         );
@@ -4484,7 +4492,7 @@ mod tests {
 
     fn gate_config() -> super::WorkerLoopConfig {
         super::WorkerLoopConfig {
-            router: sid(10),
+            router: crate::binding::ResidentBinding::new(sid(10)),
             worker_version: 1,
             gate: kian_loop::evidence::EvidenceGateConfig::default(),
             multiagent: None,

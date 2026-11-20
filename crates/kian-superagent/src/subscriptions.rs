@@ -120,7 +120,9 @@ pub struct FanoutAdmission {
 /// and the fan-out path read the *same* projection — one ownership
 /// truth, still disposable.
 pub struct SubscriptionService {
-    router_session: SessionId,
+    /// ADR-040 binding: the `router` route resolves the live session at
+    /// dispatch time, so a rotation re-points every fallback.
+    router_session: Arc<crate::binding::ResidentBinding>,
     rules: SubscriptionRuleSet,
     classes: AdmissionClassTable,
     shaping: ShapingConfig,
@@ -161,7 +163,7 @@ pub struct SubscriptionService {
 
 impl SubscriptionService {
     pub fn new(
-        router_session: SessionId,
+        router_session: Arc<crate::binding::ResidentBinding>,
         rules: SubscriptionRuleSet,
         inbox: Arc<dyn InboxWriter>,
     ) -> Self {
@@ -184,7 +186,7 @@ impl SubscriptionService {
     /// table: the provenance-keyed Fast Path evaluated **before** the
     /// rule set. An empty table is exactly `new` (today's behavior).
     pub fn with_classes(
-        router_session: SessionId,
+        router_session: Arc<crate::binding::ResidentBinding>,
         rules: SubscriptionRuleSet,
         classes: AdmissionClassTable,
         inbox: Arc<dyn InboxWriter>,
@@ -289,7 +291,7 @@ impl SubscriptionService {
 
     /// The configured resident Router session.
     pub fn router_session(&self) -> SessionId {
-        self.router_session
+        self.router_session.load()
     }
 
     /// Runtime registration of a passthrough binding (the worker
@@ -390,7 +392,7 @@ impl SubscriptionService {
         // set (honestly audited below; a set emptied by releases is
         // the same release-to-fresh-eval as an all-ended one).
         let targets: Vec<SessionId> = match &rule.route {
-            Route::Router => vec![self.router_session],
+            Route::Router => vec![self.router_session.load()],
             Route::Session(session) => vec![*session],
             Route::Passthrough { .. } => {
                 let resolution = event.topic.as_deref().map(|t| {
@@ -468,7 +470,7 @@ impl SubscriptionService {
                                     "subscription audit: topic released to fresh evaluation \
                                      ({cause}), falling back to router"
                                 );
-                                vec![self.router_session]
+                                vec![self.router_session.load()]
                             } else {
                                 live.into_iter().collect()
                             }
@@ -485,7 +487,7 @@ impl SubscriptionService {
                             reason = %IntakeReason::AdmittedRouter.code(),
                             "subscription audit: passthrough topic unbound, falling back to router"
                         );
-                        vec![self.router_session]
+                        vec![self.router_session.load()]
                     }
                 }
             }
@@ -552,7 +554,8 @@ impl SubscriptionService {
                     // the admit line's code comes from the same
                     // mapping the assembly counters use — audit and
                     // metrics cannot disagree.
-                    let reason = routed_reason(target, self.router_session, receipt.deduplicated);
+                    let reason =
+                        routed_reason(target, self.router_session.load(), receipt.deduplicated);
                     info!(
                         target: "kian::subscriptions",
                         session = %target.0,
@@ -645,7 +648,7 @@ impl SubscriptionService {
             .iter()
             .map(|&session| AdmitTarget {
                 session,
-                router: session == self.router_session,
+                router: session == self.router_session.load(),
             })
             .collect();
         sorted.sort_by_key(|t| t.session);
@@ -807,8 +810,11 @@ mod tests {
     async fn router_rule_admits_to_router_then_wakes_in_order() {
         let inbox = ScriptedInbox::new();
         let router = sid(1);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let outcome = service
             .handle_event(event("mock-im", "evt-1", None))
             .await
@@ -834,8 +840,11 @@ mod tests {
         let inbox = ScriptedInbox::new();
         let router = sid(1);
         let worker = sid(2);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service.register_topic("pr-9", worker);
         let outcome = service
             .handle_event(event("ci", "evt-2", Some("pr-9")))
@@ -869,8 +878,11 @@ mod tests {
                 correlate_by: CorrelateBy::Topic,
             },
         }]);
-        let service =
-            SubscriptionService::new(router, rules, Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules,
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let outcome = service
             .handle_event(event("ci", "evt-3", Some("pr-404")))
             .await
@@ -887,8 +899,11 @@ mod tests {
     #[tokio::test]
     async fn unmatched_event_is_dropped_with_no_admit_and_no_wake() {
         let inbox = ScriptedInbox::new();
-        let service =
-            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(sid(1)),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let outcome = service
             .handle_event(event("github", "evt-4", None))
             .await
@@ -906,8 +921,11 @@ mod tests {
             dedup: false,
             fail: true,
         });
-        let service =
-            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(sid(1)),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let err = service
             .handle_event(event("mock-im", "evt-5", None))
             .await
@@ -920,8 +938,11 @@ mod tests {
     async fn registry_install_replaces_runtime_state() {
         let inbox = ScriptedInbox::new();
         let router = sid(1);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let worker = sid(9);
         let mut rebuilt = PassthroughRegistry::new();
         rebuilt.register("pr-9", worker);
@@ -1016,8 +1037,11 @@ mod tests {
         let router = sid(1);
         let worker_a = sid(20);
         let worker_b = sid(21);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service.register_topic("pr-9", worker_a);
         service.register_topic("pr-9", worker_b);
         let outcome = service
@@ -1061,8 +1085,11 @@ mod tests {
         let router = sid(1);
         let worker_a = sid(20);
         let worker_b = sid(21);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service.register_topic("pr-9", worker_a);
         service.register_topic("pr-9", worker_b);
         let err = service
@@ -1114,8 +1141,11 @@ mod tests {
         let inbox = FanoutInbox::new();
         let router = sid(1);
         let worker = sid(30);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service.register_topic("pr-9", worker);
         let outcome = service
             .handle_event(event("ci", "evt-live", Some("pr-9")))
@@ -1146,8 +1176,11 @@ mod tests {
         let router = sid(1);
         let ended = sid(31);
         let live = sid(32);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service.register_topic("pr-9", ended);
         service.register_topic("pr-9", live);
         // The first worker's stream ended (its thread/completed landed
@@ -1198,9 +1231,12 @@ mod tests {
         let inbox = FanoutInbox::new();
         let router = sid(1);
         let ended = sid(33);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-                .with_followup_ownership(false);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        )
+        .with_followup_ownership(false);
         service.register_topic("pr-9", ended);
         service.mark_worker_ended(ended);
         let outcome = service
@@ -1224,8 +1260,11 @@ mod tests {
     async fn shared_registry_is_one_projection_across_holders() {
         let inbox = FanoutInbox::new();
         let router = sid(1);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let shared = service.shared_registry();
         service.register_topic("pr-9", sid(34));
         assert!(
@@ -1319,7 +1358,7 @@ mod tests {
                 route: Route::Router,
             }]);
             let service = SubscriptionService::new(
-                sid(1),
+                crate::binding::ResidentBinding::new(sid(1)),
                 case_rules,
                 Arc::clone(&inbox) as Arc<dyn InboxWriter>,
             )
@@ -1365,8 +1404,11 @@ mod tests {
     #[tokio::test]
     async fn absent_untrusted_config_is_byte_identical_to_legacy() {
         let inbox = MarkingInbox::new();
-        let service =
-            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(sid(1)),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         service
             .handle_event(event("mock-im", "evt-legacy", None))
             .await
@@ -1389,7 +1431,7 @@ mod tests {
                 set.insert("mock-im".to_string());
             }
             let service = SubscriptionService::new(
-                sid(1),
+                crate::binding::ResidentBinding::new(sid(1)),
                 rules(),
                 Arc::clone(&inbox) as Arc<dyn InboxWriter>,
             )
@@ -1424,14 +1466,17 @@ mod tests {
         let inbox = MarkingInbox::new();
         let mut set = std::collections::BTreeSet::new();
         set.insert("mock-im".to_string());
-        let service =
-            SubscriptionService::new(sid(1), rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-                .with_untrusted_channels(set)
-                .with_shaping(crate::provenance::ShapingConfig {
-                    inline_cap_bytes: Some(4),
-                    first_chars: 2,
-                    neighbor_fields: vec![],
-                });
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(sid(1)),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        )
+        .with_untrusted_channels(set)
+        .with_shaping(crate::provenance::ShapingConfig {
+            inline_cap_bytes: Some(4),
+            first_chars: 2,
+            neighbor_fields: vec![],
+        });
         service
             .handle_event(event("mock-im", "evt-spill", None))
             .await
@@ -1466,8 +1511,11 @@ mod tests {
             matcher: RuleMatcher::Topic("watchdog".into()),
             route: Route::Session(watchdog),
         }]);
-        let service =
-            SubscriptionService::new(router, rules, Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules,
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let outcome = service
             .handle_event(event("timer", "tick-1", Some("watchdog")))
             .await
@@ -1566,9 +1614,12 @@ mod tests {
                 reason: "off-hours".to_string(),
             },
         );
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-                .with_hook_bus(bus);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        )
+        .with_hook_bus(bus);
         service.register_topic("pr-9", worker);
 
         let outcome = service
@@ -1628,9 +1679,12 @@ mod tests {
                 .boxed()
             }),
         );
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-                .with_hook_bus(HookBus::with_registry(registry));
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        )
+        .with_hook_bus(HookBus::with_registry(registry));
 
         let outcome = service
             .handle_event(event("mock-im", "evt-1", None))
@@ -1658,8 +1712,11 @@ mod tests {
     async fn no_bus_mounted_is_byte_identical_legacy_behavior() {
         let inbox = ScriptedInbox::new();
         let router = sid(1);
-        let service =
-            SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
         let outcome = service
             .handle_event(event("mock-im", "evt-3", None))
             .await

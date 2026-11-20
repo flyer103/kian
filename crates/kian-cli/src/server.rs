@@ -232,7 +232,7 @@ struct ViewsMaintenance {
 /// `child_timeout_ms` (a quarter of the bound, clamped to [1s, 60s]).
 #[derive(Clone)]
 struct ChildTimeoutMaintenance {
-    root: kian_core::model::SessionId,
+    root: Arc<kian_superagent::ResidentBinding>,
     limits: kian_superagent::MultiagentLimits,
 }
 
@@ -477,7 +477,7 @@ impl Server {
         // superagent arm once the re-arm walk resolves the live
         // Router session (pin P5's walk root).
         let mut child_timeout_plan: Option<(
-            kian_core::model::SessionId,
+            Arc<kian_superagent::ResidentBinding>,
             kian_superagent::MultiagentLimits,
         )> = None;
         // ADR-040 phase 0: the boot-time rotation, if one happened.
@@ -571,11 +571,17 @@ impl Server {
                 }
             }
             let router_session = router_re_arm.live;
+            // ADR-040 phase 1: one binding shared by every router-facing
+            // surface (driver routing, the mounted inbox, the spawner's
+            // parent, completion reports, the router route, the tools,
+            // the recall reader and the child-timeout root). Phase 1
+            // never stores; phase 2's rotation re-points it.
+            let router_binding = kian_superagent::ResidentBinding::new(router_session);
             // (R15-C5): with the block present, the child inactivity
             // plan carries the live Router session (pin P5's walk
             // root) and the converted bounds.
             if let Some(limits) = multiagent_limits {
-                child_timeout_plan = Some((router_session, limits));
+                child_timeout_plan = Some((Arc::clone(&router_binding), limits));
             }
             if router_re_arm.is_succession() {
                 tracing::info!(
@@ -808,6 +814,7 @@ impl Server {
             }
 
             plugins.register(SuperAgentPlugin {
+                router_binding: Arc::clone(&router_binding),
                 router_agent,
                 worker_agent,
                 default_agent: config.agent_def(),
@@ -1254,7 +1261,7 @@ impl Server {
     /// (M8).
     pub fn with_child_timeout(
         mut self,
-        root: kian_core::model::SessionId,
+        root: Arc<kian_superagent::ResidentBinding>,
         limits: kian_superagent::MultiagentLimits,
     ) -> Self {
         self.child_timeout_maintenance = Some(ChildTimeoutMaintenance { root, limits });
@@ -1491,8 +1498,14 @@ impl Server {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    crate::multiagent_tick::tick(&*engine, port, plan.root, &plan.limits, now_ms)
-                        .await;
+                    crate::multiagent_tick::tick(
+                        &*engine,
+                        port,
+                        plan.root.load(),
+                        &plan.limits,
+                        now_ms,
+                    )
+                    .await;
                 }
             });
         }

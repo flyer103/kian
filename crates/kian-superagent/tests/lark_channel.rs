@@ -599,7 +599,7 @@ async fn lark_event_flows_through_classes_rules_and_provenance_untrusted() {
     let inbox = RecordingInbox::new();
     let service = Arc::new(
         SubscriptionService::with_classes(
-            router,
+            kian_superagent::ResidentBinding::new(router),
             SubscriptionRuleSet::new(vec![SubscriptionRule {
                 channel: "lark".into(),
                 matcher: RuleMatcher::Topic("ci".into()),

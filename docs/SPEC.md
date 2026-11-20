@@ -524,7 +524,7 @@ record is [ADR-040](../design/decisions/ADR-040-runtime-resident-rotation.md).
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P0 | kian-cli | The sixth end reason `rotated` + the terminal `rotated` state; `superagent.router.rotate_after_events`; the boot rotation (atomic close, chain re-resolution, pending-message migration, bounded handoff, successor bootstrap ordering) | landed (single serving process, or all replicas restart together) |
-| P1 | kian-superagent, kian-cli | The shared `ResidentBinding` refactor (driver routing, subscriptions, tools, spawner, completion reports, watchdog) — behavior-identical, the prerequisite for rotation between restarts | not started |
+| P1 | kian-superagent, kian-cli | The shared `ResidentBinding` read at use time by driver routing, the mounted residency inbox, the spawner's thread parent, the worker completion-report target, the subscription `router` route, the Router tools (mandate/spawn identity/task ids), the recall reader, the runtime metrics and the child-timeout root — behavior-identical, the prerequisite for rotation between restarts | landed |
 | P2 | kian-orchestrator, bundle | Runtime rotation at a proven-idle boundary serialized by a reserved control row, with the input-migration rule and the successor re-point of every surface | not started |
 
 Acceptance criteria are named in CONFIRMATION-MODEL §13 (L1 contract tests; L2 on a real server

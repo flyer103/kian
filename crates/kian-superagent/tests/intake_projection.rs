@@ -531,7 +531,7 @@ async fn no_cursor_source_repoll_produces_deduplicated_admissions_zero_duplicate
         wakes: Mutex::new(Vec::new()),
     });
     let service = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         SubscriptionRuleSet::new(vec![SubscriptionRule {
             channel: "timer".into(),
             matcher: RuleMatcher::Always,

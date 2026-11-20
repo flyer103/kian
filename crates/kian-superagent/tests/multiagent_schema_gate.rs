@@ -77,7 +77,7 @@ fn make_child(with_schema: bool) -> Child {
         Some("researcher".into()),
     );
     let spawner = WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         noop_inbox(),
     );
@@ -287,7 +287,7 @@ fn assemble(child: &Child, events: Vec<Event>, answers: &[&'static str]) -> Rig 
         answers: Mutex::new(answers.iter().rev().cloned().collect()),
     });
     let config = WorkerLoopConfig {
-        router: sid(AMBIENT_ROUTER),
+        router: kian_superagent::ResidentBinding::new(sid(AMBIENT_ROUTER)),
         worker_version: 7,
         gate: EvidenceGateConfig::default(),
         multiagent: Some(limits()),
@@ -555,7 +555,7 @@ async fn an_empty_final_answer_is_empty_output_and_never_a_schema_miss() {
         Arc::new(SoftFail),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
         WorkerLoopConfig {
-            router: sid(AMBIENT_ROUTER),
+            router: kian_superagent::ResidentBinding::new(sid(AMBIENT_ROUTER)),
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: Some(limits()),

@@ -283,7 +283,7 @@ fn qa_tools(
     let router = sid(0x5151);
     let inbox = QaInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &kian_superagent::worker_template("mock", "qa-worker", 7),
         inbox.clone(),
     ));
@@ -299,12 +299,18 @@ fn qa_tools(
         .iter()
         .map(|id| (id.to_string(), 60_000u64))
         .collect();
-    let mut tools = RouterTools::new(spawner, channels, &profile, hold.clone())
-        .with_worker_membership(
-            static_ids.iter().map(|s| s.to_string()).collect(),
-            timeouts,
-            directory,
-        );
+    let mut tools = RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    )
+    .with_worker_membership(
+        static_ids.iter().map(|s| s.to_string()).collect(),
+        timeouts,
+        directory,
+    );
     if let Some(streams) = streams {
         tools = tools.with_worker_streams(streams);
     }

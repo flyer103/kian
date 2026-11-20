@@ -231,7 +231,7 @@ fn ownership_tools(
     let router = sid(1);
     let inbox = RecordingInbox::new();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     ));
@@ -244,8 +244,14 @@ fn ownership_tools(
     let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
     profile.followup_ownership = enabled;
     let tools = Arc::new(
-        RouterTools::new(spawner, channels, &profile, hold.clone())
-            .with_followup_registry(registry),
+        RouterTools::new(
+            spawner,
+            channels,
+            &profile,
+            hold.clone(),
+            kian_superagent::ResidentBinding::new(profile.session),
+        )
+        .with_followup_registry(registry),
     );
     let (port, dyn_port) = RecordingPort::shared(router);
     hold.install(dyn_port);
@@ -322,8 +328,11 @@ async fn live_executor_owns_the_follow_up_with_zero_router_judge_turns() {
     let router = sid(1);
     let worker = sid(2);
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    );
     service.register_topic("pr-9", worker);
 
     let outcome = service
@@ -397,8 +406,11 @@ async fn ended_worker_releases_the_topic_to_fresh_eval() {
     assert_eq!(registry.status(&worker), WorkerStatus::Ended);
 
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    );
     service.install_registry(registry);
 
     let outcome = service
@@ -573,9 +585,12 @@ async fn ownership_off_restores_the_pre_c59_behavior() {
 
     // Fan-out side: the ended subscriber admits again.
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-            .with_followup_ownership(false);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    )
+    .with_followup_ownership(false);
     service.register_topic("pr-9", ended);
     service.mark_worker_ended(ended);
     let outcome = service
