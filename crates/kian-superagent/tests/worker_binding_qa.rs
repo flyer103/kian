@@ -200,7 +200,7 @@ fn qa_tools(
     let router = sid(0x1111);
     let inbox = QaInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "qa-worker", 7),
         inbox.clone(),
     ));
@@ -217,8 +217,14 @@ fn qa_tools(
         .iter()
         .map(|entry| (entry.id.clone(), 60_000u64))
         .collect();
-    let mut tools = RouterTools::new(spawner, channels, &profile, hold.clone())
-        .with_worker_membership(static_ids, timeouts, None);
+    let mut tools = RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    )
+    .with_worker_membership(static_ids, timeouts, None);
     if let Some(streams) = streams {
         tools = tools.with_worker_streams(streams);
     }
@@ -264,7 +270,7 @@ fn sorted_keys(value: &Value) -> Vec<String> {
 #[test]
 fn qa_wrapper_legacy_bytes_identical_and_bound_adds_exactly_one_key() {
     let spawner = WorkerSpawner::new(
-        sid(1),
+        kian_superagent::ResidentBinding::new(sid(1)),
         &worker_template("mock", "qa-worker", 7),
         QaInbox::shared(),
     );
@@ -364,7 +370,7 @@ fn qa_thread_started_payload_additive_and_both_sides_agree() {
     let worker = sid(3);
     let thread = qa_thread(router);
     let spawner = WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "qa-worker", 7),
         QaInbox::shared(),
     );

@@ -602,13 +602,16 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         clock: clock.clone(),
         engine: OnceLock::new(),
     });
-    let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
+    let router_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
 
     // The dispatch tools: spawn + the channel sends, under the
     // policies (speak: result-ready; mandate: the triage scope) and the
     // shared ownership registry.
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_agent,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -637,8 +640,14 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         kian_superagent::PassthroughRegistry::new(),
     ));
     let tools = Arc::new(
-        RouterTools::new(spawner, channels, &profile, hold.clone())
-            .with_followup_registry(Arc::clone(&shared_registry)),
+        RouterTools::new(
+            spawner,
+            channels,
+            &profile,
+            hold.clone(),
+            kian_superagent::ResidentBinding::new(profile.session),
+        )
+        .with_followup_registry(Arc::clone(&shared_registry)),
     );
 
     let router_loop = Arc::new(ReActLoop::with_config(
@@ -661,7 +670,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         ReActConfig::default(),
     ));
     let wrapper_config = WorkerLoopConfig {
-        router,
+        router: kian_superagent::ResidentBinding::new(router),
         worker_version: 7,
         multiagent: None,
         board_gating: kian_superagent::BoardGating::default(),
@@ -705,7 +714,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     // -- the subscription pipeline (the fan-out surface) --------------------
     let service = Arc::new(
         SubscriptionService::with_classes(
-            router,
+            kian_superagent::ResidentBinding::new(router),
             SubscriptionRuleSet::new(vec![SubscriptionRule {
                 channel: "github".into(),
                 matcher: RuleMatcher::Always,

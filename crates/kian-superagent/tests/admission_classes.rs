@@ -178,7 +178,7 @@ async fn ignore_event_no_row_no_wake_audit_line() {
     let inbox = ScriptedInbox::new();
     let router = SessionId::new();
     let service = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         class("mock-im", AdmissionClass::Ignore),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
@@ -207,7 +207,7 @@ async fn explicit_only_drops_non_mention_event_with_audit() {
     let inbox = ScriptedInbox::new();
     let router = SessionId::new();
     let service = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         class("lark", AdmissionClass::ExplicitOnly),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
@@ -235,7 +235,7 @@ async fn explicit_only_admits_mention_event() {
     let inbox = ScriptedInbox::new();
     let router = SessionId::new();
     let service = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         class("lark", AdmissionClass::ExplicitOnly),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
@@ -266,7 +266,7 @@ async fn explicit_only_admits_adapter_declared_explicit_payload() {
     let inbox = ScriptedInbox::new();
     let router = SessionId::new();
     let service = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         class("lark", AdmissionClass::ExplicitOnly),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
@@ -297,14 +297,14 @@ async fn candidate_rule_set_path_is_byte_identical_to_classless_config() {
 
     let classless_inbox = ScriptedInbox::new();
     let classless = SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         Arc::clone(&classless_inbox) as Arc<dyn InboxWriter>,
     );
 
     let candidate_inbox = ScriptedInbox::new();
     let candidate = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         class("mock-im", AdmissionClass::Candidate),
         Arc::clone(&candidate_inbox) as Arc<dyn InboxWriter>,
@@ -480,7 +480,7 @@ async fn classes_evaluate_before_any_judge_turn_zero_provider_calls() {
     });
 
     let service = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         eager_rules(),
         classes,
         Arc::new(EngineInbox(Arc::clone(&engine))) as Arc<dyn InboxWriter>,

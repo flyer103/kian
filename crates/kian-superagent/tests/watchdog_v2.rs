@@ -467,12 +467,18 @@ async fn build_harness(
         clock: clock.clone(),
         engine: OnceLock::new(),
     });
-    let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
-    let watchdog_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, watchdog);
+    let router_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
+    let watchdog_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(watchdog),
+    );
 
     // Router dispatch tools over the mock IM channel.
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_agent,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -486,6 +492,7 @@ async fn build_harness(
         channels.clone(),
         &profile,
         hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
     ));
 
     // The watchdog's read/intervene surface over the same recall port
@@ -555,7 +562,7 @@ async fn build_harness(
         worker_loop,
         router_inbox.clone() as Arc<dyn InboxWriter>,
         WorkerLoopConfig {
-            router,
+            router: kian_superagent::ResidentBinding::new(router),
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: None,
@@ -592,7 +599,7 @@ async fn build_harness(
         route: Route::Session(watchdog),
     }]);
     let subscriptions = Arc::new(kian_superagent::SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));

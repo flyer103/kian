@@ -496,10 +496,13 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
     // The mounted router inbox: the subscription service, the spawner
     // and the worker wrapper all admit through it (the assembly shape),
     // so the residency counter observes every Router-bound row.
-    let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
+    let router_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
 
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_agent,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -508,7 +511,13 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
     let mut channels = ChannelRegistry::new();
     channels.register("mock-im", Arc::clone(&mock_im) as Arc<dyn ChannelAdapter>);
     let hold = RouterHold::shared();
-    let dispatch_tools = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+    let dispatch_tools = Arc::new(RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    ));
 
     let router_loop = Arc::new(ReActLoop::with_config(
         router_agent,
@@ -549,7 +558,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
         worker_loop,
         router_inbox.clone() as Arc<dyn InboxWriter>,
         WorkerLoopConfig {
-            router,
+            router: kian_superagent::ResidentBinding::new(router),
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: None,
@@ -573,7 +582,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
     // The subscription pipeline over both channels (in-process, no
     // server, no credentials).
     let service = Arc::new(SubscriptionService::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules(passthrough),
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));

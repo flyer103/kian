@@ -74,7 +74,7 @@ impl InboxWriter for CaptureInbox {
 fn fixture(router: SessionId) -> (WorkerSpawner, Arc<CaptureInbox>) {
     let inbox = CaptureInbox::shared();
     let spawner = WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         inbox.clone(),
     );
@@ -585,14 +585,20 @@ fn p2_rig_with_events(
     let router = p2_router();
     let inbox = CaptureInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         inbox.clone(),
     ));
     let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
     profile.multiagent = Some(limits);
     let hold = RouterHold::shared();
-    let mut tools = RouterTools::new(spawner, ChannelRegistry::new(), &profile, hold.clone());
+    let mut tools = RouterTools::new(
+        spawner,
+        ChannelRegistry::new(),
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    );
     tools = tools.with_worker_streams(Arc::new(P2Streams));
     if let Some(roster) = roster {
         tools = tools.with_roster(roster);

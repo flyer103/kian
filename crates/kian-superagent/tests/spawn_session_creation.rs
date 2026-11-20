@@ -83,8 +83,12 @@ impl InboxWriter for RecordingInbox {
 async fn a_spawn_creates_the_session_before_admitting_and_waking() {
     let inbox = RecordingInbox::shared(false);
     let template = worker_template("worker", "worker", 7);
-    let spawner = WorkerSpawner::new(sid(1), &template, inbox.clone())
-        .with_session_creation(inbox.clone() as Arc<dyn SpawnSessionWriter>);
+    let spawner = WorkerSpawner::new(
+        kian_superagent::ResidentBinding::new(sid(1)),
+        &template,
+        inbox.clone(),
+    )
+    .with_session_creation(inbox.clone() as Arc<dyn SpawnSessionWriter>);
     let spawned = spawner.spawn(json!("deploy"), None).await.expect("spawn");
 
     assert_eq!(
@@ -101,8 +105,12 @@ async fn a_spawn_creates_the_session_before_admitting_and_waking() {
 async fn a_failed_creation_refuses_the_spawn_without_admitting() {
     let inbox = RecordingInbox::shared(true);
     let template = worker_template("worker", "worker", 7);
-    let spawner = WorkerSpawner::new(sid(1), &template, inbox.clone())
-        .with_session_creation(inbox.clone() as Arc<dyn SpawnSessionWriter>);
+    let spawner = WorkerSpawner::new(
+        kian_superagent::ResidentBinding::new(sid(1)),
+        &template,
+        inbox.clone(),
+    )
+    .with_session_creation(inbox.clone() as Arc<dyn SpawnSessionWriter>);
     let err = spawner.spawn(json!("deploy"), None).await.unwrap_err();
     assert!(err.to_string().contains("boom"), "{err}");
     assert_eq!(

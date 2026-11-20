@@ -252,7 +252,7 @@ fn mandate_tools(
     let router = sid(1);
     let inbox = RecordingInbox::new();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     ));
@@ -265,8 +265,14 @@ fn mandate_tools(
     let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
     profile.mandate = policy;
     let tools = Arc::new(
-        RouterTools::new(spawner, channels, &profile, hold.clone())
-            .with_followup_registry(registry),
+        RouterTools::new(
+            spawner,
+            channels,
+            &profile,
+            hold.clone(),
+            kian_superagent::ResidentBinding::new(profile.session),
+        )
+        .with_followup_registry(registry),
     );
     let (port, dyn_port) = RecordingPort::shared(router);
     hold.install(dyn_port);
@@ -638,12 +644,15 @@ async fn explicit_follow_up_reaches_the_live_worker_under_a_changed_version() {
         }),
     );
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-            .with_shared_registry(registry)
-            // The pointer moved past the mandate's stamped v1 — explicit
-            // authority is not version-bound (ADR-012).
-            .with_policy_pointer(Some("v2".into()));
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    )
+    .with_shared_registry(registry)
+    // The pointer moved past the mandate's stamped v1 — explicit
+    // authority is not version-bound (ADR-012).
+    .with_policy_pointer(Some("v2".into()));
 
     let outcome = service
         .handle_event(follow_up_event("evt-follow"))
@@ -682,10 +691,13 @@ async fn inferred_under_changed_version_releases_to_the_router() {
         }),
     );
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-            .with_shared_registry(registry)
-            .with_policy_pointer(Some("v2".into()));
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    )
+    .with_shared_registry(registry)
+    .with_policy_pointer(Some("v2".into()));
 
     let outcome = service
         .handle_event(follow_up_event("evt-stale"))
@@ -761,10 +773,13 @@ async fn inferred_under_current_version_and_legacy_workers_pass() {
         }),
     );
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-            .with_shared_registry(registry)
-            .with_policy_pointer(Some("v1".into()));
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    )
+    .with_shared_registry(registry)
+    .with_policy_pointer(Some("v1".into()));
     let outcome = service
         .handle_event(follow_up_event("evt-current"))
         .await
@@ -781,10 +796,13 @@ async fn inferred_under_current_version_and_legacy_workers_pass() {
     let mut legacy_registry = PassthroughRegistry::new();
     legacy_registry.register("acme/repo#7", worker);
     let inbox = RecordingInbox::new();
-    let service =
-        SubscriptionService::new(router, rules(), Arc::clone(&inbox) as Arc<dyn InboxWriter>)
-            .with_shared_registry(Arc::new(std::sync::RwLock::new(legacy_registry)))
-            .with_policy_pointer(Some("v9".into()));
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    )
+    .with_shared_registry(Arc::new(std::sync::RwLock::new(legacy_registry)))
+    .with_policy_pointer(Some("v9".into()));
     let outcome = service
         .handle_event(follow_up_event("evt-legacy"))
         .await
@@ -811,7 +829,7 @@ async fn speculative_delegations_carry_mandates_too() {
     let router = sid(1);
     let inbox = RecordingInbox::new();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::clone(&inbox) as Arc<dyn InboxWriter>,
     ));

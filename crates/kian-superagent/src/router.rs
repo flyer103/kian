@@ -742,9 +742,11 @@ pub struct RouterTools {
     /// assembly without the wiring) means no ownership check and no
     /// registration: `spawn_worker` behaves exactly as before.
     followup_registry: Option<Arc<std::sync::RwLock<PassthroughRegistry>>>,
-    /// The resident Router session: the mandate's `granted_by`
-    /// fallback for non-channel spawns — the Router itself triggered.
-    router: SessionId,
+    /// The live resident session (ADR-040 binding): the mandate's
+    /// `granted_by` fallback for non-channel spawns, the spawn-identity
+    /// derivation and the task ids — read at use time so a rotation
+    /// re-points the Router's own tool surface.
+    router: Arc<crate::binding::ResidentBinding>,
     /// (ADR-012): the mandate issuance policy. `None` issues no
     /// mandate (byte-identical legacy wrappers).
     mandate: Option<MandatePolicy>,
@@ -819,6 +821,7 @@ impl RouterTools {
         channels: ChannelRegistry,
         profile: &RouterProfile,
         hold: Arc<RouterHold>,
+        router: Arc<crate::binding::ResidentBinding>,
     ) -> Self {
         // the outbox driver is built before the literal moves
         // `channels` (it owns a clone for the boot re-drive).
@@ -848,7 +851,7 @@ impl RouterTools {
             speak_metrics: SpeakMetrics::shared(),
             followup_ownership: profile.followup_ownership,
             followup_registry: None,
-            router: profile.session,
+            router,
             mandate: profile.mandate.clone(),
             policy_label: profile
                 .policy_version
@@ -1530,7 +1533,7 @@ impl RouterTools {
                 // tail (constraint 13). Refused before any mint.
                 let seq = self.spawn_seq(&port, &call.id).await?;
                 let identity = SpawnIdentity::derive_delegated(
-                    self.router,
+                    self.router.load(),
                     seq,
                     &agent_def,
                     agent_def_version,
@@ -1559,7 +1562,7 @@ impl RouterTools {
                     })?;
                     let dep_ids: std::collections::BTreeSet<uuid::Uuid> = declared_depends_on
                         .iter()
-                        .map(|key| crate::multiagent::task_id_for_key(self.router, key))
+                        .map(|key| crate::multiagent::task_id_for_key(self.router.load(), key))
                         .collect();
                     let streams = self.child_streams()?;
                     let mut child_map: std::collections::HashMap<SessionId, Vec<Event>> =
@@ -1594,7 +1597,7 @@ impl RouterTools {
                         child_map.insert(worker, events);
                     }
                     match crate::multiagent::ready_deps(
-                        self.router,
+                        self.router.load(),
                         &parent_events,
                         identity.task_id,
                         task_key_arg.as_deref(),
@@ -1776,7 +1779,7 @@ impl RouterTools {
                 policy,
                 self.spawner.worker_template_id(),
                 &task,
-                self.router,
+                self.router.load(),
                 self.policy_label.as_deref(),
             )
         });
@@ -2213,7 +2216,7 @@ impl RouterTools {
                 conversation: conversation_key(channel, target),
             });
         };
-        let ticket = intent_ticket(args, &self.router.0.to_string());
+        let ticket = intent_ticket(args, &self.router.load().0.to_string());
         let conversation = conversation_key(channel, target);
         let send_adapter = Arc::clone(adapter);
         driver
@@ -2569,7 +2572,7 @@ impl Clone for RouterTools {
             speak_metrics: Arc::clone(&self.speak_metrics),
             followup_ownership: self.followup_ownership,
             followup_registry: self.followup_registry.clone(),
-            router: self.router,
+            router: Arc::clone(&self.router),
             mandate: self.mandate.clone(),
             policy_label: self.policy_label.clone(),
             outbox: self.outbox.clone(),
@@ -2600,14 +2603,17 @@ impl Clone for RouterTools {
 /// advance will find the row eligible on its next inner pass.
 pub struct RouterInbox {
     inner: Arc<dyn InboxWriter>,
-    router: SessionId,
+    router: Arc<crate::binding::ResidentBinding>,
     admits: Arc<AtomicU64>,
 }
 
 impl RouterInbox {
     /// Wraps `inner`; admits to `router` advance the counter.
     #[must_use]
-    pub fn new(inner: Arc<dyn InboxWriter>, router: SessionId) -> Arc<Self> {
+    pub fn new(
+        inner: Arc<dyn InboxWriter>,
+        router: Arc<crate::binding::ResidentBinding>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             router,
@@ -2640,7 +2646,7 @@ impl RouterInbox {
         session: SessionId,
         rows: Vec<(Value, Option<String>)>,
     ) -> Result<Vec<AdmitReceipt>, InboxWriteError> {
-        let is_router = session == self.router;
+        let is_router = session == self.router.load();
         let mut fresh = 0u64;
         let mut receipts = Vec::new();
         let mut failure: Option<InboxWriteError> = None;
@@ -2675,7 +2681,7 @@ impl InboxWriter for RouterInbox {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
-        let is_router = session == self.router;
+        let is_router = session == self.router.load();
         let counter = Arc::clone(&self.admits);
         let fut = self.inner.admit(session, payload, idempotency_key);
         Box::pin(async move {
@@ -3376,7 +3382,7 @@ mod tests {
             dedup: false,
         });
         let spawner = Arc::new(WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &worker_template("mock", "mock-worker", 7),
             inbox.clone() as Arc<dyn InboxWriter>,
         ));
@@ -3386,7 +3392,13 @@ mod tests {
         let hold = RouterHold::shared();
         let profile = RouterProfile::new(router, router_template("mock", "mock-router"));
         (
-            Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone())),
+            Arc::new(RouterTools::new(
+                spawner,
+                channels,
+                &profile,
+                hold.clone(),
+                crate::binding::ResidentBinding::new(profile.session),
+            )),
             hold,
             mock,
             inbox,
@@ -3892,7 +3904,7 @@ mod tests {
             dedup: false,
         });
         let spawner = Arc::new(WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &worker_template("mock", "mock-worker", 7),
             inbox.clone() as Arc<dyn InboxWriter>,
         ));
@@ -3905,8 +3917,14 @@ mod tests {
         let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
         profile.followup_ownership = enabled;
         let tools = Arc::new(
-            RouterTools::new(spawner, channels, &profile, hold.clone())
-                .with_followup_registry(registry),
+            RouterTools::new(
+                spawner,
+                channels,
+                &profile,
+                hold.clone(),
+                crate::binding::ResidentBinding::new(profile.session),
+            )
+            .with_followup_registry(registry),
         );
         let (rec, dyn_port) = RecordingPort::shared(router);
         hold.install(dyn_port);
@@ -4265,7 +4283,10 @@ mod tests {
             dedup: false,
         });
         let router = sid(10);
-        let inbox = RouterInbox::new(inner.clone() as Arc<dyn InboxWriter>, router);
+        let inbox = RouterInbox::new(
+            inner.clone() as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
         assert_eq!(inbox.admit_count(), 0);
         inbox
             .admit(router, json!("a"), Some("k1".into()))
@@ -4281,7 +4302,10 @@ mod tests {
             admits: Mutex::new(Vec::new()),
             dedup: true,
         });
-        let inbox = RouterInbox::new(dedup_inner as Arc<dyn InboxWriter>, router);
+        let inbox = RouterInbox::new(
+            dedup_inner as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
         inbox
             .admit(router, json!("again"), Some("k1".into()))
             .await
@@ -4518,7 +4542,7 @@ mod tests {
         let router = sid(10);
         let inbox = PayloadInbox::shared();
         let spawner = Arc::new(WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         ));
@@ -4531,7 +4555,13 @@ mod tests {
         let (port, dyn_port) = ScriptedPort::shared(router);
         hold.install(dyn_port);
         (
-            Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone())),
+            Arc::new(RouterTools::new(
+                spawner,
+                channels,
+                &profile,
+                hold.clone(),
+                crate::binding::ResidentBinding::new(profile.session),
+            )),
             hold,
             port,
             inbox,
@@ -4929,7 +4959,10 @@ mod tests {
             admits: Mutex::new(Vec::new()),
             dedup: false,
         });
-        let router_inbox = RouterInbox::new(inbox.clone() as Arc<dyn InboxWriter>, router);
+        let router_inbox = RouterInbox::new(
+            inbox.clone() as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
         let hold = RouterHold::shared();
         let inner = Arc::new(SettlingDriver {
             drives: std::sync::atomic::AtomicUsize::new(0),
@@ -5085,7 +5118,7 @@ mod tests {
         let router = sid(10);
         let inbox = PayloadInbox::shared();
         let spawner = Arc::new(WorkerSpawner::new(
-            router,
+            crate::binding::ResidentBinding::new(router),
             &worker_template("mock", "mock-worker", 7),
             inbox.clone(),
         ));
@@ -5101,12 +5134,18 @@ mod tests {
             .iter()
             .map(|id| (id.to_string(), 60_000u64))
             .collect();
-        let mut tools = RouterTools::new(spawner, channels, &profile, hold.clone())
-            .with_worker_membership(
-                static_ids.iter().map(|id| id.to_string()).collect(),
-                timeouts,
-                directory,
-            );
+        let mut tools = RouterTools::new(
+            spawner,
+            channels,
+            &profile,
+            hold.clone(),
+            crate::binding::ResidentBinding::new(profile.session),
+        )
+        .with_worker_membership(
+            static_ids.iter().map(|id| id.to_string()).collect(),
+            timeouts,
+            directory,
+        );
         if let Some(streams) = streams {
             tools = tools.with_worker_streams(streams);
         }

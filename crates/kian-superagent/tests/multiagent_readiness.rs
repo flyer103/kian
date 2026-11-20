@@ -216,7 +216,7 @@ fn router_rig<S: kian_superagent::WorkerStreamsPort + 'static>(
     let router = router_session();
     let inbox = CaptureInbox::shared();
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         inbox.clone(),
     ));
@@ -228,6 +228,7 @@ fn router_rig<S: kian_superagent::WorkerStreamsPort + 'static>(
         kian_superagent::ChannelRegistry::new(),
         &profile,
         hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
     );
     tools = tools.with_board_gating(BoardGating(gating));
     tools = tools.with_worker_streams(streams);
@@ -462,7 +463,7 @@ fn gating_on_adds_exactly_two_properties() {
         let router = router_session();
         let inbox = CaptureInbox::shared();
         let spawner = Arc::new(WorkerSpawner::new(
-            router,
+            kian_superagent::ResidentBinding::new(router),
             &worker_template("mock", "mock-worker", 7),
             inbox,
         ));
@@ -474,6 +475,7 @@ fn gating_on_adds_exactly_two_properties() {
             kian_superagent::ChannelRegistry::new(),
             &profile,
             hold,
+            kian_superagent::ResidentBinding::new(profile.session),
         );
         tools = tools.with_board_gating(BoardGating(true));
         tools = tools.with_roster(kian_superagent::Roster {

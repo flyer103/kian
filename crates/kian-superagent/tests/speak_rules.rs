@@ -180,7 +180,7 @@ fn make_tools(
     Arc<ScriptedPort>,
 ) {
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::new(NullInbox) as Arc<dyn InboxWriter>,
     ));
@@ -190,7 +190,13 @@ fn make_tools(
     let hold = RouterHold::shared();
     let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
     profile.speak = SpeakPolicy::from_rules(rules);
-    let tools = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+    let tools = Arc::new(RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    ));
     let (port, dyn_port) = ScriptedPort::shared(router);
     hold.install(dyn_port);
     (tools, hold, mock, port)
@@ -646,7 +652,7 @@ async fn ack_first_only_survives_a_restart_via_the_stream_rebuild() {
     // "Reboot": a brand-new tools instance (fresh tracker slot) over
     // the same hold and the same committed stream.
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::new(NullInbox) as Arc<dyn InboxWriter>,
     ));
@@ -659,7 +665,13 @@ async fn ack_first_only_survives_a_restart_via_the_stream_rebuild() {
         when: SpeakCondition::AckFirstOnly,
         per_topic_ack: true,
     }]);
-    let rebooted = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+    let rebooted = Arc::new(RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    ));
 
     let err = invoke(&rebooted, reply_call(topic_a())).await.unwrap_err();
     assert!(

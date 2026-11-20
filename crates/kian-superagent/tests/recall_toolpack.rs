@@ -479,10 +479,13 @@ async fn build_harness(
         clock: clock.clone(),
         engine: OnceLock::new(),
     });
-    let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
+    let router_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
 
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_agent,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -490,14 +493,20 @@ async fn build_harness(
     let mut channels = ChannelRegistry::new();
     channels.register("mock-im", Arc::clone(&mock) as Arc<dyn ChannelAdapter>);
     let hold = RouterHold::shared();
-    let dispatch_tools = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+    let dispatch_tools = Arc::new(RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    ));
 
     // The recall toolpack beside the dispatch tools, over the read
     // port — exactly how assembly mounts it (default on for Router).
     let recall = StoreRecallPort::new(store.clone());
     let recall_tools = Arc::new(RecallTools::new(
         recall.clone() as Arc<dyn RecallPort>,
-        router,
+        kian_superagent::ResidentBinding::new(router),
         shaping,
         recall_config,
     ));
@@ -537,7 +546,7 @@ async fn build_harness(
         worker_loop,
         router_inbox.clone() as Arc<dyn InboxWriter>,
         WorkerLoopConfig {
-            router,
+            router: kian_superagent::ResidentBinding::new(router),
             worker_version: 7,
             gate: EvidenceGateConfig::default(),
             multiagent: None,
@@ -935,7 +944,7 @@ async fn recall_outputs_are_capped_no_unbounded_raw_reinjection() {
     // by the round-trip test; the cap is a property of the output).
     let tools = RecallTools::new(
         h.recall.clone() as Arc<dyn RecallPort>,
-        h.router,
+        kian_superagent::ResidentBinding::new(h.router),
         spill_shaping(),
         RecallToolConfig {
             output_cap_bytes: 64,
@@ -1025,7 +1034,7 @@ async fn recall_neighbors_returns_the_same_topic_locality_view() {
 
     let tools = RecallTools::new(
         h.recall.clone() as Arc<dyn RecallPort>,
-        h.router,
+        kian_superagent::ResidentBinding::new(h.router),
         spill_shaping(),
         RecallToolConfig {
             output_cap_bytes: 8_192,
@@ -1087,7 +1096,7 @@ async fn recall_neighbors_returns_the_same_topic_locality_view() {
 fn recall_tool_schemas_are_stable_ordered_golden() {
     let tools = RecallTools::new(
         Arc::new(EmptyRecallPort) as Arc<dyn RecallPort>,
-        SessionId::new(),
+        kian_superagent::ResidentBinding::new(SessionId::new()),
         ShapingConfig::default(),
         RecallToolConfig::default(),
     );

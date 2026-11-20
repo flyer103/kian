@@ -187,7 +187,11 @@ async fn each_routing_outcome_branch_produces_its_code() {
     let watchdog = SessionId::new();
     let worker = SessionId::new();
     let worker_b = SessionId::new();
-    let service = SubscriptionService::new(router, rules(watchdog), Arc::clone(&inbox) as _);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(watchdog),
+        Arc::clone(&inbox) as _,
+    );
 
     // Router rule → admitted_router.
     let outcome = service
@@ -272,7 +276,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
 
     // ignore class → class_ignored (decided before the rule set).
     let ignored = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules(watchdog),
         kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
             channel: "mock-im".into(),
@@ -294,7 +298,7 @@ async fn each_routing_outcome_branch_produces_its_code() {
 
     // explicit-only without a signal → not_explicit.
     let explicit_only = SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules(watchdog),
         kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
             channel: "mock-im".into(),
@@ -325,7 +329,11 @@ async fn one_reason_code_per_decision() {
     let watchdog = SessionId::new();
     let worker_a = SessionId::new();
     let worker_b = SessionId::new();
-    let service = SubscriptionService::new(router, rules(watchdog), Arc::clone(&inbox) as _);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(watchdog),
+        Arc::clone(&inbox) as _,
+    );
     service.register_topic("pr-9", worker_a);
     service.register_topic("pr-9", worker_b);
 
@@ -453,8 +461,11 @@ async fn audit_lines_carry_reason_codes_for_every_drop_and_admit_path() {
     let worker = SessionId::new();
 
     // Drops: no rule.
-    let no_rule_service =
-        SubscriptionService::new(router, rules(watchdog), Arc::clone(&inbox) as _);
+    let no_rule_service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(watchdog),
+        Arc::clone(&inbox) as _,
+    );
     no_rule_service
         .handle_event(event("github", "aud-no-rule", None))
         .await
@@ -463,7 +474,7 @@ async fn audit_lines_carry_reason_codes_for_every_drop_and_admit_path() {
     // Drops: class ignore + explicit-only (each its own service so the
     // class tables do not overlap).
     SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules(watchdog),
         kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
             channel: "mock-im".into(),
@@ -477,7 +488,7 @@ async fn audit_lines_carry_reason_codes_for_every_drop_and_admit_path() {
     .await
     .unwrap();
     SubscriptionService::with_classes(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         rules(watchdog),
         kian_superagent::AdmissionClassTable::new(vec![kian_superagent::AdmissionClassRule {
             channel: "mock-im".into(),
@@ -493,7 +504,11 @@ async fn audit_lines_carry_reason_codes_for_every_drop_and_admit_path() {
 
     // Admits: router rule, session route, bound passthrough, unbound
     // fallback, then a deduplicated re-handling.
-    let service = SubscriptionService::new(router, rules(watchdog), Arc::clone(&inbox) as _);
+    let service = SubscriptionService::new(
+        kian_superagent::ResidentBinding::new(router),
+        rules(watchdog),
+        Arc::clone(&inbox) as _,
+    );
     service
         .handle_event(event("mock-im", "aud-router", None))
         .await

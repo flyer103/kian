@@ -242,7 +242,7 @@ fn make_tools(
     logs();
     let router = sid(10);
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_template("mock", "mock-worker", 7),
         Arc::new(NullInbox) as Arc<dyn InboxWriter>,
     ));
@@ -255,7 +255,13 @@ fn make_tools(
     channels.register("mock-im", Arc::clone(&flaky) as Arc<dyn ChannelAdapter>);
     let hold = RouterHold::shared();
     let profile = RouterProfile::new(router, router_template("mock", "mock-router"));
-    let mut tools = RouterTools::new(spawner, channels.clone(), &profile, hold.clone());
+    let mut tools = RouterTools::new(
+        spawner,
+        channels.clone(),
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    );
     if let Some((config, clock)) = outbox {
         let driver = Arc::new(OutboxDriver::new(config, clock, channels));
         tools = tools.with_outbox_driver(driver);

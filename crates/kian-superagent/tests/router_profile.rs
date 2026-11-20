@@ -326,10 +326,13 @@ async fn build_harness(
         clock: clock.clone(),
         engine: OnceLock::new(),
     });
-    let router_inbox = RouterInbox::new(late.clone() as Arc<dyn InboxWriter>, router);
+    let router_inbox = RouterInbox::new(
+        late.clone() as Arc<dyn InboxWriter>,
+        kian_superagent::ResidentBinding::new(router),
+    );
 
     let spawner = Arc::new(WorkerSpawner::new(
-        router,
+        kian_superagent::ResidentBinding::new(router),
         &worker_agent,
         router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -337,7 +340,13 @@ async fn build_harness(
     let mut channels = ChannelRegistry::new();
     channels.register("mock-im", Arc::clone(&mock) as Arc<dyn ChannelAdapter>);
     let hold = RouterHold::shared();
-    let tools = Arc::new(RouterTools::new(spawner, channels, &profile, hold.clone()));
+    let tools = Arc::new(RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    ));
 
     let router_loop = Arc::new(ReActLoop::with_config(
         router_agent,
@@ -788,7 +797,7 @@ async fn passthrough_event_reaches_worker_inbox_zero_router_events() {
         },
     ]);
     let service = Arc::new(SubscriptionService::new(
-        h.router,
+        kian_superagent::ResidentBinding::new(h.router),
         rules,
         h.router_inbox.clone() as Arc<dyn InboxWriter>,
     ));
@@ -858,7 +867,7 @@ async fn over_cap_admission_commits_one_pair_and_router_sees_only_the_excerpt() 
         route: Route::Router,
     }]);
     let service = SubscriptionService::new(
-        h.router,
+        kian_superagent::ResidentBinding::new(h.router),
         rules,
         h.router_inbox.clone() as Arc<dyn InboxWriter>,
     )

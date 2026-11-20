@@ -553,6 +553,9 @@ pub struct SuperAgentPlugin {
     /// stream is non-terminal (or never created), else the deterministic
     /// successor at the end of the chain.
     pub router_session: SessionId,
+    /// ADR-040 phase 1: the shared live-resident binding every
+    /// router-facing surface resolves at use time.
+    pub router_binding: Arc<kian_superagent::ResidentBinding>,
     /// the ended, frozen predecessors of `router_session`
     /// (empty = generation 0). Flows into the Router profile's re-arm
     /// bootstrap (per-generation key + cause-carrying prompt).
@@ -802,7 +805,7 @@ impl Plugin for SuperAgentPlugin {
         .map_err(|e| apply_error(format!("superagent profile: {e}")))?;
         // the Router profile carries the configured speculation
         // budget (None = disabled, speculative spawns refused honestly).
-        let mut profile = RouterProfile::new(self.router_session, profile.router);
+        let mut profile = RouterProfile::new(self.router_binding.load(), profile.router);
         profile.speculation = self.speculation.clone();
         profile.speak = self.speak.clone();
         // the follow-up-ownership gate rides the profile into the
@@ -844,13 +847,13 @@ impl Plugin for SuperAgentPlugin {
         // The mounted inbox: admits counted for Router residency.
         let router_inbox = RouterInbox::new(
             Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
-            self.router_session,
+            Arc::clone(&self.router_binding),
         );
 
         // Dispatch tools over the spawner + channel registry + hold.
         let spawner = Arc::new(
             WorkerSpawner::new(
-                self.router_session,
+                Arc::clone(&self.router_binding),
                 &self.worker_agent,
                 Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
             )
@@ -935,6 +938,7 @@ impl Plugin for SuperAgentPlugin {
             channels.clone(),
             &profile,
             hold.clone(),
+            Arc::clone(&self.router_binding),
         )
         .with_followup_registry(Arc::clone(&followup_registry))
         // (R17-C6, pin P4-1): the class-A emission switch rides
@@ -1013,7 +1017,7 @@ impl Plugin for SuperAgentPlugin {
         let recall_port = crate::superagent::StoreRecall::new(self.event_store.clone());
         let recall_tools = kian_superagent::RecallTools::new(
             recall_port.clone() as Arc<dyn kian_superagent::RecallPort>,
-            self.router_session,
+            Arc::clone(&self.router_binding),
             self.shaping.clone(),
             self.recall.to_runtime(),
         );
@@ -1207,7 +1211,7 @@ impl Plugin for SuperAgentPlugin {
             let watchdog_hold = kian_superagent::RouterHold::shared();
             let tools = kian_superagent::WatchdogTools::new(
                 recall_port.clone() as Arc<dyn kian_superagent::RecallPort>,
-                self.router_session,
+                self.router_binding.load(),
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
                 channels.clone(),
                 kian_superagent::ImPolicy::default(),
@@ -1216,7 +1220,7 @@ impl Plugin for SuperAgentPlugin {
             );
             let watchdog_inbox = RouterInbox::new(
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
-                profile.session,
+                kian_superagent::ResidentBinding::new(profile.session),
             );
             // the mounted inbox rides the services so the boot-time
             // policy drift notice admits through the residency counter
@@ -1267,7 +1271,7 @@ impl Plugin for SuperAgentPlugin {
                     Arc::new(worker_inner),
                     Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
                     kian_superagent::WorkerLoopConfig {
-                        router: self.router_session,
+                        router: Arc::clone(&self.router_binding),
                         worker_version: self.worker_agent.version,
                         gate: crate::superagent::clone_gate(&self.worker_gate),
                         // (R15-C5): the delegation bounds ride the worker
@@ -1285,7 +1289,7 @@ impl Plugin for SuperAgentPlugin {
                     Arc::new(worker_inner),
                     Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
                     kian_superagent::WorkerLoopConfig {
-                        router: self.router_session,
+                        router: Arc::clone(&self.router_binding),
                         worker_version: self.worker_agent.version,
                         gate: crate::superagent::clone_gate(&self.worker_gate),
                         multiagent: self.multiagent,
@@ -1333,7 +1337,7 @@ impl Plugin for SuperAgentPlugin {
             let side_recall_tools = recall_tools.clone();
             let side_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
             let side_gate = crate::superagent::clone_gate(&self.worker_gate);
-            let side_session = self.router_session;
+            let side_session = Arc::clone(&self.router_binding);
             let side_version = self.worker_agent.version;
             let side_jobs_factory = async_jobs_factory.clone();
             // (R15-C5): the sides drive spawned children in
@@ -1393,7 +1397,7 @@ impl Plugin for SuperAgentPlugin {
                         inner,
                         Arc::clone(&side_inbox),
                         kian_superagent::WorkerLoopConfig {
-                            router: side_session,
+                            router: Arc::clone(&side_session),
                             worker_version: side_version,
                             gate: crate::superagent::clone_gate(&side_gate),
                             multiagent: side_multiagent,
@@ -1406,7 +1410,7 @@ impl Plugin for SuperAgentPlugin {
                         inner,
                         Arc::clone(&side_inbox),
                         kian_superagent::WorkerLoopConfig {
-                            router: side_session,
+                            router: Arc::clone(&side_session),
                             worker_version: side_version,
                             gate: crate::superagent::clone_gate(&side_gate),
                             multiagent: side_multiagent,
@@ -1429,7 +1433,7 @@ impl Plugin for SuperAgentPlugin {
             let refuse_recall_tools = recall_tools.clone();
             let refuse_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
             let refuse_gate = crate::superagent::clone_gate(&self.worker_gate);
-            let refuse_session = self.router_session;
+            let refuse_session = Arc::clone(&self.router_binding);
             let refuse_version = self.worker_agent.version;
             let refuse_multiagent = self.multiagent;
             let refuse_board_gating = self.board_gating;
@@ -1477,7 +1481,7 @@ impl Plugin for SuperAgentPlugin {
                         inner,
                         Arc::clone(&refuse_inbox),
                         kian_superagent::WorkerLoopConfig {
-                            router: refuse_session,
+                            router: Arc::clone(&refuse_session),
                             worker_version: refuse_version,
                             gate: crate::superagent::clone_gate(&refuse_gate),
                             multiagent: refuse_multiagent,
@@ -1490,7 +1494,7 @@ impl Plugin for SuperAgentPlugin {
                         inner,
                         Arc::clone(&refuse_inbox),
                         kian_superagent::WorkerLoopConfig {
-                            router: refuse_session,
+                            router: Arc::clone(&refuse_session),
                             worker_version: refuse_version,
                             gate: crate::superagent::clone_gate(&refuse_gate),
                             multiagent: refuse_multiagent,
@@ -1552,7 +1556,7 @@ impl Plugin for SuperAgentPlugin {
             let assignee_recall_tools = recall_tools.clone();
             let assignee_inbox = Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>;
             let assignee_gate = crate::superagent::clone_gate(&self.worker_gate);
-            let assignee_session = self.router_session;
+            let assignee_session = Arc::clone(&self.router_binding);
             let assignee_multiagent = self.multiagent;
             let assignee_board_gating = self.board_gating;
             // the refusing branch's loop def: the worker template (a
@@ -1648,7 +1652,7 @@ impl Plugin for SuperAgentPlugin {
                             Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
                             Arc::clone(&assignee_inbox),
                             kian_superagent::WorkerLoopConfig {
-                                router: assignee_session,
+                                router: Arc::clone(&assignee_session),
                                 // pin P2-1: the child's own lineage
                                 // stamps the RESOLVED agent's version,
                                 // not the worker template's.
@@ -1685,7 +1689,7 @@ impl Plugin for SuperAgentPlugin {
                             Arc::new(crate::superagent::WorkerInnerDriver::React(refuse_loop)),
                             Arc::clone(&assignee_inbox),
                             kian_superagent::WorkerLoopConfig {
-                                router: assignee_session,
+                                router: Arc::clone(&assignee_session),
                                 worker_version: worker_refuse_version,
                                 gate: crate::superagent::clone_gate(&assignee_gate),
                                 multiagent: assignee_multiagent,
@@ -1698,7 +1702,7 @@ impl Plugin for SuperAgentPlugin {
             }));
         }
         let mut driver = crate::superagent::SuperAgentDriver::new(
-            self.router_session,
+            Arc::clone(&self.router_binding),
             self.worker_agent.version,
             router_side,
             worker_side,
@@ -1733,7 +1737,7 @@ impl Plugin for SuperAgentPlugin {
 
         let subscriptions = Arc::new(
             SubscriptionService::with_classes(
-                self.router_session,
+                Arc::clone(&self.router_binding),
                 self.rules,
                 self.classes,
                 Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
@@ -1761,6 +1765,7 @@ impl Plugin for SuperAgentPlugin {
 
         let services = Arc::new(crate::superagent::SuperAgentServices {
             driver,
+            router_binding: Arc::clone(&self.router_binding),
             inbox: self.inbox,
             router_inbox,
             spawner: Arc::clone(&spawner),
