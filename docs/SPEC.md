@@ -523,9 +523,10 @@ record is [ADR-040](../design/decisions/ADR-040-runtime-resident-rotation.md).
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
-| P0 | kian-cli | The sixth end reason `rotated` + the terminal `rotated` state; `superagent.router.rotate_after_events`; the boot rotation (atomic close, chain re-resolution, pending-message migration, bounded handoff, successor bootstrap ordering) | landed (single serving process, or all replicas restart together) |
+| P0 | kian-cli | The sixth end reason `rotated` + the terminal `rotated` state; `superagent.router.rotate_after_events`; the boot rotation (atomic close, chain re-resolution, pending-message migration, bounded handoff, successor bootstrap ordering) | landed (multi-replica: ADR-048 derive/repair/migrate) |
 | P1 | kian-superagent, kian-cli | The shared `ResidentBinding` read at use time by driver routing, the mounted residency inbox, the spawner's thread parent, the worker completion-report target, the subscription `router` route, the Router tools (mandate/spawn identity/task ids), the recall reader, the runtime metrics and the child-timeout root — behavior-identical, the prerequisite for rotation between restarts | landed |
 | P2 | kian-orchestrator, kian-cli | Runtime rotation between restarts: the serve ticker calls the planner (`idle` + threshold gate), the engine's atomic `rotate_idle` close, the memory index → migrated rows → handoff → judge prompt order on the successor, and the shared-binding swap (phase 1) that re-points every consumer without a restart | landed |
+| P3 | kian-cli | Multi-replica coordination: each replica's tick derives the live session from the durable chain when its binding turns terminal (catch-up + re-point), any replica completes an interrupted successor bootstrap (idempotent admit keys), and the catching-up replica migrates the rows it wrote to the frozen predecessor | landed |
 
 Acceptance criteria are named in CONFIRMATION-MODEL §13 (L1 contract tests; L2 on a real server
 covering the ask→idle→answer→resume round trip, duplicate answers, TTL expiry and a terminal end
