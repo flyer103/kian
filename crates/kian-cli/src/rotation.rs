@@ -238,6 +238,9 @@ fn handoff_payload(
 /// residency inbox (the judge prompt's admit counter) and the shared
 /// live-resident binding (swapped at the end).
 pub struct RuntimeRotation {
+    /// The configured pinned Router id: the chain root every replica
+    /// derives the live session from (ADR-047).
+    pub pinned: SessionId,
     /// The shared live-resident session every consumer reads.
     pub binding: Arc<kian_superagent::ResidentBinding>,
     /// `superagent.router.rotate_after_events` (>= 1).
@@ -252,20 +255,54 @@ pub struct RuntimeRotation {
     pub router_inbox: Arc<kian_superagent::RouterInbox>,
     /// The handoff's note redactor (the same secret policy as memory).
     pub redactor: SecretRedactor,
+    /// The ended chain (oldest first) as this replica last derived it.
+    /// The bootstrap's re-arm cause and the straggler migration read it;
+    /// a catch-up replaces it with the durable chain.
+    ended: std::sync::Mutex<Vec<kian_superagent::rearm::EndedResident>>,
 }
 
 impl RuntimeRotation {
-    /// One tick. Returns the successor when a rotation happened.
+    /// A planner over the pinned chain root, the shared binding and the
+    /// boot profile (its re-arm chain seeds the ended list).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pinned: SessionId,
+        binding: Arc<kian_superagent::ResidentBinding>,
+        threshold: u64,
+        period_ms: u64,
+        profile: kian_superagent::RouterProfile,
+        bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
+        router_inbox: Arc<kian_superagent::RouterInbox>,
+        redactor: SecretRedactor,
+    ) -> Self {
+        let ended = profile.re_arm.clone();
+        Self {
+            pinned,
+            binding,
+            threshold,
+            period_ms,
+            profile,
+            bootstrap,
+            router_inbox,
+            redactor,
+            ended: std::sync::Mutex::new(ended),
+        }
+    }
+
+    /// One tick. Returns the successor when this tick rotated the
+    /// Router; a catch-up, a repair and the no-op gates return
+    /// `Ok(None)`.
     ///
-    /// Order (the successor's context is fixed by ADR-040): the caller
-    /// retires the predecessor atomically (engine-owned, phase 2's
-    /// close), injects the memory index into the **fresh** successor
-    /// (first context-bearing row), swaps the binding (every consumer
-    /// re-points), migrates any row that raced the close (the
-    /// predecessor is frozen; a copy lands on the successor), admits the
-    /// bounded handoff, then the judge prompt (which wakes the
-    /// successor). All gates fail closed to `Ok(None)`: a busy or
-    /// running session is never rotated.
+    /// Multi-replica order (ADR-047): (a) if the local binding points at
+    /// a terminal session, another replica rotated — derive the live
+    /// session from the durable chain, re-point, and migrate the rows
+    /// this replica may have written to the frozen predecessor; (b) if
+    /// the live session is a successor with no events, its bootstrap
+    /// never completed (the winner died between the close and the
+    /// prompt) — any replica re-runs it idempotently; (c) otherwise the
+    /// normal idle + threshold gate. The close itself is claim-fenced,
+    /// so only one replica can win a rotation.
     pub async fn tick<D>(
         &self,
         engine: &Arc<Engine<D>>,
@@ -274,8 +311,62 @@ impl RuntimeRotation {
     where
         D: LoopDriver<Ctx = DrainCtx> + 'static,
     {
-        let live = self.binding.load();
-        let events = store.rebuild(live).await.map_err(|e| e.to_string())?;
+        let mut live = self.binding.load();
+        let mut events = store.rebuild(live).await.map_err(|e| e.to_string())?;
+        // (a) Catch up with a rotation another replica performed: the
+        //     local view is terminal, the durable chain knows the live
+        //     successor.
+        if !events.is_empty() && project(&events).map_err(|e| e.to_string())?.is_terminal() {
+            let resolution = kian_superagent::rearm::resolve_re_arm(self.pinned, {
+                let store = store.clone();
+                move |session| {
+                    let store = store.clone();
+                    Box::pin(async move { store.rebuild(session).await })
+                }
+            })
+            .await
+            .map_err(|e| {
+                format!(
+                    "rotation catch-up resolution (pinned {}): {e}",
+                    self.pinned.0
+                )
+            })?;
+            if resolution.live == live {
+                return Ok(None);
+            }
+            let previous = resolution.ended.last().map(|ended| ended.session);
+            self.binding.store(resolution.live);
+            *self.ended.lock().expect("rotation chain lock") = resolution.ended.clone();
+            let successor = resolution.live;
+            tracing::info!(
+                stale = %live.0,
+                live = %successor.0,
+                "rotation: caught up with a successor another replica retired onto"
+            );
+            if let Some(predecessor) = previous {
+                self.migrate_predecessor(predecessor, successor, engine, store)
+                    .await;
+            }
+            live = successor;
+            events = store.rebuild(live).await.map_err(|e| e.to_string())?;
+        }
+        // (b) Repair an interrupted rotation: a live successor with no
+        //     events never received its bootstrap. Every admit below is
+        //     idempotent by its durable key, so any replica may run it.
+        if live != self.pinned && events.is_empty() {
+            let predecessor = self
+                .ended
+                .lock()
+                .expect("rotation chain lock")
+                .last()
+                .cloned();
+            if let Some(predecessor) = predecessor {
+                self.bootstrap_successor(live, &predecessor, engine, store)
+                    .await?;
+                return Ok(None);
+            }
+        }
+        // (c) The normal rotation gate.
         if events.is_empty() || (events.len() as u64) < self.threshold {
             return Ok(None);
         }
@@ -294,12 +385,46 @@ impl RuntimeRotation {
             .map_err(|e| e.to_string())?
         {
             RotateOutcome::Rotated { .. } => {}
-            // Raced: a drain claimed it, a replica owns the lease, an
-            // input became eligible, or it ended. Nothing was written.
+            // Raced: a drain claimed it, a replica owns the lease, or it
+            // ended. Nothing was written.
             _ => return Ok(None),
         }
-        // 1. The memory index first (an explicit, fresh-only admit: the
-        //    successor has no rows yet).
+        let predecessor = kian_superagent::rearm::EndedResident {
+            session: live,
+            reason: EndReason::Rotated,
+        };
+        self.ended
+            .lock()
+            .expect("rotation chain lock")
+            .push(predecessor.clone());
+        self.bootstrap_successor(successor, &predecessor, engine, store)
+            .await?;
+        tracing::info!(
+            predecessor = %live.0,
+            successor = %successor.0,
+            "resident router rotated at runtime (ADR-040 phase 2)"
+        );
+        Ok(Some(successor))
+    }
+
+    /// Bootstrap a successor (memory index first, then the migrated
+    /// predecessor rows, the handoff and the judge prompt) and wake it.
+    /// Idempotent by the durable admit keys: a repair may re-run it.
+    async fn bootstrap_successor<D>(
+        &self,
+        successor: SessionId,
+        predecessor: &kian_superagent::rearm::EndedResident,
+        engine: &Arc<Engine<D>>,
+        store: &EventStore,
+    ) -> Result<(), String>
+    where
+        D: LoopDriver<Ctx = DrainCtx> + 'static,
+    {
+        let events = store
+            .rebuild(predecessor.session)
+            .await
+            .map_err(|e| e.to_string())?;
+        // 1. The memory index first (an explicit, fresh-only admit).
         if let Some(bootstrap) = self.bootstrap.as_ref()
             && let Err(error) = bootstrap.bootstrap(successor).await
         {
@@ -307,56 +432,60 @@ impl RuntimeRotation {
         }
         // 2. Re-point every consumer.
         self.binding.store(successor);
-        // 3. Copy anything that raced the close (the predecessor is
-        //    frozen now; the successor gets the work, at-least-once).
-        let now = now_ms();
-        if let Ok(rows) = store.eligible_inputs(live, now).await {
-            for row in rows.iter().filter(|row| !is_control(&row.payload)) {
-                let key = Some(format!("rotate:{}:{}", live.0, row.id));
-                if let Err(error) = engine
-                    .admit_quiet(successor, row.payload.clone(), key)
-                    .await
-                {
-                    tracing::warn!(successor = %successor.0, %error, "rotation: input migration skipped");
-                }
-            }
-        }
+        // 3. Copy the predecessor's pending rows (at-least-once; the
+        //    originals stay on the frozen stream as the audit record).
+        self.migrate_predecessor(predecessor.session, successor, engine, store)
+            .await;
         // 4. The bounded handoff.
-        let handoff = handoff_payload(&events, live, events.len(), &self.redactor);
+        let handoff = handoff_payload(&events, predecessor.session, events.len(), &self.redactor);
         if let Err(error) = engine
             .admit_quiet(
                 successor,
                 handoff,
-                Some(format!("rotate-handoff:{}", live.0)),
+                Some(format!("rotate-handoff:{}", predecessor.session.0)),
             )
             .await
         {
             tracing::warn!(successor = %successor.0, %error, "rotation: handoff skipped");
         }
-        // 5. The judge prompt (a successor profile: its id and the
-        //    rotated predecessor in the re-arm cause), then the wake
-        //    that starts the successor's first drain.
+        // 5. The judge prompt (a successor profile whose re-arm cause is
+        //    the whole durable chain), then the wake.
         let mut profile = self.profile.clone();
         profile.session = successor;
-        profile.re_arm.push(kian_superagent::rearm::EndedResident {
-            session: live,
-            reason: EndReason::Rotated,
-        });
+        profile.re_arm = self.ended.lock().expect("rotation chain lock").clone();
         profile
             .bootstrap(self.router_inbox.as_ref())
             .await
             .map_err(|e| format!("successor bootstrap: {e}"))?;
-        // The bootstrap's admit does not wake by itself (the inbox
-        // contract: admit then wake); this wake starts the successor's
-        // first drain, whose pre-drive take reads the rows above in
-        // order (index, migrated, handoff, prompt).
         engine.wake(successor);
-        tracing::info!(
-            predecessor = %live.0,
-            successor = %successor.0,
-            "resident router rotated at runtime (ADR-040 phase 2)"
-        );
-        Ok(Some(successor))
+        Ok(())
+    }
+
+    /// Re-admit `predecessor`'s pending message rows to `successor` with
+    /// their rotation keys (control rows never migrate; the originals
+    /// stay on the frozen stream).
+    async fn migrate_predecessor<D>(
+        &self,
+        predecessor: SessionId,
+        successor: SessionId,
+        engine: &Arc<Engine<D>>,
+        store: &EventStore,
+    ) where
+        D: LoopDriver<Ctx = DrainCtx> + 'static,
+    {
+        let now = now_ms();
+        let Ok(rows) = store.eligible_inputs(predecessor, now).await else {
+            return;
+        };
+        for row in rows.iter().filter(|row| !is_control(&row.payload)) {
+            let key = Some(format!("rotate:{}:{}", predecessor.0, row.id));
+            if let Err(error) = engine
+                .admit_quiet(successor, row.payload.clone(), key)
+                .await
+            {
+                tracing::warn!(successor = %successor.0, %error, "rotation: input migration skipped");
+            }
+        }
     }
 }
 

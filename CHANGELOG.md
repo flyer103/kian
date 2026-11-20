@@ -8,6 +8,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Multi-replica resident rotation (ADR-048)**. A replica whose `ResidentBinding` points at a
+  terminal Router now derives the live successor from the durable uuid5 chain, re-points the
+  binding and migrates the rows it had written to the frozen predecessor (`rotate:<old>:<row>`
+  keys; the originals stay as the audit record). Any replica can complete a rotation whose owner
+  died between the close and the successor's bootstrap: the successor bootstrap's admits are
+  idempotent by their durable keys (`memory-inject:<successor>`, `rotate:<old>:<row>`,
+  `rotate-handoff:<old>`, the re-arm judge-prompt key), so a repeated run is a no-op. The close
+  stays claim-fenced (one winner), and a stale replica's window is one tick with no lost work. No
+  new event kind, state edge, wire byte or config key. Contract:
+  [design/DESIGN.md](design/DESIGN.md) §4.6,
+  [ADR-048](design/decisions/ADR-048-multi-replica-resident-rotation.md).
+
 - **Harness conversation resume across drains (HARNESS-BRIDGE §4.6, ADR-047)**. A bridged
   session now remembers its harness conversation: the adapter reports the harness's continuation
   handle (Claude `session_id` from `system/init`, Codex thread id from `thread/start`), the driver

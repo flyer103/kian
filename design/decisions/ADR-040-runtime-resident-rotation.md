@@ -40,9 +40,9 @@ rotation trigger and the end reason).
   of the predecessor's pending *message* rows; the bounded synthetic handoff; and the successor's
   fixed context order (ADR-038 memory index → migrated rows → handoff → judge prompt). Gates: only
   an `idle` live session rotates, and a live lease wins. This bounds context across restarts and
-  refreshes the memory index without any runtime rebind. Deployment assumption: a single serving
-  process (or all replicas restart together) — a second live replica keeps the retired id in
-  memory; safe rotation across live replicas is phase 2's shared binding.
+  refreshes the memory index without any runtime rebind. The single-serving-process assumption the
+  phase-2 status records is superseded by [ADR-048](ADR-048-multi-replica-resident-rotation.md)
+  (derive/repair/migrate; a stale replica re-points within one tick and its rows migrate).
 - **Phase 1 — landed (2026-11-20).** The shared `ResidentBinding` (an `RwLock<SessionId>` with
   `load`/`store`) is read at use time by every router-facing surface: driver routing, the mounted
   residency inbox, the spawner's thread parent, the worker completion-report target, the
@@ -50,6 +50,10 @@ rotation trigger and the end reason).
   spawn identity, task ids), the recall reader, the runtime's metrics view and the child-timeout
   walk root. Behavior-identical: with no rotation the id never changes; the bundle tests construct
   the binding from the same session they always passed.
+- **Multi-replica coordination — landed (ADR-048, 2026-11-20).** The single-serving-process
+  assumption below is superseded: replicas derive the live session from the durable chain when their
+  binding is terminal, any replica may complete an interrupted successor bootstrap (the admit keys
+  are idempotent), and a catching-up replica migrates its stale writes to the successor.
 - **Phase 2 — landed (2026-11-20).** Runtime rotation between restarts: a serve ticker (the
   `drain.heartbeat_interval_ms` beat, clamped to [1s, 60s]) calls the planner when
   `superagent.router.rotate_after_events` is set. The planner gates on `idle` and the threshold,
