@@ -7,6 +7,8 @@
 //!   hard failure with a diagnostic on stderr and exit code 1);
 //! - `{"op":"expect_any"}` — consume one line and ignore it (the mounted e2e cannot script a
 //!   random delegation wrapper);
+//! - `{"op":"sleep","ms":N}` — stay silent for N milliseconds while staying alive (the stalled
+//!   child shape, ADR-044: no event, no exit);
 //! - `{"op":"exit","code":N}` — stop immediately with exit code N (the honest crash shape);
 //! - `{"op":"eof"}` — stop and exit 0.
 //!
@@ -90,6 +92,10 @@ pub fn run_ops(
                     )
                     .into());
                 }
+            }
+            "sleep" => {
+                let ms = op.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
             }
             "exit" => {
                 let code = op.get("code").and_then(|v| v.as_i64()).unwrap_or(1);

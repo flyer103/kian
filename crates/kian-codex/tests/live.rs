@@ -43,6 +43,7 @@ async fn live_codex_turn_is_mapped_and_honest() {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 8,
             labels: Default::default(),
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     );
     let outcomes = tokio::time::timeout(

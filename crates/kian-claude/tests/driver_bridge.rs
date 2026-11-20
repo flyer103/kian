@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use kian_claude::ClaudeAdapter;
@@ -200,6 +201,7 @@ async fn an_allowed_approval_carries_the_matching_rule() {
             policy,
             max_steps: 32,
             labels: Default::default(),
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     )
     .drive(ctx.clone())
@@ -282,6 +284,7 @@ async fn the_step_budget_stops_before_a_turn_opens() {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 0,
             labels: Default::default(),
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     )
     .drive(ctx.clone())
@@ -401,6 +404,7 @@ async fn a_tool_pre_deny_flips_an_allowed_call_to_policy_hook() {
             policy,
             max_steps: 32,
             labels: Default::default(),
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     )
     .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)
@@ -570,4 +574,119 @@ async fn a_non_json_capture_is_an_honest_soft_failure() {
         }
         other => panic!("expected SoftFailed, got {other:?}"),
     }
+}
+
+/// ADR-044: an open step that produces no progress costs one honest soft failure at the bound,
+/// never a parked drain.
+#[tokio::test]
+async fn an_open_step_that_goes_silent_ends_in_a_soft_failure_at_the_bound() {
+    let dir = scratch("step-stall");
+    let script = write_script(
+        &dir,
+        "stall.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}}"#,
+            r#"{"op":"sleep","ms":60000}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let config = BridgeDriverConfig {
+        policy: ApprovalPolicy::deny_all(),
+        max_steps: 32,
+        step_timeout_ms: 300,
+        labels: Default::default(),
+    };
+    let started = std::time::Instant::now();
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), config)
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the bound must fire promptly"
+    );
+    match outcomes.as_slice() {
+        [LoopOutcome::SoftFailed { reason }] => {
+            assert!(reason.contains("step bound"), "{reason}");
+        }
+        other => panic!("expected one SoftFailed, got {other:?}"),
+    }
+    // The child's pre-stall message is kept; nothing fabricates a completion or an end write.
+    assert!(
+        ctx.committed()
+            .iter()
+            .any(|e| e.kind == EventKind::AssistantMessage)
+    );
+    assert!(
+        !ctx.committed()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::SessionEnded { .. }))
+    );
+}
+
+/// ADR-044: the bound is per gap, not a total step cap — a step that keeps talking is not cut.
+#[tokio::test]
+async fn a_step_that_keeps_making_progress_is_not_cut() {
+    let dir = scratch("step-progress");
+    let script = write_script(
+        &dir,
+        "progress.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"one"}]}}}"#,
+            r#"{"op":"sleep","ms":100}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"two"}]}}}"#,
+            r#"{"op":"sleep","ms":100}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let config = BridgeDriverConfig {
+        policy: ApprovalPolicy::deny_all(),
+        max_steps: 32,
+        step_timeout_ms: 400,
+        labels: Default::default(),
+    };
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), config)
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+}
+
+/// ADR-044: `0` is the documented opt-out — the pre-ADR unbounded wait.
+#[tokio::test]
+async fn zero_step_timeout_disables_the_bound() {
+    let dir = scratch("step-off");
+    let script = write_script(
+        &dir,
+        "off.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"slow"}]}}}"#,
+            r#"{"op":"sleep","ms":600}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let config = BridgeDriverConfig {
+        policy: ApprovalPolicy::deny_all(),
+        max_steps: 32,
+        step_timeout_ms: 0,
+        labels: Default::default(),
+    };
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), config)
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
 }

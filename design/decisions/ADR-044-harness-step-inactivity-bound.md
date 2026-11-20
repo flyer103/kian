@@ -1,6 +1,6 @@
 # ADR-044: A harness step is bounded — no unbounded open-step wait on the bridge drivers
 
-- **Status**: proposed (owner gate, 2026-11-20)
+- **Status**: accepted (owner gate, 2026-11-20)
 - **Date**: 2026-11-20
 - **Context**: after [ADR-041](ADR-041-bounded-model-calls-and-crash-containment.md) closed the
   unbounded *model call*, an audit of every external wait on the drain path found exactly one
@@ -39,7 +39,11 @@
 
   1. **One additive config key, one semantic: child liveness.** `superagent.harness.<name>`
      gains `step_timeout_ms` (default `1_800_000` = 30 min; minimum `10_000`; `0` disables the
-     bound). It bounds the time an *open* harness step may pass with neither an event from the
+     bound; a value between `1` and `9_999` refuses boot rather than reintroducing a smaller
+     livelock). The knob is **per harness** — the same layer as `max_steps` /
+     `startup_timeout_ms`, resolved at mount time; a deployment that needs different bounds for
+     one long-build bridge and one interactive bridge configures two harness sections (a
+     per-worker-template knob would duplicate the config grammar for no semantic gain). It bounds the time an *open* harness step may pass with neither an event from the
      child nor a completed control write to it. The knob deliberately covers both the event read
      and the control write: they are the same question ("is the child still responding?"), not two
      semantics, so ADR-030's one-knob-for-one-semantic rule holds.
@@ -129,6 +133,10 @@
     measured across real long-running tools; it is configurable per deployment.
   - Whether a child that ignores SIGKILL-on-drop can leave any OS-level residue is out of scope
     here (the existing pump's kill path is unchanged).
+  - The blocked-*pipe*-write shape (a control payload larger than the OS pipe buffer against a
+    child that never reads) is covered at the wrapper level (the bound unit test); its
+    end-to-end integration is covered by the open-step read bound, not by a dedicated
+    pipe-saturation test.
 
 - **Verification map**:
   | Given | When | Then | Level |
@@ -137,5 +145,5 @@
   | a session that yields one event per short interval | the same bound (short test value) | the step is not cut | L1 |
   | a child whose stdin write blocks | a control frame is sent | `SoftFailed` at the bound; the input row stays durable | L1 |
   | `step_timeout_ms: 0` | a stalled session | pre-ADR unbounded behavior (opt-out works) | L1 |
-  | a fixture peer that stalls after its `ready` handshake | real `kian serve` + bridge session | the session ends `failed` within the bound; a bound worker's slot is reclaimed | L2 |
+  | a fixture peer that stalls after its `ready` handshake | real `kian serve` + mounted bridge session | the session ends `failed` within the bound, no fabricated `turn/end`, and the process stays healthy; the ADR-041 reclaim then frees any bound worker slot (the reclaim composition itself is proven in ADR-041's L2) | L2 |
   | timeout vs mapped `Exit` racing | the child exits at the deadline | exactly one `session/ended` | L1 |

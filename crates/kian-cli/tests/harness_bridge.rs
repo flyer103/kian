@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use common::{force_no_proxy, spawn_mock_provider, temp_dir};
-use kian_core::events::{Event, EventKind};
+use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::SessionId;
 use kian_store::EventStore;
 use serde_json::json;
@@ -38,7 +38,12 @@ fn write_config(
     provider_base: &str,
     listen: &str,
     script: &str,
+    step_timeout_ms: Option<u64>,
 ) -> PathBuf {
+    let step_bound = match step_timeout_ms {
+        Some(ms) => format!("      step_timeout_ms: {ms}\n"),
+        None => String::new(),
+    };
     let yaml = format!(
         r#"listen: "{listen}"
 storage:
@@ -88,7 +93,7 @@ superagent:
     claude:
       command: "{peer}"
       args: ["{script}"]
-drain:
+{step_bound}drain:
   max_iterations: 8
   lease_ttl_ms: 500
   heartbeat_interval_ms: 200
@@ -107,6 +112,7 @@ plugins: ["openai-compat", "local-tools", "superagent"]
 "#,
         KEY = common::KEY_ENV,
         peer = fixture_peer().display(),
+        step_bound = step_bound,
         sqlite_path = sqlite.display(),
         root = dir.display(),
     );
@@ -222,6 +228,7 @@ async fn claude_worker_chains_map_and_settle_without_step_request() {
         &provider_base,
         &format!("127.0.0.1:{port}"),
         script.to_str().unwrap(),
+        None,
     );
     let child = spawn_serve(&config);
     assert!(wait_ready(&base).await, "serve never became ready");
@@ -330,6 +337,7 @@ async fn boot(
         provider,
         &format!("127.0.0.1:{port}"),
         script.to_str().unwrap(),
+        None,
     );
     let child = spawn_serve(&config);
     assert!(wait_ready(&base).await, "serve never became ready");
@@ -383,6 +391,7 @@ async fn a_kill_9_mid_turn_ends_the_bridged_session_honestly() {
             &provider_base,
             &format!("127.0.0.1:{port}"),
             hold.to_str().unwrap(),
+            None,
         );
         let child = spawn_serve(&config);
         assert!(
@@ -431,4 +440,92 @@ async fn a_kill_9_mid_turn_ends_the_bridged_session_honestly() {
 
     child2.kill().await.expect("kill serve");
     let _ = child2.wait().await;
+}
+
+/// ADR-044 L2: a mounted harness child that stops talking mid-turn ends the session honestly
+/// within the configured open-step bound. Before the bound this parked the drain (and would have
+/// held a bound worker's slot) until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_harness_step_ends_the_session_within_the_bound() {
+    force_no_proxy();
+    let dir = temp_dir("harness-step-stall");
+    let sqlite = dir.join("kian.sqlite");
+    let script = dir.join("stall.jsonl");
+    std::fs::write(
+        &script,
+        [
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}}"#,
+            r#"{"op":"sleep","ms":60000}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write stall script");
+    let (provider_base, _mock) = spawn_mock_provider(0).await;
+    let port = free_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let config = write_config(
+        &dir,
+        &sqlite,
+        &provider_base,
+        &format!("127.0.0.1:{port}"),
+        script.to_str().unwrap(),
+        // The config floor is 10 s (ADR-044): a too-small bound refuses boot by design.
+        Some(10_000),
+    );
+    let child = spawn_serve(&config);
+    assert!(wait_ready(&base).await, "serve never became ready");
+
+    let client = reqwest::Client::new();
+    let out = rpc(&client, &base, "create_session", json!({})).await;
+    let sid = out["result"]["session"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let session = SessionId(uuid::Uuid::parse_str(&sid).unwrap());
+    let out = rpc(
+        &client,
+        &base,
+        "submit",
+        json!({"session": sid, "content": delegation_task()}),
+    )
+    .await;
+    assert_eq!(out["result"]["deduplicated"], false, "submit: {out}");
+
+    let store = EventStore::open(&sqlite).await.expect("open store");
+    let ended = wait_events(&store, session, 20_000, |events| {
+        matches!(
+            events.last().map(|e| &e.kind),
+            Some(EventKind::SessionEnded {
+                reason: EndReason::Failed
+            })
+        )
+    })
+    .await;
+    assert!(
+        ended,
+        "the stalled harness step must end the session honestly as failed"
+    );
+    let events = store.rebuild(session).await.expect("rebuild");
+    assert!(
+        events.iter().any(|e| e.kind == EventKind::AssistantMessage),
+        "the pre-stall mapped message is kept: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::TurnEnd))
+            .count(),
+        0,
+        "the driver must not fabricate a turn/end on the bound: {events:?}"
+    );
+
+    // The process stays healthy after the bound fired.
+    let out = rpc(&client, &base, "create_session", json!({})).await;
+    assert!(
+        out["result"]["session"].as_str().is_some(),
+        "server healthy: {out}"
+    );
+    drop(child);
 }

@@ -42,6 +42,12 @@ use crate::event::{
 /// 6: wakes may fold, be lost or race, so the drain never depends on one to make progress.
 pub const IDLE_INPUT_RECHECK: Duration = Duration::from_millis(50);
 
+/// Default open-step inactivity bound (HARNESS-BRIDGE §4.5, ADR-044): how long an open harness
+/// step may produce no progress (no protocol event, no completed control write) before the child
+/// is declared unresponsive. Generous on purpose — the bound ends a dead bridge, it does not
+/// police a slow one; operators on longer silent tools raise it. `0` disables the bound.
+pub const DEFAULT_STEP_TIMEOUT_MS: u64 = 1_800_000;
+
 /// Driver configuration (assembly-owned).
 #[derive(Debug, Clone)]
 pub struct BridgeDriverConfig {
@@ -51,6 +57,8 @@ pub struct BridgeDriverConfig {
     pub max_steps: u64,
     /// The audit labels stamped on captured `step/request` payloads (HARNESS-BRIDGE §5.4).
     pub labels: MapLabels,
+    /// Open-step inactivity bound in milliseconds (HARNESS-BRIDGE §4.5, ADR-044). `0` disables.
+    pub step_timeout_ms: u64,
 }
 
 impl Default for BridgeDriverConfig {
@@ -59,6 +67,7 @@ impl Default for BridgeDriverConfig {
             policy: ApprovalPolicy::deny_all(),
             max_steps: 32,
             labels: MapLabels::default(),
+            step_timeout_ms: DEFAULT_STEP_TIMEOUT_MS,
         }
     }
 }
@@ -368,6 +377,12 @@ impl BridgeDriver {
         }
     }
 
+    /// The configured open-step inactivity bound; `None` when disabled (`0`).
+    fn step_bound(&self) -> Option<Duration> {
+        (self.inner.config.step_timeout_ms > 0)
+            .then(|| Duration::from_millis(self.inner.config.step_timeout_ms))
+    }
+
     async fn step(&self, state: St) -> Step {
         match state {
             St::Done => Step::End,
@@ -391,6 +406,7 @@ impl BridgeDriver {
 
     /// Continues a parked session or spawns a fresh child, then runs.
     async fn episode(&self, ctx: Arc<dyn BridgeCtx>) -> (LoopOutcome, St) {
+        let bound = self.step_bound();
         let session = ctx.session();
         if let Some(live) = self.take(session) {
             let steps = count_steps(&ctx).await;
@@ -425,13 +441,8 @@ impl BridgeDriver {
         // The engine promotes the batch into `input/admitted` before `drive`; deliver those
         // (the drain's own take at the first safe boundary would find an empty inbox).
         for payload in fresh_promotions(&events) {
-            if let Err(e) = deliver(&mut live, &payload).await {
-                return (
-                    LoopOutcome::SoftFailed {
-                        reason: format!("bridge input delivery: {e}"),
-                    },
-                    St::Done,
-                );
+            if let Err(reason) = deliver(&mut live, &payload, bound).await {
+                return (LoopOutcome::SoftFailed { reason }, St::Done);
             }
             live.pending_inputs += 1;
         }
@@ -445,17 +456,28 @@ impl BridgeDriver {
         mut live: LiveSession,
         steps_in_stream: u64,
     ) -> (LoopOutcome, St) {
+        let bound = self.step_bound();
         loop {
             if !live.turn_open {
                 if ctx.interrupt_requested() && !live.interrupt_sent {
                     live.interrupt_sent = true;
-                    if let Err(e) = live.session.send(Control::Interrupt).await {
-                        return (
-                            LoopOutcome::SoftFailed {
-                                reason: format!("bridge interrupt: {e}"),
-                            },
-                            St::Done,
-                        );
+                    match within_step_bound(
+                        bound,
+                        "interrupt control write",
+                        live.session.send(Control::Interrupt),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            return (
+                                LoopOutcome::SoftFailed {
+                                    reason: format!("bridge interrupt: {e}"),
+                                },
+                                St::Done,
+                            );
+                        }
+                        Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
                     }
                 }
                 let rows = match ctx.take_eligible_inputs().await {
@@ -465,13 +487,8 @@ impl BridgeDriver {
                 for row in rows {
                     let payload = consumption_payload(&row.payload);
                     live.dedup.add(EventKind::InputAdmitted, payload.clone());
-                    if let Err(e) = deliver(&mut live, &payload).await {
-                        return (
-                            LoopOutcome::SoftFailed {
-                                reason: format!("bridge input delivery: {e}"),
-                            },
-                            St::Done,
-                        );
+                    if let Err(reason) = deliver(&mut live, &payload, bound).await {
+                        return (LoopOutcome::SoftFailed { reason }, St::Done);
                     }
                     live.pending_inputs += 1;
                 }
@@ -542,7 +559,12 @@ impl BridgeDriver {
                 }
             }
             let event = if live.turn_open {
-                live.session.next().await
+                match within_step_bound(bound, "step (no protocol event)", live.session.next())
+                    .await
+                {
+                    Ok(event) => event,
+                    Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
+                }
             } else {
                 // Folded/lost wake safety: at an idle safe boundary the child may legitimately
                 // stay silent until we deliver the next input, so re-check on a bounded tick.
@@ -674,13 +696,19 @@ impl BridgeDriver {
                         matched,
                         reason,
                     };
-                    if let Err(e) = live.session.answer(answer).await {
-                        return (
-                            LoopOutcome::SoftFailed {
-                                reason: format!("bridge approval answer: {e}"),
-                            },
-                            St::Done,
-                        );
+                    match within_step_bound(bound, "approval answer", live.session.answer(answer))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            return (
+                                LoopOutcome::SoftFailed {
+                                    reason: format!("bridge approval answer: {e}"),
+                                },
+                                St::Done,
+                            );
+                        }
+                        Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
                     }
                 }
                 Ok(SessionEvent::Exit { code }) => {
@@ -710,7 +738,11 @@ enum Step {
 }
 
 /// Delivers one admitted payload as the harness's control frame.
-async fn deliver(live: &mut LiveSession, payload: &Value) -> Result<(), ContractError> {
+async fn deliver(
+    live: &mut LiveSession,
+    payload: &Value,
+    bound: Option<Duration>,
+) -> Result<(), String> {
     let key = serde_json::to_string(payload).unwrap_or_default();
     if live.delivered.contains(&key) {
         return Ok(());
@@ -721,9 +753,41 @@ async fn deliver(live: &mut LiveSession, payload: &Value) -> Result<(), Contract
     } else {
         Control::Input { content }
     };
-    live.session.send(control).await?;
+    match within_step_bound(
+        bound,
+        "input delivery (control write)",
+        live.session.send(control),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("bridge control write: {e}")),
+        Err(reason) => return Err(reason),
+    }
     live.delivered.insert(key);
     Ok(())
+}
+
+/// Bounds one wait on the harness child by the configured open-step inactivity bound (ADR-044).
+///
+/// `step_timeout_ms = 0` disables the bound (the pre-ADR wait). The `Err` is the driver's honest
+/// `SoftFailed` reason: the child is unresponsive, never "completed".
+async fn within_step_bound<T>(
+    bound: Option<Duration>,
+    what: &'static str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let Some(bound) = bound else {
+        return Ok(fut.await);
+    };
+    match tokio::time::timeout(bound, fut).await {
+        Ok(value) => Ok(value),
+        Err(_) => Err(format!(
+            "harness {what}: no progress within the step bound ({} ms, HARNESS-BRIDGE §4.5, \
+             ADR-044) — the child is unresponsive; ending honestly",
+            bound.as_millis()
+        )),
+    }
 }
 
 /// The engine's row→message convention (mirrors the orchestrator's consumption plan).
@@ -791,5 +855,35 @@ fn soft(what: &str, e: BridgeCtxError) -> LoopOutcome {
 fn contract_error(e: ContractError) -> LoopOutcome {
     LoopOutcome::SoftFailed {
         reason: format!("bridge contract: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-044: the bound passes progress through, is disabled by `0`, and names itself in the
+    /// honest failure when the child goes silent.
+    #[tokio::test]
+    async fn within_step_bound_passes_progress_through_and_names_the_bound() {
+        assert_eq!(
+            within_step_bound(Some(Duration::from_millis(500)), "x", async { 7 }).await,
+            Ok(7)
+        );
+        assert_eq!(
+            within_step_bound(None, "x", async { 8 }).await,
+            Ok(8),
+            "`0` disables the bound"
+        );
+        let err = within_step_bound(
+            Some(Duration::from_millis(30)),
+            "control write",
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("silence must be bounded");
+        assert!(err.contains("control write"), "{err}");
+        assert!(err.contains("step bound"), "{err}");
+        assert!(err.contains("ADR-044"), "{err}");
     }
 }

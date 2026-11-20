@@ -137,6 +137,7 @@ async fn a_tool_pre_deny_flips_an_allowed_command_to_policy_hook() {
             policy,
             max_steps: 32,
             labels: Default::default(),
+            step_timeout_ms: kian_harness::driver::DEFAULT_STEP_TIMEOUT_MS,
         },
     )
     .with_tool_pre_port(Arc::new(DenyAll) as Arc<dyn kian_harness::ToolPrePort>)

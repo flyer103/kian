@@ -953,6 +953,7 @@ impl Server {
                             policy: mount.policy,
                             max_steps: mount.max_steps,
                             labels,
+                            step_timeout_ms: mount.step_timeout_ms,
                         },
                     )
                     .with_tool_pre_port(std::sync::Arc::new(

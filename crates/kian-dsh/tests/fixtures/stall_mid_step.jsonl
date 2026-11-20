@@ -1,0 +1,5 @@
+{"op":"send","frame":{"v":0,"type":"ready","logical_format":0}}
+{"op":"expect","frame":{"v":0,"type":"input","content":{"text":"deploy the service"}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"turn/start","payload":{},"ts":1761900000001}}}
+{"op":"send","frame":{"v":0,"type":"session-event","event":{"kind":"step/start","payload":{},"ts":1761900000002}}}
+{"op":"sleep","ms":60000}
