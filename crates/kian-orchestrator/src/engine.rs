@@ -240,6 +240,24 @@ pub enum ReleaseOutcome {
     Unknown,
 }
 
+/// The outcome of [`Engine::rotate_idle`] (ADR-040 phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotateOutcome {
+    /// The idle live session was retired: the claim + terminal
+    /// `session/ended{rotated}` batch landed atomically.
+    Rotated { seq: u64, epoch: u64 },
+    /// The session is already terminal — nothing was written.
+    AlreadyTerminal,
+    /// A drain holds the session, or a fresh lease on another replica
+    /// blocked the claim — nothing was written; retry later.
+    Busy,
+    /// The session is running, has eligible input, or never existed —
+    /// nothing was written.
+    NotEligible,
+    /// No event stream exists for the session.
+    Unknown,
+}
+
 /// The in-map handle for one draining session. Presence in
 /// `DashMap<SessionId, DrainHandle>` *is* "a drain is in flight".
 #[derive(Debug)]
@@ -1094,6 +1112,110 @@ where
             self.wake(session);
         }
         outcome
+    }
+
+    /// Retires an **idle, live** resident session by rotation (ADR-040
+    /// phase 2): one claim + `drain/claimed` + `session/ended{rotated}`
+    /// in one atomic batch, under a fresh epoch. This is the operator
+    /// action behind the runtime rotation ticker: the caller owns the
+    /// rotation *policy* (the threshold and the successor bootstrap);
+    /// the engine only guarantees the atomic close.
+    ///
+    /// Fail-closed gates, all before the claim: the projection is
+    /// `idle` (running is a takeover, never a rotation), no drain is in
+    /// flight, and the claim is free. Unlike a release, an eligible
+    /// inbox row does **not** block the rotation: the row is durable
+    /// and stays on the frozen predecessor, and the caller (the
+    /// rotation planner) re-admits it to the successor after the close
+    /// — the engine only owns the atomic end. The claim then fences a
+    /// live holder on another replica. The batch is one transaction: a crash before it leaves
+    /// the projection `idle` (retryable), never a half-close.
+    pub async fn rotate_idle(
+        &self,
+        session: SessionId,
+        end_bytes: Value,
+    ) -> Result<RotateOutcome, EngineError> {
+        match self.drains.entry(session) {
+            Entry::Occupied(_) => return Ok(RotateOutcome::Busy),
+            Entry::Vacant(v) => {
+                v.insert(DrainHandle::new(session, self.clock.now_ms()));
+            }
+        }
+        let outcome = self.rotate_idle_inner(session, end_bytes).await;
+        self.drains.remove(&session);
+        if !matches!(outcome, Ok(RotateOutcome::Rotated { .. })) && self.wakes.take(&session) {
+            // A wake folded onto this rotation (e.g. a submit raced it):
+            // the session is still open, so re-drive it — a folded wake
+            // must never be lost (constraint 6).
+            self.wake(session);
+        }
+        outcome
+    }
+
+    async fn rotate_idle_inner(
+        &self,
+        session: SessionId,
+        end_bytes: Value,
+    ) -> Result<RotateOutcome, EngineError> {
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(RotateOutcome::Unknown);
+        }
+        let state = project(&events)?;
+        if state.is_terminal() {
+            return Ok(RotateOutcome::AlreadyTerminal);
+        }
+        if state != SessionState::Idle {
+            return Ok(RotateOutcome::NotEligible);
+        }
+        let now = self.clock.now_ms();
+        let lease = match self
+            .store
+            .claim(session, &self.config.holder, self.config.lease_ttl_ms, now)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(kian_store::InboxError::ClaimRejected { .. }) => return Ok(RotateOutcome::Busy),
+            Err(e) => return Err(e.into()),
+        };
+        let head = self.store.head(session).await?;
+        let claim = Event {
+            seq: head.next_seq,
+            session,
+            epoch: lease.epoch,
+            ts: now,
+            kind: EventKind::DrainClaimed,
+            bytes: json!({"holder": self.config.holder, "epoch": lease.epoch.0}),
+            version: SCHEMA_VERSION,
+        };
+        let end = Event {
+            seq: head.next_seq + 1,
+            session,
+            epoch: lease.epoch,
+            ts: now,
+            kind: EventKind::SessionEnded {
+                reason: EndReason::Rotated,
+            },
+            bytes: end_bytes,
+            version: SCHEMA_VERSION,
+        };
+        self.store
+            .append_batch(
+                session,
+                &[claim, end],
+                AppendGuard {
+                    epoch: lease.epoch,
+                    expected_seq: head.next_seq,
+                },
+            )
+            .await?;
+        self.metrics.on_state_transition();
+        self.metrics.on_state_transition();
+        self.metrics.on_end_write();
+        Ok(RotateOutcome::Rotated {
+            seq: head.next_seq + 1,
+            epoch: lease.epoch.0,
+        })
     }
 
     async fn release_idle_inner(

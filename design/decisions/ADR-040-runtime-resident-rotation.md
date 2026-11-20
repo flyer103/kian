@@ -50,9 +50,18 @@ rotation trigger and the end reason).
   spawn identity, task ids), the recall reader, the runtime's metrics view and the child-timeout
   walk root. Behavior-identical: with no rotation the id never changes; the bundle tests construct
   the binding from the same session they always passed.
-- **Phase 2 — not started.** Runtime rotation at a proven-idle boundary, serialized by a reserved
-  control row inside the drain, with the input-migration rule and the successor re-point of every
-  surface.
+- **Phase 2 — landed (2026-11-20).** Runtime rotation between restarts: a serve ticker (the
+  `drain.heartbeat_interval_ms` beat, clamped to [1s, 60s]) calls the planner when
+  `superagent.router.rotate_after_events` is set. The planner gates on `idle` and the threshold,
+  retires the predecessor with the engine's new atomic `rotate_idle` close (one `drain/claimed` +
+  `session/ended{rotated}` batch, claim-fenced; unlike a release, a pending row does not block it —
+  the row stays durable on the frozen predecessor), injects the memory index into the fresh
+  successor, swaps the shared binding (every phase-1 consumer re-points), re-admits the rows that
+  were on the predecessor (and any that raced the close), admits the bounded handoff, then admits
+  the successor's judge prompt (its wake starts the successor's first drain). The predecessor's
+  driver, inbox and worker sides all read the binding, so no restart is involved. This supersedes
+  the reserved-control-row sketch above: the trigger is the operator-side planner, not a control
+  row inside the drain (the close is already an engine-owned atomic write).
 
 ## Decision (the phase-2 design)
 

@@ -1099,10 +1099,11 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
  (cancel/fatal) still re-arm at boot. Runtime re-arm for those explicit ends remains a recorded follow-up — it needs a
  runtime-rebindable Router binding shared by subscriptions, driver routing, tools and worker
  completion reports, which is a separate semantic change. [ADR-040](decisions/ADR-040-runtime-resident-rotation.md)
- accepts it: **phases 0 and 1 are landed** (phase 0: the `rotated` end reason and terminal state,
-the atomic close, the chain re-resolution and the successor's ordered context; phase 1: the shared
-`ResidentBinding` every router-facing surface reads at use time, behavior-identical); **phase 2**
-(runtime rotation at an idle boundary) remains open.
+ accepts it: **all three phases are landed** (phase 0: the `rotated` end reason and terminal state,
+the boot-time atomic close, the chain re-resolution and the successor's ordered context; phase 1:
+the shared `ResidentBinding` every router-facing surface reads at use time; phase 2: the runtime
+rotation between restarts — a serve ticker, the engine's atomic `rotate_idle` close, the memory
+index → migrated rows → handoff → judge prompt order, and the binding swap).
 
 ### 4.7 Bundle domain-policy layer
 

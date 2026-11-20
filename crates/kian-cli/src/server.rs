@@ -165,6 +165,9 @@ pub struct Server {
     /// ticker — interrupt-only, outside every drain; absent arms no
     /// timer at all (M8: feature-off changes nothing).
     child_timeout_maintenance: Option<ChildTimeoutMaintenance>,
+    /// ADR-040 phase 2: the runtime rotation planner (None = the Router
+    /// does not rotate between restarts).
+    resident_rotation: Option<Arc<crate::rotation::RuntimeRotation>>,
     /// The worker binding release plan (ADR-035): present iff worker
     /// binding is configured (an `endpoints:`/`workers:` section opens
     /// the durable command queue). The `release_worker` ops method needs
@@ -485,7 +488,7 @@ impl Server {
         // and handed to `start_services`, which admits the migrated rows
         // and the handoff AFTER the memory index and BEFORE the judge
         // prompt.
-        let mut resident_rotation: Option<crate::rotation::BootRotation> = None;
+        let mut boot_rotation: Option<crate::rotation::BootRotation> = None;
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
             // Super-agent mode: the bundle plugin builds all three
             // loops (router/worker/plain); `react-loop` is absent.
@@ -567,7 +570,7 @@ impl Server {
                             router_pinned.0
                         ))
                     })?;
-                    resident_rotation = rotation;
+                    boot_rotation = rotation;
                 }
             }
             let router_session = router_re_arm.live;
@@ -1161,6 +1164,24 @@ impl Server {
                     engine: Arc::clone(&engine),
                 }) as Arc<dyn kian_superagent::SessionBootstrap>
             });
+        // ADR-040 phase 2: the runtime rotation planner. Armed only when
+        // the superagent Router sets `rotate_after_events`; it holds the
+        // boot profile (cloned per rotation), the memory-index seam, the
+        // mounted residency inbox and the shared live-resident binding.
+        let resident_rotation = match (superagent.as_ref(), superagent_cfg) {
+            (Some(services), Some(sa)) => sa.router.rotate_after_events.map(|threshold| {
+                Arc::new(crate::rotation::RuntimeRotation {
+                    binding: Arc::clone(&services.router_binding),
+                    threshold,
+                    period_ms: config.drain.heartbeat_interval_ms.clamp(1_000, 60_000),
+                    profile: services.profile.clone(),
+                    bootstrap: session_bootstrap.clone(),
+                    router_inbox: Arc::clone(&services.router_inbox),
+                    redactor: memory_redactor.clone(),
+                })
+            }),
+            _ => None,
+        };
         let server = Self {
             engine,
             store,
@@ -1188,6 +1209,7 @@ impl Server {
             // absent the ticker stays unarmed (M8: feature-off arms
             // nothing).
             child_timeout_maintenance: None,
+            resident_rotation,
             worker_release: release_exec_store.map(|exec_store| WorkerReleaseMaintenance {
                 exec_store,
                 after_ms: config
@@ -1238,7 +1260,7 @@ impl Server {
                     server.store.clone(),
                     Arc::clone(&startup_order),
                     server.session_bootstrap.clone(),
-                    resident_rotation,
+                    boot_rotation,
                 )
                 .await
                 .map_err(ServeError::Assembly)?,
@@ -1564,6 +1586,29 @@ impl Server {
                 }
             });
         }
+        // Resident rotation (ADR-040 phase 2): a ticker whose each beat
+        // retires an idle, over-threshold Router and bootstraps the
+        // successor (one atomic close per rotation; the successor's
+        // bootstrap admits the memory index, the migrated rows, the
+        // handoff and the judge prompt before the wake). Strictly outside
+        // every drain; the close's gates refuse a running or busy
+        // session, so a beat with a live Router is a no-op.
+        if let Some(rotation) = self.resident_rotation.clone() {
+            let engine = Arc::clone(&self.engine);
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(rotation.period_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    if let Err(error) = rotation.tick(&engine, &store).await {
+                        tracing::warn!(%error, "resident rotation tick failed");
+                    }
+                }
+            });
+        }
+
         // Worker binding release (ADR-035): a ticker whose each beat
         // reclaims idle-ended worker threads past `workers.release_after_ms`
         // — strictly outside every drain; the tick's only write is the

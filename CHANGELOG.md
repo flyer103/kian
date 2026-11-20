@@ -52,6 +52,20 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   Auto-approved harness tools, subagents and background jobs stay outside the contract (the
   deferred `PreToolUse` shim is phase 3). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
   §4.4; [design/PLUGIN-SPEC.md](design/PLUGIN-SPEC.md) §3.2.5, §3.4.1.
+
+- **Resident rotation between restarts (ADR-040 phase 2)**. With
+  `superagent.router.rotate_after_events` set, a serve ticker (the `drain.heartbeat_interval_ms`
+  beat) retires an idle, over-threshold Router at runtime: the engine's new atomic `rotate_idle`
+  close writes `drain/claimed` + `session/ended{rotated}` in one claim-fenced batch (a pending row
+  does not block the close — it stays durable on the frozen predecessor and is migrated), the
+  deterministic successor receives the memory index, the predecessor's pending rows, a bounded
+  handoff and the judge prompt in that order, and the shared `ResidentBinding` re-points every
+  router-facing surface (driver routing, residency inbox, spawner parent, completion reports,
+  subscription route, tools, recall, child-timeout root) without a restart. Contract:
+  [design/DESIGN.md](design/DESIGN.md) §2.2/§4.6, [docs/SPEC.md](docs/SPEC.md),
+  [ADR-040](design/decisions/ADR-040-runtime-resident-rotation.md).
+
+
 - **Cron: the worktree arm can run any harness (CRON-MODEL §6.2)**. `superagent.cron.harness`
   gains `args` and `raw: true`: the default stays the dsh shape (`args --profile <name> <payload>`,
   profile `headless`), while raw mode appends the scheduled payload to the fixed args
