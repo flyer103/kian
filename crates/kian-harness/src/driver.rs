@@ -239,7 +239,7 @@ impl BridgeDriver {
     }
 }
 
-/// One durable confirmation awaiting delivery/app (ADR-048).
+/// One durable confirmation awaiting delivery/app (ADR-049).
 #[derive(Debug, Clone)]
 struct Deliverable {
     call_id: String,
@@ -270,7 +270,7 @@ struct LiveSession {
     /// The session's capture stream, opened before the child spawns (a request must have a sink
     /// before it can be forwarded).
     capture: Option<Box<dyn CaptureStream>>,
-    /// Durable confirmations found in the stream (ADR-048).
+    /// Durable confirmations found in the stream (ADR-049).
     confirms: Vec<Deliverable>,
 }
 
@@ -515,7 +515,7 @@ impl BridgeDriver {
                     }
                     live.pending_inputs += 1;
                 }
-                // Durable ask (ADR-048): the take above may have consumed the confirm row into a
+                // Durable ask (ADR-049): the take above may have consumed the confirm row into a
                 // control/confirm event; deliver each decision into the resumed conversation.
                 if let Ok(events) = ctx.events().await
                     && !live.turn_open
@@ -982,7 +982,7 @@ fn turn_end_payload(payload: &Value, iteration: u64) -> Value {
 }
 
 /// Closes a delivered but unexercised confirmation with one honest error result so the pending
-/// call never strands the session (ADR-048).
+/// call never strands the session (ADR-049).
 async fn close_unconsumed(
     ctx: &Arc<dyn BridgeCtx>,
     live: &mut LiveSession,
@@ -1023,7 +1023,7 @@ async fn close_unconsumed(
     Ok(())
 }
 
-/// The durable confirmations found in the stream (ADR-048): every pending ask with a decision.
+/// The durable confirmations found in the stream (ADR-049): every pending ask with a decision.
 fn deliverables_of(events: &[Event]) -> Vec<Deliverable> {
     let pending = kian_core::confirmation::pending_calls(events);
     let decisions = kian_core::confirmation::confirmations(events);
@@ -1047,7 +1047,7 @@ fn deliverables_of(events: &[Event]) -> Vec<Deliverable> {
         .collect()
 }
 
-/// The synthetic decision nudge delivered into the resumed conversation (ADR-048).
+/// The synthetic decision nudge delivered into the resumed conversation (ADR-049).
 fn nudge_text(deliverable: &Deliverable) -> String {
     let decision = if deliverable.expired {
         "rejected (the confirmation expired)"

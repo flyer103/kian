@@ -1,4 +1,4 @@
-//! ADR-048: a durable ask records the pending call and answers nothing; the drain settles.
+//! ADR-049: a durable ask records the pending call and answers nothing; the drain settles.
 
 use std::sync::{Arc, Mutex};
 

@@ -940,7 +940,7 @@ pub struct ApprovalsConfig {
     /// Ordered deny rules, evaluated after the allow list.
     #[serde(default)]
     pub deny: Vec<String>,
-    /// Opt in to durable `ask` (ADR-048): `default: ask` records the call as pending and ends
+    /// Opt in to durable `ask` (ADR-049): `default: ask` records the call as pending and ends
     /// `awaiting_input`. Without this flag `ask` refuses boot (fail-closed).
     #[serde(default)]
     pub durable_ask: bool,
@@ -956,7 +956,7 @@ impl ApprovalsConfig {
             Some("ask") => {
                 return Err(invalid(
                     "`approvals.default: ask` requires `approvals.durable_ask: true` \
-                     (HARNESS-BRIDGE §4.4.1, ADR-048)",
+                     (HARNESS-BRIDGE §4.4.1, ADR-049)",
                 ));
             }
             Some(other) => {

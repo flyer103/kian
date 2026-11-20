@@ -1,4 +1,4 @@
-# ADR-048: Durable `ask` for harness tools (experimental, opt-in)
+# ADR-049: Durable `ask` for harness tools (experimental, opt-in)
 
 - **Status**: accepted (owner gate, 2026-11-20).
 - **Context**: phase 1 refuses `ask` on a bridge because the harness process dies with the drain

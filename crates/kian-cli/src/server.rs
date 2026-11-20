@@ -1169,17 +1169,26 @@ impl Server {
         // boot profile (cloned per rotation), the memory-index seam, the
         // mounted residency inbox and the shared live-resident binding.
         let resident_rotation = match (superagent.as_ref(), superagent_cfg) {
-            (Some(services), Some(sa)) => sa.router.rotate_after_events.map(|threshold| {
-                Arc::new(crate::rotation::RuntimeRotation {
-                    binding: Arc::clone(&services.router_binding),
-                    threshold,
-                    period_ms: config.drain.heartbeat_interval_ms.clamp(1_000, 60_000),
-                    profile: services.profile.clone(),
-                    bootstrap: session_bootstrap.clone(),
-                    router_inbox: Arc::clone(&services.router_inbox),
-                    redactor: memory_redactor.clone(),
-                })
-            }),
+            (Some(services), Some(sa)) => match sa.router.rotate_after_events {
+                Some(threshold) => {
+                    let pinned = kian_core::model::SessionId(
+                        uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
+                            ServeError::Assembly("router session id is not a uuid".into())
+                        })?,
+                    );
+                    Some(Arc::new(crate::rotation::RuntimeRotation::new(
+                        pinned,
+                        Arc::clone(&services.router_binding),
+                        threshold,
+                        config.drain.heartbeat_interval_ms.clamp(1_000, 60_000),
+                        services.profile.clone(),
+                        session_bootstrap.clone(),
+                        Arc::clone(&services.router_inbox),
+                        memory_redactor.clone(),
+                    )))
+                }
+                None => None,
+            },
             _ => None,
         };
         let server = Self {

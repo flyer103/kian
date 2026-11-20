@@ -64,7 +64,7 @@ A live run is **recorded here** with: the CLI version, the model, the mapped cha
 outcome (`Settled`/`SoftFailed` and why), and any protocol drift. A green fixture run is not a
 substitute.
 
-## Durable ask (ADR-048, experimental)
+## Durable ask (ADR-049, experimental)
 
 `approvals: { default: ask, durable_ask: true }` records the harness's pending call as a `tool/call`
 with `permission.evaluated:"ask"` and ends the drain `awaiting_input` (no lease, no child). A
@@ -91,7 +91,7 @@ unverified**. A full live captured turn (proxy → real model) is not recorded y
   (`harness.resume`, ADR-047); an interrupted turn is not re-driven — a takeover with no
   undelivered input ends `failed` (the engine's mapping for a lost turn) with a named reason,
   never `completed`, and the next input continues the same conversation;
-- `ask` approvals are opt-in and experimental (`approvals.durable_ask: true`, ADR-048): the
+- `ask` approvals are opt-in and experimental (`approvals.durable_ask: true`, ADR-049): the
   pending call ends `awaiting_input`, a confirm resumes the conversation with a synthetic nudge,
   and only an identical re-issue (tool + arguments digest) is auto-answered; a turn that never
   re-issues closes the call with an honest error result. The live re-issue behaviour is unverified;
