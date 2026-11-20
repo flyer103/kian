@@ -10,7 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use kian_core::events::EventKind;
-use kian_harness::event::{ApprovalAnswer, ApprovalRequest, ContractError, Mapped, SessionEvent};
+use kian_harness::event::{
+    ApprovalAnswer, ApprovalConfirmation, ApprovalRequest, ContractError, Mapped, SessionEvent,
+};
 use serde_json::{Value, json};
 
 /// The adapter's spawn recipe.
@@ -108,6 +110,8 @@ pub struct CodexMapper {
     thread_id: Option<String>,
     turn_id: Option<String>,
     handshakes: usize,
+    /// A durable confirmation per harness item id (ADR-048): its result maps onto the pending call.
+    confirmed: HashMap<String, ApprovalConfirmation>,
 }
 
 impl CodexMapper {
@@ -321,12 +325,22 @@ impl CodexMapper {
                     "exit_code": item.get("exitCode").cloned().unwrap_or(Value::Null),
                 })
             });
+        let mut content = json!({"call_id": item_id, "output": output, "is_error": is_error});
+        let mut payload = json!({"role": "tool", "content": content.clone()});
+        if let Some(stamp) = self.confirmed.remove(item_id) {
+            content["call_id"] = json!(stamp.call_id);
+            payload["content"] = content;
+            payload["confirmation"] = json!({
+                "call_id": stamp.call_id,
+                "decision": if stamp.allow { "approve" } else { "reject" },
+                "requested_by": stamp.requested_by,
+                "answered_at_ms": stamp.answered_at_ms,
+                "expired": stamp.expired,
+            });
+        }
         self.held.push_back(SessionEvent::Mapped(Mapped::Event {
             kind: EventKind::ToolResult,
-            payload: json!({
-                "role": "tool",
-                "content": {"call_id": item_id, "output": output, "is_error": is_error}
-            }),
+            payload,
         }));
     }
 
@@ -376,7 +390,13 @@ impl CodexMapper {
         let (request_id, item_id) = self.awaiting.take().ok_or_else(|| {
             ContractError::Drift("approval answer with no pending request".into())
         })?;
-        self.flush_item(&item_id, Some(answer));
+        if let Some(stamp) = &answer.confirmation {
+            if let Some(item) = self.pending.remove(&item_id) {
+                self.confirmed.insert(item.item_id, stamp.clone());
+            }
+        } else {
+            self.flush_item(&item_id, Some(answer));
+        }
         let decision = if answer.allow { "accept" } else { "decline" };
         Ok(json!({"id": request_id, "result": {"decision": decision}}).to_string())
     }
@@ -558,6 +578,7 @@ mod tests {
                 policy: "configured",
                 matched: "default".into(),
                 reason: None,
+                confirmation: None,
             })
             .expect("answer");
         let parsed: Value = serde_json::from_str(&wire).unwrap();

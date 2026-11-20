@@ -723,3 +723,226 @@ async fn the_cli_session_id_is_persisted_as_the_resume_handle() {
         "the CLI session id is the durable handle"
     );
 }
+
+fn ask_config() -> BridgeDriverConfig {
+    BridgeDriverConfig {
+        policy: kian_harness::approval::ApprovalPolicy {
+            default: kian_harness::approval::Decision::Ask,
+            rules: Vec::new(),
+        },
+        ..BridgeDriverConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn a_confirmation_resumes_and_answers_an_identical_reissue_once() {
+    let dir = scratch("ask-confirm");
+    let first_script = write_script(
+        &dir,
+        "ask1.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let first: Vec<LoopOutcome> = driver(adapter(&first_script), ask_config())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(first, vec![LoopOutcome::Settled], "deferred, nothing ran");
+    assert!(
+        ctx.committed()
+            .iter()
+            .all(|event| event.kind != EventKind::ToolResult),
+        "no effect before the human decision"
+    );
+
+    let intent = kian_core::control::ConfirmIntent {
+        call_id: "t1".to_owned(),
+        decision: kian_core::control::ConfirmDecision::Approve,
+        reason: None,
+        requested_by: Some("test-operator".to_owned()),
+        answered_at_ms: 7,
+        expired: false,
+    };
+    kian_harness::ctx::BridgeCtx::append(&*ctx, EventKind::ControlConfirm, intent.event_payload())
+        .await
+        .expect("seed the durable decision");
+
+    let second_script = write_script(
+        &dir,
+        "ask2.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    ctx.start_new_drain();
+    let second: Vec<LoopOutcome> = driver(adapter(&second_script), ask_config())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(second, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+
+    let events = ctx.committed();
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolCall)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the confirmed call keeps one record; calls: {calls:?}"
+    );
+    assert_eq!(
+        calls[0].bytes.pointer("/permission/evaluated"),
+        Some(&json!("ask")),
+        "the original ask provenance is untouched"
+    );
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].bytes.pointer("/content/call_id"),
+        Some(&json!("t1")),
+        "the result maps onto the pending call"
+    );
+    assert_eq!(
+        results[0].bytes.pointer("/confirmation/decision"),
+        Some(&json!("approve"))
+    );
+    assert_eq!(
+        results[0].bytes.pointer("/confirmation/requested_by"),
+        Some(&json!("test-operator"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::InputAdmitted
+                && event.bytes.pointer("/synthetic") == Some(&json!(true))),
+        "the decision nudge is persisted as synthetic input"
+    );
+}
+
+async fn answered_ask(dir: &std::path::Path) -> Arc<MemoryCtx> {
+    let script = write_script(
+        dir,
+        "ask-defer-again.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
+    ctx.push_input(json!({"text": "hi"}));
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), ask_config())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::Settled]);
+    let intent = kian_core::control::ConfirmIntent {
+        call_id: "t1".to_owned(),
+        decision: kian_core::control::ConfirmDecision::Approve,
+        reason: None,
+        requested_by: Some("test-operator".to_owned()),
+        answered_at_ms: 7,
+        expired: false,
+    };
+    kian_harness::ctx::BridgeCtx::append(&*ctx, EventKind::ControlConfirm, intent.event_payload())
+        .await
+        .expect("seed the durable decision");
+    ctx.start_new_drain();
+    ctx
+}
+
+#[tokio::test]
+async fn a_different_reissue_is_not_auto_approved_and_the_confirmed_call_closes() {
+    let dir = scratch("ask-mismatch");
+    let ctx = answered_ask(&dir).await;
+    let script = write_script(
+        &dir,
+        "ask-mismatch.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pwd"}}]}}}"#,
+            r#"{"op":"send","line":{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"pwd"}}}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), ask_config())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::Settled], "it asks again");
+    let events = ctx.committed();
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolCall)
+        .collect();
+    assert_eq!(calls.len(), 2, "the confirmed t1 and the new t2");
+    let results: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(results.len(), 1, "t1 closed unexercised");
+    assert_eq!(
+        results[0].bytes.pointer("/content/call_id"),
+        Some(&json!("t1"))
+    );
+    assert_eq!(
+        results[0].bytes.pointer("/content/output/reason"),
+        Some(&json!("confirmed call was not re-issued"))
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_never_reissues_closes_the_confirmed_call_honestly() {
+    let dir = scratch("ask-no-reissue");
+    let ctx = answered_ask(&dir).await;
+    let script = write_script(
+        &dir,
+        "ask-no-reissue.jsonl",
+        &[
+            r#"{"op":"send","line":{"type":"system","subtype":"init"}}"#,
+            r#"{"op":"expect_any"}"#,
+            r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,
+            r#"{"op":"eof"}"#,
+        ],
+    );
+    let outcomes: Vec<LoopOutcome> = driver(adapter(&script), ask_config())
+        .drive(ctx.clone())
+        .collect()
+        .await;
+    assert_eq!(outcomes, vec![LoopOutcome::TurnDone, LoopOutcome::Settled]);
+    let results: Vec<_> = ctx
+        .committed()
+        .into_iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].bytes.pointer("/content/output/reason"),
+        Some(&json!("confirmed call was not re-issued"))
+    );
+    assert_eq!(
+        results[0].bytes.pointer("/confirmation/decision"),
+        Some(&json!("approve"))
+    );
+}

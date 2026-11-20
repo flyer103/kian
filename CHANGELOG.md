@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Harness durable `ask` (HARNESS-BRIDGE §4.4.1, CONFIRMATION-MODEL §14c, ADR-048;
+  experimental, opt-in)**. `approvals.durable_ask: true` lets a bridge defer a gated tool to a
+  human: the pending call is recorded with `permission.evaluated:"ask"` and the drain ends
+  `awaiting_input` (no lease, no child). A `confirm` resumes the harness conversation (ADR-047),
+  delivers a persisted synthetic decision nudge, and auto-answers only an identical re-issue
+  (same tool + arguments digest, one-shot) — the single pending call record stays, and the result
+  carries `confirmation` provenance. A different call follows the policy again; a resumed turn
+  that never re-issues closes the pending call with an honest error result, never a fabricated
+  execution or a stranded ask. The harness re-issue behaviour is unverified live (the matrix marks
+  it experimental). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §4.4.1.
+
 - **Harness conversation resume across drains (HARNESS-BRIDGE §4.6, ADR-047)**. A bridged
   session now remembers its harness conversation: the adapter reports the harness's continuation
   handle (Claude `session_id` from `system/init`, Codex thread id from `thread/start`), the driver

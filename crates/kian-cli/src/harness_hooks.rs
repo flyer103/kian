@@ -52,7 +52,7 @@ pub(crate) fn view_for(call: &ToolPreCall) -> ToolCallView {
         arguments_sha256: sha256_hex(&bytes),
         arguments_truncated,
         permission: PermissionView {
-            evaluated: if call.config_allow { "allow" } else { "deny" }.to_owned(),
+            evaluated: call.config_evaluated.to_owned(),
             policy: "configured".to_owned(),
             matched: call.config_matched.clone(),
             reason: None,
@@ -77,7 +77,7 @@ mod tests {
             name: "Bash".into(),
             iteration: 3,
             arguments: json!({"command": "git status"}),
-            config_allow: true,
+            config_evaluated: "allow",
             config_matched: "Bash(*git status*)".into(),
         };
         let view = view_for(&call);

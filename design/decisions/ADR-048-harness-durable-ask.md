@@ -1,6 +1,6 @@
 # ADR-048: Durable `ask` for harness tools (experimental, opt-in)
 
-- **Status**: proposed for the owner gate (2026-11-20).
+- **Status**: accepted (owner gate, 2026-11-20).
 - **Context**: phase 1 refuses `ask` on a bridge because the harness process dies with the drain
   (HARNESS-BRIDGE §4.4/§6.3). The confirmation plane itself is harness-agnostic: a `tool/call`
   recorded with `permission.evaluated:"ask"` and no result makes a settle end `awaiting_input`

@@ -64,6 +64,17 @@ A live run is **recorded here** with: the CLI version, the model, the mapped cha
 outcome (`Settled`/`SoftFailed` and why), and any protocol drift. A green fixture run is not a
 substitute.
 
+## Durable ask (ADR-048, experimental)
+
+`approvals: { default: ask, durable_ask: true }` records the harness's pending call as a `tool/call`
+with `permission.evaluated:"ask"` and ends the drain `awaiting_input` (no lease, no child). A
+`control/confirm` decision resumes the harness conversation (ADR-047), delivers a persisted
+synthetic nudge, and answers only a re-issued request whose tool + argument digest match the pending
+call (one-shot); the result maps onto the pending call with `confirmation` provenance. A different
+call follows the policy; a turn that never re-issues closes the pending call with an honest error
+result. Fixture-tested; **live re-issue behaviour is unverified** (Claude needs a login, Codex
+approval is fixture-only).
+
 ## Request capture (ADR-046)
 
 Enable with `superagent.harness.capture:`; kian starts a loopback proxy and points the harness at
@@ -80,7 +91,10 @@ unverified**. A full live captured turn (proxy → real model) is not recorded y
   (`harness.resume`, ADR-047); an interrupted turn is not re-driven — a takeover with no
   undelivered input ends `failed` (the engine's mapping for a lost turn) with a named reason,
   never `completed`, and the next input continues the same conversation;
-- `ask` approvals refuse boot (phase 2): an allow/deny policy answers the harness's own gate;
+- `ask` approvals are opt-in and experimental (`approvals.durable_ask: true`, ADR-048): the
+  pending call ends `awaiting_input`, a confirm resumes the conversation with a synthetic nudge,
+  and only an identical re-issue (tool + arguments digest) is auto-answered; a turn that never
+  re-issues closes the call with an honest error result. The live re-issue behaviour is unverified;
 - one harness per worker template; a bridge and `endpoints:`/`workers:` are mutually exclusive;
 - cron's worktree arm is still dsh-shaped (`--profile <name> <payload>`); running Claude Code or
   Codex under cron needs the phase-2 argv extension.

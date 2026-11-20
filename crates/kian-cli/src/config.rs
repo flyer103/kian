@@ -940,6 +940,10 @@ pub struct ApprovalsConfig {
     /// Ordered deny rules, evaluated after the allow list.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Opt in to durable `ask` (ADR-048): `default: ask` records the call as pending and ends
+    /// `awaiting_input`. Without this flag `ask` refuses boot (fail-closed).
+    #[serde(default)]
+    pub durable_ask: bool,
 }
 
 impl ApprovalsConfig {
@@ -948,9 +952,11 @@ impl ApprovalsConfig {
         let default = match self.default.as_deref().map(str::trim) {
             None | Some("") | Some("deny") => Decision::Deny,
             Some("allow") => Decision::Allow,
+            Some("ask") if self.durable_ask => Decision::Ask,
             Some("ask") => {
                 return Err(invalid(
-                    "`approvals.default: ask` is phase 2 (HARNESS-BRIDGE §10): a durable human                      answer cannot be delivered to a harness process that died with the drain",
+                    "`approvals.default: ask` requires `approvals.durable_ask: true` \
+                     (HARNESS-BRIDGE §4.4.1, ADR-048)",
                 ));
             }
             Some(other) => {
@@ -964,7 +970,8 @@ impl ApprovalsConfig {
             for text in texts {
                 if text.trim().eq_ignore_ascii_case("ask") {
                     return Err(invalid(
-                        "`ask` approval rules are phase 2 (HARNESS-BRIDGE §10); use allow or deny",
+                        "`ask` rules are not supported: use `approvals.default: ask` with \
+                         `durable_ask: true` (HARNESS-BRIDGE §4.4.1)",
                     ));
                 }
                 rules.push(Rule::parse(text, decision).map_err(invalid)?);
@@ -9427,7 +9434,25 @@ schedules:
             .harness
             .bridge_mount()
             .unwrap_err();
-        assert!(err.to_string().contains("phase 2"), "{err}");
+        assert!(err.to_string().contains("durable_ask"), "{err}");
+
+        let durable = with_harness(
+            "    claude:\n      command: /usr/bin/true\n      approvals:\n        default: ask\n        durable_ask: true\n",
+        );
+        let policy = ServeConfig::parse(&durable)
+            .expect("parses")
+            .superagent
+            .as_ref()
+            .unwrap()
+            .harness
+            .bridge_mount()
+            .expect("mount")
+            .expect("a mounted harness")
+            .policy;
+        assert_eq!(
+            policy.decide("Bash", &serde_json::json!({"command": "ls"})),
+            (kian_harness::approval::Decision::Ask, "default".to_owned())
+        );
 
         let bypass = with_harness(
             "    claude:\n      command: /usr/bin/true\n      args: [\"--permission-mode=bypassPermissions\"]\n",

@@ -35,7 +35,8 @@ use serde_json::{Value, json};
 use crate::approval::{ApprovalPolicy, Decision};
 use crate::ctx::{BridgeCtx, BridgeCtxError};
 use crate::event::{
-    ApprovalAnswer, Capabilities, ContractError, Control, HarnessSession, Mapped, SessionEvent,
+    ApprovalAnswer, ApprovalConfirmation, Capabilities, ContractError, Control, HarnessSession,
+    Mapped, SessionEvent,
 };
 
 /// How often an idle drain re-checks the inbox while waiting for the peer's next line. Constraint
@@ -111,8 +112,8 @@ pub struct ToolPreCall {
     pub name: String,
     pub iteration: u64,
     pub arguments: Value,
-    /// The declarative decision the hook may veto (never widen).
-    pub config_allow: bool,
+    /// The declarative decision the hook may veto (never widen): `"allow"`|`"deny"`|`"ask"`.
+    pub config_evaluated: &'static str,
     pub config_matched: String,
 }
 
@@ -238,6 +239,21 @@ impl BridgeDriver {
     }
 }
 
+/// One durable confirmation awaiting delivery/app (ADR-048).
+#[derive(Debug, Clone)]
+struct Deliverable {
+    call_id: String,
+    tool: String,
+    /// The pending call's arguments, canonicalized by `serde_json` (object keys sorted).
+    arguments_json: String,
+    allow: bool,
+    requested_by: Option<String>,
+    answered_at_ms: u64,
+    expired: bool,
+    delivered: bool,
+    consumed: bool,
+}
+
 /// One live bridge: the child plus the per-episode derived state.
 struct LiveSession {
     session: Box<dyn HarnessSession>,
@@ -254,6 +270,8 @@ struct LiveSession {
     /// The session's capture stream, opened before the child spawns (a request must have a sink
     /// before it can be forwarded).
     capture: Option<Box<dyn CaptureStream>>,
+    /// Durable confirmations found in the stream (ADR-048).
+    confirms: Vec<Deliverable>,
 }
 
 impl LiveSession {
@@ -269,6 +287,7 @@ impl LiveSession {
             interrupt_sent: false,
             tool_names: BTreeMap::new(),
             capture: None,
+            confirms: Vec::new(),
         }
     }
 }
@@ -326,7 +345,7 @@ enum St {
     Start(Arc<dyn BridgeCtx>),
     Next {
         ctx: Arc<dyn BridgeCtx>,
-        parked: Parked,
+        parked: Box<Parked>,
         steps_in_stream: u64,
     },
     Done,
@@ -441,6 +460,7 @@ impl BridgeDriver {
             Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
         };
         live.capture = capture;
+        live.confirms = deliverables_of(&events);
         // The engine promotes the batch into `input/admitted` before `drive`; deliver those
         // (the drain's own take at the first safe boundary would find an empty inbox).
         for payload in fresh_promotions(&events) {
@@ -493,6 +513,57 @@ impl BridgeDriver {
                     if let Err(reason) = deliver(&mut live, &payload, bound).await {
                         return (LoopOutcome::SoftFailed { reason }, St::Done);
                     }
+                    live.pending_inputs += 1;
+                }
+                // Durable ask (ADR-048): the take above may have consumed the confirm row into a
+                // control/confirm event; deliver each decision into the resumed conversation.
+                if let Ok(events) = ctx.events().await
+                    && !live.turn_open
+                {
+                    for deliverable in deliverables_of(&events) {
+                        if !live
+                            .confirms
+                            .iter()
+                            .any(|known| known.call_id == deliverable.call_id)
+                        {
+                            live.confirms.push(deliverable);
+                        }
+                    }
+                }
+                let undelivered: Vec<usize> = live
+                    .confirms
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, deliverable)| !deliverable.delivered)
+                    .map(|(index, _)| index)
+                    .collect();
+                for index in undelivered {
+                    let text = nudge_text(&live.confirms[index]);
+                    let content = json!({"text": text});
+                    let payload =
+                        json!({"role": "user", "content": content.clone(), "synthetic": true});
+                    if let Err(e) = ctx.append(EventKind::InputAdmitted, payload).await {
+                        return (soft("confirmation nudge append", e), St::Done);
+                    }
+                    match within_step_bound(
+                        bound,
+                        "confirmation nudge",
+                        live.session.send(Control::Steer { content }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            return (
+                                LoopOutcome::SoftFailed {
+                                    reason: format!("confirmation nudge: {e}"),
+                                },
+                                St::Done,
+                            );
+                        }
+                        Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
+                    }
+                    live.confirms[index].delivered = true;
                     live.pending_inputs += 1;
                 }
                 if live.pending_inputs > 0 {
@@ -591,6 +662,9 @@ impl BridgeDriver {
                         );
                     }
                     if kind == EventKind::TurnEnd {
+                        if let Err(e) = close_unconsumed(&ctx, &mut live).await {
+                            return (soft("confirmation close-out", e), St::Done);
+                        }
                         let mut payload = turn_end_payload(&payload, live.turn_iteration);
                         if let Some(handle) = live.session.resume_handle() {
                             payload["harness"] = json!({"resume": handle});
@@ -604,11 +678,11 @@ impl BridgeDriver {
                             LoopOutcome::TurnDone,
                             St::Next {
                                 ctx,
-                                parked: Parked {
+                                parked: Box::new(Parked {
                                     driver: self.clone_ref(),
                                     session,
                                     live: Mutex::new(Some(live)),
-                                },
+                                }),
                                 steps_in_stream,
                             },
                         );
@@ -660,6 +734,48 @@ impl BridgeDriver {
                     }
                 }
                 Ok(SessionEvent::Approval(request)) => {
+                    let arguments_json = serde_json::to_string(&request.input).unwrap_or_default();
+                    if let Some(index) = live.confirms.iter().position(|deliverable| {
+                        deliverable.delivered
+                            && !deliverable.consumed
+                            && deliverable.tool == request.tool
+                            && deliverable.arguments_json == arguments_json
+                    }) {
+                        live.confirms[index].consumed = true;
+                        let deliverable = live.confirms[index].clone();
+                        let answer = ApprovalAnswer {
+                            id: request.id.clone(),
+                            allow: deliverable.allow,
+                            policy: "configured",
+                            matched: "confirm".to_owned(),
+                            reason: None,
+                            confirmation: Some(ApprovalConfirmation {
+                                call_id: deliverable.call_id.clone(),
+                                allow: deliverable.allow,
+                                requested_by: deliverable.requested_by.clone(),
+                                answered_at_ms: deliverable.answered_at_ms,
+                                expired: deliverable.expired,
+                            }),
+                        };
+                        match within_step_bound(
+                            bound,
+                            "confirmation answer",
+                            live.session.answer(answer),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => {
+                                return (
+                                    LoopOutcome::SoftFailed {
+                                        reason: format!("confirmation answer: {e}"),
+                                    },
+                                    St::Done,
+                                );
+                            }
+                            Err(reason) => return (LoopOutcome::SoftFailed { reason }, St::Done),
+                        }
+                    }
                     let (decision, matched) = self
                         .inner
                         .config
@@ -680,7 +796,11 @@ impl BridgeDriver {
                                 name: request.tool.clone(),
                                 iteration: live.turn_iteration,
                                 arguments: request.input.clone(),
-                                config_allow: allow,
+                                config_evaluated: match decision {
+                                    Decision::Allow => "allow",
+                                    Decision::Deny => "deny",
+                                    Decision::Ask => "ask",
+                                },
                                 config_matched: matched.clone(),
                             })
                             .await;
@@ -695,12 +815,46 @@ impl BridgeDriver {
                             reason = Some(hook_reason);
                         }
                     }
+                    if decision == Decision::Ask && policy != "hook" {
+                        let Some(call_id) = request.call_id.clone() else {
+                            return (
+                                LoopOutcome::SoftFailed {
+                                    reason: "durable ask: the approval request carried no call id"
+                                        .to_owned(),
+                                },
+                                St::Done,
+                            );
+                        };
+                        let payload = json!({
+                            "role": "assistant",
+                            "content": {
+                                "id": call_id,
+                                "name": request.tool,
+                                "arguments": request.input,
+                            },
+                            "permission": {
+                                "evaluated": "ask",
+                                "policy": "configured",
+                                "matched": matched,
+                            },
+                        });
+                        if let Err(e) = ctx.append(EventKind::ToolCall, payload).await {
+                            return (soft("durable ask record", e), St::Done);
+                        }
+                        if let Err(e) = close_unconsumed(&ctx, &mut live).await {
+                            return (soft("confirmation close-out", e), St::Done);
+                        }
+                        // End the drain: nothing runs, no lease is held, the engine derives
+                        // `awaiting_input` from the pending call.
+                        return (LoopOutcome::Settled, St::Done);
+                    }
                     let answer = ApprovalAnswer {
                         id: request.id.clone(),
                         allow,
                         policy,
                         matched,
                         reason,
+                        confirmation: None,
                     };
                     match within_step_bound(bound, "approval answer", live.session.answer(answer))
                         .await
@@ -719,6 +873,9 @@ impl BridgeDriver {
                 }
                 Ok(SessionEvent::Exit { code }) => {
                     if live.turn_open {
+                        if let Err(e) = close_unconsumed(&ctx, &mut live).await {
+                            return (soft("confirmation close-out", e), St::Done);
+                        }
                         return (
                             LoopOutcome::SoftFailed {
                                 reason: format!(
@@ -822,6 +979,88 @@ fn turn_end_payload(payload: &Value, iteration: u64) -> Value {
     } else {
         json!({"iteration": iteration})
     }
+}
+
+/// Closes a delivered but unexercised confirmation with one honest error result so the pending
+/// call never strands the session (ADR-048).
+async fn close_unconsumed(
+    ctx: &Arc<dyn BridgeCtx>,
+    live: &mut LiveSession,
+) -> Result<(), BridgeCtxError> {
+    let mut closes = Vec::new();
+    for deliverable in live
+        .confirms
+        .iter_mut()
+        .filter(|deliverable| deliverable.delivered && !deliverable.consumed)
+    {
+        deliverable.consumed = true;
+        closes.push((
+            deliverable.call_id.clone(),
+            deliverable.allow,
+            deliverable.requested_by.clone(),
+            deliverable.answered_at_ms,
+            deliverable.expired,
+        ));
+    }
+    for (call_id, allow, requested_by, answered_at_ms, expired) in closes {
+        let payload = json!({
+            "role": "tool",
+            "content": {
+                "call_id": call_id,
+                "output": {"reason": "confirmed call was not re-issued"},
+                "is_error": true,
+            },
+            "confirmation": {
+                "call_id": call_id,
+                "decision": if allow { "approve" } else { "reject" },
+                "requested_by": requested_by,
+                "answered_at_ms": answered_at_ms,
+                "expired": expired,
+            },
+        });
+        ctx.append(EventKind::ToolResult, payload).await?;
+    }
+    Ok(())
+}
+
+/// The durable confirmations found in the stream (ADR-048): every pending ask with a decision.
+fn deliverables_of(events: &[Event]) -> Vec<Deliverable> {
+    let pending = kian_core::confirmation::pending_calls(events);
+    let decisions = kian_core::confirmation::confirmations(events);
+    pending
+        .into_iter()
+        .filter_map(|call| {
+            let decision = decisions.get(&call.call_id)?;
+            Some(Deliverable {
+                call_id: call.call_id.clone(),
+                tool: call.tool.clone(),
+                arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+                allow: decision.decision == kian_core::control::ConfirmDecision::Approve
+                    && !decision.expired,
+                requested_by: decision.requested_by.clone(),
+                answered_at_ms: decision.answered_at_ms,
+                expired: decision.expired,
+                delivered: false,
+                consumed: false,
+            })
+        })
+        .collect()
+}
+
+/// The synthetic decision nudge delivered into the resumed conversation (ADR-048).
+fn nudge_text(deliverable: &Deliverable) -> String {
+    let decision = if deliverable.expired {
+        "rejected (the confirmation expired)"
+    } else if deliverable.allow {
+        "approved"
+    } else {
+        "rejected"
+    };
+    format!(
+        "The user {} the pending tool call `{}` with arguments {}. Re-issue exactly that call if \
+         it is still needed; otherwise continue.",
+        decision, deliverable.tool, deliverable.arguments_json
+    )
 }
 
 /// The latest persisted harness continuation handle (ADR-047): the last `turn/end` carrying

@@ -29,6 +29,12 @@ pub struct MemoryCtx {
 }
 
 impl MemoryCtx {
+    /// Simulates a new drain on the same stream: the engine creates a fresh drain core, so the
+    /// boundary flag starts clear even after a deferred (mid-turn) ending.
+    pub fn start_new_drain(&self) {
+        self.state.lock().expect("state").in_turn = false;
+    }
+
     #[must_use]
     pub fn new(session: SessionId) -> Self {
         Self {

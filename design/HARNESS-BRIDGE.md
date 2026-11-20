@@ -168,7 +168,8 @@ A harness-initiated approval is a kian decision with a durable record:
 
 1. The adapter surfaces `ApprovalRequest{id, call_id, tool, input}` (the call id is the harness's
    own: Claude `tool_use` id, Codex `itemId`).
-2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` is refused at boot
+2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` only with
+   `approvals.durable_ask: true` (ADR-048; otherwise it refuses boot)
    (no silent downgrade, no deadlocked child).
 3. The driver dispatches `tool/pre` through its port (HARNESS-BRIDGE §4, ADR-045) with a view whose
    `surface` is `"harness"`, `call_id`/`name`/`arguments` from the request, `permission` carrying
@@ -351,7 +352,8 @@ superagent:
       step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044)
       # startup_timeout_ms applies to harnesses with an explicit handshake (codex, dsh), not Claude.
       approvals:                          # §6.3
-        default: deny
+        default: deny                     # allow | deny | ask (ask needs durable_ask)
+        durable_ask: false                # ADR-048: allow `ask` (experimental)
         allow: ["Read", "Bash(git status*)"]
       env: ["ANTHROPIC_API_KEY"]          # names passed through; never logged
       # capture: { upstream: https://api.anthropic.com, max_body_bytes: 8388608 }  # ADR-046

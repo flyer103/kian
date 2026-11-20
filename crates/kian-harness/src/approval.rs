@@ -12,6 +12,9 @@ use serde_json::Value;
 pub enum Decision {
     Allow,
     Deny,
+    /// Defer to a human (durable ask, ADR-048): the call is recorded as pending and the drain
+    /// ends `awaiting_input`. Only an opt-in harness config may produce this decision.
+    Ask,
 }
 
 /// One ordered rule: a tool name, optionally narrowed by an argument glob over the canonical

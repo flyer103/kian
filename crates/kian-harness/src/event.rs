@@ -45,6 +45,18 @@ pub struct ApprovalRequest {
     pub input: Value,
 }
 
+/// The durable confirmation a bridge answer applies (ADR-048): the pending call it closes and
+/// the provenance the adapter stamps on the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalConfirmation {
+    /// The pending `tool/call` id the decision answers.
+    pub call_id: String,
+    pub allow: bool,
+    pub requested_by: Option<String>,
+    pub answered_at_ms: u64,
+    pub expired: bool,
+}
+
 /// The kian decision, delivered back to the harness and recorded as `tool/call.permission`
 /// provenance by the adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +69,9 @@ pub struct ApprovalAnswer {
     pub matched: String,
     /// The hook's denial reason (a hook deny only).
     pub reason: Option<String>,
+    /// Set when the answer applies a durable confirmation (ADR-048): the adapter must not append
+    /// a second `tool/call`; it maps the harness's result onto `call_id` with the provenance.
+    pub confirmation: Option<ApprovalConfirmation>,
 }
 
 /// What one poll of a live harness session produced.

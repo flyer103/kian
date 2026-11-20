@@ -4,7 +4,9 @@
 //! here, so every mapping rule is unit-testable without a child.
 
 use kian_core::events::EventKind;
-use kian_harness::event::{ApprovalAnswer, ApprovalRequest, ContractError, Mapped, SessionEvent};
+use kian_harness::event::{
+    ApprovalAnswer, ApprovalConfirmation, ApprovalRequest, ContractError, Mapped, SessionEvent,
+};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
@@ -77,6 +79,8 @@ struct PendingCall {
 pub struct ClaudeMapper {
     held: VecDeque<SessionEvent>,
     pending: Vec<PendingCall>,
+    /// A durable confirmation per harness call id: the result is mapped onto the pending call.
+    confirmed: std::collections::HashMap<String, ApprovalConfirmation>,
     /// The tool of the approval request currently awaiting an answer.
     awaiting: Option<String>,
     interrupt_sent: bool,
@@ -244,12 +248,26 @@ impl ClaudeMapper {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let output = block.get("content").cloned().unwrap_or(Value::Null);
+            let mut content = json!({
+                "call_id": call_id,
+                "output": output,
+                "is_error": is_error,
+            });
+            let mut payload = json!({"role": "tool", "content": content.clone()});
+            if let Some(stamp) = self.confirmed.remove(call_id) {
+                content["call_id"] = json!(stamp.call_id);
+                payload["content"] = content;
+                payload["confirmation"] = json!({
+                    "call_id": stamp.call_id,
+                    "decision": if stamp.allow { "approve" } else { "reject" },
+                    "requested_by": stamp.requested_by,
+                    "answered_at_ms": stamp.answered_at_ms,
+                    "expired": stamp.expired,
+                });
+            }
             self.held.push_back(SessionEvent::Mapped(Mapped::Event {
                 kind: EventKind::ToolResult,
-                payload: json!({
-                    "role": "tool",
-                    "content": {"call_id": call_id, "output": output, "is_error": is_error}
-                }),
+                payload,
             }));
         }
     }
@@ -332,6 +350,11 @@ impl ClaudeMapper {
             && let Some(pos) = self.pending.iter().position(|c| c.name == tool)
         {
             let call = self.pending.remove(pos);
+            if let Some(stamp) = &answer.confirmation {
+                // The pending `tool/call` already exists: map the harness result onto it.
+                self.confirmed.insert(call.id, stamp.clone());
+                return Ok(approval_line(answer));
+            }
             let mut content = json!({
                 "id": call.id,
                 "name": call.name,
@@ -561,6 +584,7 @@ mod tests {
             policy: "configured",
             matched: "default".into(),
             reason: None,
+            confirmation: None,
         };
         let wire = mapper.answer(&answer).expect("answer line");
         let parsed: Value = serde_json::from_str(&wire).unwrap();
