@@ -163,11 +163,17 @@ when the owner asks. Negative results commit documentation only — never broken
 ## README policy
 
 `README.md` is the landing page, not a changelog and not a manual: a stranger should understand it
-in three minutes and run it in five. Keep this shape, top to bottom: one-liner + problem →
-`## Features` (exactly three bullets, one per core promise — never an
-implementation/storage/deployment metadata list) → `## How it works` (the model, closing with one
-"read more" line) → `## Quickstart` (copy-paste commands that run) → `## Environment contract` →
-`## License`.
+in three minutes and run it in five. Keep this shape, top to bottom: title + status badges →
+one-liner + problem → one recorded demo (GIF, real run) → `## Who this is for` (who it is for and
+the three things it explicitly does not promise) → `## Features` (exactly three bullets, one per
+core promise — never an implementation/storage/deployment metadata list) → `## How it works` (the
+model, closing with one "read more" line) → `## Install` (container / prebuilt binary / source,
+one command each) → `## Quickstart` (copy-paste commands that run) → `## Examples` (one or two
+runnable shapes, each its own README) → `## Environment contract` → `## License`.
+
+Recordings live in `docs/assets/` as both `.gif` (for the README) and `.cast` (replayable with
+`asciinema play`). A GIF must come from a real run against a real binary — never a mocked render of
+what the output would look like.
 
 The long form lives outside the README: `docs/advanced.md` carries the full capability list and one
 runnable snippet per capability; the document map is this file's §Docs map and

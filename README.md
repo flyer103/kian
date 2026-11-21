@@ -1,5 +1,10 @@
 # Kian — the durable execution runtime for agents
 
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![gates](https://github.com/flyer103/kian/actions/workflows/gates.yml/badge.svg)](https://github.com/flyer103/kian/actions/workflows/gates.yml)
+[![release](https://img.shields.io/github/v/release/flyer103/kian?color=green)](https://github.com/flyer103/kian/releases)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
+
 > **An open-source, model-neutral, self-hostable durable execution runtime for agents.** A session
 > survives the process, compute stays on machines you own, and the agent loop stays yours.
 
@@ -8,6 +13,23 @@ structural, not incidental: it dies with its process, it cannot be redirected at
 cannot prove what it did, and it re-pays for its own context on every turn. Kian makes the
 **Session** the durable entity, the **event stream** the only truth, and each execution interval (a
 **drain**) disposable — so a crash, a deploy or a machine move costs a restart, not the work.
+
+![kian: a turn is in flight, the process is killed with kill -9, a new drain takes over and finishes the turn — byte-identical request bytes, epoch 2](docs/assets/durable-execution.gif)
+
+## Who this is for
+
+- You run agent work that takes minutes to hours, and a restart or an OOM currently costs you the
+  whole run.
+- The code, data and credentials have to stay on your machine — a hosted sandbox is not an option.
+- You already have a loop you like (the built-in ReAct, or Claude Code / Codex / dsh) and will not
+  rewrite it for durability.
+
+And what it explicitly does **not** promise, because that shape is wrong for some teams: no
+cross-worker failover (a binding is immutable, moving machines means a new session), no
+exactly-once commands (the queue is at-least-once and results dedupe on command id), no byte-level
+replay for projection-only harnesses (if kian cannot see the request bytes, it will not claim it
+can). Those boundaries are in [docs/SPEC.md](docs/SPEC.md) and the
+[capability matrix](design/HARNESS-BRIDGE.md), not in a footnote.
 
 ## Features
 
@@ -59,21 +81,37 @@ Read more: [docs/overview.md](docs/overview.md) (the model in one page),
 [design/EVENT-MODEL.md](design/EVENT-MODEL.md) and [design/API-CONTRACT.md](design/API-CONTRACT.md)
 (the normative event and wire contracts), [design/decisions/](design/decisions/) (the ADRs).
 
+## Install
+
+Three ways in, fastest first. Each one ends at the same `kian.yaml`.
+
+```bash
+# 1. container (no toolchain; state in a volume)
+docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
+  -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
+  ghcr.io/flyer103/kian
+
+# 2. prebuilt binary (macOS arm64/x86_64 and Linux x86_64/aarch64, on the releases page)
+curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
+  | tar -xz -C /usr/local/bin kian kiand
+
+# 3. from source (Rust stable 1.85+)
+cargo build --release --workspace
+```
+
+The container image and the archives are produced by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) on every tag; the binary path swaps
+the target triple for your platform.
+
 ## Quickstart
 
-Prerequisites: Rust stable 1.85+ (`edition 2024`), plus `curl` and `jq`. Nothing else — sqlite is
-embedded and a single `kian serve` process is the whole system.
+Prerequisites for the source path: Rust stable 1.85+ (`edition 2024`), plus `curl` and `jq`. Nothing
+else — sqlite is embedded and a single `kian serve` process is the whole system.
 
 The provider contract is `base_url` + OpenAI chat-completions + SSE. The config below points at
 DeepSeek (`deepseek-flash`), and any OpenAI-compatible endpoint or gateway works unchanged.
 
-### 1. Build
-
-```bash
-cargo build --workspace
-```
-
-### 2. Write `kian.yaml`
+### 1. Write `kian.yaml`
 
 ```yaml
 listen: "127.0.0.1:7433"
@@ -105,17 +143,17 @@ Two rules are fail-closed: a missing `recovery:` section refuses to start (a pol
 implied), and a provider whose `api_key_env` variable is unset refuses to start (secrets never live
 in the file). A malformed config never degrades into a running server.
 
-### 3. Serve
+### 2. Serve
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...      # the variable named by api_key_env above
-cargo run -p kian-cli --bin kian -- serve --config kian.yaml
+kian serve --config kian.yaml       # or: cargo run -p kian-cli --bin kian -- serve --config kian.yaml
 ```
 
 The process stays in the foreground on `127.0.0.1:7433`. Prefix local commands with
 `NO_PROXY=127.0.0.1,localhost` on macOS — the system proxy otherwise intercepts localhost.
 
-### 4. Run a session
+### 3. Run a session
 
 ```bash
 SID=$(curl -s localhost:7433/rpc -H 'content-type: application/json' \
@@ -151,13 +189,13 @@ curl -s localhost:7433/rpc -H 'content-type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"projection\",\"params\":{\"session\":\"$SID\"}}"
 # {"id":3,"jsonrpc":"2.0","result":{"state":"completed"}}
 
-target/debug/kian session inspect "$SID" --config kian.yaml
-target/debug/kian session replay "$SID" --config kian.yaml    # derives the same bytes
-target/debug/kian session export "$SID" --config kian.yaml --out audit.jsonl
-target/debug/kian cache-stats --config kian.yaml --json       # prefix-cache stability report
+kian session inspect "$SID" --config kian.yaml
+kian session replay "$SID" --config kian.yaml    # derives the same bytes
+kian session export "$SID" --config kian.yaml --out audit.jsonl
+kian cache-stats --config kian.yaml --json       # prefix-cache stability report
 ```
 
-### 5. Prove durability: `kill -9` mid-turn, restart, no lost work
+### 4. Prove durability: `kill -9` mid-turn, restart, no lost work
 
 Submit an input, `kill -9` the server while the provider call is in flight, then restart on the same
 sqlite file:
@@ -170,7 +208,7 @@ curl -s localhost:7433/rpc -H 'content-type: application/json' \
 
 sleep 1
 kill -9 <pid-of-kian-serve>
-target/debug/kian session inspect "$SID2" --config kian.yaml
+kian session inspect "$SID2" --config kian.yaml
 ```
 
 ```
@@ -196,7 +234,11 @@ from the **epoch**, not from the lease: a partitioned-but-alive old holder would
 same way. The automated version of this run, with six kill points and repeated iterations, is
 `crates/kian-cli/tests/chaos_recovery.rs`.
 
-### Test
+The GIF at the top of this file is exactly this run, recorded from a real process.
+[`docs/assets/durable-execution.cast`](docs/assets/durable-execution.cast) replays it in a terminal
+(`asciinema play`).
+
+### 5. Test
 
 ```bash
 cargo test --workspace
@@ -206,6 +248,17 @@ Everything — unit, wire-level e2e against a scripted mock provider, and the ki
 (chaos-style) suite — runs in the default workspace test invocation. Local e2e sets
 `NO_PROXY=127.0.0.1,localhost` itself. Suites whose environment is absent skip with a log line and
 never fail; see the [environment contract](#environment-contract).
+
+## Examples
+
+- [examples/issue-watch](examples/issue-watch/README.md) — a resident Router triaging the issues of
+  one repository: poll intake → admission classes → `spawn_worker` under a mandate → a speak-rule →
+  the outbox. ~15 minutes to a first drafted comment, `DRY_RUN` fail-closed.
+
+The BYOM half has its own recording: a `kiand` daemon on another workspace, one event in, and the
+command runs on the worker, not on the process that decided to run it.
+
+![kian: the brain stays, the hands move](docs/assets/byom.gif)
 
 ## Environment contract
 
@@ -230,4 +283,4 @@ exception: it is issued by a QR scan and kept in a `0600` file
 
 ## License
 
-[Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE). Security reports: [SECURITY.md](SECURITY.md).
