@@ -182,16 +182,15 @@ The README's environment-contract table lists every variable.
 
 ## 6. Where the design inputs went
 
-Kian was designed against four inputs (frozen snapshots in [references/](references/), synthesis in
-[the design notes](the design notes)). Each input contributed something specific and
-identifiable in the code:
+Kian was designed against three public references plus its own durable-execution design work. Each
+input contributed something specific and identifiable in the code:
 
 | Input | What it contributed | Where it lives in Kian |
 |-------|--------------------|------------------------|
 | **DeepSeek "Super-agent Design Exploration" article** | The four super-agent traits as *composition patterns*: two-layer Router/Worker with Thread delegation, event-driven triggers with two-level admission filtering, subscription passthrough (many-to-many fan-out), Inline/Spill context shaping + Chain of Recall, speculative execution, async `start()`/`stop()` tools, channel-matched output, the watchdog session, and the §7.1 ablation methodology | `kian-superagent` (bundle, not core): Router/Worker profiles, `channels`, `subscriptions`, `classes`, `shaping`, `recall`, `speculation`, `watchdog`, `async_tools`; the ablation benchmark is `crates/kian-superagent/tests/ablation_passthrough.rs` |
 | **deepseek-harness (dsh)** | The harness/kernel split: a harness owns interaction and capability; the substrate owns durability. dsh's append-only `SessionEvent` log, its turn/step vocabulary and its "model-visible means logged" rule shaped Kian's event schema and context derivation | `kian-core` event schema + `derive_model_context`; the dsh bridge `kian-dsh` (ADR-010) maps dsh session events onto **existing** kian kinds — zero new kinds |
 | **Cordis** | Plugin mechanics: context as a service container (`ctx.<key>`), `inject`-declared dependencies, typed events, and registrations as reversible effects with disposers | `kian-plugin`: `Ctx` registry, `Plugin` trait, five-mode dispatch, `Disposer`; new capability grows config-first → plugin → seam (ADR-004) |
-| **Feishu "Kian" design doc + an internal design review** | The durable-execution core itself: Session as the sole first-class entity, event stream as sole truth, drain as the execution hold interval, the P1–P8 problems, the A1–A10 axioms, the six Admit → Wake → Drain → Promote invariants, the epoch-fencing/lease split, and the three-layer recovery model | `kian-core` (state machine, invariants), `kian-store` (CAS + fencing), `kian-orchestrator` (engine + recovery), and the ADR series ([ADR-001](../design/decisions/ADR-001-rust-foundation.md) … [ADR-011](../design/decisions/ADR-011-inbound-webhook-plane.md)) |
+| **The durable-execution design work behind this project** | The core itself: Session as the sole first-class entity, event stream as sole truth, drain as the execution hold interval, the Admit → Wake → Drain → Promote invariants, the epoch-fencing/lease split, and the three-layer recovery model | `kian-core` (state machine, invariants), `kian-store` (CAS + fencing), `kian-orchestrator` (engine + recovery), and the ADR series ([ADR-001](../design/decisions/ADR-001-rust-foundation.md) … [ADR-011](../design/decisions/ADR-011-inbound-webhook-plane.md)) |
 
 The narrow-waist rule (constraint 10) is what keeps the bundles out of the core: the article's
 Router/Worker architecture, the channels, the dsh harness and the endpoint daemons are all
@@ -206,4 +205,4 @@ Router/Worker architecture, the channels, the dsh harness and the endpoint daemo
 | know how it is built | [DESIGN.md](../design/DESIGN.md) (HOW) |
 | know why a choice was made | [design/decisions/](../design/decisions/) (WHY) |
 | see what landed when | [../CHANGELOG.md](../CHANGELOG.md) |
-| see the research inputs | [the design notes](the design notes) |
+| see what a run looks like | [../docs/advanced.md](advanced.md) |

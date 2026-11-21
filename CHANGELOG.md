@@ -1504,5 +1504,4 @@ outbox park rebuilt at boot and surfaced on the stage board; exec
 - `docs/SPEC.md` (WHAT), `design/DESIGN.md` (HOW), and the first six ADRs (Rust foundation,
   event-sourced core, super-agent as a profile, Cordis-inspired plugins, fencing via `expectedSeq`,
   model slots).
-- `AGENTS.md` with the hard constraints that bind every later change; `the design notes`
-  synthesizing the four design inputs; frozen snapshots of those inputs in `a vendored archive/`.
+- `AGENTS.md` with the hard constraints that bind every later change.

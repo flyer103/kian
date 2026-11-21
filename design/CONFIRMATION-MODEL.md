@@ -9,8 +9,7 @@
 > [API-CONTRACT.md](API-CONTRACT.md) §3.1/§3.2 (the source of truth for shapes). §9/§10 restate the
 > deltas for review; if they ever disagree with those two files, those files win.
 >
-> Input: Anthropic, "Building always-on agents" (2026-11-13), §Permissions "deferred tool calls" —
-> synthesis in [the design notes §8](../the design notes).
+> Input: Anthropic, "Building always-on agents" (2026-11-13), §Permissions "deferred tool calls".
 
 ## 0. Authority split (single truth, no restatement)
 

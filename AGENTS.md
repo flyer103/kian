@@ -7,8 +7,7 @@ flow inside a drain**. Super-agent (Router/Worker, event subscriptions, BYOM end
 *bundle* on top of the core, never core behavior.
 
 `crates/`, `docs/`, `design/`, and this file are the product. `docs/SPEC.md` is
-the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (append-only),
-`the design notes` + `a vendored archive/` the frozen research inputs.
+the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (append-only).
 
 ## Hard constraints (bind every change)
 
@@ -49,8 +48,7 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
     for a session's lifetime; switching emits an explicit migration event. Runtime model swap is
     cache-hostile and forbidden on the hot path.
 12. **English only.** All repository text is English — docs, code comments, commit messages, file
-    names. Frozen reference snapshots in `a vendored archive/` are captured source material, not
-    authored text, and keep their original language.
+    names.
 13. **Bundle shaping is replayable at its own `tool/call` seq.** When a bundle output branch
     depends on runtime context (which shaping mode, which ack, which target), derive it as a pure
     function of the committed stream evaluated at the write's own `tool/call` seq — never from the
@@ -63,15 +61,6 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
 - **`docs/` carries no research snapshots.** The design inputs are not vendored here: the design
   is the authority, and an external source is cited by its live URL in prose when a decision needs
   it. Do not reintroduce an archive directory for third-party pages or internal docs.
-
-
-
-
-
-
-
-
-
 - **macOS system proxy intercepts localhost** (inherited vadis lesson): any local end-to-end test
   involving `kian serve` + a client needs `NO_PROXY=127.0.0.1,localhost`.
 - **Tool schemas are part of the prompt prefix.** Changing tool-schema ordering/format in
@@ -103,9 +92,6 @@ consistent: `cargo test -p kian-cli --test docs_map`.
 - `LICENSE` — Apache-2.0 (the whole workspace; `license.workspace = true` in every crate).
 - `docs/advanced.md` — the capability and usage guide: the full capability list and one runnable
   snippet per capability, out of the README.
-- `the design notes` — structured synthesis of the design inputs.
-- `a vendored archive/` — frozen snapshots (WeChat super-agent article; dsh README/architecture;
-  cordis README/primer; Feishu kian design rev 1425; Feishu an internal design review rev 47).
 
 ## Version control
 
@@ -173,8 +159,6 @@ when the owner asks. Negative results commit documentation only — never broken
   (`session/created.bridge`) lands in EVENT-MODEL, crates in DESIGN's crate map.
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
-- `the design notes` — research synthesis; update when a new design input is added.
-- `a vendored archive/` — immutable archive; new inputs append new files with Archived headers.
 
 ## README policy
 

@@ -1,8 +1,6 @@
 //! Docs-map consistency check (closeout): every relative
-//! link in the authored docs (README, AGENTS, SPEC, DESIGN, ADRs, the
-//! materials digest) resolves to a file that exists. Frozen reference
-//! snapshots in `a vendored archive/` are archived source material, not
-//! authored text — their outbound links are not our contract.
+//! link in the authored docs (README, AGENTS, SPEC, DESIGN, the usage guide
+//! and the ADRs) resolves to a file that exists.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -10,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// Authored markdown surfaces of the docs map (AGENTS.md §Docs map).
 /// `design/EVENT-MODEL.md` is the normative event contract, so its
 /// outbound links are part of the enforced set too.
-const AUTHORED: [&str; 17] = [
+const AUTHORED: [&str; 16] = [
     "README.md",
     "AGENTS.md",
     "docs/SPEC.md",
@@ -27,7 +25,6 @@ const AUTHORED: [&str; 17] = [
     "design/WORKER-MODEL.md",
     "design/HARNESS-BRIDGE.md",
     "design/MULTIAGENT-MODEL.md",
-    "the design notes",
 ];
 
 fn repo_root() -> PathBuf {

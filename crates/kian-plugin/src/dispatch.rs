@@ -1,5 +1,4 @@
-//! Five-mode typed-event dispatch (DESIGN §6.1; mode semantics from
-//! the Cordis digest, `the design notes` §3).
+//! Five-mode typed-event dispatch (DESIGN §6.1; mode semantics follow Cordis).
 //!
 //! Like Cordis, the mode is a property of the *dispatch call*:
 //! - [`Ctx::emit`] — observe: run [`Ctx::on`] observers in registration

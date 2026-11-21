@@ -290,7 +290,7 @@ status recorded here.
 ### Bundle-domain policy layer
 
 Adoption of the reference implementation's domain-policy layer onto kian's substrate.
-Reference: `a vendored archive/dsh-superagent-*.md` (archived rev 6337fc8), digest §5. **Everything
+**Everything
 landed at bundle-layer (`kian-superagent`, plus read/assembly slices of `kian-cli` and the
 the issue-watch dogfood); zero new event kinds — the durable set stays 22; every addition
 is an additive payload key on a frozen wrapper, a disposable projection, or a config/template
