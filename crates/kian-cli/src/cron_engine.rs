@@ -37,6 +37,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use kian_core::events::{EndReason, EventKind};
 use kian_core::model::SessionId;
+use kian_core::seams::LoopDriver;
+use kian_core::state::project;
+use kian_orchestrator::{DrainCtx, Engine};
+use kian_superagent::SessionBootstrap;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -52,6 +56,11 @@ use kian_store::EventStore;
 pub const SKIP_DISK_PRESSURE: &str = "skipped_disk_pressure";
 /// The §5.4 token an over-ceiling slot is recorded under.
 pub const SKIP_OVERLAP: &str = "skipped_overlap";
+
+/// The `cron_firings.error` prefix a resident firing gets when its target
+/// stream is frozen (terminal): no turn can ever run there, so the slot is a
+/// broken-target failure, never a skip (CRON-MODEL §5.1/§9.3).
+pub const TARGET_TERMINAL: &str = "target_terminal";
 
 /// One `fire_time` as the store spells it — the same rendering
 /// `kian_cron::firing_id` embeds, so the row's key and its columns agree.
@@ -329,18 +338,13 @@ impl CronTickStore for DurableCronTickStore {
             }
             sweeps.insert(schedule.id.clone(), now);
         }
-        let firings = self
-            .block(self.store.list_firings(Some(&schedule.id), 20))
+        // Every still-open firing of this schedule, wherever it sits in the
+        // history: the wedge left one `admitted` row behind an unbounded run
+        // of later `skipped` rows, so the newest-N observability page cannot
+        // find it.
+        let open = self
+            .block(self.store.open_firings(&schedule.id))
             .map_err(|e| format!("cron_firings `{}`: {e}", schedule.id))?;
-        let open: Vec<_> = firings
-            .into_iter()
-            .filter(|firing| {
-                matches!(
-                    firing.state,
-                    kian_store::FiringState::Admitted | kian_store::FiringState::Running
-                )
-            })
-            .collect();
         if open.is_empty() {
             return Ok(());
         }
@@ -350,16 +354,59 @@ impl CronTickStore for DurableCronTickStore {
             // settle; the next sweep retries after the firing admits.
             Err(_) => return Ok(()),
         };
+        // A frozen (terminal) stream can never consume another row: the
+        // drain projects terminal and appends nothing (DESIGN §2.3). That
+        // makes a firing that was never consumed permanently unrunnable —
+        // it must settle failed instead of staying `admitted` forever
+        // (CRON-MODEL §5.1/§9.3). An empty stream projects no session; the
+        // next sweep retries.
+        let target_frozen = matches!(project(&events), Ok(state) if state.is_terminal());
         for firing in open {
             let Some(admitted) = events.iter().find(|ev| {
                 ev.kind == EventKind::InputAdmitted
                     && ev.bytes.pointer("/cron/firing_id").and_then(Value::as_str)
                         == Some(firing.firing_id.as_str())
             }) else {
+                if target_frozen {
+                    // The freeze cannot postdate the admission for a row the
+                    // drain consumed, so the observed finish is the later of
+                    // the two (a firing admitted after the freeze would
+                    // otherwise report a duration below zero).
+                    let frozen_at = events.last().map_or(0, |ev| ev.ts).max(firing.admitted_at);
+                    if let Err(error) = self.block(self.store.finish_firing(
+                        &firing.firing_id,
+                        kian_store::FiringState::Failed,
+                        Some(frozen_at),
+                        None,
+                        None,
+                        Some(&format!(
+                            "{TARGET_TERMINAL}: the target session is terminal; the firing was \
+                             never consumed and can never run"
+                        )),
+                    )) {
+                        tracing::warn!(
+                            firing_id = %firing.firing_id,
+                            %error,
+                            "cron freezing-target settlement failed; the next sweep retries"
+                        );
+                    }
+                }
                 continue;
             };
+            // The firing's episode ends at the FIRST end after its admission
+            // that is not the resumable `awaiting_input` end: the answer to
+            // that ask resumes the same turn, so the sweep keeps scanning
+            // forward across it. It must stop at the first *settling* end —
+            // a later episode (a retry's new input) is not this firing's
+            // outcome, and reading the last end would mis-attribute it.
             let Some(end) = events.iter().find(|ev| {
-                ev.seq > admitted.seq && matches!(ev.kind, EventKind::SessionEnded { .. })
+                ev.seq > admitted.seq
+                    && matches!(
+                        ev.kind,
+                        EventKind::SessionEnded {
+                            reason: r
+                        } if r != EndReason::AwaitingInput
+                    )
             }) else {
                 continue;
             };
@@ -380,8 +427,7 @@ impl CronTickStore for DurableCronTickStore {
                     kian_store::FiringState::Failed,
                     Some("cancelled".to_string()),
                 ),
-                // The session waits for a person; the firing is still
-                // open, and the answer's end settles it later.
+                // Excluded by the scan above; kept exhaustive.
                 EndReason::AwaitingInput => continue,
                 // A rotated resident firing never happens (rotation is a
                 // boot-time Router action, not a cron target); record an
@@ -391,14 +437,20 @@ impl CronTickStore for DurableCronTickStore {
                     Some("the target session was rotated".to_string()),
                 ),
             };
-            let _ = self.block(self.store.finish_firing(
+            if let Err(settle_error) = self.block(self.store.finish_firing(
                 &firing.firing_id,
                 state,
                 Some(end.ts),
                 None,
                 None,
                 error.as_deref(),
-            ));
+            )) {
+                tracing::warn!(
+                    firing_id = %firing.firing_id,
+                    %settle_error,
+                    "cron firing settlement failed; the next sweep retries"
+                );
+            }
         }
         Ok(())
     }
@@ -423,6 +475,101 @@ pub trait ResidentTurn: Send + Sync {
     /// cannot be answered).
     fn should_skip(&self, _session: SessionId) -> Result<Option<String>, String> {
         Ok(None)
+    }
+}
+
+/// The resident-engine turn sink the cron dispatcher writes through: one
+/// durable inbox row for the schedule's target session (the engine folds the
+/// wake itself). Blocking on the serve runtime's handle is safe here because the
+/// cron ticker runs on its own OS thread, never on a runtime worker.
+///
+/// A **frozen** (terminal) target is refused before anything is written: its
+/// stream can never consume another row (the drain projects terminal and
+/// appends nothing, DESIGN §2.3/§4.6), so admitting the firing would leave it
+/// `admitted` forever while nothing runs. The refusal surfaces as the firing's
+/// `failed` record with the [`TARGET_TERMINAL`] prefix — a broken target, never
+/// a silent skip (CRON-MODEL §5.1/§9.3).
+///
+/// Generic over the loop driver so the sink is testable with a scripted driver;
+/// assembly arms it with `ServeLoopDriver`.
+pub struct EngineTurn<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    engine: Arc<Engine<D>>,
+    handle: tokio::runtime::Handle,
+    /// ADR-038: the session bootstrap runs before the firing row, so a
+    /// fresh cron target's first context event is the memory index.
+    bootstrap: Option<Arc<dyn SessionBootstrap>>,
+}
+
+impl<D> EngineTurn<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    /// A sink over `engine`, driving futures on `handle` (the serve runtime).
+    pub fn new(
+        engine: Arc<Engine<D>>,
+        handle: tokio::runtime::Handle,
+        bootstrap: Option<Arc<dyn SessionBootstrap>>,
+    ) -> Self {
+        Self {
+            engine,
+            handle,
+            bootstrap,
+        }
+    }
+}
+
+impl<D> ResidentTurn for EngineTurn<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    fn deliver(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<(), String> {
+        self.handle.block_on(async {
+            if let Some(state) = self
+                .engine
+                .terminal_state(session)
+                .await
+                .map_err(|error| format!("target state read: {error}"))?
+            {
+                return Err(format!(
+                    "{TARGET_TERMINAL}: target session {} is terminal ({state:?}); a frozen \
+                     session never runs another turn — re-point the schedule to a live session",
+                    session.0
+                ));
+            }
+            if let Some(bootstrap) = &self.bootstrap
+                && let Err(error) = bootstrap.bootstrap(session).await
+            {
+                tracing::warn!(
+                    session = %session.0,
+                    %error,
+                    "cron target session bootstrap skipped"
+                );
+            }
+            self.engine
+                .admit(session, content, idempotency_key)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("admit: {e}"))
+        })
+    }
+
+    fn should_skip(&self, session: SessionId) -> Result<Option<String>, String> {
+        self.handle
+            .block_on(async {
+                self.engine
+                    .has_open_work(session)
+                    .await
+                    .map(|busy| busy.then(|| format!("session {} still has open work", session.0)))
+            })
+            .map_err(|e| format!("overlap check: {e}"))
     }
 }
 
@@ -846,7 +993,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::cron_tick::MemoryStore;
     use crate::cron_worktree::{TurnOutput, TurnRequest, TurnRunner, WorktreePolicy};
+    use kian_core::events::{Event, SCHEMA_VERSION};
+    use kian_core::model::{Epoch, InputRow};
+    use kian_core::seams::{LoopDriver, LoopOutcome};
+    use kian_orchestrator::{DrainCtx, Engine, EngineConfig};
+    use kian_store::AppendGuard;
+    use kian_superagent::SessionBootstrap;
 
     fn channels() -> BTreeMap<String, crate::config::ChannelConfig> {
         serde_yaml::from_str("cron-jobs:\n  type: timer\n  timer:\n    interval_ms: 60000\n")
@@ -869,6 +1023,222 @@ mod tests {
 
     fn schedule(id: &str) -> crate::config::CronRuntimeSchedule {
         schedule_yaml(id, "")
+    }
+
+    /// A schedule that fires into one fixed session (`target: {session}`),
+    /// the shape the frozen-target tests need.
+    fn session_schedule(id: &str, session: SessionId) -> crate::config::CronRuntimeSchedule {
+        let yaml = format!(
+            "schedules:\n  - id: {id}\n    expr: \"* * * * *\"\n    target: {{ session: \"{}\" }}\n    prompt: audit\n",
+            session.0
+        );
+        let section: crate::config::CronSection =
+            serde_yaml::from_str(&yaml).expect("the session-target fixture parses");
+        section
+            .to_runtime(&channels(), Utc::now())
+            .expect("the session-target fixture resolves")
+            .remove(0)
+    }
+
+    fn cron_event(sid: SessionId, seq: u64, epoch: Epoch, kind: EventKind, bytes: Value) -> Event {
+        Event {
+            seq,
+            session: sid,
+            epoch,
+            ts: 1_800_000_000_000 + seq,
+            kind,
+            bytes,
+            version: SCHEMA_VERSION,
+        }
+    }
+
+    /// A minimal **valid** frozen stream: created → claimed → ended with
+    /// `reason`. `project` must see a terminal state here — the sink/sweep
+    /// guards read the projection, not just the tail kind.
+    async fn seed_frozen_session(store: &EventStore, sid: SessionId, reason: EndReason) {
+        append_created(store, sid).await;
+        append_claim(store, sid, 2, Epoch(1)).await;
+        append_end(store, sid, 3, Epoch(1), reason).await;
+    }
+
+    async fn append_created(store: &EventStore, sid: SessionId) {
+        store
+            .append(
+                sid,
+                cron_event(
+                    sid,
+                    1,
+                    Epoch::GENESIS,
+                    EventKind::SessionCreated,
+                    serde_json::json!({}),
+                ),
+                AppendGuard {
+                    epoch: Epoch::GENESIS,
+                    expected_seq: 1,
+                },
+            )
+            .await
+            .expect("session/created");
+    }
+
+    async fn append_claim(store: &EventStore, sid: SessionId, seq: u64, epoch: Epoch) {
+        store
+            .append(
+                sid,
+                cron_event(
+                    sid,
+                    seq,
+                    epoch,
+                    EventKind::DrainClaimed,
+                    serde_json::json!({"holder": "cron-test", "epoch": epoch.0}),
+                ),
+                AppendGuard {
+                    epoch,
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("drain/claimed");
+    }
+
+    async fn append_end(
+        store: &EventStore,
+        sid: SessionId,
+        seq: u64,
+        epoch: Epoch,
+        reason: EndReason,
+    ) {
+        store
+            .append_end(
+                sid,
+                cron_event(
+                    sid,
+                    seq,
+                    epoch,
+                    EventKind::SessionEnded { reason },
+                    serde_json::json!({}),
+                ),
+                AppendGuard {
+                    epoch,
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("session/ended");
+    }
+
+    async fn append_firing_input(
+        store: &EventStore,
+        sid: SessionId,
+        seq: u64,
+        epoch: Epoch,
+        schedule_id: &str,
+        firing_id: &str,
+    ) {
+        store
+            .append(
+                sid,
+                cron_event(
+                    sid,
+                    seq,
+                    epoch,
+                    EventKind::InputAdmitted,
+                    serde_json::json!({"role": "user", "content": "audit",
+                                       "cron": {"firing_id": firing_id, "schedule_id": schedule_id}}),
+                ),
+                AppendGuard {
+                    epoch,
+                    expected_seq: seq,
+                },
+            )
+            .await
+            .expect("input/admitted");
+    }
+
+    /// Claim one firing row (`{schedule_id}@{fire_time}`) in `admitted`.
+    async fn claim_firing_row(store: &EventStore, schedule_id: &str, fire_time: &str) {
+        let firing_id = format!("{schedule_id}@{fire_time}");
+        assert!(
+            store
+                .claim_firing(&kian_store::CronFiringRow {
+                    firing_id,
+                    schedule_id: schedule_id.to_string(),
+                    fire_time: fire_time.to_string(),
+                    admitted_at: 1_800_000_000_000,
+                    state: kian_store::FiringState::Admitted,
+                    skip_reason: None,
+                    worktree_path: None,
+                    finished_at: None,
+                    error: None,
+                })
+                .await
+                .expect("claim firing")
+        );
+    }
+
+    /// The sink tests need an engine, not a provider: any drain the engine
+    /// spawns settles immediately (the session ends completed).
+    struct SettlingDriver;
+
+    impl LoopDriver for SettlingDriver {
+        type Ctx = DrainCtx;
+
+        fn drive(&self, _ctx: DrainCtx) -> futures::stream::BoxStream<'static, LoopOutcome> {
+            use futures::StreamExt;
+            futures::stream::iter(vec![LoopOutcome::Settled]).boxed()
+        }
+    }
+
+    /// Counts bootstrap calls: the frozen-target refusal must run *before* the
+    /// ADR-038 bootstrap (a bootstrap admit onto a frozen stream would strand
+    /// yet another row).
+    #[derive(Default)]
+    struct CountingBootstrap {
+        calls: AtomicUsize,
+    }
+
+    impl SessionBootstrap for CountingBootstrap {
+        fn bootstrap(
+            &self,
+            _session: SessionId,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A bootstrap that records whether the target's inbox already held a row
+    /// when it ran: ADR-038 requires bootstrap-before-admit.
+    struct ObservingBootstrap {
+        store: EventStore,
+        calls: Arc<AtomicUsize>,
+        saw_row: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SessionBootstrap for ObservingBootstrap {
+        fn bootstrap(
+            &self,
+            session: SessionId,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+            let store = self.store.clone();
+            let calls = Arc::clone(&self.calls);
+            let saw_row = Arc::clone(&self.saw_row);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Ok(rows) = store.input_rows(session).await {
+                    saw_row.store(!rows.is_empty(), Ordering::SeqCst);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn engine_for(store: &EventStore) -> Arc<Engine<SettlingDriver>> {
+        Engine::new(
+            store.clone(),
+            Arc::new(SettlingDriver),
+            EngineConfig::default(),
+        )
     }
 
     struct TempDir(PathBuf);
@@ -1056,13 +1426,29 @@ mod tests {
                     event(
                         2,
                         Epoch(1),
+                        EventKind::DrainClaimed,
+                        serde_json::json!({"holder": "cron-test", "epoch": 1}),
+                    ),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: 2,
+                    },
+                )
+                .await
+                .expect("drain/claimed");
+            store
+                .append(
+                    sid,
+                    event(
+                        3,
+                        Epoch(1),
                         EventKind::InputAdmitted,
                         serde_json::json!({"role": "user", "content": "audit",
                                            "cron": {"firing_id": firing_id, "schedule_id": "settle"}}),
                     ),
                     AppendGuard {
                         epoch: Epoch(1),
-                        expected_seq: 2,
+                        expected_seq: 3,
                     },
                 )
                 .await
@@ -1071,7 +1457,7 @@ mod tests {
                 .append_end(
                     sid,
                     event(
-                        3,
+                        4,
                         Epoch(1),
                         EventKind::SessionEnded {
                             reason: kian_core::events::EndReason::Completed,
@@ -1080,7 +1466,7 @@ mod tests {
                     ),
                     AppendGuard {
                         epoch: Epoch(1),
-                        expected_seq: 3,
+                        expected_seq: 4,
                     },
                 )
                 .await
@@ -1115,6 +1501,530 @@ mod tests {
             .expect("row");
         assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
         assert!(row.finished_at.is_some(), "{row:?}");
+    }
+
+    /// CRON-MODEL §5.1 / DESIGN §2.3: a frozen (terminal) target is not "open
+    /// work" and the resident sink refuses the firing before anything is
+    /// written — before the ADR-038 bootstrap too. This constructs the actual
+    /// wedge: a terminal session that still holds one unconsumed row. The old
+    /// `has_open_work` read that row as "busy" forever (no drain can consume
+    /// it), so the slot was `skipped_overlap` for every later tick while
+    /// `wake_now` refused the same session as terminal.
+    #[test]
+    fn a_frozen_target_refuses_the_firing_before_the_bootstrap() {
+        let rt = runtime();
+        let dir = TempDir::new("frozen-target");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        rt.block_on(seed_frozen_session(&store, sid, EndReason::Completed));
+        rt.block_on(store.admit(InputRow {
+            id: uuid::Uuid::new_v4(),
+            session: sid,
+            payload: serde_json::json!({"role": "user", "content": "late message"}),
+            admitted_at: 1_800_000_000_500,
+            eligible_at: 1_800_000_000_500,
+            idempotency_key: Some("leftover".into()),
+        }))
+        .expect("the leftover row is durable");
+
+        let engine = engine_for(&store);
+        let bootstrap = Arc::new(CountingBootstrap::default());
+        let turn = EngineTurn::new(
+            Arc::clone(&engine),
+            rt.handle().clone(),
+            Some(bootstrap.clone()),
+        );
+
+        assert_eq!(
+            turn.should_skip(sid).expect("the overlap judgement reads"),
+            None,
+            "a frozen stream holds no open work even with a leftover row — \
+             the slot is not skipped_overlap"
+        );
+        let error = turn
+            .deliver(
+                sid,
+                serde_json::json!({"content": "audit"}),
+                Some("cron:frozen".into()),
+            )
+            .expect_err("a frozen target refuses the firing");
+        assert!(
+            error.starts_with(TARGET_TERMINAL),
+            "the refusal carries the settlement token: {error}"
+        );
+        assert_eq!(
+            bootstrap.calls.load(Ordering::SeqCst),
+            0,
+            "the bootstrap never runs for a frozen target"
+        );
+        let rows = rt.block_on(store.input_rows(sid)).expect("input rows read");
+        assert_eq!(rows.len(), 1, "only the leftover row is there: {rows:?}");
+        assert_eq!(
+            rows[0].idempotency_key.as_deref(),
+            Some("leftover"),
+            "the firing's row was never admitted"
+        );
+    }
+
+    /// The conjunct: a live target still accepts the firing, and the bootstrap
+    /// runs before the durable row (ADR-038's ordering claim — the bootstrap
+    /// observes an empty inbox at call time, not merely a call count).
+    #[test]
+    fn a_live_target_accepts_the_firing_after_the_bootstrap() {
+        let rt = runtime();
+        let dir = TempDir::new("live-target");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+
+        let engine = engine_for(&store);
+        let bootstrap = Arc::new(ObservingBootstrap {
+            store: store.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            saw_row: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let turn = EngineTurn::new(
+            Arc::clone(&engine),
+            rt.handle().clone(),
+            Some(bootstrap.clone()),
+        );
+
+        assert_eq!(
+            turn.should_skip(sid).expect("the overlap judgement reads"),
+            None,
+            "a never-created target is not busy"
+        );
+        turn.deliver(
+            sid,
+            serde_json::json!({"content": "audit"}),
+            Some("cron:live".into()),
+        )
+        .expect("a live target accepts the firing");
+        assert_eq!(
+            bootstrap.calls.load(Ordering::SeqCst),
+            1,
+            "the bootstrap runs before the firing row"
+        );
+        assert!(
+            !bootstrap.saw_row.load(Ordering::SeqCst),
+            "the inbox was empty when the bootstrap ran"
+        );
+        let rows = rt.block_on(store.input_rows(sid)).expect("input rows read");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].idempotency_key.as_deref(), Some("cron:live"));
+    }
+
+    /// The whole resident decision path over a real engine + real store: a due
+    /// slot on a frozen target settles **failed** with the `target_terminal`
+    /// token — never `skipped_overlap` (the old lie), never admitted (the old
+    /// silent drop).
+    #[test]
+    fn a_frozen_target_fails_the_firing_instead_of_skipping_it() {
+        let rt = runtime();
+        let dir = TempDir::new("frozen-firing");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        rt.block_on(seed_frozen_session(&store, sid, EndReason::Completed));
+
+        let engine = engine_for(&store);
+        let turn = Arc::new(EngineTurn::new(engine, rt.handle().clone(), None));
+        let dispatcher = ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(turn)));
+
+        let schedule = session_schedule("frozen", sid);
+        // Deterministic tick instant: seed the cursor at the schedule's real
+        // anchor and fire one slack second later (no wall-clock wait).
+        let anchor = schedule.next_fire_after(Utc::now()).expect("next fire");
+        let memory = MemoryStore::new();
+        memory.set_cursor(
+            "frozen",
+            Cursor {
+                next_fire_at: Some(anchor),
+                last_fire_at: None,
+            },
+        );
+        let (report, events) = tick_and_dispatch_classified(
+            anchor + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &memory,
+            &dispatcher,
+        );
+
+        assert!(report.admitted.is_empty(), "{:?}", report.admitted);
+        assert!(
+            events.iter().all(|event| event["event"] != "cron/skipped"),
+            "a frozen target is a failure, not a skip: {events:?}"
+        );
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(
+            report.failed[0].error.starts_with(TARGET_TERMINAL),
+            "{:?}",
+            report.failed[0]
+        );
+        let settles = memory.settles();
+        assert_eq!(settles.len(), 1, "{settles:?}");
+        assert_eq!(settles[0].1, FiringState::Failed, "{settles:?}");
+        assert!(
+            settles[0]
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(TARGET_TERMINAL),
+            "{settles:?}"
+        );
+        assert!(
+            rt.block_on(store.input_rows(sid))
+                .expect("input rows read")
+                .is_empty(),
+            "the payload never lands on the frozen stream"
+        );
+    }
+
+    /// CRON-MODEL §5.1/§9.1: an open firing whose row was never consumed and
+    /// whose target is now frozen can never run — the sweep settles it failed
+    /// instead of leaving the row `admitted` forever.
+    #[test]
+    fn the_settlement_sweep_fails_a_firing_stranded_on_a_frozen_target() {
+        let rt = runtime();
+        let dir = TempDir::new("frozen-strand");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        rt.block_on(seed_frozen_session(&store, sid, EndReason::Completed));
+
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("strand@{fire_time}");
+        let schedule = session_schedule("strand", sid);
+        rt.block_on(async {
+            assert!(
+                store
+                    .claim_firing(&kian_store::CronFiringRow {
+                        firing_id: firing_id.clone(),
+                        schedule_id: "strand".to_string(),
+                        fire_time: fire_time.to_string(),
+                        admitted_at: 1_800_000_000_000,
+                        state: kian_store::FiringState::Admitted,
+                        skip_reason: None,
+                        worktree_path: None,
+                        finished_at: None,
+                        error: None,
+                    })
+                    .await
+                    .expect("claim firing")
+            );
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep reads the session");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "failed", "{row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(TARGET_TERMINAL),
+            "{row:?}"
+        );
+        assert!(row.finished_at.is_some(), "{row:?}");
+    }
+
+    /// The sweep skips over the resumable `awaiting_input` end: the answer
+    /// resumes the same turn, so only a settling end (completed here) decides
+    /// the firing's outcome. The old first-end read kept it `admitted` forever.
+    #[test]
+    fn the_settlement_sweep_skips_the_resumable_awaiting_input_end() {
+        let rt = runtime();
+        let dir = TempDir::new("await-input-end");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("multi@{fire_time}");
+        let schedule = session_schedule("multi", sid);
+        rt.block_on(async {
+            append_created(&store, sid).await;
+            append_claim(&store, sid, 2, Epoch(1)).await;
+            append_firing_input(&store, sid, 3, Epoch(1), "multi", &firing_id).await;
+            append_end(&store, sid, 4, Epoch(1), EndReason::AwaitingInput).await;
+            append_claim(&store, sid, 5, Epoch(2)).await;
+            append_end(&store, sid, 6, Epoch(2), EndReason::Completed).await;
+            claim_firing_row(&store, "multi", fire_time).await;
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep reads the session");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
+    }
+
+    /// The sweep stops at the **first settling** end after the admission. A
+    /// firing whose own episode failed must settle `failed` even when a later
+    /// episode of the same session completed: reading the last end would
+    /// mis-attribute another turn's outcome to this firing.
+    #[test]
+    fn the_settlement_sweep_stops_at_the_first_settling_end() {
+        let rt = runtime();
+        let dir = TempDir::new("first-settling-end");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("first@{fire_time}");
+        let schedule = session_schedule("first", sid);
+        rt.block_on(async {
+            append_created(&store, sid).await;
+            append_claim(&store, sid, 2, Epoch(1)).await;
+            append_firing_input(&store, sid, 3, Epoch(1), "first", &firing_id).await;
+            append_end(&store, sid, 4, Epoch(1), EndReason::Failed).await;
+            // A later, unrelated episode of the same session completes.
+            append_claim(&store, sid, 5, Epoch(2)).await;
+            append_end(&store, sid, 6, Epoch(2), EndReason::Completed).await;
+            claim_firing_row(&store, "first", fire_time).await;
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep reads the session");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "failed", "{row:?}");
+        assert_eq!(row.error.as_deref(), Some("the scheduled turn failed"));
+    }
+
+    /// The production sequence the wedge report came from: a live plain target
+    /// accepts the first firing, the turn runs and the session ends
+    /// `completed`; the next slot therefore finds a frozen target and settles
+    /// `failed`/`target_terminal` on the durable firing row — never a silent
+    /// admit, never `skipped_overlap`.
+    #[test]
+    fn a_successful_firing_freezes_the_target_and_the_next_slot_fails_target_terminal() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+        let dir = TempDir::new("production-seq");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        let schedule = session_schedule("seq", sid);
+        let anchor = schedule.next_fire_after(Utc::now()).expect("next fire");
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        let turn = Arc::new(EngineTurn::new(
+            engine_for(&store),
+            rt.handle().clone(),
+            None,
+        ));
+        let dispatcher = ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(turn)));
+
+        // Slot 1: a never-created target accepts the firing; the engine's
+        // drain runs the turn and ends the session completed.
+        let (report, _) = tick_and_dispatch_classified(
+            anchor + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &durable,
+            &dispatcher,
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.admitted.len(), 1, "{report:?}");
+        let frozen = rt.block_on(async {
+            for _ in 0..300 {
+                let events = store.rebuild(sid).await.expect("rebuild");
+                if !events.is_empty() && project(&events).expect("project").is_terminal() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        });
+        assert!(frozen, "the first firing ran and froze the target");
+        durable
+            .settle_from_target(&schedule)
+            .expect("the first slot settles from the session end");
+        let first = rt
+            .block_on(store.load_firing(&kian_cron::firing_id("seq", anchor)))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(first.state.as_str(), "succeeded", "{first:?}");
+        let events_before = rt.block_on(store.rebuild(sid)).expect("rebuild").len();
+        let rows_before = rt
+            .block_on(store.input_rows(sid))
+            .expect("input rows read")
+            .len();
+
+        // Slot 2: the frozen target refuses the firing and the durable row
+        // says failed with the target_terminal reason.
+        let next = anchor + TimeDelta::minutes(1);
+        let (report, events) = tick_and_dispatch_classified(
+            next + SEED_SLACK,
+            std::slice::from_ref(&schedule),
+            &durable,
+            &dispatcher,
+        );
+        assert!(report.admitted.is_empty(), "{report:?}");
+        assert!(
+            events.iter().all(|event| event["event"] != "cron/skipped"),
+            "the second slot is a failure, not a skip: {events:?}"
+        );
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(
+            report.failed[0].error.starts_with(TARGET_TERMINAL),
+            "{report:?}"
+        );
+        let second = rt
+            .block_on(store.load_firing(&kian_cron::firing_id("seq", next)))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(second.state.as_str(), "failed", "{second:?}");
+        assert!(
+            second
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(TARGET_TERMINAL),
+            "{second:?}"
+        );
+        assert!(second.finished_at.is_some(), "{second:?}");
+        assert_eq!(
+            rt.block_on(store.rebuild(sid)).expect("rebuild").len(),
+            events_before,
+            "the refused slot appended nothing to the frozen stream"
+        );
+        assert_eq!(
+            rt.block_on(store.input_rows(sid))
+                .expect("input rows read")
+                .len(),
+            rows_before,
+            "the refused slot admitted no row"
+        );
+        assert!(
+            rt.block_on(store.eligible_inputs(sid, 1_900_000_000_000))
+                .expect("eligible inputs read")
+                .is_empty(),
+            "no row of the frozen target is left unconsumed"
+        );
+    }
+
+    /// The stranded heal must find the open row wherever the history put it: the
+    /// pre-fix wedge left one `admitted` firing followed by an unbounded run of
+    /// later `skipped_overlap` slots, so a newest-20 observability read would
+    /// never see it.
+    #[test]
+    fn the_settlement_sweep_finds_a_firing_stranded_behind_many_settled_slots() {
+        let rt = runtime();
+        let dir = TempDir::new("stranded-wide");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let sid = SessionId(uuid::Uuid::new_v4());
+        rt.block_on(seed_frozen_session(&store, sid, EndReason::Completed));
+        let schedule = session_schedule("wide", sid);
+        let base = DateTime::parse_from_rfc3339("2027-01-15T08:05:00Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let stranded = fire_time_text(base);
+        rt.block_on(async {
+            claim_firing_row(&store, "wide", &stranded).await;
+            for i in 1..=25i64 {
+                let text = fire_time_text(base + TimeDelta::minutes(i));
+                claim_firing_row(&store, "wide", &text).await;
+                assert!(
+                    store
+                        .finish_firing(
+                            &format!("wide@{text}"),
+                            kian_store::FiringState::Skipped,
+                            Some(1_800_000_000_000 + i as u64),
+                            None,
+                            Some(SKIP_OVERLAP),
+                            None,
+                        )
+                        .await
+                        .expect("settle a skipped slot")
+                );
+            }
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep reads the session");
+
+        let row = rt
+            .block_on(store.load_firing(&format!("wide@{stranded}")))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "failed", "{row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(TARGET_TERMINAL),
+            "{row:?}"
+        );
+    }
+
+    /// Every terminal end reason freezes the stream; the sink refuses them all.
+    #[test]
+    fn cancelled_and_rotated_targets_are_refused_like_completed() {
+        let rt = runtime();
+        let dir = TempDir::new("terminal-reasons");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let bootstrap = Arc::new(CountingBootstrap::default());
+        let turn = EngineTurn::new(
+            engine_for(&store),
+            rt.handle().clone(),
+            Some(bootstrap.clone()),
+        );
+        for reason in [EndReason::Cancelled, EndReason::Rotated] {
+            let sid = SessionId(uuid::Uuid::new_v4());
+            rt.block_on(seed_frozen_session(&store, sid, reason));
+            assert_eq!(
+                turn.should_skip(sid).expect("the overlap judgement reads"),
+                None,
+                "{reason:?}"
+            );
+            let error = turn
+                .deliver(
+                    sid,
+                    serde_json::json!({"content": "audit"}),
+                    Some(format!("cron:{reason:?}")),
+                )
+                .expect_err("a terminal target refuses the firing");
+            assert!(error.starts_with(TARGET_TERMINAL), "{reason:?}: {error}");
+            assert!(
+                rt.block_on(store.input_rows(sid))
+                    .expect("input rows read")
+                    .is_empty(),
+                "{reason:?}: nothing is admitted"
+            );
+        }
+        assert_eq!(
+            bootstrap.calls.load(Ordering::SeqCst),
+            0,
+            "the bootstrap never runs for a terminal target"
+        );
     }
 
     /// CRON-MODEL §5.1's default `skip`: a firing whose target session is

@@ -163,7 +163,9 @@ Schedules live in a new `superagent.cron:` section, beside `channels:`, `watchdo
 pattern; the session must already exist or be bootstrapped by the first admit) — or
 `{channel: <name>, topic: <topic>}`, which names the **namespace** of a deterministic plain
 session: the id is derived from `cron:<channel>/<topic>`, so every firing of that channel/topic
-lands in the same conversation and a restart re-derives the same id. A channel target does
+lands in the same conversation and a restart re-derives the same id — as long as that session stays
+live; a plain session ends `completed` after its turn, and a frozen target is refused
+(`target_terminal`, §5.1/§14). A channel target does
 **not** pass through the subscription pipeline in v1 (no Router spawn, no inference worker): the
 firing runs the plain session's default agent. The channel must be declared
 (`superagent.channels`), fail-closed — the same cross-reference discipline
@@ -278,10 +280,31 @@ mode operators punish most.
 
 **v1 status.** `skip` is enforced on both arms. The worktree arm enforces it through the
 per-schedule slot ceiling (`max_concurrent`); the resident arm asks the engine whether the target
-session has open work (`running`, unconsumed eligible input, or a pending decision) and records
-`skipped_overlap` instead of admitting the row — an overlapping slot used to wait behind the
-session's single-flight drain, which duplicated unattended runs. `queue` and `kill-previous` are
+session has open work (`running`, unconsumed eligible input, or a pending decision — a frozen
+target's leftover rows are **not** that work, see below) and records `skipped_overlap` instead of
+admitting the row — an overlapping slot used to wait behind the session's single-flight drain,
+which duplicated unattended runs. `queue` and `kill-previous` are
 **not** accepted in v1: they refuse load (§3.3 rule 8) rather than silently behaving as `skip`.
+
+**Frozen targets are neither open work nor a skip.** A terminal projection
+(`completed`/`cancelled`/`rotated`) freezes the stream, so no drain can ever take another input:
+rows admitted onto it stay pending forever as audit facts (DESIGN §2.3/§4.6). The resident arm
+therefore reads the judgement as the work a drain could still run: `has_open_work` is **false** for
+a frozen target (its leftover rows are records, not runnable work), and delivery is **refused**
+before the payload is admitted — `target_terminal: target session <uuid> is terminal (<state>); a
+frozen session never runs another turn — re-point the schedule to a live session`. The slot
+settles `failed` with that `error`: a dead target is broken, not a policy skip, and one that is
+silently skipped forever is indistinguishable from a busy schedule. The same rule governs the
+settlement sweep (§9.1): an open firing that was never consumed and whose target is frozen settles
+`failed`/`target_terminal` instead of staying `admitted` forever — the sweep finds it wherever it
+sits in the history, not only within the newest page.
+
+The operator action is to re-point the schedule at a live session (a terminal session never
+resumes). That exposes the target lifecycle v1 has: a **plain** session ends `completed` after its
+turn, so a `{session}`/`{channel}` target serves one successful firing and then freezes — a
+recurring resident schedule needs a target that holds its drain (a resident/Router-shaped
+session). Deterministic target succession for the resident arm is a recorded open question (§14);
+v1 surfaces the dead target (`failed`/`target_terminal`) instead of hiding it.
 
 ### 5.2 Due-ness and tick coalescing
 
@@ -527,11 +550,20 @@ non-context `cron: {schedule_id, firing_id, fire_time, target}` key plus the ide
 | `firing_id` | PK, `{schedule_id}@{fire_time}` — the idempotency key |
 | `schedule_id`, `fire_time` | logical identity; `fire_time` is UTC RFC 3339 whole seconds |
 | `admitted_at` | epoch ms the slot was recorded (it is the slot, not `now`: admission may be late) |
-| `state` | `admitted`\|`running`\|`succeeded`\|`failed`\|`skipped` (settled by the worktree arm's known outcome, or by the resident-arm settlement sweep reading the target session's end) |
+| `state` | `admitted`\|`running`\|`succeeded`\|`failed`\|`skipped` (settled by the worktree arm's known outcome, by the resident-arm settlement sweep reading the target session's end, or `failed` by the resident sink's frozen-target refusal) |
 | `skip_reason` | machine token for `skipped`: `skipped_overlap`, `superseded`, `outside_coalesce`, `policy_skip`, `queue_starved`, `disk_cap`, … |
 | `worktree_path` | the per-firing tree, when one was created (§6.2) |
 | `finished_at` | epoch ms at settlement; absent while `admitted`/`running` |
-| `error` | bounded, credential-redacted failure detail |
+| `error` | bounded, credential-redacted failure detail; a frozen target's refusals carry the `target_terminal:` prefix |
+
+**The resident-arm settlement rule.** The sweep settles from the **first** `session/ended` after
+the firing's `input/admitted` whose reason is not `awaiting_input`. `awaiting_input` is the
+resumable end — the answer resumes the same turn — so the scan continues across it; the first
+*settling* end wins, and a later episode's end (a retry's new input) is never attributed to the
+firing. Two firings consumed in one drain batch share that batch's end (one turn served both) and
+both settle from it. `finished_at` is the settlement observation: a frozen-target refusal records
+the tick instant, the stranded heal records the freeze instant floored at `admitted_at` (never a
+negative duration).
 
 ### 9.2 Tick reports
 
@@ -554,10 +586,17 @@ firing rows newest-first. The decisive answer is in those rows:
 2. **Config rejected** — `kian cron list` exits `2` with the load-time error (§3.3).
 3. **Misfire-suppressed / overlap-skipped / queue-starved** — a `skipped` row whose
    `skip_reason` names the decisive reason; `firing_id` carries the slot.
-4. **Worktree unavailable** — a `failed` row whose `error` carries the captured git stderr.
-5. **Ran and failed** — a `failed` row with `error` and `finished_at` (duration is `finished_at −
+4. **Target session frozen** — a `failed` row whose `error` starts with `target_terminal:`
+   (`cron list` shows `last=failed`): the target ended `completed`/`cancelled`/`rotated`, so no
+   turn can ever run there. This is not a skip — the slot was consumed by a dead target, not by
+   policy (§5.1). Re-point the schedule at a live session. Note that a plain target freezes after
+   its one turn: for a recurring schedule choose a target that stays resident (a Router-shaped
+   session holds its drain), or a fresh `channel`/`topic` namespace (a new deterministic id); v1
+   has no target succession (§14).
+5. **Worktree unavailable** — a `failed` row whose `error` carries the captured git stderr.
+6. **Ran and failed** — a `failed` row with `error` and `finished_at` (duration is `finished_at −
    admitted_at`).
-6. **Nothing recent and `next_fire_at` in the past** — the ticker is not running (server down,
+7. **Nothing recent and `next_fire_at` in the past** — the ticker is not running (server down,
    or the schedule resolves empty); the store is not the problem.
 
 ## 10. CLI surface
@@ -636,6 +675,11 @@ document does not trigger that path.
 | Integration (coexist) | cron + timer + watchdog in one config | all three fire; a cron target naming the watchdog session rejected at load |
 | Unit (overlap) | busy target session, `overlap: skip` | one `skipped_overlap` row with its reason; the payload never reaches the session (`a_busy_target_session_skips_the_slot_instead_of_queueing_it`) |
 | Unit (settlement) | resident firing, target session ends `completed` | the firing row settles `succeeded` with `finished_at` (`the_settlement_sweep_records_the_target_sessions_end`) |
+| Unit (settlement ends) | `awaiting_input` then `completed`; `failed` then a later episode's `completed` | the first **settling** end after the admission decides (the resumable end is skipped); a later episode's end is never attributed to the firing (`the_settlement_sweep_skips_the_resumable_awaiting_input_end`, `the_settlement_sweep_stops_at_the_first_settling_end`) |
+| Unit (frozen target) | terminal target (`completed`/`cancelled`/`rotated`), with or without leftover eligible rows | `has_open_work` false; delivery refused before the ADR-038 bootstrap; firing `failed` with `target_terminal:`; no `skipped_overlap`, no new inbox row (`a_frozen_target_refuses_the_firing_before_the_bootstrap`, `cancelled_and_rotated_targets_are_refused_like_completed`) |
+| Unit (frozen settlement) | open firing never consumed on a frozen target, stranded behind ≥20 later settled slots | settles `failed`/`target_terminal` (`the_settlement_sweep_fails_a_firing_stranded_on_a_frozen_target`, `the_settlement_sweep_finds_a_firing_stranded_behind_many_settled_slots`) |
+| Integration (production sequence) | first firing succeeds and freezes the target; the next slot comes due | next firing `failed`/`target_terminal` on the durable row; the cursor still advances; the target is never re-created or re-admitted (`a_successful_firing_freezes_the_target_and_the_next_slot_fails_target_terminal`) |
+| Unit (startup) | frozen session with leftover rows at boot, and an unprojectable stream | the frozen session is not woken, live sessions still drain, a corrupt stream does not abort the NoLostWork pass (`startup_rebuild_skips_frozen_sessions_but_recovers_live_ones`, `startup_rebuild_survives_an_unprojectable_stream`) |
 | Integration (config) | `overlap: queue` / resident `timeout_ms` / watchdog target | load refuses, naming the rule (§3.3 rules 6–8) |
 | Integration (CLI) | `list` → `run-now` → `logs --schedule` → `rm` | round-trip; logs names the state and skip reason; `run-now` refuses a resident schedule |
 | Regression | existing `examples/issue-watch` timer config | unchanged behaviour, no cron table created |
@@ -657,6 +701,12 @@ document does not trigger that path.
 6. **Clock authority.** v1 trusts the host clock (and its tz database) and treats a large
    backward jump as a no-op (already-passed fire times stay consumed). Should a backward jump
    instead rewind the cursor, or be surfaced as a misfire?
+7. **Resident-arm target succession.** A plain session ends `completed` after its turn, so a
+   `{session}`/`{channel}` resident-arm target serves one successful firing and then records
+   `failed`/`target_terminal` for every later slot. Should the resident arm derive a deterministic
+   successor for a frozen target (the resident re-arm shape: migrate pending rows, bootstrap the
+   successor, re-point) or is a resident-shaped target the only supported deployment? v1 records
+   the dead target and leaves re-pointing to the operator (§5.1).
 
 ## 15. Risks
 

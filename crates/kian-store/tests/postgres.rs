@@ -1559,6 +1559,15 @@ async fn pg_cron_claims_advance_and_restart() {
     }
     assert_eq!(winners, 1, "exactly one racer may own the slot");
     assert!(!pg.store.claim_firing(&slot).await.expect("replay claim"));
+    // The settlement sweep's open-firing read (CRON-MODEL §9.1): the claimed
+    // slot is open until it settles.
+    let open = pg
+        .store
+        .open_firings("night-audit")
+        .await
+        .expect("open firings");
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].firing_id, slot.firing_id);
 
     // Settle once; the terminal row is never rewritten.
     assert!(
@@ -1586,6 +1595,14 @@ async fn pg_cron_claims_advance_and_restart() {
             )
             .await
             .expect("replay settle")
+    );
+    assert!(
+        pg.store
+            .open_firings("night-audit")
+            .await
+            .expect("open firings after settle")
+            .is_empty(),
+        "a settled slot is never seen as open"
     );
 
     // Admit-then-advance: an unrecorded slot is refused, the recorded one

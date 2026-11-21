@@ -170,12 +170,19 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 0,
     },
     ProducerFile {
-        // Three API-borne producers plus the cron resident dispatcher
-        // (CRON-MODEL §6.1): a scheduled firing is an internal producer
-        // (operator config, same class as a watchdog timer), so it bypasses
-        // `admit/pre` by the §3.4.3 matrix — recorded there and here.
+        // The API-borne producers (`submit`/`steer`/`queue`) plus the
+        // memory-index admit. The cron resident dispatcher moved to
+        // `cron_engine.rs` (row below); both are internal producers by the
+        // §3.4.3 matrix and bypass `admit/pre` there and here.
         file: "kian-cli/src/server.rs",
-        admits: 4,
+        admits: 3,
+    },
+    ProducerFile {
+        // The cron resident sink (`EngineTurn`): a scheduled firing is an
+        // internal producer (operator config, same class as a watchdog timer),
+        // so it bypasses `admit/pre` by the §3.4.3 matrix (CRON-MODEL §6.1).
+        file: "kian-cli/src/cron_engine.rs",
+        admits: 1,
     },
     ProducerFile {
         file: "kian-cli/src/superagent.rs",
