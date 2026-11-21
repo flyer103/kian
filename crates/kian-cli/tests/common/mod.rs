@@ -96,30 +96,46 @@ async fn completions(
         }
     }
     let _ = body;
-    let (extra_content_length, body): (Option<usize>, String) = match mock
+    let body: String = match mock
         .script
         .get(n - 1)
         .unwrap_or(mock.script.last().expect("non-empty script"))
     {
-        ScriptedResponse::Text(text) => (None, sse_completion_body(text)),
+        ScriptedResponse::Text(text) => sse_completion_body(text),
         ScriptedResponse::ToolCall {
             id,
             name,
             arguments,
-        } => (
-            None,
-            sse_tool_call_body(
-                id,
-                name,
-                &serde_json::to_string(arguments).expect("tool arguments serialize"),
-            ),
+        } => sse_tool_call_body(
+            id,
+            name,
+            &serde_json::to_string(arguments).expect("tool arguments serialize"),
         ),
         ScriptedResponse::DieMidStream => {
-            // One partial frame, then the body stops short of the
-            // promised content-length — the reader dies mid-stream.
-            let partial =
-                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n".to_string();
-            (Some(partial.len() + 128), partial)
+            // One partial frame, then the body aborts: hyper drops the
+            // connection without the terminating chunk, which is the
+            // truncation the provider must surface as a stream error.
+            //
+            // This used to promise a larger Content-Length than the body
+            // it sent. hyper 1.12 panics on that mismatch ("payload claims
+            // content-length of N, custom content-length header claims M")
+            // — on a CI runner the panic poisons the keep-alive connection
+            // and the recovered turn never reaches the mock, so the test
+            // failed as a 2-vs-3 call count rather than as the thing it
+            // asserts. An aborted chunked body is both truthful and the
+            // same failure from the client's side.
+            let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            let chunks = futures::stream::iter(vec![
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(partial.as_bytes())),
+                Err(std::io::Error::other("mock: the provider dies mid-stream")),
+            ]);
+            mock.delivered.fetch_add(1, Ordering::SeqCst);
+            let mut response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+            response.headers_mut().insert(
+                "content-type",
+                axum::http::HeaderValue::from_static("text/event-stream"),
+            );
+            return response;
         }
     };
     mock.delivered.fetch_add(1, Ordering::SeqCst);
@@ -128,11 +144,6 @@ async fn completions(
         "content-type",
         axum::http::HeaderValue::from_static("text/event-stream"),
     );
-    if let Some(len) = extra_content_length
-        && let Ok(value) = axum::http::HeaderValue::from_str(&len.to_string())
-    {
-        response.headers_mut().insert("content-length", value);
-    }
     response
 }
 

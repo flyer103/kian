@@ -365,7 +365,10 @@ async fn loss_then_re_registration_redrives_on_the_same_id() {
             2,
         )
         .await;
-    let frame = tokio::time::timeout(Duration::from_secs(3), fake2.writer_rx.recv())
+    // Generous: the re-drive is evidence-polled (40 ms) by the backend,
+    // and a 2-core CI runner has starved the old 3 s bound. A timeout
+    // here means the row never moved, not that the runner was slow.
+    let frame = tokio::time::timeout(Duration::from_secs(15), fake2.writer_rx.recv())
         .await
         .expect("re-drive on generation 2")
         .expect("command frame");
