@@ -176,6 +176,11 @@ async fn handle(
             return refuse("capture: upstream unavailable");
         }
     };
+    tracing::debug!(
+        target: "kian::capture",
+        status = %upstream_response.status(),
+        "capture proxy upstream answered"
+    );
 
     let mut response = Response::builder().status(
         StatusCode::from_u16(upstream_response.status().as_u16())

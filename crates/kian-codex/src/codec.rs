@@ -251,7 +251,8 @@ impl CodexMapper {
             | "turn/plan/updated"
             | "thread/tokenUsage/updated"
             | "thread/started"
-            | "error" => {
+            | "error"
+            | "warning" => {
                 self.absorbed("codex/advisory");
                 Ok(())
             }
@@ -595,6 +596,21 @@ mod tests {
             }
             other => panic!("expected tool/call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn warning_notifications_are_absorbed() {
+        let mut mapper = CodexMapper::new();
+        ingest(
+            &mut mapper,
+            json!({"method": "warning", "params": {"message": "high demand; retrying"}}),
+        );
+        assert!(matches!(
+            mapper.pop(),
+            Some(SessionEvent::Mapped(Mapped::Absorbed {
+                kind: "codex/advisory"
+            }))
+        ));
     }
 
     #[test]
