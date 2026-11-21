@@ -235,6 +235,12 @@ verbs write nothing — no events, no inbox rows, no view updates.
 
 The cloud loop can execute commands on a remote endpoint daemon (`kiand`) over a durable queue:
 
+![kian: a kiand worker daemon on another workspace receives the delegated command and the file appears there, not on the server](assets/byom.gif)
+
+**What the recording shows.** A `kiand` daemon started with a different workspace root; one event
+goes in, the Router delegates to that worker, and the command it runs appears in the worker's
+directory — not in the server's. ([replay the cast](assets/byom.cast))
+
 ```bash
 cargo run -p kiand -- --listen 127.0.0.1:7401 --heartbeat-ms 1000 --workspace-root .
 ```

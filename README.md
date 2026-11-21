@@ -22,14 +22,6 @@ shows `drain claims 2`, and the replay derives **2 of 2 request bodies byte-iden
 was written twice; nothing was lost. The recording is a real run
 ([replay the cast](docs/assets/durable-execution.cast)).
 
-![kian: a kiand worker daemon on another workspace receives the delegated command and the file appears there, not on the server](docs/assets/byom.gif)
-
-**BYOM execution.** The brain stays here, the hands move. A `kiand` daemon is started with a
-different workspace root; one event goes in, the Router delegates to that worker, and the command it
-runs appears in the worker's directory — not in the server's. The binding is 1:1 and immutable for
-the session's life, and the queue is durable, so a worker that goes offline parks the work instead of
-losing it ([replay the cast](docs/assets/byom.cast)).
-
 ## Who this is for
 
 - You run agent work that takes minutes to hours, and a restart or an OOM currently costs you the
