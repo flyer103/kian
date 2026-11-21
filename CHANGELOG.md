@@ -8,6 +8,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Codex bridge: absorb `warning` notifications**. codex-cli 0.166.0 emits a `warning`
+  notification at runtime; it is advisory (never the turn's content) and is now absorbed with the
+  `codex/advisory` counter instead of failing the turn as contract drift.
+
 - **Harness durable `ask` (HARNESS-BRIDGE §4.4.1, CONFIRMATION-MODEL §14c, ADR-050;
   experimental, opt-in)**. `approvals.durable_ask: true` lets a bridge defer a gated tool to a
   human: the pending call is recorded with `permission.evaluated:"ask"` and the drain ends
