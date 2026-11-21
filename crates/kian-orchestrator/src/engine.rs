@@ -1316,6 +1316,13 @@ where
     /// admits a firing — a scheduled inspection must not pile onto a
     /// session that is still working.
     ///
+    /// A **frozen** (terminal) stream holds no runnable work: no drain may
+    /// ever consume its leftover input rows — the drain projects terminal
+    /// and appends nothing — so those rows stay pending as audit facts
+    /// (DESIGN §2.3/§4.6, `wake_now` refuses the session as terminal).
+    /// Answering `true` for them would be a permanently stuck "busy"
+    /// (nothing can change it), so terminal short-circuits to `false`.
+    ///
     /// Pure over the stream + inbox (no in-memory scheduler state), so a
     /// second replica reaches the same answer.
     pub async fn has_open_work(&self, session: SessionId) -> Result<bool, EngineError> {
@@ -1323,10 +1330,14 @@ where
             return Ok(false);
         }
         let events = self.store.rebuild(session).await?;
+        let state = project(&events)?;
+        if state.is_terminal() {
+            return Ok(false);
+        }
         if !pending_calls(&events).is_empty() {
             return Ok(true);
         }
-        if matches!(project(&events)?, SessionState::Running) {
+        if matches!(state, SessionState::Running) {
             return Ok(true);
         }
         Ok(!self
@@ -1334,6 +1345,27 @@ where
             .eligible_inputs(session, self.clock.now_ms())
             .await?
             .is_empty())
+    }
+
+    /// The terminal projection state, when the session's stream is frozen
+    /// (`completed`/`cancelled`/`rotated`); `None` for a live or
+    /// never-created session. A frozen stream never runs another turn, so
+    /// a caller that must *claim* work — the cron resident sink — refuses
+    /// instead of admitting a row that can never be consumed (a wake for
+    /// such a session is the no-op the drain already implements, DESIGN
+    /// §2.3; CRON-MODEL §5.1).
+    ///
+    /// Pure projection read (constraint 1), legal at any time.
+    pub async fn terminal_state(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<SessionState>, EngineError> {
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let state = project(&events)?;
+        Ok(state.is_terminal().then_some(state))
     }
 
     /// The versioned projection read (READ-MODEL §3, P0): `version`
@@ -1697,6 +1729,11 @@ where
     /// Startup NoLostWork rebuild: registers a pending wake for every
     /// session the inbox scan reports with eligible-but-unconsumed
     /// input, then drains them. Returns the number of sessions found.
+    ///
+    /// Sessions whose stream is **frozen** (terminal) are skipped: their
+    /// leftover rows can never be consumed (a wake spawns a drain that
+    /// projects terminal and exits without writing anything), so they are
+    /// audit facts, not a pending wake (CRON-MODEL §5.1).
     pub async fn startup_rebuild(&self) -> Result<usize, EngineError> {
         let inboxes = self.store.startup_scan(self.clock.now_ms()).await?;
         let mut sessions: Vec<SessionId> = Vec::with_capacity(inboxes.len());
@@ -1709,9 +1746,21 @@ where
                 ConfirmIntent::parse(&row.payload).is_some()
                     || kian_core::control::InterruptIntent::parse(&row.payload).is_some()
             });
-            if !has_control_row {
-                let events = self.store.rebuild(inbox.session).await?;
-                if !pending_calls(&events).is_empty() {
+            let events = self.store.rebuild(inbox.session).await?;
+            if !events.is_empty() {
+                match project(&events) {
+                    Ok(state) if state.is_terminal() => continue,
+                    Ok(_) => {}
+                    // An unprojectable stream must not abort the whole
+                    // NoLostWork pass (before this read it only failed that
+                    // session's drain): wake it and let the drain report.
+                    Err(error) => tracing::warn!(
+                        session = %inbox.session.0,
+                        %error,
+                        "startup scan: stream does not project — waking it anyway"
+                    ),
+                }
+                if !has_control_row && !pending_calls(&events).is_empty() {
                     continue;
                 }
             }
@@ -2722,6 +2771,215 @@ mod tests {
             .await,
             "draining flags cleared after both sessions complete"
         );
+        cleanup(&path);
+    }
+
+    /// CRON-MODEL §5.1 / DESIGN §2.3: a terminal (frozen) session's leftover
+    /// inbox rows are audit facts, not runnable work. The old answer — `true`
+    /// because `eligible_inputs` was non-empty — was a permanently stuck
+    /// "busy": no drain can ever consume a frozen stream, so `overlap: skip`
+    /// dropped every slot forever while `wake_now` refused the same session
+    /// as terminal.
+    #[tokio::test]
+    async fn frozen_session_with_leftover_input_reads_as_no_open_work() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = SessionId::new();
+        eng.create_session_with(sid, json!({}))
+            .await
+            .expect("create");
+        eng.admit(sid, json!("first"), Some("first".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the session ends completed"
+        );
+
+        // A row admitted after the freeze: durable, and never consumable.
+        let late = eng
+            .admit_quiet(sid, json!("late"), Some("late".into()))
+            .await
+            .expect("late admit");
+        assert!(!late.deduplicated);
+        assert_eq!(
+            store.eligible_inputs(sid, T0).await.unwrap().len(),
+            1,
+            "the leftover row stays durable and pending (audit fact)"
+        );
+        assert_eq!(
+            eng.terminal_state(sid).await.expect("terminal read"),
+            Some(SessionState::Completed),
+            "the frozen projection is visible to a work-claiming caller"
+        );
+        assert!(
+            !eng.has_open_work(sid).await.expect("open work"),
+            "a frozen stream holds no runnable work"
+        );
+        cleanup(&path);
+    }
+
+    /// The conjunct for the test above: a *live* session holding the same
+    /// eligible row still reads as open work (the frozen short-circuit must
+    /// not swallow real queued work).
+    #[tokio::test]
+    async fn live_session_with_pending_input_still_reads_as_open_work() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = SessionId::new();
+        eng.create_session_with(sid, json!({}))
+            .await
+            .expect("create");
+        eng.admit_quiet(sid, json!("queued"), Some("q".into()))
+            .await
+            .expect("quiet admit");
+
+        assert_eq!(
+            eng.terminal_state(sid).await.expect("terminal read"),
+            None,
+            "a live session is not frozen"
+        );
+        assert!(
+            eng.has_open_work(sid).await.expect("open work"),
+            "queued input on a live session is work"
+        );
+        let unknown = SessionId::new();
+        assert_eq!(
+            eng.terminal_state(unknown).await.expect("unknown read"),
+            None,
+            "a never-created session is not frozen"
+        );
+        assert!(
+            !eng.has_open_work(unknown).await.expect("unknown work"),
+            "a never-created session holds no work"
+        );
+        cleanup(&path);
+    }
+
+    /// Startup NoLostWork: the rebuild skips a frozen session's leftover
+    /// rows (waking it only spawns a drain that projects terminal and exits)
+    /// while still draining every live session, and the leftover row survives
+    /// as the audit fact it is.
+    #[tokio::test]
+    async fn startup_rebuild_skips_frozen_sessions_but_recovers_live_ones() {
+        let (store, path) = open_store().await;
+        let first = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let frozen = SessionId::new();
+        first
+            .create_session_with(frozen, json!({}))
+            .await
+            .expect("create frozen");
+        first
+            .admit(frozen, json!("first"), Some("first".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, frozen).await == SessionState::Completed
+            })
+            .await,
+            "the session ends completed"
+        );
+        first
+            .admit_quiet(frozen, json!("late"), Some("late".into()))
+            .await
+            .expect("late admit");
+
+        // Restart shape: a fresh engine over the same store; a live session
+        // also holds a durable row (admitted with no wake at all).
+        let live = SessionId::new();
+        store.admit(row(live, 99, json!("live"))).await.unwrap();
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let found = eng.startup_rebuild().await.expect("rebuild");
+        assert_eq!(found, 1, "only the live session is woken");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, live).await == SessionState::Completed
+                    && !eng.is_draining(&live)
+            })
+            .await,
+            "the live session drains to completion"
+        );
+        assert_eq!(
+            eng.pending_wake_depth(),
+            0,
+            "no wake is registered for the frozen session"
+        );
+        assert_eq!(
+            store.eligible_inputs(frozen, T0).await.unwrap().len(),
+            1,
+            "the frozen session's leftover row is preserved, not consumed"
+        );
+        assert!(
+            !eng.has_open_work(frozen).await.expect("open work"),
+            "the frozen session stays out of the work judgement"
+        );
+        cleanup(&path);
+    }
+
+    /// An unprojectable stream must not abort the whole NoLostWork pass: the
+    /// startup scan wakes it so its drain reports the projection failure,
+    /// instead of failing serve assembly before any session is recovered.
+    #[tokio::test]
+    async fn startup_rebuild_survives_an_unprojectable_stream() {
+        let (store, path) = open_store().await;
+        let corrupt = SessionId::new();
+        // created -> ended without a claim: illegal per the transition table,
+        // but the store's CAS accepts the bytes (a real corruption shape).
+        store
+            .append(
+                corrupt,
+                Event {
+                    seq: 1,
+                    session: corrupt,
+                    epoch: Epoch::GENESIS,
+                    ts: T0 + 1,
+                    kind: EventKind::SessionCreated,
+                    bytes: json!({}),
+                    version: SCHEMA_VERSION,
+                },
+                AppendGuard {
+                    epoch: Epoch::GENESIS,
+                    expected_seq: 1,
+                },
+            )
+            .await
+            .expect("session/created");
+        store
+            .append_end(
+                corrupt,
+                Event {
+                    seq: 2,
+                    session: corrupt,
+                    epoch: Epoch(1),
+                    ts: T0 + 2,
+                    kind: EventKind::SessionEnded {
+                        reason: EndReason::Completed,
+                    },
+                    bytes: json!({}),
+                    version: SCHEMA_VERSION,
+                },
+                AppendGuard {
+                    epoch: Epoch(1),
+                    expected_seq: 2,
+                },
+            )
+            .await
+            .expect("session/ended");
+        store
+            .admit(row(corrupt, 7, json!("work")))
+            .await
+            .expect("row admitted");
+
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let found = eng
+            .startup_rebuild()
+            .await
+            .expect("the pass survives the corrupt stream");
+        assert_eq!(found, 1, "the session is woken so its drain reports");
         cleanup(&path);
     }
 

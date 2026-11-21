@@ -891,6 +891,10 @@ pub(crate) const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, f
 
 pub(crate) const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = $1::text";
 
+/// The settlement sweep's open-firing read (CRON-MODEL §9.1) — the sqlite
+/// twin's comment explains why a newest-page scan is not enough.
+pub(crate) const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE schedule_id = $1::text AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
+
 pub(crate) async fn cron_upsert_schedule(
     pool: &PgPool,
     p: &crate::cron::ScheduleInsert<'_>,
@@ -1035,4 +1039,15 @@ pub(crate) async fn cron_load_firing(
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+pub(crate) async fn cron_open_firings(
+    pool: &PgPool,
+    schedule_id: &str,
+) -> Result<Vec<crate::cron::FiringCols>, StoreError> {
+    let rows: Vec<crate::cron::FiringCols> = sqlx::query_as(CRON_OPEN_FIRINGS_SQL)
+        .bind(schedule_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }

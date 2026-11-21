@@ -945,6 +945,13 @@ const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, a
 
 const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = ?";
 
+/// The settlement sweep's read (CRON-MODEL §9.1): every firing of one
+/// schedule that is still open, oldest first. A bounded-by-age read is not
+/// enough — the pre-fix wedge left one `admitted` row stranded behind an
+/// unbounded run of later `skipped` rows, so the sweep must find it wherever
+/// it is in the history, not only within the newest page.
+const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE schedule_id = ?1 AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
+
 /// One idempotent declaration upsert. The pre-read digest is for the
 /// caller's *report* only (Inserted / Unchanged / Redeclared): the state
 /// change is decided by the statement itself, so a race can only make
@@ -1095,4 +1102,15 @@ pub(crate) async fn cron_load_firing(
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+pub(crate) async fn cron_open_firings(
+    pool: &SqlitePool,
+    schedule_id: &str,
+) -> Result<Vec<crate::cron::FiringCols>, StoreError> {
+    let rows: Vec<crate::cron::FiringCols> = sqlx::query_as(CRON_OPEN_FIRINGS_SQL)
+        .bind(schedule_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }

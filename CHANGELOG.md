@@ -8,6 +8,26 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A frozen cron target no longer wedges its schedule (CRON-MODEL §5.1/§9.3)**. A session whose
+  stream projects terminal can never consume another input, so its leftover inbox rows are audit
+  facts, not work: `has_open_work` now answers `false` for a terminal projection. The resident arm
+  used to read those rows as "still working" and record `skipped_overlap` for every later slot — a
+  permanently stuck busy that no wake could clear (`wake_now` refuses terminal sessions), while a
+  target with no leftover rows at firing time was silently admitted onto the frozen stream and its
+  firing stayed `admitted` forever. The resident sink now refuses delivery into a frozen target
+  *before* the ADR-038 bootstrap and admits nothing; the firing settles `failed` with a
+  `target_terminal:` error (a dead target is visible, never a silent skip or a silent admit). The
+  settlement sweep closes a firing stranded by an earlier frozen admit, finds an open firing
+  anywhere in the history (the wedge left one behind an unbounded run of later `skipped_overlap`
+  rows, so the newest-page read never saw it), and reads the first **settling** end after the
+  admission (skipping the resumable `awaiting_input` end, and never attributing a later episode's
+  end to the firing), so a turn that asked a question and later completed settles instead of
+  staying `admitted`. The startup inbox rebuild no longer wakes frozen sessions — their rows stay
+  honestly pending as the audit record — and its new frozen-skip read tolerates an unprojectable
+  stream (warn and wake, never abort the pass). Contract:
+  [design/CRON-MODEL.md](design/CRON-MODEL.md) §5.1/§9.1/§9.3, [design/DESIGN.md](design/DESIGN.md)
+  §2.3/§4.6.
+
 - **Claude bridge: absorb thinking-only assistant messages**. Extended thinking can arrive as its
   own `assistant` message whose content blocks are `thinking`/`redacted_thinking` only (observed
   live with a Claude-compatible provider); it carries no model context and is now absorbed as

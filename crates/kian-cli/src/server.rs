@@ -31,6 +31,7 @@ use kian_store::EventStore;
 
 use crate::api::{ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics, PendingView};
 use crate::config::{DshHarnessConfig, ServeConfig};
+use crate::cron_engine::EngineTurn;
 use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
 use crate::ops::{
     DreamAdmitReceipt, MockSendReceipt, OpsError, OpsPlane, ResetReceipt, WakeReceipt,
@@ -56,56 +57,6 @@ pub enum ServeError {
     Store(#[from] kian_store::StoreError),
     #[error("engine: {0}")]
     Engine(#[from] EngineError),
-}
-
-/// The resident-engine turn sink the cron dispatcher writes through: one
-/// durable inbox row for the schedule's target session (the engine folds the
-/// wake itself). Blocking on the serve runtime's handle is safe here because the
-/// cron ticker runs on its own OS thread, never on a runtime worker.
-struct EngineTurn {
-    engine: Arc<Engine<ServeLoopDriver>>,
-    handle: tokio::runtime::Handle,
-    /// ADR-038: the session bootstrap runs before the firing row, so a
-    /// fresh cron target's first context event is the memory index.
-    bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
-}
-
-impl crate::cron_engine::ResidentTurn for EngineTurn {
-    fn deliver(
-        &self,
-        session: SessionId,
-        content: serde_json::Value,
-        idempotency_key: Option<String>,
-    ) -> Result<(), String> {
-        self.handle
-            .block_on(async {
-                if let Some(bootstrap) = &self.bootstrap
-                    && let Err(error) = bootstrap.bootstrap(session).await
-                {
-                    tracing::warn!(
-                        session = %session.0,
-                        %error,
-                        "cron target session bootstrap skipped"
-                    );
-                }
-                self.engine
-                    .admit(session, content, idempotency_key)
-                    .await
-                    .map(|_| ())
-            })
-            .map_err(|e| format!("admit: {e}"))
-    }
-
-    fn should_skip(&self, session: SessionId) -> Result<Option<String>, String> {
-        self.handle
-            .block_on(async {
-                self.engine
-                    .has_open_work(session)
-                    .await
-                    .map(|busy| busy.then(|| format!("session {} still has open work", session.0)))
-            })
-            .map_err(|e| format!("overlap check: {e}"))
-    }
 }
 
 /// The assembled single-machine server.
@@ -1423,11 +1374,11 @@ impl Server {
                 tokio::runtime::Handle::current(),
                 schedules.clone(),
             );
-            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn {
-                engine: Arc::clone(&self.engine),
-                handle: tokio::runtime::Handle::current(),
-                bootstrap: self.session_bootstrap.clone(),
-            });
+            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn::new(
+                Arc::clone(&self.engine),
+                tokio::runtime::Handle::current(),
+                self.session_bootstrap.clone(),
+            ));
             let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
                 Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
             // Selection rule: a schedule that declares `worktree:` is

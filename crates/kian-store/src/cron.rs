@@ -700,6 +700,22 @@ impl EventStore {
         };
         rows.map(decode_firing).transpose()
     }
+
+    /// Every still-open (`admitted`/`running`) firing of one schedule, oldest
+    /// slot first — the settlement sweep's read (CRON-MODEL §9.1). Unlike
+    /// [`EventStore::list_firings`] (the newest-N observability page) this is
+    /// not bounded by recency: a firing the wedge left stranded sits behind
+    /// arbitrarily many later settled slots and must still be found.
+    pub async fn open_firings(&self, schedule_id: &str) -> Result<Vec<CronFiringRow>, CronError> {
+        validate_schedule_id(schedule_id)?;
+        let rows = match self {
+            EventStore::Sqlite(pool) => crate::sqlite::cron_open_firings(pool, schedule_id).await?,
+            EventStore::Postgres(pool) => {
+                crate::postgres::cron_open_firings(pool, schedule_id).await?
+            }
+        };
+        rows.into_iter().map(decode_firing).collect()
+    }
 }
 
 #[cfg(test)]
