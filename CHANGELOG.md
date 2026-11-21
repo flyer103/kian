@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Claude bridge: tool permission prompts reach kian**. The Claude child no longer runs in
+  print mode (which auto-denied every permission prompt) and passes
+  `--permission-mode manual --permission-prompt-tool stdio`, so the harness's `can_use_tool`
+  control requests reach kian's approval policy. Live-verified 2026-11-21: an allowed `Bash` call
+  ran with `permission.evaluated:"allow"`, a denied one produced an honest error result and did
+  not execute. `--resume`/capture keep working under the new argv (recorded in the runbook).
+
 - **A frozen cron target no longer wedges its schedule (CRON-MODEL §5.1/§9.3)**. A session whose
   stream projects terminal can never consume another input, so its leftover inbox rows are audit
   facts, not work: `has_open_work` now answers `false` for a terminal projection. The resident arm

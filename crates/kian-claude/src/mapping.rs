@@ -42,15 +42,19 @@ impl ClaudeConfig {
     /// The child argv: the fixed stream-json shape first, then `--model`/`--resume`, then extras.
     #[must_use]
     pub fn argv(&self, resume: Option<&str>) -> Vec<String> {
+        // No `--print`: the SDK transport runs the CLI with streaming stdin only, and print mode
+        // auto-denies permission prompts (live-verified 2026-11-21). `manual` + the stdio prompt
+        // tool route every tool prompt to kian's control channel.
         let mut argv: Vec<String> = vec![
-            "--print".to_owned(),
             "--input-format".to_owned(),
             "stream-json".to_owned(),
             "--output-format".to_owned(),
             "stream-json".to_owned(),
             "--verbose".to_owned(),
             "--permission-mode".to_owned(),
-            "default".to_owned(),
+            "manual".to_owned(),
+            "--permission-prompt-tool".to_owned(),
+            "stdio".to_owned(),
         ];
         if let Some(model) = &self.model {
             argv.push("--model".to_owned());

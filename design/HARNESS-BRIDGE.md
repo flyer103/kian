@@ -91,7 +91,7 @@ phase.
 | cache accounting / prefix audit | ✔ | ✔ with `capture:`, else — | ✔ with `capture:`, else — |
 | steer (strippable, injected at the next safe boundary) | ✔ | ◐ queued as the next user message | ◐ `turn/steer` when the pinned protocol supports it |
 | interrupt (stop the in-flight turn) | ◐ frame exists; mounted driver does not forward mid-episode | ✔ `control_request{interrupt}` | ✔ `turn/interrupt` |
-| pre-execution tool gate answered by kian | — | ✔ `can_use_tool` control request | ✔ server-initiated approval request |
+| pre-execution tool gate answered by kian | — | ✔ `can_use_tool` control request (live-verified Bash allow/deny) | ✔ server-initiated approval request |
 | durable `ask` (human decision across a restart) | — | ◐ experimental (opt-in, identical re-issue only) | ◐ same |
 | approval provenance on `tool/call` | — | ✔ (`policy:"configured"`) | ✔ |
 | `tool/call` appended before execution | ✔ (log-before-execute contract) | ◐ requires the pre-execution `tool_use` block (verified per pin, §11) | ◐ same question for `item/started` |
@@ -270,7 +270,8 @@ introduce (no new kinds), and it participates in no plugin resolution or model-s
 
 ## 5. Per-harness mapping
 
-### 5.1 Claude Code — `claude --print --input-format stream-json --output-format stream-json --verbose`
+### 5.1 Claude Code — `claude --input-format stream-json --output-format stream-json --verbose
+--permission-mode manual --permission-prompt-tool stdio`
 
 Long-lived child; one JSON object per line each way. The CLI has **no ready frame**: readiness is
 the spawn plus the first input (the stream may stay silent until then), and it emits advisory
@@ -283,7 +284,7 @@ verified against (§11).
 | `assistant` message, `text` block | `assistant/message` | assembled content verbatim; no reasoning block invention |
 | `assistant` message, `tool_use` block | pending `tool/call` | appended when the approval outcome is known, with `permission` provenance |
 | `user` message, `tool_result` block | `tool/result` | `is_error` from the block |
-| `control_request` `can_use_tool` | approval (§4.4) | kian answers `control_response` |
+| `control_request` `can_use_tool` | approval (§4.4) | kian answers `control_response` (live-verified 2026-11-21 for Bash allow/deny) |
 | `control_request` `interrupt` (ours) | — | we send it; its response is absorbed |
 | `result` (`success` / `error_*` / interrupted) | `turn/end` outcome `final_answer` / `error` / `cancelled` | interrupts are `cancelled`, never `final` |
 | `stream_event` (partial deltas) | absorbed (counter) | never mapped; the final message is the truth |
@@ -348,7 +349,7 @@ superagent:
   harness:
     claude:            # or codex / dsh — exactly one
       command: claude                    # else KIAN_CLAUDE_BIN, else refuse (fail-closed)
-      args: ["--permission-mode", "default"]   # fixed at spawn; defaults documented
+      args: []                           # the adapter fixes the stream-json/permission flags
       model: claude-sonnet-4-5           # passed to the harness; audit label for the stream
       max_steps: 32
       step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044)
@@ -508,7 +509,7 @@ with a live smoke before an adapter claims the capability:
 
 | Fact to pin | Why it matters | Where it bites |
 |---|---|---|
-| Claude Code stream-json message set, `can_use_tool` shape, interrupt control request, `--resume` semantics | the adapter's whole mapping | `kian-claude` codec, §5.1 — **2.1.318 verified**: `system/hook_*` precede `init`, no ready frame, synthetic API-error assistant messages; `can_use_tool`/`--resume` still unverified live |
+| Claude Code stream-json message set, `can_use_tool` shape, interrupt control request, `--resume` semantics | the adapter's whole mapping | `kian-claude` codec, §5.1 — **2.1.318 verified live (2026-11-21)**: `system/hook_*` precede `init`, no ready frame, synthetic API-error assistant messages, thinking-only assistant messages, `can_use_tool` allow/deny, `--resume` continuation |
 | whether Claude Code re-emits history on `--resume` | dedup correctness on takeover | A4 |
 | Codex app-server method/notification names, item variants, approval request/response shapes, `thread/resume`, `turn/steer` | the adapter's whole mapping | `kian-codex` codec, §5.2 — **0.166.0 verified**: handshake, `thread/start`, `turn/start`, `item/*` agent message, `turn/completed`; approval shapes and `turn/steer` still unverified live |
 | whether either CLI exposes the assembled request anywhere (debug/telemetry) | whether phase 3's proxy is the only route to exact | §2 |
