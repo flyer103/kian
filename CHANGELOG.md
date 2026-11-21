@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Claude bridge: absorb thinking-only assistant messages**. Extended thinking can arrive as its
+  own `assistant` message whose content blocks are `thinking`/`redacted_thinking` only (observed
+  live with a Claude-compatible provider); it carries no model context and is now absorbed as
+  `claude/thinking` instead of failing the turn as contract drift.
+
 - **Codex bridge: absorb `warning` notifications**. codex-cli 0.166.0 emits a `warning`
   notification at runtime; it is advisory (never the turn's content) and is now absorbed with the
   `codex/advisory` counter instead of failing the turn as contract drift.
