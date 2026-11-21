@@ -88,27 +88,17 @@ Read more: [docs/overview.md](docs/overview.md) (the model in one page),
 
 ## Install
 
-Three ways in, fastest first. Each one ends at the same `kian.yaml`.
+From source. Rust stable 1.85+ (`edition 2024`), and nothing else — sqlite is embedded and a single
+`kian serve` process is the whole system.
 
 ```bash
-# 1. container (no toolchain; state in a volume)
-docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
-  -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
-  ghcr.io/flyer103/kian
-
-# 2. prebuilt binary (swap the triple: x86_64-apple-darwin, x86_64-unknown-linux-gnu,
-#    aarch64-unknown-linux-gnu — all four are attached to every release)
-mkdir -p ~/.local/bin
-curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
-  | tar -xz -C ~/.local/bin kian kiand
-
-# 3. from source (Rust stable 1.85+)
 cargo build --release --workspace
 ```
 
-The container image and the archives are produced by
-[`.github/workflows/release.yml`](.github/workflows/release.yml) on every tag; the binary path swaps
-the target triple for your platform.
+Both binaries land in `target/release/`: `kian` (the runtime and operator CLI) and `kiand` (the BYOM
+endpoint daemon). Every tagged release is also built by
+[release.yml](.github/workflows/release.yml) into a container image and four platform archives
+(Linux x86_64/aarch64, macOS arm64/x86_64) — use those instead of a toolchain once you have them.
 
 ## Quickstart
 

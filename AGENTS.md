@@ -167,8 +167,8 @@ in three minutes and run it in five. Keep this shape, top to bottom: title + sta
 one-liner + problem → one recorded demo (GIF, real run) → `## Who this is for` (who it is for and
 the three things it explicitly does not promise) → `## Features` (exactly three bullets, one per
 core promise — never an implementation/storage/deployment metadata list) → `## How it works` (the
-model, closing with one "read more" line) → `## Install` (container / prebuilt binary / source,
-one command each) → `## Quickstart` (copy-paste commands that run) → `## Examples` (one or two
+model, closing with one "read more" line) → `## Install` (the fastest path that actually
+works today, plus the container/archive paths once a release has published them) → `## Quickstart` (copy-paste commands that run) → `## Examples` (one or two
 runnable shapes, each its own README) → `## Environment contract` → `## License`.
 
 Recordings live in `docs/assets/` as both `.gif` (for the README) and `.cast` (replayable with
@@ -201,6 +201,10 @@ runnable snippet per capability; the document map is this file's §Docs map and
 5. Adding a capability = one short section with a runnable snippet in `docs/advanced.md` (plus one
    line in `## Features` only if it is one of the three core promises); its semantics stay in
    SPEC / DESIGN / EVENT-MODEL.
+6. `site/index.html` mirrors this README's claims, install steps and quickstart (its own README says
+   so). A change to the one-liner, `## Features`, `## Install` or `## Quickstart` updates the site in
+   the same change, or the two drift and the landing page starts promising what the runtime no
+   longer does.
 
 ## CHANGELOG policy
 
