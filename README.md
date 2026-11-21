@@ -720,6 +720,7 @@ superagent:
     codex:
       command: /usr/local/bin/codex # or export KIAN_CODEX_BIN
       approval_policy: on-request # `never` refuses boot (it removes the gate)
+      # approvals: { default: ask, durable_ask: true }   # ADR-050: durable human gate
       approvals:
         default: deny
         allow: ["commandExecution(*git *)"]

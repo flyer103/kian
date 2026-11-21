@@ -430,6 +430,16 @@ no IM/channel answering (free text is not a decision — the mapping needs seman
 agents; no UI card; no new session state; no change to `LoopDriver`/`LoopOutcome`; no outbox row for
 the request (the request is the stream; a delivery row is the bundle's business).
 
+## 14c. Harness bridges (ADR-050, experimental)
+
+A bridge may opt in to `durable_ask` ([HARNESS-BRIDGE](HARNESS-BRIDGE.md) §4.4.1): the pending
+call is recorded exactly like a ReAct `ask` (one `tool/call` with `permission.evaluated:"ask"`,
+no result), so §4/§6/§7 apply unchanged — the settle ends `awaiting_input`, the answer is a
+durable `control/confirm` row, and the pending call must eventually be closed by a result. The
+only difference is the resume side: the harness resumes its conversation (ADR-047) and the
+decision covers an **identical re-issue** (tool + arguments digest), not the in-flight call; a
+turn that never re-issues closes the call with an honest error result.
+
 ## 14b. Phase-2 semantics (worker integration, landed)
 
 - **No completion pair while waiting.** The worker driver reads its own stream at the terminal

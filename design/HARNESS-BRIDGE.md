@@ -92,6 +92,7 @@ phase.
 | steer (strippable, injected at the next safe boundary) | ✔ | ◐ queued as the next user message | ◐ `turn/steer` when the pinned protocol supports it |
 | interrupt (stop the in-flight turn) | ◐ frame exists; mounted driver does not forward mid-episode | ✔ `control_request{interrupt}` | ✔ `turn/interrupt` |
 | pre-execution tool gate answered by kian | — | ✔ `can_use_tool` control request | ✔ server-initiated approval request |
+| durable `ask` (human decision across a restart) | — | ◐ experimental (opt-in, identical re-issue only) | ◐ same |
 | approval provenance on `tool/call` | — | ✔ (`policy:"configured"`) | ✔ |
 | `tool/call` appended before execution | ✔ (log-before-execute contract) | ◐ requires the pre-execution `tool_use` block (verified per pin, §11) | ◐ same question for `item/started` |
 | `tool/post` observation (hook port) | ✔ (port; test-mounted) | ◐ port exists, bus wiring P2 | ◐ same |
@@ -169,7 +170,8 @@ A harness-initiated approval is a kian decision with a durable record:
 
 1. The adapter surfaces `ApprovalRequest{id, call_id, tool, input}` (the call id is the harness's
    own: Claude `tool_use` id, Codex `itemId`).
-2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` is refused at boot
+2. The driver evaluates the declarative policy (§6.3): `allow` | `deny`; `ask` only with
+   `approvals.durable_ask: true` (ADR-050; otherwise it refuses boot)
    (no silent downgrade, no deadlocked child).
 3. The driver dispatches `tool/pre` through its port (HARNESS-BRIDGE §4, ADR-045) with a view whose
    `surface` is `"harness"`, `call_id`/`name`/`arguments` from the request, `permission` carrying
@@ -199,6 +201,19 @@ re-derived identically on the takeover (`allow` → the tool may run again under
 idempotency; `deny` → the same denial). Phase 1 accepts that re-derivation instead of persisting
 an in-flight approval: the harness owns the effect, and kian cannot resume a process. This is
 recorded because it is the phase-2 `ask` problem in miniature (§10).
+
+#### 4.4.1 Durable ask (ADR-050, experimental, opt-in)
+
+With `approvals.durable_ask: true`, a policy `ask` records the pending `tool/call`
+(`permission.evaluated:"ask"`) and ends the drain — no answer to the harness, no lease, the engine
+derives `awaiting_input`. A `confirm` row is read at the next episode: the driver admits a
+synthetic decision nudge (model-visible, persisted) and resumes the conversation (ADR-047); it
+auto-answers a **re-issued** request only when the tool name and canonical arguments digest match
+the pending call (one-shot), keeping one call record and stamping `confirmation` on the result.
+Anything else follows the policy; a resumed turn that never re-issues the call closes the pending
+call with an honest error result (never a fabricated execution, never a stranded pending call).
+The harness's re-issue behaviour is unverified live: the capability matrix marks this `◐` and the
+opt-in is explicit.
 
 ### 4.5 Honesty rules
 
@@ -339,7 +354,8 @@ superagent:
       step_timeout_ms: 1800000            # open-step inactivity bound; 0 disables (ADR-044)
       # startup_timeout_ms applies to harnesses with an explicit handshake (codex, dsh), not Claude.
       approvals:                          # §6.3
-        default: deny
+        default: deny                     # allow | deny | ask (ask needs durable_ask)
+        durable_ask: false                # ADR-050: allow `ask` (experimental)
         allow: ["Read", "Bash(git status*)"]
       env: ["ANTHROPIC_API_KEY"]          # names passed through; never logged
       # capture: { upstream: https://api.anthropic.com, max_body_bytes: 8388608 }  # ADR-046
@@ -450,10 +466,11 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A8 | `Capabilities` consts equal this table (drift test over a fixture JSON) | L1 |
 | A9 | unknown protocol frame → SoftFailed naming it; an unknown advisory system frame is absorbed with a counter (never a silent drop of model-visible content) | L1 |
 | A10 | export/replay round-trips at event level; `session/created.bridge` survives and states the class (§4.7) | L2 |
-| A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers a fail-closed `413`/`502` **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
-| A12 | open-step silence → SoftFailed naming `step_timeout_ms` (never `completed`, no fabricated `turn/end`); a step that keeps emitting is not cut; `0` disables; below 10 s refuses boot; the mounted bridge ends a stalled session within the bound ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)) | L1/L2 |
-| A13 | per-agent harness selection: one serve declares two harnesses and two roster entries select different loops; the kian-loop child persists `step/request` while the Codex child stays projection-only and maps its peer's answer, both ending honestly; bridged agents refuse kian `tools:`/`tools_allow` and `exec_worker`; a config with no selection keeps the legacy single-harness rules ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)) | L1/L2 |
+| A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers a fail-closed `413`/`502` **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
+| A13 | `approvals.durable_ask: true`: an `ask` records a pending `tool/call` (`permission.evaluated:"ask"`), ends `awaiting_input`, and answers nothing to the harness; a confirm resumes the conversation with a persisted synthetic nudge and auto-answers only an identical re-issue once (one call record, `tool/result.confirmation`); a different call follows policy; a turn that never re-issues closes the pending call with an honest error result; expiry denies | L2 |
+| A14 | open-step silence → SoftFailed naming `step_timeout_ms` (never `completed`, no fabricated `turn/end`); a step that keeps emitting is not cut; `0` disables; below 10 s refuses boot; the mounted bridge ends a stalled session within the bound ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)) | L1/L2 |
+| A15 | per-agent harness selection: one serve declares two harnesses and two roster entries select different loops; the kian-loop child persists `step/request` while the Codex child stays projection-only and maps its peer's answer, both ending honestly; bridged agents refuse kian `tools:`/`tools_allow` and `exec_worker`; a config with no selection keeps the legacy single-harness rules ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)) | L1/L2 |
 
 ## 10. Phases
 

@@ -883,7 +883,7 @@ impl HarnessConfig {
         Ok(None)
     }
 
-    /// (ADR-049) every declared non-dsh bridge mount, in declaration order (claude, codex).
+    /// (ADR-050) every declared non-dsh bridge mount, in declaration order (claude, codex).
     pub fn bridge_mounts(&self) -> Result<Vec<BridgeMountSpec>, ConfigError> {
         let mut mounts = Vec::new();
         if let Some(claude) = &self.claude {
@@ -895,7 +895,7 @@ impl HarnessConfig {
         Ok(mounts)
     }
 
-    /// (ADR-049) whether one harness is declared (`kian` is always available).
+    /// (ADR-050) whether one harness is declared (`kian` is always available).
     #[must_use]
     pub fn declared(&self, key: HarnessKey) -> bool {
         match key {
@@ -906,7 +906,7 @@ impl HarnessConfig {
         }
     }
 
-    /// (ADR-049) the `session/created` bridge marker for one spawn's resolved harness; `None` for
+    /// (ADR-050) the `session/created` bridge marker for one spawn's resolved harness; `None` for
     /// the built-in kian loop (the historical `{}` bytes).
     #[must_use]
     pub fn bridge_marker_for(&self, key: HarnessKey) -> Option<serde_json::Value> {
@@ -930,7 +930,7 @@ impl HarnessConfig {
     }
 }
 
-/// (ADR-049) One worker inner-loop choice: the built-in kian loop or one external harness.
+/// (ADR-050) One worker inner-loop choice: the built-in kian loop or one external harness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HarnessKey {
     /// The built-in kian loop (the default; also the plain/Router loop).
@@ -1022,6 +1022,10 @@ pub struct ApprovalsConfig {
     /// Ordered deny rules, evaluated after the allow list.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Opt in to durable `ask` (ADR-050): `default: ask` records the call as pending and ends
+    /// `awaiting_input`. Without this flag `ask` refuses boot (fail-closed).
+    #[serde(default)]
+    pub durable_ask: bool,
 }
 
 impl ApprovalsConfig {
@@ -1030,9 +1034,11 @@ impl ApprovalsConfig {
         let default = match self.default.as_deref().map(str::trim) {
             None | Some("") | Some("deny") => Decision::Deny,
             Some("allow") => Decision::Allow,
+            Some("ask") if self.durable_ask => Decision::Ask,
             Some("ask") => {
                 return Err(invalid(
-                    "`approvals.default: ask` is phase 2 (HARNESS-BRIDGE §10): a durable human                      answer cannot be delivered to a harness process that died with the drain",
+                    "`approvals.default: ask` requires `approvals.durable_ask: true` \
+                     (HARNESS-BRIDGE §4.4.1, ADR-050)",
                 ));
             }
             Some(other) => {
@@ -1046,7 +1052,8 @@ impl ApprovalsConfig {
             for text in texts {
                 if text.trim().eq_ignore_ascii_case("ask") {
                     return Err(invalid(
-                        "`ask` approval rules are phase 2 (HARNESS-BRIDGE §10); use allow or deny",
+                        "`ask` rules are not supported: use `approvals.default: ask` with \
+                         `durable_ask: true` (HARNESS-BRIDGE §4.4.1)",
                     ));
                 }
                 rules.push(Rule::parse(text, decision).map_err(invalid)?);
@@ -1583,7 +1590,7 @@ fn default_followup_ownership() -> bool {
 }
 
 impl SuperAgentConfig {
-    /// (ADR-049) the default worker template's inner loop: an explicit
+    /// (ADR-050) the default worker template's inner loop: an explicit
     /// `superagent.worker.harness`, else the legacy single declared harness (which replaced the
     /// template for every worker side), else the built-in kian loop.
     pub fn worker_harness_key(&self) -> Result<HarnessKey, ConfigError> {
@@ -1602,10 +1609,10 @@ impl SuperAgentConfig {
         }
     }
 
-    /// (ADR-049) the per-spawn `session/created` class markers: the default worker template's
+    /// (ADR-050) the per-spawn `session/created` class markers: the default worker template's
     /// choice plus one per roster assignee. Legacy mode (no explicit selection) keeps the
     /// historical global marker for non-roster spawns; a roster child is always kian-loop in that
-    /// mode, so it writes `{}` (the pre-ADR-049 mixed-config lie this ADR fixes).
+    /// mode, so it writes `{}` (the pre-ADR-050 mixed-config lie this ADR fixes).
     pub fn harness_markers(&self) -> Result<crate::superagent::BridgeMarkers, ConfigError> {
         let per_agent = self.per_agent_harness();
         let worker = self.worker_harness_key()?;
@@ -1639,7 +1646,7 @@ impl SuperAgentConfig {
         })
     }
 
-    /// (ADR-049) each roster entry's inner loop, keyed by entry id (absent = `kian`).
+    /// (ADR-050) each roster entry's inner loop, keyed by entry id (absent = `kian`).
     pub fn roster_harness_keys(
         &self,
     ) -> Result<std::collections::BTreeMap<String, HarnessKey>, ConfigError> {
@@ -1659,7 +1666,7 @@ impl SuperAgentConfig {
         Ok(keys)
     }
 
-    /// (ADR-049) whether any worker template/roster entry selects its harness explicitly
+    /// (ADR-050) whether any worker template/roster entry selects its harness explicitly
     /// (the per-agent mode; absent = the legacy single-harness shape).
     #[must_use]
     pub fn per_agent_harness(&self) -> bool {
@@ -1911,7 +1918,7 @@ pub struct RosterEntryDef {
     /// entry's children.
     #[serde(default)]
     pub output_schema: Option<serde_json::Value>,
-    /// (ADR-049) this entry's worker inner loop: `kian` (the default) | `dsh` | `claude` |
+    /// (ADR-050) this entry's worker inner loop: `kian` (the default) | `dsh` | `claude` |
     /// `codex`. A bridged choice requires `superagent.harness.<key>`, an agent with no `tools:`,
     /// an empty `tools_allow`, and refuses `exec_worker` at spawn.
     #[serde(default)]
@@ -2421,7 +2428,7 @@ pub struct SuperAgentWorkerConfig {
     /// agent's `version`. An explicit value that contradicts the agent's
     /// version refuses to start (the `AgentDef.version` **is** the pin).
     pub pinned_version: Option<u64>,
-    /// (ADR-049) the default worker template's inner loop: `kian` (the built-in loop, the
+    /// (ADR-050) the default worker template's inner loop: `kian` (the built-in loop, the
     /// default) | `dsh` | `claude` | `codex`. A bridged choice requires the matching
     /// `superagent.harness.<key>` section, an empty `tools:` on the agent, and no worker surface.
     #[serde(default)]
@@ -3689,7 +3696,7 @@ impl ServeConfig {
                     ));
                 }
             }
-            // (ADR-049) no explicit per-agent selection = the legacy shape, byte-compatible:
+            // (ADR-050) no explicit per-agent selection = the legacy shape, byte-compatible:
             // one harness at most, and a harness cannot coexist with a worker surface.
             let per_agent = sa.per_agent_harness();
             let worker_harness = sa.worker_harness_key()?;
@@ -3698,7 +3705,7 @@ impl ServeConfig {
                     return Err(invalid(
                         "`superagent.harness` configures at most one harness (dsh | claude | \
                          codex) unless a worker template selects one per agent via \
-                         `superagent.worker.harness` / `superagent.roster[].harness` (ADR-049): \
+                         `superagent.worker.harness` / `superagent.roster[].harness` (ADR-050): \
                          the legacy worker template has one inner loop",
                     ));
                 }
@@ -4629,7 +4636,7 @@ impl ServeConfig {
                         version: agent.version,
                     }
                 }),
-                // (ADR-049) the spawn-side refusal reads this recorded fact: an entry whose
+                // (ADR-050) the spawn-side refusal reads this recorded fact: an entry whose
                 // worker loop is an external harness owns its tools and must never be bound to
                 // a kian execution worker. Absent selection = the built-in loop (not bridged).
                 harness_bridged: match def.harness.as_deref() {
@@ -9778,7 +9785,7 @@ schedules:
         assert!(err.contains("mutually exclusive"), "was: {err}");
     }
 
-    // -- ADR-049: per-agent harness selection ----------------------
+    // -- ADR-050: per-agent harness selection ----------------------
 
     /// The per-agent fixture: two declared harnesses, a kian default template and a bridged
     /// roster entry (`codex-agent` → `codex` on the tool-free `codex-w` agent).
@@ -9829,7 +9836,7 @@ schedules:
     fn a_legacy_bridged_config_marks_non_roster_spawns_and_leaves_roster_children_kian() {
         // No explicit selections = the legacy single-harness shape: the global marker still
         // covers non-roster spawns (byte-compatible), while a roster child runs the kian loop and
-        // therefore writes `{}` (the pre-ADR-049 marker lie).
+        // therefore writes `{}` (the pre-ADR-050 marker lie).
         let yaml = roster_yaml(
             "  roster:\n    - id: researcher\n      description: Finds sources\n      agent: \
              research\n      mandate_template:\n        scope: read only\n        strength: \
@@ -9907,7 +9914,7 @@ schedules:
     #[test]
     fn a_roster_only_selection_keeps_the_default_template_on_the_builtin_loop() {
         // Per-agent mode does not let the single declared harness capture the default template:
-        // with no `superagent.worker.harness`, an unselected template is `kian` (ADR-049).
+        // with no `superagent.worker.harness`, an unselected template is `kian` (ADR-050).
         let yaml = per_agent_yaml().replace("    harness: kian\n", "");
         let cfg = ServeConfig::parse(&yaml).expect("roster-only selection boots");
         let sa = cfg.superagent.as_ref().expect("superagent");
@@ -9945,7 +9952,25 @@ schedules:
             .harness
             .bridge_mount()
             .unwrap_err();
-        assert!(err.to_string().contains("phase 2"), "{err}");
+        assert!(err.to_string().contains("durable_ask"), "{err}");
+
+        let durable = with_harness(
+            "    claude:\n      command: /usr/bin/true\n      approvals:\n        default: ask\n        durable_ask: true\n",
+        );
+        let policy = ServeConfig::parse(&durable)
+            .expect("parses")
+            .superagent
+            .as_ref()
+            .unwrap()
+            .harness
+            .bridge_mount()
+            .expect("mount")
+            .expect("a mounted harness")
+            .policy;
+        assert_eq!(
+            policy.decide("Bash", &serde_json::json!({"command": "ls"})),
+            (kian_harness::approval::Decision::Ask, "default".to_owned())
+        );
 
         let bypass = with_harness(
             "    claude:\n      command: /usr/bin/true\n      args: [\"--permission-mode=bypassPermissions\"]\n",
