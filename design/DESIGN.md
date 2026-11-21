@@ -893,10 +893,14 @@ graph LR
   that worker's endpoint (`AsyncJobs` already persists `endpoint_id` per job row), so an async
   execution cannot escape a bound session's worker — refusing `superagent.async_tools` outright would
   break existing deployments to prevent a violation a per-side pair removes; and
-  `superagent.harness.dsh` **plus** a non-empty `endpoints:` list now refuses to boot, because the
-  dsh harness runs the loop inside the dsh child and never mounts the kian `exec` tool, so a recorded
-  binding could not route anything (a claimed-but-unenforceable binding is the exact dishonesty this
-  section's audit exists to prevent).
+  `superagent.harness.dsh` **plus** a non-empty `endpoints:` list refuses to boot in the legacy
+  single-harness shape, because the dsh harness runs the loop inside the dsh child and never mounts
+  the kian `exec` tool, so a recorded binding could not route anything (a claimed-but-unenforceable
+  binding is the exact dishonesty this section's audit exists to prevent). With per-agent harness
+  selection ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)) the rule is per agent
+  instead: a surface may stay configured beside declared harnesses, but a bridged agent declares no
+  kian tools and `spawn_worker(agent=<bridged>, exec_worker=…)` is refused at the tool; only a
+  kian-loop agent binds an execution worker.
 - **Runtime membership — the directory, the routes and the runtime catalog** (ADR-021, ADR-031;
   semantics in [`design/WORKER-MODEL.md`](WORKER-MODEL.md), wire in
   [`design/API-CONTRACT.md`](API-CONTRACT.md) §8). Membership is **runtime, not configuration**: with a

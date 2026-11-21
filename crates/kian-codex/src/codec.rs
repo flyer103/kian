@@ -110,7 +110,7 @@ pub struct CodexMapper {
     thread_id: Option<String>,
     turn_id: Option<String>,
     handshakes: usize,
-    /// A durable confirmation per harness item id (ADR-049): its result maps onto the pending call.
+    /// A durable confirmation per harness item id (ADR-050): its result maps onto the pending call.
     confirmed: HashMap<String, ApprovalConfirmation>,
 }
 

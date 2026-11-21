@@ -678,13 +678,10 @@ pub struct SuperAgentPlugin {
     /// `StoreRecall` port the runtime exposes (the shared instance is
     /// built once, below).
     pub recall: crate::config::RecallConfig,
-    /// the resolved dsh bridge config
-    /// (`superagent.harness.dsh`, default off). When present the
-    /// worker template's inner loop is the `DshDriver`.
-    pub dsh_harness: Option<kian_dsh::DshDriverConfig>,
-    /// the resolved Claude Code / Codex bridge (HARNESS-BRIDGE §7, default off). When present the
-    /// worker template's inner loop is the shared `BridgeDriver`.
-    pub bridge_harness: Option<Arc<kian_harness::BridgeDriver>>,
+    /// (ADR-049) the assembled worker-loop mounts: the built-in kian loop plus every declared
+    /// external harness, the default worker template's choice and each roster entry's choice.
+    /// Every worker side resolves its own inner loop from here instead of one process-wide enum.
+    pub harness_mounts: crate::superagent::HarnessMounts,
     /// The timer input sources, built by the server over the
     /// system clock; registered into the channel registry and the
     /// consumer spawn exactly like mocks. Their run tasks start in
@@ -1155,20 +1152,16 @@ impl Plugin for SuperAgentPlugin {
                 },
             )),
         };
-        // the worker template's inner loop is config-gated — the
-        // dsh bridge replaces the built-in ReAct loop when
-        // `superagent.harness.dsh` is on (default off; the decorator,
-        // evidence gate and completion report above it are unchanged).
-        // The config is resolved fail-closed by the server assembly
-        // (`DshHarnessConfig::to_runtime`: command from config or
-        // `KIAN_DSH_BIN`); the mount just builds the driver from it.
-        let worker_inner = match (&self.bridge_harness, &self.dsh_harness) {
-            (Some(driver), _) => crate::superagent::WorkerInnerDriver::Bridge(Arc::clone(driver)),
-            (None, Some(config)) => crate::superagent::WorkerInnerDriver::Dsh(Arc::new(
-                kian_dsh::DshDriver::new(config.clone()),
-            )),
-            (None, None) => crate::superagent::WorkerInnerDriver::React(worker_loop),
-        };
+        // (ADR-049) every worker side resolves its inner loop from the assembled mounts: the
+        // default template's choice here, each roster entry's own choice in the assignee factory
+        // below. Absent a selection the built-in loop (`kian`) is used, byte-compatible.
+        let harness_mounts = self.harness_mounts.clone();
+        let worker_harness = harness_mounts.worker;
+        // The default template's inner loop, resolved once: the declared harness for this template
+        // or the built-in loop (`Arc` so both wrapper arms below share it).
+        let worker_inner = Arc::new(harness_mounts.bridged_inner(worker_harness).unwrap_or_else(
+            || crate::superagent::WorkerInnerDriver::React(Arc::clone(&worker_loop)),
+        ));
 
         // Plain-session loop: the default agent, with its own gate. The
         // agent's `tools:` list filters the local surface (
@@ -1272,7 +1265,7 @@ impl Plugin for SuperAgentPlugin {
             // gate, no guard, byte-identical.
             match ctx.resolve::<kian_plugin::hooks::HookBus>() {
                 Some(bus) => kian_superagent::WorkerLoopDriver::with_hooks(
-                    Arc::new(worker_inner),
+                    Arc::clone(&worker_inner),
                     Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
                     kian_superagent::WorkerLoopConfig {
                         router: Arc::clone(&self.router_binding),
@@ -1290,7 +1283,7 @@ impl Plugin for SuperAgentPlugin {
                     Some(bus.as_ref().clone()),
                 ),
                 None => kian_superagent::WorkerLoopDriver::new(
-                    Arc::new(worker_inner),
+                    Arc::clone(&worker_inner),
                     Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
                     kian_superagent::WorkerLoopConfig {
                         router: Arc::clone(&self.router_binding),
@@ -1353,6 +1346,7 @@ impl Plugin for SuperAgentPlugin {
             // per-worker-id sides — inner loop (turn/*, tool/*,
             // recover) and wrapper (settle/pre) alike.
             let side_hooks = hook_bus.clone();
+            let harness_for_sides = harness_mounts.clone();
             side_factory = Some(Arc::new(move |id: &str, _description: Option<&str>| {
                 let mut tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
                 tools.push(Arc::new(kian_exec::RemoteExecTool::new(
@@ -1395,7 +1389,14 @@ impl Plugin for SuperAgentPlugin {
                         side_config.clone(),
                     )),
                 };
-                let inner = Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop));
+                // (ADR-049) the endpoint-bound sides follow the default worker template's
+                // choice (a bridged template cannot coexist with a worker surface, so this is
+                // the built-in loop in every bootable config).
+                let inner = Arc::new(
+                    harness_for_sides
+                        .bridged_inner(worker_harness)
+                        .unwrap_or_else(|| crate::superagent::WorkerInnerDriver::React(side_loop)),
+                );
                 match &side_hooks {
                     Some(bus) => kian_superagent::WorkerLoopDriver::with_hooks(
                         inner,
@@ -1568,6 +1569,9 @@ impl Plugin for SuperAgentPlugin {
             // side mounts no working tool either way).
             let worker_refuse_agent = self.worker_agent.clone();
             let worker_refuse_version = self.worker_agent.version;
+            // (ADR-049) each roster entry resolves its own worker loop; a bridged entry runs the
+            // harness driver and never mounts a kian tool surface.
+            let assignee_harness = harness_mounts.clone();
             let assignee_remote = remote.as_ref().map(|r| {
                 (
                     Arc::clone(&r.backend),
@@ -1652,8 +1656,20 @@ impl Plugin for SuperAgentPlugin {
                             Arc::clone(&assignee_policy),
                             assignee_config.clone(),
                         ));
+                        let entry_harness = assignee_harness
+                            .assignees
+                            .get(assignee)
+                            .copied()
+                            .unwrap_or(crate::config::HarnessKey::Kian);
+                        let inner = Arc::new(
+                            assignee_harness
+                                .bridged_inner(entry_harness)
+                                .unwrap_or_else(|| {
+                                    crate::superagent::WorkerInnerDriver::React(side_loop)
+                                }),
+                        );
                         kian_superagent::WorkerLoopDriver::new(
-                            Arc::new(crate::superagent::WorkerInnerDriver::React(side_loop)),
+                            inner,
                             Arc::clone(&assignee_inbox),
                             kian_superagent::WorkerLoopConfig {
                                 router: Arc::clone(&assignee_session),

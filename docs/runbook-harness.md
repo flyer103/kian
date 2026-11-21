@@ -64,7 +64,7 @@ A live run is **recorded here** with: the CLI version, the model, the mapped cha
 outcome (`Settled`/`SoftFailed` and why), and any protocol drift. A green fixture run is not a
 substitute.
 
-## Durable ask (ADR-049, experimental)
+## Durable ask (ADR-050, experimental)
 
 `approvals: { default: ask, durable_ask: true }` records the harness's pending call as a `tool/call`
 with `permission.evaluated:"ask"` and ends the drain `awaiting_input` (no lease, no child). A
@@ -91,10 +91,14 @@ unverified**. A full live captured turn (proxy → real model) is not recorded y
   (`harness.resume`, ADR-047); an interrupted turn is not re-driven — a takeover with no
   undelivered input ends `failed` (the engine's mapping for a lost turn) with a named reason,
   never `completed`, and the next input continues the same conversation;
-- `ask` approvals are opt-in and experimental (`approvals.durable_ask: true`, ADR-049): the
+- `ask` approvals are opt-in and experimental (`approvals.durable_ask: true`, ADR-050): the
   pending call ends `awaiting_input`, a confirm resumes the conversation with a synthetic nudge,
   and only an identical re-issue (tool + arguments digest) is auto-answered; a turn that never
   re-issues closes the call with an honest error result. The live re-issue behaviour is unverified;
 - one harness per worker template; a bridge and `endpoints:`/`workers:` are mutually exclusive;
+- one harness **per worker agent** (ADR-049): a deployment may declare several and select one per
+  `superagent.worker.harness` / `superagent.roster[].harness`; a bridged agent owns its tools (no
+  `tools:`, no `tools_allow`, no `exec_worker`), and a bridged default template cannot coexist with
+  `endpoints:`/`workers:`; with no explicit selection the legacy single-harness rules apply;
 - cron's worktree arm is still dsh-shaped (`--profile <name> <payload>`); running Claude Code or
   Codex under cron needs the phase-2 argv extension.

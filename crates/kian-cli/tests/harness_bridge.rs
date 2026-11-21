@@ -121,6 +121,136 @@ plugins: ["openai-compat", "local-tools", "superagent"]
     path
 }
 
+/// The scripted Codex app-server peer (workspace sibling of the `kian` bin).
+fn codex_fixture_peer() -> PathBuf {
+    let kian = PathBuf::from(env!("CARGO_BIN_EXE_kian"));
+    let peer = kian
+        .parent()
+        .expect("target dir")
+        .join("kian-codex-fixture-peer");
+    assert!(
+        peer.exists(),
+        "fixture peer {} missing — build the workspace (cargo test --workspace)",
+        peer.display()
+    );
+    peer
+}
+
+/// (ADR-049) The per-agent fixture: one serve whose roster names a kian-loop agent and a Codex
+/// agent, each selecting its harness; the same mock provider serves the kian loop.
+fn write_mixed_config(dir: &Path, sqlite: &Path, provider_base: &str, listen: &str) -> PathBuf {
+    let yaml = format!(
+        r#"listen: "{listen}"
+storage:
+  sqlite: "{sqlite_path}"
+agent:
+  id: default
+  model_slots:
+    main:
+      provider: mock
+      model: mock-model
+agents:
+  router:
+    id: router
+    version: 3
+    model_slots:
+      router:
+        provider: mock
+        model: mock-router
+    tools: ["spawn_worker", "reply"]
+  worker:
+    id: worker
+    version: 7
+    model_slots:
+      main:
+        provider: mock
+        model: mock-worker
+    tools: ["fs_read", "fs_write", "exec"]
+  kian-w:
+    id: kian-w
+    version: 1
+    model_slots:
+      main:
+        provider: mock
+        model: mock-kian
+    tools: []
+  codex-w:
+    id: codex-w
+    version: 1
+    model_slots:
+      main:
+        provider: mock
+        model: mock-codex
+    tools: []
+providers:
+  mock:
+    base_url: "{provider_base}"
+    api_key_env: {KEY}
+superagent:
+  router:
+    session_id: "{ROUTER_SESSION}"
+    agent: router
+    slot: router
+  worker:
+    agent: worker
+    harness: kian
+  roster:
+    - id: kian-agent
+      description: A built-in-loop worker
+      agent: kian-w
+      harness: kian
+      mandate_template:
+        scope: local work
+        strength: inferred
+      tools_allow: []
+      limits: {{max_children: 0}}
+    - id: codex-agent
+      description: A Codex worker
+      agent: codex-w
+      harness: codex
+      mandate_template:
+        scope: codex work
+        strength: inferred
+      tools_allow: []
+      limits: {{max_children: 0}}
+  subscriptions:
+    - channel: mock-im
+      match: always
+      route: router
+  channels:
+    mock-im:
+      type: mock-im
+  harness:
+    codex:
+      command: "{peer}"
+      args: ["simple"]
+drain:
+  max_iterations: 8
+  lease_ttl_ms: 500
+  heartbeat_interval_ms: 200
+tools:
+  root: "{root}"
+  exec_timeout_ms: 30000
+recovery:
+  budget:
+    tokens: 16
+    wall_clock_ms: 300000
+    retry_cost_tokens: 1
+  rules:
+    - class: unknown
+      action: fail
+plugins: ["openai-compat", "local-tools", "superagent"]
+"#,
+        KEY = common::KEY_ENV,
+        peer = codex_fixture_peer().display(),
+        sqlite_path = sqlite.display(),
+        root = dir.display(),
+    );
+    let path = dir.join("kian.yaml");
+    std::fs::write(&path, yaml).expect("write config");
+    path
+}
+
 fn spawn_serve(config: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_kian"))
         .args(["serve", "--config", config.to_str().unwrap()])
@@ -526,6 +656,107 @@ async fn a_stalled_harness_step_ends_the_session_within_the_bound() {
     assert!(
         out["result"]["session"].as_str().is_some(),
         "server healthy: {out}"
+    );
+    drop(child);
+}
+
+/// (ADR-049) One serve, one entry, two roster agents: the kian-loop agent's session persists
+/// `step/request` (the exact class) while the Codex agent's session is projection-only and maps
+/// the Codex peer's answer — both driven from the same assembly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_serve_selects_the_harness_per_roster_agent() {
+    force_no_proxy();
+    let dir = temp_dir("per-agent-harness");
+    let sqlite = dir.join("kian.sqlite");
+    let (provider_base, _mock) = spawn_mock_provider(0).await;
+    let port = free_port().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let config = write_mixed_config(&dir, &sqlite, &provider_base, &format!("127.0.0.1:{port}"));
+    let child = spawn_serve(&config);
+    assert!(wait_ready(&base).await, "serve never became ready");
+    let client = reqwest::Client::new();
+    let store = EventStore::open(&sqlite).await.expect("open store");
+
+    let submit_as = |assignee: &'static str, task: &'static str| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let out = rpc(&client, &base, "create_session", json!({})).await;
+            let sid = out["result"]["session"]
+                .as_str()
+                .expect("session id")
+                .to_owned();
+            let wrapper = json!({
+                "thread_id": uuid::Uuid::new_v4().to_string(),
+                "task": task,
+                "assignee": assignee,
+            });
+            let out = rpc(
+                &client,
+                &base,
+                "submit",
+                json!({"session": sid, "content": wrapper}),
+            )
+            .await;
+            assert_eq!(out["result"]["deduplicated"], false, "submit: {out}");
+            SessionId(uuid::Uuid::parse_str(&sid).unwrap())
+        }
+    };
+
+    let kian_session = submit_as("kian-agent", "do the kian task").await;
+    let codex_session = submit_as("codex-agent", "do the codex task").await;
+
+    for session in [kian_session, codex_session] {
+        let ended = wait_events(&store, session, 20_000, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::SessionEnded { .. }))
+        })
+        .await;
+        assert!(ended, "{session:?} never settled");
+    }
+
+    let kian_events = store.rebuild(kian_session).await.expect("rebuild kian");
+    eprintln!(
+        "KIAN EVENTS: {:?}",
+        kian_events
+            .iter()
+            .map(|event| (event.kind, event.bytes.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        kian_events
+            .iter()
+            .any(|event| event.kind == EventKind::StepRequest),
+        "the kian loop persists its exact request bytes"
+    );
+    assert!(
+        kian_events.iter().any(|event| {
+            event.kind == EventKind::AssistantMessage
+                && event.bytes.to_string().contains("All done.")
+        }),
+        "the kian loop mapped the mock provider's answer"
+    );
+
+    let codex_events = store.rebuild(codex_session).await.expect("rebuild codex");
+    eprintln!(
+        "CODEX EVENTS: {:?}",
+        codex_events
+            .iter()
+            .map(|event| (event.kind, event.bytes.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        codex_events
+            .iter()
+            .all(|event| event.kind != EventKind::StepRequest),
+        "projection-only: the Codex child's request bytes are not kian events"
+    );
+    assert!(
+        codex_events.iter().any(|event| {
+            event.kind == EventKind::AssistantMessage && event.bytes.to_string().contains("pong")
+        }),
+        "the Codex peer's mapped answer"
     );
     drop(child);
 }

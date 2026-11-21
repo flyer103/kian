@@ -355,12 +355,17 @@ What multiagent **adds**, all of it config or bundle code:
 
 ### 3.1 Roster semantics
 
-- A roster entry is `{id, description, agent, mandate_template, tools_allow, limits, output_schema?}`.
-  `id` is the name the model uses; `agent` is an `AgentDef` reference and the memory scope;
-  `description` is the one line used for selection; `mandate_template.scope` is the advisory scope text
-  the entry carries (§5.1); `tools_allow` is intersected with the parent's surface (never a widening);
-  `limits.max_children: 0` makes the entry a leaf; `output_schema` is the optional default expectation
-  for this entry's children (§3.2.1).
+- A roster entry is `{id, description, agent, mandate_template, tools_allow, limits, output_schema?,
+  harness?}`. `id` is the name the model uses; `agent` is an `AgentDef` reference and the memory
+  scope; `description` is the one line used for selection; `mandate_template.scope` is the advisory
+  scope text the entry carries (§5.1); `tools_allow` is intersected with the parent's surface (never
+  a widening); `limits.max_children: 0` makes the entry a leaf; `output_schema` is the optional
+  default expectation for this entry's children (§3.2.1).
+- `harness` ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)) selects the entry's worker
+  inner loop: `kian` (the built-in loop, the default) | `dsh` | `claude` | `codex`. A bridged entry
+  owns its tools in the harness child: its agent declares no `tools:`, `tools_allow` is empty, and
+  `spawn_worker` refuses an `exec_worker` binding for it (never an audit-fiction route). The kian-loop
+  default is unchanged when the key is absent.
 - **A spawn records the resolution, not the name** (§2.1.1): the entry id, the `AgentDef` id and its
   version, and the mandate's `policy_version` ride the wrapper content. That is what makes a replayed
   spawn reproducible after a roster edit, and why a roster change can affect new spawns only.

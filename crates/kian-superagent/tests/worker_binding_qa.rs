@@ -24,7 +24,8 @@ use kian_core::model::{Epoch, SessionId, Thread};
 use kian_core::seams::{ToolCall, ToolError, ToolProvider as _};
 use kian_orchestrator::WakeOutcome;
 use kian_superagent::{
-    AdmitReceipt, EXEC_WORKER_KEY, InboxWriteError, InboxWriter, MockChannel, RouterHold,
+    AdmitReceipt, EXEC_WORKER_KEY, InboxWriteError, InboxWriter, MandateStrength, MandateTemplate,
+    MockChannel, MultiagentLimits, ResolvedAgent, Roster, RosterEntry, RosterLimits, RouterHold,
     RouterProfile, RouterTools, SPAWN_WORKER_TOOL, SpawnRequest, StreamPort, StreamPortError,
     WorkerBinding, WorkerEntry, WorkerSpawner, WorkerStreamsError, WorkerStreamsPort,
     bound_workers, busy_owner, delegation_content, delegation_worker_binding, router_template,
@@ -685,6 +686,99 @@ async fn qa_spawn_refusal_matrix_is_honest_and_traceless() {
             .unwrap()
             .iter()
             .all(|e| e.kind != EventKind::ThreadStarted),
+        "no thread/started"
+    );
+}
+
+/// (ADR-049) A bridged roster entry owns its tools inside the harness child: binding it to an
+/// execution worker is refused before any side effect (no admit, no wake, no lineage).
+#[tokio::test]
+async fn qa_bridged_roster_entry_refuses_exec_worker_before_any_side_effect() {
+    let router = sid(0x1111);
+    let inbox = QaInbox::shared();
+    let spawner = Arc::new(WorkerSpawner::new(
+        kian_superagent::ResidentBinding::new(router),
+        &worker_template("mock", "qa-worker", 7),
+        inbox.clone(),
+    ));
+    let mut channels = kian_superagent::ChannelRegistry::new();
+    channels.register(
+        "mock-im",
+        Arc::new(MockChannel::new("mock-im")) as Arc<dyn kian_core::seams::ChannelAdapter>,
+    );
+    let hold = RouterHold::shared();
+    let mut profile = RouterProfile::new(router, router_template("mock", "qa-router"));
+    profile.worker_membership = true;
+    profile.multiagent = Some(MultiagentLimits {
+        max_children: 2,
+        max_depth: 2,
+        child_timeout_ms: 60_000,
+    });
+    let catalog = qa_catalog_two();
+    let static_ids: Vec<String> = catalog.iter().map(|entry| entry.id.clone()).collect();
+    let timeouts: BTreeMap<String, u64> = catalog
+        .iter()
+        .map(|entry| (entry.id.clone(), 60_000u64))
+        .collect();
+    let roster = Roster {
+        entries: vec![RosterEntry {
+            id: "codex-agent".to_string(),
+            description: "A Codex worker".to_string(),
+            agent: "codex".to_string(),
+            mandate_template: MandateTemplate {
+                scope: "delegate".to_string(),
+                strength: MandateStrength::Inferred,
+            },
+            tools_allow: Vec::new(),
+            limits: RosterLimits { max_children: 0 },
+            output_schema: None,
+            harness_bridged: true,
+            resolved_agent: Some(ResolvedAgent {
+                def_id: "codex".to_string(),
+                version: 1,
+            }),
+        }],
+    };
+    let tools = RouterTools::new(
+        spawner,
+        channels,
+        &profile,
+        hold.clone(),
+        kian_superagent::ResidentBinding::new(profile.session),
+    )
+    .with_worker_membership(static_ids, timeouts, None)
+    .with_worker_streams(QaStreams::shared())
+    .with_roster(roster);
+    let (port, dyn_port) = QaPort::shared(router);
+    hold.install(dyn_port);
+    let tools = Arc::new(tools);
+
+    // The spawn derives its identity from the requesting tool/call's committed seq.
+    let call = spawn_call(json!({
+        "task": "codex work",
+        "agent": "codex-agent",
+        "exec_worker": "qa-one"
+    }));
+    port.events.lock().unwrap().push(ev(
+        router,
+        1,
+        EventKind::ToolCall,
+        json!({"content": {"id": call.id.clone()}}),
+    ));
+    let err = tools.invoke(call).await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("harness bridge"), "{text}");
+    assert!(text.contains("codex-agent"), "{text}");
+    assert!(text.contains("exec_worker"), "{text}");
+    // Zero side effects after the refusal.
+    assert!(inbox.admits.lock().unwrap().is_empty(), "no inbox row");
+    assert!(inbox.wakes.lock().unwrap().is_empty(), "no wake");
+    assert!(
+        port.events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != EventKind::ThreadStarted),
         "no thread/started"
     );
 }

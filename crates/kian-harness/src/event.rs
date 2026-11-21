@@ -45,7 +45,7 @@ pub struct ApprovalRequest {
     pub input: Value,
 }
 
-/// The durable confirmation a bridge answer applies (ADR-049): the pending call it closes and
+/// The durable confirmation a bridge answer applies (ADR-050): the pending call it closes and
 /// the provenance the adapter stamps on the result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalConfirmation {
@@ -69,7 +69,7 @@ pub struct ApprovalAnswer {
     pub matched: String,
     /// The hook's denial reason (a hook deny only).
     pub reason: Option<String>,
-    /// Set when the answer applies a durable confirmation (ADR-049): the adapter must not append
+    /// Set when the answer applies a durable confirmation (ADR-050): the adapter must not append
     /// a second `tool/call`; it maps the harness's result onto `call_id` with the provenance.
     pub confirmation: Option<ApprovalConfirmation>,
 }

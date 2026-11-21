@@ -8,7 +8,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
-- **Harness durable `ask` (HARNESS-BRIDGE §4.4.1, CONFIRMATION-MODEL §14c, ADR-049;
+- **Harness durable `ask` (HARNESS-BRIDGE §4.4.1, CONFIRMATION-MODEL §14c, ADR-050;
   experimental, opt-in)**. `approvals.durable_ask: true` lets a bridge defer a gated tool to a
   human: the pending call is recorded with `permission.evaluated:"ask"` and the drain ends
   `awaiting_input` (no lease, no child). A `confirm` resumes the harness conversation (ADR-047),
@@ -18,6 +18,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   that never re-issues closes the pending call with an honest error result, never a fabricated
   execution or a stranded ask. The harness re-issue behaviour is unverified live (the matrix marks
   it experimental). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §4.4.1.
+
+- **Harness bridges: per-agent harness selection (ADR-049)**. `superagent.worker.harness` and
+  `superagent.roster[].harness` choose the worker inner loop per agent — `kian` (built-in, default) |
+  `dsh` | `claude` | `codex` — so one serve/Router can declare several harnesses and dispatch each
+  worker agent to its own loop. `superagent.harness.{dsh,claude,codex}` may then be declared
+  together; every explicit selection must name a declared section, a bridged agent must declare no
+  `tools:` (and a bridged roster entry no `tools_allow`), a bridged default template cannot coexist
+  with `endpoints:`/`workers:`, and `spawn_worker(agent=<bridged>, exec_worker=…)` refuses at the
+  tool. The `session/created.bridge` class marker is now resolved per spawn (a kian-loop child
+  writes `{}` even beside bridged siblings). With no selection anywhere the legacy single-harness
+  rules and bytes are unchanged. Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
+  §6.1/§6.2/§9 A13, [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §3.1.
 
 - **Resident rotation fires for a parked Router (ADR-040 phase 2)**. A parked resident holds its
   drain, so the rotation trigger is now the **hold owner**: the Router driver checks its policy at a
@@ -32,7 +44,6 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   a schedule naming the pinned Router session would fire into a frozen session:
   `cron_targets_rotating_router`. The `channel:` namespace is unaffected; with rotation off the
   pinned id is stable and the historical behavior is unchanged.
-
 - **Multi-replica resident rotation (ADR-048)**. A replica whose `ResidentBinding` points at a
   terminal Router now derives the live successor from the durable uuid5 chain, re-points the
   binding and migrates the rows it had written to the frozen predecessor (`rotate:<old>:<row>`
@@ -44,7 +55,6 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   new event kind, state edge, wire byte or config key. Contract:
   [design/DESIGN.md](design/DESIGN.md) §4.6,
   [ADR-048](design/decisions/ADR-048-multi-replica-resident-rotation.md).
-
 - **Harness conversation resume across drains (HARNESS-BRIDGE §4.6, ADR-047)**. A bridged
   session now remembers its harness conversation: the adapter reports the harness's continuation
   handle (Claude `session_id` from `system/init`, Codex thread id from `thread/start`), the driver
@@ -54,9 +64,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   honestly `failed` (it is not re-driven), but the following input continues the same
   conversation; a rejected resume is a named `SoftFailed` — never a silent fresh conversation.
   No config or class change; dsh is unchanged. Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md)
-  §4.6; [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §3.
-
-- **Harness request capture: bridged sessions can be `exact` (HARNESS-BRIDGE §5.4, ADR-046)**.
+  §4.6; [design/EVENT-MODEL.md](design/EVENT-MODEL.md) §3.- **Harness request capture: bridged sessions can be `exact` (HARNESS-BRIDGE §5.4, ADR-046)**.
   With `superagent.harness.capture:` on, kian starts a loopback recording proxy and points the
   mounted Claude Code (`ANTHROPIC_BASE_URL`) or Codex (`model_providers.kian-capture`) at it. Each
   request body is recorded **before** it is forwarded (fail-closed: an oversized/unknown route or

@@ -430,7 +430,7 @@ no IM/channel answering (free text is not a decision — the mapping needs seman
 agents; no UI card; no new session state; no change to `LoopDriver`/`LoopOutcome`; no outbox row for
 the request (the request is the stream; a delivery row is the bundle's business).
 
-## 14c. Harness bridges (ADR-049, experimental)
+## 14c. Harness bridges (ADR-050, experimental)
 
 A bridge may opt in to `durable_ask` ([HARNESS-BRIDGE](HARNESS-BRIDGE.md) §4.4.1): the pending
 call is recorded exactly like a ReAct `ask` (one `tool/call` with `permission.evaluated:"ask"`,
