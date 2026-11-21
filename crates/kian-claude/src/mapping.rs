@@ -180,6 +180,7 @@ impl ClaudeMapper {
             })?;
         let mut text = String::new();
         let mut tools = 0usize;
+        let mut thinking = 0usize;
         for block in content {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
@@ -205,7 +206,7 @@ impl ClaudeMapper {
                     tools += 1;
                 }
                 // thinking / redacted_thinking / images are not kian context.
-                Some(_) => {}
+                Some(_) => thinking += 1,
                 None => {
                     return Err(ContractError::Drift(
                         "claude assistant content block has no type".into(),
@@ -220,6 +221,14 @@ impl ClaudeMapper {
             }));
         }
         if text.is_empty() && tools == 0 {
+            if thinking > 0 {
+                // Extended thinking arrives as its own assistant message (a live CLI/relay
+                // shape); it is not context and must not fail the turn.
+                self.held.push_back(SessionEvent::Mapped(Mapped::Absorbed {
+                    kind: "claude/thinking",
+                }));
+                return Ok(());
+            }
             return Err(ContractError::Drift(
                 "claude assistant message carried no text and no tool_use".into(),
             ));
@@ -473,6 +482,35 @@ mod tests {
             .position(|arg| arg == "--resume")
             .expect("--resume");
         assert_eq!(resumed[pos + 1], "sess-1");
+    }
+
+    #[test]
+    fn a_thinking_only_assistant_message_is_absorbed_not_drift() {
+        let mut mapper = ClaudeMapper::new();
+        mapper.init_seen = true;
+        mapper
+            .ingest(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"let me think"}]}}"#,
+            )
+            .expect("thinking-only assistant is absorbed");
+        assert!(matches!(
+            mapper.pop(),
+            Some(SessionEvent::Mapped(Mapped::Absorbed {
+                kind: "claude/thinking"
+            }))
+        ));
+        mapper
+            .ingest(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"pong"}]}}"#,
+            )
+            .expect("the real answer follows");
+        assert_eq!(
+            mapper.pop(),
+            Some(SessionEvent::Mapped(Mapped::Event {
+                kind: EventKind::AssistantMessage,
+                payload: json!({"role": "assistant", "content": {"text": "pong"}}),
+            }))
+        );
     }
 
     #[test]
