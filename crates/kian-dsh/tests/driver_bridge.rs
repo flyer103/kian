@@ -23,6 +23,12 @@ use uuid::Uuid;
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 const PEER: &str = env!("CARGO_BIN_EXE_kian-dsh-fixture-peer");
 
+/// Deadlock guard, not a latency assertion: this suite runs its eleven
+/// process-spawning tests in parallel, and a loaded CI runner can stretch a
+/// child spawn/step well past 15 s (the old bound) without a deadlock. 60 s
+/// still fails a real wedge and stays inside the job budget.
+const DRIVE_DEADLOCK_GUARD: Duration = Duration::from_secs(60);
+
 fn map_ctx() -> MapCtx {
     MapCtx {
         slot: "main".to_owned(),
@@ -280,10 +286,9 @@ async fn late_eligible_input_still_lands_at_the_idle_boundary() {
     });
 
     let driver = driver("steer.jsonl");
-    let outcomes =
-        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
-            .await
-            .expect("the bridge must not deadlock waiting for a wake; it re-checks the inbox");
+    let outcomes = tokio::time::timeout(DRIVE_DEADLOCK_GUARD, drive_to_end(&driver, ctx.clone()))
+        .await
+        .expect("the bridge must not deadlock waiting for a wake; it re-checks the inbox");
 
     assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
     let turn_starts = ctx
@@ -563,10 +568,9 @@ async fn tool_post_observes_the_mapped_tool_result_retrospectively() {
     });
     let driver = driver("basic_turn.jsonl")
         .with_tool_post_port(port.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
-    let outcomes =
-        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
-            .await
-            .expect("bridge flow completes");
+    let outcomes = tokio::time::timeout(DRIVE_DEADLOCK_GUARD, drive_to_end(&driver, ctx.clone()))
+        .await
+        .expect("bridge flow completes");
     assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
 
     let seen = port.seen.lock().expect("port").clone();
@@ -617,10 +621,9 @@ async fn result_without_mapped_call_is_skipped_with_audit() {
     // speech, not the recorded event).
     let driver = driver("unmapped_result.jsonl")
         .with_tool_post_port(port.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
-    let outcomes =
-        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver, ctx.clone()))
-            .await
-            .expect("bridge flow completes");
+    let outcomes = tokio::time::timeout(DRIVE_DEADLOCK_GUARD, drive_to_end(&driver, ctx.clone()))
+        .await
+        .expect("bridge flow completes");
     assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
 
     assert!(
@@ -657,10 +660,9 @@ async fn dedupe_path_dispatches_nothing() {
     });
     let driver1 = driver("basic_turn.jsonl")
         .with_tool_post_port(port1.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
-    let outcomes =
-        tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver1, ctx.clone()))
-            .await
-            .expect("first drive completes");
+    let outcomes = tokio::time::timeout(DRIVE_DEADLOCK_GUARD, drive_to_end(&driver1, ctx.clone()))
+        .await
+        .expect("first drive completes");
     assert_eq!(*outcomes.last().expect("outcomes"), LoopOutcome::Settled);
     assert_eq!(port1.seen.lock().expect("port").len(), 1);
     let appended_after_first = ctx.events_snapshot().len();
@@ -673,7 +675,7 @@ async fn dedupe_path_dispatches_nothing() {
     });
     let driver2 = driver("basic_turn.jsonl")
         .with_tool_post_port(port2.clone() as Arc<dyn kian_dsh::toolpost::ToolPostPort>);
-    let _ = tokio::time::timeout(Duration::from_secs(15), drive_to_end(&driver2, ctx.clone()))
+    let _ = tokio::time::timeout(DRIVE_DEADLOCK_GUARD, drive_to_end(&driver2, ctx.clone()))
         .await
         .expect("second drive completes");
 

@@ -90,6 +90,14 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
+/// Every test in this file spawns real `kiand` daemons and a real
+/// `kian serve` on loopback ports; `free_port` probes then releases a port, so
+/// parallel tests can win the same port between the probe and the child's bind
+/// (observed as `kiand exited before printing its listening line` / `Address
+/// already in use`). Serialise the file's tests — the suite is ~18 s serially
+/// and this removes the intra-file port TOCTOU entirely.
+static PORT_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const ROUTER_SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const LEGACY_SESSION: &str = "12345678-90ab-cdef-1234-567890abcdef";
 const HEARTBEAT_MS: u64 = 50;
@@ -761,6 +769,7 @@ fn exec_call(id: &str, shell_command: &str) -> ScriptedResponse {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_bound_sessions_route_exec_to_their_own_daemon() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-routing");
     let dir_a = dir.join("daemon-a");
@@ -971,6 +980,7 @@ fn desc_bound(which: &str) -> &str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kill9_of_bound_kiand_redrives_same_worker_and_session_continues() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-kill9");
     let dir_a = dir.join("daemon-a");
@@ -1175,6 +1185,7 @@ async fn kill9_of_bound_kiand_redrives_same_worker_and_session_continues() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_restart_rebuilds_binding_and_next_command_goes_to_same_worker() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-serve-restart");
     let dir_a = dir.join("daemon-a");
@@ -1360,6 +1371,7 @@ async fn serve_restart_rebuilds_binding_and_next_command_goes_to_same_worker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_unbound_session_routes_to_first_endpoint_and_never_counts_busy() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-legacy");
     let dir_a = dir.join("daemon-a");
@@ -1547,6 +1559,7 @@ async fn legacy_unbound_session_routes_to_first_endpoint_and_never_counts_busy()
 /// filesystem.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_unbound_follows_config_order_when_ids_are_not_alphabetical() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-legacy-order");
     let dir_a = dir.join("daemon-a");
@@ -1645,6 +1658,7 @@ async fn legacy_unbound_follows_config_order_when_ids_are_not_alphabetical() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_endpoints_serve_keeps_the_legacy_spawn_surface() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-zero-endpoints");
 
@@ -1734,6 +1748,7 @@ async fn zero_endpoints_serve_keeps_the_legacy_spawn_surface() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_tools_follow_the_bound_worker() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-async-bound");
     let dir_a = dir.join("daemon-a");
@@ -1886,6 +1901,7 @@ async fn async_tools_follow_the_bound_worker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn busy_worker_refusal_names_owner_then_other_worker_takes_over() {
+    let _port_serial = PORT_SERIAL.lock().await;
     force_no_proxy();
     let dir = temp_dir("l2-busy");
     let dir_a = dir.join("daemon-a");
@@ -2205,6 +2221,7 @@ async fn seed_bound_thread(
 /// the binding is the committed stream, exactly as the resolver reads it.
 #[tokio::test]
 async fn release_worker_ops_closes_a_stuck_binding_and_frees_it() {
+    let _port_serial = PORT_SERIAL.lock().await;
     use kian_core::events::EventKind as EK;
     use serde_json::json;
     force_no_proxy();

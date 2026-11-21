@@ -231,10 +231,14 @@ mod tests {
         store.observe(100);
         store.persist_now();
         let generation = store.generation();
-        // A different inode = a different database.
-        std::fs::write(&db, b"y").expect("db2");
-        let _ = std::fs::remove_file(&db);
-        std::fs::write(&db, b"z").expect("db3");
+        // A different inode = a different database. Build the replacement while
+        // the original still exists, then rename over it: unlink-then-create can
+        // reuse the freed inode number on ext4/overlay filesystems (the GitHub
+        // runners), which would keep the old generation and fail this assertion
+        // for an environment reason rather than a bridge bug.
+        let replacement = dir.join("chat.db.replacement");
+        std::fs::write(&replacement, b"z").expect("replacement db");
+        std::fs::rename(&replacement, &db).expect("replace db");
         let reloaded = CursorStore::load(&dir, &db);
         assert_ne!(reloaded.generation(), generation);
         assert!(reloaded.fresh());

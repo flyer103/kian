@@ -593,10 +593,13 @@ async fn an_open_step_that_goes_silent_ends_in_a_soft_failure_at_the_bound() {
     );
     let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
     ctx.push_input(json!({"text": "hi"}));
+    // 2 s (not 300 ms): the bound must fire promptly, but the already-read
+    // pre-stall message must first commit; a 300 ms window was lost under CI
+    // load and failed the "kept message" assertion for a scheduling reason.
     let config = BridgeDriverConfig {
         policy: ApprovalPolicy::deny_all(),
         max_steps: 32,
-        step_timeout_ms: 300,
+        step_timeout_ms: 2_000,
         labels: Default::default(),
     };
     let started = std::time::Instant::now();
@@ -647,10 +650,13 @@ async fn a_step_that_keeps_making_progress_is_not_cut() {
     );
     let ctx = Arc::new(MemoryCtx::new(SessionId::new()));
     ctx.push_input(json!({"text": "hi"}));
+    // A wide margin (5 s) over the 100 ms scripted cadence: the assertion is
+    // "a talking step is not cut", and a tight 400 ms bound did not survive
+    // CI scheduling jitter (a loaded gap was mistaken for silence).
     let config = BridgeDriverConfig {
         policy: ApprovalPolicy::deny_all(),
         max_steps: 32,
-        step_timeout_ms: 400,
+        step_timeout_ms: 5_000,
         labels: Default::default(),
     };
     let outcomes: Vec<LoopOutcome> = driver(adapter(&script), config)
@@ -782,6 +788,10 @@ async fn a_confirmation_resumes_and_answers_an_identical_reissue_once() {
             r#"{"op":"expect_any"}"#,
             r#"{"op":"send","line":{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}}"#,
             r#"{"op":"send","line":{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}}"#,
+            // The resume writes twice: the persisted-decision steer nudge and the
+            // one-shot auto-answer to the re-issued control request. Consume both;
+            // consuming one let the other race the peer's eof (stdin write failed).
+            r#"{"op":"expect_any"}"#,
             r#"{"op":"expect_any"}"#,
             r#"{"op":"send","line":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}}"#,
             r#"{"op":"send","line":{"type":"result","subtype":"success","is_error":false}}"#,

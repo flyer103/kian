@@ -330,10 +330,11 @@ async fn a_second_replica_catches_up_and_migrates_its_straggler() {
         "a catch-up is not a rotation"
     );
     assert_eq!(binding_b.load(), successor, "replica B re-points");
-    let rows = store
-        .eligible_inputs(successor, u64::MAX / 2)
-        .await
-        .expect("successor inbox");
+    // The successor's drain is already live (replica A bootstrapped it), so it
+    // may consume the migrated row before this read: migration is proven by the
+    // row existing on the successor with its rotation key, not by it still
+    // being eligible (asserting eligibility made this test race the drain).
+    let rows = store.input_rows(successor).await.expect("successor inbox");
     let migrated = rows
         .iter()
         .find(|row| row.payload.get("content") == Some(&json!("written by a stale replica")))
@@ -342,6 +343,8 @@ async fn a_second_replica_catches_up_and_migrates_its_straggler() {
         migrated.idempotency_key,
         Some(format!("rotate:{}:{}", live.0, straggler))
     );
+    // The original row deliberately stays on the frozen predecessor as the
+    // audit record (ADR-048); only the migrated copy runs on the successor.
 }
 
 /// ADR-047 (b): a rotation whose owner died between the close and the
