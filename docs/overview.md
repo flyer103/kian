@@ -26,8 +26,8 @@ Kian's answer is the durable-execution answer, applied to agent semantics: make 
 durable entity, make the **event stream** the only source of truth, and make each execution interval
 (a **drain**) disposable and restartable.
 
-**One-line claim:** Kian is the Temporal of agents — an open-source, model-neutral, self-hostable
-durable execution runtime built on three promises: agent work survives the process (killable,
+**One-line claim:** Kian is an open-source, model-neutral, self-hostable durable execution runtime
+for agents, built on three promises: agent work survives the process (killable,
 resumable, migratable, auditable), compute stays on machines you own (BYOM), and the loop stays
 yours (harness integration).
 

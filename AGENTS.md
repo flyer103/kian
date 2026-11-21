@@ -1,6 +1,6 @@
 # AGENTS.md — kian
 
-Durable execution runtime for agents ("the Temporal of agents"): sessions die, resume, migrate and
+Durable execution runtime for agents: sessions die, resume, migrate and
 audit cleanly. A `Session` is the one first-class durable entity, the append-only event stream is
 the sole truth, a `drain` is the execution hold interval, and **the agent loop is just a control
 flow inside a drain**. Super-agent (Router/Worker, event subscriptions, BYOM endpoints) is a
@@ -100,6 +100,9 @@ consistent: `cargo test -p kian-cli --test docs_map`.
 - `design/DESIGN.md` — HOW: execution model (Admit→Wake→Drain→Promote), session state machine,
   three-layer recovery, event schema versioning, plugin system, crate map, super-agent bundle.
 - `design/decisions/` — ADRs, append-only. ADR-001 Rust foundation … ADR-019 governed memory.
+- `LICENSE` — Apache-2.0 (the whole workspace; `license.workspace = true` in every crate).
+- `docs/advanced.md` — the capability and usage guide: the full capability list and one runnable
+  snippet per capability, out of the README.
 - `the design notes` — structured synthesis of the design inputs.
 - `a vendored archive/` — frozen snapshots (WeChat super-agent article; dsh README/architecture;
   cordis README/primer; Feishu kian design rev 1425; Feishu an internal design review rev 47).
@@ -112,8 +115,10 @@ when the owner asks. Negative results commit documentation only — never broken
 
 ## Docs map
 
-- `README.md` — the product entry point (see the README policy below): one-line claim, features,
-  quickstart, advanced usage, docs map.
+- `README.md` — the landing page (see the README policy below): one-line claim, three features, the
+  model, quickstart, environment contract, crate map, license. Long form is never here.
+- `docs/advanced.md` — every capability with one runnable snippet, plus the super-agent bundle,
+  channels, scheduling, memory, plugins and the operator surfaces.
 - `docs/SPEC.md` — the contract (WHAT). Changing scope means changing this file in the same change.
 - `design/DESIGN.md` — the blueprint (HOW). Any crate/seam/invariant change updates it in the same
   change.
@@ -172,12 +177,16 @@ when the owner asks. Negative results commit documentation only — never broken
 
 ## README policy
 
-`README.md` is the product entry point, not a changelog: it is a concise demo of the core product
-plus minimal usage of advanced capabilities. Keep this shape, top to bottom: one-liner + problem →
-`## Features` (capability bullets — never an implementation/storage/deployment metadata list) →
-`## How it works` → `## Docs map` → `## Quickstart` (copy-paste commands that run) →
-`## Advanced usage` (one short config/CLI example per capability) → `## Environment contract` →
-`## Crate map` → `## Examples`.
+`README.md` is the landing page, not a changelog and not a manual: a stranger should understand it
+in three minutes and run it in five. Keep this shape, top to bottom: one-liner + problem →
+`## Features` (exactly three bullets, one per core promise — never an
+implementation/storage/deployment metadata list) → `## How it works` (the model, closing with one
+"read more" line) → `## Quickstart` (copy-paste commands that run) → `## Environment contract` →
+`## Crate map` → `## License`.
+
+The long form lives outside the README: `docs/advanced.md` carries the full capability list and one
+runnable snippet per capability; the document map is this file's §Docs map and
+[docs/overview.md](docs/overview.md).
 
 **Never add to README** — these live in their owning docs:
 
@@ -185,20 +194,22 @@ plus minimal usage of advanced capabilities. Keep this shape, top to bottom: one
   [docs/SPEC.md](docs/SPEC.md), [docs/overview.md](docs/overview.md), the pull request;
 - release history and internal work-plan narratives — [CHANGELOG.md](CHANGELOG.md), SPEC §5;
 - verbose live-run logs and benchmark methodology — runbooks, SPEC, the pull request;
-- semantic detail already owned by SPEC / DESIGN / EVENT-MODEL — link to it, never restate it.
+- semantic detail already owned by SPEC / DESIGN / EVENT-MODEL — link to it, never restate it;
+- positioning-by-analogy ("the X of Y") or comparisons with other products — describe what the
+  runtime is and what it guarantees, not what it resembles.
 
 **When changing README**, in the same change:
 
 1. Fix cross-references: this file's docs map and any SPEC/DESIGN/runbook sentence pointing at a
    README section (no stale pointer to a removed README section).
-2. Preserve the anchors other docs link to (`#quickstart`, `#environment-contract`,
-   `#live-dsh-bridge-run-log-manual-env-gated`, `#tool-permissions-per-call-governance`).
+2. Preserve the anchors other docs link to (`#quickstart`, `#environment-contract`).
 3. Keep every relative link resolvable and every crate named; `cargo test -p kian-cli --test
    docs_map` is the gate.
 4. Keep Quickstart commands executable against this tree, YAML snippets parseable, and abridged
    output marked as abridged.
-5. Adding a capability = one line in `## Features` + one usage example in `## Advanced usage`; its
-   semantics stay in SPEC / DESIGN / EVENT-MODEL.
+5. Adding a capability = one short section with a runnable snippet in `docs/advanced.md` (plus one
+   line in `## Features` only if it is one of the three core promises); its semantics stay in
+   SPEC / DESIGN / EVENT-MODEL.
 
 ## CHANGELOG policy
 

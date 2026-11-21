@@ -1,5 +1,5 @@
 //! P5 end-to-end: the in-tree reference sidecar
-//! (`examples/hook-approval-gate/sidecar.py`, PLUGIN-SPEC §2's
+//! (`tests/fixtures/plugins/approval-gate-sidecar.py`, PLUGIN-SPEC §2's
 //! language-neutrality paragraph made executable) driven through the
 //! **real** serve assembly — `Server::from_config_file` over a written
 //! `kian.yaml` whose `sidecars:` section names a generated manifest
@@ -139,7 +139,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn sidecar_script() -> PathBuf {
-    let script = repo_root().join("examples/hook-approval-gate/sidecar.py");
+    let script =
+        repo_root().join("crates/kian-cli/tests/fixtures/plugins/approval-gate-sidecar.py");
     assert!(
         script.is_file(),
         "the reference sidecar must exist at {}",

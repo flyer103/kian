@@ -4,8 +4,8 @@
 
 ## 1. Positioning
 
-**Kian = the Temporal of agents**: an open-source, model-neutral, self-hostable durable execution
-runtime built on three promises: agent work is **killable, resumable, migratable and auditable**
+**Kian is an open-source, model-neutral, self-hostable durable execution runtime for agents**,
+built on three promises: agent work is **killable, resumable, migratable and auditable**
 (durable execution), compute runs on **machines you own** (BYOM), and the **loop stays yours**
 (harness integration).
 
@@ -283,7 +283,7 @@ status recorded here.
 | Item | Contents | Status |
 |------|---------|--------|
 | live leg — contract-v0 peer | `contrib/dsh-v0-peer/dsh-v0-peer.mjs` (zero-dep Node) adapting stock dsh JSON-RPC onto the frozen [ADR-010](../design/decisions/ADR-010-dsh-session-mapping.md) v0 contract; live run green (real `deepseek-chat`, full mapped chain, honest `Settled`) — supersedes the 2026-11-01 honest negative | landed |
-| Dogfood workload | `examples/issue-watch/`: TimerChannel → `gh issue list` → Router triage → worker draft (dry-run) on the real `flyer103/kian` repo; `demo-restart.sh` proves kill -9 reboot resumes the same session; RUNLOG records real data | landed |
+| Dogfood workload | an out-of-tree issue-watch harness: TimerChannel → `gh issue list` → Router triage → worker draft (dry-run) on the real `flyer103/kian` repo; its restart demo proves a kill -9 reboot resumes the same session; the run log records real data | landed |
 | Wire dialect v2 (breaking) | Strict OpenAI-compatible serialization: dotless built-in tool names (`fs_list`/`fs_read`/`fs_write`, dotted forms replayable), wire-level `tool_calls`/`tool_call_id`, `AgentDef.tools` fail-closed. Found live via DeepSeek HTTP 400/422; constraint-3 event in DESIGN (golden hash same commit) | landed |
 | Router re-arm | Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident Router with an observable `[re-arm]` cause input; soft-failed sessions re-open the same pinned session. Zero new kinds; DESIGN §4.6 | landed |
 
@@ -292,9 +292,9 @@ status recorded here.
 Adoption of the reference implementation's domain-policy layer onto kian's substrate.
 Reference: `a vendored archive/dsh-superagent-*.md` (archived rev 6337fc8), digest §5. **Everything
 landed at bundle-layer (`kian-superagent`, plus read/assembly slices of `kian-cli` and the
-`examples/issue-watch` dogfood); zero new event kinds — the durable set stays 22; every addition
+the issue-watch dogfood); zero new event kinds — the durable set stays 22; every addition
 is an additive payload key on a frozen wrapper, a disposable projection, or a config/template
-artifact.** Semantics: DESIGN §4.7; operator surface: the README's bundle-policy and operator-surface sections.
+artifact.** Semantics: DESIGN §4.7; operator surface: [advanced.md](advanced.md) bundle-policy and operator-surface sections.
 
 | Item | What landed | Status |
 |---|---|---|
@@ -306,8 +306,8 @@ artifact.** Semantics: DESIGN §4.7; operator surface: the README's bundle-polic
 | Thread/Correlation intake projection | Config-owned canonical thread keys `<channel>:<group>#<key>` used as routing topics; stream-derived read positions (lark/GitHub cursors) or honest idempotent re-poll — no position table; correlation adds context, never routes; fan-out grants no authority — [ADR-013](../design/decisions/ADR-013-thread-intake-projection.md) | landed (ADR-013 stays a draft record) |
 | Outbox+receipts bounded retry | Reuse audit verdict: the outbox is a disposable projection over `tool/call` intent + `channel/delivered` receipt plus a bounded driver — no new durable state; 2s→60s backoff, `max_attempts` 6 then parked honestly (`delivery-retry` stage, named on `kian tickets`); per-(ticket, conversation) ordering; additive `attempt`/`first_attempt_ms` on new receipts; park survives reboot ( +, plan) | landed |
 | Policy/prompt versioning + drift marking | `[policy <label>]` header added at render (template text untouched, persisted prompts replay byte-identically); boot-time drift marking (audit + counter, live sessions never rewritten); config-gated one-shot policy-changed marker input | landed |
-| Issue-watch multi-Ticket dogfood | GitHub poll-receive mode beside the webhook (`since` cursors, bounded backfill); `examples/issue-watch` v2 composes the whole stack — one Ticket per live issue, thread-keyed topics, mandate-bounded triagers, speak-rule deliveries through the outbox; v1 kept as `config-timer.yaml` | landed |
-| live validation | The eight-step validation protocol executed live against `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`): steps 1, 4, 5, 6, 7, 8 PASS with captured evidence; steps 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; the gap report filed the gaps (`examples/issue-watch/RUNLOG.md` §7) | executed (with honest negatives) |
+| Issue-watch multi-Ticket dogfood | GitHub poll-receive mode beside the webhook (`since` cursors, bounded backfill); the issue-watch v2 harness composes the whole stack — one Ticket per live issue, thread-keyed topics, mandate-bounded triagers, speak-rule deliveries through the outbox; v1 kept as the timer config | landed |
+| live validation | The eight-step validation protocol executed live against `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`): steps 1, 4, 5, 6, 7, 8 PASS with captured evidence; steps 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; the gap report filed the gaps (the issue-watch run log §7) | executed (with honest negatives) |
 | gap fixes | The four gaps, all landed: the `User-Agent` stamp on every github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode; `spawn_topic` accepts the live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing work live; outbox park rebuilt at boot and surfaced per-ticket on the stage board; exec secret hygiene — shared core redactor + env policy, `env` dumps never persist secrets (the one cross-bundle-fence commit, filed separately) | landed |
 | Multiagent delegation (session-internal + roster) | The multiagent contract: delegation = a **child session** via `Thread` (one mechanism, no lighter tier) with a derived spawn identity (`spawn_uid`) so a replay cannot mint a duplicate child, and a completion delivered as a **pair of writes** with a reconciliation rule; cross-session composition = existing Thread/Mandate/subscription/`agent.id` + a config agent roster over `AgentDef` (`superagent.roster`, selected only through a read-only `list_agents`); the board ruling — a disposable `task_board` view plus a control path recomputed from the primary, **never** a board entity and never a control read on the view; a closed nine-value task-outcome vocabulary (an empty answer is never a success) plus a separate two-value spawn outcome; config-only caps (`max_children` 4, `max_depth` 1). **Zero new event kinds, no new table/route/ops method/metrics key, no core change**; **no event-payload key set changes before P4** — P1 adds message content inside new delegation wrappers and new reports, P2 adds three `spawn_worker` arguments (one constraint-3 change), and the two additive `thread/*` audit key groups are a P4 owner gate — [MULTIAGENT-MODEL](../design/MULTIAGENT-MODEL.md), [ADR-029](../design/decisions/ADR-029-multiagent-delegation-and-board.md) | implemented P1–P4 (R15–R17; tests only — no live-run evidence) |
 

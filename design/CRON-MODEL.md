@@ -725,7 +725,7 @@ document does not trigger that path.
 | Unit (startup) | frozen session with leftover rows at boot, and an unprojectable stream | the frozen session is not woken, live sessions still drain, a corrupt stream does not abort the NoLostWork pass (`startup_rebuild_skips_frozen_sessions_but_recovers_live_ones`, `startup_rebuild_survives_an_unprojectable_stream`) |
 | Integration (config) | `overlap: queue` / resident `timeout_ms` / watchdog target | load refuses, naming the rule (§3.3 rules 6–8) |
 | Integration (CLI) | `list` → `run-now` → `logs --schedule` → `rm` | round-trip; logs names the state, the firing's session and the skip reason; `run-now` refuses a resident schedule (`cron_logs_renders_the_recorded_session`) |
-| Regression | existing `examples/issue-watch` timer config | unchanged behaviour, no cron table created |
+| Regression | existing issue-watch timer config | unchanged behaviour, no cron table created |
 
 ## 14. Open questions
 

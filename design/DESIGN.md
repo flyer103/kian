@@ -1354,7 +1354,7 @@ gap fixes recorded in the closing bullets.
  (idempotent re-poll), topic = the thread key `issue-github:<owner>/<repo>#<N>`,
  admission classes per (bot/CI ignored, human comments candidate, adapter-declared
  `explicit` on issue authorship → ADR-012 mandate strength). The example
- (`examples/issue-watch` v2; the timer v1 kept verbatim as `config-timer.yaml` for the
+ (issue-watch v2; the timer v1 kept verbatim as a config for the
  regression demo) composes the whole bundle stack on one source: the Router judges
  new issues (accept with Mandate → `spawn_worker` per issue topic), follow-ups admit to
  the live triager with zero Router judge turns, ended workers release to fresh
@@ -1369,7 +1369,7 @@ gap fixes recorded in the closing bullets.
 - **Live validation** — the eight-step validation protocol executed
  live against the real `flyer103/kian` repo (2026-11-04, four scratch stores, real
  DeepSeek work trips, real GitHub REST traffic, `DRY_RUN=1` throughout; every claim cited
- by session id + seq or a captured log line — `examples/issue-watch/RUNLOG.md` §7):
+ by session id + seq or a captured log line — the issue-watch run log §7):
  scenarios 1 (Eval accept → Ticket + Mandate), 4 (speak-rules: deliver-once, one
  sub-item not-reached and honestly marked), 5 (stage board honesty, including the
  arm-5 `queued`-on-completed projection gap confirmed live exactly as documented),

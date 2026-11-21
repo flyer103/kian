@@ -210,5 +210,5 @@ no kian-side code change is warranted by this run.
 2. Point `superagent.harness.dsh.command` (or `KIAN_DSH_BIN`) at the
    contract-satisfying peer.
 3. Run the one-liner above; record the outcome in the README's
-   [live dsh-bridge run log](../README.md#live-dsh-bridge-run-log-manual-env-gated)
+   [live dsh-bridge run log](advanced.md#harness-bridge-dsh)
    — a `Settled` run with the session stream and replay report closes the live leg.
