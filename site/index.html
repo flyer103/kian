@@ -293,14 +293,15 @@ drain claims        2</code></pre>
     <p class="eyebrow">Quickstart</p>
     <div class="section-head">
       <h2>One binary. One sqlite file. No external queue.</h2>
-      <p class="section-lede">Rust stable 1.85+, plus <code>curl</code> and <code>jq</code> &mdash; sqlite is embedded and a single <code>kian serve</code> process is the whole system. The provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
+      <p class="section-lede">No toolchain needed: a prebuilt archive or the container image. sqlite is embedded and a single <code>kian serve</code> process is the whole system, and the provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
     </div>
 
     <ol class="steps">
       <li>
-        <h3><span class="step-no">1</span>Build</h3>
-        <pre tabindex="0"><code>git clone https://github.com/flyer103/kian &amp;&amp; cd kian
-cargo build --release --workspace</code></pre>
+        <h3><span class="step-no">1</span>Install</h3>
+        <pre tabindex="0"><code>mkdir -p ~/.local/bin
+curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
+  | tar -xz -C ~/.local/bin kian kiand</code></pre>
       </li>
       <li>
         <h3><span class="step-no">2</span>Write <code>kian.yaml</code></h3>
@@ -327,7 +328,7 @@ recovery:
       <li>
         <h3><span class="step-no">3</span>Serve</h3>
         <pre tabindex="0"><code>export DEEPSEEK_API_KEY=sk-...
-./target/release/kian serve --config kian.yaml</code></pre>
+kian serve --config kian.yaml</code></pre>
       </li>
       <li>
         <h3><span class="step-no">4</span>Run a session</h3>
