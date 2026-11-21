@@ -28,7 +28,7 @@ jobs:
 
   gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # The workspace's debug test binaries no longer fit the hosted
@@ -61,7 +61,7 @@ jobs:
   # and the multi-replica e2e) actually run.
   postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17

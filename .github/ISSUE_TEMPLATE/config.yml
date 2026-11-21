@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/flyer103/kian/security/advisories/new
+    about: Report privately. Never open a public issue for an exploitable bug.
+  - name: Question about the model, the event stream or "why this design"
+    url: https://github.com/flyer103/kian/blob/main/docs/overview.md
+    about: docs/overview.md is the one-page model; design/decisions/ holds the reasoning per choice.
+  - name: How do I run X?
+    url: https://github.com/flyer103/kian/blob/main/docs/advanced.md
+    about: One runnable snippet per capability, from channels to cron to plugins.

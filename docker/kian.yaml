@@ -1,0 +1,32 @@
+# Container configuration for `docker run`.
+#
+# The only difference from the source quickstart is `listen`: the container
+# must bind 0.0.0.0 (the quickstart's 127.0.0.1 is a host-loopback default and
+# would be unreachable through `-p`). State lives in /data, which is the
+# volume the image expects.
+#
+#   docker run --rm -p 7433:7433 \
+#     -e DEEPSEEK_API_KEY \
+#     -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" \
+#     -v kian-data:/data \
+#     ghcr.io/flyer103/kian
+
+listen: "0.0.0.0:7433"
+storage:
+  sqlite: "/data/kian.db"
+agent:
+  id: my-agent
+  model_slots:
+    main:
+      provider: deepseek
+      model: deepseek-flash
+providers:
+  deepseek:
+    base_url: "https://api.deepseek.com"
+    api_key_env: DEEPSEEK_API_KEY
+recovery:
+  rules:
+    - class: rate_limited
+      action: {backoff_retry: {delay_ms: 500}}
+    - class: unknown
+      action: fail

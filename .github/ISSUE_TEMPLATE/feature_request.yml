@@ -1,0 +1,49 @@
+name: Feature request
+description: A capability, a harness, a channel or an operational surface you need.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kian grows by one of four moves, in this order: configuration → plugin → seam (with an ADR)
+        → core primitive. A request that fits an earlier move is much more likely to land.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today? Concrete situations beat abstractions.
+      placeholder: "I want to run the same session against two providers and compare cost per turn."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: Which shape do you think it takes?
+      options:
+        - Configuration (a field, a default, a validation)
+        - Plugin (a sidecar at an existing hook port)
+        - Seam (a new trait implementation behind an existing boundary)
+        - Core primitive (a new event kind or state-machine transition)
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: What contract would it change?
+      description: |
+        Does it add an event kind, a wire shape, a CLI flag, a config key, a tool schema? Anything
+        that changes event bytes or prompt bytes is a bigger deal than it looks (cache stability).
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Existing config, a plugin, an ADR that already rules this out.
+    validations:
+      required: false

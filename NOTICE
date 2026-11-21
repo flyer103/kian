@@ -1,0 +1,27 @@
+Kian
+Copyright 2026 The Kian Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+This product includes software developed at other projects, redistributed
+under their own licenses. Notable runtime dependencies (all permissively
+licensed, resolved in Cargo.lock):
+
+- tokio, axum, serde, reqwest (MIT / Apache-2.0)
+- sqlx and libsqlite3-sys, which links SQLite (MIT; SQLite itself is public
+  domain)
+- rusqlite-family bindings and the Rust standard library (MIT / Apache-2.0)
+
+The `kian-dsh`, `kian-claude` and `kian-codex` bridges spawn third-party CLIs
+(`dsh`, `claude`, `codex`) as child processes; those programs are not
+redistributed here and remain governed by their own licenses.

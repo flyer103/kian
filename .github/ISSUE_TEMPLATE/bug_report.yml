@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in the runtime, the CLI or a bridge behaves differently from the contract.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: this project is pre-1.0 and several behaviours are deliberate boundaries —
+        at-least-once command delivery, projection-only harnesses without byte-level replay, and
+        the "no cross-worker failover" rule. Check [docs/SPEC.md](https://github.com/flyer103/kian/blob/main/docs/SPEC.md)
+        and the [capability matrix](https://github.com/flyer103/kian/blob/main/design/HARNESS-BRIDGE.md)
+        first.
+
+        **Do not paste provider keys, tokens, chat ids, personal paths or full `session export`
+        payloads.** Redact them.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `kian --version`, or the tag / commit you built.
+      placeholder: "kian 0.1.0 (a5426d1)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Durable execution / recovery / fencing
+        - Event stream / projection / replay
+        - BYOM execution endpoints (kiand)
+        - Provider / model slots
+        - Harness bridge (dsh / Claude Code / Codex)
+        - Channels (Lark / GitHub / WeChat / iMessage)
+        - Super-agent bundle (Router / Worker)
+        - Cron / memory / plugins / read model
+        - CLI / operator surfaces
+        - Docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and why
+      description: Quote the contract if you can — an event kind, an ADR, a SPEC line.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include the sequence of events or the CLI output, redacted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        Config (redacted), commands, and whether it reproduces after a restart on the same sqlite file.
+        A crash-recovery bug is much easier to act on if you say where the process died.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / event stream excerpt
+      description: Redact secrets and personal data. `kian session inspect <id>` output is usually enough.
+      render: shell
+    validations:
+      required: false
