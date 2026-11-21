@@ -128,7 +128,8 @@ curl -s localhost:7433/rpc -H 'content-type: application/json' \
 curl -sN localhost:7433/sessions/$SID/events      # live SSE stream; ends after session/ended
 ```
 
-The stream *is* the audit record. Abridged — ids shortened and the full `step/request` body elided:
+The stream *is* the audit record. Abridged — captured against a local OpenAI-compatible stub
+(hence the reply text), ids shortened, and the full `step/request` body elided:
 
 ```
 event: kian
