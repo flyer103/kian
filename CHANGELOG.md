@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Claude bridge: tool permission prompts reach kian**. The Claude child no longer runs in
+  print mode (which auto-denied every permission prompt) and passes
+  `--permission-mode manual --permission-prompt-tool stdio`, so the harness's `can_use_tool`
+  control requests reach kian's approval policy. Live-verified 2026-11-21: an allowed `Bash` call
+  ran with `permission.evaluated:"allow"`, a denied one produced an honest error result and did
+  not execute. `--resume`/capture keep working under the new argv (recorded in the runbook).
+
 - **Claude bridge: absorb thinking-only assistant messages**. Extended thinking can arrive as its
   own `assistant` message whose content blocks are `thinking`/`redacted_thinking` only (observed
   live with a Claude-compatible provider); it carries no model context and is now absorbed as

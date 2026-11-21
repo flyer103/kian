@@ -17,6 +17,8 @@ the live legs. The contract lives in [HARNESS-BRIDGE](../design/HARNESS-BRIDGE.m
 | Claude Code live | **positive, 2026-11-21** — `claude 2.1.318` via the shell's Claude-compatible provider; reply `pong`, `TurnEnd(final_answer)` | `KIAN_CLAUDE_BIN=… cargo test -p kian-claude --test live -- --nocapture`: observed `InputAdmitted → TurnStart → AssistantMessage("pong") → TurnEnd(final_answer)` (the earlier not-logged-in run recorded an honest `TurnEnd(error)`) |
 | Claude capture + resume live | **positive, 2026-11-21** — exact `step/request` body through the loopback proxy (122 KB) and the resumed drain answered `pong` from the same conversation (2 captured requests) | `KIAN_CLAUDE_BIN=… KIAN_CLAUDE_LIVE_CAPTURE=1 NO_PROXY=127.0.0.1,localhost cargo test -p kian-cli --test live_claude_capture_resume -- --nocapture`; the run used the shell's `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` |
 | Codex live | **positive, 2026-11-20** — `codex-cli 0.166.0`, one real turn, reply `pong`, `Settled` | `KIAN_CODEX_BIN=… cargo test -p kian-codex --test live -- --nocapture`: observed `InputAdmitted → TurnStart → AssistantMessage("pong") → TurnEnd(final_answer)` |
+| Claude live tool approvals | **positive, 2026-11-21** — the harness asked kian via `can_use_tool`; allow ran the tool with `permission.evaluated:"allow"`, deny produced an honest error result and no execution | `KIAN_CLAUDE_BIN=… KIAN_CLAUDE_LIVE_APPROVALS=1 … cargo test -p kian-cli --test live_claude_approvals -- --nocapture` |
+| Claude durable ask live experiment | **honest fallback observed** — confirm → nudge → the fresh resumed conversation re-issued a similar-but-not-identical call, so kian asked again and closed the pending call with `confirmed call was not re-issued` (ADR-050 live findings) | same suite, `live_claude_durable_ask_reissue_experiment` |
 | Codex capture + resume live | **positive, 2026-11-21** — exact `step/request` bodies through the loopback proxy (80 KB, `class exact`) and the resumed drain answered `pong` from the same conversation (3 captured requests) | `KIAN_CODEX_BIN=… KIAN_CODEX_LIVE_CAPTURE=1 NO_PROXY=127.0.0.1,localhost cargo test -p kian-cli --test live_capture_resume -- --nocapture`; the run used the configured `deepseek` provider (`deepseek-flash`, responses wire API) |
 
 The fixture children speak the *native* protocol shapes pinned below. Codex's live leg is recorded;
@@ -26,15 +28,17 @@ live run exercised tool approvals — the capability matrix's `◐` rows for app
 
 ## Protocol pins
 
-Claude Code (`claude --print --input-format stream-json --output-format stream-json --verbose
---permission-mode default`):
+Claude Code (`claude --input-format stream-json --output-format stream-json --verbose
+--permission-mode manual --permission-prompt-tool stdio`; no `--print` — print mode auto-denies
+permission prompts, live-verified 2026-11-21):
 
 - input: `{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]}}`
 - interrupt: `{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}`
 - approval answer: `{"type":"control_response","response":{"subtype":"success","request_id":…,
   "response":{"behavior":"allow"|"deny","message":…}}}`
 - output: `system/init`, `assistant`, `user` (tool results), `result`, `control_request`
-  (`can_use_tool`), `control_response`, `stream_event`
+  (`can_use_tool`), `control_response`, `stream_event`; tool prompts reach kian only with
+  `--permission-prompt-tool stdio` and without `--print`
 
 Codex (`codex app-server`, JSON-RPC 2.0 JSONL without the `jsonrpc` header; pinned from the
 upstream `codex-rs/app-server/README.md`):

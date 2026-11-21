@@ -438,7 +438,8 @@ no result), so §4/§6/§7 apply unchanged — the settle ends `awaiting_input`,
 durable `control/confirm` row, and the pending call must eventually be closed by a result. The
 only difference is the resume side: the harness resumes its conversation (ADR-047) and the
 decision covers an **identical re-issue** (tool + arguments digest), not the in-flight call; a
-turn that never re-issues closes the call with an honest error result.
+turn that never re-issues closes the call with an honest error result. A live experiment (2026-11-21)
+observed the honest close-out rather than an identical re-issue — see ADR-050's live findings.
 
 ## 14b. Phase-2 semantics (worker integration, landed)
 

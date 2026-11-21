@@ -53,6 +53,17 @@
     **unverified live** — the capability matrix marks durable ask `◐ experimental`, and a
     deployment opts in explicitly;
   - a harness that never re-issues still leaves an honest audit trail (the close-out result).
+- **Live findings (2026-11-21, Claude 2.1.318 via a Claude-compatible provider)**: the defer half
+  worked (one pending call, `Settled`, no answer); the confirm delivered a persisted synthetic
+  nudge and the resume turn ran. The turn was a **fresh CLI conversation**, because a deferred ask
+  writes no `turn/end` and therefore persists no resume handle (ADR-047), so the nudge alone is the
+  prompt. The harness re-issued a *similar but not identical* call (same `command`, a different
+  `description` argument) — not the identical re-issue the auto-answer requires — so kian asked
+  again and closed the original pending call with the honest
+  `confirmed call was not re-issued` result carrying the approve provenance. The fallback behaved
+  as designed; the identical-re-issue premise is **not observed** on this path. A follow-up could
+  persist the handle on the pending `tool/call` (additive `harness.resume`) and/or match on a
+  narrower key, but both widen the approval scope and need their own gate.
 - **Rollback Trigger**: a harness whose resume never re-issues (then durable ask stays opt-out for
   it and the matrix says so), or a re-issue that cannot be correlated by tool+arguments digest
   (then the confirmed call is closed unexercised rather than guessed).
