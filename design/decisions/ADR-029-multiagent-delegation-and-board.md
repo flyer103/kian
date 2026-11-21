@@ -48,8 +48,8 @@ would fork truth).
 The three clusters the rulings rest on — durable execution and replay, the effect-committed/record-absent
 window, and delegation isolation plus board-versus-projection — each have primary literature. These nine
 identifiers were resolved and their titles matched on 2026-11-15; they are the citation subset this ADR
-keeps so that the *why* survives in the repository. `the design notes` remains the home for the
-fuller synthesis and is deliberately untouched in this round.
+keeps so that the *why* survives in the repository. The fuller synthesis behind these decisions is
+not vendored; where it matters, the ruling cites the identifier directly.
 
 **Cluster 1 — durable execution is replay plus effect control (D1, M4).**
 

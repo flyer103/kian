@@ -115,7 +115,7 @@ The review card must independently verify R1–R9 and constraint 3 before closeo
 - `design/READ-MODEL.md` — the contract this decision establishes.
 - `design/EVENT-MODEL.md` — truth model and `compact` semantics.
 - `design/API-CONTRACT.md` — wire shapes (planned section until each phase lands).
-- GitHub, "Inside GitHub's new Git storage architecture" (2026-11-05) — the external input
-  synthesized in `the design notes`; adopted principles: immutable truth vs minimal
+- GitHub, "Inside GitHub's new Git storage architecture" (2026-11-05) — the external input;
+  adopted principles: immutable truth vs minimal
   ordered state, version-check fast path, verified compaction, maintenance off the serving path;
   rejected: consensus layer, object-store split, transparent cold tier.

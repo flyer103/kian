@@ -7,7 +7,7 @@
   forgotten"), [ADR-014](ADR-014-durable-interrupt-intent.md) (the reserved control-envelope
   precedent), [ADR-028](ADR-028-harness-hook-plugins.md) (D13: the hook verdict vocabulary stays
   closed at `deny`), `crates/kian-superagent/src/stage.rs` (the `awaiting-answer` stage is read-side
-  only; an ended ticket re-enters fresh Eval), `docs/SPEC.md` §5, `the design notes` §8.
+  only; an ended ticket re-enters fresh Eval), `docs/SPEC.md` §5.
 
 ## Context
 
