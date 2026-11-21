@@ -91,9 +91,11 @@ docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
   -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
   ghcr.io/flyer103/kian
 
-# 2. prebuilt binary (macOS arm64/x86_64 and Linux x86_64/aarch64, on the releases page)
+# 2. prebuilt binary (swap the triple: x86_64-apple-darwin, x86_64-unknown-linux-gnu,
+#    aarch64-unknown-linux-gnu — all four are attached to every release)
+mkdir -p ~/.local/bin
 curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
-  | tar -xz -C /usr/local/bin kian kiand
+  | tar -xz -C ~/.local/bin kian kiand
 
 # 3. from source (Rust stable 1.85+)
 cargo build --release --workspace
