@@ -1,0 +1,51 @@
+# Landing page
+
+The Kian landing page: plain HTML, CSS and JavaScript. No build step, no external requests, no
+cookies, no client-side framework.
+
+## Preview
+
+```bash
+python3 -m http.server 8080 --directory site
+```
+
+Open <http://127.0.0.1:8080>. `_headers` is a Cloudflare Pages file, so the local server does not
+apply the CSP; that is expected.
+
+## Deploy to Cloudflare Pages
+
+Direct upload, no repository connection needed. The first run prompts to create the project:
+
+```bash
+npx wrangler pages deploy site --project-name kian-site
+```
+
+Or connect the repository in the dashboard: framework preset **None**, build command empty, build
+output directory `site`. `_headers` applies the CSP, HSTS and cache policy on every deploy.
+
+Bind a custom domain under **Custom domains** once DNS points at Cloudflare.
+
+## GitHub Pages mirror
+
+[`pages.yml`](../.github/workflows/pages.yml) publishes `site/` on every push to `main`. Enable it
+once under **Settings → Pages → Build and deployment → Source: GitHub Actions**. Asset paths are
+relative, so the mirror also works under the repository subpath (`/<repo>/`).
+
+## Before going live
+
+- Replace `https://kian-site.pages.dev` in `index.html` (canonical plus Open Graph/Twitter URLs)
+  with the production origin once a custom domain is bound. The current value matches the default
+  `wrangler` project name.
+- Replace `flyer103/kian` if the repository moves.
+- Regenerate `assets/og.png` when the headline or one-liner changes.
+- Adding any third-party script or analytics requires widening `script-src`/`connect-src` in
+  `_headers` first; the current policy blocks all third-party requests.
+
+## Notes
+
+- The page mirrors the claims in the root `README.md`; when the README's features or quickstart
+  change, update `index.html` in the same change. The recorded demo GIF stays in the README rather
+  than being duplicated here.
+- Repository convention: all text is English.
+- Unknown nested paths (`/a/b`) get `404.html`, whose relative assets resolve against the requested
+  path; the site is a single page, so this trade-off is accepted.
