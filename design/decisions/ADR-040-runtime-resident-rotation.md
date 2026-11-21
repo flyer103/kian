@@ -54,18 +54,21 @@ rotation trigger and the end reason).
   assumption below is superseded: replicas derive the live session from the durable chain when their
   binding is terminal, any replica may complete an interrupted successor bootstrap (the admit keys
   are idempotent), and a catching-up replica migrates its stale writes to the successor.
-- **Phase 2 — landed (2026-11-20).** Runtime rotation between restarts: a serve ticker (the
-  `drain.heartbeat_interval_ms` beat, clamped to [1s, 60s]) calls the planner when
-  `superagent.router.rotate_after_events` is set. The planner gates on `idle` and the threshold,
-  retires the predecessor with the engine's new atomic `rotate_idle` close (one `drain/claimed` +
-  `session/ended{rotated}` batch, claim-fenced; unlike a release, a pending row does not block it —
-  the row stays durable on the frozen predecessor), injects the memory index into the fresh
-  successor, swaps the shared binding (every phase-1 consumer re-points), re-admits the rows that
-  were on the predecessor (and any that raced the close), admits the bounded handoff, then admits
-  the successor's judge prompt (its wake starts the successor's first drain). The predecessor's
-  driver, inbox and worker sides all read the binding, so no restart is involved. This supersedes
-  the reserved-control-row sketch above: the trigger is the operator-side planner, not a control
-  row inside the drain (the close is already an engine-owned atomic write).
+- **Phase 2 — landed (2026-11-20).** Runtime rotation between restarts, in two cooperating parts:
+  - **The hold owner ends its own session.** A parked resident holds its drain, so no outside
+    closer can ever claim it idle. The `RouterDriver` therefore checks its rotation policy at a
+    **park boundary** (threshold met, no delegated thread outstanding) and yields a reserved
+    rotation stop; the engine maps it to `session/ended{rotated}` (terminal, frozen). This is the
+    real trigger for a live Router.
+  - **The ticker completes the successor.** The serve ticker (the `drain.heartbeat_interval_ms`
+    beat, clamped to [1s, 60s]) sees the terminal predecessor, derives the uuid5 successor (a
+    multi-replica peer does the same — ADR-048), injects the memory index, swaps the shared binding
+    (every phase-1 consumer re-points), migrates the predecessor's pending rows, admits the bounded
+    handoff, then the successor's judge prompt (its wake starts the successor's first drain). The
+    planner's engine-owned `rotate_idle` close (one `drain/claimed` + `session/ended{rotated}`
+    batch) remains for a genuinely idle window (e.g. a soft-failed session between holds).
+  No restart is involved; the reserved-control-row sketch is superseded twice over (the hold owner
+  ends itself; the close is already an engine-owned atomic write).
 
 ## Decision (the phase-2 design)
 
@@ -147,5 +150,7 @@ catalog (additions-only) and is never emitted when the feature is off.
    `handoff` key outside `content`.
 4. **Input migration rule.** Exactly which predecessor inputs the successor re-offers, and how the
    successor proves it saw each once (a re-offer key derived from the predecessor's row ids).
-5. **Cron targets.** Refuse `{session}` rotation targets at load (proposed) vs resolve them through
-   the binding (a moving target in a static declaration).
+5. **Cron targets — resolved: refuse at load.** A fixed `session:` target naming the pinned Router
+   while `rotate_after_events` is set refuses boot (`cron_targets_rotating_router`, CRON-MODEL §3.3
+   rule 9): a static declaration cannot follow a moving binding. The `channel:` namespace is
+   unaffected; with rotation off the pinned id is stable and the historical behavior stands.

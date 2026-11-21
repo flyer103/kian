@@ -826,6 +826,7 @@ impl Server {
             }
             plugins.register(SuperAgentPlugin {
                 router_binding: Arc::clone(&router_binding),
+                router_rotate_after_events: sa.router.rotate_after_events,
                 router_agent,
                 worker_agent,
                 default_agent: config.agent_def(),

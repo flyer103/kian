@@ -1102,8 +1102,9 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
  accepts it: **all three phases are landed** (phase 0: the `rotated` end reason and terminal state,
 the boot-time atomic close, the chain re-resolution and the successor's ordered context; phase 1:
 the shared `ResidentBinding` every router-facing surface reads at use time; phase 2: the runtime
-rotation between restarts — a serve ticker, the engine's atomic `rotate_idle` close, the memory
-index → migrated rows → handoff → judge prompt order, and the binding swap). Multi-replica safety
+rotation between restarts — the hold owner ends its own parked session `rotated` at a park boundary,
+a serve ticker derives the successor and bootstraps it (memory index → migrated rows → handoff →
+judge prompt), and the shared binding swap re-points every consumer). Multi-replica safety
 is [ADR-048](decisions/ADR-048-multi-replica-resident-rotation.md): replicas derive the live session
 from the durable chain when their binding turns terminal, any replica may complete an interrupted
 successor bootstrap (idempotent keys), and a catching-up replica migrates its stale writes to the

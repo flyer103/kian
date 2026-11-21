@@ -4000,6 +4000,11 @@ impl ServeConfig {
                 &resolved_cron,
                 sa.watchdog.as_ref().map(|w| w.session_id.as_str()),
             )?;
+            reject_cron_targeting_the_rotating_router(
+                &resolved_cron,
+                Some(sa.router.session_id.as_str()),
+                sa.router.rotate_after_events.is_some(),
+            )?;
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -5312,6 +5317,38 @@ pub fn reject_cron_targeting_the_watchdog(
             return Err(invalid(format!(
                 "superagent.cron schedule `{}` targets the watchdog session `{watchdog}` \
                  (cron_targets_watchdog, CRON-MODEL §3.3 rule 7)",
+                schedule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// CRON-MODEL §3.3 rule 8 (`cron_targets_rotating_router`): when the
+/// resident Router may rotate (`superagent.router.rotate_after_events`),
+/// a wall-clock schedule must not name its **pinned** session as a fixed
+/// target — the live Router is the first non-terminal link of the
+/// deterministic chain, so a static target would fire into a session that
+/// may be frozen (ADR-040/ADR-048). The channel namespace is unaffected.
+pub fn reject_cron_targeting_the_rotating_router(
+    schedules: &[CronRuntimeSchedule],
+    router_session: Option<&str>,
+    rotation_enabled: bool,
+) -> Result<(), ConfigError> {
+    if !rotation_enabled {
+        return Ok(());
+    }
+    let Some(router) = router_session else {
+        return Ok(());
+    };
+    for schedule in schedules {
+        if let CronTarget::Session { session } = &schedule.target
+            && session == router
+        {
+            return Err(invalid(format!(
+                "superagent.cron schedule `{}` targets the resident Router session `{router}`                  while rotation is enabled (`superagent.router.rotate_after_events`): the live                  Router moves along the uuid5 chain, so a fixed target can fire into a frozen \
+                 session (cron_targets_rotating_router, CRON-MODEL §3.3 rule 8; ADR-048). Use a \
+                 `channel:` target or disable rotation",
                 schedule.id
             )));
         }
@@ -9184,6 +9221,55 @@ schedules:
         assert!(err.contains("`audit`"), "{err}");
         assert!(reject_cron_targeting_the_watchdog(&resolved, Some("other")).is_ok());
         assert!(reject_cron_targeting_the_watchdog(&resolved, None).is_ok());
+    }
+
+    /// CRON-MODEL §3.3 rule 8 (`cron_targets_rotating_router`): a fixed
+    /// `session:` target naming the resident Router refuses when rotation
+    /// is enabled (the live Router moves along the chain).
+    #[test]
+    fn cron_targeting_the_rotating_router_refuses() {
+        let router = "11111111-2222-3333-4444-555555555555";
+        let resolved = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { session: \"11111111-2222-3333-4444-555555555555\" }\n    prompt: audit\n",
+        )
+        .unwrap();
+        let err = reject_cron_targeting_the_rotating_router(&resolved, Some(router), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cron_targets_rotating_router"), "{err}");
+        assert!(err.contains("`audit`"), "{err}");
+        assert!(reject_cron_targeting_the_rotating_router(&resolved, Some(router), false).is_ok());
+        assert!(reject_cron_targeting_the_rotating_router(&resolved, Some("other"), true).is_ok());
+    }
+
+    /// The same rule through the whole config: rotation + a fixed Router
+    /// target refuses boot; the same schedule without rotation parses.
+    #[test]
+    fn cron_session_target_on_the_rotating_router_refuses_boot() {
+        let cron = "  cron:\n    schedules:\n      - id: audit\n        expr: \"@daily\"\n        \
+                    target: { session: \"11111111-2222-3333-4444-555555555555\" }\n        \
+                    prompt: audit\n";
+        let rotating = superagent_yaml().replace(
+            "superagent:\n  router:",
+            &format!("superagent:\n{cron}  router:"),
+        );
+        let rotating = rotating.replace(
+            "    slot: router\n",
+            "    slot: router\n    rotate_after_events: 5\n",
+        );
+        let err =
+            ServeConfig::parse(&rotating).expect_err("rotation + fixed Router target refuses");
+        assert!(
+            err.to_string().contains("cron_targets_rotating_router"),
+            "unexpected error: {err}"
+        );
+        // The same schedule without rotation parses (the pinned id is stable).
+        let stable = superagent_yaml().replace(
+            "superagent:\n  router:",
+            &format!("superagent:\n{cron}  router:"),
+        );
+        ServeConfig::parse(&stable).expect("no rotation: a fixed Router target is fine");
     }
 
     /// The schedule id shape is enforced (§3.1).

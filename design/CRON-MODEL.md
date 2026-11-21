@@ -184,6 +184,11 @@ id that does not exist yet is bootstrapped on first admit like any control-plane
 8. An unimplemented policy is rejected instead of accepted-and-ignored: `overlap: queue` /
    `kill-previous` refuse load with a message naming the v1 scope. (The `sandbox` block is not a
    config field at all in v1 — §8.2.)
+9. A fixed `session:` target naming the resident Router is rejected when rotation is enabled
+   (`superagent.router.rotate_after_events`): the live Router moves along the deterministic uuid5
+   chain, so a static target can fire into a frozen session — `cron_targets_rotating_router`
+   (ADR-048). The `channel:` namespace is unaffected, and with rotation off the pinned id is
+   stable (the historical behavior is unchanged).
 
 ### 3.4 Example
 
