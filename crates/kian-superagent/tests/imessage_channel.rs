@@ -26,6 +26,26 @@ use kian_superagent::imessage::{
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
+// Waiting for evidence, not for a guess.
+// ---------------------------------------------------------------------------
+
+/// Polls `cond` until it holds or `ms` elapses. The three degradation
+/// tests below used a fixed sleep and then read adapter state; on a
+/// loaded runner the driver had not polled yet, so they failed as
+/// "0 where 1 was expected" while the product was behaving. A sleep is a
+/// guess about the scheduler — the state is the evidence
+/// (AGENTS.md § 4).
+async fn wait_until<F: FnMut() -> bool>(mut cond: F, ms: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The scripted bridge mock.
 // ---------------------------------------------------------------------------
 
@@ -356,8 +376,16 @@ async fn a_changed_generation_resets_the_cursor_to_zero() {
     }));
     let adapter = channel(&mock).await;
     let _stream = adapter.subscribe().boxed();
-    // Let the driver consume all three scripted pages.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the driver has consumed all three scripted pages.
+    wait_until(
+        || {
+            let queries = mock.update_queries();
+            queries.iter().any(|q| q.contains("since_rowid=500"))
+                && queries.iter().any(|q| q.contains("since_rowid=7"))
+        },
+        5_000,
+    )
+    .await;
     let queries = mock.update_queries();
     assert!(
         queries
@@ -381,7 +409,7 @@ async fn a_gap_is_counted() {
     }));
     let adapter = channel(&mock).await;
     let _stream = adapter.subscribe().boxed();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_until(|| adapter.gap_events() == 1, 5_000).await;
     assert_eq!(adapter.gap_events(), 1);
     adapter.shutdown();
 }
@@ -392,7 +420,7 @@ async fn a_token_mismatch_pauses_with_an_honest_reason() {
     mock.reject_auth();
     let adapter = channel(&mock).await;
     let _stream = adapter.subscribe().boxed();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_until(|| adapter.paused(), 5_000).await;
     assert!(adapter.paused());
     let reason = adapter.paused_reason().expect("reason");
     assert!(reason.contains("KIAN_IMESSAGE_BRIDGE_TOKEN"), "{reason}");

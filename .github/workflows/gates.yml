@@ -51,7 +51,14 @@ jobs:
       # runs alone below so failure output stays readable.
       - run: cargo build --workspace --locked
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
+      # One test at a time *within* a binary: the runner has two cores and a
+      # handful of e2e suites pace themselves with short waits (a poll
+      # interval, a driver's first cycle). Two concurrent tests on two cores
+      # starve those waits, which surfaced as three different flakes on three
+      # consecutive runs (a 0-vs-1 frame count, a 2-vs-3 call count, an
+      # Elapsed). Deterministic beats fast here; the job still sits well
+      # inside its 60-minute budget.
+      - run: cargo test --workspace --locked -- --test-threads=1
         env:
           NO_PROXY: 127.0.0.1,localhost
 
