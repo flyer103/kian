@@ -137,7 +137,7 @@ fn adr_series_is_contiguous_from_001_and_unique() {
 }
 
 /// Every workspace crate is mapped in the docs: the crate map in
-/// DESIGN §7 and the README must each name all of `crates/*` — the
+/// overview §4 and DESIGN §7 must each name all of `crates/*` — the
 /// workspace includes `kian-exec`, `kian-superagent` and `kiand`, and a
 /// future crate that forgets the docs map fails here rather than
 /// silently disappearing from the documentation.
@@ -145,7 +145,7 @@ fn adr_series_is_contiguous_from_001_and_unique() {
 fn every_workspace_crate_is_mapped_in_the_docs() {
     let root = repo_root();
     let design = std::fs::read_to_string(root.join("design/DESIGN.md")).expect("DESIGN.md");
-    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
+    let overview = std::fs::read_to_string(root.join("docs/overview.md")).expect("overview.md");
 
     let mut crates: Vec<String> = std::fs::read_dir(root.join("crates"))
         .expect("crates dir")
@@ -171,8 +171,10 @@ fn every_workspace_crate_is_mapped_in_the_docs() {
                 "{name}: missing from design/DESIGN.md (§7 crate map)"
             ));
         }
-        if !readme.contains(name.as_str()) {
-            failures.push(format!("{name}: missing from README.md"));
+        if !overview.contains(name.as_str()) {
+            failures.push(format!(
+                "{name}: missing from docs/overview.md (§4 crate map)"
+            ));
         }
     }
     assert!(

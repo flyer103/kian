@@ -129,7 +129,7 @@ mutates projections directly. After a crash, replay rebuilds every in-memory str
 
 ## 4. Crate map
 
-Fifteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
+Nineteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
 `kian-orchestrator` depends only on core + store + seam traits, and no provider, channel or harness
 implementation ever enters its dependency tree.
 
@@ -148,8 +148,12 @@ implementation ever enters its dependency tree.
 | `kian-superagent` | The super-agent *bundle*: Router/Worker templates, event subscriptions, channels, output policies, recall, watchdog v2 |
 | `kian-sdk` | Wire-only embedded client (frozen JSON-RPC + SSE surface, typed errors); depends on no kian crate |
 | `kian-dsh` | The dsh bridge: a `LoopDriver` that drives a `dsh` child over stdio and maps its events onto existing kinds; depends on `kian-core` only |
+| `kian-harness` | Shared external-harness skeleton: driver state machine, approval policy, fixtures and the capability types the three bridges share |
+| `kian-claude` | Claude Code adapter: `stream-json` child, `can_use_tool` approvals, interrupt |
+| `kian-codex` | Codex adapter: `app-server` JSON-RPC child, server-initiated approvals, interrupt |
 | `kian-cli` | The `kian` binary: `serve` assembly, operator CLI (`inspect`/`replay`/`export`/`wake-now`), the GitHub webhook receiver |
 | `kiand` | The endpoint daemon binary (`kian-endpoint` + a thin main) |
+| `kian-imessage-bridge` | The macOS-side iMessage bridge: loopback HTTP over `imsg rpc` for the `type: imessage` channel |
 
 ## 5. What has been demonstrated
 

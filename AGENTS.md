@@ -116,7 +116,8 @@ when the owner asks. Negative results commit documentation only — never broken
 ## Docs map
 
 - `README.md` — the landing page (see the README policy below): one-line claim, three features, the
-  model, quickstart, environment contract, crate map, license. Long form is never here.
+  model, quickstart, environment contract, license. Long form is never here — the crate map is
+  overview §4, not the landing page.
 - `docs/advanced.md` — every capability with one runnable snippet, plus the super-agent bundle,
   channels, scheduling, memory, plugins and the operator surfaces.
 - `docs/SPEC.md` — the contract (WHAT). Changing scope means changing this file in the same change.
@@ -182,7 +183,7 @@ in three minutes and run it in five. Keep this shape, top to bottom: one-liner +
 `## Features` (exactly three bullets, one per core promise — never an
 implementation/storage/deployment metadata list) → `## How it works` (the model, closing with one
 "read more" line) → `## Quickstart` (copy-paste commands that run) → `## Environment contract` →
-`## Crate map` → `## License`.
+`## License`.
 
 The long form lives outside the README: `docs/advanced.md` carries the full capability list and one
 runnable snippet per capability; the document map is this file's §Docs map and
@@ -203,8 +204,8 @@ runnable snippet per capability; the document map is this file's §Docs map and
 1. Fix cross-references: this file's docs map and any SPEC/DESIGN/runbook sentence pointing at a
    README section (no stale pointer to a removed README section).
 2. Preserve the anchors other docs link to (`#quickstart`, `#environment-contract`).
-3. Keep every relative link resolvable and every crate named; `cargo test -p kian-cli --test
-   docs_map` is the gate.
+3. Keep every relative link resolvable; the crate map stays in overview §4 + DESIGN §7, and
+   `cargo test -p kian-cli --test docs_map` is the gate for both.
 4. Keep Quickstart commands executable against this tree, YAML snippets parseable, and abridged
    output marked as abridged.
 5. Adding a capability = one short section with a runnable snippet in `docs/advanced.md` (plus one

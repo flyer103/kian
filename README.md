@@ -228,30 +228,6 @@ exception: it is issued by a QR scan and kept in a `0600` file
 ([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). Executed live records live in
 [CHANGELOG.md](CHANGELOG.md).
 
-## Crate map
-
-| Crate | One line |
-|-------|----------|
-| `kian-core` | Concept model, the event-kind catalog, session state machine, projection engine, model-context derivation, seam traits |
-| `kian-store` | EventStore with `expectedSeq` CAS + epoch fencing, inbox, claims/leases, dual backend (sqlite default, postgres optional) |
-| `kian-orchestrator` | Admit → Wake → Drain → Promote engine and the bounded three-layer recovery subsystem |
-| `kian-llm` | OpenAI-compatible provider, model slots, persist-before-send hook |
-| `kian-loop` | `LoopDriver` seam plus the built-in ReAct loop |
-| `kian-memory` | The memory bundle: the dreaming drain — dream prompt, fail-closed note parser, `DreamDriver` — the frozen creation-time index renderer, and the read-only search/map views |
-| `kian-cron` | Wall-clock scheduling core: cron grammar, IANA zones, DST-aware next-fire, misfire/coalescing |
-| `kian-plugin` | Static plugin system: `Ctx` registry, `Plugin` trait, dispatch, `Disposer` |
-| `kian-endpoint` | KiandProto endpoint-side SDK library (embeddable) |
-| `kian-exec` | KiandProto server half: connections, durable command queue, heartbeat watchdog |
-| `kian-superagent` | The bundle: Router/Worker templates, subscriptions, channels, output policies, recall, watchdog |
-| `kian-sdk` | Wire-only embedded client (frozen JSON-RPC + SSE surface, typed errors) |
-| `kian-dsh` | The dsh bridge: a `LoopDriver` over a stdio child, mapping onto existing kinds |
-| `kian-harness` | Shared bridge skeleton: session trait, driver state machine, approval policy, fixtures |
-| `kian-claude` | Claude Code adapter: `stream-json` child, approvals, interrupt |
-| `kian-codex` | Codex adapter: `app-server` JSON-RPC child, approvals, interrupt |
-| `kian-cli` | The `kian` binary: serve assembly, operator CLI, inbound webhook receiver |
-| `kiand` | The endpoint daemon binary |
-| `kian-imessage-bridge` | The macOS-side iMessage bridge: loopback HTTP over `imsg rpc` for the `type: imessage` channel |
-
 ## License
 
 [Apache-2.0](LICENSE).
