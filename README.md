@@ -64,8 +64,8 @@ Read more: [docs/overview.md](docs/overview.md) (the model in one page),
 Prerequisites: Rust stable 1.85+ (`edition 2024`), plus `curl` and `jq`. Nothing else — sqlite is
 embedded and a single `kian serve` process is the whole system.
 
-The provider contract is `base_url` + OpenAI chat-completions + SSE, so any OpenAI-compatible
-endpoint works, including a gateway that fronts several provider accounts.
+The provider contract is `base_url` + OpenAI chat-completions + SSE. The config below points at
+DeepSeek (`deepseek-flash`), and any OpenAI-compatible endpoint or gateway works unchanged.
 
 ### 1. Build
 
@@ -83,12 +83,12 @@ agent:
   id: my-agent
   model_slots:
     main:
-      provider: openai
-      model: gpt-4o-mini
+      provider: deepseek
+      model: deepseek-flash                   # DeepSeek-V4.1-Flash
 providers:
-  openai:
-    base_url: "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
-    api_key_env: OPENAI_API_KEY             # names the env var; the key never lives in the file
+  deepseek:
+    base_url: "https://api.deepseek.com"    # any OpenAI-compatible endpoint
+    api_key_env: DEEPSEEK_API_KEY           # names the env var; the key never lives in the file
 drain:
   max_iterations: 32
   lease_ttl_ms: 1500             # default 30000; shortened so a takeover is visible in seconds
@@ -108,7 +108,7 @@ in the file). A malformed config never degrades into a running server.
 ### 3. Serve
 
 ```bash
-export OPENAI_API_KEY=sk-...        # the variable named by api_key_env above
+export DEEPSEEK_API_KEY=sk-...      # the variable named by api_key_env above
 cargo run -p kian-cli --bin kian -- serve --config kian.yaml
 ```
 
@@ -136,7 +136,7 @@ event: kian
 data: {"seq":1,…,"kind":"session/created","bytes":{},"version":0}
 data: {"seq":2,…,"epoch":1,"kind":"drain/claimed","bytes":{"epoch":1,"holder":"kian-serve"}}
 data: {"seq":3,…,"kind":"input/admitted","bytes":{"content":"hello kian","role":"user"}}
-data: {"seq":6,…,"kind":"step/request","bytes":{"body":{…,"messages":[{"content":"hello kian","role":"user"}]},"iteration":0,"model":"gpt-4o-mini"}}
+data: {"seq":6,…,"kind":"step/request","bytes":{"body":{…,"messages":[{"content":"hello kian","role":"user"}]},"iteration":0,"model":"deepseek-flash"}}
 data: {"seq":7,…,"kind":"assistant/message","bytes":{"content":{"text":"hello from a scripted provider"},"role":"assistant"}}
 data: {"seq":9,…,"kind":"session/ended","reason":"completed","bytes":{}}
 event: done

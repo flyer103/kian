@@ -81,12 +81,12 @@ agents:
   router:
     id: router
     model_slots:
-      router: { provider: local, model: gpt-4o-mini }
+      router: { provider: deepseek, model: deepseek-flash }
     tools: ["spawn_worker", "reply", "deliver_structured"]
   worker:
     id: worker
     model_slots:
-      main: { provider: local, model: gpt-4o-mini }
+      main: { provider: deepseek, model: deepseek-flash }
     tools: ["fs_list", "fs_read", "fs_write", "exec"]   # fs_* run on the bound worker (v2)
 superagent:
   router: { session_id: "00000000-0000-0000-0000-000000000001", agent: router, slot: router }
