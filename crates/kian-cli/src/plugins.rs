@@ -556,6 +556,9 @@ pub struct SuperAgentPlugin {
     /// ADR-040 phase 1: the shared live-resident binding every
     /// router-facing surface resolves at use time.
     pub router_binding: Arc<kian_superagent::ResidentBinding>,
+    /// ADR-040 phase 2: the Router driver's rotation threshold (the hold
+    /// owner ends its own session `rotated` at a park boundary).
+    pub router_rotate_after_events: Option<u64>,
     /// the ended, frozen predecessors of `router_session`
     /// (empty = generation 0). Flows into the Router profile's re-arm
     /// bootstrap (per-generation key + cause-carrying prompt).
@@ -1260,7 +1263,8 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&router_metrics),
                 Arc::new(kian_superagent::SystemTurnClock),
             ),
-        );
+        )
+        .with_rotation(self.router_rotate_after_events);
         let worker_side = {
             // Port (e) mount (PLUGIN-SPEC §4.6/§13.1): the settle gate +
             // the §9.2 drain-boundary guard ride the bus the assembly

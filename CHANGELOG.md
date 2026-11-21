@@ -19,6 +19,20 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   execution or a stranded ask. The harness re-issue behaviour is unverified live (the matrix marks
   it experimental). Contract: [design/HARNESS-BRIDGE.md](design/HARNESS-BRIDGE.md) §4.4.1.
 
+- **Resident rotation fires for a parked Router (ADR-040 phase 2)**. A parked resident holds its
+  drain, so the rotation trigger is now the **hold owner**: the Router driver checks its policy at a
+  park boundary (stream at `rotate_after_events`, no delegated thread outstanding) and ends its own
+  session `rotated`; the serve ticker then derives the uuid5 successor, bootstraps it (memory index
+  → migrated rows → handoff → judge prompt) and re-points the shared binding. The planner's
+  engine-owned `rotate_idle` close remains for a genuinely idle window. Verified by a live
+  `kian serve` + scripted-provider test (the driver rotates, the ticker completes the successor).
+
+- **A fixed cron `session:` target on a rotating Router refuses boot (CRON-MODEL §3.3 rule 9)**.
+  With `superagent.router.rotate_after_events` set, the live Router moves along the uuid5 chain, so
+  a schedule naming the pinned Router session would fire into a frozen session:
+  `cron_targets_rotating_router`. The `channel:` namespace is unaffected; with rotation off the
+  pinned id is stable and the historical behavior is unchanged.
+
 - **Multi-replica resident rotation (ADR-048)**. A replica whose `ResidentBinding` points at a
   terminal Router now derives the live successor from the durable uuid5 chain, re-points the
   binding and migrates the rows it had written to the frozen predecessor (`rotate:<old>:<row>`

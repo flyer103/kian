@@ -2778,6 +2778,10 @@ struct DriverCore<D: LoopDriver> {
     /// consumes a batch *before* `drive()` starts, so only a baseline
     /// from before that consumption yields the true batch diff.
     mark: Mutex<Option<u64>>,
+    /// ADR-040 phase 2: when set, the hold owner retires this resident
+    /// `rotated` at a park boundary once its stream reaches this many
+    /// events and no delegated thread is outstanding.
+    rotate_after_events: Option<u64>,
     /// The inbox counter snapshot at the last judge turn's close
     /// , persistent across holds. `Phase::First` compares it
     /// against the live counter to tell a re-drive with fresh durable
@@ -2872,6 +2876,31 @@ impl<D: LoopDriver> RouterDriver<D> {
                 metrics,
                 mark: Mutex::new(None),
                 admit_mark: Mutex::new(None),
+                rotate_after_events: None,
+            }),
+        }
+    }
+
+    /// Arms the ADR-040 rotation policy: the hold owner ends its own
+    /// session `rotated` at a park boundary once the stream reaches
+    /// `threshold` events and no delegated thread is outstanding. The
+    /// rotation ticker then completes the successor (derive/repair).
+    /// `None` (the default) never rotates; a parked resident holds its
+    /// drain, so this is the only owner that can end it at a safe point.
+    #[must_use]
+    pub fn with_rotation(self, threshold: Option<u64>) -> Self {
+        let core = &*self.inner;
+        Self {
+            inner: Arc::new(DriverCore {
+                driver: Arc::clone(&core.driver),
+                hold: Arc::clone(&core.hold),
+                port_for: Arc::clone(&core.port_for),
+                inbox: Arc::clone(&core.inbox),
+                park_tick: core.park_tick,
+                metrics: core.metrics.clone(),
+                mark: Mutex::new(None),
+                admit_mark: Mutex::new(None),
+                rotate_after_events: threshold,
             }),
         }
     }
@@ -2957,6 +2986,14 @@ where
                                 Some(baseline) => now > baseline,
                             };
                             if !work {
+                                if rotation_due(&core).await {
+                                    return Some((
+                                        LoopOutcome::Stopped {
+                                            reason: kian_core::seams::ROTATION_STOP_REASON.into(),
+                                        },
+                                        Phase::Done,
+                                    ));
+                                }
                                 phase = Phase::Park { ctx, seen: now };
                                 continue;
                             }
@@ -3015,6 +3052,15 @@ where
                                 // instead of freezing the session.
                                 Some(LoopOutcome::Settled) => {
                                     finish_turn(&core, turn).await;
+                                    if rotation_due(&core).await {
+                                        return Some((
+                                            LoopOutcome::Stopped {
+                                                reason: kian_core::seams::ROTATION_STOP_REASON
+                                                    .into(),
+                                            },
+                                            Phase::Done,
+                                        ));
+                                    }
                                     Some((LoopOutcome::TurnDone, Phase::Park { ctx, seen }))
                                 }
                                 // (ADR-024) A resident episode that
@@ -3038,6 +3084,15 @@ where
                                         reason = %reason,
                                         "resident Router episode budget exhausted; parking until the next input"
                                     );
+                                    if rotation_due(&core).await {
+                                        return Some((
+                                            LoopOutcome::Stopped {
+                                                reason: kian_core::seams::ROTATION_STOP_REASON
+                                                    .into(),
+                                            },
+                                            Phase::Done,
+                                        ));
+                                    }
                                     Some((LoopOutcome::TurnDone, Phase::Park { ctx, seen }))
                                 }
                                 // Honest terminals propagate unchanged:
@@ -3111,6 +3166,24 @@ async fn has_outstanding_threads<D: LoopDriver>(core: &DriverCore<D>) -> bool {
 // ---------------------------------------------------------------------------
 // Judge-turn timing — pure observability over the stream
 // ---------------------------------------------------------------------------
+
+/// ADR-040 phase 2: is this resident due for rotation at a park
+/// boundary? Requires a configured threshold, no outstanding delegated
+/// thread (their reports would be orphaned by the end) and a stream at
+/// or over the threshold. A failed read is "not due" — rotation is an
+/// optimization, never a correctness path.
+async fn rotation_due<D: LoopDriver>(core: &DriverCore<D>) -> bool {
+    let Some(threshold) = core.rotate_after_events else {
+        return false;
+    };
+    if has_outstanding_threads(core).await {
+        return false;
+    }
+    match router_stream(core).await {
+        Some(events) => events.len() as u64 >= threshold,
+        None => false,
+    }
+}
 
 /// The Router's committed stream via the hold's port, or `None` when no
 /// port is installed or the read fails: timing must never change
@@ -5024,6 +5097,107 @@ mod tests {
             assert!(matches!(settled_turn, Some(LoopOutcome::TurnDone)));
         }
         assert_eq!(inner.drives.load(Ordering::SeqCst), 2);
+    }
+
+    /// ADR-040 phase 2: at a park boundary with the rotation threshold
+    /// met and no delegated thread outstanding, the hold owner stops
+    /// with the reserved rotation reason (the engine ends it `rotated`);
+    /// without the policy the same stream parks instead.
+    #[tokio::test]
+    async fn a_parked_router_over_the_threshold_stops_with_the_rotation_reason() {
+        use futures::StreamExt;
+        use kian_core::seams::{LoopDriver as _, LoopOutcome, ROTATION_STOP_REASON};
+        use std::sync::atomic::Ordering;
+
+        let router = sid(13);
+        let events = vec![
+            event(router, 1, EventKind::SessionCreated, json!({})),
+            event(
+                router,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "the first task"}),
+            ),
+        ];
+        let inbox: Arc<ScriptedInbox> = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let router_inbox = RouterInbox::new(
+            inbox.clone() as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
+        let hold = RouterHold::shared();
+        let inner = Arc::new(SettlingDriver {
+            drives: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let port_for: crate::PortFor<()> = Arc::new(move |_ctx: &()| {
+            let (port, dyn_port) = RecordingPort::shared_with_events(router, events.clone());
+            drop(port);
+            dyn_port
+        });
+        let driver = super::RouterDriver::with_park_tick(
+            inner.clone(),
+            hold,
+            port_for,
+            router_inbox.clone(),
+            std::time::Duration::from_millis(1),
+        )
+        .with_rotation(Some(2));
+
+        router_inbox
+            .admit(router, json!({"row": 1}), None)
+            .await
+            .unwrap();
+        let mut stream = driver.drive(());
+        let stopped = stream.next().await;
+        assert!(
+            matches!(stopped, Some(LoopOutcome::Stopped { ref reason }) if reason == ROTATION_STOP_REASON),
+            "expected the rotation stop, got {stopped:?}"
+        );
+        assert_eq!(inner.drives.load(Ordering::SeqCst), 1);
+
+        // The same stream without the policy parks (the legacy behavior).
+        let events = vec![
+            event(router, 1, EventKind::SessionCreated, json!({})),
+            event(
+                router,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "the first task"}),
+            ),
+        ];
+        let inbox: Arc<ScriptedInbox> = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let router_inbox = RouterInbox::new(
+            inbox.clone() as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
+        let hold = RouterHold::shared();
+        let inner = Arc::new(SettlingDriver {
+            drives: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let port_for: crate::PortFor<()> = Arc::new(move |_ctx: &()| {
+            let (port, dyn_port) = RecordingPort::shared_with_events(router, events.clone());
+            drop(port);
+            dyn_port
+        });
+        let parked = super::RouterDriver::with_park_tick(
+            inner.clone(),
+            hold,
+            port_for,
+            router_inbox.clone(),
+            std::time::Duration::from_millis(1),
+        );
+        router_inbox
+            .admit(router, json!({"row": 1}), None)
+            .await
+            .unwrap();
+        let mut stream = parked.drive(());
+        assert!(matches!(stream.next().await, Some(LoopOutcome::TurnDone)));
+        assert!(matches!(stream.next().await, Some(LoopOutcome::TurnDone)));
     }
 
     // ------------------------------------------------------------------

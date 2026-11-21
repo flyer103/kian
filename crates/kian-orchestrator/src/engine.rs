@@ -2060,7 +2060,15 @@ where
                 }
                 Supervised::Stopped { reason } => {
                     tracing::info!(session = %session.0, reason, "loop stopped intentionally");
-                    end_reason = EndReason::Completed;
+                    // ADR-040 phase 2: the resident Router's hold owner
+                    // requests a rotation at its park boundary; the
+                    // session ends `rotated` (terminal), and the rotation
+                    // ticker completes the successor.
+                    end_reason = if reason == kian_core::seams::ROTATION_STOP_REASON {
+                        EndReason::Rotated
+                    } else {
+                        EndReason::Completed
+                    };
                     break 'episodes;
                 }
                 Supervised::SoftFailed { reason } => {

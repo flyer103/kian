@@ -92,5 +92,5 @@ replica-to-replica channel.
   successor. ADR-040's single-serving-process assumption is **superseded** by this ADR; the
   remaining caveat is only the bounded window above.
 - Not addressed here: a replica that is *partitioned from the store* cannot be helped (it is
-  already outside the durable truth); and cron `{session}` targets that name a rotating Router are
-  still a separate config decision (ADR-040).
+  already outside the durable truth). Cron `{session}` targets naming a rotating Router are refused
+  at load instead (ADR-040 open question 5; CRON-MODEL §3.3 rule 9).
