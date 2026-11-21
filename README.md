@@ -26,7 +26,9 @@ machines you choose, and the loop you already run. Kian ships each as a product 
   session for that session's whole life; offline work parks and resumes honestly.
 - **Harness integration** — bring your own loop: the built-in ReAct loop, or an existing harness
   (dsh, Claude Code, Codex) behind the same `LoopDriver` seam and event kinds — durability does
-  not force a rewrite of the loop that already works. A harness-owned loop is a *projection-only*
+  not force a rewrite of the loop that already works. One serve may declare several harnesses and
+  select one **per worker agent** ([ADR-049](design/decisions/ADR-049-per-agent-harness-selection.md)).
+  A harness-owned loop is a *projection-only*
   session: durable control and audit, but no byte-level model-request replay, and the capability
   matrix says exactly what each harness supports ([HARNESS-BRIDGE](design/HARNESS-BRIDGE.md)).
 
@@ -677,7 +679,10 @@ contract-v0 fixture peer. The live leg ran green on 2026-11-02 via
 
 The same mount point runs Claude Code (`stream-json`) or Codex (`app-server`) as the worker
 template's inner loop; the harness keeps its tools, sandbox and model, kian keeps the session,
-control and audit. Exactly one harness per worker template; default off.
+control and audit. Default off; a deployment may declare several harnesses and select one per
+worker agent (`superagent.worker.harness` / `superagent.roster[].harness`) — a bridged agent owns
+its tools (no `tools:`, no `exec_worker`), and a config with no selection keeps the legacy
+single-harness rules ([ADR-049](design/decisions/ADR-049-per-agent-harness-selection.md)).
 
 ```yaml
 superagent:
@@ -688,6 +693,25 @@ superagent:
       approvals:                    # the harness's own tool gate, answered by kian
         default: deny
         allow: ["Read", "Bash(*git status*)"]
+```
+
+Per-agent harness selection — one Router entry, different worker loops:
+
+```yaml
+superagent:
+  harness:
+    codex:
+      command: /usr/local/bin/codex   # or export KIAN_CODEX_BIN
+  worker:
+    agent: worker
+    harness: kian                    # the default worker template's loop
+  roster:
+    - id: codex-agent
+      agent: codex-w                 # an AgentDef with tools: []
+      harness: codex                 # this entry's loop
+      tools_allow: []
+      mandate_template: { scope: codex work, strength: inferred }
+      limits: { max_children: 0 }
 ```
 
 ```yaml

@@ -215,6 +215,7 @@ fn router_rig(gating: bool, parent_events: Vec<Event>) -> RouterRig {
             tools_allow: vec!["fs_read".to_string()],
             limits: kian_superagent::RosterLimits { max_children: 2 },
             output_schema: None,
+            harness_bridged: false,
             resolved_agent: Some(kian_superagent::ResolvedAgent {
                 def_id: "kian-research".to_string(),
                 version: 3,

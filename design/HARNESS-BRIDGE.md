@@ -5,7 +5,9 @@
   [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document generalizes the
   *kian-side* contract and adds Claude Code and Codex bridges
   ([ADR-043](decisions/ADR-043-multi-harness-bridge.md)). The open-step inactivity bound is
-  [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (accepted, owner gate 2026-11-20).
+  [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (accepted, owner gate 2026-11-20);
+  per-agent harness selection (one serve, many worker loops) is
+  [ADR-049](decisions/ADR-049-per-agent-harness-selection.md) (accepted, owner gate 2026-11-20).
 - **Owners**: `kian-harness` (shared skeleton), `kian-claude` (Claude Code adapter),
   `kian-codex` (Codex adapter). `kian-dsh` keeps its v0 contract; convergence is phase 3.
 - **Read this with**: [SPEC](../docs/SPEC.md) §2.2 C, [DESIGN](DESIGN.md) §6.2/§7/§16,
@@ -343,30 +345,57 @@ superagent:
       # capture: { upstream: https://api.anthropic.com, max_body_bytes: 8388608 }  # ADR-046
 ```
 
-`harness.{dsh,claude,codex}` are mutually exclusive (one inner loop per worker template);
-`command` resolves from config, then the harness env var (`KIAN_CLAUDE_BIN`, `KIAN_CODEX_BIN`,
-`KIAN_DSH_BIN`), then refusal. Unknown keys refuse (`deny_unknown_fields`, the house rule).
+`harness.{dsh,claude,codex}` may be declared **together** when the deployment selects a loop per
+worker agent ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)):
+
+```yaml
+superagent:
+  worker:
+    agent: worker
+    harness: kian          # the default worker template's loop: kian | dsh | claude | codex
+  roster:
+    - id: codex-agent
+      agent: codex-w       # an AgentDef with no `tools:` (the child owns them)
+      harness: codex       # this entry's loop
+      tools_allow: []      # a bridged entry runs no kian tool surface
+```
+
+The selection grammar is closed: `kian` | `dsh` | `claude` | `codex` (absent = `kian`); an explicit
+bridged selection requires its declared section, else boot refuses. **With no selection anywhere**
+the legacy shape applies unchanged: at most one harness section, and it replaces the worker
+template for every worker side. A bridged agent must declare no `tools:` (and a bridged roster entry
+no `tools_allow`); a bridged **default** template cannot coexist with a worker surface
+(`endpoints:`/`workers:`). `command` resolves from config, then the harness env var
+(`KIAN_CLAUDE_BIN`, `KIAN_CODEX_BIN`, `KIAN_DSH_BIN`), then refusal. Unknown keys refuse
+(`deny_unknown_fields`, the house rule).
 
 ### 6.2 Invariants at boot
 
-1. a bridge and a worker surface (`endpoints:` or `workers:`) are mutually exclusive — the child
-   owns the tools and kian never mounts `exec`, so a binding could not route anything (the
-   [ADR-020](decisions/ADR-020-durable-worker-binding.md) rationale, today enforced for dsh at
-   [`config.rs`](../crates/kian-cli/src/config.rs) lines 2900–2918);
-2. a bridge requires the `superagent` plugin and section;
-3. `approvals.default: ask` refuses boot in phase 1; a rule whose tool pattern cannot be parsed
+1. **tool ownership is per worker agent** ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)):
+   a bridged agent owns its tools in the child process, so its `AgentDef.tools` must be empty (a
+   bridged roster entry's `tools_allow` too), `spawn_worker(agent=<bridged>, exec_worker=…)` refuses
+   **before any side effect**, and a bridged **default** template cannot coexist with a worker
+   surface (`endpoints:`/`workers:`). A kian-loop agent keeps its tools and its `exec_worker`
+   binding, so a surface may stay configured beside declared harnesses. With **no explicit
+   selection** the legacy global exclusivity is unchanged (one harness, no worker surface);
+2. **the selection (and the class marker) is per spawned worker agent**: the loop is resolved from
+   the committed spawn identity (the wrapper's `assignee`, else the default template) — never live
+   state — and `session/created.bridge` is written from that same identity, so a kian-loop child
+   carries `{}` even in a deployment with bridged siblings;
+3. a bridge requires the `superagent` plugin and section;
+4. `approvals.default: ask` refuses boot in phase 1; a rule whose tool pattern cannot be parsed
    refuses boot;
-4. `model`/argv/model-selection is fixed for the session's lifetime — no hot swap (the analogue
+5. `model`/argv/model-selection is fixed for the session's lifetime — no hot swap (the analogue
    of the model-slot immutability rule, AGENTS constraint 11);
-5. the adapter builds argv from the structured fields and appends `args`; an `args` entry matching
+6. the adapter builds argv from the structured fields and appends `args`; an `args` entry matching
    the harness's known bypass flag (`--dangerously-skip-permissions` / `bypassPermissions`, Codex
    `--dangerously-bypass-approvals-and-sandbox`) **refuses boot** — a bypassed harness never asks,
    so kian's approval policy would be a claim with no decision behind it;
-6. `superagent.cron.harness` is the cron runner, not the worker bridge: its default shape is dsh
+7. `superagent.cron.harness` is the cron runner, not the worker bridge: its default shape is dsh
    (`args --profile <name> <payload>`), and `raw: true` runs any harness as `args <payload>`
    (`claude --print … "<task>"`, `codex exec "<task>"`). A raw config needs an explicit `command`
    and refuses a `profile`; the argv contract is [CRON-MODEL](CRON-MODEL.md) §6.2;
-7. `harness.<name>.step_timeout_ms` is `0` (disabled) or at least `10_000`; anything smaller
+8. `harness.<name>.step_timeout_ms` is `0` (disabled) or at least `10_000`; anything smaller
    **refuses boot** — the knob ends a dead bridge, it must not reintroduce a smaller livelock
    ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)).
 
@@ -386,7 +415,7 @@ problem is the reason phase 2 needs its own design, not a flag.
 | `kian-harness` | shared skeleton: session trait, driver state machine, dedup, budget, approval policy, fixture script runner, capabilities |
 | `kian-claude` | Claude Code adapter: spawn, stream-json codec, control requests, approval translation |
 | `kian-codex` | Codex adapter: spawn, JSON-RPC client, thread/turn lifecycle, approval translation |
-| `kian-cli` | config + assembly: `WorkerInnerDriver::{React,Dsh,Claude,Codex}`, ctx ports over `DrainCtx`, `tool/post` ports, the `session/created` marker |
+| `kian-cli` | config + assembly: the per-harness mounts (`HarnessMounts`: one shared driver per declared harness), the per-agent inner-loop selection, ctx ports over `DrainCtx`, `tool/post` ports, the per-spawn `session/created` marker |
 
 Assembly follows the existing dsh mount ([`plugins.rs`](../crates/kian-cli/src/plugins.rs) lines
 1112–1127, [`superagent.rs`](../crates/kian-cli/src/superagent.rs) lines 906–925): only the
@@ -424,6 +453,7 @@ harness child, L3 env-gated live smoke). Every row is a test or a documented ski
 | A12 | with `capture:` on, every forwarded model request is appended as `step/request` **before** its assistant message, `body` is byte-equal to the forwarded body, a turn with retries records each attempt, `max_body_bytes`/queue failure answers a fail-closed `413`/`502` **without forwarding**, and `session/created.bridge.request_bytes` is `"exact"` | L1/L2 |
 | A11 | without `KIAN_CLAUDE_BIN`/`KIAN_CODEX_BIN` the live suites skip green; with them and credentials they run and are recorded in the runbook — Codex 0.166.0 ran one live turn (`pong`, `Settled`) on 2026-11-20; Claude 2.1.318 is protocol-verified but its model turn is unverified (the local CLI is not logged in) | L3 (env-gated, CI-excluded) |
 | A12 | open-step silence → SoftFailed naming `step_timeout_ms` (never `completed`, no fabricated `turn/end`); a step that keeps emitting is not cut; `0` disables; below 10 s refuses boot; the mounted bridge ends a stalled session within the bound ([ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md)) | L1/L2 |
+| A13 | per-agent harness selection: one serve declares two harnesses and two roster entries select different loops; the kian-loop child persists `step/request` while the Codex child stays projection-only and maps its peer's answer, both ending honestly; bridged agents refuse kian `tools:`/`tools_allow` and `exec_worker`; a config with no selection keeps the legacy single-harness rules ([ADR-049](decisions/ADR-049-per-agent-harness-selection.md)) | L1/L2 |
 
 ## 10. Phases
 
@@ -435,6 +465,11 @@ raw argv (`raw: true`) for Claude Code/Codex ([CRON-MODEL](CRON-MODEL.md) §6.2)
 **Phase 1.5 (ADR-044, landed).** The open-step wait (event read and control write) is bounded in
 both bridge drivers by `step_timeout_ms`, so a wedged harness child reaches an honest `failed`
 end and the worker slot is reclaimed instead of parked forever — see §9 A12.
+
+**Phase 1.7 (ADR-049, landed).** Per-agent harness selection: `superagent.worker.harness` and
+`superagent.roster[].harness` choose `kian | dsh | claude | codex` per worker agent in one serve;
+the sides share the declared mounts, the tool ownership is per agent, and the `session/created`
+marker is per spawn. See §6.1/§6.2 and acceptance row A13.
 
 **Phase 2.** Harness approvals dispatch at `tool/pre` (ADR-045; landed), conversation resume
 across drains (ADR-047; this change), durable interactive

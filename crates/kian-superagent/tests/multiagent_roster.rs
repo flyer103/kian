@@ -98,6 +98,7 @@ fn entry(id: &str, agent: &str, tools: &[&str]) -> RosterEntry {
         tools_allow: tools.iter().map(|t| (*t).to_string()).collect(),
         limits: RosterLimits { max_children: 2 },
         output_schema: None,
+        harness_bridged: false,
         resolved_agent: None,
     }
 }
@@ -149,6 +150,7 @@ fn roster_entry_round_trips_with_the_contract_field_set() {
             "required": ["summary"],
             "properties": {"summary": {"type": "string"}}
         })),
+        harness_bridged: false,
         resolved_agent: None,
     };
     let wire = serde_json::to_value(&original).expect("serializes");
