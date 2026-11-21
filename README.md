@@ -16,6 +16,20 @@ cannot prove what it did, and it re-pays for its own context on every turn. Kian
 
 ![kian: a turn is in flight, the process is killed with kill -9, a new drain takes over and finishes the turn — byte-identical request bytes, epoch 2](docs/assets/durable-execution.gif)
 
+**Durable execution.** A turn is in flight and the request bytes are already durable. `kill -9` the
+process, restart it, and a new drain claims the session at epoch 2 and finishes the turn — the stream
+shows `drain claims 2`, and the replay derives **2 of 2 request bodies byte-identically**. Nothing
+was written twice; nothing was lost. The recording is a real run
+([replay the cast](docs/assets/durable-execution.cast)).
+
+![kian: a kiand worker daemon on another workspace receives the delegated command and the file appears there, not on the server](docs/assets/byom.gif)
+
+**BYOM execution.** The brain stays here, the hands move. A `kiand` daemon is started with a
+different workspace root; one event goes in, the Router delegates to that worker, and the command it
+runs appears in the worker's directory — not in the server's. The binding is 1:1 and immutable for
+the session's life, and the queue is durable, so a worker that goes offline parks the work instead of
+losing it ([replay the cast](docs/assets/byom.cast)).
+
 ## Who this is for
 
 - You run agent work that takes minutes to hours, and a restart or an OOM currently costs you the
@@ -256,11 +270,6 @@ never fail; see the [environment contract](#environment-contract).
 - [examples/issue-watch](examples/issue-watch/README.md) — a resident Router triaging the issues of
   one repository: poll intake → admission classes → `spawn_worker` under a mandate → a speak-rule →
   the outbox. ~15 minutes to a first drafted comment, `DRY_RUN` fail-closed.
-
-The BYOM half has its own recording: a `kiand` daemon on another workspace, one event in, and the
-command runs on the worker, not on the process that decided to run it.
-
-![kian: the brain stays, the hands move](docs/assets/byom.gif)
 
 ## Environment contract
 
