@@ -16,10 +16,8 @@ cannot prove what it did, and it re-pays for its own context on every turn. Kian
 
 ![kian: a turn is in flight, the process is killed with kill -9, a new drain takes over and finishes the turn — byte-identical request bytes, epoch 2](docs/assets/durable-execution.gif)
 
-**Durable execution.** A turn is in flight and the request bytes are already durable. `kill -9` the
-process, restart it, and a new drain claims the session at epoch 2 and finishes the turn — the stream
-shows `drain claims 2`, and the replay derives **2 of 2 request bodies byte-identically**. Nothing
-was written twice; nothing was lost. The recording is a real run
+**Durable execution.** A turn in flight, `kill -9`, and a new drain finishes it — watch the last
+frames for `drain claims 2` and `2 of 2 requests byte-identical`
 ([replay the cast](docs/assets/durable-execution.cast)).
 
 ## Who this is for
