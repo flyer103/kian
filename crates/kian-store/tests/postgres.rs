@@ -1509,6 +1509,10 @@ async fn pg_cron_claims_advance_and_restart() {
         versions.contains(&7),
         "open_postgres applies v7, got {versions:?}"
     );
+    assert!(
+        versions.contains(&8),
+        "open_postgres applies v8, got {versions:?}"
+    );
 
     const T0: u64 = 1_761_900_000_000;
     fn firing(schedule_id: &str, fire_time: &str) -> CronFiringRow {
@@ -1516,6 +1520,7 @@ async fn pg_cron_claims_advance_and_restart() {
             firing_id: format!("{schedule_id}@{fire_time}"),
             schedule_id: schedule_id.to_owned(),
             fire_time: fire_time.to_owned(),
+            session: None,
             admitted_at: T0,
             state: FiringState::Admitted,
             skip_reason: None,
@@ -1568,6 +1573,26 @@ async fn pg_cron_claims_advance_and_restart() {
         .expect("open firings");
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].firing_id, slot.firing_id);
+
+    // v8: the firing records the session it is dispatched to (CRON-MODEL
+    // §3.2/§9.1); the claim starts with no session, the guarded write fills it.
+    let session = kian_core::model::SessionId::new();
+    assert!(
+        pg.store
+            .set_firing_session(&slot.firing_id, session)
+            .await
+            .expect("record firing session")
+    );
+    let recorded = pg
+        .store
+        .load_firing(&slot.firing_id)
+        .await
+        .expect("load firing")
+        .expect("row");
+    assert_eq!(
+        recorded.session.as_deref(),
+        Some(session.0.to_string().as_str())
+    );
 
     // Settle once; the terminal row is never rewritten.
     assert!(

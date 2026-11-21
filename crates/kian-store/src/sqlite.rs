@@ -908,7 +908,7 @@ pub(crate) async fn view_publish_delta(
     Ok(())
 }
 
-// -- durable cron state (CRON-MODEL §4/§9, migration v7) --------------------
+// -- durable cron state (CRON-MODEL §4/§9, migrations v7-v8) ----------------
 // The sqlite twin of the pg statements below. Fire times are canonical
 // UTC RFC 3339 `Z` TEXT, so `<` on them is chronological and the
 // monotonic cursor guard needs no calendar math.
@@ -931,7 +931,7 @@ const CRON_SCHEDULE_SQL: &str = "SELECT id, expr, tz, declaration_digest, cursor
 /// `rows_affected() == 1` is exactly "this caller won the slot".
 const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WHERE id = ?1";
 
-const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)\nON CONFLICT DO NOTHING";
+const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\nON CONFLICT DO NOTHING";
 
 /// Non-terminal rows only: a settled slot is never rewritten.
 const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = ?2,\n    worktree_path = COALESCE(?3, worktree_path),\n    finished_at = ?4,\n    skip_reason = COALESCE(?5, skip_reason),\n    error = ?6\nWHERE firing_id = ?1 AND state IN ('admitted', 'running')";
@@ -941,16 +941,16 @@ const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = ?2,\n    
 /// firing record — the cursor may lag the truth, never lead it.
 const CRON_ADVANCE_CURSOR_SQL: &str = "UPDATE cron_schedules\nSET cursor_fire_at = ?2,\n    next_fire_at = ?3,\n    updated_at = ?4\nWHERE id = ?1\n  AND (cursor_fire_at IS NULL OR cursor_fire_at < ?2)\n  AND EXISTS (SELECT 1 FROM cron_firings WHERE firing_id = ?5)";
 
-const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE (?1 IS NULL OR schedule_id = ?1)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT ?2";
+const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings\nWHERE (?1 IS NULL OR schedule_id = ?1)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT ?2";
 
-const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = ?";
+const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings WHERE firing_id = ?";
 
 /// The settlement sweep's read (CRON-MODEL §9.1): every firing of one
 /// schedule that is still open, oldest first. A bounded-by-age read is not
 /// enough — the pre-fix wedge left one `admitted` row stranded behind an
 /// unbounded run of later `skipped` rows, so the sweep must find it wherever
 /// it is in the history, not only within the newest page.
-const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE schedule_id = ?1 AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
+const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings\nWHERE schedule_id = ?1 AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
 
 /// One idempotent declaration upsert. The pre-read digest is for the
 /// caller's *report* only (Inserted / Unchanged / Redeclared): the state
@@ -1019,6 +1019,7 @@ pub(crate) async fn cron_claim_firing(
         .bind(p.worktree_path)
         .bind(p.finished_at)
         .bind(p.error)
+        .bind(p.session)
         .execute(pool)
         .await?;
     Ok(res.rows_affected() == 1)
@@ -1113,4 +1114,22 @@ pub(crate) async fn cron_open_firings(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// Record where a claimed firing is dispatched (CRON-MODEL §3.2/§9.1). The
+/// `state IN ('admitted','running')` guard makes it a no-op on an already
+/// settled row — a settlement race, never an error.
+const CRON_SET_FIRING_SESSION_SQL: &str = "UPDATE cron_firings SET session = ?2 WHERE firing_id = ?1 AND state IN ('admitted', 'running')";
+
+pub(crate) async fn cron_set_firing_session(
+    pool: &SqlitePool,
+    firing_id: &str,
+    session: &str,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_SET_FIRING_SESSION_SQL)
+        .bind(firing_id)
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
 }

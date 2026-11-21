@@ -8,6 +8,35 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Frozen cron targets succeed through a per-slot firing session (CRON-MODEL §3.2/§5.1/§9.1)**.
+  A plain target session ends `completed` after its turn, so the resident arm used to run exactly
+  one successful firing per schedule and then fail every later slot (`target_terminal`). Dispatch
+  now resolves the target first: a live/empty target receives the firing as before; a **terminal**
+  target is replaced by the deterministic firing session
+  `uuid5(target, "kian:cron:firing:<firing_id>")` (one fresh session per slot, frozen name
+  contract) and the payload is admitted there, so a recurring schedule keeps running with no
+  operator action. The configured target stays a delivery anchor with continuity while it lives;
+  the new `cron_firings.session` column (additive migration **v8**, sqlite + postgres, nullable
+  for pre-v8 rows) records where each firing actually ran, the settlement sweep reads that record
+  instead of guessing from the target, and a stranded pre-v8 / crash-interrupted row settles
+  `failed`/`target_terminal` only after a 60 s grace so a concurrently claiming replica's
+  in-flight dispatch is never mis-settled (a pending row on a live recorded session is left
+  alone; a pre-v8 row on a live target is not inferred, because a re-pointed schedule may name a
+  different delivery session). The overlap judgement is made on the resolved session and re-checked
+  at the admit boundary, so a session that became busy after resolution still records
+  `skipped_overlap` rather than queueing a duplicate; a `set_firing_session` that loses a race to
+  settlement refuses the dispatch. `target_terminal` remains for the race where a resolved session
+  freezes before the admit, a crash between the session record and the admit, pre-succession
+  residue, and a corrupt `session` column. The migration gate is bumped to v8 (a real
+  v7-database-with-rows upgrade path is pinned), and CRON-MODEL §12.1a records the rolling-upgrade
+  caveat: an *older-running* replica has no grace, so the upgrade should be stop-the-world.
+  Firing-session footprint and guidance are recorded in CRON-MODEL §9.4 (a held-drain resident
+  target projects `running` and is skipped by the overlap judgement, so the practical recurring
+  mode is the per-slot path or the worktree arm); chain-shaped succession remains an alternative
+  not taken. Contract:
+  [design/CRON-MODEL.md](design/CRON-MODEL.md) §3.2/§5.1/§9.1/§9.3/§9.4,
+  [design/DESIGN.md](design/DESIGN.md) §2.3/§4.6.
+
 - **Claude bridge: tool permission prompts reach kian**. The Claude child no longer runs in
   print mode (which auto-denied every permission prompt) and passes
   `--permission-mode manual --permission-prompt-tool stdio`, so the harness's `can_use_tool`

@@ -161,6 +161,17 @@ const V7_CRON_STATE: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS cron_schedules (\n    id TEXT PRIMARY KEY,\n    expr TEXT NOT NULL,\n    tz TEXT NOT NULL,\n    declaration_digest TEXT NOT NULL,\n    cursor_fire_at TEXT,\n    next_fire_at TEXT,\n    enabled INTEGER NOT NULL,\n    created_at INTEGER NOT NULL,\n    updated_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_cron_schedules_next_fire ON cron_schedules (enabled, next_fire_at);\nCREATE TABLE IF NOT EXISTS cron_firings (\n    firing_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    fire_time TEXT NOT NULL,\n    admitted_at INTEGER NOT NULL,\n    state TEXT NOT NULL,\n    skip_reason TEXT,\n    worktree_path TEXT,\n    finished_at INTEGER,\n    error TEXT,\n    UNIQUE (schedule_id, fire_time)\n);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_schedule_time ON cron_firings (schedule_id, fire_time);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_state ON cron_firings (state, finished_at)",
 };
 
+/// v8 — the firing's session (CRON-MODEL §3.2/§9.1). The resident arm may run
+/// a slot in a *derived* session (the configured target was frozen at
+/// dispatch), so the durable firing record names where the firing actually
+/// ran. Additive and nullable: rows recorded before v8 keep `NULL` and the
+/// settlement sweep falls back to the configured target for them.
+const V8_CRON_FIRING_SESSION: Migration = Migration {
+    version: 8,
+    name: "v8_cron_firing_session",
+    up: "ALTER TABLE cron_firings ADD COLUMN session TEXT",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -173,6 +184,7 @@ pub fn chain() -> &'static [Migration] {
         V5_ARCHIVED_SESSIONS,
         V6_SESSION_KIND_INDEX,
         V7_CRON_STATE,
+        V8_CRON_FIRING_SESSION,
     ]
 }
 
@@ -294,6 +306,14 @@ const PG_V7_CRON_STATE: Migration = Migration {
     up: "CREATE TABLE IF NOT EXISTS cron_schedules (\n    id TEXT PRIMARY KEY,\n    expr TEXT NOT NULL,\n    tz TEXT NOT NULL,\n    declaration_digest TEXT NOT NULL,\n    cursor_fire_at TEXT,\n    next_fire_at TEXT,\n    enabled BIGINT NOT NULL,\n    created_at BIGINT NOT NULL,\n    updated_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_cron_schedules_next_fire ON cron_schedules (enabled, next_fire_at);\nCREATE TABLE IF NOT EXISTS cron_firings (\n    firing_id TEXT PRIMARY KEY,\n    schedule_id TEXT NOT NULL,\n    fire_time TEXT NOT NULL,\n    admitted_at BIGINT NOT NULL,\n    state TEXT NOT NULL,\n    skip_reason TEXT,\n    worktree_path TEXT,\n    finished_at BIGINT,\n    error TEXT,\n    UNIQUE (schedule_id, fire_time)\n);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_schedule_time ON cron_firings (schedule_id, fire_time);\nCREATE INDEX IF NOT EXISTS idx_cron_firings_state ON cron_firings (state, finished_at)",
 };
 
+/// v8 (postgres chain) — the firing's session, pg DDL (same version, name and
+/// shape as the sqlite generation; TEXT is the same column type on both).
+const PG_V8_CRON_FIRING_SESSION: Migration = Migration {
+    version: 8,
+    name: "v8_cron_firing_session",
+    up: "ALTER TABLE cron_firings ADD COLUMN session TEXT",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -308,6 +328,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V5_ARCHIVED_SESSIONS,
         PG_V6_SESSION_KIND_INDEX,
         PG_V7_CRON_STATE,
+        PG_V8_CRON_FIRING_SESSION,
     ]
 }
 
@@ -428,7 +449,7 @@ mod tests {
     /// caught here, not at open time on a user's database. (Relaxed in
     /// the chain is designed to grow beyond the events generation;
     /// a generation is well-formed when it names a store table it
-    /// creates.)
+    /// creates or extends with an additive column.)
     #[test]
     fn every_migration_is_well_formed() {
         for m in chain() {
@@ -436,12 +457,29 @@ mod tests {
             assert!(
                 m.up.contains("CREATE TABLE")
                     || m.up.contains("CREATE INDEX")
+                    || m.up.contains("ALTER TABLE cron_firings")
                     || m.name.contains("meta"),
-                "migration v{} ({}) creates no table — is it registered to the right chain?",
+                "migration v{} ({}) neither creates nor extends a store table — is it \
+                 registered to the right chain?",
                 m.version,
                 m.name
             );
         }
+    }
+
+    /// v8 is a committed generation: its SQL is pinned byte-for-byte so a
+    /// rewrite is caught instead of silently diverging from every already
+    /// migrated database (the same doctrine as v0/v1).
+    #[test]
+    fn v8_generation_sql_is_frozen() {
+        let v8: &Migration = &chain()[8];
+        assert_eq!(v8.version, 8);
+        assert_eq!(v8.name, "v8_cron_firing_session");
+        assert_eq!(v8.up, "ALTER TABLE cron_firings ADD COLUMN session TEXT");
+        let pg_v8: &Migration = &pg_chain()[8];
+        assert_eq!(pg_v8.version, 8);
+        assert_eq!(pg_v8.name, "v8_cron_firing_session");
+        assert_eq!(pg_v8.up, "ALTER TABLE cron_firings ADD COLUMN session TEXT");
     }
 
     /// v0 is a committed generation: its SQL is pinned byte-for-byte so
@@ -825,5 +863,71 @@ mod tests {
                 "ON events (session, kind, seq)",
             )
         );
+    }
+    /// v7 -> v8 real upgrade path (CRON-MODEL §12.1): a database created with
+    /// the pre-v8 chain and an existing `cron_firings` row opens under this
+    /// build, applies v8 additively, and the old row decodes with
+    /// `session: NULL` (the settlement fallback).
+    #[tokio::test]
+    async fn v7_database_with_a_firing_row_upgrades_additively() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let path =
+            std::env::temp_dir().join(format!("kian-migrate-v7-{}.sqlite", uuid::Uuid::new_v4()));
+        {
+            let connect = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(connect)
+                .await
+                .expect("raw pool opens");
+            sqlx::raw_sql(
+                "CREATE TABLE _kian_migrations (\n    version INTEGER PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at INTEGER NOT NULL\n)",
+            )
+            .execute(&pool)
+            .await
+            .expect("meta table");
+            for migration in &super::chain()[..8] {
+                sqlx::raw_sql(migration.up)
+                    .execute(&pool)
+                    .await
+                    .expect("pre-v8 migration applies");
+                sqlx::query(
+                    "INSERT INTO _kian_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                )
+                .bind(i64::from(migration.version))
+                .bind(migration.name)
+                .bind(0i64)
+                .execute(&pool)
+                .await
+                .expect("bookkeeping row");
+            }
+            sqlx::raw_sql(
+                "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state)\nVALUES ('night-audit@2026-11-09T02:30:00Z', 'night-audit', '2026-11-09T02:30:00Z', 1761900000000, 'succeeded')",
+            )
+            .execute(&pool)
+            .await
+            .expect("legacy firing row");
+            pool.close().await;
+        }
+
+        // The new build opens the file: migrate() applies v8 only.
+        let store = crate::EventStore::open(&path).await.expect("open store");
+        let versions = super::applied_versions(store.pool())
+            .await
+            .expect("versions");
+        assert!(versions.contains(&8), "v8 applied: {versions:?}");
+        let row = store
+            .load_firing("night-audit@2026-11-09T02:30:00Z")
+            .await
+            .expect("load legacy firing")
+            .expect("row");
+        assert_eq!(row.session, None, "pre-v8 row decodes with no session");
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

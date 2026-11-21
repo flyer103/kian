@@ -30,6 +30,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use kian_core::model::SessionId;
 
 use crate::config::CronRuntimeSchedule;
 
@@ -129,9 +130,21 @@ pub trait CronTickStore {
         error: Option<&str>,
     ) -> Result<bool, String>;
 
+    /// Record the session a claimed firing is dispatched to (CRON-MODEL
+    /// §3.2/§9.1). The tick calls this **before** `dispatch`, so a settlement
+    /// sweep on another replica reads where the firing runs instead of
+    /// inferring it from the configured target. `Ok(true)` = recorded;
+    /// `Ok(false)` = the row is already settled (a settlement race) or absent
+    /// — the caller must refuse to dispatch, or it would run a turn recorded
+    /// against a settled firing. Default: `Ok(true)` (an in-memory test store
+    /// has no firing record to annotate).
+    fn set_firing_session(&self, _firing_id: &str, _session: SessionId) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// Settle resident-arm firings whose target session reached an end
     /// (CRON-MODEL §9.1). The resident arm accepts asynchronously, so the
-    /// ticker reads the target session's stream and records the terminal
+    /// ticker reads the recorded session's stream and records the terminal
     /// state. Called once per schedule per tick; implementations throttle
     /// and the default is a no-op.
     fn settle_from_target(&self, _schedule: &CronRuntimeSchedule) -> Result<(), String> {
@@ -187,15 +200,34 @@ pub struct DispatchOutcome {
 /// worktree turn delays the other schedules' ticks (CRON-MODEL §5.4/§7.3
 ///; a non-blocking execution pool is a P2 item).
 pub trait CronDispatcher {
+    /// The session this firing will run in, when the arm executes turns inside
+    /// sessions (the resident arm). Called **before** [`CronDispatcher::dispatch`];
+    /// the ticking replica records the answer on the firing row
+    /// ([`CronTickStore::set_firing_session`]) so settlement reads the truth.
+    /// `None` = the worktree arm runs outside any session. The default is
+    /// `None`; a resident arm resolves the target or its frozen successor
+    /// (CRON-MODEL §3.2).
+    fn resolve_session(
+        &self,
+        _schedule: &CronRuntimeSchedule,
+        _firing_id: &str,
+    ) -> Result<Option<SessionId>, String> {
+        Ok(None)
+    }
+
     /// Hand one admitted firing to the executor. `payload` is the JSON
     /// rendering of [`Admitted::payload`] — `{schedule_id, firing_id,
     /// fire_time, prompt, target}` — so both future impls read the same
-    /// shape.
+    /// shape. `session` is the value [`CronDispatcher::resolve_session`]
+    /// returned for this firing: the executor must deliver to **exactly**
+    /// that session (it was recorded durably before this call), never
+    /// re-resolve.
     fn dispatch(
         &self,
         schedule: &CronRuntimeSchedule,
         firing_id: &str,
         payload: &str,
+        session: Option<SessionId>,
     ) -> Result<(), String>;
 
     /// The terminal outcome the last [`CronDispatcher::dispatch`] already
@@ -296,6 +328,11 @@ pub fn tick_once(
 /// A dispatch error settles the firing as `Failed` and moves the slot from
 /// `admitted` to `failed` — the tick still ends with the cursor advanced, so
 /// a failing executor cannot wedge the schedule into a re-fire loop.
+///
+/// This is the **unclassified** variant (tests only): a resolution refusal
+/// settles `Failed` here. Production uses
+/// [`crate::cron_engine::tick_and_dispatch_classified`], which maps guard
+/// refusals (`skipped_overlap`, `skipped_disk_pressure`) to `Skipped`.
 pub fn tick_and_dispatch(
     now: DateTime<Utc>,
     schedules: &[CronRuntimeSchedule],
@@ -310,7 +347,53 @@ pub fn tick_and_dispatch(
             admitted.push(entry);
             continue;
         };
-        match dispatcher.dispatch(schedule, &entry.firing_id, &entry.payload) {
+        let resolved = match dispatcher.resolve_session(schedule, &entry.firing_id) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = store.finish_firing(
+                    &entry.firing_id,
+                    FiringState::Failed,
+                    Some(now),
+                    None,
+                    None,
+                    Some(&error),
+                );
+                report.failed.push(Failed {
+                    schedule_id: entry.schedule_id,
+                    firing_id: entry.firing_id,
+                    fire_time: entry.fire_time,
+                    error,
+                });
+                continue;
+            }
+        };
+        if let Some(session) = resolved {
+            let error = match store.set_firing_session(&entry.firing_id, session) {
+                Ok(true) => None,
+                Ok(false) => {
+                    Some("the firing row is no longer open (settled concurrently)".to_string())
+                }
+                Err(error) => Some(format!("record firing session: {error}")),
+            };
+            if let Some(error) = error {
+                let _ = store.finish_firing(
+                    &entry.firing_id,
+                    FiringState::Failed,
+                    Some(now),
+                    None,
+                    None,
+                    Some(&error),
+                );
+                report.failed.push(Failed {
+                    schedule_id: entry.schedule_id,
+                    firing_id: entry.firing_id,
+                    fire_time: entry.fire_time,
+                    error,
+                });
+                continue;
+            }
+        }
+        match dispatcher.dispatch(schedule, &entry.firing_id, &entry.payload, resolved) {
             Ok(()) => admitted.push(entry),
             Err(error) => {
                 let _ = store.finish_firing(
@@ -890,6 +973,7 @@ mod tests {
             _schedule: &CronRuntimeSchedule,
             firing_id: &str,
             _payload: &str,
+            _session: Option<SessionId>,
         ) -> Result<(), String> {
             Err(format!("{firing_id}: resident engine is not running"))
         }

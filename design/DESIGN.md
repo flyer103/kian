@@ -247,9 +247,10 @@ registered for the resumer (invariants 5/6) — except for a decision-blocked se
 row lands (CONFIRMATION-MODEL R1b); a drain that finds the projection terminal
 releases without appending anything (terminal streams freeze). The frozen reading also governs
 the scheduler: `has_open_work` reports no open work for a terminal projection (leftover inbox
-rows are audit facts, never a wake), and an unattended firing against a frozen target is refused
-and recorded `failed` (`target_terminal`) instead of being skipped or admitted into a stream that
-can never consume it (CRON-MODEL §5.1).
+rows are audit facts, never a wake), and an unattended firing against a frozen target is neither
+skipped nor admitted into a stream that can never consume it — it resolves to its deterministic
+per-slot firing session (`uuid5(target, "kian:cron:firing:<firing_id>")`) and runs there
+(CRON-MODEL §3.2/§5.1).
 
 Two stream-repair rules complete the boundary model. **Promotion gate**: while a decision is
 pending, ordinary message rows are not consumed into context — promoting one would interleave a
@@ -1098,8 +1099,8 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
 - **Honesty unchanged.** No fake completions, no catch-up ticks: inputs that arrived while the
  predecessor was terminal were never consumed and stay honestly pending on the frozen stream.
  Those rows are records, not work: `has_open_work` reads a frozen stream as holding no runnable
- work, and a scheduled firing against one is refused and settled `failed`
- (`target_terminal`, CRON-MODEL §5.1) instead of admitting another stranded row.
+ work, and a scheduled firing against one resolves to its own per-slot firing session
+ (CRON-MODEL §3.2/§9.4) instead of admitting another stranded row on the frozen stream.
  The successor starts with a fresh in-context view (one possible re-draft across the succession
  boundary — observable, not hidden). **Resident budget scope (ADR-024):** a resident loop's
  iteration budget is per episode, so a long-lived Router no longer chains successors at every

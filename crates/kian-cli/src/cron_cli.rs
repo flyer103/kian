@@ -461,6 +461,7 @@ async fn run_now(
         firing_id: firing_id.clone(),
         schedule_id: schedule.id.clone(),
         fire_time: fire.clone(),
+        session: None,
         admitted_at: u64::try_from(now.timestamp_millis()).unwrap_or(0),
         state: FiringState::Admitted,
         skip_reason: None,
@@ -483,7 +484,25 @@ async fn run_now(
             }
         };
         let payload = dispatch_payload(&schedule, &firing_id, fire_time);
-        match dispatcher.dispatch(&schedule, &firing_id, &payload) {
+        // Resolve + record the delivery session before dispatching, exactly
+        // like the tick loop (CRON-MODEL §3.2/§9.1).
+        let dispatched = match dispatcher.resolve_session(&schedule, &firing_id) {
+            Ok(resolved) => {
+                let recorded = match resolved {
+                    Some(session) => store.set_firing_session(&firing_id, session).await,
+                    None => Ok(true),
+                };
+                match recorded {
+                    Ok(true) => dispatcher.dispatch(&schedule, &firing_id, &payload, resolved),
+                    Ok(false) => {
+                        Err("the firing row is no longer open (settled concurrently)".to_string())
+                    }
+                    Err(error) => Err(format!("record firing session: {error}")),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match dispatched {
             Ok(()) => (
                 FiringState::Admitted,
                 "dispatch accepted the firing; the schedule cursor is untouched by run-now"
@@ -545,13 +564,14 @@ fn render_firing(row: &CronFiringRow) -> String {
         |finished| format!("{}ms", finished.saturating_sub(row.admitted_at)),
     );
     let skip = row.skip_reason.clone().unwrap_or_else(|| "-".to_string());
+    let session = row.session.clone().unwrap_or_else(|| "-".to_string());
     let error = row
         .error
         .as_ref()
         .map(|e| format!("  error={e}"))
         .unwrap_or_default();
     format!(
-        "{}  state={}  duration={duration}  skip_reason={skip}  firing_id={}{error}",
+        "{}  state={}  session={session}  duration={duration}  skip_reason={skip}  firing_id={}{error}",
         row.fire_time,
         row.state.as_str(),
         row.firing_id
@@ -583,6 +603,7 @@ async fn logs(
                     "schedule_id": row.schedule_id,
                     "fire_time": row.fire_time,
                     "state": row.state.as_str(),
+                    "session": row.session,
                     "duration_ms": row.finished_at.map(|f| f.saturating_sub(row.admitted_at)),
                     "skip_reason": row.skip_reason,
                     "error": row.error,
@@ -656,10 +677,12 @@ async fn rm(id: &str, config_path: &Path, json: bool) -> Result<String, String> 
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{CronCommand, DEFAULT_LOG_LIMIT, USAGE, execute, execute_with, parse_args};
+    use super::{
+        CronCommand, DEFAULT_LOG_LIMIT, USAGE, execute, execute_with, parse_args, render_firing,
+    };
     use crate::config::CronRuntimeSchedule;
     use crate::cron_tick::CronDispatcher;
-    use kian_store::{EventStore, FiringState};
+    use kian_store::{CronFiringRow, EventStore, FiringState};
 
     /// The session every hermetic schedule targets (no channel needed).
     const SESSION: &str = "99999999-8888-7777-6666-555555555555";
@@ -672,6 +695,7 @@ mod tests {
             _schedule: &CronRuntimeSchedule,
             _firing_id: &str,
             _payload: &str,
+            _session: Option<kian_core::model::SessionId>,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -685,6 +709,7 @@ mod tests {
             _schedule: &CronRuntimeSchedule,
             _firing_id: &str,
             _payload: &str,
+            _session: Option<kian_core::model::SessionId>,
         ) -> Result<(), String> {
             Err("worktree_unavailable: hermetic test".to_string())
         }
@@ -959,6 +984,68 @@ superagent:
         cleanup(&dir);
     }
 
+    /// A resident-shaped injected dispatcher resolves a session; `run-now`
+    /// records it on the firing row before dispatching (CRON-MODEL §3.2/§9.1).
+    struct ResolvingDispatcher {
+        session: kian_core::model::SessionId,
+    }
+
+    impl CronDispatcher for ResolvingDispatcher {
+        fn resolve_session(
+            &self,
+            _schedule: &CronRuntimeSchedule,
+            _firing_id: &str,
+        ) -> Result<Option<kian_core::model::SessionId>, String> {
+            Ok(Some(self.session))
+        }
+
+        fn dispatch(
+            &self,
+            _schedule: &CronRuntimeSchedule,
+            _firing_id: &str,
+            _payload: &str,
+            session: Option<kian_core::model::SessionId>,
+        ) -> Result<(), String> {
+            assert_eq!(
+                session,
+                Some(self.session),
+                "dispatch gets the recorded session"
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cron_cli_run_now_records_the_resolved_session() {
+        let dir = temp_dir("run-now-session");
+        let sqlite = dir.join("events.sqlite");
+        let config = write_config(&dir, &sqlite);
+        migrated_store(&sqlite);
+        let session = kian_core::model::SessionId::new();
+        let dispatcher = ResolvingDispatcher { session };
+        let cmd = CronCommand::RunNow {
+            id: "b5-ping".to_string(),
+            config: config.clone(),
+            json: false,
+        };
+        block_on(execute_with(&cmd, Some(&dispatcher))).expect("run-now admits");
+        let path = sqlite.clone();
+        block_on(async move {
+            let store = EventStore::open(&path).await.expect("open store");
+            let rows = store
+                .list_firings(Some("b5-ping"), 1)
+                .await
+                .expect("firing rows");
+            assert_eq!(
+                rows[0].session,
+                Some(session.0.to_string()),
+                "the resolved session is recorded before dispatch"
+            );
+            store.close().await;
+        });
+        cleanup(&dir);
+    }
+
     #[test]
     fn cron_cli_run_now_refuses_unknown_id() {
         let dir = temp_dir("unknown");
@@ -1095,5 +1182,32 @@ superagent:
         // the firing machinery is still intact for observability.
         let _ = FiringState::Admitted;
         cleanup(&dir);
+    }
+    /// CRON-MODEL §9.1/§3.2: `cron logs` names the session the firing ran in,
+    /// so a succession is inspectable (`kian session inspect <uuid>`).
+    #[test]
+    fn cron_logs_renders_the_recorded_session() {
+        let row = CronFiringRow {
+            firing_id: "audit@2026-11-09T02:30:00Z".to_string(),
+            schedule_id: "audit".to_string(),
+            fire_time: "2026-11-09T02:30:00Z".to_string(),
+            session: Some("0f0e0d0c-1111-4222-8333-444455556666".to_string()),
+            admitted_at: 1_700_000_000_000,
+            state: FiringState::Succeeded,
+            skip_reason: None,
+            worktree_path: None,
+            finished_at: Some(1_700_000_001_000),
+            error: None,
+        };
+        let rendered = render_firing(&row);
+        assert!(
+            rendered.contains("session=0f0e0d0c-1111-4222-8333-444455556666"),
+            "{rendered}"
+        );
+        let legacy = CronFiringRow {
+            session: None,
+            ..row
+        };
+        assert!(render_firing(&legacy).contains("session=-"), "legacy row");
     }
 }

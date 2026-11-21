@@ -1112,8 +1112,8 @@ async fn evidence_ref_points_at_the_committed_verdict_seq() {
 
 /// The exhaustive spelling match: adding or removing an `EventKind`
 /// variant breaks this function's compile, and the pinned count pins
-/// the catalog at 22 (EVENT-MODEL §3). The migration chain is pinned
-/// at its landed seven entries (v0..=v6) — P4 adds payload keys only.
+/// the catalog at 23 (EVENT-MODEL §3). The migration chain is pinned
+/// at its landed nine entries (v0..=v8) — P4 adds payload keys only.
 /// [anchors.md rule 5]
 #[test]
 fn no_new_event_kind_route_table_or_migration() {
@@ -1183,13 +1183,13 @@ fn no_new_event_kind_route_table_or_migration() {
     let chain = kian_store::migrations::chain();
     assert_eq!(
         chain.len(),
-        8,
-        "the migration chain is v0..=v7 (cron state)"
+        9,
+        "the migration chain is v0..=v8 (cron firing session)"
     );
     for (index, migration) in chain.iter().enumerate() {
         assert_eq!(
             migration.version, index as u32,
-            "versions stay v0..=v7, adjacent and unedited"
+            "versions stay v0..=v8, adjacent and unedited"
         );
     }
 }

@@ -892,6 +892,7 @@ impl CronDispatcher for WorktreeDispatcher {
         schedule: &CronRuntimeSchedule,
         firing_id: &str,
         payload: &str,
+        _session: Option<kian_core::model::SessionId>,
     ) -> Result<(), String> {
         let now = Utc::now();
         // §6.4: housekeeping rides the tick that dispatches, not a schedule.
@@ -1405,7 +1406,7 @@ mod tests {
         let path = dispatcher.worktree_path("audit", &firing_id, fire_time());
 
         dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect("the firing runs");
 
         let record = dispatcher.firing(&firing_id).expect("recorded");
@@ -1510,7 +1511,7 @@ mod tests {
 
         // A fake dispatch from inside wtB: create, run, capture, cleanup.
         dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect("a firing from a linked worktree runs");
         let record = dispatcher.firing(&firing_id).expect("recorded");
         assert_eq!(record.outcome, FiringOutcome::Ok, "{:?}", record.error);
@@ -1539,7 +1540,7 @@ mod tests {
         let firing_id = kian_cron::firing_id("audit", fire_time());
 
         let error = dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect_err("a non-repo must fail the firing");
 
         assert!(error.starts_with("worktree_unavailable"), "{error}");
@@ -1576,7 +1577,7 @@ mod tests {
         let lease = dispatcher.try_lease("audit", 1).expect("first slot");
         assert!(dispatcher.try_lease("audit", 1).is_none());
         let error = dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect_err("over the ceiling");
         assert!(error.starts_with("skipped_overlap"), "{error}");
         let record = dispatcher.firing(&firing_id).expect("recorded");
@@ -1588,7 +1589,7 @@ mod tests {
         drop(lease);
         assert_eq!(dispatcher.running("audit"), 0);
         dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect("the slot is free again");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(dispatcher.running("audit"), 0);
@@ -1612,7 +1613,7 @@ mod tests {
         let path = dispatcher.worktree_path("audit", &firing_id, fire_time());
 
         let error = dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect_err("a timeout is a failed firing");
         assert!(error.starts_with("timeout:"), "{error}");
 
@@ -1712,7 +1713,7 @@ mod tests {
         let sched = schedule("audit", 1, 60_000);
         let firing_id = kian_cron::firing_id("audit", fire_time());
         let error = dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect_err("the cap is exhausted");
         assert!(error.starts_with("disk_pressure"), "{error}");
         assert!(error.contains("over the total cap"), "{error}");
@@ -2118,7 +2119,7 @@ mod tests_b4b {
     fn dispatch_once(dispatcher: &WorktreeDispatcher, id: &str) -> (String, Result<(), String>) {
         let sched = schedule(id);
         let firing_id = kian_cron::firing_id(id, fire_time());
-        let outcome = dispatcher.dispatch(&sched, &firing_id, &payload(id, &firing_id));
+        let outcome = dispatcher.dispatch(&sched, &firing_id, &payload(id, &firing_id), None);
         (firing_id, outcome)
     }
 
@@ -2716,7 +2717,7 @@ mod tests_dsh_contract {
         let firing_id = kian_cron::firing_id("audit", fire_time());
 
         let error = dispatcher
-            .dispatch(&sched, &firing_id, &payload("audit", &firing_id))
+            .dispatch(&sched, &firing_id, &payload("audit", &firing_id), None)
             .expect_err("a nonzero exit is a failed firing");
 
         assert!(error.starts_with("failed:"), "{error}");

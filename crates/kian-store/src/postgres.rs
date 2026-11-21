@@ -857,7 +857,7 @@ pub(crate) async fn view_publish_delta(
     Ok(())
 }
 
-// -- durable cron state (CRON-MODEL §4/§9, v7) ------------------------------
+// -- durable cron state (CRON-MODEL §4/§9, v7-v8) ---------------------------
 // Same statements as the sqlite twins, `$N` placeholders with explicit
 // casts (every nullable parameter needs one — pg cannot infer a bare
 // NULL). Fire times stay TEXT in the canonical UTC RFC 3339 `Z` form, so
@@ -881,19 +881,19 @@ pub(crate) const CRON_SCHEDULE_SQL: &str = "SELECT id, expr, tz, declaration_dig
 /// winner (`rows_affected() == 1`).
 pub(crate) const CRON_DELETE_SCHEDULE_SQL: &str = "DELETE FROM cron_schedules WHERE id = $1::text";
 
-pub(crate) const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error)\nVALUES ($1::text, $2::text, $3::text, $4::bigint, $5::text, $6::text, $7::text, $8::bigint, $9::text)\nON CONFLICT DO NOTHING";
+pub(crate) const CRON_FIRING_CLAIM_SQL: &str = "INSERT INTO cron_firings (firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session)\nVALUES ($1::text, $2::text, $3::text, $4::bigint, $5::text, $6::text, $7::text, $8::bigint, $9::text, $10::text)\nON CONFLICT DO NOTHING";
 
 pub(crate) const CRON_FIRING_FINISH_SQL: &str = "UPDATE cron_firings\nSET state = $2::text,\n    worktree_path = COALESCE($3::text, worktree_path),\n    finished_at = $4::bigint,\n    skip_reason = COALESCE($5::text, skip_reason),\n    error = $6::text\nWHERE firing_id = $1::text AND state IN ('admitted', 'running')";
 
 pub(crate) const CRON_ADVANCE_CURSOR_SQL: &str = "UPDATE cron_schedules\nSET cursor_fire_at = $2::text,\n    next_fire_at = $3::text,\n    updated_at = $4::bigint\nWHERE id = $1::text\n  AND (cursor_fire_at IS NULL OR cursor_fire_at < $2::text)\n  AND EXISTS (SELECT 1 FROM cron_firings WHERE firing_id = $5::text)";
 
-pub(crate) const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE ($1::text IS NULL OR schedule_id = $1::text)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT $2::bigint";
+pub(crate) const CRON_LIST_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings\nWHERE ($1::text IS NULL OR schedule_id = $1::text)\nORDER BY fire_time DESC, firing_id DESC\nLIMIT $2::bigint";
 
-pub(crate) const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings WHERE firing_id = $1::text";
+pub(crate) const CRON_LOAD_FIRING_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings WHERE firing_id = $1::text";
 
 /// The settlement sweep's open-firing read (CRON-MODEL §9.1) — the sqlite
 /// twin's comment explains why a newest-page scan is not enough.
-pub(crate) const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error\nFROM cron_firings\nWHERE schedule_id = $1::text AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
+pub(crate) const CRON_OPEN_FIRINGS_SQL: &str = "SELECT firing_id, schedule_id, fire_time, admitted_at, state, skip_reason, worktree_path, finished_at, error, session\nFROM cron_firings\nWHERE schedule_id = $1::text AND state IN ('admitted', 'running')\nORDER BY fire_time ASC, firing_id ASC";
 
 pub(crate) async fn cron_upsert_schedule(
     pool: &PgPool,
@@ -959,6 +959,7 @@ pub(crate) async fn cron_claim_firing(
         .bind(p.worktree_path)
         .bind(p.finished_at)
         .bind(p.error)
+        .bind(p.session)
         .execute(pool)
         .await?;
     Ok(res.rows_affected() == 1)
@@ -1050,4 +1051,21 @@ pub(crate) async fn cron_open_firings(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// Record where a claimed firing is dispatched (CRON-MODEL §3.2/§9.1) — the
+/// sqlite twin's comment explains the guarded no-op semantics.
+pub(crate) const CRON_SET_FIRING_SESSION_SQL: &str = "UPDATE cron_firings SET session = $2::text WHERE firing_id = $1::text AND state IN ('admitted', 'running')";
+
+pub(crate) async fn cron_set_firing_session(
+    pool: &PgPool,
+    firing_id: &str,
+    session: &str,
+) -> Result<bool, crate::cron::CronError> {
+    let res = sqlx::query(CRON_SET_FIRING_SESSION_SQL)
+        .bind(firing_id)
+        .bind(session)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
 }

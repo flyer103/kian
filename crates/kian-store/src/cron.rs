@@ -1,4 +1,4 @@
-//! Durable cron state (CRON-MODEL §4/§9, migration v7).
+//! Durable cron state (CRON-MODEL §4/§9, migrations v7–v8).
 //!
 //! Two tables, both **state of record for the scheduler, never event
 //! truth**: a firing is an ordinary admitted turn whose record is an
@@ -44,6 +44,8 @@
 //!
 //! The dialect SQL lives in [`crate::sqlite`] / [`crate::postgres`]; this
 //! module owns the row types, validation and the dual-backend dispatch.
+
+use kian_core::model::SessionId;
 
 use crate::event_store::{EventStore, StoreError};
 
@@ -147,6 +149,12 @@ pub struct CronFiringRow {
     pub schedule_id: String,
     /// UTC RFC 3339 `Z`, whole seconds.
     pub fire_time: String,
+    /// The session the firing was dispatched to (CRON-MODEL §3.2/§9.1): the
+    /// configured target while it was live/empty, or the derived firing
+    /// session when the target was frozen at dispatch. Written before the
+    /// admit; a failed delivery keeps the session it tried. `None` on rows
+    /// recorded before v8.
+    pub session: Option<String>,
     /// Epoch ms the slot was recorded (not necessarily the fire time:
     /// §5.2 keeps `fire_time` reproducible, admission may be late).
     pub admitted_at: u64,
@@ -311,11 +319,14 @@ fn validate_schedule_id(value: &str) -> Result<(), CronError> {
 }
 
 /// The claim payload the dispatch layer hands the backend (one struct
-/// instead of a nine-positional column list).
+/// instead of a ten-positional column list).
 pub(crate) struct FiringInsert<'a> {
     pub firing_id: &'a str,
     pub schedule_id: &'a str,
     pub fire_time: &'a str,
+    /// Normally `None` at claim time: the tick loop records the resolved
+    /// session with [`EventStore::set_firing_session`] before dispatch.
+    pub session: Option<&'a str>,
     pub admitted_at: i64,
     pub state: &'a str,
     pub skip_reason: Option<&'a str>,
@@ -357,6 +368,7 @@ pub(crate) type FiringCols = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
 fn decode_schedule(row: ScheduleCols) -> Result<CronScheduleRow, CronError> {
@@ -389,6 +401,7 @@ fn decode_firing(row: FiringCols) -> Result<CronFiringRow, CronError> {
         worktree,
         finished,
         err,
+        session,
     ) = row;
     let state = FiringState::parse(&state).ok_or_else(|| CronError::CorruptRow {
         reason: format!("cron_firings.state {state:?} is not a known state"),
@@ -412,6 +425,7 @@ fn decode_firing(row: FiringCols) -> Result<CronFiringRow, CronError> {
         worktree_path: worktree,
         finished_at,
         error: err,
+        session,
     })
 }
 
@@ -533,6 +547,7 @@ impl EventStore {
             firing_id: &firing.firing_id,
             schedule_id: &firing.schedule_id,
             fire_time: &firing.fire_time,
+            session: firing.session.as_deref(),
             admitted_at: to_i64_checked(firing.admitted_at, "cron admitted_at")?,
             state: firing.state.as_str(),
             skip_reason: firing.skip_reason.as_deref(),
@@ -546,6 +561,29 @@ impl EventStore {
         match self {
             EventStore::Sqlite(pool) => crate::sqlite::cron_claim_firing(pool, &payload).await,
             EventStore::Postgres(pool) => crate::postgres::cron_claim_firing(pool, &payload).await,
+        }
+    }
+
+    /// Records the session a claimed firing is being dispatched to
+    /// (CRON-MODEL §3.2/§9.1). The tick loop writes it **before** dispatch so a
+    /// concurrently sweeping replica reads where the firing runs instead of
+    /// inferring it from the configured target; the settlement sweep then
+    /// reads exactly that stream. Idempotent (`UPDATE … WHERE state IN
+    /// ('admitted','running')`): `false` = the row already settled or is
+    /// absent (a settlement race), never an error.
+    pub async fn set_firing_session(
+        &self,
+        firing_id: &str,
+        session: SessionId,
+    ) -> Result<bool, CronError> {
+        let session = session.0.to_string();
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::cron_set_firing_session(pool, firing_id, &session).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::cron_set_firing_session(pool, firing_id, &session).await
+            }
         }
     }
 
@@ -726,6 +764,7 @@ mod tests {
 
     use super::{CronFiringRow, FiringState, ScheduleUpsert};
     use crate::EventStore;
+    use kian_core::model::SessionId;
 
     const T0: u64 = 1_761_900_000_000;
 
@@ -751,6 +790,7 @@ mod tests {
             firing_id: format!("{schedule_id}@{fire_time}"),
             schedule_id: schedule_id.to_owned(),
             fire_time: fire_time.to_owned(),
+            session: None,
             admitted_at: T0,
             state: FiringState::Admitted,
             skip_reason: None,
@@ -797,6 +837,80 @@ mod tests {
         assert_eq!(rows.len(), 1, "one row per slot");
         assert_eq!(rows[0].state, FiringState::Admitted);
 
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// CRON-MODEL §3.2/§9.1 (v8): the firing records where it actually runs.
+    /// A claim starts with no session (the pre-v8 / legacy shape), the tick
+    /// records the resolved session before dispatch, and the guarded write
+    /// never rewrites a settled row.
+    #[tokio::test]
+    async fn set_firing_session_round_trips_and_never_touches_a_settled_row() {
+        let path = temp_db_path();
+        let store = EventStore::open(&path).await.expect("open");
+        seed_schedule(&store, "night-audit", "d1").await;
+        let slot = firing("night-audit", "2026-11-09T02:30:00Z");
+        assert!(store.claim_firing(&slot).await.expect("claim"));
+        let loaded = store
+            .load_firing(&slot.firing_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(loaded.session, None, "a claim records no session yet");
+
+        let session = SessionId::new();
+        let session_text = session.0.to_string();
+        assert!(
+            store
+                .set_firing_session(&slot.firing_id, session)
+                .await
+                .expect("record session")
+        );
+        let loaded = store
+            .load_firing(&slot.firing_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(loaded.session.as_deref(), Some(session_text.as_str()));
+        let listed = store
+            .list_firings(Some("night-audit"), 10)
+            .await
+            .expect("list");
+        assert_eq!(listed[0].session.as_deref(), Some(session_text.as_str()));
+        let open = store.open_firings("night-audit").await.expect("open");
+        assert_eq!(open[0].session.as_deref(), Some(session_text.as_str()));
+
+        // A settled row is frozen: a late session write is a guarded no-op.
+        assert!(
+            store
+                .finish_firing(
+                    &slot.firing_id,
+                    FiringState::Succeeded,
+                    Some(T0 + 1_000),
+                    None,
+                    None,
+                    None
+                )
+                .await
+                .expect("settle")
+        );
+        assert!(
+            !store
+                .set_firing_session(&slot.firing_id, SessionId::new())
+                .await
+                .expect("late record is a no-op")
+        );
+        let loaded = store
+            .load_firing(&slot.firing_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            loaded.session.as_deref(),
+            Some(session_text.as_str()),
+            "a settled row's session is never rewritten"
+        );
         store.close().await;
         cleanup(&path);
     }
