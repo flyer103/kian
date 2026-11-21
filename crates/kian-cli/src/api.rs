@@ -914,11 +914,41 @@ async fn fan_in_events_sse(
         watched: AtomicU64::new(0),
     });
     let kinds = query.kinds.clone();
-    let setup: Vec<SessionId> = query.sessions.clone();
 
-    // State machine per cycle: establish the tail cursors on the first
-    // cycle (emitting one error frame per unlistable session), then
-    // poll every watched session's bounded tail. Backpressure is
+    // Tail-only start (READ-MODEL §4.2): one head query per listed
+    // session, taken *here* — before the response is handed back — and
+    // one error frame per unlistable session.
+    //
+    // Establishing the cursors lazily on the first poll cycle raced an
+    // event appended immediately after the client opened the stream: the
+    // lazily-read head was already past that event, so a tail-only
+    // consumer silently missed it (the e2e caught this on a loaded CI
+    // runner). Reading the head at accept time makes "tail from open"
+    // mean what it says.
+    let mut watch: Vec<FanInWatch> = Vec::new();
+    let mut pending: Vec<SseEvent> = Vec::new();
+    for session in query.sessions.iter().copied() {
+        match state.plane.session_version(session).await {
+            Ok(version) => {
+                watch.push(FanInWatch {
+                    session,
+                    last: version,
+                });
+                guard.session_added();
+            }
+            Err(e) => {
+                let (_, message) = control_err(e);
+                pending.push(
+                    SseEvent::default()
+                        .event("error")
+                        .data(format!("{message} — dropped from this stream")),
+                );
+            }
+        }
+    }
+    let close_after_pending = watch.is_empty();
+
+    // State machine per cycle: poll every watched session's bounded tail. Backpressure is
     // bounded twice over: the unfold future is only advanced when the
     // consumer reads (a slow or stalled consumer suspends polling
     // outright — the server never buffers on its behalf), and one
@@ -926,47 +956,39 @@ async fn fan_in_events_sse(
     let stream = futures::stream::unfold(
         (
             Arc::clone(&state.plane),
-            Vec::<FanInWatch>::new(),
-            setup,
+            watch,
+            pending,
             kinds,
             metrics,
             guard,
-            false, // tail cursors established?
+            close_after_pending,
             false, // close after this yield?
         ),
-        move |(plane, mut watch, setup, kinds, metrics, guard, mut initialized, mut done)| {
+        move |(
+            plane,
+            mut watch,
+            mut pending,
+            kinds,
+            metrics,
+            guard,
+            close_after_pending,
+            mut done,
+        )| {
             async move {
                 if done {
                     return None;
                 }
                 let mut items: Vec<Result<SseEvent, Infallible>> = Vec::new();
-                if !initialized {
-                    // Tail-only start (READ-MODEL §4.2): one head query
-                    // per listed session; the pre-connect history is
-                    // never replayed. An unlistable session gets its
-                    // one error frame and is skipped — the stream
-                    // continues with the others.
-                    for session in setup.iter().copied() {
-                        match plane.session_version(session).await {
-                            Ok(version) => {
-                                watch.push(FanInWatch {
-                                    session,
-                                    last: version,
-                                });
-                                guard.session_added();
-                            }
-                            Err(e) => {
-                                let (_, message) = control_err(e);
-                                items.push(Ok(SseEvent::default()
-                                    .event("error")
-                                    .data(format!("{message} — dropped from this stream"))));
-                            }
-                        }
+                if !pending.is_empty() {
+                    for event in pending.drain(..) {
+                        items.push(Ok(event));
                     }
-                    initialized = true;
-                    if watch.is_empty() {
+                    if close_after_pending {
                         done = true;
                     }
+                }
+                if watch.is_empty() && pending.is_empty() {
+                    done = true;
                 } else {
                     loop {
                         let mut i = 0;
@@ -1041,11 +1063,11 @@ async fn fan_in_events_sse(
                     (
                         plane,
                         watch,
-                        setup,
+                        pending,
                         kinds,
                         metrics,
                         guard,
-                        initialized,
+                        close_after_pending,
                         done,
                     ),
                 ))

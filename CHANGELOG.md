@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **The fan-in stream takes its tail cursors when the request is accepted (READ-MODEL §4.2)**.
+  `GET /events` used to read each listed session's head lazily, on its first poll cycle; an event
+  appended between the client opening the stream and that cycle was already behind the head, so a
+  tail-only consumer silently missed it. The head queries now run before the response is handed
+  back, which is what "tail from open" was always documented to mean.
+
 - **Frozen cron targets succeed through a per-slot firing session (CRON-MODEL §3.2/§5.1/§9.1)**.
   A plain target session ends `completed` after its turn, so the resident arm used to run exactly
   one successful firing per schedule and then fail every later slot (`target_terminal`). Dispatch
