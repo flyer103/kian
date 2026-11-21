@@ -428,7 +428,8 @@ unverified until actually executed.
 
 **First live L3 run (2026-11-08, owner phone)** — results, recorded here as evidence:
 
-- QR login succeeded (bot `<bot-id>@im.bot`, user `<open-id>@im.wechat`)
+- QR login succeeded (bot `<bot-id>@im.bot`, user `<open-id>@im.wechat`; ids redacted in the
+  published copy, the run record keeps the pairing)
   only after the adapter sent the **official client identity** (`bot` / `0x0002040A` / `2.4.10`);
   kian-branded identity values failed **client-side** (`Network error`) before the scan reached
   the server (`scanned` count stayed 0).
