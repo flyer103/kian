@@ -3,6 +3,8 @@ name = "kiand"
 description = "Endpoint daemon: kian-endpoint's Endpoint + LocalExecutor behind a thin, fail-closed main"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 path = "src/lib.rs"

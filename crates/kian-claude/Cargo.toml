@@ -3,6 +3,8 @@ name = "kian-claude"
 description = "Claude Code bridge adapter: stream-json child behind the shared bridge skeleton (phase 1)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # HARNESS-BRIDGE / ADR-037: a protocol adapter + spawn recipe on top of
 # `kian-harness`. Depends on `kian-core` only through the skeleton (the

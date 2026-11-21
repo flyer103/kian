@@ -3,6 +3,8 @@ name = "kian-harness"
 description = "Shared skeleton for external-harness bridges (LoopDriver state machine, approvals, fixtures)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # HARNESS-BRIDGE §4: the shared skeleton sits on the narrow waist — its
 # ONLY kian dependency is `kian-core` (the seam types plus the event

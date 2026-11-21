@@ -3,6 +3,8 @@ name = "kian-orchestrator"
 description = "Execution model, recovery subsystem (classification + policy + budget), control-plane implementation"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # Narrow waist (AGENTS.md constraint 10): this crate depends on kian-core
 # and kian-store ONLY. Never add provider/channel/plugin crates here.

@@ -3,6 +3,8 @@ name = "kian-exec"
 description = "KiandProto server half: ConnectionManager that dials execution endpoints (durable queue + RemoteExecBackend land in the next slice)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kian-core.workspace = true

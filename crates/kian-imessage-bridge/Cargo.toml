@@ -3,6 +3,8 @@ name = "kian-imessage-bridge"
 description = "macOS-side iMessage bridge: a loopback HTTP ABI over `imsg rpc` for the kian imessage channel"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # CHANNEL-IMESSAGE §3: this binary is the only component that touches
 # macOS (chat.db under Full Disk Access, Messages.app under Automation).

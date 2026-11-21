@@ -3,6 +3,8 @@ name = "kian-codex"
 description = "Codex bridge adapter: codex app-server JSON-RPC child behind the shared bridge skeleton (phase 1)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kian-core.workspace = true

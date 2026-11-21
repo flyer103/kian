@@ -3,6 +3,8 @@ name = "kian-dsh"
 description = "dsh bridge: the LoopDriver that drives a dsh --profile sdk child process over stdio JSON-lines (ADR-010)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # DESIGN §7: the bridge crate sits on the narrow waist — its ONLY
 # kian dependency is `kian-core` (the seam types `LoopDriver`/

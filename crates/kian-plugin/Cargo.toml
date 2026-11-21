@@ -3,6 +3,8 @@ name = "kian-plugin"
 description = "Ctx registry, Plugin trait, five-mode dispatch, Disposer"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kian-core.workspace = true

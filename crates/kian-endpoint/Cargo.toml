@@ -3,6 +3,8 @@ name = "kian-endpoint"
 description = "Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 kian-core.workspace = true
