@@ -25,11 +25,11 @@ output directory `site`. `_headers` applies the CSP, HSTS and cache policy on ev
 
 Bind a custom domain under **Custom domains** once DNS points at Cloudflare.
 
-## GitHub Pages mirror
+## Live
 
-[`pages.yml`](../.github/workflows/pages.yml) publishes `site/` on every push to `main`. Enable it
-once under **Settings → Pages → Build and deployment → Source: GitHub Actions**. Asset paths are
-relative, so the mirror also works under the repository subpath (`/<repo>/`).
+<https://kian-site.pages.dev/> (Cloudflare Pages, project `kian-site`). Every deploy uploads `site/`
+as-is; `_headers` supplies the CSP, HSTS and cache policy. There is no GitHub Pages mirror — the
+Cloudflare project is the only deployment, and no workflow publishes this directory.
 
 ## Before going live
 
