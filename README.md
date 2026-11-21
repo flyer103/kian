@@ -1,5 +1,6 @@
 # Kian — the durable execution runtime for agents
 
+[![website](https://img.shields.io/badge/website-kian--site.pages.dev-ff7a45)](https://kian-site.pages.dev)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![gates](https://github.com/flyer103/kian/actions/workflows/gates.yml/badge.svg)](https://github.com/flyer103/kian/actions/workflows/gates.yml)
 [![release](https://img.shields.io/github/v/release/flyer103/kian?color=green)](https://github.com/flyer103/kian/releases)
