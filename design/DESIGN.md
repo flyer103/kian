@@ -526,6 +526,26 @@ reads as an unexpected prefix change) and `kian cost` reports maintenance reques
 priced subtotal apart from turns. Limits: no price-aware planner, no `compact_slot`, no
 maintenance fallback; wall-clock budgets remain ungated.
 
+**Vision inputs (ADR-062, P5c — landed):** the one capability that changes the request dialect
+rather than adding a surface beside it. A user input payload may carry its content object as
+{text, images: [{artifact, media_type}]}; the loop resolves each referenced blob through the
+same artifact store the spill path uses (a new DrainCtx::artifact_bytes accessor) and attaches
+the bytes to the derived ChatMessage only when the bound target declares vision: true. The V2
+plan builder then rewrites exactly those messages into OpenAI content parts
+([{type: text}, {type: image_url, image_url: {url: data:<media_type>;base64,<bytes>}}]) inside the
+single place that produces the persisted and sent bytes, so persist-what-you-send holds and the
+estimate band already prices the image bytes. The image field is serde-skipped, so the frozen V1
+body and every image-free V2 body keep their exact bytes (constraint 3); the capability is
+per-target, like thinking and effort. Bounds: at most four images per message and eight MiB per
+image, user messages only; a missing, oversized or malformed reference drops that image with a
+warning and the text envelope still flies (an artifact reclaimed by GC degrades the answer, never
+fails the turn). Replay honesty: the persisted step/request body is still the exact bytes sent,
+but offline replay cannot rebuild base64 from the stream alone, so kian session replay counts a
+request whose recorded messages carry content parts as a vision request instead of a byte-identity
+mismatch. Limits: no real vision provider is wired in the tree (the L2 evidence is a scripted
+provider), no per-image pricing, no replay re-derivation from the artifact store, and the channel
+media edge (ADR-061) still transcribes to text rather than attaching vision.
+
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and
 before the RPC returns), the source memory session's stream is rebuilt, folded and rendered by

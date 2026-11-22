@@ -772,6 +772,35 @@ Non-goals recorded with the phase: no real-adapter media ingestion (WeChat CDN d
 attachments remain those channels' phase 2), no outbound audio send, no TTS call behind the model's
 back, no media pricing, no new event kind and no queue or batching at the edge.
 
+### Vision inputs (ADR-062, P5c landed)
+
+Scope: let a vision-capable model see an image without leaving the event log. A user input payload
+may carry its content as `{"text": <string>, "images": [{"artifact": <content id>,
+"media_type": <IANA type>}]}`; downstream this becomes a dialect-level content-parts message.
+
+Semantics: the loop resolves each referenced blob through the artifact store
+(`DrainCtx::artifact_bytes`) and attaches the bytes to the chat message it derives. Only a target
+whose `model_profiles:` entry declares `vision: true` takes this path: the V2 request plan rewrites
+exactly those messages to OpenAI content parts (`[{"type":"text","text":...},{"type":"image_url",
+"image_url":{"url":"data:<media_type>;base64,<bytes>"}}]`); the frozen V1 body (no profile) and
+every image-free V2 body keep their exact bytes, because the image field is `#[serde(skip)]`. At
+most 4 images per message and 8 MiB per image; a missing, oversized or malformed reference drops
+that image with a warning and the text envelope still reaches the model (a reclaimed blob degrades
+the answer, never fails the turn). The exact base64 bytes are persisted on `step/request` by
+persist-what-you-send; an offline replay cannot re-derive them from the stream alone, so
+`kian session replay` counts such requests as vision requests instead of byte-identity mismatches.
+
+The contract is [ADR-062](../design/decisions/ADR-062-vision-content-parts.md); the artifacts are
+ADR-055; the profile knob is ADR-053; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5c | kian-llm, kian-loop, kian-orchestrator | dialect-level vision: artifact-backed image bytes on vision-profile messages as OpenAI content parts, bounded and honestly degradable | landed |
+
+Non-goals recorded with the phase: no real vision provider wired in the tree (scripted-provider L2
+evidence), no image pricing, no images outside `role: user`, no replay re-derivation from the
+artifact store, no automatic vision from channel media (that edge transcribes to text).
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

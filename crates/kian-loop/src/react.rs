@@ -57,13 +57,13 @@ use kian_core::confirmation::{PendingCall, confirmable, confirmations, pending_c
 use kian_core::context::{Message, context_provenance, derive_model_context};
 use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{Event, EventKind};
-use kian_core::model::{AgentDef, Permission, SlotName};
+use kian_core::model::{AgentDef, ModelProfile, Permission, SlotName};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
     ToolCall, ToolProvider, ToolResult,
 };
 use kian_llm::plan::build_request_plan;
-use kian_llm::provider::{ChatMessage, WireFunctionCall, WireToolCall};
+use kian_llm::provider::{ChatImage, ChatMessage, WireFunctionCall, WireToolCall};
 use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
 use kian_orchestrator::compaction::{
@@ -91,6 +91,12 @@ const MAX_COMPACTIONS_PER_EPISODE: usize = 2;
 /// Output reserve assumed for a profile that declares no output cap, when
 /// deciding whether the next request is close to the window.
 const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 4_096;
+
+/// Upper bound on images attached to one user message (ADR-062).
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+
+/// Upper bound on one attached image byte payload (ADR-062).
+const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound on the transcript handed to the summarizer, in characters.
 /// The model already cost the context; the transcript only has to carry
@@ -1031,6 +1037,63 @@ impl Inner {
         Ok(fresh.binding(&self.config.slot)?.clone())
     }
 
+    /// Builds the chat messages for this turn, attaching artifact-backed
+    /// images to user messages when the bound target declares `vision`
+    /// (ADR-062). Without the capability the conversion is exactly
+    /// [`to_chat_message`]: no bytes load and each content keeps the
+    /// compact JSON fallback it had before this capability existed.
+    async fn chat_messages(
+        &self,
+        ctx: &DrainCtx,
+        profile: Option<&ModelProfile>,
+        messages: &[Message],
+    ) -> Vec<ChatMessage> {
+        let vision = profile.is_some_and(|p| p.vision);
+        let mut chat = Vec::with_capacity(messages.len());
+        for message in messages {
+            let Some(mut chat_message) = to_chat_message(message) else {
+                continue;
+            };
+            if vision
+                && message.role == "user"
+                && let Some((text, references)) = vision_envelope(&message.content)
+            {
+                chat_message.content = text;
+                chat_message.images = self.load_images(ctx, &references).await;
+            }
+            chat.push(chat_message);
+        }
+        chat
+    }
+
+    /// Loads the referenced image blobs for one user message (ADR-062).
+    ///
+    /// Bounded and honest: a missing, unreadable or oversized blob drops
+    /// that image with a warning, and the envelope's text still flies (an
+    /// artifact reclaimed by GC degrades the answer, never the turn).
+    async fn load_images(&self, ctx: &DrainCtx, references: &[ImageReference]) -> Vec<ChatImage> {
+        let mut images = Vec::new();
+        for (artifact, media_type) in references.iter().take(MAX_IMAGES_PER_MESSAGE) {
+            let Some(bytes) = ctx.artifact_bytes(artifact).await else {
+                continue;
+            };
+            if bytes.len() > MAX_VISION_IMAGE_BYTES {
+                tracing::warn!(
+                    artifact = %artifact,
+                    bytes = bytes.len(),
+                    limit = MAX_VISION_IMAGE_BYTES,
+                    "vision image is over the byte bound; the image is skipped (ADR-062)"
+                );
+                continue;
+            }
+            images.push(ChatImage {
+                media_type: media_type.clone(),
+                bytes,
+            });
+        }
+        images
+    }
+
     /// Runs one provider turn: persist the A2 audit copy, call the slot
     /// (with fallback traversal), assemble the streamed response, then
     /// either dispatch tool calls (log-before-execute) or return a final
@@ -1049,7 +1112,9 @@ impl Inner {
         // array order — serialization contract).
         let mut schemas = self.tools.schemas();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
-        let chat: Vec<ChatMessage> = messages.iter().filter_map(to_chat_message).collect();
+        let chat = self
+            .chat_messages(ctx, target.profile.as_ref(), messages)
+            .await;
 
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called. The plan is the single source of the bytes
@@ -2019,6 +2084,53 @@ pub fn to_chat_message(m: &Message) -> Option<ChatMessage> {
     }
 }
 
+/// One image reference in a vision envelope: the artifact id and its media type.
+type ImageReference = (String, String);
+
+/// The text to send plus the image references parsed out of a vision envelope.
+type VisionEnvelope = (Option<String>, Vec<ImageReference>);
+
+/// The ADR-062 vision envelope: a user message content object
+/// `{"text": <string>, "images": [{"artifact": <id>, "media_type": <type>}]}`.
+///
+/// Returns the text to send and the referenced blobs, or `None` when the
+/// payload is not an envelope with at least one usable reference (both keys
+/// are required on an item). A malformed descriptor therefore never changes
+/// the bytes: the legacy compact-JSON conversion still applies.
+fn vision_envelope(content: &Value) -> Option<VisionEnvelope> {
+    let object = content.as_object()?;
+    let references = object.get("images")?.as_array()?;
+    let mut usable = Vec::new();
+    for item in references {
+        let Some(entry) = item.as_object() else {
+            continue;
+        };
+        let Some(artifact) = entry
+            .get("artifact")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(media_type) = entry
+            .get("media_type")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        usable.push((artifact.to_owned(), media_type.to_owned()));
+    }
+    if usable.is_empty() {
+        return None;
+    }
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some((text, usable))
+}
+
 /// The permission decision for one tool call (ADR-015). Evaluated
 /// once per call, before the `tool/call` append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2224,6 +2336,7 @@ fn string_or_compact(role: &str, content: &Value) -> ChatMessage {
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
+        images: Vec::new(),
     }
 }
 
@@ -2241,6 +2354,7 @@ fn tool_result_message(content: &Value) -> ChatMessage {
             tool_call_id: Some(call_id.to_owned()),
             tool_calls: None,
             reasoning_content: None,
+            images: Vec::new(),
         };
     }
     ChatMessage {
@@ -2249,6 +2363,7 @@ fn tool_result_message(content: &Value) -> ChatMessage {
         tool_call_id: Some(String::new()),
         tool_calls: None,
         reasoning_content: None,
+        images: Vec::new(),
     }
 }
 
@@ -2299,6 +2414,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
             tool_call_id: None,
             tool_calls: calls,
             reasoning_content: reasoning_field(obj),
+            images: Vec::new(),
         });
     }
     // The per-call `tool/call` transcript duplicate: the enclosing
@@ -2313,6 +2429,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: reasoning_field(obj),
+            images: Vec::new(),
         });
     }
     Some(string_or_compact("assistant", content))

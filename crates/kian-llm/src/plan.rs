@@ -116,6 +116,12 @@ pub fn build_request_plan(
     if let Some(max_output) = profile.max_output {
         body["max_tokens"] = json!(max_output);
     }
+    // ADR-062: an image-bearing message becomes OpenAI content parts, and
+    // only under a profile that declares the capability. Every other body
+    // keeps the exact bytes `build_chat_body` produced.
+    if profile.vision && messages.iter().any(|m| !m.images.is_empty()) {
+        body["messages"] = Value::Array(vision_messages(messages)?);
+    }
 
     let digest = sha256_hex(
         &serde_json::to_vec(profile)
@@ -128,6 +134,83 @@ pub fn build_request_plan(
         Some(digest),
         profile.max_output,
     )
+}
+
+/// Renders the image-bearing messages as OpenAI content parts (ADR-062).
+///
+/// Only a message that actually carries an image changes shape: its string
+/// content becomes a `text` part followed by one `image_url` part per image
+/// (`data:<media_type>;base64,<bytes>`). Every other message keeps the exact
+/// object `build_chat_body` produced.
+fn vision_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError> {
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut value = serde_json::to_value(message)
+            .map_err(|e| ProviderError::Other(format!("message serialization failed: {e}")))?;
+        if message.images.is_empty() {
+            out.push(value);
+            continue;
+        }
+        let mut parts = Vec::with_capacity(message.images.len() + 1);
+        if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
+            parts.push(json!({"type": "text", "text": text}));
+        }
+        for image in &message.images {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{};base64,{}",
+                        image.media_type,
+                        base64_encode(&image.bytes)
+                    ),
+                },
+            }));
+        }
+        let Some(object) = value.as_object_mut() else {
+            return Err(ProviderError::Other(
+                "message serialization produced a non-object".to_string(),
+            ));
+        };
+        object.insert("content".to_string(), Value::Array(parts));
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Standard padded base64 (RFC 4648) of an image payload (ADR-062).
+///
+/// The workspace carries no base64 dependency; this encoder is the inverse
+/// of the decoder the channel media edge uses and is covered by vectors.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = chunk.get(1).copied().map(u32::from);
+        let third = chunk.get(2).copied().map(u32::from);
+        out.push(char::from(ALPHABET[(first >> 2) as usize]));
+        out.push(char::from(
+            ALPHABET[(((first & 0b11) << 4) | (second.unwrap_or(0) >> 4)) as usize],
+        ));
+        match (second, third) {
+            (Some(one), None) => {
+                out.push(char::from(ALPHABET[((one & 0b1111) << 2) as usize]));
+                out.push('=');
+            }
+            (Some(one), Some(two)) => {
+                out.push(char::from(
+                    ALPHABET[(((one & 0b1111) << 2) | (two >> 6)) as usize],
+                ));
+                out.push(char::from(ALPHABET[(two & 0b111111) as usize]));
+            }
+            (None, _) => {
+                out.push('=');
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn finish(
@@ -171,7 +254,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::FROZEN_CHAT_BODY_SHA256;
+    use crate::provider::{ChatImage, FROZEN_CHAT_BODY_SHA256};
     use kian_core::seams::ToolSchema;
 
     fn user() -> Vec<ChatMessage> {
@@ -277,5 +360,84 @@ mod tests {
         let plan = build_request_plan(Some(&profile()), "m", &user(), &[tool]).unwrap();
         assert_eq!(plan.body["tools"][0]["function"]["name"], json!("fs_read"));
         assert_eq!(plan.body["tools"][0].get("strict"), None);
+    }
+
+    fn image_message() -> ChatMessage {
+        let mut message = ChatMessage::plain("user", "what is on this invoice?");
+        message.images = vec![ChatImage {
+            media_type: "image/png".into(),
+            bytes: b"hi".to_vec(),
+        }];
+        message
+    }
+
+    #[test]
+    fn base64_encoder_matches_the_reference_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+    }
+
+    #[test]
+    fn a_vision_profile_renders_an_image_bearing_message_as_content_parts() {
+        let plan = build_request_plan(
+            Some(&profile()),
+            "deepseek-vision",
+            &[ChatMessage::plain("system", "be terse"), image_message()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.body_version, BodyVersion::V2);
+        assert_eq!(plan.body["messages"][0]["content"], json!("be terse"));
+        assert_eq!(
+            plan.body["messages"][1]["content"],
+            json!([
+                {"type": "text", "text": "what is on this invoice?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ])
+        );
+        assert_eq!(plan.body["messages"][1].get("images"), None);
+    }
+
+    #[test]
+    fn a_vision_profile_without_images_keeps_the_v2_body_unchanged() {
+        let p = profile();
+        let plain = ChatMessage::plain("user", "what is on this invoice?");
+        let without_images = build_request_plan(Some(&p), "m", &[plain], &[]).unwrap();
+        let mut with_image = image_message();
+        with_image.images.clear();
+        let stripped = build_request_plan(Some(&p), "m", &[with_image], &[]).unwrap();
+        assert_eq!(without_images.body["messages"], stripped.body["messages"]);
+    }
+
+    #[test]
+    fn a_profile_without_vision_never_renders_content_parts() {
+        let p = ModelProfile {
+            vision: false,
+            ..profile()
+        };
+        let plan = build_request_plan(Some(&p), "m", &[image_message()], &[]).unwrap();
+        assert_eq!(
+            plan.body["messages"][0]["content"],
+            json!("what is on this invoice?")
+        );
+        assert_eq!(plan.body["messages"][0].get("images"), None);
+    }
+
+    #[test]
+    fn the_v1_body_never_carries_image_parts() {
+        let messages = [image_message()];
+        let plan = build_request_plan(None, "m", &messages, &[]).unwrap();
+        assert_eq!(plan.body_version, BodyVersion::V1);
+        assert_eq!(plan.body, build_chat_body("m", &messages, &[]));
+        assert_eq!(
+            plan.body["messages"][0]["content"],
+            json!("what is on this invoice?")
+        );
     }
 }

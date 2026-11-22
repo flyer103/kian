@@ -978,6 +978,42 @@ the contract those channel phases implement (a mock channel can carry it today).
 wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
 Semantics: [ADR-061](../design/decisions/ADR-061-channel-edge-media.md).
 
+## Vision inputs
+
+A vision-capable model can see an image that lives in the artifact store. Declare the capability
+on the target, ingest the image, and submit the descriptor in the user content.
+
+```yaml
+model_profiles:
+  flash-vision:
+    provider: deepseek
+    model: deepseek-vision
+    dialect: openai_chat
+    vision: true
+```
+
+```console
+kian artifacts put ./invoice.png
+# kian artifacts put: ./invoice.png -> 9f2c... (image/png, 18244 bytes)
+```
+
+```json
+{"method": "submit",
+ "params": {"session": "...",
+            "content": {"role": "user",
+                        "content": {"text": "what is the total on this invoice?",
+                                    "images": [{"artifact": "9f2c...",
+                                                "media_type": "image/png"}]}}}}
+```
+
+Only messages on a `vision: true` profile attach the bytes; the request body carries the image as
+a `data:` URL content part, so the persisted `step/request` is the exact bytes sent. Limits: 4
+images per message, 8 MiB each, user messages only, and no image pricing — the provider's usage is
+what `kian cost` prices. A blob missing at send time drops that image (a warning, and the text
+still goes) rather than failing the turn; `kian session replay` reports such requests as vision
+requests because offline replay cannot rebuild base64. Semantics:
+[ADR-062](../design/decisions/ADR-062-vision-content-parts.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`

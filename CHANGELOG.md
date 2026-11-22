@@ -8,6 +8,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Vision inputs: a vision-profile target sees artifact-backed images as dialect content parts
+  (DESIGN §3.2, ADR-062, P5c).** A user input content may carry `{"text", "images": [{"artifact",
+  "media_type"}]}`; the loop resolves the blobs through the artifact store and the V2 request plan
+  rewrites exactly those messages into OpenAI `image_url` content parts under a `model_profiles`
+  `vision: true` target. V1 and every image-free V2 body stay byte-identical (the field is
+  `#[serde(skip)]`), inputs are bounded (4 images, 8 MiB each), a reclaimed blob degrades the picture
+  rather than the turn, and `session replay` counts such requests as vision requests instead of
+  byte-identity mismatches.
+
 - **Channel-edge media: voice notes and photos become durable text context (DESIGN §4.2, ADR-061,
   P5b).** The assembly's channel pump runs an optional media edge before admission: an adapter event
   carrying the additive `media` envelope has each item's bytes written to the artifact store,

@@ -21,12 +21,13 @@ use kian_core::model::{AgentDef, Budgets, Permission, SessionId, SlotName};
 use kian_core::seams::{PolicyRule, RecoveryAction, ToolCall, ToolResult};
 use kian_core::state::{SessionState, project};
 use kian_llm::ProviderRegistry;
-use kian_orchestrator::{BudgetOutcome, Engine, EngineConfig};
+use kian_orchestrator::{ArtifactRuntime, BudgetOutcome, Engine, EngineConfig, ReadModelConfig};
 use kian_store::EventStore;
 
 use crate::react::{CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop};
 use crate::test_support::{
-    HookTools, RecordingPolicy, ScriptedProvider, agent_def, text_chunk, tool_call_chunk,
+    HookTools, NoopPolicy, NoopTools, RecordingPolicy, ScriptedProvider, agent_def, text_chunk,
+    tool_call_chunk,
 };
 use crate::tools::LocalTools;
 
@@ -2306,5 +2307,192 @@ async fn maintenance_reserve_parks_the_turn_and_a_budget_raise_resumes_it() {
         "the raise is a durable event"
     );
     assert_eq!(provider.requests().len(), 2);
+    cleanup_db(&h.db_path);
+}
+
+// -- acceptance: vision content parts (ADR-062) -----------------------------
+
+fn vision_profile() -> kian_core::model::ModelProfile {
+    kian_core::model::ModelProfile {
+        dialect: kian_core::model::ModelDialect::OpenAiChat,
+        context_window: None,
+        max_output: None,
+        reasoning: false,
+        thinking: None,
+        effort: None,
+        strict: false,
+        cache: true,
+        vision: true,
+    }
+}
+
+/// Engine harness with an explicit artifact runtime so the loop can read
+/// referenced image blobs (ADR-062) through `DrainCtx::artifact_bytes`.
+async fn harness_with_artifacts(
+    agent: AgentDef,
+    turns: Vec<ScriptedChunksArgs>,
+    artifacts: Option<ArtifactRuntime>,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent,
+        Arc::new(registry),
+        Arc::new(NoopTools),
+        Arc::new(NoopPolicy),
+        ReActConfig::default(),
+    );
+    let engine = Engine::new_with_read_model_and_artifacts(
+        store.clone(),
+        Arc::new(react),
+        EngineConfig::default(),
+        ReadModelConfig::default(),
+        artifacts,
+    );
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+/// What a client submits: the payload IS the model content. The engine's
+/// admission wraps it as `{"role":"user","content": payload}`, so this
+/// object becomes one user message whose content is the ADR-062 envelope.
+fn image_envelope(artifact: &str) -> Value {
+    json!({
+        "text": "what is on this invoice?",
+        "images": [{"artifact": artifact, "media_type": "image/png"}]
+    })
+}
+
+/// ADR-062 L2: a user message referencing an artifact image is rendered as
+/// dialect content parts (text + image_url data URL) for a vision profile;
+/// the bytes come from the artifact runtime, and the internal carrier field
+/// never reaches the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vision_profile_sends_artifact_images_as_content_parts() {
+    let dir = std::env::temp_dir().join(format!("kian-loop-vision-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let reference = blobs.put(b"hi", "image/png").expect("put blob");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(
+        agent,
+        vec![vec![text_chunk("the invoice total is 42")]],
+        Some(artifacts),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&reference.id)).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().expect("messages");
+    let last = messages.last().expect("user message");
+    assert_eq!(last["role"], json!("user"));
+    assert_eq!(
+        last["content"],
+        json!([
+            {"type": "text", "text": "what is on this invoice?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+        ]),
+        "the artifact bytes fly as one dialect image part"
+    );
+    assert_eq!(
+        last.get("images"),
+        None,
+        "the internal carrier never reaches the wire"
+    );
+
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-062 honesty: neither a missing blob nor a non-vision profile changes
+/// the wire shape into content parts — the envelope's text still flies, and
+/// a non-vision target keeps the legacy compact-JSON conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_blob_or_a_non_vision_profile_keeps_the_text_only_shape() {
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(agent, vec![vec![text_chunk("ok")]], None).await;
+    let sid = h.engine.create_session().await.expect("create");
+    let missing = "f".repeat(64);
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&missing)).await,
+        EndReason::Completed
+    );
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    assert_eq!(
+        last["content"],
+        json!("what is on this invoice?"),
+        "a reclaimed artifact degrades to the envelope text, never a failed turn"
+    );
+    cleanup_db(&h.db_path);
+
+    let muted = kian_core::model::ModelProfile {
+        vision: false,
+        ..vision_profile()
+    };
+    let agent = profiled_agent_def(
+        Some(muted),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(agent, vec![vec![text_chunk("ok")]], None).await;
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&missing)).await,
+        EndReason::Completed
+    );
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    let content = last["content"]
+        .as_str()
+        .expect("a non-vision target keeps the compact-JSON string");
+    assert!(
+        content.contains("images") && content.contains(&missing),
+        "the legacy fallback carries the envelope verbatim: {content}"
+    );
     cleanup_db(&h.db_path);
 }

@@ -120,6 +120,28 @@ pub struct ChatMessage {
     /// (ADR-022, DESIGN §3.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Images attached to this user message (ADR-062).
+    ///
+    /// Never serialized: the frozen body may not grow a field, so the plan
+    /// builder renders the bytes as content parts only for a profile that
+    /// declares `vision` and every other body stays byte-identical.
+    #[serde(skip)]
+    pub images: Vec<ChatImage>,
+}
+
+/// One image attached to a user message (ADR-062).
+///
+/// The bytes ride the in-memory chat message only. The plan builder renders
+/// them into the persisted `step/request` body as OpenAI content parts under
+/// a vision-capable profile; `#[serde(skip)]` on the field keeps the frozen
+/// V1 body and every image-free V2 body identical to the pre-vision
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatImage {
+    /// The IANA media type carried in the `data:` URL.
+    pub media_type: String,
+    /// The image bytes resolved from the artifact store.
+    pub bytes: Vec<u8>,
 }
 
 impl ChatMessage {
@@ -132,6 +154,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 }
@@ -1276,6 +1299,7 @@ mod tests {
                     },
                 }]),
                 reasoning_content: None,
+                images: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -1283,6 +1307,7 @@ mod tests {
                 tool_call_id: Some("call-1".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                images: Vec::new(),
             },
         ];
         let a = build_chat_body("kimi-k2", &messages, &tools);
@@ -1318,6 +1343,7 @@ mod tests {
                     },
                 }]),
                 reasoning_content: None,
+                images: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -1325,6 +1351,7 @@ mod tests {
                 tool_call_id: Some("call-9".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                images: Vec::new(),
             },
         ];
         let body = build_chat_body("m1", &round_trip, &[]);

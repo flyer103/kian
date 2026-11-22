@@ -1036,6 +1036,46 @@ impl DrainCtx {
             .is_empty())
     }
 
+    /// Reads one artifact blob by id for the driver (ADR-062 vision
+    /// inputs). `None` when no artifact runtime is configured, the blob
+    /// has aged out, or the store read fails — the driver degrades the
+    /// request (drops that image), never the turn: a reclaimed artifact
+    /// lowers fidelity, it does not break replay or honesty.
+    pub async fn artifact_bytes(&self, id: &str) -> Option<Vec<u8>> {
+        let runtime = self.core.artifacts.as_ref()?;
+        let store = Arc::clone(runtime.store());
+        let artifact_id = id.to_owned();
+        match tokio::task::spawn_blocking(move || store.get(&artifact_id)).await {
+            Ok(Ok(Some(bytes))) => Some(bytes),
+            Ok(Ok(None)) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    "artifact is not available (aged out or never stored); the request degrades (ADR-062)"
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    error = %e,
+                    "artifact read failed; the request degrades (ADR-062)"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    error = %e,
+                    "artifact read task failed; the request degrades (ADR-062)"
+                );
+                None
+            }
+        }
+    }
+
     /// The end write (constraint 4): `session/ended` as one atomic
     /// append via `append_end`.
     pub async fn end_session(&self, reason: EndReason) -> Result<Event, EngineError> {
@@ -6601,6 +6641,45 @@ mod tests {
         )
         .await
         .expect("drain ctx")
+    }
+
+    /// ADR-062: the driver reads image bytes through the artifact runtime;
+    /// a missing blob and an absent runtime both degrade to `None` (drop
+    /// the image, keep the turn) instead of failing.
+    #[tokio::test]
+    async fn artifact_bytes_round_trip_and_degrade_honestly() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        let blobs = ArtifactStore::open(&dir).expect("open artifacts");
+        let reference = blobs.put(b"hi", "image/png").expect("put blob");
+        assert_eq!(
+            ctx.artifact_bytes(&reference.id).await,
+            Some(b"hi".to_vec())
+        );
+        assert_eq!(
+            ctx.artifact_bytes(&"a".repeat(64)).await,
+            None,
+            "an aged-out id degrades instead of erroring"
+        );
+        let plain = DrainCtx::with_interrupt(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plain.artifact_bytes(&reference.id).await,
+            None,
+            "no runtime means no image bytes, never a failure"
+        );
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An oversized successful `tool/result` output becomes a content

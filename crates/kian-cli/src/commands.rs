@@ -374,7 +374,27 @@ pub struct ContextMismatch {
 pub struct ModelContextCheck {
     pub requests_checked: u64,
     pub byte_identical: u64,
+    /// Requests whose recorded body carries dialect content parts
+    /// (ADR-062 vision). Their per-message bytes are not re-derivable
+    /// offline — the image data URLs live only in the recorded body, and
+    /// the event stream deliberately holds artifact references, not
+    /// base64 — so they are counted here and left out of the byte diff
+    /// instead of being reported as mismatches.
+    pub vision_requests: u64,
     pub mismatches: Vec<ContextMismatch>,
+}
+
+/// Whether one recorded body message carries dialect content parts
+/// (ADR-062): a `content` array whose items name a `type`.
+fn message_has_content_parts(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str).is_some())
+        })
 }
 
 /// For every `step/request` event, re-derives the model context from
@@ -417,14 +437,20 @@ pub fn check_model_context(events: &[Event]) -> ModelContextCheck {
             }
             Err(e) => format!("(derive failed: {e})"),
         };
-        let recorded = serde_json::to_string(
-            &ev.bytes
-                .get("body")
-                .and_then(|b| b.get("messages"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .unwrap_or_default();
+        let recorded_messages = ev
+            .bytes
+            .get("body")
+            .and_then(|b| b.get("messages"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if recorded_messages
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(message_has_content_parts))
+        {
+            out.vision_requests += 1;
+            continue;
+        }
+        let recorded = serde_json::to_string(&recorded_messages).unwrap_or_default();
         if derived == recorded {
             out.byte_identical += 1;
         } else {
@@ -552,6 +578,14 @@ pub async fn run_replay(
     } else {
         format!("VIOLATED ({})", violations.join("; "))
     };
+    let vision_line = if model_context.vision_requests == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({} vision request(s) carry content parts not re-derivable offline)",
+            model_context.vision_requests
+        )
+    };
     let mismatch_line = if model_context.mismatches.is_empty() {
         String::new()
     } else {
@@ -565,7 +599,7 @@ pub async fn run_replay(
         )
     };
     let body = format!(
-        "session             {}\nevents              {}\nderived state       {}\n{live_line}\ninvariants          {invariants_line}\nmodel context       {} of {} requests byte-identical{mismatch_line}\n",
+        "session             {}\nevents              {}\nderived state       {}\n{live_line}\ninvariants          {invariants_line}\nmodel context       {} of {} requests byte-identical{vision_line}{mismatch_line}\n",
         session.0,
         events.len(),
         serde_json::to_value(derived_state).unwrap_or_default(),
@@ -3069,6 +3103,29 @@ mod tests {
         assert_eq!(check.mismatches[0].seq, 5);
         assert!(check.mismatches[0].derived.contains("hello"));
         assert!(check.mismatches[0].recorded.contains("REWRITTEN"));
+    }
+
+    /// ADR-062: a request whose recorded body carries dialect content parts
+    /// (image data URLs) is counted as a vision request instead of being
+    /// reported as a divergence — the base64 exists only in the recorded
+    /// body, never re-derivable from the stream.
+    #[test]
+    fn vision_requests_are_counted_not_reported_as_divergence() {
+        let recorded = json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is on this invoice?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+            ]}
+        ]);
+        let events = honest_stream(recorded);
+        let check = check_model_context(&events);
+        assert_eq!(check.requests_checked, 1);
+        assert_eq!(check.vision_requests, 1);
+        assert_eq!(check.byte_identical, 0);
+        assert!(
+            check.mismatches.is_empty(),
+            "vision bodies are honestly skipped, not called divergences"
+        );
     }
 
     /// Export → import round-trip at the unit level: an imported JSONL
