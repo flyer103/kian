@@ -161,6 +161,12 @@ pub struct ServeConfig {
     /// fail-closed and mounts the `artifact_read` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<ArtifactsConfig>,
+    /// The `web:` section (ADR-056, P2b). `None` (the section absent)
+    /// is client-side web tools **off**: the tool set is byte-identical
+    /// and no provider key is read. Present mounts `web_search` /
+    /// `web_fetch` beside the local tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebConfig>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -580,6 +586,92 @@ fn default_artifact_gc_max_bytes() -> u64 {
 }
 fn default_artifact_retention_days() -> u64 {
     30
+}
+
+/// The `web:` section (ADR-056, P2b): the client-side DeepSeek Search /
+/// Fetch tools. Protocol-only — the adapter speaks the documented
+/// request/response shapes, never a provider SDK.
+///
+/// ```yaml
+/// web:
+///   base_url: https://api.deepseek.com
+///   api_key_env: DEEPSEEK_API_KEY
+///   timeout_ms: 30000
+///   search:
+///     max_results: 10
+///     need_content: false
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Provider origin. The adapter appends `/v1/tools/search` and
+    /// `/v1/tools/fetch`.
+    #[serde(default = "default_web_base_url")]
+    pub base_url: String,
+    /// Environment variable holding the provider key — read once at
+    /// serve assembly; a missing value refuses boot (ADR-056 decision 2).
+    #[serde(default = "default_web_api_key_env")]
+    pub api_key_env: String,
+    /// Per-request HTTP timeout, milliseconds.
+    #[serde(default = "default_web_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Search defaults (a call may override them within the closed range).
+    #[serde(default)]
+    pub search: WebSearchConfig,
+}
+
+impl WebConfig {
+    /// Reads the provider key from the configured env name, fail-closed.
+    pub fn api_key(&self) -> Result<String, String> {
+        let key = std::env::var(&self.api_key_env).map_err(|_| {
+            format!(
+                "web.api_key_env `{}` is not set — the client-side web tools need a provider key",
+                self.api_key_env
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(format!(
+                "web.api_key_env `{}` is set but empty",
+                self.api_key_env
+            ));
+        }
+        Ok(key)
+    }
+}
+
+/// The `web.search:` sub-section: defaults a `web_search` call inherits
+/// when it omits `count` / `need_content`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    /// Default result page size (1–50; the tool may override it).
+    #[serde(default = "default_web_max_results")]
+    pub max_results: u64,
+    /// Default whether each result carries its extracted page content.
+    #[serde(default)]
+    pub need_content: bool,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            max_results: default_web_max_results(),
+            need_content: false,
+        }
+    }
+}
+
+fn default_web_base_url() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_web_api_key_env() -> String {
+    "DEEPSEEK_API_KEY".into()
+}
+fn default_web_timeout_ms() -> u64 {
+    30_000
+}
+fn default_web_max_results() -> u64 {
+    10
 }
 
 /// The `tools.exec_env:` section (fix ①: secrets never reach
@@ -4237,6 +4329,38 @@ impl ServeConfig {
                 .map_err(|e| invalid(format!("artifacts: {e}")))?;
         }
 
+        // The `web:` section (ADR-056, P2b): a parseable http(s) origin,
+        // a positive timeout, a search page size inside the provider's
+        // documented 1–50 range, and a named (non-blank) key env. The
+        // key **value** check is a serve-startup check (assembly reads
+        // the env once), exactly like the workers' `token_env`.
+        if let Some(web) = self.web.as_ref() {
+            let parsed = reqwest::Url::parse(&web.base_url).map_err(|e| {
+                invalid(format!(
+                    "web.base_url `{}` is not a valid URL: {e}",
+                    web.base_url
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                return Err(invalid(format!(
+                    "web.base_url `{}` must be an absolute http(s) URL with a host",
+                    web.base_url
+                )));
+            }
+            if web.timeout_ms == 0 {
+                return Err(invalid("web.timeout_ms must be > 0"));
+            }
+            if web.api_key_env.trim().is_empty() {
+                return Err(invalid("web.api_key_env must not be blank"));
+            }
+            if !(1..=50).contains(&web.search.max_results) {
+                return Err(invalid(format!(
+                    "web.search.max_results must be between 1 and 50 (got {})",
+                    web.search.max_results
+                )));
+            }
+        }
+
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
             if sa.channels.is_empty() {
@@ -4833,7 +4957,7 @@ impl ServeConfig {
     /// The compiled agent definition handed to the loop.
     #[must_use]
     pub fn agent_def(&self) -> AgentDef {
-        self.with_artifact_tools(agent_def_of(&self.agent, &self.model_profiles))
+        self.with_bundle_tools(agent_def_of(&self.agent, &self.model_profiles))
     }
 
     /// The compiled definition of a named agent (`None` when the id
@@ -4842,17 +4966,24 @@ impl ServeConfig {
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
         self.agents
             .get(id)
-            .map(|agent| self.with_artifact_tools(agent_def_of(agent, &self.model_profiles)))
+            .map(|agent| self.with_bundle_tools(agent_def_of(agent, &self.model_profiles)))
     }
 
-    /// ADR-055: when the `artifacts:` section is enabled the
-    /// `artifact_read` tool is auto-mounted onto every compiled agent
-    /// (the `local-tools` plugin registers it whenever spill is on, so
-    /// the mounted name always resolves). Absent section = untouched.
-    fn with_artifact_tools(&self, mut def: AgentDef) -> AgentDef {
-        if self.artifacts.is_some() && !def.tools.iter().any(|tool| tool == "artifact_read") {
-            def.tools.push("artifact_read".into());
-        }
+    /// The bundle-edge tools ride the mounted list, not the YAML: when a
+    /// section is enabled its tool names are appended to every compiled
+    /// agent — `artifact_read` for `artifacts:` (ADR-055), `web_search`
+    /// / `web_fetch` for `web:` (ADR-056). The matching plugin always
+    /// registers those names whenever the section is on, so the mounted
+    /// name resolves; absent sections leave the list untouched.
+    fn with_bundle_tools(&self, mut def: AgentDef) -> AgentDef {
+        let mut mount = |name: &str, enabled: bool| {
+            if enabled && !def.tools.iter().any(|tool| tool == name) {
+                def.tools.push(name.into());
+            }
+        };
+        mount("artifact_read", self.artifacts.is_some());
+        mount("web_search", self.web.is_some());
+        mount("web_fetch", self.web.is_some());
         def
     }
 
@@ -10673,5 +10804,60 @@ schedules:
         let no_harness = with_harness("    capture:\n      max_body_bytes: 4096\n");
         let err = ServeConfig::parse(&no_harness).unwrap_err().to_string();
         assert!(err.contains("requires a `claude` or `codex`"), "{err}");
+    }
+
+    // -- web tools (ADR-056, P2b) ------------------------------------
+
+    #[test]
+    fn web_section_parses_defaults_and_mounts_the_two_tools() {
+        let yaml = format!("{}web: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("web section parses");
+        let web = cfg.web.as_ref().expect("web present");
+        assert_eq!(web.base_url, "https://api.deepseek.com");
+        assert_eq!(web.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(web.timeout_ms, 30_000);
+        assert_eq!(web.search.max_results, 10);
+        assert!(!web.search.need_content);
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "web_search"));
+        assert!(def.tools.iter().any(|tool| tool == "web_fetch"));
+    }
+
+    #[test]
+    fn absent_web_section_keeps_the_mounted_tool_list_untouched() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("config parses");
+        assert!(cfg.web.is_none());
+        let def = cfg.agent_def();
+        assert!(!def.tools.iter().any(|tool| tool == "web_search"));
+        assert!(!def.tools.iter().any(|tool| tool == "web_fetch"));
+    }
+
+    #[test]
+    fn web_section_misconfigurations_refuse_boot() {
+        let bad_url = format!("{}web:\n  base_url: api.deepseek.com\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_url).unwrap_err().to_string();
+        assert!(err.contains("web.base_url"), "{err}");
+
+        let bad_scheme = format!("{}web:\n  base_url: ftp://api.deepseek.com\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_scheme).unwrap_err().to_string();
+        assert!(err.contains("absolute http(s)"), "{err}");
+
+        let zero_timeout = format!("{}web:\n  timeout_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&zero_timeout).unwrap_err().to_string();
+        assert!(err.contains("web.timeout_ms"), "{err}");
+
+        let bad_count = format!("{}web:\n  search:\n    max_results: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_count).unwrap_err().to_string();
+        assert!(err.contains("max_results"), "{err}");
+
+        let blank_env = format!("{}web:\n  api_key_env: \"  \"\n", valid_yaml());
+        let err = ServeConfig::parse(&blank_env).unwrap_err().to_string();
+        assert!(err.contains("api_key_env"), "{err}");
+
+        let typo = format!("{}web:\n  base_ur: https://example.com\n", valid_yaml());
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "unknown keys refuse boot (deny_unknown_fields)"
+        );
     }
 }

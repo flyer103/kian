@@ -142,9 +142,11 @@ pub struct LocalToolsPlugin {
     /// the exec output redactor (`tools.exec_redact`, default
     /// on; built at assembly from every secret name kian.yaml names).
     pub redactor: kian_core::secrets::SecretRedactor,
-    /// ADR-055: the artifact store when the `artifacts:` section is on —
-    /// `None` keeps the provider set byte-identical (local tools only).
-    pub artifacts: Option<Arc<kian_store::ArtifactStore>>,
+    /// Bundle-edge tool providers mounted beside the local tools:
+    /// `artifact_read` when `artifacts:` is on (ADR-055), the web tools
+    /// when `web:` is on (ADR-056). Empty keeps the provider set
+    /// byte-identical (local tools only).
+    pub extras: Vec<Arc<dyn ToolProvider>>,
 }
 
 impl Plugin for LocalToolsPlugin {
@@ -161,12 +163,13 @@ impl Plugin for LocalToolsPlugin {
             .with_exec_timeout(self.exec_timeout_ms)
             .with_env_policy(self.env_policy)
             .with_redactor(self.redactor);
-        let provider: Arc<dyn ToolProvider> = match self.artifacts {
-            Some(store) => Arc::new(crate::superagent::CombinedTools::new(vec![
-                Arc::new(tools) as Arc<dyn ToolProvider>,
-                Arc::new(crate::artifacts::ArtifactReadTool::new(store)) as Arc<dyn ToolProvider>,
-            ])),
-            None => Arc::new(tools) as Arc<dyn ToolProvider>,
+        let provider: Arc<dyn ToolProvider> = if self.extras.is_empty() {
+            Arc::new(tools) as Arc<dyn ToolProvider>
+        } else {
+            let mut providers: Vec<Arc<dyn ToolProvider>> =
+                vec![Arc::new(tools) as Arc<dyn ToolProvider>];
+            providers.extend(self.extras);
+            Arc::new(crate::superagent::CombinedTools::new(providers))
         };
         ctx.provide::<dyn ToolProvider>(provider)
     }

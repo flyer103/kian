@@ -565,6 +565,22 @@ An aged-out blob is a normal, documented outcome that `artifact_read` reports as
 to the mounted tool list; core names neither the tool nor the store policy. Errors never spill, and
 an absent `artifacts:` block keeps every payload byte-identical to legacy.
 
+**Client-side web tools (ADR-056, phase 2b)**: the DeepSeek Search and Fetch HTTP APIs are mounted
+as two ordinary `ToolProvider` tools, `web_search` and `web_fetch`, from the bundle crate
+`kian-web` — never from a core crate, and never as a server-side model capability. Every call is a
+normal `tool/call` with the documented request JSON plus a `tool/result` carrying the provider's
+response verbatim, so it rides the same persistence, replay, budget and artifact-spill path as any
+local tool; a large page spills by reference through the ADR-055 path rather than being silently
+truncated. Assembly is presence-locked: a `web:` block mounts the two schemas (fixed order,
+appended to every compiled agent's mounted list) and reads the key from `api_key_env` once — a
+missing value refuses boot; an absent block leaves the tool set and every request byte-identical.
+Failures are honest results (`is_error` carrying the HTTP status and a bounded body), never
+exceptions or zero-result success; 408/429/5xx are marked retryable but nothing retries
+automatically. The tool descriptions state that returned pages are untrusted data, never
+instructions, and no provider-encrypted page signature is stored — a client re-reads a page instead.
+Search/Fetch bill per successful request, which the phase-0 token cost projection does not price
+(ADR-056 limit).
+
 **The audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
 keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
 payloads replay byte-identically: `"usage": <provider usage JSON verbatim>` when the provider
@@ -1731,6 +1747,7 @@ graph TB
  KS[kian-store<br/>EventStore / Inbox / projection engine]
  KO[kian-orchestrator<br/>Admit→Wake→Drain→Promote<br/>+ recovery subsystem]
  KCR[kian-cron<br/>grammar / next-fire / misfire]
+ KW[kian-web<br/>client-side web tools:<br/>Search / Fetch as ToolProvider]
  KL[kian-llm<br/>ModelProvider seam + openai-compat]
  KE[kian-exec<br/>KiandProto server half:<br/>ConnectionManager<br/>+ durable queue]
  KP[kian-plugin<br/>Ctx/Plugin/Disposer/dispatch]
@@ -1748,6 +1765,7 @@ graph TB
  KL & KP & KLD & KM --> KO
  KM --> KLD
  KE --> KC & KS
+ KW --> KC
  KSA --> KP & KO & KLD
  KCL --> KO
  KCL --> KCR
@@ -1770,6 +1788,7 @@ graph TB
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies, and the real channel adapters (lark, github, wechat) plus the mock channel | profile assembly |
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
+| kian-web | Client-side web tools bundle (ADR-056): `web_search` / `web_fetch` over the DeepSeek Search/Fetch HTTP APIs as an ordinary `ToolProvider` — no core crate names the provider, the endpoint or the response shape; oversized pages spill through ADR-055 | `WebTools`, `WebToolsConfig` |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kian-harness (planned, phase 1) | The shared bridge skeleton ([HARNESS-BRIDGE](HARNESS-BRIDGE.md), [ADR-043](decisions/ADR-043-multi-harness-bridge.md)): the session trait, the driver state machine (episode spawn/park, safe boundaries, takeover dedup, step budget, honesty outcomes), the declarative approval policy, the `tool/post` port shape and the capability declarations. Narrow waist: depends on `kian-core` only; the drain surface is a crate-local ctx port implemented by assembly | `HarnessSession`, `BridgeDriver`, `Capabilities`, `ApprovalPolicy` |

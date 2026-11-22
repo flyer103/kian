@@ -8,6 +8,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Web search and URL reading are audited tool calls on the operator's own key (DESIGN §2.2, ADR-056)**.
+  A new top-level `web:` block (`base_url` default `https://api.deepseek.com`, `api_key_env` default
+  `DEEPSEEK_API_KEY`, `timeout_ms`, `search.max_results`/`need_content`) mounts `web_search` and
+  `web_fetch` from the new `kian-web` bundle crate — no core crate names the provider, the endpoint
+  or the response shape, and no server-side capability is hidden in a model response. Every call is
+  an ordinary `tool/call` + `tool/result` with the documented request persisted before it flies; a
+  large page spills by reference through ADR-055 instead of being truncated, and `artifact_read`
+  pages it back. Failures are honest `is_error` results carrying the HTTP status (408/429/5xx marked
+  retryable, nothing retried automatically); out-of-contract arguments are refused without a request.
+  An absent block leaves the tool set and every request byte-identical; present, the key is read once
+  at assembly and a missing value refuses boot. Returned pages are untrusted data, and Search/Fetch
+  per-request fees are not yet in the token cost projection.
 - **Tool results ride the event stream by reference, and the blob store is disposable (DESIGN §2.2, ADR-055)**.
   With a new top-level `artifacts:` block configured, the engine rewrites a successful `tool/result`
   whose output exceeds `inline_max_bytes` (default 16 KiB) into a content-addressed

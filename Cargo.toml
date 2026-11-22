@@ -17,6 +17,7 @@ members = [
     "crates/kian-claude",
     "crates/kian-codex",
     "crates/kian-cron",
+    "crates/kian-web",
     "crates/kian-cli",
     "crates/kian-imessage-bridge",
     "crates/kiand",
@@ -86,6 +87,9 @@ kian-claude = { path = "crates/kian-claude" }
 kian-codex = { path = "crates/kian-codex" }
 # the cron scheduling core (CRON-MODEL §2, §5) — pure: no I/O, no clock.
 kian-cron = { path = "crates/kian-cron" }
+# the client-side web tools bundle (ADR-056): DeepSeek Search/Fetch as
+# audited ToolProvider tools, never a core capability.
+kian-web = { path = "crates/kian-web" }
 kian-cli = { path = "crates/kian-cli" }
 kiand = { path = "crates/kiand" }
 

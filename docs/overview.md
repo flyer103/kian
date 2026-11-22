@@ -129,7 +129,7 @@ mutates projections directly. After a crash, replay rebuilds every in-memory str
 
 ## 4. Crate map
 
-Nineteen crates, one responsibility each. Dependency direction is the crate form of the iron rule:
+Twenty crates, one responsibility each. Dependency direction is the crate form of the iron rule:
 `kian-orchestrator` depends only on core + store + seam traits, and no provider, channel or harness
 implementation ever enters its dependency tree.
 
@@ -151,6 +151,7 @@ implementation ever enters its dependency tree.
 | `kian-harness` | Shared external-harness skeleton: driver state machine, approval policy, fixtures and the capability types the three bridges share |
 | `kian-claude` | Claude Code adapter: `stream-json` child, `can_use_tool` approvals, interrupt |
 | `kian-codex` | Codex adapter: `app-server` JSON-RPC child, server-initiated approvals, interrupt |
+| `kian-web` | The client-side web tools bundle: `web_search`/`web_fetch` over the DeepSeek Search/Fetch HTTP APIs as an audited `ToolProvider` (ADR-056) |
 | `kian-cli` | The `kian` binary: `serve` assembly, operator CLI (`inspect`/`replay`/`export`/`wake-now`/`usage-stats`/`cost`/`raise-budget`), the GitHub webhook receiver |
 | `kiand` | The endpoint daemon binary (`kian-endpoint` + a thin main) |
 | `kian-imessage-bridge` | The macOS-side iMessage bridge: loopback HTTP over `imsg rpc` for the `type: imessage` channel |
@@ -166,6 +167,7 @@ Status is recorded here and in the [CHANGELOG](../CHANGELOG.md). "Default-green"
 | Steer / interrupt semantics and honesty | **done** — default-green | `crates/kian-cli/tests/steer_interrupt.rs`: steer lands at the next safe boundary (no input inside an in-flight provider turn); interrupt settles on abort and resumes honestly (interrupt ≠ failed); idle/terminal interrupts are no-ops |
 | Cost projection: exact micro-currency from a config price book, peak/off-peak aware | **done** (phase 0, read-only) — default-green | `crates/kian-cli/tests/cost_projection.rs` + `crates/kian-cli/src/cost.rs` tests: a real store and a real `pricing:` book price two attempts at 38/77 micro-USD; unpriced models are counted, never priced at zero; no event carries a price (ADR-052) |
 | Session token budget: a pre-send gate, a resumable `awaiting_budget` park, durable raises | **done** (phase 1b) — default-green | `crates/kian-loop/src/integration_tests.rs` + `crates/kian-orchestrator/src/engine.rs` tests: a pinned budget below the estimate ends the session `awaiting_budget` with zero provider requests and no `step/request`; a `raise_budget` row resumes it to `completed`; an exact raise replay dedupes to one row; wall-clock raises do not gate; an unconfigured agent keeps the legacy stream (ADR-054) |
+| Client-side web tools: DeepSeek Search/Fetch as audited tool calls, pages spill by reference | **done** (phase 2b) — default-green | `crates/kian-web/src/lib.rs` tests (wiremock): the documented request bodies, config-derived defaults, honest/retryable provider errors, transport failure, out-of-contract arguments refused without a request, stable schema order; `crates/kian-cli/src/config.rs` tests: an absent `web:` block leaves the mounted tool list byte-identical |
 | Tool results by reference — oversized results spill to a disposable content-addressed blob store, replay-safe previews, `artifact_read` windows | **done** (phase 2) — default-green | `crates/kian-store/src/artifact.rs` tests (content-addressed put/get, id traversal rejection, retention+cap GC) + append-path tests in `crates/kian-orchestrator/src/engine.rs` (oversized success spills with a bounded preview, `is_error` never spills, absent config byte-identical, context identical after blob loss) + `crates/kian-cli/src/artifacts.rs` (window/clamp/missing-blob) |
 | Cache-byte stability | **done** — default-green | `crates/kian-cli/tests/cache_stability.rs`: consecutive requests share the byte prefix; only `compact` breaks it and counts under the `compact` cause; `unexpected_prefix_change` stays zero — exposed on `GET /metrics` and `kian cache-stats` |
 | Super-agent demo: IM request → Router judges → Worker completes → ≤300-unit reply + structured delivery | **done** — default-green | `crates/kian-cli/tests/superagent_demo.rs` (10 tests) plus the negative path where a gate-failed worker never reaches delivered |

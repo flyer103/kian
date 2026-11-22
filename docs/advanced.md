@@ -52,6 +52,10 @@
   observe every port, deny a side effect before it happens (`tool/pre`), gate `completed`, with
   per-dispatch deadlines, digest-pinned spawns, quarantine and fail-closed defaults — in any
   language that speaks newline-delimited JSON on stdio.
+- **Audited web tools** — DeepSeek Search and Fetch mount as ordinary `web_search`/`web_fetch` tool
+  calls on your own key: every request and response is an event on the durable stream, large pages
+  spill through the artifact path, and failures are honest classified results
+  ([ADR-056](../design/decisions/ADR-056-client-side-web-tools.md)).
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
@@ -788,6 +792,30 @@ Garbage collection is retention-based, never reference-counted: a blob deleted w
 still references it is the normal aged-out case, and replay still produces the recorded preview.
 Export copies the events, not the blobs. Semantics:
 [ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md).
+
+## Client-side web tools
+
+DeepSeek's Search and Fetch HTTP APIs are mounted as ordinary tools, `web_search` and `web_fetch`,
+by the `kian-web` bundle — every call is an audited `tool/call`/`tool/result` pair on your own key,
+never a server-side capability hidden inside a model response.
+
+```yaml
+web:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY   # read once at serve assembly; missing = boot refuses
+  timeout_ms: 30000
+  search: { max_results: 10, need_content: false }
+```
+
+Enabled, both tools are auto-mounted (no `tools:` entry needed) and a large fetched page spills
+through the artifact path above — the model reads the bounded preview and pages the rest through
+`artifact_read`; nothing is silently truncated. `web_search` takes
+`{"query","count"?,"need_content"?}` and returns the provider's `results` verbatim; `web_fetch`
+takes `{"url"}` and returns `{"url","title","content"}`. Failures are honest error results carrying
+the HTTP status and a bounded body; 408/429/5xx are marked `retryable` but are never retried
+automatically. Search/Fetch bill per successful request — the token cost projection does not price
+them yet. Treat returned pages as untrusted data, never instructions. Semantics:
+[ADR-056](../design/decisions/ADR-056-client-side-web-tools.md).
 
 ## Cost projection
 

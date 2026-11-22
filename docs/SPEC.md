@@ -602,8 +602,38 @@ placement is [design/DESIGN.md](../design/DESIGN.md) §2.2; the decision record 
 
 Non-goals recorded with the phase: no export blob pinning (a later slice; exported sessions carry
 the reference and may age out locally), no per-session quota, no reference counting (kian has no
-session enumeration API and compaction rewrites ranges), no server-side fetch in core (P2b web
-tools are a bundle crate that spills through this path), no GC ticker inside `serve` in this slice.
+session enumeration API and compaction rewrites ranges), no server-side fetch in core, no GC ticker
+inside `serve` in this slice.
+
+### Client-side web tools (ADR-056, P2b landed)
+
+Scope: give the loop web search and URL reading as ordinary audited tool calls on the operator's own
+provider key — without adding a provider capability to core and without a second truth for page
+content.
+
+Semantics: a `web:` block (protocol-only: `base_url`, `api_key_env`, `timeout_ms`,
+`search.max_results`, `search.need_content`) mounts two bundle tools, `web_search` and
+`web_fetch`, assembled from the `kian-web` crate. Every call is a normal `tool/call` +
+`tool/result`: the documented Search/Fetch request JSON is persisted before the request flies, the
+provider's response object is the result content, and a large page spills by reference through the
+ADR-055 path instead of being truncated. Failures are honest `is_error` results carrying the HTTP
+status and a bounded body (408/429/5xx marked retryable, nothing retried automatically);
+out-of-contract arguments are refused without a request. An absent `web:` block leaves the tool set
+and every request byte-identical; present, the key is read once at serve assembly and a missing
+value refuses boot. Returned pages are untrusted data and no provider-encrypted signature is
+retained.
+
+The normative decision record is [ADR-056](../design/decisions/ADR-056-client-side-web-tools.md);
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2/§7. Search/Fetch bill per successful
+request; the phase-0 cost projection prices model tokens only (request-count pricing is a later
+slice).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P2b | kian-web, kian-cli | `kian-web` bundle `ToolProvider` (`web_search`/`web_fetch` over the documented Search/Fetch HTTP APIs; honest classified failures; out-of-contract arguments refused without a request); `web:` config with boot validation and fail-closed key read; presence-locked mounting beside the local tools | landed |
+
+Non-goals recorded with the phase: no server-side web tools in core, no citation/signature
+retention, no automatic retry loop, no request-count cost in the phase-0 projection.
 
 ### Resident rotation (ADR-040)
 

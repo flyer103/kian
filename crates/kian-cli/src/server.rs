@@ -389,6 +389,28 @@ impl Server {
             }
             None => (None, None),
         };
+        // Bundle-edge tools mounted beside the local tools. ADR-055: the
+        // artifact reader when spill is on. ADR-056 (P2b): the client-side
+        // web tools when `web:` is on — the provider key is read here,
+        // once, and a missing value refuses boot.
+        let mut bundle_tools: Vec<Arc<dyn kian_core::seams::ToolProvider>> = Vec::new();
+        if let Some(store) = artifact_store.as_ref() {
+            bundle_tools.push(Arc::new(crate::artifacts::ArtifactReadTool::new(
+                Arc::clone(store),
+            )));
+        }
+        if let Some(web) = config.web.as_ref() {
+            let api_key = web.api_key().map_err(ServeError::Assembly)?;
+            let web_tools = kian_web::WebTools::new(kian_web::WebToolsConfig {
+                base_url: web.base_url.clone(),
+                api_key,
+                timeout_ms: web.timeout_ms,
+                max_results: web.search.max_results,
+                need_content: web.search.need_content,
+            })
+            .map_err(|e| ServeError::Assembly(format!("web: {e}")))?;
+            bundle_tools.push(Arc::new(web_tools));
+        }
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
@@ -396,7 +418,7 @@ impl Server {
                 exec_timeout_ms: config.tools.exec_timeout_ms,
                 env_policy: exec_env_policy,
                 redactor: exec_redactor.clone(),
-                artifacts: artifact_store,
+                extras: bundle_tools,
             },
         ];
         // ADR-035: the release path (ops verb + reclaim tick) reads the
