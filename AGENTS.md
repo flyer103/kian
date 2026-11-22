@@ -73,15 +73,19 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
 ## Commands
 
 ```bash
+./scripts/selfcheck.sh     # all four gates, serialized exactly as CI runs them
 cargo build --workspace
 cargo test  --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 These are the CI gates on every push ([`.github/workflows/gates.yml`](.github/workflows/gates.yml)).
-A docs-only change that skips the full workspace run must still keep links and crate mappings
-consistent: `cargo test -p kian-cli --test docs_map`.
+`scripts/selfcheck.sh` is the same set in the same serialized shape; the pre-push hook calls it, so
+enable it once per clone with `git config core.hooksPath .githooks` (`KIAN_SELFCHECK=quick git push`
+skips the suite, `KIAN_SELFCHECK=off git push` skips the hook entirely). A red CI run is then the
+exception, not the first evidence. A docs-only change that skips the full workspace run must still
+keep links and crate mappings consistent: `cargo test -p kian-cli --test docs_map`.
 
 ## Repo layout
 

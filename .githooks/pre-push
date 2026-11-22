@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Pre-push hook: the same gates CI runs, before the push instead of after.
+# Enable once per clone: git config core.hooksPath .githooks
+# Skip one push: KIAN_SELFCHECK=off git push
+# Quick (fmt + clippy only): KIAN_SELFCHECK=quick git push
+set -euo pipefail
+
+exec "$(git rev-parse --show-toplevel)/scripts/selfcheck.sh"

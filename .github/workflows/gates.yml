@@ -1,5 +1,11 @@
 # The four gates (AGENTS.md) on every push and PR.
 #
+# Split: `fmt` + `gates` are the per-push feedback loop (the same commands
+# `scripts/selfcheck.sh` runs locally, so a green local run predicts CI).
+# The `postgres` job is the only one that needs a live database; it runs on
+# PRs and nightly instead of on every push to main, and it no longer
+# re-runs the workspace suite (the `gates` job already does, serialized).
+#
 # Test parallelism note: crates with process-spawning e2e suites
 # (kian-cli, kiand) run in their own job to avoid port/temp-dir
 # collisions with concurrent suite runs — the same discipline the
@@ -11,6 +17,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # nightly postgres backend coverage (02:00 Asia/Shanghai)
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -65,10 +78,13 @@ jobs:
   # Postgres surfaces are env-gated (KIAN_PG_URL) and skip — never
   # fail — when the env is absent. This job supplies a real postgres
   # so the gated suites (kian-store, kian-exec, kian-cli postgres_serve
-  # and the multi-replica e2e) actually run.
+  # and the multi-replica e2e) actually run. PRs exercise a backend
+  # change before merge; the nightly schedule catches drift on main
+  # without paying the database setup on every push.
   postgres:
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -85,8 +101,8 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      # Same disk bound as the gates job: the postgres job's final
-      # `cargo test --workspace` links the same large test binaries.
+      # The gated suites link the same large test binaries as the gates
+      # job; keep the same disk bound.
       - name: Free runner disk space
         run: |
           df -h /
@@ -105,14 +121,10 @@ jobs:
                    "kian-cli --test postgres_serve" "kian-cli --test postgres_multi_replica"; do
             echo "== cargo test -p $t =="
             # shellcheck disable=SC2086 # $t is a word-split target list by design
-            cargo test --locked -p $t 2>&1 | tee /tmp/out.log
+            cargo test --locked -p $t -- --test-threads=1 2>&1 | tee /tmp/out.log
             grep -q "test result: ok" /tmp/out.log
             if grep -q "SKIP:" /tmp/out.log; then
               echo "ERROR: gated suite skipped despite KIAN_PG_URL being set" >&2
               exit 1
             fi
           done
-      - name: default gates stay green without any env
-        run: cargo test --locked --workspace
-        env:
-          NO_PROXY: 127.0.0.1,localhost
