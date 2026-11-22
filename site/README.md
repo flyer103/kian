@@ -38,8 +38,10 @@ Cloudflare project is the only deployment, and no workflow publishes this direct
   `wrangler` project name.
 - Replace `flyer103/kian` if the repository moves.
 - Regenerate `assets/og.png` when the headline or one-liner changes.
-- Adding any third-party script or analytics requires widening `script-src`/`connect-src` in
-  `_headers` first; the current policy blocks all third-party requests.
+- Cloudflare Web Analytics is enabled on the Pages project, so the platform injects its beacon into
+  the deployed HTML; `_headers` allows exactly that host (`static.cloudflareinsights.com` for the
+  script, `cloudflareinsights.com` for the beacon request). Any other third-party script still needs
+  the CSP widened first.
 
 ## Notes
 
