@@ -10,6 +10,12 @@ use serde_json::Value;
 use crate::events::{Event, EventKind};
 use crate::model::Budgets;
 
+/// Fraction of the token allowance withheld from ordinary turns so
+/// maintenance work (compaction, ADR-057) stays affordable near the limit.
+/// Without it the runtime can end up short of budget for the one call that
+/// would have prevented a context overflow.
+pub const DEFAULT_MAINTENANCE_RESERVE_PERCENT: u64 = 10;
+
 /// The token usage one provider turn reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenUsage {
@@ -78,12 +84,36 @@ impl BudgetProjection {
         })
     }
 
+    /// Gross token allowance (base plus raises) before spend, or `None`
+    /// when the session has no token budget.
+    #[must_use]
+    pub fn allowance_tokens(&self) -> Option<u64> {
+        self.tokens_limit
+            .map(|limit| limit.saturating_add(self.tokens_raised))
+    }
+
+    /// Tokens withheld from ordinary turns for maintenance work.
+    #[must_use]
+    pub fn maintenance_reserve_tokens(&self) -> Option<u64> {
+        self.allowance_tokens()
+            .map(|allowance| allowance.saturating_mul(DEFAULT_MAINTENANCE_RESERVE_PERCENT) / 100)
+    }
+
     /// Whether an estimated turn size (prompt upper bound plus declared
     /// output cap) would cross the remaining allowance.
     #[must_use]
     pub fn would_exceed_tokens(&self, estimate: u64) -> bool {
         self.remaining_tokens()
             .is_some_and(|remaining| estimate > remaining)
+    }
+
+    /// Whether an estimate would cross what ordinary turns may spend: the
+    /// remaining allowance minus the maintenance reserve. Maintenance calls
+    /// themselves use `Self::would_exceed_tokens` and may draw the reserve.
+    #[must_use]
+    pub fn would_exceed_tokens_reserving(&self, estimate: u64, reserve: u64) -> bool {
+        self.remaining_tokens()
+            .is_some_and(|remaining| estimate > remaining.saturating_sub(reserve))
     }
 }
 
@@ -252,6 +282,54 @@ mod tests {
         let projection = project_budget(&events, &budgets(None));
         assert!(!projection.would_exceed_tokens(600));
         assert!(projection.would_exceed_tokens(601));
+    }
+
+    #[test]
+    fn ordinary_turns_reserve_a_share_for_maintenance() {
+        let events = vec![
+            event(
+                0,
+                EventKind::SessionCreated,
+                json!({"budgets": {"tokens": 1_000}}),
+            ),
+            event(
+                1,
+                EventKind::TurnEnd,
+                json!({"usage": {"prompt_tokens": 800, "completion_tokens": 50}}),
+            ),
+        ];
+        let projection = project_budget(&events, &budgets(None));
+        assert_eq!(projection.allowance_tokens(), Some(1_000));
+        assert_eq!(projection.maintenance_reserve_tokens(), Some(100));
+        // Remaining is 150: ordinary turns may spend 50, maintenance may
+        // still draw the reserved 100.
+        assert!(!projection.would_exceed_tokens_reserving(50, 100));
+        assert!(projection.would_exceed_tokens_reserving(51, 100));
+        assert!(!projection.would_exceed_tokens(150));
+        assert!(projection.would_exceed_tokens(151));
+    }
+
+    #[test]
+    fn an_unbudgeted_session_never_reserves_or_blocks() {
+        let projection = project_budget(&[], &budgets(None));
+        assert_eq!(projection.allowance_tokens(), None);
+        assert_eq!(projection.maintenance_reserve_tokens(), None);
+        assert!(!projection.would_exceed_tokens_reserving(u64::MAX, 10));
+    }
+
+    #[test]
+    fn raises_enlarge_the_allowance_and_with_it_the_reserve() {
+        let events = vec![
+            event(
+                0,
+                EventKind::SessionCreated,
+                json!({"budgets": {"tokens": 1_000}}),
+            ),
+            event(1, EventKind::BudgetRaised, json!({"tokens": 1_000})),
+        ];
+        let projection = project_budget(&events, &budgets(None));
+        assert_eq!(projection.allowance_tokens(), Some(2_000));
+        assert_eq!(projection.maintenance_reserve_tokens(), Some(200));
     }
 
     #[test]

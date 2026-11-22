@@ -635,6 +635,41 @@ slice).
 Non-goals recorded with the phase: no server-side web tools in core, no citation/signature
 retention, no automatic retry loop, no request-count cost in the phase-0 projection.
 
+### Context compaction (ADR-057, P3 landed)
+
+Scope: keep a long session inside its declared context window without rewriting history, and keep
+compaction economically honest and observable. Folding is the only deliberate prefix-invalidation
+point (constraint 3), so it is a bounded, evidence-driven decision - never a background chore and
+never a cost optimization.
+
+Semantics: `kian-orchestrator::compaction` exposes a pure planner
+(`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
+after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
+with an explicit reason. The loop folds under two triggers only: a declared
+`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90),
+or the provider's authoritative `ContextOverflow` answer. The summary is produced by an ordinary
+persisted maintenance turn - `turn/start`, `step/request` with `purpose: "compact"`, the
+summary, then `compact` - using the session's bound slot/provider with one request and no
+fallback; the summarizer is not routed through `turn/request` / `turn/response` hook ports. The
+`compact` event is appended only after the summary exists; a failed summarizer leaves the
+projection untouched and its request is still persisted and priced. Ordinary turns reserve ten
+percent of the budget allowance for maintenance requests, so the session can always pay for the
+compaction that prevents the overflow deadlock. At most two folds run per drain episode.
+Observability follows the purpose: cache metrics pair only ordinary requests, and `kian cost`
+reports maintenance requests apart from turns.
+
+The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md)
+§3/§4.2/§4.3; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2; the decision record is
+[ADR-057](../design/decisions/ADR-057-production-compaction-and-maintenance-reserve.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P3 | kian-orchestrator, kian-loop, kian-core, kian-cli | the pure compaction planner (settings/pressure/trigger/plan, keep-recent-turns fold, minimum reclaim, strictly-past disjoint ranges); preventive and reactive folds in the ReAct loop as persisted maintenance turns (`purpose: "compact"`, summary request, `compact` on success only); per-episode fold bound; the maintenance budget reserve; purpose-aware cache metrics and cost reporting | landed |
+
+Non-goals recorded with the phase: no price-aware break-even planner, no separate compaction
+scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
+enforcement of the reserve.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

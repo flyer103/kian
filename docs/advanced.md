@@ -758,6 +758,38 @@ admitted), `terminal` (session completed/cancelled/rotated — nothing admitted)
 or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
 idle. Semantics: [ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
 
+## Context compaction
+
+When the bound model profile declares a `context_window`, the loop keeps a long session inside it
+by folding old turns behind one summary instead of dying at the limit. Folding is the only action
+that invalidates the provider prefix cache, so it is triggered by evidence only: the next request's
+worst case (projected context plus the declared `max_output`) reaching 90% of the window, or the
+provider itself answering a context-overflow error. Nothing is compacted for cost, and a session
+whose profile declares no window never folds preventively.
+
+```yaml
+model_profiles:
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+```
+
+The fold is itself a persisted maintenance turn: a `turn/start`, a `step/request` carrying
+`purpose: "compact"`, the summarizer request body, and - only after the summary exists - the
+`compact` event. A failed summarizer leaves the context untouched (the failed request is still
+persisted and priced). Defaults keep the four most recent turns verbatim, require at least 1024
+reclaimed tokens per fold, fold only under the 90% pressure gate, and allow at most two folds per
+drain episode; an embedder driving the loop directly can override them with
+`ReActLoop::with_compaction`. Ordinary turns reserve ten percent of the session token budget for
+maintenance requests, so a session can always pay for the compaction that prevents the overflow.
+
+Both operator views follow the purpose: `kian cache-stats` pairs only ordinary requests (a
+maintenance body is never reported as an unexpected prefix change), and `kian cost` prints
+maintenance requests and their subtotal apart from turns. Semantics:
+[ADR-057](../design/decisions/ADR-057-production-compaction-and-maintenance-reserve.md).
+
 ## Tool result artifacts
 
 A large tool result (a fetch, an OCR page, an `exec` dump) does not belong in the log or in the

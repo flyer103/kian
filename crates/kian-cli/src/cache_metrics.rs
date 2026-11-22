@@ -156,6 +156,12 @@ pub fn session_cache_report(session: SessionId, events: &[Event]) -> SessionCach
             }
             EventKind::StepRequest => {
                 report.requests += 1;
+                // ADR-057 maintenance requests deliberately carry a
+                // different body: they neither pair with nor invalidate the
+                // turn prefix chain, so the chain spans them untouched.
+                if ev.bytes.get("purpose").and_then(|v| v.as_str()) == Some("compact") {
+                    continue;
+                }
                 let Some(cur) = request_message_bytes(ev) else {
                     report.parse_errors += 1;
                     continue;
@@ -578,6 +584,28 @@ mod tests {
         assert_eq!(r.requests, 2);
         assert_eq!(r.compared_pairs, 0);
         assert_eq!(r.parse_errors, 1);
+    }
+
+    #[test]
+    fn maintenance_requests_do_not_join_the_turn_prefix_chain() {
+        let mut b = B::new();
+        b.request(msgs(&[("user", "q1")]));
+        b.compact(1, 2);
+        b.push(
+            EventKind::StepRequest,
+            json!({
+                "slot": "main", "provider": "p", "model": "m",
+                "iteration": 1, "purpose": "compact",
+                "body": {"model": "m", "messages": [{"role": "system", "content": "summarize"}]},
+            }),
+        );
+        b.request(msgs(&[("user", "q1"), ("assistant", "a1")]));
+        let r = session_cache_report(SessionId(Uuid::nil()), &b.build());
+        assert_eq!(r.requests, 3);
+        assert_eq!(r.compared_pairs, 1, "only the two turn requests pair");
+        assert_eq!(r.prefix_stable_pairs, 1);
+        assert_eq!(r.first_unexpected_at, None);
+        assert!(!r.invalidation_causes.contains_key(CAUSE_UNEXPECTED));
     }
 
     /// The aggregate folds per-session reports and rates.

@@ -485,6 +485,29 @@ so `FROZEN_CHAT_BODY_SHA256` is unchanged), and a non-thinking provider never em
 of replaying reasoning is input tokens and is observable through the existing usage events; no
 trimming or synthesis is performed (constraint 2/3).
 
+**Production compaction (ADR-057, P3 — landed):** the projection rule above is now driven by a
+pure planner, `kian-orchestrator::compaction`. `plan_compaction(events, settings, trigger)` reads
+only the stream: it keeps the most recent `keep_recent_turns` turn/start boundaries verbatim,
+starts after the last `compact` event, requires a minimum reclaim (`min_reclaim_tokens`) and
+returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Two triggers exist and
+both are evidence: a declared `profile.context_window` whose worst-case next request (projected
+context plus the declared output cap) reaches `trigger_percent`, or the provider's own
+`ContextOverflow` answer. The loop never compacts for cost — folding is the only deliberate
+prefix invalidation (constraint 3), so it must answer a measured pressure. The fold itself is an
+ordinary persisted maintenance turn: `turn/start`, `step/request` with `purpose: "compact"`, then
+the summary, then `compact` only on success; the summarizer uses the session's bound
+slot/provider, one request, no fallback traversal and no `turn/request`/`turn/response` hook ports
+(it is not a model turn). The compact payload keeps its frozen `{from_seq,to_seq,summary}` keys
+and adds audit-only `produced_by.step_seq`, `reason`, `folded_messages` and `reclaimed_tokens`;
+projection and `context_to_bytes` are untouched. At most two folds run per drain episode. The
+ordinary turn gate reserves ten percent of the budget allowance (`kian-core::budget`) for these
+maintenance requests, so a session cannot spend itself into being unable to compact; the reserve
+is what makes the `awaiting_budget` park recoverable instead of a deadlock. CLI observability
+follows the `purpose`: the cache checker pairs only ordinary requests (a maintenance body never
+reads as an unexpected prefix change) and `kian cost` reports maintenance requests and their
+priced subtotal apart from turns. Limits: no price-aware planner, no `compact_slot`, no
+maintenance fallback; wall-clock budgets remain ungated.
+
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and
 before the RPC returns), the source memory session's stream is rebuilt, folded and rendered by

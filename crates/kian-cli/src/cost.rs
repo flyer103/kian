@@ -46,6 +46,11 @@ pub struct SessionCostReport {
     pub unpriced_models: Vec<String>,
     pub peak_requests: u64,
     pub off_peak_requests: u64,
+    /// Usage-bearing maintenance turns (ADR-057: the turn's purpose is
+    /// compact) — priced with the same book, reported apart from turns.
+    pub maintenance_requests_with_usage: u64,
+    /// Priced subtotal of maintenance turns, in micro-units.
+    pub maintenance_cost_micros: Option<u64>,
 }
 
 /// Whole-store aggregate (the kian cost default shape).
@@ -67,6 +72,8 @@ pub struct CostStatsReport {
     pub unpriced_models: Vec<String>,
     pub peak_requests: u64,
     pub off_peak_requests: u64,
+    pub maintenance_requests_with_usage: u64,
+    pub maintenance_cost_micros: Option<u64>,
 }
 
 impl CostStatsReport {
@@ -97,6 +104,14 @@ impl CostStatsReport {
         self.unpriced_models.sort();
         self.peak_requests += s.peak_requests;
         self.off_peak_requests += s.off_peak_requests;
+        self.maintenance_requests_with_usage += s.maintenance_requests_with_usage;
+        if let Some(cost) = s.maintenance_cost_micros {
+            self.maintenance_cost_micros = Some(
+                self.maintenance_cost_micros
+                    .unwrap_or(0)
+                    .saturating_add(cost),
+            );
+        }
     }
 }
 
@@ -161,6 +176,13 @@ pub fn session_cost_report(
                     report.unknown_usage_requests += 1;
                     continue;
                 }
+                // ADR-057: maintenance turns are usage-bearing turns of
+                // their own; totals include them, the report also names them.
+                let maintenance =
+                    ev.bytes.get("purpose").and_then(|v| v.as_str()) == Some("compact");
+                if maintenance {
+                    report.maintenance_requests_with_usage += 1;
+                }
                 report.input_tokens += totals.input_tokens;
                 report.cache_hit_tokens += totals.cache_read_input_tokens;
                 report.cache_miss_tokens += totals.cache_miss_input_tokens;
@@ -189,6 +211,14 @@ pub fn session_cost_report(
                     &quote,
                 );
                 report.cost_micros = Some(report.cost_micros.unwrap_or(0).saturating_add(cost));
+                if maintenance {
+                    report.maintenance_cost_micros = Some(
+                        report
+                            .maintenance_cost_micros
+                            .unwrap_or(0)
+                            .saturating_add(cost),
+                    );
+                }
                 report.priced_requests += 1;
                 if quote.peak {
                     report.peak_requests += 1;
@@ -247,6 +277,16 @@ pub fn render_cost_stats(report: &CostStatsReport) -> String {
         report.off_peak_requests,
         cost,
     );
+    if report.maintenance_requests_with_usage > 0 {
+        let maintenance_cost = match (&report.currency, report.maintenance_cost_micros) {
+            (Some(currency), Some(micros)) => format_micros(currency, micros),
+            _ => "n/a".to_string(),
+        };
+        out.push_str(&format!(
+            "maintenance requests    {}\nmaintenance cost        {}\n",
+            report.maintenance_requests_with_usage, maintenance_cost
+        ));
+    }
     if !report.unpriced_models.is_empty() {
         out.push_str(&format!(
             "unpriced models         {}\n",
@@ -531,6 +571,29 @@ mod tests {
         assert_eq!(r.unknown_usage_requests, 1);
         assert_eq!(r.unpriced_models, vec!["other/model".to_string()]);
         assert_eq!(r.cost_micros, Some(2));
+    }
+
+    #[test]
+    fn maintenance_turns_are_priced_apart_from_turns() {
+        let mut b = B::new();
+        b.step("deepseek", "deepseek-flash");
+        b.turn(1_000, json!({"prompt_tokens": 10, "completion_tokens": 1}));
+        b.push_at(
+            EventKind::TurnEnd,
+            1_100,
+            json!({"iteration": 0, "purpose": "compact", "outcome": "compacted",
+                   "usage": {"prompt_tokens": 10, "completion_tokens": 1}}),
+        );
+        let r = session_cost_report(SessionId(Uuid::nil()), &b.build(), Some(&book()));
+        assert_eq!(r.requests_with_usage, 2);
+        assert_eq!(r.priced_requests, 2);
+        assert_eq!(r.maintenance_requests_with_usage, 1);
+        assert_eq!(
+            r.cost_micros,
+            Some(4),
+            "the total still includes maintenance"
+        );
+        assert_eq!(r.maintenance_cost_micros, Some(2));
     }
 
     #[test]

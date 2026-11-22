@@ -8,6 +8,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Long sessions fold old turns under measured context pressure, as audited maintenance turns (DESIGN §3.2, ADR-057)**.
+  A new pure planner (`kian-orchestrator::compaction`) keeps the most recent turns verbatim,
+  starts after the previous compact, requires a minimum reclaim and returns a strictly-past
+  disjoint range; the loop folds only when a declared `model_profiles.*.context_window` is 90%
+  consumed by the worst-case next request, or when the provider itself reports a context
+  overflow — never for cost. The fold is an ordinary persisted maintenance turn (`turn/start`,
+  `step/request` with `purpose: "compact"`, then a `compact` event only on success, with additive
+  `produced_by`/`reason`/`folded_messages`/`reclaimed_tokens`), uses the session's bound slot with
+  one request and no fallback, and is capped at two folds per drain episode. Ordinary turns now
+  reserve ten percent of the token budget allowance for maintenance, so a session cannot spend
+  itself into being unable to compact; cache metrics pair only ordinary requests and `kian cost`
+  reports maintenance requests and their subtotal apart from turns.
+
 - **Web search and URL reading are audited tool calls on the operator's own key (DESIGN §2.2, ADR-056)**.
   A new top-level `web:` block (`base_url` default `https://api.deepseek.com`, `api_key_env` default
   `DEEPSEEK_API_KEY`, `timeout_ms`, `search.max_results`/`need_content`) mounts `web_search` and
