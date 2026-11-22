@@ -205,12 +205,15 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 1,
     },
     ProducerFile {
-        // The conductor's only admission is a step's child task row, and it goes
+        // The conductor's admissions are a step's child task rows, and they go
         // through `WorkerSpawner::admit` (the row above), the same path the
-        // Router uses — the conductor writes no inbox row itself. It appears
-        // here because the count is textual (JOB-MODEL §8.3).
+        // Router uses — the conductor writes no inbox row itself. Both call
+        // sites are the same producer class (§8.3): a fresh dispatch admits the
+        // row it just recorded as `thread/started`, and the re-drive of a
+        // recorded dispatch (f9113ef) admits the child its ids derive to. It
+        // appears here because the count is textual (JOB-MODEL §8.3).
         file: "kian-superagent/src/job/conduct.rs",
-        admits: 1,
+        admits: 2,
     },
     ProducerFile {
         file: "kian-superagent/src/policy_version.rs",
