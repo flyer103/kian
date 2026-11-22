@@ -1783,6 +1783,34 @@ impl Plugin for SuperAgentPlugin {
                     .expect("the watchdog side is built exactly when the profile is present"),
             );
         }
+        // (JOB-MODEL §5.3, §9.2, §13.1, §13.3) the job conductor: it spawns
+        // its own run's steps through the one spawner, places them against
+        // this process's worker catalog, delivers through the mounted channel
+        // registry and admits alerts through the mounted inbox. The catalogue
+        // it alerts against is resolved after this assembly, so the port
+        // starts unmounted and is installed at boot.
+        let job_alerts = crate::job_runtime::JobAlertPort::new(
+            Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>
+        );
+        let job_directory: Arc<dyn kian_superagent::WorkerDirectoryPort> =
+            match directory_for_sides.clone() {
+                Some(directory) => directory,
+                None => Arc::new(crate::job_runtime::EmptyDirectory),
+            };
+        let job_deps = Arc::new(kian_superagent::job::conduct::JobDeps::new(
+            crate::superagent::StoreWorkerStreams::new(self.event_store.clone()),
+            Arc::clone(&spawner),
+            job_directory,
+            crate::job_runtime::deliver_port(&channels),
+            Arc::clone(&job_alerts) as Arc<dyn kian_superagent::job::conduct::AlertPort>,
+            Arc::new(crate::job_runtime::JobClock::new(Arc::new(
+                kian_orchestrator::SystemClock,
+            ))),
+        ));
+        driver = driver.with_job_runs(kian_superagent::job::conduct::JobLoopDriver::new(
+            crate::job_runtime::run_port_for_ctx(),
+            job_deps,
+        ));
         // (R12, S1/S2): the lazy side factory + static order + the
         // refusing factory + the directory port ride the driver —
         // with none installed (zero endpoints and no workers:) the
@@ -1875,6 +1903,7 @@ impl Plugin for SuperAgentPlugin {
             recall: recall_port,
             timers: self.timer_channels,
             watchdog: self.watchdog.clone(),
+            job_alerts,
         });
         ctx.provide::<crate::superagent::SuperAgentServices>(services)
     }

@@ -338,6 +338,7 @@ fn wrapper_message(identity: &SpawnIdentity) -> Value {
         exec_worker: None,
         identity: Some(identity.clone()),
         output_schema: None,
+        parent: None,
     });
     spawned.task_message
 }

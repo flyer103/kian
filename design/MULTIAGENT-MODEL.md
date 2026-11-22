@@ -472,6 +472,10 @@ as MUST/MUST NOT.
 - No second store, no workflow server, no separate scheduler database.
 - The reference implementation's row-per-task shape **MUST NOT** be adopted as an internal model. A
   workflow engine's records describe *what a process did*; kian's streams already are that record.
+- A **job run** is not a board (JOB-MODEL §1): the plan is configuration, the run is an ordinary
+  session, and the status view is a disposable projection — the three things this section forbids (a
+  tasks table, a mutable status column, a second store) are still absent. The difference is that a
+  board is a place work waits, while a run is the record of work that was dispatched.
 
 ### 4.2 "Board" means two surfaces, split by read class
 
@@ -597,6 +601,9 @@ would cross a *boundary* (spawn, channel reply, control plane, memory-session wr
 `max_children` is derived the same way the speculation cap is (DESIGN §4.1: a pure projection over
 the parent's stream), so the bound survives restarts. No hard ceiling above the configured value
 exists: config is the policy, and the refusal path is what keeps it honest.
+
+These bound a Router's fan-out; a job run's `deadline_ms`, `max_parallel` and per-step `timeout_ms`
+are separate knobs with separate semantics (JOB-MODEL §7–8).
 
 ### 5.4 Validation order (every refusal precedes every side effect)
 

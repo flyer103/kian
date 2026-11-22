@@ -189,6 +189,30 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 2,
     },
     ProducerFile {
+        // `kian job run` / `kian job cancel` admit the operator's control rows
+        // directly: a manual slot and a cancel are internal producers (operator
+        // intent, the same class as a watchdog timer), not inbound channel
+        // traffic, so they bypass `admit/pre` by the §3.4.3 matrix
+        // (JOB-MODEL §15.3).
+        file: "kian-cli/src/job_cli.rs",
+        admits: 2,
+    },
+    ProducerFile {
+        // The alert sink: a failed run admits one alert run's first row through
+        // `AlertPort` (JOB-MODEL §13.3). An alert is an internal producer of the
+        // completion class, so it bypasses `admit/pre` by the §3.4.3 matrix.
+        file: "kian-cli/src/job_runtime.rs",
+        admits: 1,
+    },
+    ProducerFile {
+        // The conductor's only admission is a step's child task row, and it goes
+        // through `WorkerSpawner::admit` (the row above), the same path the
+        // Router uses — the conductor writes no inbox row itself. It appears
+        // here because the count is textual (JOB-MODEL §8.3).
+        file: "kian-superagent/src/job/conduct.rs",
+        admits: 1,
+    },
+    ProducerFile {
         file: "kian-superagent/src/policy_version.rs",
         admits: 1,
     },

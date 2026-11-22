@@ -118,6 +118,14 @@ const USAGE: &str = "usage:
                                          recent firings: state, fire time, duration, skip reason
   kian cron rm <id> [--config <path>] [--json]
                                          drop the store row (the config declaration still needs editing)
+  kian job list [--config <path>] [--json]
+                                         declared jobs: steps, plan digest, triggers, alerts
+  kian job status <run|job> [--config <path>] [--json]
+                                         a run's steps and attempts, or a job's recent firings
+  kian job run <job> [--slot <token>] [--config <path>] [--json]
+                                         admit one manual run (a fresh manual:<token> slot by default)
+  kian job cancel <run> [--config <path>] [--json]
+                                         ask the run's conductor to end the run cancelled
   kian --version                        print the version
 ";
 
@@ -141,6 +149,7 @@ fn main() -> ExitCode {
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
+        Some("job") => job(&args[2..]),
         Some("workers") => workers(&args[2..]),
         Some("board") => board(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
@@ -155,6 +164,19 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("kian: unknown command `{other}`\n{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn job(args: &[String]) -> ExitCode {
+    match kian_cli::job_cli::run(args) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: {}", e.message());
+            ExitCode::from(e.exit_code())
         }
     }
 }

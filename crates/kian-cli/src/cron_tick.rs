@@ -593,6 +593,7 @@ pub fn dispatch_payload(
         crate::config::CronTarget::Channel { channel, topic } => {
             serde_json::json!({ "channel": channel, "topic": topic })
         }
+        crate::config::CronTarget::Job { job } => serde_json::json!({ "job": job }),
     };
     serde_json::json!({
         "schedule_id": schedule.id,

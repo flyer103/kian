@@ -1637,6 +1637,18 @@ pub struct SuperAgentConfig {
     /// [`reject_cron_targeting_the_watchdog`].
     #[serde(default)]
     pub cron: CronSection,
+    /// (JOB-MODEL §7.1) the declared jobs (`superagent.jobs`): reusable
+    /// plans, their wall-clock triggers and the failure alerts. A trigger
+    /// lowers into the same cron runtime vector as a
+    /// [`CronTarget::Job`] schedule — one scheduler, one cursor, one
+    /// claim table — and the resolved plan is frozen into the run's first
+    /// input row at fire time, so a later config edit cannot change a run
+    /// already admitted. Absent (the default) = no jobs declared, nothing
+    /// lowered, empty catalog. Validated fail-closed by
+    /// [`crate::job_config::JobsSection::resolve`] (JOB-MODEL §7.4
+    /// V1..V22).
+    #[serde(default)]
+    pub jobs: crate::job_config::JobsSection,
 }
 
 /// 's default: follow-up ownership is **on** — the honest default
@@ -4400,7 +4412,18 @@ impl ServeConfig {
             // unsupported-policy gates, and the watchdog cross-reference
             // (rule 7: a wall-clock judge must not fight the interval
             // watchdog for the same session).
-            let resolved_cron = sa.cron.to_runtime(&sa.channels, chrono::Utc::now())?;
+            let mut resolved_cron = sa.cron.to_runtime(&sa.channels, chrono::Utc::now())?;
+            // (JOB-MODEL §7.1a, §18.2 amendment 1) job triggers lower into
+            // the same runtime vector, so the cron ticker, cursor, misfire
+            // policy and claim table stay the only scheduler. Schedule ids
+            // share one namespace: a job trigger may not shadow a declared
+            // cron schedule, so the taken set is seeded from the cron ids.
+            let taken: std::collections::BTreeSet<String> = resolved_cron
+                .iter()
+                .map(|schedule| schedule.id.clone())
+                .collect();
+            let resolved_jobs = sa.jobs.resolve(&sa.channels, &taken, chrono::Utc::now())?;
+            resolved_cron.extend(resolved_jobs.schedules);
             reject_cron_targeting_the_watchdog(
                 &resolved_cron,
                 sa.watchdog.as_ref().map(|w| w.session_id.as_str()),
@@ -5293,6 +5316,14 @@ pub enum CronTarget {
         channel: String,
         /// A non-empty routing topic.
         topic: String,
+    },
+    /// Run a declared job (`design/JOB-MODEL.md` §7.1a). Runtime-only: the
+    /// operator-facing `cron.schedules[*].target` never accepts it; a
+    /// `jobs.triggers` entry is lowered into this shape at load so one
+    /// scheduler, one cursor and one claim table serve both.
+    Job {
+        /// The job id, resolved against the mounted job catalog at fire time.
+        job: String,
     },
 }
 
@@ -9671,6 +9702,23 @@ schedules:
     }
 
     /// The target resolves fail-closed (§3.2) and an empty prompt refuses.
+    /// JOB-MODEL §18.4: the operator cron surface keeps exactly two
+    /// target shapes (`session`, or `channel` + `topic`); a job is admitted
+    /// by `superagent.jobs.triggers`, never by a schedule target. The
+    /// runtime-only `CronTarget::Job` has no wire form: this YAML is
+    /// otherwise valid, so the parse error is the refusal.
+    #[test]
+    fn cron_targets_refuse_a_job_key() {
+        let err = serde_yaml::from_str::<CronSection>(
+            "schedules:\n  - id: digest\n    expr: \"@daily\"\n    target: { job: digest }\n    prompt: go\n",
+        )
+        .expect_err("a job target must not parse");
+        assert!(
+            err.to_string().contains("CronTargetDef"),
+            "the refusal must come from the target shape: {err}"
+        );
+    }
+
     #[test]
     fn cron_target_and_prompt_are_fail_closed() {
         let undeclared = cron_section_from(

@@ -2288,9 +2288,12 @@ struct TakeReport {
 /// only). The envelopes are row-level conventions
 /// only — the committed event payload contracts are unchanged (the
 /// marker rides EVENT-MODEL §4.2's additive provenance keys). Like the
-/// steer wrapper before it, each exact two-key shape is reserved: a
-/// plain payload of that precise shape is read as an envelope, not
-/// content.
+/// steer wrapper before it, each exact shape is reserved: a plain payload
+/// of that precise key set is read as an envelope, not content. The job
+/// envelope is the newest family — `{"content": X, "job": M}` for an
+/// operator admit and `{"content": X, "cron": C, "job": M}` for a firing
+/// (JOB-MODEL §14 A1); the frozen plan rides top-level so the conductor
+/// classifies on it alone.
 enum Consumption {
     /// One `input/admitted` event (the entire legacy surface).
     Single(Value),
@@ -2372,6 +2375,26 @@ fn consumption_plan(row: &InputRow) -> Consumption {
             // bytes).
             return Consumption::Single(json!({"role": "user", "content": content, "cron": cron}));
         }
+        if obj.len() == 2
+            && let (Some(content), Some(job)) = (obj.get("content"), obj.get("job"))
+        {
+            // JOB-MODEL §14 A1: a run's first row. The plan and its digest
+            // ride as an additive, non-context key (derive_model_context
+            // reads role/content only) and the conductor classifies on this
+            // key alone — never on the prompt text.
+            return Consumption::Single(json!({"role": "user", "content": content, "job": job}));
+        }
+        if obj.len() == 3
+            && let (Some(content), Some(cron), Some(job)) =
+                (obj.get("content"), obj.get("cron"), obj.get("job"))
+        {
+            // JOB-MODEL §7.1a: a firing that starts a run carries the
+            // scheduler's proof beside the plan (CRON-MODEL §6.1 keeps that
+            // proof additive the same way).
+            return Consumption::Single(
+                json!({"role": "user", "content": content, "cron": cron, "job": job}),
+            );
+        }
     }
     Consumption::Single(json!({"role": "user", "content": row.payload}))
 }
@@ -2391,8 +2414,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Clock, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome, ManualClock,
-        ReleaseOutcome, WakeOutcome,
+        Clock, Consumption, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome,
+        ManualClock, ReleaseOutcome, WakeOutcome, consumption_plan,
     };
     use crate::metrics::Metrics;
     use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
@@ -3662,6 +3685,61 @@ mod tests {
             admitted[0].bytes
         );
         cleanup(&path);
+    }
+    /// JOB-MODEL §14 A1: a run's first row is `{content, job}` (an
+    /// operator's `kian job run`) or `{content, cron, job}` (a firing),
+    /// and each consumes to ONE message with the frozen plan riding as a
+    /// top-level additive key. The conductor classifies a run on that key
+    /// alone, so a nested marker would silently hand the run to the
+    /// default loop.
+    #[test]
+    fn job_rows_promote_the_frozen_plan_to_the_top_level() {
+        let sid = SessionId::new();
+        let plan = json!({"id": "digest", "steps": []});
+        let manual = consumption_plan(&row(
+            sid,
+            1,
+            json!({"content": "run the digest", "job": plan.clone()}),
+        ));
+        let Consumption::Single(bytes) = manual else {
+            panic!("a job row consumes to one message");
+        };
+        assert_eq!(
+            bytes,
+            json!({"role": "user", "content": "run the digest", "job": plan.clone()})
+        );
+
+        let fired = consumption_plan(&row(
+            sid,
+            2,
+            json!({"content": "run the digest", "cron": {"firing": "f1"}, "job": plan.clone()}),
+        ));
+        let Consumption::Single(bytes) = fired else {
+            panic!("a fired job row consumes to one message");
+        };
+        assert_eq!(
+            bytes,
+            json!({
+                "role": "user",
+                "content": "run the digest",
+                "cron": {"firing": "f1"},
+                "job": plan,
+            })
+        );
+    }
+
+    /// The job envelope is exact like every other reserved shape: a
+    /// superset stays ordinary content, so no writer can mint a run
+    /// marker by adding a key.
+    #[test]
+    fn job_shaped_supersets_stay_ordinary_content() {
+        let superset = json!({"content": "not a run", "job": {"run_id": "forged"}, "extra": 1});
+        let Consumption::Single(bytes) =
+            consumption_plan(&row(SessionId::new(), 1, superset.clone()))
+        else {
+            panic!("a superset consumes to one message");
+        };
+        assert_eq!(bytes, json!({"role": "user", "content": superset}));
     }
 
     // -- invariant 4: drain has no durable identity -------------------------

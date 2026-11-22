@@ -559,6 +559,29 @@ usage/recall (CRON-MODEL §6.1). The tick loop and the durable adapter are exerc
 worktree paths carry unit coverage, and the confirmation plane's crash repair is exercised by the
 `kill -9` chaos suite (L2).
 
+### Declarative jobs (P0–P1 landed)
+
+Scope: a unit of work that is a *plan* of steps — fetch on one machine, summarise, then deliver —
+carried as ordinary durable machinery, with honest per-step evidence. No workflow engine, no job
+table, no second scheduler, no new event kinds. The normative contract is
+[design/JOB-MODEL.md](../design/JOB-MODEL.md); the decision record is
+[ADR-052](../design/decisions/ADR-052-job-model.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-superagent, kian-cli | The four axes (trigger / plan / placement / evidence); a run is an ordinary session whose stateless conductor parks (so a run may wait hours without ending); the plan frozen into the admitted row with its digest; capability-only step declarations with placement computed once per attempt; a step attempt is an ordinary child thread; delivery as a conductor action over the channel adapter; one run verdict as the outcome record; alerts as deliver-only runs; `kian job list\|status\|run\|cancel` | landed |
+| P1 | kian-superagent | The kernel: dependency-ordered readiness, per-attempt retries with a bounded backoff, the effect gate (`needs_operator` for an unknown write), text artifacts by reference with a cap breach as a failure, the run deadline, the outcome lattice | landed |
+| P2 | kian-cli | The worker binding view, HTTP/JSON-RPC/SSE status, sweep-side alerting, `resume --assume-no-effect`, schema checks on step output, channel-side dedupe | designed |
+| P3–P4 | — | Binary artifacts (needs a worker upload seam), enforced cancellation (needs a core interrupt that cancels an in-flight tool future), per-step cost, event triggers, `max_parallel > 1` | designed |
+
+A run's trigger is a cron schedule whose runtime target is the job (§7.1 of the contract), so the
+durable cursor, misfire policy and settlement sweep are the ones already tested — a job firing adds
+no scheduler and no table. A step's success is never an exit code: it is the declared check set
+(§11.2) evaluated over the child's own committed facts, and a delivery is the channel's receipt.
+The run's outcome rides one additive `evidence/verdict` with gate `run`, because the engine — not a
+driver — owns the session end.
+
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

@@ -110,6 +110,12 @@ pub struct Server {
     cron_schedules: Vec<crate::config::CronRuntimeSchedule>,
     /// The §5.4 process-wide worktree concurrency ceiling (global config).
     cron_max_concurrent: u32,
+    /// The resolved job catalog (JOB-MODEL §7.1): present iff
+    /// `superagent.jobs` resolved at arm time. The cron ticker mounts it on
+    /// the resident dispatcher, which is the only reader — a job firing
+    /// admits one input row carrying the frozen plan, and the conductor
+    /// never consults this config again (§4 J2).
+    job_catalog: Option<Arc<crate::job_config::JobCatalog>>,
     /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
     /// plan pin P5): present iff the superagent bundle configures
     /// `superagent.multiagent` limits. [`Server::serve`] spawns its
@@ -1046,13 +1052,40 @@ impl Server {
         // already validated the section, so resolution failing here can
         // only mean a channel target moved: arming nothing is the
         // fail-closed choice, and an empty set arms no timer at all.
-        let cron_schedules: Vec<crate::config::CronRuntimeSchedule> = match superagent_cfg {
-            Some(sa) => sa
-                .cron
-                .to_runtime(&sa.channels, chrono::Utc::now())
-                .unwrap_or_default(),
-            None => Vec::new(),
+        // Job triggers lower into the same runtime vector (JOB-MODEL
+        // §7.1a): one scheduler, one cursor, one claim table. A job
+        // schedule is armed only when its catalog resolved with it — a
+        // firing with no mounted catalog could not admit a run, so arming
+        // it would only produce a failing tick.
+        let (cron_schedules, job_catalog): (
+            Vec<crate::config::CronRuntimeSchedule>,
+            Option<Arc<crate::job_config::JobCatalog>>,
+        ) = match superagent_cfg {
+            Some(sa) => {
+                let mut schedules = sa
+                    .cron
+                    .to_runtime(&sa.channels, chrono::Utc::now())
+                    .unwrap_or_default();
+                let taken: std::collections::BTreeSet<String> = schedules
+                    .iter()
+                    .map(|schedule| schedule.id.clone())
+                    .collect();
+                match sa.jobs.resolve(&sa.channels, &taken, chrono::Utc::now()) {
+                    Ok(resolved) => {
+                        schedules.extend(resolved.schedules);
+                        (schedules, Some(Arc::new(resolved.catalog)))
+                    }
+                    Err(_) => (schedules, None),
+                }
+            }
+            None => (Vec::new(), None),
         };
+        // (JOB-MODEL §13.3) the alert port learns the catalogue it admits
+        // against. Without it a failed run is still recorded honestly; only
+        // the pushed alert is missing, never invented.
+        if let (Some(services), Some(catalog)) = (superagent.as_ref(), job_catalog.as_ref()) {
+            services.job_alerts.install(Arc::clone(catalog));
+        }
         let cron_max_concurrent = superagent_cfg
             .as_ref()
             .map_or(crate::config::DEFAULT_CRON_GLOBAL_MAX_CONCURRENT, |sa| {
@@ -1114,6 +1147,7 @@ impl Server {
             hooks,
             cron_schedules,
             cron_max_concurrent,
+            job_catalog,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -1388,8 +1422,12 @@ impl Server {
                 tokio::runtime::Handle::current(),
                 self.session_bootstrap.clone(),
             ));
+            let mut resident_dispatch = crate::cron_engine::ResidentDispatcher::new(turn);
+            if let Some(catalog) = self.job_catalog.clone() {
+                resident_dispatch = resident_dispatch.with_jobs(catalog);
+            }
             let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
-                Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
+                Arc::new(resident_dispatch);
             // Selection rule: a schedule that declares `worktree:` is
             // dispatched to the worktree-backed arm; every other schedule goes
             // to the resident engine.

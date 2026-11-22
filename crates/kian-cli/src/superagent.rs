@@ -1291,6 +1291,11 @@ pub struct SuperAgentDriver {
     /// emission switch — passed to the child-side `lineage_plan` so
     /// a gated child emits its `thread/started` audit keys.
     board_gating: kian_superagent::BoardGating,
+    /// The job conductor side (JOB-MODEL §5.3): a session whose stream
+    /// carries a job marker on an admitted input runs under it. `None` =
+    /// job runs are not mounted; such a stream settles honestly instead of
+    /// falling through to the default agent loop over a marker payload.
+    job_side: Option<Arc<kian_superagent::job::conduct::JobLoopDriver<DrainCtx>>>,
 }
 
 impl SuperAgentDriver {
@@ -1319,7 +1324,20 @@ impl SuperAgentDriver {
             refuse_side: None,
             legacy_unbound_audited: Arc::new(Mutex::new(BTreeSet::new())),
             board_gating: kian_superagent::BoardGating::default(),
+            job_side: None,
         }
+    }
+
+    /// Installs the job conductor (JOB-MODEL §5.3). Additive: without it a
+    /// job-marked stream settles with a failed run verdict rather than being
+    /// mistaken for a plain session.
+    #[must_use]
+    pub fn with_job_runs(
+        mut self,
+        side: kian_superagent::job::conduct::JobLoopDriver<DrainCtx>,
+    ) -> Self {
+        self.job_side = Some(Arc::new(side));
+        self
     }
 
     /// Attaches the resident watchdog session and its driver.
@@ -1406,6 +1424,7 @@ impl LoopDriver for SuperAgentDriver {
         // the single `worker_side` below is today's exact path,
         // byte-identical.
         let worker = self.worker_side.clone();
+        let job = self.job_side.clone();
         let default = Arc::clone(&self.default_side);
         let router = self.router.load();
         let worker_version = self.worker_version;
@@ -1427,6 +1446,19 @@ impl LoopDriver for SuperAgentDriver {
         let board_gating = self.board_gating;
         futures::stream::once(async move {
             let events = ctx.events().await.unwrap_or_default();
+            // (JOB-MODEL §5.3) A run is classified by the trusted marker on
+            // its admitted input, never by content — so a run is decided
+            // from the stream itself and a takeover classifies identically.
+            // A malformed marker (`Err`) is still a run: the conductor owns
+            // the honest `invalid_job_input` failure, so it must not fall
+            // through to the agent loop either.
+            if let Some(marker) = kian_superagent::job::status::marker(&events) {
+                let digest = marker.ok().map(|marker| marker.plan_digest);
+                return match job {
+                    Some(side) => side.drive(ctx).boxed(),
+                    None => crate::job_runtime::unmounted_run(ctx, digest),
+                };
+            }
             match lineage_plan(
                 &events,
                 session,
@@ -2315,6 +2347,10 @@ pub struct SuperAgentServices {
     /// configured — the drift notice admits through the mounted inbox
     /// a parked resident polls.
     pub watchdog_inbox: Option<Arc<RouterInbox>>,
+    /// §13.3's alert port: the conductor admits one alert row per failed
+    /// run through it. Mounted empty by the plugin; the config-resolved
+    /// catalogue is installed here at boot by [`crate::server::Server::from_config`].
+    pub job_alerts: Arc<crate::job_runtime::JobAlertPort>,
 }
 
 /// Post-`startup_rebuild` services start (the load-bearing

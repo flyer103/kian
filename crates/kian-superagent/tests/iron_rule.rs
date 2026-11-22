@@ -45,6 +45,14 @@ fn src_sources() -> Vec<(PathBuf, String)> {
 ///
 /// amendment: `src/router.rs` joins the decorator modules for the
 /// same reason (`RouterDriver` implements the seam).
+///
+/// amendment: `src/job/conduct.rs` joins the decorator modules for the
+/// same reason (`JobLoopDriver` is the *run* session's driver, the
+/// conductor of JOB-MODEL §5.3: it implements the same core seam and
+/// calls nothing but the ports it is handed — its own `RunPort`, the
+/// worker streams port, the spawner, the directory port, the deliver and
+/// alert ports). It names no engine, store or hold symbol, so the
+/// `FORBIDDEN` list still applies to it unchanged.
 const FORBIDDEN: [&str; 11] = [
     "Engine",
     "DrainCtx",
@@ -65,9 +73,9 @@ const FORBIDDEN: [&str; 11] = [
 /// contains the seam trait's name); it implements and calls nothing.
 const DECORATOR_SEAM_TOKENS: [&str; 2] = ["LoopDriver", ".drive("];
 
-/// Modules allowed to name the loop seam: the decorators themselves and
-/// the re-exporting crate root.
-const DECORATOR_MODULES: [&str; 3] = ["worker.rs", "router.rs", "lib.rs"];
+/// Modules allowed to name the loop seam: the decorators themselves, the
+/// job conductor (the run session's driver) and the re-exporting crate root.
+const DECORATOR_MODULES: [&str; 4] = ["worker.rs", "router.rs", "conduct.rs", "lib.rs"];
 
 #[test]
 fn bundle_references_no_execution_api() {

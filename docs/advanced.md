@@ -32,6 +32,11 @@
 - **Scheduled turns** — declarative `superagent.cron` schedules execute as ordinary durable turns
   (resident, or a detached per-firing git worktree), with a durable slot cursor, DST-correct
   next-fire math, misfire coalescing, disk guards and a `kian cron list|run-now|logs|rm` surface.
+- **Declarative jobs** — `superagent.jobs` declares a plan of capability-addressed steps:
+  a trigger starts a run (an ordinary durable session), one child session runs each step, text
+  artifacts move by reference, each step is proven by the evidence gate, delivery is the channel
+  adapter's receipt, and a failed run raises an alert run — with `kian job list|status|run|cancel`
+  ([JOB-MODEL](../design/JOB-MODEL.md)).
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
@@ -697,6 +702,80 @@ target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store
 
 Semantics: [design/CRON-MODEL.md](../design/CRON-MODEL.md); decision:
 [ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
+
+## Declarative jobs (`superagent.jobs`)
+
+A job is a *plan* of steps, not one prompt: each step declares the capabilities it needs (`requires`) —
+never a hostname — what it produces, and how it is proven done. A trigger starts a run; the run is
+an ordinary session whose driver dispatches one child session per step and parks between ticks.
+Delivery is its own conductor action, so the words that land are the ones the channel's receipt
+names.
+
+```yaml
+superagent:
+  jobs:
+    jobs:
+      - id: digest
+        limits: {deadline_ms: 900000}
+        plan:
+          - id: gather
+            requires: [net.unrestricted]        # a hostname is never a selector
+            prompt: "Collect today's sources; at most 40 lines."
+            produces: {name: sources, media: text, max_bytes: 24576}
+            timeout_ms: 120000
+            retries: 1
+            verify:
+              - {check: final_message_present}
+              - {check: min_tool_results, n: 1}
+          - id: compose
+            depends_on: [gather]
+            inputs: [{step: gather, name: sources}]
+            prompt: "You are the editor. Use the supplied sources; do not fetch."
+            produces: {name: digest, media: text, max_bytes: 24576}
+            verify: [{check: final_message_present}]
+          - id: send
+            action: deliver
+            depends_on: [compose]
+            channel: imessage
+            target: {handle: "+8613800000000"}
+            content: {from_artifact: {step: compose, name: digest}}
+            verify:
+              - {check: delivery_receipt, channel: imessage, target: {handle: "+8613800000000"}}
+    triggers:
+      - id: digest-morning                      # the schedule id; defaults to the job id
+        job: digest
+        expr: "0 9 * * *"
+        tz: Asia/Shanghai
+        catch_up: latest                        # skip | latest
+    alerts:
+      - id: digest-failed
+        on_failure_of: digest
+        channel: lark                           # must differ from every deliver channel
+        target: {topic: ops}
+```
+
+The alert channel must differ from every deliver channel of the job (a failure of the delivery path
+cannot be reported through itself): a single-channel deployment needs a second channel before it can
+alert on that channel's own failures.`
+
+Inspect and drive runs from the CLI:
+
+```bash
+target/debug/kian job list   --config kian.yaml             # jobs, plan digests, triggers, alerts
+target/debug/kian job status digest@2026-11-23T01:00:00Z    # one run: steps, attempts, workers, outcomes
+target/debug/kian job status digest                         # one job: header + recent firings
+target/debug/kian job run    digest --config kian.yaml      # a manual slot (never deduped with a cron slot)
+target/debug/kian job cancel digest@manual:01JBQ4Z7Q9K3YV6N8M2X0T5R4E
+```
+
+What the contract guarantees: a run's plan is frozen at admit, so editing `jobs:` never changes a
+run in flight; a retry is a new attempt on a fresh child (never a rebind); an unwritable effect is
+refused rather than repeated; a step that is not proven done makes the run `unverified`, never
+`succeeded`; and a run's outcome is written before the run ends, so the settlement sweep, the alert
+and `kian job status` all read the same fact.
+
+Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
+[ADR-052](../design/decisions/ADR-052-job-model.md).
 
 ## Operator surfaces
 

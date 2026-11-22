@@ -1436,6 +1436,15 @@ capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-int
  `AgentDef.tools` schema filter (what the model *sees*) is untouched; permissions decide what
  *runs*.
 
+- **Declarative job plans** — `superagent.jobs` declares a job as ordered steps with
+  capability requirements, declared artifacts and declared checks; a trigger starts a *run*,
+  an ordinary session whose driver is a stateless conductor that parks between episodes.
+  Each step attempt is a child session placed per attempt by capability, text artifacts move
+  by reference into the producer's immutable bytes, and a step settles only on its declared
+  checks — delivery is the channel adapter's receipt, and a failed run admits an alert run.
+  `kian job list|status|run|cancel`; no new event kind, table or route
+  ([JOB-MODEL](JOB-MODEL.md), [ADR-052](decisions/ADR-052-job-model.md)).
+
 ### 4.8 Multiagent bundle (R14, designed)
 
 The bundle's multiagent contract — a parent session delegating a **child session** via `Thread`, the
@@ -1656,6 +1665,11 @@ A new capability is attempted in order of core footprint, smallest first:
 3. **Seam** (wider waist, requires an ADR): a new trait + three roles + built-in default.
 4. **Core primitive** (last resort): entering kian-core requires proof it cannot be expressed at
  the edge.
+
+A declarative plan (`design/JOB-MODEL.md`) is rungs 1–2: `superagent.jobs` is configuration, the
+conductor and the placement selector live in the bundle, and the run rides the existing session
+carrier. The only seam touch is an additive optional field (`SpawnRequest.parent`), not a new trait;
+no crate in the core waist changes.
 
 ### 6.4 Hook plugins (lifecycle hooks and the stdio sidecar tier)
 

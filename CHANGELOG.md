@@ -8,6 +8,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Declarative jobs: a run is a plan of steps, not one prompt (JOB-MODEL, ADR-052)**. A new
+  `superagent.jobs` section declares jobs (a plan of capability-addressed steps with `depends_on`,
+  `inputs`/`produces`, per-step `verify`, `timeout_ms`, `retries`, the effect gate and an optional
+  step), `triggers` that lower into the existing cron runtime vector as a job-targeted schedule
+  (one scheduler, one cursor, one claim table) and `alerts` that fire as deliver-only runs. A run is
+  an ordinary durable session whose new `JobLoopDriver` conductor parks between ticks, dispatches one
+  child session per step attempt through the existing spawner with derived ids (`kian:job:step:…`),
+  freezes the plan and its digest into the admitted row, records placement before the child exists,
+  and writes exactly one run verdict (`evidence/verdict` gate `run`) before its final outcome — so a
+  step's success is the declared check set over the child's own events and a delivery is the
+  channel's receipt, never an exit code. New surface: `kian job list|status|run|cancel`, the additive
+  `job` key on `input/admitted`, `thread/started` and `evidence/verdict`, the runtime-only
+  `CronTarget::Job`, `SpawnRequest.parent` with the `kian.parent` wrapper key for a non-resident
+  parent, and job metrics. No new event kind, table, route or config-file scheduler; the settlement
+  sweep settles a job firing from its run verdict (unverified settles failed, honestly named).
+
 - **A dispatch that never left the process no longer spends the re-drive bound (WORKER-MODEL,
   ADR-033)**. `RegisteredTransport::dispatch_frame` and the connection manager now fail a frame
   whose writer is already closed as `ConnectionError::NotWritten` and flip the transport offline
