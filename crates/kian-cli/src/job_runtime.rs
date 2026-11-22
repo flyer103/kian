@@ -193,7 +193,6 @@ impl WorkerDirectoryPort for EmptyDirectory {
 /// It records the honest failure and then settles the run: a run whose steps
 /// were never dispatched must not look like a run that succeeded, and it must
 /// not fall back onto a plain agent loop over the marker payload either.
-#[must_use]
 pub fn unmounted_run(
     ctx: DrainCtx,
     plan_digest: Option<String>,
