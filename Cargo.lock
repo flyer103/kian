@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "kian-claude"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "kian-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "chrono",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "kian-codex"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "kian-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "serde",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "kian-cron"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "kian-dsh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "kian-endpoint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "kian-exec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "kian-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "kian-imessage-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "chrono",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "kian-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "kian-loop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "kian-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "kian-orchestrator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dashmap",
  "futures",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "kian-plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "kian-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "reqwest",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "kian-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "kian-superagent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "futures",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "kiand"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "kian-core",

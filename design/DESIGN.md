@@ -1797,7 +1797,7 @@ list are fixed by [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md); the rationale is
 **SDK freeze and versioning.** The `kian-sdk` public surface *is* the frozen wire
 contract: after it is **additive-only** — removing or reshaping a method, param, response
 field, or error code is a breaking change and requires a new design decision (the event-kinds rule
-applied to the API). The crate carries its own version (`0.1.0`), decoupled from the workspace
+applied to the API). The crate carries its own version (`0.1.1`), decoupled from the workspace
 bump cadence; publishing to crates.io happens only when the owner asks. Golden wire fixtures in
 `crates/kian-sdk/tests/fixtures/` pin the request/response bytes of every method (the 
 serialization-freeze discipline applied to the client).

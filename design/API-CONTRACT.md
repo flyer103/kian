@@ -629,7 +629,7 @@ Window consequences:
 
 ### 9.3 Version numbers
 
-This file is **v0** (the version marker in the title). `kian-sdk` is `0.1.0`; its golden fixtures
+This file is **v0** (the version marker in the title). `kian-sdk` is `0.1.1`; its golden fixtures
 pin the current bytes. KiandProto carries its own `PROTOCOL_VERSION`. There is no JSON-RPC
 `version` field and no URL versioning — additions are called out here.
 

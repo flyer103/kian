@@ -8,6 +8,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Registry metadata only (v0.1.1, no code change)**: every crate carries the repository README,
+  the homepage, keywords and categories, so the crates.io page documents the project instead of
+  presenting an empty shell. No behavior, wire or event change.
+
 - **Distribution: the workspace publishes to crates.io**. Every crate ships as `kian-*`/`kiand`
   under the `Kian Runtime` name, so `cargo install kian-cli kiand` is the shortest install path
   (README § Install, the site quickstart). Internal path dependencies carry a `version` so the
