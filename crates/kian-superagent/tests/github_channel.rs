@@ -384,7 +384,7 @@ async fn send_resolves_only_after_the_api_accepts() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "issue_comment"
             }),
@@ -409,7 +409,7 @@ async fn send_resolves_only_after_the_api_accepts() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "pr_review"
             }),
@@ -429,7 +429,7 @@ async fn send_resolves_only_after_the_api_accepts() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "pr_description"
             }),
@@ -450,7 +450,7 @@ async fn send_resolves_only_after_the_api_accepts() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "issue_comment"
             }),
@@ -474,7 +474,7 @@ async fn send_resolves_only_after_the_api_accepts() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "pr_description"
             }),
@@ -528,7 +528,7 @@ async fn every_request_carries_a_user_agent() {
                 channel: "github".into(),
                 target: json!({
                     "owner": "flyer103",
-                    "repo": "kian",
+                    "repo": "kian-runtime",
                     "number": 9,
                     "kind": kind
                 }),
@@ -571,7 +571,7 @@ async fn receive_only_channel_and_degenerate_targets_error_before_any_wire() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "issue_comment"
             }),
@@ -594,9 +594,9 @@ async fn receive_only_channel_and_degenerate_targets_error_before_any_wire() {
     for bad in [
         json!("not an object"),
         json!({}),
-        json!({"owner": "", "repo": "kian", "number": 9, "kind": "issue_comment"}),
-        json!({"owner": "flyer103", "repo": "kian", "number": 0, "kind": "issue_comment"}),
-        json!({"owner": "flyer103", "repo": "kian", "number": 9, "kind": "merge"}),
+        json!({"owner": "", "repo": "kian-runtime", "number": 9, "kind": "issue_comment"}),
+        json!({"owner": "flyer103", "repo": "kian-runtime", "number": 0, "kind": "issue_comment"}),
+        json!({"owner": "flyer103", "repo": "kian-runtime", "number": 9, "kind": "merge"}),
     ] {
         let err = channel
             .send(ChannelDelivery {
@@ -616,7 +616,7 @@ async fn receive_only_channel_and_degenerate_targets_error_before_any_wire() {
             channel: "github".into(),
             target: json!({
                 "owner": "flyer103",
-                "repo": "kian",
+                "repo": "kian-runtime",
                 "number": 9,
                 "kind": "issue_comment"
             }),

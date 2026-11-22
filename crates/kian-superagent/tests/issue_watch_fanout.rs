@@ -406,7 +406,7 @@ fn count_kind(events: &[Event], kind: EventKind) -> usize {
 fn issue_target(number: u64) -> Value {
     json!({
         "owner": "flyer103",
-        "repo": "kian",
+        "repo": "kian-runtime",
         "number": number,
         "kind": "issue_comment",
     })

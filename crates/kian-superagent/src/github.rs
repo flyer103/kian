@@ -1793,7 +1793,7 @@ mod tests {
         let conv = |kind: &str| {
             crate::outbox::conversation_key(
                 "issue-github",
-                &json!({"kind": kind, "number": 4, "owner": "flyer103", "repo": "kian"}),
+                &json!({"kind": kind, "number": 4, "owner": "flyer103", "repo": "kian-runtime"}),
             )
         };
         assert_eq!(
@@ -1811,7 +1811,7 @@ mod tests {
         // to on the Router stream.
         assert_eq!(
             keys[0],
-            "issue-github:{\"kind\":\"issue_comment\",\"number\":4,\"owner\":\"flyer103\",\"repo\":\"kian\"}"
+            "issue-github:{\"kind\":\"issue_comment\",\"number\":4,\"owner\":\"flyer103\",\"repo\":\"kian-runtime\"}"
         );
         // Anything not of the thread-key shape derives nothing —
         // honest empty, never a guess.
