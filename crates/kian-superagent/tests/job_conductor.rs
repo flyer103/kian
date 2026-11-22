@@ -6,9 +6,15 @@
 //! fails the step immediately (never a wait), and a failed delivery fails the
 //! run and admits exactly one alert run.
 //!
+//! The `w1..w8` tests are the §17 crash windows, each simulated the same way:
+//! build the committed prefix a crash at that point leaves behind, throw the
+//! conductor away, and drive a brand-new one over exactly that prefix. W9 (the
+//! sweep settles the firing) is scheduler side and covered by the cron
+//! settlement tests.
+//!
 //! Fakes only: no store, no daemon, no network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -99,8 +105,10 @@ struct World {
     run: Mutex<Vec<Event>>,
     children: Mutex<BTreeMap<SessionId, Vec<Event>>>,
     admits: Mutex<Vec<(SessionId, Value, Option<String>)>>,
+    admit_keys: Mutex<BTreeSet<String>>,
     sends: Mutex<Vec<(String, Value, Value)>>,
     alerts: Mutex<Vec<(SessionId, Value, String)>>,
+    alert_keys: Mutex<BTreeSet<String>>,
     deliver_error: Mutex<Option<ChannelError>>,
     clock: Mutex<u64>,
 }
@@ -111,8 +119,10 @@ impl World {
             run: Mutex::new(Vec::new()),
             children: Mutex::new(BTreeMap::new()),
             admits: Mutex::new(Vec::new()),
+            admit_keys: Mutex::new(BTreeSet::new()),
             sends: Mutex::new(Vec::new()),
             alerts: Mutex::new(Vec::new()),
+            alert_keys: Mutex::new(BTreeSet::new()),
             deliver_error: Mutex::new(None),
             clock: Mutex::new(1_700_000_000_000),
         })
@@ -265,6 +275,14 @@ impl AlertPort for FakeAlerts {
     ) -> BoxFuture<'static, Result<(), String>> {
         let world = Arc::clone(&self.0);
         Box::pin(async move {
+            let first = world
+                .alert_keys
+                .lock()
+                .map_err(|error| error.to_string())?
+                .insert(key.clone());
+            if !first {
+                return Ok(());
+            }
             world
                 .alerts
                 .lock()
@@ -294,6 +312,16 @@ impl InboxWriter for CaptureInbox {
     ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
         let world = Arc::clone(&self.0);
         Box::pin(async move {
+            if let Some(key) = &idempotency_key {
+                let first = world
+                    .admit_keys
+                    .lock()
+                    .map_err(|error| InboxWriteError::Write(error.to_string()))?
+                    .insert(key.clone());
+                if !first {
+                    return Ok(AdmitReceipt { deduplicated: true });
+                }
+            }
             world
                 .admits
                 .lock()
@@ -804,4 +832,340 @@ async fn a_takeover_re_derives_instead_of_redispatching() {
         kian_superagent::job::outcome::RunOutcome::Succeeded
     );
     assert_eq!(harness.world.sends.lock().expect("sends").len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Crash windows (§17 W1–W8, §18.4 L2)
+//
+// Every window is simulated the same way: build the committed prefix a crash
+// at that point leaves behind, throw the conductor away, and drive a brand-new
+// one over exactly that prefix. W9 (the sweep settles the firing) lives on the
+// scheduler side and is covered by the cron settlement tests.
+// ---------------------------------------------------------------------------
+
+fn dispatch_count(harness: &Harness) -> usize {
+    status::dispatches(&harness.world.run_events()).len()
+}
+
+fn admit_count(harness: &Harness) -> usize {
+    harness.world.admits.lock().expect("admits").len()
+}
+
+fn step_verdict_count(harness: &Harness) -> usize {
+    status::verdicts(&harness.world.run_events()).len()
+}
+
+fn run_verdict_count(harness: &Harness) -> usize {
+    harness
+        .world
+        .run_events()
+        .into_iter()
+        .filter(|event| {
+            event.kind == EventKind::EvidenceVerdict
+                && event.bytes.get("gate").and_then(Value::as_str) == Some("run")
+        })
+        .count()
+}
+
+fn alert_count(harness: &Harness) -> usize {
+    harness.world.alerts.lock().expect("alerts").len()
+}
+
+/// One tick of a conductor that did not exist before this call.
+async fn fresh_tick(harness: &Harness) -> LoopOutcome {
+    let driver = harness.new_driver();
+    let mut stream = driver.drive(context(harness));
+    next_outcome(&mut stream).await
+}
+
+fn push_event(harness: &Harness, kind: EventKind, bytes: Value) {
+    let now = harness.world.now_ms();
+    let mut log = harness.world.run.lock().expect("the run log");
+    let seq = log.last().map(|event| event.seq + 1).unwrap_or(1);
+    log.push(event(harness.run, seq, kind, bytes, now));
+}
+
+#[tokio::test]
+async fn w1_before_the_claim_a_redrive_dispatches_exactly_once() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert_eq!(
+        harness.world.run_events().len(),
+        1,
+        "only the durable run row"
+    );
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1);
+    assert_eq!(admit_count(&harness), 1);
+    // A second conductor over the same prefix must not dispatch a second child.
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1);
+    assert_eq!(
+        admit_count(&harness),
+        1,
+        "the task key folds the repeat admit"
+    );
+}
+
+#[tokio::test]
+async fn w2_after_the_claim_before_any_dispatch_the_tick_dispatches_from_scratch() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    push_event(&harness, EventKind::DrainClaimed, json!({}));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1);
+    assert_eq!(admit_count(&harness), 1);
+    // Claims are engine state, not the conductor's: replay derives the same
+    // single dispatch and writes no verdict out of them.
+    assert!(status::verdicts(&harness.world.run_events()).is_empty());
+}
+
+#[tokio::test]
+async fn w3_a_record_without_a_child_is_recreated_with_the_same_ids() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    assert_eq!(admit_count(&harness), 1);
+
+    // The crash landed between the record and create_session: the child has
+    // no stream and no task row.
+    harness.world.children.lock().expect("children").clear();
+    harness.world.admits.lock().expect("admits").clear();
+    harness.world.admit_keys.lock().expect("keys").clear();
+
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1, "the record is not rewritten");
+    assert_eq!(admit_count(&harness), 1, "the same child is created again");
+    assert_eq!(
+        dispatched_child(&harness),
+        child,
+        "the ids derive from (run, step, attempt)"
+    );
+
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, child_stream(child, EndReason::Completed));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(step_verdict_count(&harness), 1, "the attempt settles once");
+}
+
+#[tokio::test]
+async fn w4_a_child_created_but_never_admitted_is_readmitted_with_the_same_key() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    // The spawner's idempotency key is thread-scoped, not task-scoped
+    // (crates/kian-superagent/src/worker.rs: admit keys on the thread id), and
+    // the thread id is derived from (run, step, attempt), so a re-admit
+    // reconstructs the same key.
+    let key = format!(
+        "thread:{}",
+        plan::child_thread_id(harness.run, plan::spawn_uid(harness.run, "fetch", 1))
+    );
+
+    // The crash landed between create_session and admit: the child stream has
+    // one session/created event and the inbox row is missing.
+    harness.world.admits.lock().expect("admits").clear();
+    harness.world.admit_keys.lock().expect("keys").clear();
+    let now = harness.world.now_ms();
+    harness.world.children.lock().expect("children").insert(
+        child,
+        vec![event(child, 1, EventKind::SessionCreated, json!({}), now)],
+    );
+
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1);
+    let admits = harness.world.admits.lock().expect("admits").clone();
+    assert_eq!(admits.len(), 1);
+    assert_eq!(
+        admits[0].2.as_deref(),
+        Some(key.as_str()),
+        "the task key is the idempotency key"
+    );
+
+    // A crash after the admit: the row is durable, so the repeat admit folds.
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(admit_count(&harness), 1, "first write wins");
+}
+
+#[tokio::test]
+async fn w5_an_admitted_child_that_never_drained_is_never_re_admitted() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    let now = harness.world.now_ms();
+    harness.world.children.lock().expect("children").insert(
+        child,
+        vec![
+            event(child, 1, EventKind::SessionCreated, json!({}), now),
+            event(
+                child,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "do the step"}),
+                now + 1,
+            ),
+        ],
+    );
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(dispatch_count(&harness), 1);
+    assert_eq!(
+        admit_count(&harness),
+        1,
+        "a durable row is not written twice"
+    );
+
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, child_stream(child, EndReason::Completed));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(step_verdict_count(&harness), 1);
+}
+
+#[tokio::test]
+async fn w6_a_child_mid_turn_is_only_observed() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    let now = harness.world.now_ms();
+    harness.world.children.lock().expect("children").insert(
+        child,
+        vec![
+            event(child, 1, EventKind::SessionCreated, json!({}), now),
+            event(
+                child,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "do the step"}),
+                now + 1,
+            ),
+            event(
+                child,
+                3,
+                EventKind::ToolCall,
+                json!({"call_id": "c1", "tool": "fetch", "args": {}}),
+                now + 2,
+            ),
+        ],
+    );
+    for _ in 0..2 {
+        assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    }
+    assert_eq!(dispatch_count(&harness), 1);
+    assert_eq!(admit_count(&harness), 1);
+    assert_eq!(
+        step_verdict_count(&harness),
+        0,
+        "a running child is not a verdict"
+    );
+
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, child_stream(child, EndReason::Completed));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(step_verdict_count(&harness), 1);
+}
+
+#[tokio::test]
+async fn w7_a_deliver_intent_without_a_receipt_is_never_resent() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, child_stream(child, EndReason::Completed));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(step_verdict_count(&harness), 1);
+
+    // The crash landed after the send intent and before the adapter returned.
+    push_event(
+        &harness,
+        EventKind::ToolCall,
+        json!({
+            "call_id": "job:deliver:notify:1",
+            "tool": "reply",
+            "args": {
+                "channel": "mock-im",
+                "target": {"handle": "owner"},
+                "content": {"text": "the digest"},
+            },
+        }),
+    );
+
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let verdicts = status::verdicts(&harness.world.run_events());
+    assert_eq!(verdicts.len(), 2);
+    assert_eq!(verdicts[1].step, "notify");
+    assert_eq!(
+        verdicts[1].outcome,
+        Some(kian_superagent::job::outcome::AttemptOutcome::NeedsOperator),
+        "an unknown send outcome is needs_operator, never a silent retry"
+    );
+    assert!(
+        harness.world.sends.lock().expect("sends").is_empty(),
+        "the adapter is not called again"
+    );
+
+    match fresh_tick(&harness).await {
+        LoopOutcome::SoftFailed { reason } => assert_eq!(reason, JOB_FAILED_REASON),
+        other => panic!("the run must fail, not {other:?}"),
+    }
+    assert_eq!(run_verdict_count(&harness), 1);
+    assert_eq!(alert_count(&harness), 1);
+
+    // A re-drive of the ended stream writes nothing new.
+    assert!(matches!(
+        fresh_tick(&harness).await,
+        LoopOutcome::SoftFailed { .. }
+    ));
+    assert_eq!(run_verdict_count(&harness), 1);
+    assert_eq!(alert_count(&harness), 1);
+}
+
+#[tokio::test]
+async fn w8_committed_verdicts_without_an_end_settle_the_run_once() {
+    let harness = harness(vec![online(WORKER, &["net.unrestricted"])], None);
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, child_stream(child, EndReason::Failed));
+    assert!(matches!(fresh_tick(&harness).await, LoopOutcome::TurnDone));
+    assert_eq!(step_verdict_count(&harness), 1);
+    assert_eq!(
+        run_verdict_count(&harness),
+        0,
+        "the crash left no run verdict"
+    );
+    assert_eq!(alert_count(&harness), 0);
+
+    match fresh_tick(&harness).await {
+        LoopOutcome::SoftFailed { reason } => assert_eq!(reason, JOB_FAILED_REASON),
+        other => panic!("the run must fail, not {other:?}"),
+    }
+    assert_eq!(run_verdict_count(&harness), 1);
+    assert_eq!(alert_count(&harness), 1);
+
+    // The run verdict is the truth a re-drive reads: no second one, no second
+    // alert, no rewritten step verdict.
+    assert!(matches!(
+        fresh_tick(&harness).await,
+        LoopOutcome::SoftFailed { .. }
+    ));
+    assert_eq!(run_verdict_count(&harness), 1);
+    assert_eq!(step_verdict_count(&harness), 1);
+    assert_eq!(alert_count(&harness), 1);
 }

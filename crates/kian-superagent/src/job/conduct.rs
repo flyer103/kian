@@ -413,7 +413,17 @@ async fn tick(port: &Arc<dyn RunPort>, deps: &JobDeps) -> Tick {
     }
 
     if let Some((step, attempt)) = in_flight(plan, &facts) {
-        return observe(port, deps, &marker, &dispatches, step, attempt, now).await;
+        return observe(
+            port,
+            deps,
+            &marker,
+            &dispatches,
+            &events,
+            step,
+            attempt,
+            now,
+        )
+        .await;
     }
 
     let halted = run_halted(plan, &facts);
@@ -855,13 +865,14 @@ async fn finish_invalid_input(port: &Arc<dyn RunPort>, err: status::MarkerError)
     Tick::finish(LoopOutcome::SoftFailed { reason })
 }
 
-/// Watch the one in-flight attempt (§8.5).
+/// Watch the one in-flight attempt (§8.5, §17 W3–W6).
 #[allow(clippy::too_many_arguments)]
 async fn observe(
     port: &Arc<dyn RunPort>,
     deps: &JobDeps,
     marker: &status::JobMarker,
     dispatches: &[DispatchRecord],
+    events: &[Event],
     step: &StepPlan,
     attempt: u32,
     now: u64,
@@ -891,7 +902,7 @@ async fn observe(
     };
     let timeout_at = record.at_ms.saturating_add(step.timeout_ms);
     let child = match deps.streams.read_stream(record.child).await {
-        Ok(events) => events,
+        Ok(child) => child,
         Err(err) => {
             if now >= timeout_at {
                 let gate = failed_gate(
@@ -901,11 +912,31 @@ async fn observe(
                 );
                 return settle_step(port, step, attempt, gate, AttemptOutcome::TimedOut).await;
             }
-            return Tick::park(deps.clamp_wait(timeout_at.saturating_sub(now)));
+            // W3: the record is the placement decision (J3) and the child ids
+            // derive from (run, step, attempt), so the very same child is
+            // created again. Nothing is re-selected.
+            return readmit_child(port, deps, marker, events, step, attempt, record).await;
         }
     };
     if let Some(reason) = end_reason(&child) {
         return settle_agent(port, marker, step, attempt, &child, reason).await;
+    }
+    if !child_started(&child) {
+        if now >= timeout_at {
+            let gate = failed_gate(
+                attempt,
+                TIMEOUT_CHECK,
+                Some(format!(
+                    "attempt {attempt} never started within {} ms",
+                    step.timeout_ms
+                )),
+            );
+            return settle_step(port, step, attempt, gate, AttemptOutcome::TimedOut).await;
+        }
+        // W4/W5: the child exists but was never admitted, or its wake was
+        // lost. The task key makes the re-admit a no-op when the row is
+        // already durable, so a crash on either side of the admit is safe.
+        return readmit_child(port, deps, marker, events, step, attempt, record).await;
     }
     if now >= timeout_at {
         let gate = failed_gate(
@@ -919,6 +950,75 @@ async fn observe(
         return settle_step(port, step, attempt, gate, AttemptOutcome::TimedOut).await;
     }
     Tick::park(deps.clamp_wait(timeout_at.saturating_sub(now)))
+}
+
+/// Re-drive the child of a recorded attempt that never started (§17 W3/W4).
+///
+/// The record fixed the placement, so the worker is not chosen again; the ids
+/// derive from (run, step, attempt), so prepare yields the same thread and
+/// session. admit is idempotent on the task key: a second call after the row
+/// landed is a no-op, and create_session returns early when the stream exists.
+async fn readmit_child(
+    port: &Arc<dyn RunPort>,
+    deps: &JobDeps,
+    marker: &status::JobMarker,
+    events: &[Event],
+    step: &StepPlan,
+    attempt: u32,
+    record: &DispatchRecord,
+) -> Tick {
+    let task = match child_task_text(deps, marker, events, step, attempt).await {
+        Ok(task) => task,
+        Err(detail) => {
+            let gate = failed_gate(attempt, INPUT_CHECK, Some(detail));
+            return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+        }
+    };
+    let run_session = port.session();
+    let spawn = crate::job::plan::spawn_uid(run_session, &step.id, attempt);
+    let thread_id = crate::job::plan::child_thread_id(run_session, spawn);
+    let request = SpawnRequest {
+        task: Value::String(task),
+        correlation: None,
+        speculative: false,
+        mandate: None,
+        exec_worker: Some(record.worker.clone()),
+        identity: Some(SpawnIdentity {
+            spawn_uid: spawn,
+            thread_id,
+            task_id: crate::job::plan::step_task_id(run_session, &step.id, attempt),
+            agent_def: deps.spawner.worker_template_id().to_string(),
+            agent_def_version: deps.spawner.pinned_version(),
+            assignee: None,
+        }),
+        output_schema: step.output_schema.clone(),
+        parent: Some(run_session),
+    };
+    let spawned = deps.spawner.prepare(&request);
+    if spawned.worker_session != record.child || thread_id != record.thread_id {
+        let gate = failed_gate(
+            attempt,
+            DISPATCH_CHECK,
+            Some("the recorded dispatch does not name the child its ids derive".to_string()),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    }
+    if let Err(err) = deps.spawner.admit(&spawned).await {
+        let gate = failed_gate(
+            attempt,
+            DISPATCH_CHECK,
+            Some(format!("the child could not be admitted: {err}")),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    }
+    Tick::park(JOB_TICK_MIN_MS)
+}
+
+/// Whether the child ever took a turn of its own (§17 W5).
+fn child_started(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| event.kind == EventKind::InputAdmitted)
 }
 
 fn end_reason(events: &[Event]) -> Option<EndReason> {

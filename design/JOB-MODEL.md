@@ -1615,14 +1615,20 @@ truth table is `crates/kian-superagent/src/job/placement.rs`; the two lattices a
 `crates/kian-cli/tests/job_event_registry.rs`; config lowering and the `target.job` refusal are
 `crates/kian-cli/src/job_config.rs` and `cron_targets_refuse_a_job_key`; the three delivery
 dispositions (`Ok` → `succeeded`, `Timeout` → `needs_operator`, any other error → `failed`) are
-`crates/kian-superagent/tests/job_conductor.rs`. Two rows are narrower than written, and that is the
+`crates/kian-superagent/tests/job_conductor.rs`. One row is narrower than written, and that is the
 truthful unverified list for this slice:
 
-- **The crash row is not a process-kill harness.** W1–W8 have no kill-at-each-window driver. The
-  property the row exists to prove — a takeover re-derives its next step from committed events and
-  never re-dispatches — is proved in-process by a second conductor over the same committed stream
-  (`job_conductor.rs::a_takeover_re_derives_instead_of_redispatching`), and a run admitted before the
-  server starts is drained by the startup rebuild in the L3 test. A kill harness remains open.
+- **The crash row is deterministic windows, not OS kills.** `w1..w8_*` in
+  `crates/kian-superagent/tests/job_conductor.rs` each build the *committed prefix a crash at that
+  window leaves behind*, discard the conductor and drive a brand-new one over exactly that prefix:
+  W1–W2 dispatch exactly once; W3 recreates the recorded child with the same derived ids; W4 re-admits
+  with the same thread-scoped idempotency key and W5 never re-admits a durable row; W6 only observes;
+  W7 settles `needs_operator` and never resends; W8 settles the run once, with one run verdict and one
+  alert, and a repeat re-drive writes nothing new. W3/W4 required a real recovery path in the
+  conductor (`observe` → `readmit_child`), not just a test. W9 is scheduler side and is covered by
+  the cron settlement tests. What the harness does not do is kill a process at an arbitrary
+  instruction (signals and timing would make the suite flaky); "any instruction" rests on the
+  argument that every decision reads committed events (constraint 13) plus these windows.
 - **The L3 rows are partial.** `crates/kian-cli/tests/job_run_e2e.rs` exercises a real server, the
   real CLI admit path and a real channel adapter, but with a **deliver-only** plan: no real worker
   and no iMessage adapter. The worker-fallback scenario (selected worker goes offline, next
