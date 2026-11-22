@@ -3,8 +3,9 @@
 # One process, one sqlite file. An iMessage conversation is the whole
 # interface: the owner texts a task, the Router judges it, an executor
 # worker runs it under a Mandate, and the result comes back in the same
-# conversation. Nothing here answers a pending `ask` from the phone —
-# that is CONFIRMATION-MODEL phase 3, still unstarted.
+# conversation. Add `confirm_answers.channels: [phone]` (and an `ask`
+# permission) to also answer a pending confirmation from the phone with
+# `approve <code>` — CONFIRMATION-MODEL §14d; off by default.
 #
 # Prerequisites (design/runbook-imessage.md §2/§3): a Mac signed into a
 # dedicated Apple ID running `kian-imessage-bridge`, a private transport
@@ -77,6 +78,11 @@ superagent:
   # number, so the model is told what the policy enforces; a reply
   # answering 详情 is delivered whole regardless (DESIGN §4.2).
   im: { reply_units: 300 }
+  # CONFIRMATION-MODEL §14d: opt in to answering a pending `ask` from the
+  # phone with `approve <code>` / `reject <code> <reason>`. Absent = off;
+  # the line is intercepted before the model, never parsed by it. Needs an
+  # `ask` permission on a worker tool (see docs/advanced.md).
+  # confirm_answers: { channels: [phone] }
   classes:
     # topics is the allowlist; this is the second gate, and the shape to
     # copy when one handle should only be judged on request

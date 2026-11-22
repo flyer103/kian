@@ -511,8 +511,48 @@ The session goes `idle` with end reason `awaiting_input`; `kian pending <uuid>` 
 `kian confirm <uuid> <call-id> --approve|--reject` answers it (or the `confirm`/`pending` RPCs).
 Approving invokes the frozen call and appends its result; rejecting appends the honest error.
 Contract: [CONFIRMATION-MODEL](../design/CONFIRMATION-MODEL.md)
-([ADR-036](../design/decisions/ADR-036-durable-confirmation-plane.md)). Phase 1 supports plain
-sessions — `ask` on a superagent worker agent refuses to start until phase 2.
+([ADR-036](../design/decisions/ADR-036-durable-confirmation-plane.md)). `ask` works on plain
+sessions and, since phase 2, on worker agents: a waiting worker ends `awaiting_input` without a
+completion report and keeps its thread, so the answer resumes the same session (resident Router
+agents still refuse `ask`).
+
+A decision can also arrive **through a channel** — the point of this for a phone-side setup is that
+the reply never reaches the model:
+
+```yaml
+superagent:
+  confirm_answers:
+    channels: [phone]        # absent or empty = off; one channel per line
+```
+
+with a channel that is declared in `superagent.channels` and whose `type` is `imessage` or
+`mock-im` (the boot refuses anything else, and refuses a channel that is admitted as
+`class: ignore`). The owner then answers a pending call with a message the intercept consumes:
+
+```
+approve q7k2mf
+reject  q7k2mf   the target path is wrong
+```
+
+- the six-character code is derived from `(session, tool/call seq, call id)` — it is a correlation
+  token, not a secret. The authority is the **sender handle**: the channel allowlist already
+  refused every other sender before the event existed, so a leaked code approves nothing;
+- a well-formed code that names no pending call is dropped and audited (`reason=answer_no_match`),
+  never forwarded as a task; a message that merely *starts* with a verb — or whose second word is
+  not a code (`同意，但先把 X 改一下`, `approve abc123`) — is ordinary input, because dropping a
+  person's words would lose real work and free text is never a decision; the Router is told to
+  treat "it's approved" as a request to check, never as an assertion;
+- the write goes through the same `confirm` seam the CLI/RPC use (`control/confirm` plus the
+  `tool/result.confirmation` stamp), so TTL expiry, `not_pending` and archived-session outcomes are
+  identical;
+- with the key set, the Router additionally gets a read-only `pending_decisions` tool (it lists the
+  open calls with their codes) and a frozen prompt line: never assert a confirmation happened, treat
+  free text as a request to check. The reply's own transport is still the only place the text could
+  be recorded — the command is not persisted, by design.
+
+Contract: [CONFIRMATION-MODEL §14d](../design/CONFIRMATION-MODEL.md#14d-phase-3a--channel-answers-closed-vocabulary-landed)
+and [ADR-051](../design/decisions/ADR-051-channel-answers.md).
+
 ## Hook plugins (`sidecars:`)
 
 Operator-trusted sidecar processes subscribe to harness hooks over a stdio JSON-lines ABI

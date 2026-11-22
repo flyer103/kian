@@ -97,6 +97,30 @@ pub enum RoutingOutcome {
     /// target — no inbox row anywhere, one audit line, and the sender
     /// is not told in v1 (§16.15). A redelivery is re-vetoed (§8.6).
     RefusedByHook { plugin: String, reason: String },
+    /// An inbound message on an answers-enabled channel resolved to a
+    /// pending call and was submitted to the confirmation plane
+    /// (CONFIRMATION-MODEL §14d): exactly one `control/confirm` row
+    /// when `applied` is `accepted`; no row at all when the race (or
+    /// the TTL) already settled the call. Never an inbox row — the
+    /// model never sees an answer.
+    Answered {
+        session: SessionId,
+        call_id: String,
+        decision: kian_core::control::ConfirmDecision,
+        applied: crate::answers::AnswerOutcome,
+    },
+    /// Command-shaped input (a closed verb plus a code-shaped token)
+    /// that matched no live pending decision: dropped and audited,
+    /// never admitted — a typo cannot become a Router instruction.
+    DroppedAnswerNoMatch,
+    /// Command-shaped input whose code matched two or more pending
+    /// calls (a derivation collision): dropped and audited, never
+    /// guessed at.
+    DroppedAnswerAmbiguous,
+    /// The code resolved but the confirmation write failed; nothing
+    /// was decided. The audit line carries the error; a retry is
+    /// idempotent at the `(session, call_id)` key.
+    DroppedAnswerWriteFailed,
 }
 
 /// One subscriber's admission inside a [`RoutingOutcome::FannedOut`].
@@ -159,6 +183,10 @@ pub struct SubscriptionService {
     /// is shaped and before the first inbox row. `None` (default)
     /// consults nothing — byte-identical fan-out behavior.
     hooks: Option<kian_plugin::hooks::HookBus>,
+    /// the answer surface (CONFIRMATION-MODEL §14d). `None` (the
+    /// default) keeps the intake byte-identical: no channel may answer
+    /// a pending `ask` and no interceptor runs.
+    answers: Option<crate::answers::AnswerSurface>,
 }
 
 impl SubscriptionService {
@@ -179,6 +207,7 @@ impl SubscriptionService {
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
             hooks: None,
+            answers: None,
         }
     }
 
@@ -203,6 +232,7 @@ impl SubscriptionService {
             registry: Arc::new(RwLock::new(PassthroughRegistry::new())),
             inbox,
             hooks: None,
+            answers: None,
         }
     }
 
@@ -212,6 +242,17 @@ impl SubscriptionService {
     /// `admit/post` fires per admitted target after its row is durable.
     pub fn with_hook_bus(mut self, hooks: kian_plugin::hooks::HookBus) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Mounts the answer surface (CONFIRMATION-MODEL §14d): on the
+    /// configured channels, a message whose whole text is a closed
+    /// command (`approve <code>` / `reject <code> [reason]`) is
+    /// intercepted here — before the admission class, before the rule
+    /// set, before any model call — and written as a `control/confirm`
+    /// row through the assembly's [`crate::answers::AnswerPort`].
+    pub fn with_answers(mut self, answers: crate::answers::AnswerSurface) -> Self {
+        self.answers = Some(answers);
         self
     }
 
@@ -319,6 +360,133 @@ impl SubscriptionService {
             .clone()
     }
 
+    /// Tries the answer surface (CONFIRMATION-MODEL §14d). `None` means
+    /// "not an answer": the event falls through to the ordinary intake
+    /// path unchanged. `Some` means the event was consumed here — it
+    /// never becomes an inbox row.
+    async fn answer_attempt(
+        &self,
+        event: &ChannelEvent,
+    ) -> Option<Result<RoutingOutcome, InboxWriteError>> {
+        let surface = self.answers.as_ref()?;
+        if !surface.covers(&event.channel) {
+            return None;
+        }
+        let text = crate::answers::message_text(event)?;
+        let command = match crate::answers::parse_answer(text) {
+            crate::answers::ParseOutcome::None => return None,
+            crate::answers::ParseOutcome::Command(command) => command,
+        };
+        // The answer is scoped to the conversation the message arrived
+        // on: the candidates are that topic's live subscribers, rebuilt
+        // from the stream at startup (constraint 1). No topic, no
+        // candidates — fail closed, never a global scan.
+        let Some(topic) = event.topic.as_deref() else {
+            info!(
+                target: "kian::subscriptions",
+                channel = %event.channel,
+                event_id = %event.event_id,
+                reason = %IntakeReason::AnswerNoMatch.code(),
+                "subscription audit: command-shaped message dropped (no topic)"
+            );
+            return Some(Ok(RoutingOutcome::DroppedAnswerNoMatch));
+        };
+        let workers: Vec<SessionId> = {
+            let registry = self.registry.read().expect("passthrough registry lock");
+            registry.resolve_live(topic).into_iter().collect()
+        };
+        let mut hits: Vec<(SessionId, String)> = Vec::new();
+        for worker in workers {
+            match surface.matches(worker, &command.code).await {
+                Ok(call_ids) => {
+                    hits.extend(call_ids.into_iter().map(|call_id| (worker, call_id)));
+                }
+                Err(error) => warn!(
+                    target: "kian::subscriptions",
+                    worker = %worker.0,
+                    error = %error,
+                    "answer surface: pending-set read failed on this worker"
+                ),
+            }
+        }
+        match hits.len() {
+            0 => {
+                info!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    topic = %topic,
+                    reason = %IntakeReason::AnswerNoMatch.code(),
+                    "subscription audit: command-shaped message matched no pending decision"
+                );
+                Some(Ok(RoutingOutcome::DroppedAnswerNoMatch))
+            }
+            1 => {
+                let (worker, call_id) = hits.remove(0);
+                let principal = answer_principal(event);
+                let applied = match surface
+                    .submit(
+                        worker,
+                        call_id.clone(),
+                        command.decision,
+                        command.reason,
+                        principal.clone(),
+                    )
+                    .await
+                {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        warn!(
+                            target: "kian::subscriptions",
+                            worker = %worker.0,
+                            call_id = %call_id,
+                            error = %error,
+                            "answer surface: confirmation write failed"
+                        );
+                        info!(
+                            target: "kian::subscriptions",
+                            channel = %event.channel,
+                            event_id = %event.event_id,
+                            call_id = %call_id,
+                            reason = %IntakeReason::AnswerWriteFailed.code(),
+                            "subscription audit: channel answer could not be written"
+                        );
+                        return Some(Ok(RoutingOutcome::DroppedAnswerWriteFailed));
+                    }
+                };
+                info!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    worker = %worker.0,
+                    call_id = %call_id,
+                    decision = command.decision.as_str(),
+                    applied = applied.code(),
+                    principal = %principal,
+                    reason = %IntakeReason::AnswerApplied.code(),
+                    "subscription audit: channel answer submitted to the confirmation plane"
+                );
+                Some(Ok(RoutingOutcome::Answered {
+                    session: worker,
+                    call_id,
+                    decision: command.decision,
+                    applied,
+                }))
+            }
+            _ => {
+                info!(
+                    target: "kian::subscriptions",
+                    channel = %event.channel,
+                    event_id = %event.event_id,
+                    matches = hits.len(),
+                    reason = %IntakeReason::AnswerAmbiguous.code(),
+                    "subscription audit: command-shaped message matched several pending decisions"
+                );
+                Some(Ok(RoutingOutcome::DroppedAnswerAmbiguous))
+            }
+        }
+    }
+
     /// Handles one inbound channel event: rule match → route →
     /// durable admit (idempotent per `(session, event_id)`) → wake.
     ///
@@ -332,6 +500,17 @@ impl SubscriptionService {
         &self,
         event: ChannelEvent,
     ) -> Result<RoutingOutcome, InboxWriteError> {
+        // The answer surface runs first (CONFIRMATION-MODEL §14d): a
+        // command-shaped message on a channel that opted in is either
+        // applied to a pending call or dropped — it is never admitted,
+        // so no prompt can reinterpret an answer. The admission-class
+        // gate below cannot be reached by an answer: the boot
+        // validation refuses a channel that is both an answer channel
+        // and `class: ignore`.
+        if let Some(outcome) = self.answer_attempt(&event).await {
+            return outcome;
+        }
+
         // Fast Path first: the admission class over provenance
         // decides in code, before the rule set and before any model
         // call could be spent. `Candidate` (and an absent table) falls
@@ -709,6 +888,19 @@ impl SubscriptionService {
             })
             .collect()
     }
+}
+
+/// The provenance of an answer, recorded as `control/confirm`'s
+/// `requested_by` (CONFIRMATION-MODEL §14d X4): the channel, the
+/// adapter-reported sender and the channel event id. The message text
+/// itself is never persisted.
+fn answer_principal(event: &ChannelEvent) -> String {
+    let sender = match event.sender.as_ref() {
+        Some(serde_json::Value::String(sender)) => sender.clone(),
+        Some(other) => other.to_string(),
+        None => "unknown".to_string(),
+    };
+    format!("{}:{}:{}", event.channel, sender, event.event_id)
 }
 
 #[cfg(test)]

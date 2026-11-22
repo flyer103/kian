@@ -64,11 +64,23 @@ pub enum IntakeReason {
     /// Reserved for: an all-ended subscriber set falls back to the
     /// Router as a *release to fresh evaluation*, not a plain admit.
     ReleasedToEval,
+    /// A channel answer resolved a pending `ask` and was submitted to
+    /// the confirmation plane (CONFIRMATION-MODEL §14d).
+    AnswerApplied,
+    /// Command-shaped input that matched no live pending decision
+    /// (wrong code, a lapsed conversation, or a malformed code).
+    AnswerNoMatch,
+    /// Command-shaped input whose code matched several pending calls
+    /// (a derivation collision — never guessed at).
+    AnswerAmbiguous,
+    /// The code resolved but the confirmation write failed; nothing was
+    /// decided.
+    AnswerWriteFailed,
 }
 
 impl IntakeReason {
     /// The closed set, in declaration order (snapshot shape).
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::NoRule,
         Self::ClassIgnored,
         Self::NotExplicit,
@@ -76,6 +88,10 @@ impl IntakeReason {
         Self::AdmittedPassthrough,
         Self::Deduplicated,
         Self::ReleasedToEval,
+        Self::AnswerApplied,
+        Self::AnswerNoMatch,
+        Self::AnswerAmbiguous,
+        Self::AnswerWriteFailed,
     ];
 
     /// The stable machine code — identical to the serde name, and the
@@ -90,6 +106,10 @@ impl IntakeReason {
             Self::AdmittedPassthrough => "admitted_passthrough",
             Self::Deduplicated => "deduplicated",
             Self::ReleasedToEval => "released_to_eval",
+            Self::AnswerApplied => "answer_applied",
+            Self::AnswerNoMatch => "answer_no_match",
+            Self::AnswerAmbiguous => "answer_ambiguous",
+            Self::AnswerWriteFailed => "answer_write_failed",
         }
     }
 
@@ -104,6 +124,10 @@ impl IntakeReason {
             Self::AdmittedPassthrough => "admitted directly without Router judgment",
             Self::Deduplicated => "deduplicated against the existing row",
             Self::ReleasedToEval => "released to a fresh evaluation",
+            Self::AnswerApplied => "answer applied to a pending confirmation",
+            Self::AnswerNoMatch => "dropped: command-shaped, no pending decision matched",
+            Self::AnswerAmbiguous => "dropped: command-shaped, several pending decisions matched",
+            Self::AnswerWriteFailed => "dropped: the confirmation write failed",
         }
     }
 }
@@ -203,5 +227,9 @@ pub fn outcome_reasons(outcome: &RoutingOutcome, router: SessionId) -> Vec<Intak
             .iter()
             .map(|a| routed_reason(a.session, router, a.deduplicated))
             .collect(),
+        RoutingOutcome::Answered { .. } => vec![IntakeReason::AnswerApplied],
+        RoutingOutcome::DroppedAnswerNoMatch => vec![IntakeReason::AnswerNoMatch],
+        RoutingOutcome::DroppedAnswerAmbiguous => vec![IntakeReason::AnswerAmbiguous],
+        RoutingOutcome::DroppedAnswerWriteFailed => vec![IntakeReason::AnswerWriteFailed],
     }
 }

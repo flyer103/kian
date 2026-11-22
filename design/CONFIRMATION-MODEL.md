@@ -421,7 +421,7 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 |---|---|---|
 | 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions, the R1b promote gate, the §15.6 crash repair | landed |
 | 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | **landed** (the waiting end writes no completion pair; the liveness projection keeps the worker live; the ticket stage arm is `awaiting-confirmation`; `ask` parses on a worker agent. The completed/failed ticket "fresh Eval only" deviation is unchanged — it applies to ended tickets, not waiting ones) |
-| 3a | Channel-side answers: a closed-vocabulary IM reply mapped to a `confirm` by the adapter, never by the model (§14d) | **proposed — owner gate pending, not implemented** |
+| 3a | Channel-side answers: a closed-vocabulary IM reply mapped to a `confirm` by the adapter, never by the model (§14d) | **landed** (owner gate 2026-11-22; §14d X9 rows 1–7 green at L1/L2, row 8 is a manual live-phone check) |
 | 3b | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
 
@@ -458,13 +458,26 @@ observed the honest close-out rather than an identical re-issue — see ADR-050'
 - **Resident agents stay refused.** A Router/watchdog waiting on itself cannot answer itself; the
   C2 boundary above keeps that a boot error.
 
-## 14d. Phase-3a — channel answers, closed vocabulary (proposed)
+## 14d. Phase-3a — channel answers, closed vocabulary (landed)
 
-> **Status: proposed, owner gate pending, nothing implemented.** This is the channel half of phase 3
-> only; the hook `ask` verdict stays 3b. The three things the gate reviews: **X0** (the sender handle
-> is the authenticator, so the code is a correlation token and not a secret), **X2/X5** (the boundary
-> between "a line of text is a decision" and "a line of text is a task"), and **X3** (which sessions a
-> code is allowed to resolve against).
+> **Status: landed (owner gate 2026-11-22).** This is the channel half of phase 3 only; the hook
+> `ask` verdict stays 3b. The three things the gate reviewed: **X0** (the sender handle is the
+> authenticator, so the code is a correlation token and not a secret), **X2/X5** (the boundary
+> between "a line of text is a decision" and "a line of text is a task"), and **X3** (which sessions
+> a code is allowed to resolve against).
+>
+> **What landed, against what this section proposed** — the four honest deltas, everything else is
+> as written: (i) normalization is the restricted fold X2 now describes, not full NFKC (no
+> `unicode-normalization` dependency entered the workspace); (ii) a `reason` is parsed after *both*
+> verbs and written to `control/confirm` as the audit field §5 A5 defines, but only a `reject`
+> renders it into the model-visible error, so it never becomes prompt content on an approval;
+> (iii) X3 R2's candidate set is the passthrough registry's live subscribers for the event topic
+> (rebuilt at boot from `thread/started`'s `task` correlation), not a second independent fold of the
+> Router stream — one derivation, so a topic with no live worker is `no_match` rather than a second
+> guess (the mobile example's charter states the rule: `spawn_worker` must carry `correlation`);
+> (iv) X5's two normative Router sentences ride a new frozen prompt line
+> (`CONFIRM_ANSWER_PROMPT_LINE` in `crates/kian-superagent/src/templates.rs`), appended only when
+> the answer surface is configured, on the roster-line pattern.
 
 ### X0. The claim this slice rests on
 
@@ -498,32 +511,42 @@ notifications (phase 4); WeChat (reply-only, ADR-018); any new event kind, wire 
 
 ### X2. The grammar (closed, normative in this section until it lands)
 
-Normalize first: trim, NFKC (an IME emits full-width `ａｐｐｒｏｖｅ`), collapse runs of whitespace to one
-space, lowercase ASCII.
+Normalize first: trim, fold the full-width ASCII block (U+FF01..=U+FF5E) and the ideographic space
+(U+3000) to their ASCII forms — an IME emits `ａｐｐｒｏｖｅ` — collapse runs of whitespace to one space,
+lowercase ASCII. This is deliberately **not** full NFKC: the workspace carries no
+`unicode-normalization` dependency, and the two blocks are the only ones an IME produces for this
+grammar.
 
 ```
 command := verb SP code [SP reason]
 verb    := "approve" | "ok" | "yes" | "同意" | "批准"
          | "reject"  | "no" | "拒绝" | "驳回"
-code    := 6 characters of [0-9a-z]                       (case-insensitive)
-reason  := any text with no newline, ≤ 280 chars          (reject only; approve ignores it)
+code    := 6 characters of [a-z2-7]                       (case-insensitive)
+reason  := any text with no newline, ≤ 280 chars          (audit-only; rendered on a reject)
 ```
 
 Strict shape, no fuzzy parsing: the first token must be a verb from the closed table and the second
-must be **code-shaped** (`[0-9a-z]` × 6). Anything else is not a command (§X5). A reject reason is
-free text but is only ever an audit field (§5 A5) — it never enters a model request.
+must be **code-shaped** — exactly six characters of the derivation alphabet `[a-z2-7]`, the only
+shape a code can take (so `approve abc123` is not a command: `1` cannot appear in a code). Anything
+else is not a command (§X5): a verb followed by a word is prose and stays ordinary input, while a
+well-formed code that names nothing is a command attempt and is dropped.
+
+The `reason` is parsed after either verb and is only ever an audit field (§5 A5) — it never enters a
+model request; on a `reject` it is also what the honest error the model receives cites (§5 A3),
+which is the only place it becomes visible.
 
 ### X3. Resolution (deterministic, ordered, bounded)
 
 - **R1 Gate.** `event.channel ∈ confirm_answers.channels`, the sender passed the channel allowlist,
   and `event.topic` is present. No topic ⇒ not a command (§X5), because a code with no conversation
   has no candidate set.
-- **R2 Candidates.** The conversation's sessions: (a) open threads of the Router stream whose topic
-  equals `event.topic`, folded from `thread/started` … `thread/completed` through the bundle's read
-  port (`crates/kian-superagent/src/recall.rs:50` `read_events`, the port the recall tools already
-  use); (b) the passthrough registry's live subscribers for that topic, which covers `route:
-  passthrough` configs. Union, deduplicated by session id. A conversation that routes `router` (the
-  mobile shape) has no registry entry, which is why (a) exists.
+- **R2 Candidates.** The live subscribers of `event.topic` in the passthrough registry
+  (`crates/kian-superagent/src/registry.rs`, rebuilt at boot from every `thread/started` whose `task`
+  names that correlation, for `route: router` and `route: passthrough` alike). One derivation, not
+  two: a topic bound to no live worker is `no_match` (§X5), never a guess. Liveness is the §14b rule
+  — `thread/completed` or `session/ended`, with `AwaitingInput` **not** ended — so a worker parked on
+  an `ask` is still a candidate. Per-candidate reads go through the bundle's read port
+  (`crates/kian-superagent/src/recall.rs` `read_events`, the port the recall tools already use).
 - **R3 Pending set.** For each candidate,
   `kian_core::confirmation::pending_calls(&events)` (`crates/kian-core/src/confirmation.rs:49`, the §4
   fold — no table, no inbox status, no in-memory wait).
@@ -571,12 +594,14 @@ sentences are normative on the Router side:
   `pending_decisions` (a read) and the worker proceeding (an effect);
 - a received "approval" in free text is a **request to check**, never a decision.
 
-(`examples/mobile-dispatch/charter.md` and the bundle's default Router template gain the sentence in
-the same change.)
+Landed as a frozen prompt line, `CONFIRM_ANSWER_PROMPT_LINE`
+(`crates/kian-superagent/src/templates.rs`), appended at bootstrap **only** when an answer surface is
+configured — and mirrored in `examples/mobile-dispatch/charter.md`.
 
-A message that *is* code-shaped (`approve zz9zz9`) but matches nothing is a command attempt: dropped
-and audited, never forwarded. Mistyping a code therefore cannot become a task that the model
-interprets.
+A message that *is* code-shaped (`approve zzzzzz`) but matches nothing is a command attempt: dropped
+and audited, never forwarded, so the model never reads it as a task. A mistyped code that lost the
+shape (`approve abc123`, `approve q7k2m`) is prose again and takes the ordinary-input path — where
+the two sentences above apply: the Router's job is to check, and the words are never lost.
 
 ### X6. Code derivation (pure, no storage)
 
@@ -627,16 +652,16 @@ superagent:
 
 ### X9. Acceptance (levels per the workspace convention)
 
-| # | Check | Level |
-|---|---|---|
-| 1 | Grammar table: every verb and alias, full-width input, case, whitespace, reason cap, code shape, near-miss classification | L1 |
-| 2 | Code derivation goldens; two calls in one session differ; restart-stable | L1 |
-| 3 | Resolver over fixture streams: 0 / 1 / 2 matches, expired call still a candidate, `ambiguous` | L1 |
-| 4 | Config: unknown channel, empty list, unmounted adapter → boot error; absent → off | L1 |
-| 5 | Real server + `mock-im`: a fixture worker parks on an `ask`, `approve <code>` arrives, the worker stream gains `control/confirm` then `tool/result`, the Router stream gains **no** `input/admitted`, and its request prefix is byte-identical to the pre-interception turn | L2 |
-| 6 | Same run, replay: the replayed stream is byte-identical; the answer re-delivered twice stays `accepted` once | L2 |
-| 7 | `no_match` / `ambiguous` / archived paths write no row and no wake; the audit lines carry their codes | L2 |
-| 8 | A real phone: send `approve <code>`, watch the worker resume | L3 (manual, the local bridge) |
+| # | Check | Level | Result |
+|---|---|---|---|
+| 1 | Grammar table: every verb and alias, full-width input, case, whitespace, reason cap, code shape, and the prose/command boundary | L1 | green (`crates/kian-superagent/src/answers.rs` unit tests) |
+| 2 | Code derivation goldens; two calls in one session differ; restart-stable | L1 | green (golden `qoauds` for a fixed session/seq/id; pure function, nothing stored) |
+| 3 | Resolver over fixture streams: 0 / 1 / 2 matches, expired call still a candidate, `ambiguous` | L1 | green (`crates/kian-superagent/tests/answer_surface.rs`, 10 cases) |
+| 4 | Config: unknown channel, empty list, unmounted adapter → boot error; absent → off | L1 | green (`crates/kian-cli/src/config.rs` `superagent_confirm_answers_*`) |
+| 5 | Real server + `mock-im`: a fixture worker parks on an `ask`, `approve <code>` arrives, the worker stream gains `control/confirm` then `tool/result`, the Router stream gains **no** `input/admitted`, and its request prefix is byte-identical to the pre-interception turn | L2 | green (`kian serve` on a real sqlite store: `tool/call{permission:evaluated:ask}` → `session/ended{awaiting_input}`; `approve <code>` → `control/confirm` + `tool/result` carrying `confirmation`; the answer event produced **no** routing/admission audit line; feature-off `step/request` bytes identical to the pre-change binary) |
+| 6 | Same run, replay: the replayed stream is byte-identical; the answer re-delivered twice stays `accepted` once | L2 | green on replay (`kian session replay`: 2 of 2 requests byte-identical for the worker and the Router). The double-delivery half splits: re-sending the same `approve <code>` after the call resolved is `no_match` (no pending call left to match — the audit line above), and the `not_pending` race path is covered at L1 (`a_raced_answer_is_reported_as_not_pending`) |
+| 7 | `no_match` / `ambiguous` / archived paths write no row and no wake; the audit lines carry their codes | L2 | green for `no_match` on the real server (a malformed code and a stale code each produced `command-shaped message matched no pending decision … reason=answer_no_match`, with no `control/confirm`, no admission and no wake); `ambiguous` and archived are covered at L1 only — no fixture produced them end to end |
+| 8 | A real phone: send `approve <code>`, watch the worker resume | L3 (manual, the local bridge) | **not run** — needs the owner's phone and a live bridge; L2 used the `mock-im` adapter, which shares the adapter contract but not the transport |
 
 ### X10. Rollback
 
@@ -651,8 +676,11 @@ phase-1/2 behavior touched. A revert of the two crates suffices.
 2. **Who renders the code.** 3a has the Router relay it (model-mediated, may forget or mangle). A
    system-rendered notification is 3b — it needs a new outbound trigger, which is a bigger authority
    change than this slice.
-3. **Where the grammar lives once landed.** It is channel syntax; [CHANNEL-IMESSAGE](CHANNEL-IMESSAGE.md)
-   owns it then, and this section keeps only the answer semantics.
+3. **Where the grammar lives once landed.** *Resolved at landing: it stays here.* The grammar is
+   channel syntax, but the answer surface is opt-in per channel and is defined by the confirmation
+   plane (codes, codes' derivation, resolution, the write), so splitting it across two documents
+   would create two authorities for one closed set. [CHANNEL-IMESSAGE](CHANNEL-IMESSAGE.md) keeps
+   the transport contract and links here.
 
 ## 15. Open questions
 

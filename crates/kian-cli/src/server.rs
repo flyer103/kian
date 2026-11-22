@@ -850,6 +850,14 @@ impl Server {
                     .map(|shaping| shaping.to_runtime())
                     .unwrap_or_default(),
                 untrusted_channels,
+                // (CONFIRMATION-MODEL §14d phase 3a) the answer
+                // surface's channels (validated fail-closed at load)
+                // plus the TTL its codes live under — empty = no
+                // interceptor, no tool, byte-identical prefix.
+                confirm_answers: crate::superagent::ConfirmAnswerMount {
+                    channels: sa.confirm_answer_channels().map_err(ServeError::Config)?,
+                    ttl_ms: config.confirmation.ttl_ms,
+                },
                 mock_channels,
                 lark_channels,
                 github_channels,

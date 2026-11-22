@@ -400,6 +400,26 @@ fn intake_reason_vocabulary_is_golden() {
             "released_to_eval",
             "released to a fresh evaluation",
         ),
+        (
+            IntakeReason::AnswerApplied,
+            "answer_applied",
+            "answer applied to a pending confirmation",
+        ),
+        (
+            IntakeReason::AnswerNoMatch,
+            "answer_no_match",
+            "dropped: command-shaped, no pending decision matched",
+        ),
+        (
+            IntakeReason::AnswerAmbiguous,
+            "answer_ambiguous",
+            "dropped: command-shaped, several pending decisions matched",
+        ),
+        (
+            IntakeReason::AnswerWriteFailed,
+            "answer_write_failed",
+            "dropped: the confirmation write failed",
+        ),
     ];
     assert_eq!(IntakeReason::ALL.len(), golden.len(), "the set is closed");
     for &(variant, code, display) in &golden {

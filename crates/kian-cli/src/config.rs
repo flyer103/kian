@@ -1453,6 +1453,25 @@ fn default_im_reply_units() -> u64 {
     kian_superagent::DEFAULT_MAX_WORDS
 }
 
+/// (CONFIRMATION-MODEL §14d, phase 3a) the answer surface
+/// (`superagent.confirm_answers`): the channels whose inbound text is
+/// parsed as a closed-set confirmation command and mapped onto a
+/// pending `ask` *before* admission, instead of being admitted as
+/// input for the model to interpret. Absent/empty (the default) =
+/// the interceptor is never installed, no `pending_decisions` tool is
+/// mounted and the Router's tool set keeps today's exact bytes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmAnswersConfig {
+    /// Channel names whose inbound text may answer a pending ask.
+    /// Every name must be declared in `channels:`, must be typed
+    /// `imessage` or `mock-im` (phase 3a's scope) and must not be
+    /// admitted as `ignore` — all three are boot errors, never
+    /// defaults. Empty = the feature is off.
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
 /// The `superagent:` section. Presence switches `serve` into the
 /// super-agent assembly (bundle plugins, resident Router, subscription
 /// engine); absence keeps the built-in single-agent server byte-for-byte.
@@ -1601,6 +1620,15 @@ pub struct SuperAgentConfig {
     /// Absent = no derivation, byte-identical wrappers.
     #[serde(default)]
     pub intake: IntakeConfig,
+    /// (CONFIRMATION-MODEL §14d phase 3a) the answer surface
+    /// (`superagent.confirm_answers`): inbound text on these channels
+    /// is parsed as a closed-set confirmation command and mapped onto
+    /// a pending `ask` before admission — never admitted as input.
+    /// Absent (the default) = the interceptor is never installed and
+    /// the Router's tool set is byte-identical. Converted fail-closed
+    /// by [`SuperAgentConfig::confirm_answer_channels`].
+    #[serde(default)]
+    pub confirm_answers: ConfirmAnswersConfig,
     /// (CRON-MODEL §3) the declared cron schedules (`superagent.cron`).
     /// Absent (the default) = no cron schedules declared, nothing to
     /// fire. Validated fail-closed at load by [`CronSection::to_runtime`]
@@ -3186,6 +3214,63 @@ impl SuperAgentConfig {
         Ok(set)
     }
 
+    /// The answer surface's channel set (CONFIRMATION-MODEL §14d X7),
+    /// fail-closed: empty entries, duplicates and channels not declared
+    /// in `channels` are errors, never defaults; a channel whose type
+    /// cannot carry a text answer, or one the admission classes drop
+    /// before the interceptor runs, refuses to boot instead of
+    /// answering nothing. Empty result = the feature is off.
+    pub fn confirm_answer_channels(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, ConfigError> {
+        let mut set = std::collections::BTreeSet::new();
+        for (i, channel) in self.confirm_answers.channels.iter().enumerate() {
+            if channel.trim().is_empty() {
+                return Err(invalid(format!(
+                    "superagent.confirm_answers.channels[{i}] must not be empty"
+                )));
+            }
+            let declared = self.channels.get(channel).ok_or_else(|| {
+                invalid(format!(
+                    "superagent.confirm_answers.channels[{i}] references channel `{channel}` \
+                     which is not declared in superagent.channels"
+                ))
+            })?;
+            if !kian_superagent::answers::ANSWER_CHANNEL_TYPES
+                .contains(&declared.channel_type.as_str())
+            {
+                return Err(invalid(format!(
+                    "superagent.confirm_answers.channels[{i}] references channel `{channel}` of \
+                     type `{}`; the answer surface answers on {:?} only",
+                    declared.channel_type,
+                    kian_superagent::answers::ANSWER_CHANNEL_TYPES
+                )));
+            }
+            // An `ignore` class on the whole channel is an explicit
+            // "drop this channel's input" statement; mounting answers
+            // there contradicts a decision the operator already made,
+            // so refuse it rather than quietly re-opening the door.
+            if self.classes.iter().any(|class| {
+                class.channel == *channel
+                    && class.topic.is_none()
+                    && class.sender.is_none()
+                    && class.class == "ignore"
+            }) {
+                return Err(invalid(format!(
+                    "superagent.confirm_answers.channels[{i}] references channel `{channel}` which \
+                     is admitted as `class: ignore`; answering on a channel whose input is dropped \
+                     is contradictory"
+                )));
+            }
+            if !set.insert(channel.clone()) {
+                return Err(invalid(format!(
+                    "superagent.confirm_answers.channels[{i}] duplicates channel `{channel}`"
+                )));
+            }
+        }
+        Ok(set)
+    }
+
     /// The runtime untrusted set (+ +): the configured
     /// `untrusted_channels` list **plus every lark- and github-typed
     /// channel** — real inbound text is attacker-controllable, so a
@@ -4436,6 +4521,11 @@ impl ServeConfig {
             // the untrusted-channel list cross-references the
             // declared channels and converts cleanly (fail-closed).
             sa.untrusted_channel_set()?;
+            // (CONFIRMATION-MODEL §14d) the answer-surface channel
+            // list cross-references the declared channels, refuses a
+            // channel type that cannot carry a text answer and a
+            // channel-wide `ignore` contradiction (fail-closed).
+            sa.confirm_answer_channels()?;
             // /ADR-013: the intake thread-keys cross-reference the
             // declared channels and convert cleanly (fail-closed —
             // an undeclared channel or an empty key list refuses to
@@ -7079,6 +7169,97 @@ recovery:
             1,
         );
         assert!(ServeConfig::parse(&empty).is_err());
+    }
+
+    /// the answer surface (phase 3a): absent = off, declared
+    /// mock-im/imessage channels convert, and every unsound
+    /// declaration refuses to boot instead of answering nothing.
+    #[test]
+    fn superagent_confirm_answers_parse_and_convert() {
+        // Absent = off (the interceptor is never installed).
+        let legacy = ServeConfig::parse(&superagent_yaml()).unwrap();
+        let sa = legacy.superagent.unwrap();
+        assert!(sa.confirm_answer_channels().unwrap().is_empty());
+
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  confirm_answers:\n    channels: [mock-im]\n  channels:",
+            1,
+        );
+        let sa = ServeConfig::parse(&yaml)
+            .expect("confirm_answers parses")
+            .superagent
+            .unwrap();
+        assert_eq!(
+            sa.confirm_answer_channels().unwrap(),
+            std::collections::BTreeSet::from(["mock-im".to_string()])
+        );
+    }
+
+    /// fail-closed: undeclared channels, answer-incapable channel
+    /// types, `ignore`d channels, duplicates and empty entries are all
+    /// boot errors.
+    #[test]
+    fn superagent_confirm_answers_refuses_unsound_declarations() {
+        let parse = |channels: &str, extra: &str| {
+            let yaml = superagent_yaml()
+                .replacen(
+                    "  channels:",
+                    &format!("  confirm_answers:\n    channels: {channels}\n  channels:"),
+                    1,
+                )
+                .replacen("  channels:\n", &format!("  channels:\n{extra}"), 1);
+            ServeConfig::parse(&yaml).map_err(|e| e.to_string())
+        };
+
+        let error = parse("[nope]", "").unwrap_err();
+        assert!(
+            error.contains("confirm_answers.channels[0] references channel `nope`"),
+            "unexpected error: {error}"
+        );
+
+        let error = parse("[lark]", "").unwrap_err();
+        assert!(
+            error.contains("references channel `lark`"),
+            "unexpected error: {error}"
+        );
+
+        // A timer channel is a first-class channel type but carries no
+        // text answer: it refuses rather than silently answering nothing.
+        let error = parse(
+            "[ticker]",
+            "    ticker:\n      type: timer\n      timer:\n        interval_ms: 60000\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("of type `timer`"),
+            "unexpected error: {error}"
+        );
+
+        // An `ignore` class on the whole channel contradicts an answer
+        // mount even though the interceptor runs before admission.
+        let yaml = superagent_yaml().replacen(
+            "  channels:",
+            "  confirm_answers:\n    channels: [ci]\n  classes:\n    - channel: ci\n      class: ignore\n  channels:",
+            1,
+        );
+        let error = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(
+            error.contains("is admitted as `class: ignore`"),
+            "unexpected error: {error}"
+        );
+
+        let error = parse("[mock-im, mock-im]", "").unwrap_err();
+        assert!(
+            error.contains("duplicates channel `mock-im`"),
+            "unexpected error: {error}"
+        );
+
+        let error = parse("[\"\"]", "").unwrap_err();
+        assert!(
+            error.contains("must not be empty"),
+            "unexpected error: {error}"
+        );
     }
 
     // -----------------------------------------------------------------------

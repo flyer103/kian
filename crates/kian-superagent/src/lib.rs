@@ -101,6 +101,7 @@
 //!   `read_progress` over `RecallPort`; `intervene` as a steer row via
 //!   `InboxWriter`; `escalate` under the IM policy)
 
+pub mod answers;
 pub mod audit;
 pub mod binding;
 pub mod bootstrap;
@@ -233,11 +234,11 @@ pub use rules::{
 pub use stage::{NoOutbox, OutboxView, TicketStage, project_stage};
 pub use subscriptions::{FanoutAdmission, RoutingOutcome, SubscriptionService};
 pub use templates::{
-    ASYNC_TOOLS, CHANNEL_TOOLS, ProfileError, ROSTER_INSTRUCTION_PROMPT_LINE, ROUTER_SLOT,
-    SPAWN_WORKER_TOOL, SuperAgentProfile, WORKER_PROMPT_TEMPLATE, WORKER_TOOLS,
-    empty_tool_parameters, is_channel_tool, mount_async_tools, mount_recall_tools,
-    mount_watchdog_tools, render_worker_prompt, router_template, worker_mandate_line,
-    worker_template,
+    ASYNC_TOOLS, CHANNEL_TOOLS, CONFIRM_ANSWER_PROMPT_LINE, ProfileError,
+    ROSTER_INSTRUCTION_PROMPT_LINE, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
+    WORKER_PROMPT_TEMPLATE, WORKER_TOOLS, empty_tool_parameters, is_channel_tool,
+    mount_async_tools, mount_recall_tools, mount_watchdog_tools, render_worker_prompt,
+    router_template, worker_mandate_line, worker_template,
 };
 pub use timeout::{ChildTick, due_interrupts};
 pub use timer::{

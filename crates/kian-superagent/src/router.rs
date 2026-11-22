@@ -111,6 +111,13 @@ pub use crate::templates::JUDGE_PROMPT_TEMPLATE;
 /// `router::` path discipline.
 pub use crate::templates::ROSTER_INSTRUCTION_PROMPT_LINE;
 
+/// (CONFIRMATION-MODEL §14d X5, landed with phase 3a) the frozen
+/// channel-answer line, appended by the bootstrap render path iff the
+/// answer surface is configured. Lives in [`crate::templates`] beside
+/// the other template artifacts; re-exported here for the historical
+/// `router::` path discipline.
+pub use crate::templates::CONFIRM_ANSWER_PROMPT_LINE;
+
 /// Parking tick default: how often a parked Router re-checks its inbox
 /// signal (and lets supervision observe an interrupt).
 pub const DEFAULT_PARK_TICK_MS: u64 = 50;
@@ -352,6 +359,15 @@ pub struct RouterProfile {
     /// no prefix byte. Persisted prompts are never rewritten
     /// (constraint 3); only the next bootstrap renders the line.
     pub roster_instruction: bool,
+    /// (CONFIRMATION-MODEL §14d X5): whether the frozen channel-answer
+    /// line ([`CONFIRM_ANSWER_PROMPT_LINE`]) is appended after the
+    /// rendered judge prompt — on **iff `superagent.confirm_answers`
+    /// names at least one channel**. `false` (the default, and what an
+    /// absent key produces) renders today's bootstrap bytes exactly;
+    /// the line is a constant, so an equivalent answer-surface edit
+    /// changes no prefix byte. Persisted prompts are never rewritten
+    /// (constraint 3); only the next bootstrap renders the line.
+    pub confirm_answers: bool,
 }
 
 impl RouterProfile {
@@ -375,6 +391,7 @@ impl RouterProfile {
             outbox: None,
             multiagent: None,
             roster_instruction: false,
+            confirm_answers: false,
         }
     }
 
@@ -427,6 +444,17 @@ impl RouterProfile {
         // never rewritten — only the next bootstrap renders it.
         let rendered = if self.roster_instruction {
             format!("{rendered}\n\n{}", ROSTER_INSTRUCTION_PROMPT_LINE)
+        } else {
+            rendered
+        };
+        // (CONFIRMATION-MODEL §14d X5): the frozen channel-answer line
+        // is appended after the rendered prompt — never inside the
+        // template — and only when an answer surface is configured, so
+        // an absent `confirm_answers` bootstraps byte-identically to
+        // today. It is a constant: naming a different channel rewrites
+        // no byte of the prefix.
+        let rendered = if self.confirm_answers {
+            format!("{rendered}\n\n{}", CONFIRM_ANSWER_PROMPT_LINE)
         } else {
             rendered
         };
@@ -3314,7 +3342,8 @@ mod tests {
     use crate::mock::MockChannel;
     use crate::policy::{DEFAULT_MAX_WORDS, ImPolicy, StructuredPolicy};
     use crate::templates::{
-        ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile, router_template, worker_template,
+        CONFIRM_ANSWER_PROMPT_LINE, ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile,
+        router_template, worker_template,
     };
     use crate::worker::{
         SpawnError, StreamPort, StreamPortError, WorkerSpawner, delegation_is_speculative,
@@ -5836,6 +5865,44 @@ mod tests {
             dedup: false,
         });
         let legacy = RouterProfile::new(sid(16), router_template("mock", "mock-router"));
+        legacy.bootstrap(&*legacy_inbox).await.unwrap();
+        let legacy_payload = legacy_inbox.admits.lock().unwrap()[0]
+            .1
+            .as_str()
+            .expect("prompt payload")
+            .to_string();
+        assert_eq!(legacy_payload, legacy.judge.render(0, legacy.im.max_words));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_appends_the_answer_line_only_when_configured() {
+        let inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let mut profile = RouterProfile::new(sid(17), router_template("mock", "mock-router"));
+        profile.confirm_answers = true;
+        profile.bootstrap(&*inbox).await.unwrap();
+        let admits = inbox.admits.lock().unwrap().clone();
+        assert_eq!(admits.len(), 1);
+        let payload = admits[0].1.as_str().expect("prompt payload");
+        // The frozen line is appended AFTER the rendered prompt (the
+        // template text itself is untouched), exactly once, and carries
+        // no channel name or count.
+        assert!(payload.starts_with(&profile.judge.render(0, profile.im.max_words)));
+        assert!(
+            payload.ends_with(&format!("\n\n{}", CONFIRM_ANSWER_PROMPT_LINE)),
+            "{payload}"
+        );
+        assert_eq!(payload.matches(CONFIRM_ANSWER_PROMPT_LINE).count(), 1);
+        assert!(!CONFIRM_ANSWER_PROMPT_LINE.contains('{'));
+        // The default profile renders exactly today's bytes — no
+        // separator, no line.
+        let legacy_inbox = Arc::new(ScriptedInbox {
+            admits: Mutex::new(Vec::new()),
+            dedup: false,
+        });
+        let legacy = RouterProfile::new(sid(18), router_template("mock", "mock-router"));
         legacy.bootstrap(&*legacy_inbox).await.unwrap();
         let legacy_payload = legacy_inbox.admits.lock().unwrap()[0]
             .1

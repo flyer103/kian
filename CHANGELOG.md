@@ -8,6 +8,21 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A pending `ask` can be answered from a channel for good (CONFIRMATION-MODEL §14d, ADR-051)**.
+  `superagent.confirm_answers.channels` opts a channel into the confirmation plane: an inbound
+  `approve <code>` / `reject <code> <reason>` is intercepted in the bundle's admission path — before
+  the class gate and before any inbox row — and written through the same `confirm` seam the RPC
+  uses (`control/confirm`, then the frozen call's `tool/result` carrying `confirmation`). The
+  sender handle is the authenticator (the channel allowlist ran first); the six-character code is a
+  pure function of `(session, call_seq, call_id)`, so it needs no storage and is replay-stable.
+  Anything that is not the closed grammar stays ordinary input — free text is never a decision — and
+  a code-shaped line that matches no pending call is dropped with an audit line
+  (`answer_no_match`), never forwarded. With the key set, the Router gains a read-only
+  `pending_decisions` tool (open calls with their codes) and a frozen prompt line forbidding it to
+  assert that a confirmation happened. Absent is off, byte-identical to today; boot refuses an
+  undeclared channel, a non-IM channel, or one admitted as `class: ignore`. No new event kind, wire
+  method or metric key; the inbound text itself is not persisted.
+
 - **The IM reply budget is configurable and defaults to 300 units (DESIGN §4.2)**.
   `superagent.im.reply_units` sets `ImPolicy::max_words`; the Router judge prompt renders the same
   number at bootstrap (`{budget}`), so the model is told what the policy enforces, and the

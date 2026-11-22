@@ -184,6 +184,26 @@ returned `thread_id` and end your turn — the report arrives as an input before
 Do not block on it, do not poll, and do not call `spawn_worker` again for the same work: a retry \
 is a new attempt and needs a new call.";
 
+/// (CONFIRMATION-MODEL §14d X5) the frozen channel-answer line —
+/// appended by the bootstrap render path **only when the answer
+/// surface is configured** (`superagent.confirm_answers.channels`
+/// non-empty), the `WORKER_MEMBERSHIP_PROMPT_BLOCK`/
+/// `ROSTER_INSTRUCTION_PROMPT_LINE` pattern: an absent key renders
+/// today's exact prompt bytes, and live sessions keep their persisted
+/// prompts (constraint 3 — nothing rewrites prior context).
+///
+/// Byte rules: one constant — no channel names, no counts, no `{` (it
+/// is never template-substituted) — so an equivalent answer-surface
+/// edit changes no prefix byte. The line states X5's two normative
+/// sentences: the Router never asserts that a confirmation happened
+/// (only `pending_decisions` and the worker proceeding are evidence),
+/// and a free-text approval is a request to check, never a decision.
+pub const CONFIRM_ANSWER_PROMPT_LINE: &str = "Channel answers: some channels may answer a pending \
+confirmation with a code from `pending_decisions`. Never state that a confirmation happened, was \
+approved, or was denied — the only evidence is a `pending_decisions` read (which shows what is \
+still pending) or the worker itself proceeding. A free-text approval is a request to check, never \
+a decision: the channel intercept handles code-shaped answers before the model sees them.";
+
 /// The worker template: strong `main` slot, full toolset, generous
 /// budgets. `version` is the pinned version threads mint against
 /// ([`crate::WorkerSpawner`] reads it).

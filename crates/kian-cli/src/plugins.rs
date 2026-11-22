@@ -641,6 +641,13 @@ pub struct SuperAgentPlugin {
     /// from these channels admit with the untrusted bit inside the
     /// provenance wrapper. Empty = every channel trusted.
     pub untrusted_channels: std::collections::BTreeSet<String>,
+    /// (CONFIRMATION-MODEL §14d phase 3a) the answer surface's mounted
+    /// shape: the channels whose inbound text is parsed as a closed-set
+    /// confirmation command, and the `confirmation.ttl_ms` its codes
+    /// live under. Empty channels (the default) = the interceptor is
+    /// never installed, no `pending_decisions` tool is mounted and the
+    /// Router's tool set keeps today's exact bytes.
+    pub confirm_answers: crate::superagent::ConfirmAnswerMount,
     /// Mock channels by configured name (v1's only adapter type).
     pub mock_channels: BTreeMap<String, Arc<MockChannel>>,
     /// Lark channels by configured name: built by the server
@@ -837,6 +844,11 @@ impl Plugin for SuperAgentPlugin {
         // prompt byte would never render in production — a config key
         // with no effect.
         profile.roster_instruction = self.roster.is_some();
+        // (CONFIRMATION-MODEL §14d X5): the frozen channel-answer line
+        // renders iff an answer surface is configured (the same
+        // non-empty channel set that mounts `pending_decisions`), so
+        // an absent `confirm_answers` keeps today's prefix bytes.
+        profile.confirm_answers = !self.confirm_answers.is_empty();
         // (R12, R1/R2 — supersedes ADR-020 D5/D7): membership on iff
         // `endpoints:` is non-empty or `workers:` is configured — the
         // bootstrap then appends the frozen membership block (a
@@ -1039,6 +1051,34 @@ impl Plugin for SuperAgentPlugin {
         router_providers.push(router_tools as Arc<dyn ToolProvider>);
         if self.recall.router {
             router_providers.push(Arc::new(recall_tools.clone()) as Arc<dyn ToolProvider>);
+        }
+        // (CONFIRMATION-MODEL §14d phase 3a) the answer surface mounts
+        // exactly when a channel opted in: the interceptor answers
+        // command-shaped text before admission, and the read-only
+        // `pending_decisions` tool is the operator's only way to learn
+        // a code. Absent config mounts neither — the Router tool set
+        // (and therefore the prompt prefix) stays byte-identical.
+        let answer_surface = if self.confirm_answers.is_empty() {
+            None
+        } else {
+            Some(kian_superagent::answers::AnswerSurface::new(
+                self.confirm_answers.channels.clone(),
+                Arc::clone(&recall_port) as Arc<dyn kian_superagent::RecallPort>,
+                crate::superagent::EngineAnswers::new(
+                    Arc::clone(&self.inbox),
+                    self.confirm_answers.ttl_ms,
+                ) as Arc<dyn kian_superagent::answers::AnswerPort>,
+                self.confirm_answers.ttl_ms,
+            ))
+        };
+        if answer_surface.is_some() {
+            router_providers.push(
+                Arc::new(kian_superagent::answers::PendingDecisionTools::new(
+                    Arc::clone(&recall_port) as Arc<dyn kian_superagent::RecallPort>,
+                    Arc::clone(&self.router_binding),
+                    self.confirm_answers.ttl_ms,
+                )) as Arc<dyn ToolProvider>,
+            );
         }
         let router_tools: Arc<dyn ToolProvider> = match router_providers.len() {
             0 | 1 => router_providers
@@ -1762,32 +1802,37 @@ impl Plugin for SuperAgentPlugin {
         }
         let driver = Arc::new(driver);
 
-        let subscriptions = Arc::new(
-            SubscriptionService::with_classes(
-                Arc::clone(&self.router_binding),
-                self.rules,
-                self.classes,
-                Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
-            )
-            .with_shaping(self.shaping)
-            .with_untrusted_channels(self.untrusted_channels)
-            // /ADR-013: the derived thread key joins spilled
-            // events' Inline neighbors as recall context (context
-            // only — routing stays topic-keyed).
-            .with_thread_keys(self.thread_keys.clone())
-            // the fan-out and the spawn tool share one registry
-            // projection, and the ownership gate rides the same flag.
-            .with_shared_registry(Arc::clone(&followup_registry))
-            .with_followup_ownership(self.followup_ownership)
-            // (ADR-012): the fan-out's mandate revalidation compares
-            // against the same current pointer the bootstrap renders and
-            // the spawn tool stamps — one configured version everywhere.
-            .with_policy_pointer(
-                self.policy_version
-                    .as_ref()
-                    .map(|version| version.label().to_string()),
-            ),
+        let mut subscriptions = SubscriptionService::with_classes(
+            Arc::clone(&self.router_binding),
+            self.rules,
+            self.classes,
+            Arc::clone(&router_inbox) as Arc<dyn kian_superagent::InboxWriter>,
+        )
+        .with_shaping(self.shaping)
+        .with_untrusted_channels(self.untrusted_channels)
+        // /ADR-013: the derived thread key joins spilled
+        // events' Inline neighbors as recall context (context
+        // only — routing stays topic-keyed).
+        .with_thread_keys(self.thread_keys.clone())
+        // the fan-out and the spawn tool share one registry
+        // projection, and the ownership gate rides the same flag.
+        .with_shared_registry(Arc::clone(&followup_registry))
+        .with_followup_ownership(self.followup_ownership)
+        // (ADR-012): the fan-out's mandate revalidation compares
+        // against the same current pointer the bootstrap renders and
+        // the spawn tool stamps — one configured version everywhere.
+        .with_policy_pointer(
+            self.policy_version
+                .as_ref()
+                .map(|version| version.label().to_string()),
         );
+        // (CONFIRMATION-MODEL §14d phase 3a) the answer surface —
+        // installed only when a channel opted in; an absent surface
+        // keeps the intake path exactly as it was.
+        if let Some(surface) = answer_surface {
+            subscriptions = subscriptions.with_answers(surface);
+        }
+        let subscriptions = Arc::new(subscriptions);
         let subscription_metrics = Arc::new(crate::superagent::SubscriptionMetrics::default());
 
         let services = Arc::new(crate::superagent::SuperAgentServices {

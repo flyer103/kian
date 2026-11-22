@@ -110,6 +110,15 @@ impl EngineInbox {
         })
     }
 
+    /// The installed engine, when the assembly has reached installation:
+    /// the answer surface is constructed before the engine exists (the
+    /// engine needs the driver, the driver needs the subscription
+    /// service), so it resolves the handle at call time like the inbox
+    /// does.
+    pub fn engine_handle(&self) -> Option<Arc<Engine<ServeLoopDriver>>> {
+        self.engine.get().cloned()
+    }
+
     /// Installs the per-spawn marker map written on spawned worker sessions' `session/created`
     /// (first write only; a later call is ignored).
     pub fn set_bridge_markers(&self, markers: BridgeMarkers) {
@@ -237,6 +246,78 @@ impl StreamPort for DrainCtxPort {
 /// Router/Worker decorators with it).
 pub fn port_for_ctx() -> PortFor<DrainCtx> {
     Arc::new(|ctx: &DrainCtx| Arc::new(DrainCtxPort(ctx.clone())) as Arc<dyn StreamPort>)
+}
+
+// ---------------------------------------------------------------------------
+// The AnswerPort over the engine's confirmation plane
+// ---------------------------------------------------------------------------
+
+/// [`kian_superagent::answers::AnswerPort`] over the engine's own
+/// confirmation write (CONFIRMATION-MODEL §14d phase 3a): an answer
+/// arriving on an IM channel takes **exactly** the path a CLI/HTTP
+/// answer takes — one reserved control row, the same pending-set check,
+/// the same TTL rewrite and the same `not_pending` for a racing
+/// decision. Nothing here can fabricate or bypass a decision.
+///
+/// The engine is resolved through the inbox at call time for the same
+/// reason the inbox itself is late-bound: the surface is constructed
+/// before the engine exists.
+pub struct EngineAnswers {
+    inbox: Arc<EngineInbox>,
+    ttl_ms: u64,
+}
+
+impl EngineAnswers {
+    pub fn new(inbox: Arc<EngineInbox>, ttl_ms: u64) -> Arc<Self> {
+        Arc::new(Self { inbox, ttl_ms })
+    }
+}
+
+impl kian_superagent::answers::AnswerPort for EngineAnswers {
+    fn answer(
+        &self,
+        session: SessionId,
+        call_id: String,
+        decision: kian_core::control::ConfirmDecision,
+        reason: Option<String>,
+        requested_by: String,
+    ) -> BoxFuture<
+        'static,
+        Result<kian_superagent::answers::AnswerOutcome, kian_superagent::answers::AnswerError>,
+    > {
+        let engine = self
+            .inbox
+            .engine_handle()
+            .expect("engine installed before the first answer");
+        let ttl_ms = self.ttl_ms;
+        Box::pin(async move {
+            match engine
+                .confirm(
+                    session,
+                    &call_id,
+                    decision,
+                    reason,
+                    Some(requested_by),
+                    ttl_ms,
+                )
+                .await
+            {
+                Ok(kian_orchestrator::ConfirmOutcome::Accepted) => {
+                    Ok(kian_superagent::answers::AnswerOutcome::Accepted)
+                }
+                Ok(kian_orchestrator::ConfirmOutcome::NotPending) => {
+                    Ok(kian_superagent::answers::AnswerOutcome::NotPending)
+                }
+                Ok(kian_orchestrator::ConfirmOutcome::Expired) => {
+                    Ok(kian_superagent::answers::AnswerOutcome::Expired)
+                }
+                Ok(kian_orchestrator::ConfirmOutcome::UnknownSession) => {
+                    Ok(kian_superagent::answers::AnswerOutcome::UnknownSession)
+                }
+                Err(e) => Err(kian_superagent::answers::AnswerError::Write(e.to_string())),
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,6 +1655,28 @@ impl ToolProvider for CombinedTools {
 }
 
 // ---------------------------------------------------------------------------
+// The answer surface mount (CONFIRMATION-MODEL §14d phase 3a)
+// ---------------------------------------------------------------------------
+
+/// The answer surface's configuration as the assembly carries it: the
+/// channel names allowed to answer (already validated fail-closed at
+/// load) and the `confirmation.ttl_ms` the derived codes live under.
+/// An empty channel set — the default — means the assembly installs no
+/// interceptor and mounts no `pending_decisions` tool, so the Router's
+/// prompt prefix is byte-identical to the pre-3a assembly.
+#[derive(Debug, Clone, Default)]
+pub struct ConfirmAnswerMount {
+    pub channels: std::collections::BTreeSet<String>,
+    pub ttl_ms: u64,
+}
+
+impl ConfirmAnswerMount {
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Subscription metrics (the consumer loop is assembly-owned so the
 // outcomes are observable)
 // ---------------------------------------------------------------------------
@@ -1684,6 +1787,16 @@ impl SubscriptionMetrics {
             // (the service's and the bus's `hook-veto`) carry it, and
             // no legacy counter drifts.
             kian_superagent::RoutingOutcome::RefusedByHook { .. } => {}
+            // The answer surface (CONFIRMATION-MODEL §14d) makes its own
+            // decision: it either writes a `control/confirm` row or drops
+            // the message. Neither is an admission shape, so no legacy
+            // counter moves; all four codes ride the per-reason set
+            // (`answer_applied` / `answer_no_match` / `answer_ambiguous` /
+            // `answer_write_failed`), which is where a new shape belongs.
+            kian_superagent::RoutingOutcome::Answered { .. }
+            | kian_superagent::RoutingOutcome::DroppedAnswerNoMatch
+            | kian_superagent::RoutingOutcome::DroppedAnswerAmbiguous
+            | kian_superagent::RoutingOutcome::DroppedAnswerWriteFailed => {}
         }
         for reason in kian_superagent::outcome_reasons(outcome, router) {
             self.by_reason.bump(reason);

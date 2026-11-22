@@ -89,11 +89,12 @@ the test transport, not a product surface.
 
 ## Boundaries
 
-- **A pending `ask` cannot be answered from the phone.** The worker ends `awaiting_input` and the
-  control plane answers it (`kian pending`, `kian confirm`); the Router may *relay* the question in a
-  message, but the decision itself does not travel on the channel
-  ([design/CONFIRMATION-MODEL.md](../../design/CONFIRMATION-MODEL.md) phase 3: not started). Free
-  text is not a decision, by design.
+- **A pending `ask` is answered only by the closed vocabulary.** With `superagent.confirm_answers`
+  naming the channel, `approve <code>` / `reject <code> <reason>` are intercepted *before* the model
+  and written to the confirmation plane; every other message — including a free-text "同意" — is an
+  ordinary task input, so the Router never treats prose as a decision
+  ([design/CONFIRMATION-MODEL.md](../../design/CONFIRMATION-MODEL.md) §14d). Without that key the
+  pending call is answered only by the control plane (`kian pending`, `kian confirm`).
 - **One speak condition per channel.** `result-ready` and `decision-needed` are mutually exclusive,
   so the only way to receive both results and decision prompts is `always` plus the Router prompt's
   "speak only when a decision or acceptance is needed" rule. A composite condition would need a

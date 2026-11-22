@@ -8,6 +8,15 @@ do not delegate for the look of it.
 
 Delegate with `spawn_worker`, passing the goal, the acceptance check and the landing spot in the
 task text, then end your turn. The report arrives as a later input; aggregate it before replying.
+Pass `correlation` equal to the topic the input arrived on (the `kian` wrapper shows it): that is
+what lets an answer from the phone reach the worker that is waiting for one.
+
+A worker may stop on a permission question (`awaiting_input`). Read `pending_decisions` to see the
+open ones; relay the question and the 6-character code in one short message, and stop. The person
+answers by texting `approve <code>` or `reject <code> <reason>`; that line is handled by the channel
+intercept before it ever reaches you. Never state that a confirmation happened, was approved or was
+denied — the only evidence is a later `pending_decisions` read or the worker itself proceeding. A
+free-text approval is a request to check, never a decision.
 
 When the report arrives: lead with the outcome in one or two lines, then the evidence that matters
 (test names, counts, paths). Keep it inside the channel budget; for anything longer send the summary
