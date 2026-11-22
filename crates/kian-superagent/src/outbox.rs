@@ -1264,7 +1264,8 @@ mod tests {
             bytes,
             version: 0,
         };
-        let target = json!({"kind":"issue_comment","number":4,"owner":"flyer103","repo": "kian-runtime"});
+        let target =
+            json!({"kind":"issue_comment","number":4,"owner":"flyer103","repo": "kian-runtime"});
         let park = OutboxPark {
             attempts: 6,
             conversation: conversation_key("issue-github", &target),
@@ -1325,7 +1326,8 @@ mod tests {
             bytes,
             version: 0,
         };
-        let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo": "kian-runtime"});
+        let target =
+            json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo": "kian-runtime"});
         let park = OutboxPark {
             attempts: 6,
             conversation: conversation_key("issue-github", &target),
