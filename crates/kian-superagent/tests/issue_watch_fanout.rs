@@ -146,7 +146,7 @@ fn comment_item(id: u64, issue: u64, updated: &str) -> Value {
         "id": id,
         "body": "still reproducible on main",
         "updated_at": updated,
-        "issue_url": format!("https://api.github.com/repos/flyer103/kian/issues/{issue}"),
+        "issue_url": format!("https://api.github.com/repos/flyer103/kian-runtime/issues/{issue}"),
         "user": {"login": "reporter", "type": "User"},
     })
 }
@@ -430,20 +430,20 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     let api_base = fixture.clone().serve().await;
     // Poll 1: one new human issue (#101).
     fixture.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User")]),
     );
-    fixture.serve_page("/repos/flyer103/kian/issues/comments", json!([]));
+    fixture.serve_page("/repos/flyer103/kian-runtime/issues/comments", json!([]));
 
     let github_config = GitHubConfig {
         api_base: api_base.clone(),
-        topics: BTreeMap::from([("flyer103/kian".to_string(), "issues".to_string())]),
+        topics: BTreeMap::from([("flyer103/kian-runtime".to_string(), "issues".to_string())]),
         events: BTreeSet::new(),
         untrusted: true,
         send: true,
         token: Some("ghp_fixture".into()),
         poll: Some(PollConfig {
-            repo: "flyer103/kian".into(),
+            repo: "flyer103/kian-runtime".into(),
             interval_ms: 30_000,
             kinds: BTreeSet::from([PollKind::Issues, PollKind::IssueComments]),
             since_field: POLL_SINCE_FIELD.into(),
@@ -487,7 +487,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     let comment_991 = comment_events(&[comment_item(991, 101, "2026-11-04T11:00:00Z")]).remove(0);
     assert_eq!(
         issue_101.topic.as_deref(),
-        Some("github:flyer103/kian#101"),
+        Some("github:flyer103/kian-runtime#101"),
         "the poll topic is the thread key"
     );
 
@@ -773,7 +773,10 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     let mandate = kian_superagent::delegation_mandate(task).expect("mandate on the wrapper");
     assert_eq!(mandate["strength"], "explicit");
     assert_eq!(mandate["source"]["channel"], "github");
-    assert_eq!(mandate["source"]["topic"], "github:flyer103/kian#101");
+    assert_eq!(
+        mandate["source"]["topic"],
+        "github:flyer103/kian-runtime#101"
+    );
     assert_eq!(mandate["granted_by"]["login"], "reporter");
     assert!(
         mandate["scope"]
@@ -788,7 +791,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
         shared_registry
             .read()
             .expect("registry")
-            .live_owner("github:flyer103/kian#101"),
+            .live_owner("github:flyer103/kian-runtime#101"),
         Some(worker_a)
     );
 
@@ -821,7 +824,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
 
     // -- poll 2: the follow-up comment — zero Router judge turns -----------
     fixture.serve_page(
-        "/repos/flyer103/kian/issues/comments",
+        "/repos/flyer103/kian-runtime/issues/comments",
         json!([comment_item(991, 101, "2026-11-04T11:00:00Z")]),
     );
     assert_eq!(github.poll_once().await.expect("poll 2"), 1);
@@ -899,7 +902,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     assert!(
         posts[0]
             .0
-            .starts_with("/repos/flyer103/kian/issues/101/comments")
+            .starts_with("/repos/flyer103/kian-runtime/issues/101/comments")
     );
     assert!(
         posts[0].1["body"]
@@ -943,7 +946,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
 
     // -- poll 3: a second live issue fans out independently -----------------
     fixture.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([
             issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"), // unchanged
             issue_item(102, "2026-11-04T12:00:00Z", "another-user", "User"), // new
@@ -1025,12 +1028,12 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
     assert!(
         posts
             .iter()
-            .any(|(path, _)| path.starts_with("/repos/flyer103/kian/issues/101/comments"))
+            .any(|(path, _)| path.starts_with("/repos/flyer103/kian-runtime/issues/101/comments"))
     );
     assert!(
         posts
             .iter()
-            .any(|(path, _)| path.starts_with("/repos/flyer103/kian/issues/102/comments"))
+            .any(|(path, _)| path.starts_with("/repos/flyer103/kian-runtime/issues/102/comments"))
     );
 
     // The speak ledger on the Router stream: the suppressed ack left

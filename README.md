@@ -2,8 +2,8 @@
 
 [![website](https://img.shields.io/badge/website-kian--site.pages.dev-ff7a45)](https://kian-site.pages.dev)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![gates](https://github.com/flyer103/kian/actions/workflows/gates.yml/badge.svg)](https://github.com/flyer103/kian/actions/workflows/gates.yml)
-[![release](https://img.shields.io/github/v/release/flyer103/kian?color=green)](https://github.com/flyer103/kian/releases)
+[![gates](https://github.com/flyer103/kian-runtime/actions/workflows/gates.yml/badge.svg)](https://github.com/flyer103/kian-runtime/actions/workflows/gates.yml)
+[![release](https://img.shields.io/github/v/release/flyer103/kian-runtime?color=green)](https://github.com/flyer103/kian-runtime/releases)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](Cargo.toml)
 
 > **An open-source, model-neutral, self-hostable durable execution runtime for agents.** A session
@@ -94,11 +94,11 @@ Three ways in, fastest first. Each one ends at the same `kian.yaml`.
 # 1. container (no toolchain; state lives in the volume)
 docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
   -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
-  ghcr.io/flyer103/kian
+  ghcr.io/flyer103/kian-runtime
 
 # 2. prebuilt archive (swap the triple: Linux x86_64/aarch64, macOS arm64/x86_64)
 mkdir -p ~/.local/bin
-curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
+curl -fsSL https://github.com/flyer103/kian-runtime/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin kian kiand
 
 # 3. from source (Rust stable 1.85+, edition 2024)

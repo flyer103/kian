@@ -467,8 +467,8 @@ mod tests {
         // The live spelling: a bare non-empty string is a topic token
         // (the model passes the ticket correlation verbatim).
         assert_eq!(
-            super::correlation_topic(&json!("issue-github:flyer103/kian#3")),
-            Some("issue-github:flyer103/kian#3".to_string())
+            super::correlation_topic(&json!("issue-github:flyer103/kian-runtime#3")),
+            Some("issue-github:flyer103/kian-runtime#3".to_string())
         );
         // The explicit object spelling keeps working.
         assert_eq!(

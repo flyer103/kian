@@ -7587,7 +7587,8 @@ recovery:
         )
     }
 
-    const GITHUB_SECTION: &str = "      github:\n        topics:\n          flyer103/kian: ci\n";
+    const GITHUB_SECTION: &str =
+        "      github:\n        topics:\n          flyer103/kian-runtime: ci\n";
 
     #[test]
     fn github_channel_config_parses_with_defaults() {
@@ -7598,7 +7599,7 @@ recovery:
         assert_eq!(github.api_base, "https://api.github.com");
         assert_eq!(
             github.topics,
-            BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())])
+            BTreeMap::from([("flyer103/kian-runtime".to_string(), "ci".to_string())])
         );
         assert!(github.events.is_empty());
         assert!(!github.send, "send defaults off (receive-only)");

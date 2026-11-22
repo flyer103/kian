@@ -1381,7 +1381,7 @@ gap fixes recorded in the closing bullets.
  show — and `flaky-proxy.py` gained the path-scoped delivery-leg fault mode
  (`FAIL_N`/`FAIL_PATH`) so the retry/park arms reproduce with shipped tooling.
 - **Live validation** — the eight-step validation protocol executed
- live against the real `flyer103/kian` repo (2026-11-04, four scratch stores, real
+ live against the real `flyer103/kian-runtime` repo (2026-11-04, four scratch stores, real
  DeepSeek work trips, real GitHub REST traffic, `DRY_RUN=1` throughout; every claim cited
  by session id + seq or a captured log line — the issue-watch run log §7):
  scenarios 1 (Eval accept → Ticket + Mandate), 4 (speak-rules: deliver-once, one

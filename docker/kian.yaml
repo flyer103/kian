@@ -9,7 +9,7 @@
 #     -e DEEPSEEK_API_KEY \
 #     -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" \
 #     -v kian-data:/data \
-#     ghcr.io/flyer103/kian
+#     ghcr.io/flyer103/kian-runtime
 
 listen: "0.0.0.0:7433"
 storage:

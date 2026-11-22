@@ -7,7 +7,7 @@ crash, so please report it privately first.
 ## Reporting a vulnerability
 
 Use GitHub's private advisory flow: **Security → Report a vulnerability** on
-<https://github.com/flyer103/kian>. That opens a draft advisory only the maintainers can see.
+<https://github.com/flyer103/kian-runtime>. That opens a draft advisory only the maintainers can see.
 
 Please do **not** open a public issue for anything that could be exploited before a fix ships. If
 the advisory flow is unavailable, contact the maintainer ([@flyer103](https://github.com/flyer103))

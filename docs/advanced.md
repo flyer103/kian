@@ -142,7 +142,7 @@ superagent:
     github:
       type: github
       github:
-        topics: { "flyer103/kian": "kian-repo" }   # owner/repo → topic; also the allowlist
+        topics: { "flyer103/kian-runtime": "kian-repo" }   # owner/repo → topic; also the allowlist
         send: true                                  # reply half; requires KIAN_GITHUB_TOKEN
         webhook: { max_body_bytes: 1048576 }        # mounts POST /webhooks/github
     lark-im:

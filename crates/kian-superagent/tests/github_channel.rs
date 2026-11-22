@@ -175,7 +175,7 @@ async fn capture_endpoint(State(state): State<Arc<GitHubMock>>, req: Request) ->
 fn github_config(api_base: &str) -> GitHubConfig {
     GitHubConfig {
         api_base: api_base.to_string(),
-        topics: BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())]),
+        topics: BTreeMap::from([("flyer103/kian-runtime".to_string(), "ci".to_string())]),
         events: BTreeSet::new(),
         untrusted: true,
         send: true,
@@ -188,7 +188,7 @@ fn send_config(api_base: &str) -> GitHubConfig {
     github_config(api_base)
 }
 
-/// A `sender`-bearing webhook body for `flyer103/kian`.
+/// A `sender`-bearing webhook body for `flyer103/kian-runtime`.
 fn delivery_body() -> Value {
     json!({
         "action": "created",
@@ -203,7 +203,7 @@ fn delivery_body() -> Value {
             "body": "please take a look",
             "user": {"login": "reporter"}
         },
-        "repository": {"id": 1, "full_name": "flyer103/kian", "name": "kian"},
+        "repository": {"id": 1, "full_name": "flyer103/kian-runtime", "name": "kian"},
         "sender": {"login": "reporter", "type": "User", "id": 7}
     })
 }
@@ -253,7 +253,7 @@ async fn fixture_delivery_ingests_as_a_provenance_carrying_event() {
     assert_eq!(event.channel, "github");
     assert_eq!(event.event_id, "d-abc123");
     assert_eq!(event.topic.as_deref(), Some("ci"));
-    assert_eq!(event.group.as_deref(), Some("flyer103/kian"));
+    assert_eq!(event.group.as_deref(), Some("flyer103/kian-runtime"));
     assert_eq!(
         event.sender,
         Some(json!({"login": "reporter", "type": "User", "id": 7}))
@@ -340,7 +340,7 @@ async fn events_filter_unsupported_types_and_unmapped_repos_never_surface() {
     let check_run = json!({
         "action": "completed",
         "check_run": {"id": 5, "conclusion": "failure", "output": {"title": "tests failed"}},
-        "repository": {"full_name": "flyer103/kian"},
+        "repository": {"full_name": "flyer103/kian-runtime"},
         "sender": {"login": "github-actions", "type": "Bot"}
     });
     assert_eq!(channel.ingest_delivery("check_run", "d-ok", &check_run), 1);
@@ -397,7 +397,7 @@ async fn send_resolves_only_after_the_api_accepts() {
     let calls = mock.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "POST");
-    assert_eq!(calls[0].1, "/repos/flyer103/kian/issues/9/comments");
+    assert_eq!(calls[0].1, "/repos/flyer103/kian-runtime/issues/9/comments");
     assert_eq!(calls[0].2, "Bearer ghp_mock");
     assert_eq!(calls[0].3, "2022-11-28");
     // The §4.2 structured sections render as markdown sections.
@@ -419,7 +419,7 @@ async fn send_resolves_only_after_the_api_accepts() {
         .expect("send accepted");
     let calls = mock.calls();
     assert_eq!(calls[1].0, "POST");
-    assert_eq!(calls[1].1, "/repos/flyer103/kian/pulls/9/reviews");
+    assert_eq!(calls[1].1, "/repos/flyer103/kian-runtime/pulls/9/reviews");
     assert_eq!(calls[1].4["body"], "plain string content passes through");
     assert_eq!(calls[1].4["event"], "COMMENT");
 
@@ -439,7 +439,7 @@ async fn send_resolves_only_after_the_api_accepts() {
         .expect("send accepted");
     let calls = mock.calls();
     assert_eq!(calls[2].0, "PATCH");
-    assert_eq!(calls[2].1, "/repos/flyer103/kian/pulls/9");
+    assert_eq!(calls[2].1, "/repos/flyer103/kian-runtime/pulls/9");
     assert_eq!(calls[2].4["body"], RENDERED_SECTIONS);
 
     // Rejection → an honest error naming the HTTP status and the
@@ -502,11 +502,11 @@ async fn every_request_carries_a_user_agent() {
 
     // The poll leg: one poll drives both list endpoints (GET).
     mock.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User")]),
     );
     mock.serve_page(
-        "/repos/flyer103/kian/issues/comments",
+        "/repos/flyer103/kian-runtime/issues/comments",
         json!([comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment")]),
     );
     let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
@@ -758,7 +758,10 @@ async fn github_event_flows_through_classes_rules_and_provenance_untrusted() {
     assert_eq!(kian["event_id"], "d-yes");
     assert_eq!(kian["topic"], "ci");
     assert_eq!(kian["untrusted"], json!(true));
-    assert_eq!(kian["raw"]["repository"]["full_name"], "flyer103/kian");
+    assert_eq!(
+        kian["raw"]["repository"]["full_name"],
+        "flyer103/kian-runtime"
+    );
     assert_eq!(kian["raw"]["sender"]["login"], "reporter");
     assert_eq!(kian["raw"]["explicit"], json!(true));
 }
@@ -786,7 +789,7 @@ async fn github_live_smoke_env_gated() {
     };
     let config = GitHubConfig {
         api_base: kian_superagent::GITHUB_DEFAULT_API_BASE.into(),
-        topics: BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())]),
+        topics: BTreeMap::from([("flyer103/kian-runtime".to_string(), "ci".to_string())]),
         events: BTreeSet::new(),
         untrusted: true,
         send: true,
@@ -827,7 +830,7 @@ fn poll_channel_config(api_base: &str) -> GitHubConfig {
     config.send = false;
     config.token = None;
     config.poll = Some(PollConfig {
-        repo: "flyer103/kian".into(),
+        repo: "flyer103/kian-runtime".into(),
         interval_ms: 30_000,
         kinds: BTreeSet::from([PollKind::Issues, PollKind::IssueComments]),
         since_field: POLL_SINCE_FIELD.into(),
@@ -851,7 +854,7 @@ fn comment_item(id: u64, issue: u64, updated: &str, body: &str) -> Value {
         "id": id,
         "body": body,
         "updated_at": updated,
-        "issue_url": format!("https://api.github.com/repos/flyer103/kian/issues/{issue}"),
+        "issue_url": format!("https://api.github.com/repos/flyer103/kian-runtime/issues/{issue}"),
         "user": {"login": "reporter", "type": "User"},
     })
 }
@@ -867,14 +870,14 @@ async fn poll_pages_parse_into_thread_keyed_channel_events() {
     let mock = GitHubMock::new();
     let base = mock.clone().serve().await;
     mock.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([
             issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
             issue_item(102, "2026-11-04T10:30:00Z", "github-actions[bot]", "Bot"),
         ]),
     );
     mock.serve_page(
-        "/repos/flyer103/kian/issues/comments",
+        "/repos/flyer103/kian-runtime/issues/comments",
         json!([comment_item(
             991,
             101,
@@ -904,17 +907,26 @@ async fn poll_pages_parse_into_thread_keyed_channel_events() {
     assert_eq!(
         ids,
         vec![
-            "poll:issues:flyer103/kian#101:2026-11-04T10:00:00Z",
-            "poll:issues:flyer103/kian#102:2026-11-04T10:30:00Z",
-            "poll:issue_comment:flyer103/kian#991:2026-11-04T11:00:00Z",
+            "poll:issues:flyer103/kian-runtime#101:2026-11-04T10:00:00Z",
+            "poll:issues:flyer103/kian-runtime#102:2026-11-04T10:30:00Z",
+            "poll:issue_comment:flyer103/kian-runtime#991:2026-11-04T11:00:00Z",
         ]
     );
     // The topic is the derived thread key — one canonical topic per
     // issue thread; the comment joins its issue's thread.
-    assert_eq!(events[0].topic.as_deref(), Some("github:flyer103/kian#101"));
-    assert_eq!(events[1].topic.as_deref(), Some("github:flyer103/kian#102"));
-    assert_eq!(events[2].topic.as_deref(), Some("github:flyer103/kian#101"));
-    assert_eq!(events[0].group.as_deref(), Some("flyer103/kian"));
+    assert_eq!(
+        events[0].topic.as_deref(),
+        Some("github:flyer103/kian-runtime#101")
+    );
+    assert_eq!(
+        events[1].topic.as_deref(),
+        Some("github:flyer103/kian-runtime#102")
+    );
+    assert_eq!(
+        events[2].topic.as_deref(),
+        Some("github:flyer103/kian-runtime#101")
+    );
+    assert_eq!(events[0].group.as_deref(), Some("flyer103/kian-runtime"));
     // Adapter-declared explicit on (human) issue authorship; the
     // bot's issue and the human comment never carry it.
     assert_eq!(events[0].payload["explicit"], json!(true));
@@ -924,14 +936,14 @@ async fn poll_pages_parse_into_thread_keyed_channel_events() {
 
     // The GETs carried the cursor, URL-encoded, on both endpoints.
     let issues_path = mock
-        .first_path_starting_with("/repos/flyer103/kian/issues?")
+        .first_path_starting_with("/repos/flyer103/kian-runtime/issues?")
         .expect("issues list call");
     assert!(
         issues_path.contains("&since=2026-11-01T00%3A00%3A00Z"),
         "the since cursor rides the issues list query: {issues_path}"
     );
     let comments_path = mock
-        .first_path_starting_with("/repos/flyer103/kian/issues/comments")
+        .first_path_starting_with("/repos/flyer103/kian-runtime/issues/comments")
         .expect("comments list call");
     assert!(
         comments_path.contains("&since=2026-11-01T00%3A00%3A00Z"),
@@ -955,7 +967,7 @@ async fn poll_since_cursor_is_honored_nothing_older_is_emitted() {
     let mock = GitHubMock::new();
     let base = mock.clone().serve().await;
     mock.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User")]),
     );
     let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
@@ -967,7 +979,7 @@ async fn poll_since_cursor_is_honored_nothing_older_is_emitted() {
     // A page holding the SAME item, an OLDER item, and one NEWER
     // update of issue 101: only the newer surfaces.
     mock.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([
             issue_item(100, "2026-11-03T09:00:00Z", "old", "User"), // older
             issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"), // tie
@@ -980,7 +992,7 @@ async fn poll_since_cursor_is_honored_nothing_older_is_emitted() {
         .expect("event within 5s")
         .expect("stream open");
     assert_eq!(
-        event.event_id, "poll:issues:flyer103/kian#101:2026-11-04T12:00:00Z",
+        event.event_id, "poll:issues:flyer103/kian-runtime#101:2026-11-04T12:00:00Z",
         "only the strictly-newer item surfaces"
     );
     // Nothing else followed.
@@ -1003,13 +1015,13 @@ async fn same_page_repolled_dedupes_by_event_id() {
         issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
         comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment"),
     ]);
-    mock.serve_page("/repos/flyer103/kian/issues", page.clone());
-    mock.serve_page("/repos/flyer103/kian/issues/comments", page.clone());
+    mock.serve_page("/repos/flyer103/kian-runtime/issues", page.clone());
+    mock.serve_page("/repos/flyer103/kian-runtime/issues/comments", page.clone());
     // (The comments endpoint returning the issue-shaped items is
     // harmless: the comment mapper skips what has no issue_url/id —
     // serve the right page below instead.)
     mock.serve_page(
-        "/repos/flyer103/kian/issues/comments",
+        "/repos/flyer103/kian-runtime/issues/comments",
         json!([comment_item(991, 101, "2026-11-04T11:00:00Z", "a comment")]),
     );
     let channel = GitHubChannel::new("github", poll_channel_config(&base)).expect("valid config");
@@ -1044,14 +1056,14 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
     let mock = GitHubMock::new();
     let base = mock.clone().serve().await;
     mock.serve_page(
-        "/repos/flyer103/kian/issues",
+        "/repos/flyer103/kian-runtime/issues",
         json!([
             issue_item(101, "2026-11-04T10:00:00Z", "reporter", "User"),
             issue_item(102, "2026-11-04T10:30:00Z", "github-actions[bot]", "Bot"),
         ]),
     );
     mock.serve_page(
-        "/repos/flyer103/kian/issues/comments",
+        "/repos/flyer103/kian-runtime/issues/comments",
         json!([comment_item(
             991,
             101,
@@ -1106,8 +1118,8 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
         .iter()
         .filter_map(|(_, _, key)| key.as_deref())
         .collect();
-    assert!(keys.contains(&"poll:issues:flyer103/kian#101:2026-11-04T10:00:00Z"));
-    assert!(keys.contains(&"poll:issue_comment:flyer103/kian#991:2026-11-04T11:00:00Z"));
+    assert!(keys.contains(&"poll:issues:flyer103/kian-runtime#101:2026-11-04T10:00:00Z"));
+    assert!(keys.contains(&"poll:issue_comment:flyer103/kian-runtime#991:2026-11-04T11:00:00Z"));
     assert!(
         !keys.iter().any(|k| k.contains("#102")),
         "the bot's issue never admitted: {keys:?}"
@@ -1121,7 +1133,7 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
             payload["kian"]["topic"]
                 .as_str()
                 .unwrap()
-                .starts_with("github:flyer103/kian#"),
+                .starts_with("github:flyer103/kian-runtime#"),
             "the topic is the derived thread key: {}",
             payload["kian"]["topic"]
         );
@@ -1145,7 +1157,7 @@ fn payload_since_cursor_reads_issue_and_pr_timestamps_and_none_otherwise() {
     let issue = json!({
         "action": "created",
         "issue": {"number": 9, "updated_at": "2026-11-03T10:30:00Z"},
-        "repository": {"full_name": "flyer103/kian"},
+        "repository": {"full_name": "flyer103/kian-runtime"},
     });
     assert_eq!(
         payload_since_cursor(&issue).as_deref(),
@@ -1156,7 +1168,7 @@ fn payload_since_cursor_reads_issue_and_pr_timestamps_and_none_otherwise() {
     let pr = json!({
         "action": "synchronize",
         "pull_request": {"number": 11, "updated_at": "2026-11-03T11:00:00Z"},
-        "repository": {"full_name": "flyer103/kian"},
+        "repository": {"full_name": "flyer103/kian-runtime"},
     });
     assert_eq!(
         payload_since_cursor(&pr).as_deref(),
@@ -1179,7 +1191,7 @@ fn payload_since_cursor_reads_issue_and_pr_timestamps_and_none_otherwise() {
     let push = json!({
         "ref": "refs/heads/main",
         "commits": [{"id": "abc", "message": "fix"}],
-        "repository": {"full_name": "flyer103/kian"},
+        "repository": {"full_name": "flyer103/kian-runtime"},
     });
     assert_eq!(payload_since_cursor(&push), None);
 

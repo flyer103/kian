@@ -1458,7 +1458,7 @@ outbox park rebuilt at boot and surfaced on the stage board; exec
   `deepseek-chat` appended the full mapped chain (turn/start, input/admitted, step/request,
   assistant/message, turn/end) with an honest `Settled` outcome — see `docs/runbook-dsh.md` for the run.
 - **Dogfood example** (`examples/issue-watch/`): a real long-running workload on
-  `flyer103/kian` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
+  `flyer103/kian-runtime` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
   reply (dry-run by default) → everything in the durable audit stream. `demo-restart.sh` resumes the
   same session from the event
   stream after `kill -9` + reboot; `RUNLOG.md` records the run.

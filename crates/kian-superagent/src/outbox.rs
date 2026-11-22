@@ -1279,7 +1279,7 @@ mod tests {
                 EventKind::ToolCall,
                 json!({"role": "assistant", "content": {"id": "c1", "name": "deliver_structured",
                     "arguments": {"channel": "issue-github", "target": target, "payload": {},
-                                  "correlation": "poll:issues:flyer103/kian#4:2026-11-03T21:27:36Z"}}}),
+                                  "correlation": "poll:issues:flyer103/kian-runtime#4:2026-11-03T21:27:36Z"}}}),
             ),
             mk(
                 2,
@@ -1297,7 +1297,7 @@ mod tests {
         );
         assert_eq!(
             pending[0].ticket,
-            "poll:issues:flyer103/kian#4:2026-11-03T21:27:36Z"
+            "poll:issues:flyer103/kian-runtime#4:2026-11-03T21:27:36Z"
         );
         let status = OutboxStatus::from_events(&events);
         assert_eq!(status.parked_lines().len(), 1);
@@ -1338,7 +1338,7 @@ mod tests {
                 EventKind::ToolCall,
                 json!({"role": "assistant", "content": {"id": "c1", "name": "deliver_structured",
                     "arguments": {"channel": "issue-github", "target": target, "payload": {},
-                                  "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z"}}}),
+                                  "correlation": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z"}}}),
             ),
             mk(
                 2,
@@ -1365,8 +1365,8 @@ mod tests {
         let wrapper_string = json!({
             "kian": {
                 "type": "channel_event", "channel": "issue-github",
-                "topic": "issue-github:flyer103/kian#6",
-                "event_id": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+                "topic": "issue-github:flyer103/kian-runtime#6",
+                "event_id": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z",
                 "raw": {}
             }
         })
@@ -1377,7 +1377,7 @@ mod tests {
                 worker_session,
                 EventKind::InputAdmitted,
                 json!({"role": "user", "content": {
-                    "correlation": "issue-github:flyer103/kian#6",
+                    "correlation": "issue-github:flyer103/kian-runtime#6",
                     "task": wrapper_string}}),
             ),
             mk(

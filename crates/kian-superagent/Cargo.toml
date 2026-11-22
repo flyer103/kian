@@ -1,5 +1,6 @@
 [package]
 name = "kian-superagent"
+description = "Super-agent bundle: Router/Worker, subscriptions, channels and the declarative job conductor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1325,7 +1325,7 @@ mod tests {
     fn config() -> GitHubConfig {
         GitHubConfig {
             api_base: "https://api.github.com".into(),
-            topics: BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())]),
+            topics: BTreeMap::from([("flyer103/kian-runtime".to_string(), "ci".to_string())]),
             events: BTreeSet::new(),
             untrusted: true,
             send: false,
@@ -1411,7 +1411,7 @@ mod tests {
                 },
                 "repository": {
                     "id": 1,
-                    "full_name": "flyer103/kian",
+                    "full_name": "flyer103/kian-runtime",
                     "name": "kian"
                 },
                 "sender": {
@@ -1434,7 +1434,7 @@ mod tests {
         // id — one delivery, one durable row).
         assert_eq!(event.event_id, "d-abc123");
         assert_eq!(event.topic.as_deref(), Some("ci"));
-        assert_eq!(event.group.as_deref(), Some("flyer103/kian"));
+        assert_eq!(event.group.as_deref(), Some("flyer103/kian-runtime"));
         assert_eq!(
             event.sender,
             Some(json!({"login": "reporter", "type": "User", "id": 7}))
@@ -1464,7 +1464,7 @@ mod tests {
         // An @-mention in a commit message (push) counts too.
         let push = json!({
             "commits": [{"message": "revert: @kian-agent take a look"}],
-            "repository": {"full_name": "flyer103/kian"},
+            "repository": {"full_name": "flyer103/kian-runtime"},
             "sender": {"login": "pusher", "type": "User"}
         });
         let event = delivery_to_event("github", &config(), "push", "d-push", &push).expect("maps");
@@ -1475,7 +1475,7 @@ mod tests {
     fn machine_events_never_declare_explicit() {
         for event_type in ["push", "check_run", "status"] {
             let body = json!({
-                "repository": {"full_name": "flyer103/kian"},
+                "repository": {"full_name": "flyer103/kian-runtime"},
                 "sender": {"login": "github-actions", "type": "Bot"}
             });
             let event =
@@ -1487,24 +1487,24 @@ mod tests {
         let status = json!({
             "state": "success",
             "context": "ci/linux",
-            "repository": {"full_name": "flyer103/kian"}
+            "repository": {"full_name": "flyer103/kian-runtime"}
         });
         let event =
             delivery_to_event("github", &config(), "status", "d-st", &status).expect("maps");
         assert_eq!(event.sender, None);
         assert_eq!(event.topic.as_deref(), Some("ci"));
-        assert_eq!(event.group.as_deref(), Some("flyer103/kian"));
+        assert_eq!(event.group.as_deref(), Some("flyer103/kian-runtime"));
     }
 
     #[test]
     fn pr_scoped_payload_resolves_the_repo_hash_pr_topic_override() {
         let mut cfg = config();
         cfg.topics
-            .insert("flyer103/kian#9".to_string(), "pr-9".to_string());
+            .insert("flyer103/kian-runtime#9".to_string(), "pr-9".to_string());
         let pr_event = json!({
             "action": "synchronize",
             "pull_request": {"number": 9, "title": "fix", "body": ""},
-            "repository": {"full_name": "flyer103/kian"},
+            "repository": {"full_name": "flyer103/kian-runtime"},
             "sender": {"login": "contributor", "type": "User"}
         });
         let event =
@@ -1515,9 +1515,9 @@ mod tests {
         // the same override via the nested pull_request object.
         let pr_comment = json!({
             "action": "created",
-            "issue": {"number": 9, "pull_request": {"url": "https://api.github.com/repos/flyer103/kian/pulls/9"}},
+            "issue": {"number": 9, "pull_request": {"url": "https://api.github.com/repos/flyer103/kian-runtime/pulls/9"}},
             "comment": {"body": "rebased"},
-            "repository": {"full_name": "flyer103/kian"},
+            "repository": {"full_name": "flyer103/kian-runtime"},
             "sender": {"login": "contributor", "type": "User"}
         });
         let event =
@@ -1528,7 +1528,7 @@ mod tests {
         let other_pr = json!({
             "action": "opened",
             "pull_request": {"number": 10, "title": "other", "body": ""},
-            "repository": {"full_name": "flyer103/kian"},
+            "repository": {"full_name": "flyer103/kian-runtime"},
             "sender": {"login": "contributor", "type": "User"}
         });
         let event =
@@ -1596,7 +1596,7 @@ mod tests {
 
     fn poll_config() -> super::PollConfig {
         super::PollConfig {
-            repo: "flyer103/kian".into(),
+            repo: "flyer103/kian-runtime".into(),
             interval_ms: 30_000,
             kinds: BTreeSet::from([super::PollKind::Issues]),
             since_field: super::POLL_SINCE_FIELD.into(),
@@ -1671,17 +1671,23 @@ mod tests {
         // Chronological order (oldest first).
         assert_eq!(
             events[0].event_id,
-            "poll:issues:flyer103/kian#101:2026-11-04T10:00:00Z"
+            "poll:issues:flyer103/kian-runtime#101:2026-11-04T10:00:00Z"
         );
         assert_eq!(
             events[1].event_id,
-            "poll:issues:flyer103/kian#102:2026-11-04T10:30:00Z"
+            "poll:issues:flyer103/kian-runtime#102:2026-11-04T10:30:00Z"
         );
         // The topic is the derived thread key: one canonical
         // topic per issue thread, not the static table's repo topic.
-        assert_eq!(events[0].topic.as_deref(), Some("github:flyer103/kian#101"));
-        assert_eq!(events[1].topic.as_deref(), Some("github:flyer103/kian#102"));
-        assert_eq!(events[0].group.as_deref(), Some("flyer103/kian"));
+        assert_eq!(
+            events[0].topic.as_deref(),
+            Some("github:flyer103/kian-runtime#101")
+        );
+        assert_eq!(
+            events[1].topic.as_deref(),
+            Some("github:flyer103/kian-runtime#102")
+        );
+        assert_eq!(events[0].group.as_deref(), Some("flyer103/kian-runtime"));
         // The adapter-declared explicit signal on (human) issue
         // authorship; the bot's item never carries it.
         assert_eq!(events[0].payload["explicit"], json!(true));
@@ -1700,7 +1706,7 @@ mod tests {
             "id": 991,
             "body": "still reproducible on main",
             "updated_at": "2026-11-04T11:00:00Z",
-            "issue_url": "https://api.github.com/repos/flyer103/kian/issues/101",
+            "issue_url": "https://api.github.com/repos/flyer103/kian-runtime/issues/101",
             "user": {"login": "reporter", "type": "User"},
         })];
         let (events, _) = super::poll_items_to_events(
@@ -1714,11 +1720,14 @@ mod tests {
         let event = &events[0];
         assert_eq!(
             event.event_id,
-            "poll:issue_comment:flyer103/kian#991:2026-11-04T11:00:00Z"
+            "poll:issue_comment:flyer103/kian-runtime#991:2026-11-04T11:00:00Z"
         );
         // The comment joins its issue's thread: the same canonical
         // topic the issue's own event carried.
-        assert_eq!(event.topic.as_deref(), Some("github:flyer103/kian#101"));
+        assert_eq!(
+            event.topic.as_deref(),
+            Some("github:flyer103/kian-runtime#101")
+        );
         // A human comment is a candidate, never authorship-explicit.
         assert!(event.payload.get("explicit").is_none());
         // A mention in the comment body is explicit (the existing
@@ -1727,7 +1736,7 @@ mod tests {
             "id": 992,
             "body": "@kian-agent please look",
             "updated_at": "2026-11-04T11:05:00Z",
-            "issue_url": "https://api.github.com/repos/flyer103/kian/issues/101",
+            "issue_url": "https://api.github.com/repos/flyer103/kian-runtime/issues/101",
             "user": {"login": "reporter", "type": "User"},
         });
         let (events, _) = super::poll_items_to_events(
@@ -1780,7 +1789,7 @@ mod tests {
         // send kinds — the exact `conversation_key` the outbox intent
         // carries. The live run2 conversation string is asserted
         // byte-for-byte.
-        let keys = super::topic_conversation_keys("issue-github:flyer103/kian#4");
+        let keys = super::topic_conversation_keys("issue-github:flyer103/kian-runtime#4");
         let conv = |kind: &str| {
             crate::outbox::conversation_key(
                 "issue-github",
@@ -1808,13 +1817,13 @@ mod tests {
         // honest empty, never a guess.
         for topic in [
             "ci",
-            "issue-github:flyer103/kian",
-            "issue-github:flyer103/kian#zero",
+            "issue-github:flyer103/kian-runtime",
+            "issue-github:flyer103/kian-runtime#zero",
             "issue-github:flyer103#4",
             "issue-github:/kian#4",
             "issue-github:flyer103/#4",
-            ":flyer103/kian#4",
-            "issue-github:flyer103/kian#4:extra",
+            ":flyer103/kian-runtime#4",
+            "issue-github:flyer103/kian-runtime#4:extra",
         ] {
             assert!(
                 super::topic_conversation_keys(topic).is_empty(),
