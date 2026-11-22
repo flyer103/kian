@@ -88,20 +88,23 @@ Read more: [docs/overview.md](docs/overview.md) (the model in one page),
 
 ## Install
 
-Three ways in, fastest first. Each one ends at the same `kian.yaml`.
+Four ways in, fastest first. Each one ends at the same `kian.yaml`.
 
 ```bash
-# 1. container (no toolchain; state lives in the volume)
+# 1. cargo (Rust stable 1.85+; installs both binaries)
+cargo install kian-cli kiand
+
+# 2. container (no toolchain; state lives in the volume)
 docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
   -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
   ghcr.io/flyer103/kian
 
-# 2. prebuilt archive (swap the triple: Linux x86_64/aarch64, macOS arm64/x86_64)
+# 3. prebuilt archive (swap the triple: Linux x86_64/aarch64, macOS arm64/x86_64)
 mkdir -p ~/.local/bin
 curl -fsSL https://github.com/flyer103/kian-runtime/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin kian kiand
 
-# 3. from source (Rust stable 1.85+, edition 2024)
+# 4. from source (Rust stable 1.85+, edition 2024)
 cargo build --release --workspace
 ```
 

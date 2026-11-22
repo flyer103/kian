@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Distribution: the workspace publishes to crates.io**. Every crate ships as `kian-*`/`kiand`
+  under the `Kian Runtime` name, so `cargo install kian-cli kiand` is the shortest install path
+  (README § Install, the site quickstart). Internal path dependencies carry a `version` so the
+  registry can resolve them.
+
 - **Declarative jobs: a run is a plan of steps, not one prompt (JOB-MODEL, ADR-052)**. A new
   `superagent.jobs` section declares jobs (a plan of capability-addressed steps with `depends_on`,
   `inputs`/`produces`, per-step `verify`, `timeout_ms`, `retries`, the effect gate and an optional

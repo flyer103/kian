@@ -293,13 +293,17 @@ drain claims        2</code></pre>
     <p class="eyebrow">Quickstart</p>
     <div class="section-head">
       <h2>One binary. One sqlite file. No external queue.</h2>
-      <p class="section-lede">No toolchain needed: a prebuilt archive or the container image. sqlite is embedded and a single <code>kian serve</code> process is the whole system, and the provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
+      <p class="section-lede">One <code>cargo install</code>, a prebuilt archive, or the container image. sqlite is embedded and a single <code>kian serve</code> process is the whole system, and the provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
     </div>
 
     <ol class="steps">
       <li>
         <h3><span class="step-no">1</span>Install</h3>
-        <pre tabindex="0"><code>mkdir -p ~/.local/bin
+        <pre tabindex="0"><code># with Rust (stable 1.85+)
+cargo install kian-cli kiand
+
+# or a prebuilt archive, no toolchain needed
+mkdir -p ~/.local/bin
 curl -fsSL https://github.com/flyer103/kian-runtime/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin kian kiand</code></pre>
       </li>
