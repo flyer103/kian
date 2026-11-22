@@ -181,8 +181,11 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         // The cron resident sink (`EngineTurn`): a scheduled firing is an
         // internal producer (operator config, same class as a watchdog timer),
         // so it bypasses `admit/pre` by the §3.4.3 matrix (CRON-MODEL §6.1).
+        // ADR-059 (P4) adds the deferred delivery path through one shared
+        // helper: the textual .admit( sites are the helper's engine call plus
+        // its two callers (immediate deliver and deliver_at), one producer.
         file: "kian-cli/src/cron_engine.rs",
-        admits: 1,
+        admits: 3,
     },
     ProducerFile {
         file: "kian-cli/src/superagent.rs",

@@ -118,9 +118,9 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 | Method | Params | Result |
 |---|---|---|
 | `create_session` | `{}` (or `null`) | `{"session":"<uuid>"}` |
-| `submit` | `{"session":"<uuid>","content":<any>,"idempotency_key":"<string>"?}` | `{"deduplicated":<bool>}` |
-| `steer` | same as `submit` | `{"deduplicated":<bool>}` |
-| `queue` | same as `submit` | `{"deduplicated":<bool>}` |
+| `submit` | `{"session":"<uuid>","content":<any>,"idempotency_key":"<string>"?,"defer":"off_peak"?}` | `{"deduplicated":<bool>}`; additive with `defer`: `{"deduplicated","deferred","eligible_at_ms"}` |
+| `steer` | same as `submit`, without `defer` | `{"deduplicated":<bool>}` |
+| `queue` | `submit` params including optional `defer` | same as `submit` |
 | `interrupt` | `{"session":"<uuid>"}` | `{"outcome":"requested" \| "not_draining"}` |
 | `confirm` | `{"session":"<uuid>","call_id":"<str>","decision":"approve" \| "reject","reason":"<str>"?,"requested_by":"<str>"?}` | `{"outcome":"accepted" \| "not_pending" \| "expired"}` |
 | `raise_budget` | `{"session":"<uuid>","tokens":<u64>?,"wall_clock_ms":<u64>?,"reason":"<str>"?,"requested_by":"<str>"?,"idempotency_key":"<str>"?}` | `{"outcome":"accepted" \| "deduplicated" \| "terminal"}` |
@@ -138,6 +138,16 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   at the next provider-turn safe boundary and never inside an in-flight provider turn.
 - `queue` uses the same admit path; the input is promoted at the next safe boundary and never
   interrupts the current turn.
+- `defer` (ADR-059) is opt-in and additive. The closed value `off_peak` plans the admission
+  against the configured `pricing.peak_windows`/`pricing.holidays` calendar and admits the
+  durable row with a future `eligible_at`, so no drain consumes it before an off-peak instant.
+  The result reports the planned instant and whether the row was actually deferred: a next off
+  peak beyond `defer.max_wait_ms`, or an admit instant that is already off peak, admits
+  immediately with `deferred:false` and the recorded reason says why. Deferral requires a
+  configured `defer:` section; without one the request is refused `-32602` (it is never
+  silently run now). A request without `defer` keeps the byte-identical result above.
+  `eligible_at` is a not-before gate, not a promise that a drain starts at that instant;
+  `steer` never defers — interactive steering is never delayed.
 - `interrupt` requests an abort. The intent is durable (ADR-014): whenever work may still be in
   flight the server also admits a control-envelope inbox row that the owning drain consumes into a
   `control/interrupt` event, so the intent survives a drain crash and crosses replicas.

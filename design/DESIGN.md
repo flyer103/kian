@@ -234,7 +234,11 @@ this row-level convention: a
 row payload of exactly `{"content": X, "spill": Y}` consumes as **two events in one fenced write
 batch** — `input/admitted` carrying `{"role": "user", "content": X}` exactly as the bare content
 would have produced, followed immediately by `input/spilled` carrying the opaque sidecar verbatim —
-while rows without the envelope consume byte-identically to before. Promote-boundary enforcement lives in the drain-context
+while rows without the envelope consume byte-identically to before. The scheduler's firing
+rows keep the prompt as the message and carry the firing proof as an additive non-context key
+(`{content, cron}`) — plus, for an `off_peak` schedule, the deferral decision
+(`{content, cron, defer}`, ADR-059) — so every firing sends the same prompt bytes.
+Promote-boundary enforcement lives in the drain-context
 surface handed to the `LoopDriver` seam (`LoopDriver::Ctx`): input-taking is refused while a
 provider turn is in flight, and every drain write carries the claim's epoch under expectedSeq
 CAS (seq-mismatch from a fenced-out concurrent writer is repaired by re-reading the head; a
@@ -260,6 +264,20 @@ previous drain died inside is closed with one honest-error result per unpaired c
 (`kian-core::repair`; reconstructed `tool/call` when it was never logged, additive `recovered`
 marker, no fabricated permission) — EVENT-MODEL §4.2. Logged `ask` calls are never repaired;
 their approval path owns them (CONFIRMATION-MODEL R4/§15.6).
+
+**Deferral (ADR-059, P4).** Off-peak deferral is a planning decision plus a gate, never a second
+scheduler. A pure planner in `kian-cli::defer` reads the same `pricing:` book the cost projection
+uses and returns the next off-peak instant bounded by `defer.max_wait_ms` (a next instant beyond
+the bound, or an admit instant already off peak, runs immediately and records the reason). The
+admission path (`Engine::admit_at`) persists the ordinary inbox row with that `eligible_at`;
+the store's existing `eligible_at <= now` predicate is the hard gate, so a stale, folded or early
+wake can never consume the row. The wake registry keeps holding no timers: `kian serve` arms a
+due-wake sweep (only when a `defer:` section exists) that re-runs the same eligibility scan as the
+startup rebuild and wakes sessions whose rows became due — correctness never depends on the sweep's
+cadence, a late sweep only adds latency. Only explicit opt-ins defer — JSON-RPC
+`submit`/`queue` with `defer: "off_peak"`, and a cron resident schedule with
+`defer: off_peak` (a worktree firing has no inbox row and refuses it); interactive inputs and
+steering never defer.
 
 ### 2.4 Three-layer recovery (A4/A5)
 
@@ -1838,7 +1856,9 @@ ticker on a dedicated OS thread. Each tick walks the schedules; a due slot is cl
 `cron_firings` (the primary key is the idempotency lock) *before* anything is dispatched, and the
 cursor advances only after the claim, so a crash between the two re-claims nothing. Dispatch has
 two arms: the resident arm admits one durable inbox row for the target session (`{content, cron}`
-payload — the firing proof is additive and non-context — idempotency key `cron:<firing_id>`), and
+payload — the firing proof is additive and non-context — idempotency key `cron:<firing_id>`; a
+schedule that declares `defer: off_peak` instead admits with a future `eligible_at` and adds the
+non-context `defer` decision beside the proof, ADR-059), and
 the worktree arm cuts a detached git tree under the resolved `worktree.root`, runs the configured
 harness under `timeout_ms`, then captures and cleans up (or keeps, `keep_on_failure`) the tree;
 the disk guards and the per-schedule slot ceiling live in `cron_worktree`. The ticker is not a

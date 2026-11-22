@@ -17,6 +17,18 @@ use chrono_tz::Tz;
 use kian_core::model::{ModelDialect, ModelProfile, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 
+/// Milliseconds in one wall-clock minute (off-peak planning granularity,
+/// ADR-059).
+const MINUTE_MS: u64 = 60_000;
+/// The off-peak search horizon (ADR-059): eight days covers one whole week
+/// plus a day of timezone/DST slack.
+const OFF_PEAK_SCAN_HORIZON_MS: u64 = 8 * 24 * 60 * MINUTE_MS;
+/// A reference Monday 00:00 UTC used by the boot-time off-peak existence
+/// check (the window set is weekly, so one reference week is sufficient).
+const REFERENCE_WEEK_MS: u64 = 1_767_571_200_000;
+/// Minutes in the reference week.
+const REFERENCE_WEEK_MINUTES: u64 = 7 * 24 * 60;
+
 // ---------------------------------------------------------------------------
 // Config shapes (the pricing: and model_profiles: sections)
 // ---------------------------------------------------------------------------
@@ -490,6 +502,57 @@ impl PriceBook {
         })
     }
 
+    /// The next instant at or after `from_ms` outside every peak window
+    /// (ADR-059): `Some(from_ms)` when already off peak, else the first
+    /// off-peak minute boundary inside the scan horizon. `None` means the
+    /// configured windows leave no off-peak minute in the horizon - the
+    /// `defer:` section refuses boot in that case rather than defer
+    /// forever.
+    ///
+    /// Pure and minute-granular: an eligibility instant only gates the
+    /// inbox row, and the due-wake sweep that observes it is coarser.
+    #[must_use]
+    pub fn next_off_peak_ms(&self, from_ms: u64) -> Option<u64> {
+        if !self.is_peak(from_ms) {
+            return Some(from_ms);
+        }
+        let mut cursor = from_ms.saturating_add(MINUTE_MS - 1) / MINUTE_MS * MINUTE_MS;
+        let end = from_ms.saturating_add(OFF_PEAK_SCAN_HORIZON_MS);
+        while cursor <= end {
+            if !self.is_peak(cursor) {
+                return Some(cursor);
+            }
+            cursor = cursor.saturating_add(MINUTE_MS);
+        }
+        None
+    }
+
+    /// True when at least one minute of a reference week is outside every
+    /// peak window, ignoring the holiday table (ADR-059 boot validation:
+    /// holidays can only add off-peak minutes, never remove one).
+    #[must_use]
+    pub fn has_off_peak_minute(&self) -> bool {
+        (0..REFERENCE_WEEK_MINUTES).any(|i| !self.peak_only(REFERENCE_WEEK_MS + i * MINUTE_MS))
+    }
+
+    /// The window-only peak predicate (no holiday suppression).
+    fn peak_only(&self, ts_ms: u64) -> bool {
+        let Some(dt) = i64::try_from(ts_ms)
+            .ok()
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+        else {
+            return false;
+        };
+        self.windows.iter().any(|w| {
+            let local = dt.with_timezone(&w.tz);
+            if !w.weekdays.contains(&local.weekday()) {
+                return false;
+            }
+            let minute = local.hour() * 60 + local.minute();
+            minute >= w.start_minute && minute < w.end_minute
+        })
+    }
+
     /// The exact cost of one usage object under quote, in micro-USD.
     /// Rounds once, half-up, after summing the three components.
     #[must_use]
@@ -728,5 +791,68 @@ mod tests {
         assert!(!book.has_prices());
         assert_eq!(book.entry_count(), 0);
         assert!(book.quote("deepseek", "deepseek-flash", 0).is_none());
+    }
+
+    #[test]
+    fn off_peak_scan_finds_the_next_non_peak_minute() {
+        let book = base().book().unwrap();
+        // Already off peak: the instant itself.
+        let monday_morning = ts(2026, 11, 23, 5, 0);
+        assert_eq!(book.next_off_peak_ms(monday_morning), Some(monday_morning));
+        // Just before a peak window: still off peak, so the instant itself.
+        assert_eq!(
+            book.next_off_peak_ms(ts(2026, 11, 23, 0, 59)),
+            Some(ts(2026, 11, 23, 0, 59))
+        );
+        // The first minute of a peak window: its exclusive end.
+        assert_eq!(
+            book.next_off_peak_ms(ts(2026, 11, 23, 1, 0)),
+            Some(ts(2026, 11, 23, 4, 0))
+        );
+        // Inside a peak window: its exclusive end too.
+        assert_eq!(
+            book.next_off_peak_ms(ts(2026, 11, 23, 2, 30)),
+            Some(ts(2026, 11, 23, 4, 0))
+        );
+        // A mid-minute instant resolves on the next minute edge.
+        assert_eq!(
+            book.next_off_peak_ms(ts(2026, 11, 23, 1, 0) + 30_000),
+            Some(ts(2026, 11, 23, 4, 0))
+        );
+        assert!(book.has_off_peak_minute());
+    }
+
+    #[test]
+    fn a_holiday_is_off_peak_for_the_planner_too() {
+        let mut cfg = base();
+        cfg.holidays = vec!["2026-11-23".into()];
+        cfg.holiday_timezone = Some("Asia/Shanghai".into());
+        let book = cfg.book().unwrap();
+        let inside = ts(2026, 11, 23, 2, 0);
+        // The window would be peak, but the holiday suppresses it: the
+        // instant is already off peak and never waits.
+        assert_eq!(book.next_off_peak_ms(inside), Some(inside));
+    }
+
+    #[test]
+    fn a_week_of_peak_has_no_off_peak_minute() {
+        let mut cfg = base();
+        cfg.peak_windows = vec![super::PeakWindowConfig {
+            weekdays: vec![
+                super::WeekdayName::Mon,
+                super::WeekdayName::Tue,
+                super::WeekdayName::Wed,
+                super::WeekdayName::Thu,
+                super::WeekdayName::Fri,
+                super::WeekdayName::Sat,
+                super::WeekdayName::Sun,
+            ],
+            start: "00:00".into(),
+            end: "24:00".into(),
+            timezone: "UTC".into(),
+        }];
+        let book = cfg.book().unwrap();
+        assert!(!book.has_off_peak_minute());
+        assert!(book.next_off_peak_ms(ts(2026, 11, 23, 2, 0)).is_none());
     }
 }

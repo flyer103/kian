@@ -677,6 +677,40 @@ Non-goals recorded with the phase: no price-aware break-even planner, no separat
 scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
 enforcement of the reserve.
 
+### Off-peak deferral (ADR-059, P4 landed)
+
+Scope: let a deliberately submitted batch admission or a scheduled firing wait for an off-peak
+pricing window, without introducing a second scheduler and without ever delaying interactive work.
+
+Semantics: the planner is pure and lives in `kian-cli` beside the price book. Given the current
+instant and the configured peak/holiday calendar it returns the next off-peak instant, bounded by
+`defer.max_wait_ms`; when the bound is exceeded, or the admit instant is already off peak, the
+admission runs immediately and the recorded reason says why it did not wait (a `deferred: false`
+decision is an honest record, never a silent skip). Deferral is opt-in only: the JSON-RPC
+`submit`/`queue` methods accept `defer: "off_peak"`, and a cron resident schedule declares
+`defer: off_peak` (absent keeps today's immediate bytes). The admission path persists the ordinary
+durable inbox row with the planned `eligible_at`; the store's existing eligibility predicate is
+the hard gate, so no wake can consume the row early and no second timer system exists. A serve-side
+due-wake sweep, armed only by a `defer:` section, re-runs the startup eligibility scan to wake
+sessions whose rows became due; a late sweep adds latency only. Interactive inputs — CLI runs,
+chat, channel messages, steering — never defer, and a cron worktree firing cannot defer (an
+isolated external job has no inbox row). The cron decision rides the admitted payload as a
+non-context additive `defer` key; no new event kind is involved.
+
+The normative wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; the scheduling
+semantics are [design/CRON-MODEL.md](../design/CRON-MODEL.md) §3.1/§3.3/§6.1; the event contract is
+[design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §4.2; the placement is
+[design/DESIGN.md](../design/DESIGN.md) §2.3; the decision record is
+[ADR-059](../design/decisions/ADR-059-off-peak-deferral.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P4 | kian-cli, kian-orchestrator | the pure off-peak planner over `pricing.peak_windows`/holidays (bounded by `defer.max_wait_ms`, immediate when already off peak or the bound is exceeded); `Engine::admit_at` over the existing `eligible_at` hard gate; the serve due-wake sweep; the optional `defer:` config section with boot validation; `defer: off_peak` on cron resident schedules; additive `defer` on `submit`/`queue` and the non-context payload decision | landed |
+
+Non-goals recorded with the phase: no second scheduler or per-row timer, no deferral of
+interactive inputs or steering, no job deferral (the job runtime is not in this tree), no
+`overlap`/queue policy change, no cost guarantee from deferring.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

@@ -606,6 +606,32 @@ pub trait ResidentTurn: Send + Sync {
         idempotency_key: Option<String>,
     ) -> Result<(), String>;
 
+    /// Plans this firing's deferral (ADR-059). The default is immediate: a
+    /// fake sink or a worktree-only dispatcher never defers.
+    fn plan_deferral(
+        &self,
+        policy: crate::defer::DeferPolicy,
+    ) -> Result<crate::defer::DeferPlan, String> {
+        Ok(crate::defer::DeferPlan::immediate(
+            policy,
+            0,
+            "deferral not supported by this sink",
+        ))
+    }
+
+    /// Delivers the firing at an explicit eligibility instant (ADR-059). The
+    /// default ignores the instant and delivers now, so a fake sink keeps its
+    /// old behavior and a plain deliver call site is unchanged.
+    fn deliver_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        _eligible_at_ms: Option<u64>,
+    ) -> Result<(), String> {
+        self.deliver(session, content, idempotency_key)
+    }
+
     /// The default `overlap: skip` judgement (CRON-MODEL §5.1): a firing
     /// must not pile onto a session that is still working. `Ok(Some(reason))`
     /// records the slot as `skipped_overlap`; `Err` is a real failure
@@ -649,6 +675,9 @@ where
     /// ADR-038: the session bootstrap runs before the firing row, so a
     /// fresh cron target's first context event is the memory index.
     bootstrap: Option<Arc<dyn SessionBootstrap>>,
+    /// ADR-059: the off-peak planner, armed only when the serve config
+    /// declares a defer: section. None keeps every firing immediate.
+    deferral: Option<crate::defer::DeferCalendar>,
 }
 
 impl<D> EngineTurn<D>
@@ -665,19 +694,28 @@ where
             engine,
             handle,
             bootstrap,
+            deferral: None,
         }
     }
-}
 
-impl<D> ResidentTurn for EngineTurn<D>
-where
-    D: LoopDriver<Ctx = DrainCtx> + 'static,
-{
-    fn deliver(
+    /// Arms the off-peak planner (ADR-059). Without it every firing is
+    /// immediate, and config validation refused any schedule that declared
+    /// defer: off_peak without a defer: section.
+    #[must_use]
+    pub fn with_deferral(mut self, calendar: crate::defer::DeferCalendar) -> Self {
+        self.deferral = Some(calendar);
+        self
+    }
+
+    /// The one admit path shared by deliver (immediate) and deliver_at
+    /// (deferred): the terminal/overlap/bootstrap checks run identically and
+    /// only the eligibility instant of the durable row differs (ADR-059).
+    fn admit(
         &self,
         session: SessionId,
         content: Value,
         idempotency_key: Option<String>,
+        eligible_at_ms: Option<u64>,
     ) -> Result<(), String> {
         self.handle.block_on(async {
             if let Some(state) = self
@@ -696,7 +734,7 @@ where
             // before the session was recorded), but resolution + the durable
             // session record widen that window. Re-check at the admit boundary:
             // a drain that started meanwhile must not get a queued duplicate
-            // (CRON-MODEL §5.1). A trip here settles the slot `skipped_overlap`
+            // (CRON-MODEL §5.1). A trip here settles the slot skipped_overlap
             // and keeps the recorded session as "the session it tried".
             if self
                 .engine
@@ -718,12 +756,55 @@ where
                     "cron target session bootstrap skipped"
                 );
             }
-            self.engine
-                .admit(session, content, idempotency_key)
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("admit: {e}"))
+            let admitted = match eligible_at_ms {
+                Some(at) => {
+                    self.engine
+                        .admit_at(session, content, idempotency_key, at)
+                        .await
+                }
+                None => self.engine.admit(session, content, idempotency_key).await,
+            };
+            admitted.map(|_| ()).map_err(|e| format!("admit: {e}"))
         })
+    }
+}
+
+impl<D> ResidentTurn for EngineTurn<D>
+where
+    D: LoopDriver<Ctx = DrainCtx> + 'static,
+{
+    fn deliver(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<(), String> {
+        self.admit(session, content, idempotency_key, None)
+    }
+
+    fn plan_deferral(
+        &self,
+        policy: crate::defer::DeferPolicy,
+    ) -> Result<crate::defer::DeferPlan, String> {
+        let now_ms = self.engine.now_ms();
+        match &self.deferral {
+            Some(calendar) => Ok(calendar.plan(policy, now_ms)),
+            None => Ok(crate::defer::DeferPlan::immediate(
+                policy,
+                now_ms,
+                "deferral is not configured",
+            )),
+        }
+    }
+
+    fn deliver_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        eligible_at_ms: Option<u64>,
+    ) -> Result<(), String> {
+        self.admit(session, content, idempotency_key, eligible_at_ms)
     }
 
     fn should_skip(&self, session: SessionId) -> Result<Option<String>, String> {
@@ -831,10 +912,28 @@ impl CronDispatcher for ResidentDispatcher {
         };
         let cron: Value = serde_json::from_str(payload)
             .map_err(|e| format!("dispatch payload is not JSON: {e}"))?;
-        // `content` is the turn's user message; `cron` carries the routing
-        // proof (schedule_id / firing_id / fire_time / target) as an additive
+        // content is the turn's user message; cron carries the routing proof
+        // (schedule_id / firing_id / fire_time / target) as an additive
         // non-context key, so the model request is the prompt alone.
-        let content = serde_json::json!({ "content": schedule.prompt, "cron": cron });
+        let mut content = serde_json::json!({ "content": schedule.prompt, "cron": cron });
+        // ADR-059: a schedule that declared defer: off_peak admits its durable
+        // row with a future eligibility instant instead of dropping it or
+        // delaying outside the event log. The decision rides on the row payload
+        // as an additive non-context key (derive_model_context keeps only
+        // content), so an operator can answer why it did not run now. An
+        // immediate firing keeps the exact bytes it had before this change.
+        if schedule.defer == crate::defer::DeferPolicy::OffPeak {
+            let plan = self.turn.plan_deferral(schedule.defer)?;
+            if let Some(object) = content.as_object_mut() {
+                object.insert("defer".to_string(), serde_json::json!(plan));
+            }
+            return self.turn.deliver_at(
+                session,
+                content,
+                Some(format!("cron:{firing_id}")),
+                plan.deferred.then_some(plan.eligible_at_ms),
+            );
+        }
         self.turn
             .deliver(session, content, Some(format!("cron:{firing_id}")))
     }
@@ -1618,6 +1717,134 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A resident sink that records the deferred admission path (ADR-059).
+    #[derive(Default)]
+    struct DeferResident {
+        plans: AtomicUsize,
+        deliveries: Mutex<Vec<(SessionId, Value, Option<u64>)>>,
+    }
+
+    impl ResidentTurn for DeferResident {
+        fn deliver(
+            &self,
+            session: SessionId,
+            content: Value,
+            _idempotency_key: Option<String>,
+        ) -> Result<(), String> {
+            if let Ok(mut seen) = self.deliveries.lock() {
+                seen.push((session, content, None));
+            }
+            Ok(())
+        }
+
+        fn plan_deferral(
+            &self,
+            policy: crate::defer::DeferPolicy,
+        ) -> Result<crate::defer::DeferPlan, String> {
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::defer::DeferPlan {
+                policy,
+                eligible_at_ms: 1_800_000_600_000,
+                deferred: true,
+                reason: "scheduled off peak".to_string(),
+            })
+        }
+
+        fn deliver_at(
+            &self,
+            session: SessionId,
+            content: Value,
+            _idempotency_key: Option<String>,
+            eligible_at_ms: Option<u64>,
+        ) -> Result<(), String> {
+            if let Ok(mut seen) = self.deliveries.lock() {
+                seen.push((session, content, eligible_at_ms));
+            }
+            Ok(())
+        }
+    }
+
+    fn dispatch_at(
+        schedule: &crate::config::CronRuntimeSchedule,
+        dispatcher: &ScheduleDispatcher,
+        session: SessionId,
+    ) {
+        let fire_time = DateTime::parse_from_rfc3339("2024-06-03T12:00:00Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let firing_id = kian_cron::firing_id(&schedule.id, fire_time);
+        let payload = cron_tick::dispatch_payload(schedule, &firing_id, fire_time);
+        dispatcher
+            .dispatch(schedule, &firing_id, &payload, Some(session))
+            .expect("the resident arm accepts the firing");
+    }
+
+    #[test]
+    fn an_off_peak_schedule_defers_through_deliver_at_and_records_the_decision() {
+        let fake = Arc::new(DeferResident::default());
+        let dispatcher =
+            ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(fake.clone())));
+        let schedule = schedule_yaml(
+            "audit",
+            "    defer: off_peak
+",
+        );
+        let session = SessionId(uuid::Uuid::new_v4());
+
+        dispatch_at(&schedule, &dispatcher, session);
+
+        assert_eq!(
+            fake.plans.load(Ordering::SeqCst),
+            1,
+            "the planner ran exactly once for the deferred firing"
+        );
+        let seen = fake.deliveries.lock().expect("deliveries");
+        assert_eq!(seen.len(), 1);
+        let (seen_session, content, eligible_at) = &seen[0];
+        assert_eq!(*seen_session, session);
+        assert_eq!(
+            *eligible_at,
+            Some(1_800_000_600_000),
+            "the sink admits at the planned eligibility instant"
+        );
+        let decision = content
+            .get("defer")
+            .expect("the decision rides the row payload as a non-context key");
+        assert_eq!(decision["policy"], "off_peak");
+        assert_eq!(decision["deferred"], true);
+        assert_eq!(decision["eligible_at_ms"], 1_800_000_600_000_u64);
+        assert_eq!(decision["reason"], "scheduled off peak");
+        assert_eq!(content["content"], "audit .state/");
+        assert!(content.get("cron").is_some(), "the routing proof stays");
+    }
+
+    #[test]
+    fn an_immediate_schedule_keeps_the_old_payload_bytes() {
+        let fake = Arc::new(DeferResident::default());
+        let dispatcher =
+            ScheduleDispatcher::resident(Arc::new(ResidentDispatcher::new(fake.clone())));
+        let schedule = schedule("audit");
+        let session = SessionId(uuid::Uuid::new_v4());
+
+        dispatch_at(&schedule, &dispatcher, session);
+
+        assert_eq!(
+            fake.plans.load(Ordering::SeqCst),
+            0,
+            "an immediate schedule never asks the deferral planner"
+        );
+        let seen = fake.deliveries.lock().expect("deliveries");
+        assert_eq!(seen.len(), 1);
+        let (_, content, eligible_at) = &seen[0];
+        assert_eq!(*eligible_at, None);
+        assert!(
+            content.get("defer").is_none(),
+            "an immediate firing keeps the exact payload it had before"
+        );
+        assert_eq!(content["content"], "audit .state/");
+        assert!(content.get("cron").is_some());
     }
 
     fn runtime() -> tokio::runtime::Runtime {

@@ -116,6 +116,12 @@ pub struct Server {
     /// never a failure path for a request (a reclaimed blob only
     /// degrades an old result's fidelity; replay keeps the preview).
     artifact_maintenance: Option<ArtifactMaintenance>,
+    /// The off-peak deferral plan (ADR-059): present iff the defer:
+    /// section is configured. serve arms the due-wake ticker and the cron
+    /// planner only then; absent refuses API defer requests, forbids a
+    /// cron schedule declaring defer: off_peak at load time, and changes
+    /// no admission bytes.
+    defer: Option<DeferRuntime>,
     /// The resolved `superagent.cron` schedules (CRON-MODEL §3): empty iff
     /// no cron section is configured (or none resolved). [`Server::serve`]
     /// spawns the cron ticker only when this is non-empty — feature-off
@@ -202,6 +208,16 @@ struct ArtifactMaintenance {
     interval_ms: u64,
     max_bytes: u64,
     retention_days: u64,
+}
+
+/// The serve-side off-peak deferral plan (ADR-059): present iff the
+/// defer: section is configured. The calendar is a pure read; correctness
+/// never depends on the sweep — a durable row's eligible_at is the hard
+/// gate and the ticker only shortens the wait.
+#[derive(Clone)]
+struct DeferRuntime {
+    calendar: crate::defer::DeferCalendar,
+    sweep_interval_ms: u64,
 }
 
 /// The serve-side child inactivity plan (MULTIAGENT-MODEL §5.3, pin
@@ -417,6 +433,24 @@ impl Server {
                 }
                 None => (None, None, None),
             };
+        // ADR-059: the off-peak planner. Absent defer: section = deferral
+        // off: API defer requests are refused (-32602), a cron schedule may
+        // not declare defer: off_peak (load-time error), and no due-wake
+        // ticker is armed.
+        let defer_runtime = match config.defer.as_ref() {
+            Some(defer) => {
+                let book = Arc::new(
+                    config
+                        .price_book()
+                        .map_err(|e| ServeError::Assembly(format!("defer: price book: {e}")))?,
+                );
+                Some(DeferRuntime {
+                    calendar: defer.calendar(book),
+                    sweep_interval_ms: defer.sweep_interval_ms,
+                })
+            }
+            None => None,
+        };
         // Bundle-edge tools mounted beside the local tools. ADR-055: the
         // artifact reader when spill is on. ADR-056 (P2b): the client-side
         // web tools when `web:` is on — the provider key is read here,
@@ -1192,6 +1226,7 @@ impl Server {
             snapshot_maintenance,
             views_maintenance,
             artifact_maintenance,
+            defer: defer_runtime,
             // The one process-wide hook bus (provided to the plugin ctx
             // above; the §8/§9 sidecar runtime mounts on it after the
             // inbox rebuild).
@@ -1383,6 +1418,31 @@ impl Server {
                 }
             });
         }
+        // Deferred admissions (ADR-059): each beat wakes sessions whose
+        // durable rows became eligible. A sweep, not a per-row timer: a
+        // missed or doubled beat only changes latency, because the store's
+        // eligible_at comparison is the hard gate and no wake can consume a
+        // row early. Armed only when the defer: section exists (feature-off
+        // arms no timer).
+        if let Some(plan) = self.defer.clone() {
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                    plan.sweep_interval_ms.max(1),
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    match engine.due_wake_sweep().await {
+                        Ok(0) => {}
+                        Ok(woken) => {
+                            tracing::info!(sessions = woken, "deferred wake sweep");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "deferred wake sweep failed"),
+                    }
+                }
+            });
+        }
         // Snapshot maintenance (READ-MODEL §9, P1): a ticker whose each
         // beat builds verified snapshots for candidate sessions under a
         // per-session maintenance lease — strictly outside every drain
@@ -1500,11 +1560,17 @@ impl Server {
                 tokio::runtime::Handle::current(),
                 schedules.clone(),
             );
-            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn::new(
+            let mut turn = EngineTurn::new(
                 Arc::clone(&self.engine),
                 tokio::runtime::Handle::current(),
                 self.session_bootstrap.clone(),
-            ));
+            );
+            // ADR-059: the planner is armed only with the defer: section;
+            // without it an immediate firing keeps its exact old bytes.
+            if let Some(defer) = self.defer.as_ref() {
+                turn = turn.with_deferral(defer.calendar.clone());
+            }
+            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(turn);
             let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
                 Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
             // Selection rule: a schedule that declares `worktree:` is
@@ -2057,6 +2123,61 @@ impl ControlPlane for Server {
                 .await
                 .map(|o| o.deduplicated)
                 .map_err(internal("queue"))
+        })
+    }
+
+    fn submit_deferred(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+        policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<crate::api::DeferredAdmission, ControlError>> {
+        Box::pin(async move {
+            // Port (a′): the admission observation is identical to submit —
+            // deferral changes the row's eligibility instant, not its shape.
+            self.observe_api_admission(session, &content, false).await;
+            let plan = match self.defer.as_ref() {
+                Some(defer) => defer.calendar.plan(policy, self.engine.now_ms()),
+                None => return Err(ControlError::DeferralUnavailable),
+            };
+            let admitted = self
+                .engine
+                .admit_at(session, content, idempotency_key, plan.eligible_at_ms)
+                .await
+                .map_err(internal("submit_deferred"))?;
+            Ok(crate::api::DeferredAdmission {
+                deduplicated: admitted.deduplicated,
+                eligible_at_ms: plan.eligible_at_ms,
+                deferred: plan.deferred,
+            })
+        })
+    }
+
+    fn queue_deferred(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+        policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<crate::api::DeferredAdmission, ControlError>> {
+        Box::pin(async move {
+            // Port (a′): the queue row shares submit's ingress.
+            self.observe_api_admission(session, &content, false).await;
+            let plan = match self.defer.as_ref() {
+                Some(defer) => defer.calendar.plan(policy, self.engine.now_ms()),
+                None => return Err(ControlError::DeferralUnavailable),
+            };
+            let admitted = self
+                .engine
+                .admit_at(session, content, idempotency_key, plan.eligible_at_ms)
+                .await
+                .map_err(internal("queue_deferred"))?;
+            Ok(crate::api::DeferredAdmission {
+                deduplicated: admitted.deduplicated,
+                eligible_at_ms: plan.eligible_at_ms,
+                deferred: plan.deferred,
+            })
         })
     }
 

@@ -71,6 +71,7 @@ pub mod cron_cli;
 pub mod cron_engine;
 pub mod cron_tick;
 pub mod cron_worktree;
+pub mod defer;
 mod harness_hooks;
 pub mod imessage_check;
 pub mod memory;

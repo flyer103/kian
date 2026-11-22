@@ -1604,16 +1604,53 @@ where
         idempotency_key: Option<String>,
     ) -> Result<AdmitOutcome, EngineError> {
         let outcome = self.admit_row(session, content, idempotency_key).await?;
-        // wake transport (ADR-009 decision 4): publish the advisory
-        // cross-replica hint. The admit INSERT above is a single
-        // statement, so it has *committed* by the time we get here —
-        // the notify can never be observed before its row is visible
-        // (durable-before-wake holds for remote replicas too). The
-        // notify is best-effort: a failure is logged and skipped (a
-        // wake is losable by invariant; the sweep ticker and each
-        // replica's startup scan bound the miss). sqlite is a no-op —
-        // the in-process registry below is the single-process
-        // transport.
+        self.publish_admit_wake(session).await;
+        Ok(outcome)
+    }
+
+    /// Admits one input at an explicit eligibility instant (ADR-059):
+    /// the durable row is written exactly like Engine::admit, but a
+    /// row that is not yet eligible does NOT wake. The due-wake
+    /// sweep (or a later admission, or a restart) wakes the session when
+    /// the instant arrives, and the store's eligible_at gate refuses
+    /// early consumption regardless — the wake is never the correctness
+    /// mechanism, only the latency one.
+    pub async fn admit_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        eligible_at_ms: u64,
+    ) -> Result<AdmitOutcome, EngineError> {
+        let outcome = self
+            .admit_row_at(session, content, idempotency_key, eligible_at_ms)
+            .await?;
+        if eligible_at_ms > self.clock.now_ms() {
+            return Ok(outcome);
+        }
+        self.publish_admit_wake(session).await;
+        Ok(outcome)
+    }
+
+    /// The engine's wall clock reading, milliseconds (ADR-059: the
+    /// deferral planner and the cron sinks plan against the same clock
+    /// the inbox rows are stamped with).
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The advisory wake half of Engine::admit: publish the
+    /// cross-replica hint, then wake the in-process registry.
+    ///
+    /// wake transport (ADR-009 decision 4): the admit INSERT is a single
+    /// statement, so it has *committed* by the time we get here — the
+    /// notify can never be observed before its row is visible
+    /// (durable-before-wake holds for remote replicas too). The notify is
+    /// best-effort: a failure is logged and skipped (a wake is losable by
+    /// invariant; the sweep ticker and each replica's startup scan bound
+    /// the miss). sqlite is a no-op — the in-process registry below is the
+    /// single-process transport.
+    async fn publish_admit_wake(&self, session: SessionId) {
         if let Err(e) = self.store.notify_wake(session).await {
             tracing::warn!(
                 session = %session.0,
@@ -1622,7 +1659,6 @@ where
             );
         }
         self.wake(session);
-        Ok(outcome)
     }
 
     /// Admits one input **quietly** (MEMORY-MODEL §6, P2 plan §2.2):
@@ -1655,16 +1691,29 @@ where
         idempotency_key: Option<String>,
     ) -> Result<AdmitOutcome, EngineError> {
         let now = self.clock.now_ms();
+        self.admit_row_at(session, content, idempotency_key, now)
+            .await
+    }
+
+    /// The durable-row write with an explicit eligibility instant
+    /// (ADR-059). Constraint 6 still holds: the row is durable BEFORE any
+    /// wake may fire; on any store failure the caller returns without
+    /// touching the registry.
+    async fn admit_row_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        eligible_at_ms: u64,
+    ) -> Result<AdmitOutcome, EngineError> {
         let input = InputRow {
             id: Uuid::new_v4(),
             session,
             payload: content,
-            admitted_at: now,
-            eligible_at: now,
+            admitted_at: self.clock.now_ms(),
+            eligible_at: eligible_at_ms,
             idempotency_key,
         };
-        // Constraint 6: the row is durable BEFORE any wake may fire.
-        // On any store failure we return without touching the registry.
         Ok(self.store.admit(input).await?)
     }
 
@@ -1987,6 +2036,26 @@ where
     /// projects terminal and exits without writing anything), so they are
     /// audit facts, not a pending wake (CRON-MODEL §5.1).
     pub async fn startup_rebuild(&self) -> Result<usize, EngineError> {
+        self.scan_eligible_sessions().await
+    }
+
+    /// The due-wake sweep (ADR-059 decision 5): re-derives the wake
+    /// registry from the inbox so a deferred row whose eligible_at has
+    /// come due wakes its session without a per-row timer. The wake
+    /// registry holds no timers by design; correctness never depends on
+    /// this ticker (a later admission or a restart finds the row too, and
+    /// the store's eligible_at gate refuses early consumption either way),
+    /// so an absent or late sweep only adds latency. Returns the number of
+    /// sessions woken.
+    pub async fn due_wake_sweep(&self) -> Result<usize, EngineError> {
+        self.scan_eligible_sessions().await
+    }
+
+    /// The shared inbox scanner behind the startup rebuild and the
+    /// due-wake sweep: registers a pending wake for every session with
+    /// eligible-but-unconsumed input, then wakes them. Neither caller
+    /// reads a timer.
+    async fn scan_eligible_sessions(&self) -> Result<usize, EngineError> {
         let inboxes = self.store.startup_scan(self.clock.now_ms()).await?;
         let mut sessions: Vec<SessionId> = Vec::with_capacity(inboxes.len());
         for inbox in &inboxes {
@@ -2656,6 +2725,21 @@ fn consumption_plan(row: &InputRow) -> Consumption {
             // bytes).
             return Consumption::Single(json!({"role": "user", "content": content, "cron": cron}));
         }
+        if obj.len() == 3
+            && let (Some(content), Some(cron), Some(defer)) =
+                (obj.get("content"), obj.get("cron"), obj.get("defer"))
+        {
+            // ADR-059: an off-peak firing carries the scheduler's deferral
+            // decision beside the proof. The decision is additive and
+            // non-context (derive_model_context reads role/content only), so
+            // the model still receives the prompt alone.
+            return Consumption::Single(json!({
+                "role": "user",
+                "content": content,
+                "cron": cron,
+                "defer": defer,
+            }));
+        }
     }
     Consumption::Single(json!({"role": "user", "content": row.payload}))
 }
@@ -2929,6 +3013,71 @@ mod tests {
         let scan = store.startup_scan(T0).await.expect("scan");
         assert_eq!(scan.len(), 1);
         assert_eq!(scan[0].eligible.len(), 1);
+        cleanup(&path);
+    }
+
+    /// ADR-059: a row admitted with a future eligibility instant is
+    /// durable immediately but arms nothing — it is invisible to the
+    /// eligible scan and cannot be consumed early. When the clock reaches
+    /// the instant, the due-wake sweep (not a per-row timer) wakes the
+    /// session and the row drains.
+    #[tokio::test]
+    async fn a_deferred_row_is_invisible_until_due_and_the_sweep_wakes_it() {
+        let (store, path) = open_store().await;
+        let clock = Arc::new(ManualClock::new(T0));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig::default(),
+            clock.clone(),
+        );
+        let sid = SessionId::new();
+        let due = T0 + 60_000;
+
+        let outcome = eng
+            .admit_at(sid, json!("batch task"), Some("defer-1".into()), due)
+            .await
+            .expect("deferred admit");
+        assert!(!outcome.deduplicated);
+        assert!(!eng.is_draining(&sid), "a deferred admit must not wake");
+        assert_eq!(eng.pending_wake_depth(), 0, "no wake is registered");
+        assert!(
+            store.startup_scan(T0).await.expect("scan").is_empty(),
+            "the row is not eligible yet"
+        );
+        let due_scan = store.startup_scan(due).await.expect("scan");
+        assert_eq!(due_scan.len(), 1, "the row is durable");
+        assert_eq!(due_scan[0].eligible.len(), 1);
+        assert_eq!(
+            eng.due_wake_sweep().await.expect("sweep"),
+            0,
+            "nothing is due yet"
+        );
+        assert!(!eng.is_draining(&sid));
+
+        // A repeated deferred admit dedupes even while the first is pending.
+        let again = eng
+            .admit_at(sid, json!("batch task"), Some("defer-1".into()), due)
+            .await
+            .expect("repeat");
+        assert!(again.deduplicated, "same key, same row");
+
+        clock.advance(60_000);
+        assert_eq!(eng.now_ms(), due);
+        assert_eq!(eng.due_wake_sweep().await.expect("sweep"), 1);
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the due row drains after the sweep"
+        );
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "one row was consumed: {events:#?}");
         cleanup(&path);
     }
 
@@ -3599,6 +3748,71 @@ mod tests {
         assert!(
             !with_marker.contains("night-audit@"),
             "the firing marker must never enter model context"
+        );
+        cleanup(&path);
+    }
+
+    /// ADR-059: the deferred cron envelope — exactly
+    /// `{"content": X, "cron": M, "defer": D}` — consumes to ONE
+    /// `input/admitted` carrying the prompt and both additive keys, and the
+    /// deferral decision leaves the projected model context byte-identical.
+    #[tokio::test]
+    async fn deferred_cron_envelope_consumes_to_one_admitted_with_the_decision() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let cron = json!({
+            "schedule_id": "night-audit",
+            "firing_id": "night-audit@2026-11-18T03:30:00Z",
+            "fire_time": "2026-11-18T03:30:00Z",
+            "target": {"channel": "cron-jobs", "topic": "audit"},
+        });
+        let defer = json!({
+            "policy": "off_peak",
+            "deferred": true,
+            "eligible_at_ms": 1_795_000_000_000u64,
+            "reason": "next off-peak at 1795000000000",
+        });
+        let prompt = "audit .state/";
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": prompt, "cron": cron.clone(), "defer": defer.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "exactly one input/admitted event");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": prompt, "cron": cron, "defer": defer}),
+            "the deferral decision rides the admitted payload verbatim"
+        );
+        let mut bare = events.clone();
+        for ev in &mut bare {
+            if ev.kind == EventKind::InputAdmitted {
+                ev.bytes.as_object_mut().unwrap().remove("defer");
+            }
+        }
+        let with_decision =
+            serde_json::to_string(&kian_core::context::derive_model_context(&events).unwrap())
+                .unwrap();
+        let without_decision =
+            serde_json::to_string(&kian_core::context::derive_model_context(&bare).unwrap())
+                .unwrap();
+        assert_eq!(with_decision, without_decision);
+        assert!(with_decision.contains("audit .state/"));
+        assert!(
+            !with_decision.contains("off_peak"),
+            "the deferral decision must never enter model context"
         );
         cleanup(&path);
     }

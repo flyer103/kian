@@ -167,6 +167,14 @@ pub struct ServeConfig {
     /// `web_fetch` beside the local tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<WebConfig>,
+    /// The `defer:` section (ADR-059, P4). `None` (the section absent)
+    /// is off-peak deferral **off**: an API `defer` request is refused,
+    /// a cron schedule cannot declare `defer: off_peak`, and every
+    /// admission stays byte-identical to before. Present parses
+    /// fail-closed, requires peak windows in `pricing:`, and arms the
+    /// due-wake sweep in serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer: Option<DeferConfig>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -681,6 +689,61 @@ fn default_web_timeout_ms() -> u64 {
 }
 fn default_web_max_results() -> u64 {
     10
+}
+
+/// The `defer:` section (ADR-059, P4): explicit off-peak deferral for
+/// batch admissions.
+///
+/// ```yaml
+/// defer:
+///   sweep_interval_ms: 5000
+///   max_wait_ms: 43200000
+/// ```
+///
+/// Absent = deferral **off**: the API refuses `defer`, cron refuses
+/// `defer: off_peak`, and no ticker arms. Present requires
+/// `pricing.peak_windows` (without them every minute is off peak and
+/// deferral would be a lie) and arms the due-wake sweep; it never
+/// changes the bytes of an admission that does not ask to defer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferConfig {
+    /// The due-wake sweep cadence, milliseconds. Latency only: an absent
+    /// or late sweep never consumes a deferred row early (the store's
+    /// `eligible_at` gate refuses it).
+    #[serde(default = "default_defer_sweep_interval_ms")]
+    pub sweep_interval_ms: u64,
+    /// Longest wait a deferred admission may take before it runs
+    /// immediately instead (the why-didn't-wait bound, ADR-059).
+    #[serde(default = "default_defer_max_wait_ms")]
+    pub max_wait_ms: u64,
+}
+
+impl Default for DeferConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval_ms: default_defer_sweep_interval_ms(),
+            max_wait_ms: default_defer_max_wait_ms(),
+        }
+    }
+}
+
+impl DeferConfig {
+    /// Builds the off-peak planner over a price book.
+    #[must_use]
+    pub fn calendar(
+        &self,
+        book: std::sync::Arc<crate::pricing::PriceBook>,
+    ) -> crate::defer::DeferCalendar {
+        crate::defer::DeferCalendar::new(book, self.max_wait_ms)
+    }
+}
+
+fn default_defer_sweep_interval_ms() -> u64 {
+    5_000
+}
+fn default_defer_max_wait_ms() -> u64 {
+    12 * 60 * 60 * 1000
 }
 
 /// The `tools.exec_env:` section (fix ①: secrets never reach
@@ -4375,6 +4438,36 @@ impl ServeConfig {
             }
         }
 
+        // The `defer:` section (ADR-059, P4): deferral is only
+        // meaningful when the price book declares peak windows (without
+        // them every minute is off peak and every defer: off_peak would
+        // run immediately), and the wait cap must be real.
+        if let Some(defer) = self.defer.as_ref() {
+            if defer.sweep_interval_ms < 100 {
+                return Err(invalid(
+                    "defer.sweep_interval_ms must be >= 100 (serve would spin)",
+                ));
+            }
+            if defer.max_wait_ms == 0 {
+                return Err(invalid(
+                    "defer.max_wait_ms must be > 0 (a zero cap makes defer: off_peak a lie)",
+                ));
+            }
+            if self.pricing.peak_windows.is_empty() {
+                return Err(invalid(
+                    "defer: requires pricing.peak_windows — with no peak window the price book                      is off peak forever and every deferral would run immediately",
+                ));
+            }
+            let book = self
+                .price_book()
+                .map_err(|e| invalid(format!("defer: pricing is unusable: {e}")))?;
+            if !book.has_off_peak_minute() {
+                return Err(invalid(
+                    "defer: the configured peak windows cover the whole week — no off-peak                      instant exists, so defer: off_peak could never wait",
+                ));
+            }
+        }
+
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
             if sa.channels.is_empty() {
@@ -4699,6 +4792,18 @@ impl ServeConfig {
                 Some(sa.router.session_id.as_str()),
                 sa.router.rotate_after_events.is_some(),
             )?;
+            // ADR-059: a schedule may only declare defer: off_peak when
+            // the defer: section exists — otherwise the firing would be
+            // admitted with a future eligibility instant that nothing
+            // plans and no sweep looks for.
+            for schedule in &resolved_cron {
+                if schedule.defer == crate::defer::DeferPolicy::OffPeak && self.defer.is_none() {
+                    return Err(invalid(format!(
+                        "superagent.cron schedule `{}` declares defer: off_peak but no defer:                          section exists — add the section (sweep_interval_ms, max_wait_ms) or                          drop the schedule key (ADR-059)",
+                        schedule.id
+                    )));
+                }
+            }
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -5526,6 +5631,13 @@ pub struct CronScheduleDef {
     /// defaults, an object sets `repo`/`root`/`base`/`keep_on_failure`).
     #[serde(default)]
     pub worktree: Option<CronWorktreeDef>,
+    /// Off-peak deferral (ADR-059). Absent = the firing is admitted
+    /// immediately, byte-identical to before; `off_peak` holds the
+    /// durable inbox row until the next off-peak instant within
+    /// `defer.max_wait_ms`. A worktree-isolated schedule refuses it: an
+    /// isolated firing has no inbox row to hold.
+    #[serde(default)]
+    pub defer: Option<crate::defer::DeferPolicy>,
 }
 
 /// Wire form of a schedule's `worktree:` policy (§6): `true` for §6's
@@ -5684,6 +5796,8 @@ pub struct CronRuntimeSchedule {
     pub timeout_ms: u64,
     /// The §6 worktree isolation plan; `None` = resident-engine dispatch.
     pub worktree: Option<CronWorktreePlan>,
+    /// Off-peak deferral of this schedule's firings (ADR-059).
+    pub defer: crate::defer::DeferPolicy,
 }
 
 impl CronRuntimeSchedule {
@@ -6014,6 +6128,17 @@ impl CronSection {
                 }
             };
 
+            // ADR-059: off-peak deferral holds a durable inbox row; a
+            // worktree-isolated firing has no inbox row to hold, so the
+            // combination is refused rather than silently ignored.
+            let defer = def.defer.unwrap_or_default();
+            if defer == crate::defer::DeferPolicy::OffPeak && worktree.is_some() {
+                fail(
+                    "defer: off_peak is only supported for resident (session) schedules —                      a worktree-isolated firing has no inbox row to defer (ADR-059)"
+                        .to_string(),
+                );
+            }
+
             if errors.len() > before {
                 continue;
             }
@@ -6034,6 +6159,7 @@ impl CronSection {
                 max_concurrent,
                 timeout_ms,
                 worktree,
+                defer,
             });
         }
 
@@ -10894,5 +11020,125 @@ schedules:
             ServeConfig::parse(&typo).is_err(),
             "unknown keys refuse boot (deny_unknown_fields)"
         );
+    }
+
+    // -- off-peak deferral (ADR-059, P4) --------------------------------
+
+    /// A pricing block with one real peak window, so the defer section has
+    /// something to plan against (its validation refuses boot without one).
+    fn peak_pricing_yaml() -> String {
+        "pricing:\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      \
+         end: \"04:00\"\n      timezone: UTC\n"
+            .to_string()
+    }
+
+    fn cron_audit_block(defer: bool) -> String {
+        let decl = if defer {
+            "        defer: off_peak\n"
+        } else {
+            ""
+        };
+        format!(
+            "superagent:\n  cron:\n    schedules:\n      - id: audit\n        expr: \"@daily\"\n        \
+             target: {{ channel: mock-im, topic: audit }}\n        prompt: audit\n{decl}"
+        )
+    }
+
+    #[test]
+    fn defer_section_parses_defaults_and_plans_against_pricing() {
+        let yaml = format!("{}{}defer: {{}}\n", valid_yaml(), peak_pricing_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("defer section parses");
+        let defer = cfg.defer.as_ref().expect("defer present");
+        assert_eq!(defer.sweep_interval_ms, 5_000);
+        assert_eq!(defer.max_wait_ms, 12 * 60 * 60 * 1000);
+        let book = std::sync::Arc::new(cfg.price_book().expect("price book builds"));
+        let calendar = defer.calendar(book);
+        // Monday 2026-11-23 02:00 UTC sits inside the fixture window.
+        let inside = chrono::DateTime::parse_from_rfc3339("2026-11-23T02:00:00Z")
+            .expect("fixture instant")
+            .timestamp_millis() as u64;
+        let plan = calendar.plan(crate::defer::DeferPolicy::OffPeak, inside);
+        assert!(plan.deferred, "a peak instant waits for the next off peak");
+        assert_eq!(plan.eligible_at_ms, inside + 2 * 60 * 60 * 1000);
+        let immediate = calendar.plan(crate::defer::DeferPolicy::Immediate, inside);
+        assert!(!immediate.deferred);
+        assert_eq!(immediate.eligible_at_ms, inside);
+    }
+
+    #[test]
+    fn defer_section_misconfigurations_refuse_boot() {
+        let fast_sweep = format!(
+            "{}{}defer:\n  sweep_interval_ms: 99\n",
+            valid_yaml(),
+            peak_pricing_yaml()
+        );
+        let err = ServeConfig::parse(&fast_sweep).unwrap_err().to_string();
+        assert!(err.contains("sweep_interval_ms"), "{err}");
+
+        let zero_cap = format!(
+            "{}{}defer:\n  max_wait_ms: 0\n",
+            valid_yaml(),
+            peak_pricing_yaml()
+        );
+        let err = ServeConfig::parse(&zero_cap).unwrap_err().to_string();
+        assert!(err.contains("max_wait_ms"), "{err}");
+
+        let no_windows = format!("{}defer: {{}}\n", valid_yaml());
+        let err = ServeConfig::parse(&no_windows).unwrap_err().to_string();
+        assert!(err.contains("pricing.peak_windows"), "{err}");
+
+        let always_peak = format!(
+            "{}pricing:\n  peak_windows:\n    - weekdays: [mon, tue, wed, thu, fri, sat, sun]\n      \
+             start: \"00:00\"\n      end: \"24:00\"\n      timezone: UTC\ndefer: {{}}\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&always_peak).unwrap_err().to_string();
+        assert!(err.contains("off-peak"), "{err}");
+    }
+
+    #[test]
+    fn cron_defer_requires_the_defer_section_and_resolves_per_schedule() {
+        let base = format!("{}{}", superagent_yaml(), peak_pricing_yaml());
+        let sectioned = base.replacen("superagent:\n", &cron_audit_block(true), 1);
+        let err = ServeConfig::parse(&sectioned).unwrap_err().to_string();
+        assert!(err.contains("audit"), "{err}");
+        assert!(err.contains("defer: off_peak"), "{err}");
+
+        let with_section = format!("{}defer: {{}}\n", sectioned);
+        let cfg = ServeConfig::parse(&with_section).expect("defer section resolves the schedule");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert_eq!(sa.cron.schedules[0].id, "audit");
+        let resolved = sa
+            .cron
+            .to_runtime(&sa.channels, chrono::Utc::now())
+            .expect("schedule resolves");
+        assert_eq!(resolved[0].defer, crate::defer::DeferPolicy::OffPeak);
+
+        // An immediate declaration stays immediate and needs no defer section.
+        let immediate = base.replacen("superagent:\n", &cron_audit_block(false), 1);
+        let cfg = ServeConfig::parse(&immediate).expect("immediate schedule parses");
+        let resolved = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent")
+            .cron
+            .to_runtime(
+                &cfg.superagent.as_ref().expect("superagent").channels,
+                chrono::Utc::now(),
+            )
+            .expect("schedule resolves");
+        assert_eq!(resolved[0].defer, crate::defer::DeferPolicy::Immediate);
+    }
+
+    #[test]
+    fn a_worktree_schedule_cannot_declare_off_peak_deferral() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n    \
+             defer: off_peak\n    worktree: true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only supported for resident"), "{err}");
     }
 }

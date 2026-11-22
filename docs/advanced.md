@@ -758,6 +758,61 @@ admitted), `terminal` (session completed/cancelled/rotated — nothing admitted)
 or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
 idle. Semantics: [ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
 
+## Off-peak deferral
+
+A batch submission or a scheduled firing can be allowed to wait for an off-peak pricing window.
+Deferral is opt-in only and never applies to interactive work: a CLI run, a chat message, a channel
+message or a steer always runs immediately.
+
+`@yaml
+pricing:
+  peak_windows:
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "01:00"
+      end: "04:00"
+      timezone: UTC
+defer:
+  sweep_interval_ms: 5000     # due-wake scan cadence; correctness never depends on it
+  max_wait_ms: 43200000       # 12 h: beyond this the admission runs now, with a reason
+`@
+
+The planner reads the same price book the cost projection uses (peak windows plus the
+`pricing.holidays` calendar), so "off peak" means the same thing everywhere. The `defer:`
+section requires `pricing.peak_windows` to declare at least one off-peak minute in a week — an
+always-peak calendar refuses boot instead of deferring forever, and a schedule that declares
+`defer: off_peak` without a `defer:` section refuses load.
+
+JSON-RPC `submit`/`queue` accept the optional `defer` parameter:
+
+`@bash
+curl -s localhost:7433/rpc -H 'content-type: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"submit","params":{"session":"<uuid>","content":"nightly audit","defer":"off_peak"}}'
+# {"deduplicated":false,"deferred":true,"eligible_at_ms":1795000000000}
+`@
+
+A cron resident schedule declares the same policy (a worktree schedule cannot defer — it is an
+isolated external job with no inbox row):
+
+`@yaml
+superagent:
+  cron:
+    schedules:
+      - id: night-audit
+        expr: "30 3 * * 1-5"
+        target: { channel: cron-jobs, topic: audit }
+        prompt: "Audit .state/ for orphaned worktrees."
+        defer: off_peak
+`@
+
+The deferred row is an ordinary inbox row with a future `eligible_at`: it is persisted before any
+wake (admit-before-wake), invisible to the drain until due, and `kian serve` wakes it with a
+due-wake sweep. `eligible_at` is a not-before gate, not a promise of when the turn runs — a later
+drain may still be busy. When the next off peak is farther than `defer.max_wait_ms`, or the admit
+instant is already off peak, the admission runs immediately and records the reason
+(`deferred: false`). Without a `defer:` section, a request carrying `defer` is refused with
+`-32602` rather than silently running now. Semantics:
+[ADR-059](../design/decisions/ADR-059-off-peak-deferral.md).
+
 ## Context compaction
 
 When the bound model profile declares a `context_window`, the loop keeps a long session inside it

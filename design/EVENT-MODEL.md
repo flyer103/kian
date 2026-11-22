@@ -193,6 +193,14 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   refuses that exact shape with `-32602` (kian-99). Non-context by construction:
   `derive_model_context` reads `role`/`content`/`synthetic` only, so the key never enters a model
   request.
+- `input/admitted`: `defer`: {`policy`,`deferred`,`eligible_at_ms`,`reason`} — the off-peak
+  decision (ADR-059, CRON-MODEL §6.1), present exactly when the cron schedule declared
+  `defer: off_peak` (an immediate schedule's bytes are unchanged: no key). It rides beside the
+  `cron` proof and outside `content`, so the delivered turn is still the prompt alone;
+  `deferred: false` records a decision that ran immediately because the next off-peak was beyond
+  `defer.max_wait_ms` or the admit instant was already off peak, and `reason` says which. The
+  row is an ordinary durable inbox row: `eligible_at` is the gate that keeps it invisible until
+  due; no new event kind is involved.
 - `memory/note`: `"redactions": [{"kind","name","count"}]` — note `text` passes the secret
   redactor before append; the report is aggregate counts only (the `tool/result` precedent).
 - `thread/started` and the delegation wrapper (ADR-020): `"exec_worker"` — the **execution-worker

@@ -8,6 +8,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Batch and scheduled admissions can wait for an off-peak pricing window (DESIGN §2.3, CRON-MODEL §6.1, API-CONTRACT §3.2, ADR-059)**.
+  A pure planner beside the price book returns the next off-peak instant, bounded by
+  `defer.max_wait_ms`; the ordinary inbox row is persisted with that `eligible_at` and the
+  store's existing eligibility predicate is the hard gate — no second scheduler and no timer per
+  row. Only explicit opt-ins defer: JSON-RPC `submit`/`queue` with `defer: "off_peak"` and a
+  cron resident schedule with `defer: off_peak`, whose decision rides the admitted payload as a
+  non-context additive `defer` key; interactive inputs and steering always run immediately, and a
+  worktree firing refuses deferral (it has no inbox row). A serve-side due-wake sweep, armed only
+  by a `defer:` section, wakes sessions whose rows became due; a wait beyond the bound, or an
+  admit instant already off peak, runs now and records why. No new event kind: the stream still
+  carries ordinary admitted rows.
+
 - **Artifact retention runs inside `serve`, and exports can pin the blobs they reference (DESIGN §2.2, ADR-058)**.
   With an `artifacts:` block configured, serve now arms a retention GC ticker beside the snapshot
   and view tickers (`artifacts.gc.interval_ms`, default one hour, outside every drain, a failed
