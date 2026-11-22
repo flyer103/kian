@@ -742,6 +742,36 @@ Non-goals recorded with the phase: no channel media delivery (P5b), no vision co
 (P5c), no media pricing in the cost projection, no media persisted as an event, no server-side
 media tool in the core.
 
+### Channel-edge media (ADR-061, P5b landed)
+
+Scope: inbound images and voice messages become durable text context at the channel edge, before the
+turn exists, while their bytes live in the artifact store. This is the second half of the P5 media
+capability: P5a made media addressable; P5b makes what a person *sent* readable by the model.
+
+Semantics: the assembly's channel pump (`kian-cli`) runs one optional edge before
+`SubscriptionService::handle_event`. An adapter event whose payload carries the additive `media`
+array — items `{"kind":"image"|"audio","media_type","base64"[,"language"]}`, absent from every
+text event so existing payload bytes are unchanged — is processed item by item: the bytes are written
+to the artifact store (ADR-055), `image_ocr` / `audio_transcribe` (ADR-060) produce the transcript, and
+the item is rewritten to `{"kind","media_type","artifact","size","transcript"}` or
+`{"kind","media_type","error"}`. Transcripts are appended to the payload's `text` under
+`[image transcript]` / `[voice message transcript]` markers, in item order. Base64 never re-enters the
+payload, no message is dropped, and every failure (decode, provider, oversize, missing blob) is an
+honest per-item `error` that does not block admission. A payload without `media` is passed through
+byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is not a channel
+capability yet: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+
+The edge contract is [ADR-061](../design/decisions/ADR-061-channel-edge-media.md); the tool protocol is
+ADR-060; the blobs are ADR-055; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5b | kian-cli | the channel-pump media edge: the typed inbound media envelope, artifact-backed OCR/ASR transcripts appended to the admitted text, honest per-item failures | landed |
+
+Non-goals recorded with the phase: no real-adapter media ingestion (WeChat CDN download and iMessage
+attachments remain those channels' phase 2), no outbound audio send, no TTS call behind the model's
+back, no media pricing, no new event kind and no queue or batching at the edge.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

@@ -961,6 +961,20 @@ argument (a cached tool schema cannot flip it); a pinned resident prompt therefo
 correctly. The derivation is a pure function over events, so the boot outbox re-drive derives the
 same answer at the intent's `tool/call` seq and re-sends the intent's exact bytes.
 
+**Inbound channel media (P5b, ADR-061).** Media arrives before a turn exists, so it is processed at the
+assembly's channel pump (`kian-cli` `spawn_subscription_consumers`), not by a tool the model calls and
+not inside `kian-superagent`: an adapter event whose payload carries the additive `media` array
+(`{kind, media_type, base64[, language]}` items; absent from every text event, so old payload bytes are
+unchanged) is rewritten before `SubscriptionService::handle_event` — each item's bytes go into the
+content-addressed artifact store (ADR-055, ADR-060), the matching `image_ocr` / `audio_transcribe` tool
+produces the transcript, and the item becomes `{kind, media_type, artifact, size, transcript|error}`
+while the payload's text gains a fixed `[image transcript]` / `[voice message transcript]` line in item
+order. Base64 never re-enters the payload, no message is ever dropped (a failed item is an honest
+`error` string and the event still admits), and the edge exists only when `media:` is configured.
+Untrusted channels stay untrusted: the transcript is channel text like any other. Outbound audio is not
+part of this — shipped adapters are text-only, so a voice reply is the `speech_synthesize` tool plus a
+text reply naming the artifact.
+
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
 | Any channel | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `outcome-only` suppresses the post-dispatch acknowledgement and admits results and decisions, `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |

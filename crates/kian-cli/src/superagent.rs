@@ -1824,15 +1824,25 @@ pub fn spawn_subscription_consumers(
     service: Arc<SubscriptionService>,
     adapters: Vec<Arc<dyn ChannelAdapter>>,
     metrics: Arc<SubscriptionMetrics>,
+    edge: Option<Arc<crate::media_edge::MediaEdge>>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     adapters
         .into_iter()
         .map(|adapter| {
             let service = Arc::clone(&service);
             let metrics = Arc::clone(&metrics);
+            let edge = edge.clone();
             let mut stream = adapter.subscribe();
             tokio::spawn(async move {
                 while let Some(event) = stream.next().await {
+                    // ADR-061: the media edge runs before routing, so an
+                    // inbound image or voice note is already an artifact
+                    // reference plus transcript when it is shaped and
+                    // admitted. Absent = the event is untouched.
+                    let event = match edge.as_ref() {
+                        Some(edge) => edge.prepare(event).await,
+                        None => event,
+                    };
                     match service.handle_event(event).await {
                         Ok(outcome) => {
                             // Legacy shape counters plus the
@@ -2261,6 +2271,11 @@ pub struct SuperAgentServices {
     pub imessage_channels: BTreeMap<String, Arc<kian_superagent::ImessageChannel>>,
     /// Adapters in config order (consumer spawn order).
     pub adapters: Vec<Arc<dyn ChannelAdapter>>,
+    /// ADR-061: the channel-edge media processor, mounted only when
+    /// `media:` is configured — every adapter event is prepared through
+    /// it before `SubscriptionService::handle_event`. `None` = today's
+    /// bytes on every channel.
+    pub media: Option<Arc<crate::media_edge::MediaEdge>>,
     /// The worker's evidence gate config (shared counters).
     pub worker_gate: EvidenceGateConfig,
     /// Subscription outcome counters.
@@ -2537,6 +2552,7 @@ pub async fn start_services(
         Arc::clone(&services.subscriptions),
         services.adapters.clone(),
         Arc::clone(&services.subscription_metrics),
+        services.media.clone(),
     );
     record(&order, "subscriptions_started");
 
@@ -2943,6 +2959,7 @@ mod tests {
             Arc::clone(&service),
             vec![Arc::clone(&channel) as Arc<dyn ChannelAdapter>],
             Arc::clone(&metrics),
+            None,
         );
 
         // A non-mention event drops (explicit-only without a signal);
@@ -2979,6 +2996,7 @@ mod tests {
             Arc::clone(&ignored_service),
             vec![Arc::clone(&ignored_channel) as Arc<dyn ChannelAdapter>],
             Arc::clone(&ignored_metrics),
+            None,
         );
         ignored_channel.inject(None, serde_json::json!({"text": "noise"}));
         for _ in 0..200 {
@@ -2990,6 +3008,125 @@ mod tests {
         assert_eq!(ignored_metrics.snapshot()["dropped_ignored"], 1);
         assert_eq!(ignored_metrics.snapshot()["routed"], 0);
         for task in tasks.into_iter().chain(ignored_tasks) {
+            task.abort();
+        }
+    }
+
+    /// ADR-061: the pump prepares every adapter event through the media
+    /// edge before the subscription service sees it — an inbound photo
+    /// reaches the admitted payload as an artifact reference plus
+    /// transcript, and the base64 bytes never do.
+    #[tokio::test]
+    async fn the_channel_pump_transcribes_media_before_admission() {
+        use kian_superagent::{
+            AdmissionClass, AdmissionClassRule, AdmissionClassTable, InboxWriteError, InboxWriter,
+            Route, RuleMatcher, SubscriptionRule, SubscriptionRuleSet,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingInbox {
+            payloads: Mutex<Vec<serde_json::Value>>,
+        }
+        impl InboxWriter for RecordingInbox {
+            fn admit(
+                &self,
+                _session: SessionId,
+                payload: serde_json::Value,
+                _key: Option<String>,
+            ) -> futures::future::BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>>
+            {
+                self.payloads.lock().unwrap().push(payload);
+                Box::pin(async {
+                    Ok(AdmitReceipt {
+                        deduplicated: false,
+                    })
+                })
+            }
+            fn wake(&self, _session: SessionId) -> WakeOutcome {
+                WakeOutcome::Folded
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/tools/ocr"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "Total 42"})),
+            )
+            .mount(&server)
+            .await;
+        let dir = std::env::temp_dir().join(format!("kian-pump-media-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(kian_store::ArtifactStore::open(dir).unwrap());
+        let tools = Arc::new(
+            kian_media::MediaTools::new(
+                kian_media::MediaToolsConfig {
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    timeout_ms: 5_000,
+                    max_input_bytes: 1_048_576,
+                    default_voice: None,
+                    default_format: "mp3".into(),
+                },
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
+        let edge = Arc::new(crate::media_edge::MediaEdge::new(tools, store));
+
+        let channel = Arc::new(kian_superagent::MockChannel::new("mock-im"));
+        let rules = SubscriptionRuleSet::new(vec![SubscriptionRule {
+            channel: "mock-im".into(),
+            matcher: RuleMatcher::Always,
+            route: Route::Router,
+        }]);
+        let classes = AdmissionClassTable::new(vec![AdmissionClassRule {
+            channel: "mock-im".into(),
+            topic: None,
+            sender: None,
+            class: AdmissionClass::ExplicitOnly,
+        }]);
+        let inbox = Arc::new(RecordingInbox::default());
+        let service = Arc::new(kian_superagent::SubscriptionService::with_classes(
+            kian_superagent::ResidentBinding::new(SessionId::new()),
+            rules,
+            classes,
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        ));
+        let metrics = Arc::new(SubscriptionMetrics::default());
+        let tasks = super::spawn_subscription_consumers(
+            Arc::clone(&service),
+            vec![Arc::clone(&channel) as Arc<dyn ChannelAdapter>],
+            Arc::clone(&metrics),
+            Some(edge),
+        );
+        channel.inject(
+            None,
+            serde_json::json!({
+                "text": "what is @kian on this invoice?",
+                "media": [{"kind": "image", "media_type": "image/png", "base64": "aGk="}]
+            }),
+        );
+        for _ in 0..200 {
+            if !inbox.payloads.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let payloads = inbox.payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1);
+        let serialized = serde_json::to_string(&payloads[0]).unwrap();
+        assert!(
+            serialized.contains("[image transcript] Total 42"),
+            "got {serialized}"
+        );
+        assert!(serialized.contains("\"artifact\""), "got {serialized}");
+        assert!(
+            !serialized.contains("aGk="),
+            "base64 must not reach admission: {serialized}"
+        );
+        for task in tasks {
             task.abort();
         }
     }

@@ -775,7 +775,11 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+/// Decodes standard padded base64; `None` on malformed or non-canonical input.
+///
+/// Public because the channel-edge media processor (ADR-061, `kian-cli`)
+/// decodes adapter bytes before writing them to the artifact store.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return None;

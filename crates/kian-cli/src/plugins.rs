@@ -719,6 +719,10 @@ pub struct SuperAgentPlugin {
     /// projections and resolves invoking sessions from committed
     /// `tool/call` events). Only used when `async_tools` is on.
     pub event_store: kian_store::EventStore,
+    /// ADR-061: the channel-edge media processor, mounted only when
+    /// `media:` is configured. `None` = every channel pump keeps its
+    /// exact bytes and no media envelope is ever preprocessed.
+    pub media_edge: Option<Arc<crate::media_edge::MediaEdge>>,
 }
 
 impl Plugin for SuperAgentPlugin {
@@ -1862,6 +1866,7 @@ impl Plugin for SuperAgentPlugin {
             wechat_channels: self.wechat_channels,
             imessage_channels: self.imessage_channels,
             adapters,
+            media: self.media_edge,
             worker_gate: self.worker_gate,
             subscription_metrics,
             router_metrics,

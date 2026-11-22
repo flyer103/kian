@@ -74,6 +74,7 @@ pub mod cron_worktree;
 pub mod defer;
 mod harness_hooks;
 pub mod imessage_check;
+pub mod media_edge;
 pub mod memory;
 pub mod multiagent_tick;
 pub mod ops;

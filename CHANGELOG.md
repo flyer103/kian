@@ -8,6 +8,14 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Channel-edge media: voice notes and photos become durable text context (DESIGN §4.2, ADR-061,
+  P5b).** The assembly's channel pump runs an optional media edge before admission: an adapter event
+  carrying the additive `media` envelope has each item's bytes written to the artifact store,
+  transcribed by the ADR-060 tools, and rewritten to an artifact reference plus transcript, with the
+  transcript appended to the admitted text under fixed markers. Base64 never re-enters the payload, no
+  message is dropped on a media failure (an honest per-item `error`), and a payload without `media`
+  keeps its exact bytes. No shipped adapter emits the envelope yet — WeChat and iMessage record it as
+  their phase-2 contract; outbound audio remains `speech_synthesize` plus a text reply.
 - **Client-side media tools and file ingest (ADR-060, P5a).** `media:` mounts
   `image_ocr`, `audio_transcribe` and `speech_synthesize` as ordinary audited tools over
   DeepSeek's media HTTP APIs; input bytes are read from and synthesized audio is written into the

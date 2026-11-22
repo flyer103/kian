@@ -456,6 +456,10 @@ impl Server {
         // web tools when `web:` is on — the provider key is read here,
         // once, and a missing value refuses boot. ADR-060 (P5a): the media
         // tools when `media:` is on, under the same key discipline.
+        // ADR-061 (P5b): the media tools instance is kept beside the
+        // mounted provider so the channel-edge processor can call the same
+        // OCR/ASR surface the model can call.
+        let mut media_tools_ref: Option<Arc<kian_media::MediaTools>> = None;
         let mut bundle_tools: Vec<Arc<dyn kian_core::seams::ToolProvider>> = Vec::new();
         if let Some(store) = artifact_store.as_ref() {
             bundle_tools.push(Arc::new(crate::artifacts::ArtifactReadTool::new(
@@ -491,7 +495,10 @@ impl Server {
                 Arc::clone(store),
             )
             .map_err(|e| ServeError::Assembly(format!("media: {e}")))?;
-            bundle_tools.push(Arc::new(media_tools));
+            let media_tools = Arc::new(media_tools);
+            let mounted: Arc<dyn kian_core::seams::ToolProvider> = media_tools.clone();
+            bundle_tools.push(mounted);
+            media_tools_ref = Some(media_tools);
         }
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
@@ -503,6 +510,16 @@ impl Server {
                 extras: bundle_tools,
             },
         ];
+        // ADR-061 (P5b): the channel-edge media processor shares the media
+        // tools and the artifact store assembled above. Absent `media:` =
+        // None, and every channel pump keeps its exact bytes.
+        let media_edge = match (media_tools_ref.as_ref(), artifact_store.as_ref()) {
+            (Some(tools), Some(store)) => Some(Arc::new(crate::media_edge::MediaEdge::new(
+                Arc::clone(tools),
+                Arc::clone(store),
+            ))),
+            _ => None,
+        };
         // ADR-035: the release path (ops verb + reclaim tick) reads the
         // same durable queue to gate on live command rows, so keep one
         // clone before the remote-exec plugin takes ownership.
@@ -1002,6 +1019,7 @@ impl Server {
                 recall: sa.recall.clone(),
                 harness_mounts,
                 event_store: store.clone(),
+                media_edge,
             });
             None // services resolve from the Ctx after activation
         } else {

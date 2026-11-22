@@ -957,6 +957,27 @@ kian artifacts put ./invoice.png
 `--media-type` overrides the extension guess and `--json` emits the reference as JSON. Semantics:
 [ADR-060](../design/decisions/ADR-060-client-side-media-tools.md).
 
+### Channel media (inbound transcription)
+
+When `media:` is configured, `kian serve` runs a media edge in the channel pump: an adapter event
+whose payload carries the additive `media` array has its items stored as artifacts and transcribed
+before admission, so a voice note or a photo becomes durable text context plus a referenced blob. The
+envelope an adapter sends is:
+
+```json
+{"text": "what is on this invoice?",
+ "media": [{"kind": "image", "media_type": "image/png", "base64": "iVBORw0..."}]}
+```
+
+After the edge the admitted payload holds no base64 — the item becomes an artifact reference plus its
+transcript, and the text gains a marker line (`[image transcript] ...`, `[voice message transcript]
+...`). An item that fails (bad base64, provider error, oversize input) carries an `error` string and the
+message is still admitted; a payload without `media` passes through untouched. No shipped adapter emits
+this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge is text-only, so this is
+the contract those channel phases implement (a mock channel can carry it today). Outbound audio is not
+wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+Semantics: [ADR-061](../design/decisions/ADR-061-channel-edge-media.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
