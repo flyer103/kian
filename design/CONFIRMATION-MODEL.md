@@ -421,11 +421,13 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 |---|---|---|
 | 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions, the R1b promote gate, the §15.6 crash repair | landed |
 | 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | **landed** (the waiting end writes no completion pair; the liveness projection keeps the worker live; the ticket stage arm is `awaiting-confirmation`; `ask` parses on a worker agent. The completed/failed ticket "fresh Eval only" deviation is unchanged — it applies to ended tickets, not waiting ones) |
-| 3 | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening; channel-side answers (an IM reply mapped to a `confirm`) | not started |
+| 3a | Channel-side answers: a closed-vocabulary IM reply mapped to a `confirm` by the adapter, never by the model (§14d) | **proposed — owner gate pending, not implemented** |
+| 3b | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
 
 **Phase-1 non-goals, explicit.** No hook `ask`; no free-text clarification path (a decision only);
-no IM/channel answering (free text is not a decision — the mapping needs semantic judgment); no automatic expiry; no `ask` on worker/resident
+no IM/channel answering (free text is not a decision — the mapping needs semantic judgment; §14d
+keeps this: only a closed grammar is a decision, free text never is); no automatic expiry; no `ask` on worker/resident
 agents; no UI card; no new session state; no change to `LoopDriver`/`LoopOutcome`; no outbox row for
 the request (the request is the stream; a delivery row is the bundle's business).
 
@@ -455,6 +457,198 @@ observed the honest close-out rather than an identical re-issue — see ADR-050'
   row on the same session; the stage returns to the ordinary arms when the result lands.
 - **Resident agents stay refused.** A Router/watchdog waiting on itself cannot answer itself; the
   C2 boundary above keeps that a boot error.
+
+## 14d. Phase-3a — channel answers, closed vocabulary (proposed)
+
+> **Status: proposed, owner gate pending, nothing implemented.** This is the channel half of phase 3
+> only; the hook `ask` verdict stays 3b. The three things the gate reviews: **X0** (the sender handle
+> is the authenticator, so the code is a correlation token and not a secret), **X2/X5** (the boundary
+> between "a line of text is a decision" and "a line of text is a task"), and **X3** (which sessions a
+> code is allowed to resolve against).
+
+### X0. The claim this slice rests on
+
+The authority behind a decision is the **sender handle**, already enforced before the event exists:
+the bridge restricts its read surface, `topics` is the receive allowlist, and an unmapped sender is a
+drop ([CHANNEL-IMESSAGE](CHANNEL-IMESSAGE.md) §4, §8 `allowlist first, both directions`). Therefore a
+message that survives the allowlist came from the owner's own Apple ID.
+
+The six-character code is **not** a secret and **not** an authenticator: it is a correlation token
+that binds one line of text to one frozen `tool/call`. It is derived from public stream data (§X6),
+it travels through the model's context because the Router relays it, and it may leak. Leakage
+approves nothing — a sender outside the allowlist never reaches the intercept at all. This is why
+this slice needs no secret store, no rotation, no attempt counter and no rate limit; adding one would
+be defending the wrong boundary.
+
+### X1. Kernel (what 3a lands)
+
+1. `superagent.confirm_answers` — one closed config key, absent = off (§X7);
+2. the intercept in the bundle's admission path, before the class fast path
+   (`crates/kian-superagent/src/subscriptions.rs:331` `handle_event`) — the event is either an answer
+   or an ordinary intake event, never both;
+3. the resolver: topic → open threads → pending set → code match (§X3), over the existing read port;
+4. the write through the **existing** answer path — the same `Engine::confirm` call the `confirm` RPC
+   makes (`crates/kian-cli/src/server.rs:1940`), so §5 A1–A7 and W1's outcomes apply verbatim;
+5. one read-only Router tool `pending_decisions`, so the code can reach the human at all (§X7).
+
+**Non-goals (explicit).** Free-text clarification (a decision only, as in phase 1); attachments and
+images; a bare `approve` with no code; one message answering N calls; any authority to rewrite,
+retry, extend or expire an ask (the channel is a transport for a decision, never its judge); expiry
+notifications (phase 4); WeChat (reply-only, ADR-018); any new event kind, wire method or metric key.
+
+### X2. The grammar (closed, normative in this section until it lands)
+
+Normalize first: trim, NFKC (an IME emits full-width `ａｐｐｒｏｖｅ`), collapse runs of whitespace to one
+space, lowercase ASCII.
+
+```
+command := verb SP code [SP reason]
+verb    := "approve" | "ok" | "yes" | "同意" | "批准"
+         | "reject"  | "no" | "拒绝" | "驳回"
+code    := 6 characters of [0-9a-z]                       (case-insensitive)
+reason  := any text with no newline, ≤ 280 chars          (reject only; approve ignores it)
+```
+
+Strict shape, no fuzzy parsing: the first token must be a verb from the closed table and the second
+must be **code-shaped** (`[0-9a-z]` × 6). Anything else is not a command (§X5). A reject reason is
+free text but is only ever an audit field (§5 A5) — it never enters a model request.
+
+### X3. Resolution (deterministic, ordered, bounded)
+
+- **R1 Gate.** `event.channel ∈ confirm_answers.channels`, the sender passed the channel allowlist,
+  and `event.topic` is present. No topic ⇒ not a command (§X5), because a code with no conversation
+  has no candidate set.
+- **R2 Candidates.** The conversation's sessions: (a) open threads of the Router stream whose topic
+  equals `event.topic`, folded from `thread/started` … `thread/completed` through the bundle's read
+  port (`crates/kian-superagent/src/recall.rs:50` `read_events`, the port the recall tools already
+  use); (b) the passthrough registry's live subscribers for that topic, which covers `route:
+  passthrough` configs. Union, deduplicated by session id. A conversation that routes `router` (the
+  mobile shape) has no registry entry, which is why (a) exists.
+- **R3 Pending set.** For each candidate,
+  `kian_core::confirmation::pending_calls(&events)` (`crates/kian-core/src/confirmation.rs:49`, the §4
+  fold — no table, no inbox status, no in-memory wait).
+- **R4 Match.** Compute the code for every pending call (§X6) and compare it to the presented one,
+  visiting **every** candidate (no early exit), so response timing never reveals which candidate
+  matched.
+- **R5 Outcomes.** Exactly one match ⇒ answer (§X4). Zero ⇒ `no_match`; two or more ⇒ `ambiguous`. A
+  non-match writes **no inbox row and no wake** — one audit line each, the `DroppedNoRule`
+  discipline: an honest no-op, never a silent swallow, never a fallback to "the model will figure it
+  out".
+- **R6 No pre-filtering on expiry.** A pending call past `confirmation.ttl_ms` is still a candidate;
+  the answer is admitted and comes back `expired` (§5 A6 owns the rewrite). Filtering it here would
+  report a different truth than the control plane's.
+
+### X4. The write (no new semantics)
+
+The bundle calls one port, `AnswerPort::answer(session, call_id, decision, reason, requested_by)`;
+`crates/kian-cli` implements it over `Engine::confirm(session, &call_id, decision, reason,
+Some(principal), confirmation_ttl_ms)` — byte-for-byte the call the RPC makes. Consequences: §5 A1
+(the bundle never appends an event), A3 (the frozen call is executed, never a re-serialized one), A4
+(`(session, call_id)` is the idempotency key the seam already derives), and W1's `accepted` /
+`not_pending` / `expired` / `-32007` map one-to-one onto the audit lines here.
+
+`principal` = `"{channel}:{sender}:{event_id}"` — the channel name, the opaque sender identity the
+adapter reports (`ChannelEvent.sender`), and the adapter's own event id
+(`ChannelEvent.event_id`, the bridge message guid). §5 A5's `requested_by` then carries the transport
+identity into the durable record with no schema change.
+
+An archived session returns `UnknownSession`: audit `archived`, no row, no wake.
+
+**Persisted bytes, stated honestly.** The inbound text is not persisted: the durable record is the
+decision, its principal, its timestamp and its reason (plus the message id inside the principal). The
+transport's own log is the record of the message body. This is a deliberate limit, not an oversight —
+persisting the command as an input event would make it model-visible and re-open the question this
+slice exists to close.
+
+### X5. The near-miss rule
+
+A message that **starts** with a verb but does not carry a code-shaped second token
+(`同意`, `同意，但先把 X 改一下`) is admitted as ordinary input: the person is talking, not answering,
+and dropping it would lose real work. To keep that from producing a false "it is approved", two
+sentences are normative on the Router side:
+
+- the Router **never states that a confirmation happened or did not happen**. The only authority is
+  `pending_decisions` (a read) and the worker proceeding (an effect);
+- a received "approval" in free text is a **request to check**, never a decision.
+
+(`examples/mobile-dispatch/charter.md` and the bundle's default Router template gain the sentence in
+the same change.)
+
+A message that *is* code-shaped (`approve zz9zz9`) but matches nothing is a command attempt: dropped
+and audited, never forwarded. Mistyping a code therefore cannot become a task that the model
+interprets.
+
+### X6. Code derivation (pure, no storage)
+
+```
+code(call) = BASE32_LOWER( SHA-256("kian-confirm-v1|" + session_uuid + "|" + call_seq + "|" + call_id) )[0..6]
+BASE32_LOWER = "abcdefghijklmnopqrstuvwxyz234567"
+```
+
+Pure ⇒ restart-stable, replay-stable, derivation-free storage; 30 bits ⇒ a collision inside one
+conversation is unlikely but *defined*: it resolves to `ambiguous`, never to a guess. `call_seq`
+separates two calls that reuse an id across turns; `session` separates two workers holding the same
+tool call.
+
+### X7. Configuration
+
+```yaml
+superagent:
+  confirm_answers:
+    channels: [phone]        # absent or empty = off (the default)
+```
+
+- **Fail-closed boot.** A channel name that no mounted adapter provides, or a non-empty list naming a
+  channel whose config is not an IM channel, refuses boot. Absent is off, never "all channels".
+- **The tool is mounted iff the list is non-empty.** Adding it changes the Router's tool block, and
+  tool schemas are prompt prefix (constraint 3): the invalidation happens once, at boot, by config —
+  which is the only place this codebase allows a prefix-invalidating decision to come from.
+
+### X8. Adversarial walk
+
+| Failure point | Answer | Why it holds |
+|---|---|---|
+| crash after the answer is admitted, before the outcome line | replay re-consumes the row: A4's key makes the second application `not_pending` | the row is durable before the audit line |
+| two devices answer the same call | first wins, second `not_pending` | §5 A4 |
+| the same code arrives twice | second is `not_pending` | same key |
+| the call resolves (`tool/result` lands) between R3 and X4 | `not_pending`; audit records it; no lie | the seam re-checks at admission |
+| the worker is mid-drain | the row waits in the inbox, the wake is advisory | constraint 6 |
+| a code leaks to a group chat / a public issue | nothing: the reply comes from a non-allowlisted handle and never reaches R1 | X0 |
+| a code typed wrong | `no_match`, no row, no wake | X2/X3 R5 |
+| two codes collide in one conversation | `ambiguous`, no row | X6 |
+| the answer arrives after the TTL | `expired`, session resumes honestly | §5 A6 |
+| the conversation has 30 open threads | bounded: one read per open thread, only on a code-shaped message | X3 R2 |
+| the channel is down | unaffected: answers are inbound-only; no new outbound path exists | §X1 non-goals |
+| a replay of the whole stream | identical: codes are pure functions of committed bytes; the intercept adds no state | constraint 13 |
+
+### X9. Acceptance (levels per the workspace convention)
+
+| # | Check | Level |
+|---|---|---|
+| 1 | Grammar table: every verb and alias, full-width input, case, whitespace, reason cap, code shape, near-miss classification | L1 |
+| 2 | Code derivation goldens; two calls in one session differ; restart-stable | L1 |
+| 3 | Resolver over fixture streams: 0 / 1 / 2 matches, expired call still a candidate, `ambiguous` | L1 |
+| 4 | Config: unknown channel, empty list, unmounted adapter → boot error; absent → off | L1 |
+| 5 | Real server + `mock-im`: a fixture worker parks on an `ask`, `approve <code>` arrives, the worker stream gains `control/confirm` then `tool/result`, the Router stream gains **no** `input/admitted`, and its request prefix is byte-identical to the pre-interception turn | L2 |
+| 6 | Same run, replay: the replayed stream is byte-identical; the answer re-delivered twice stays `accepted` once | L2 |
+| 7 | `no_match` / `ambiguous` / archived paths write no row and no wake; the audit lines carry their codes | L2 |
+| 8 | A real phone: send `approve <code>`, watch the worker resume | L3 (manual, the local bridge) |
+
+### X10. Rollback
+
+Config off ⇒ the intercept is inert and the tool is unmounted. No migration, no stream change, no
+phase-1/2 behavior touched. A revert of the two crates suffices.
+
+### X11. Open at the gate
+
+1. **Bare `approve` with no code** when exactly one pending call is reachable: convenient, but it makes
+   every "同意" a decision. Deferred out of 3a; if wanted, it needs the extra condition that the last
+   outbound delivery to the conversation named that call.
+2. **Who renders the code.** 3a has the Router relay it (model-mediated, may forget or mangle). A
+   system-rendered notification is 3b — it needs a new outbound trigger, which is a bigger authority
+   change than this slice.
+3. **Where the grammar lives once landed.** It is channel syntax; [CHANNEL-IMESSAGE](CHANNEL-IMESSAGE.md)
+   owns it then, and this section keeps only the answer semantics.
 
 ## 15. Open questions
 
