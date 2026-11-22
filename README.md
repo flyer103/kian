@@ -1,4 +1,4 @@
-# Kian — the durable execution runtime for agents
+# Kian Runtime — the durable execution runtime for agents
 
 [![website](https://img.shields.io/badge/website-kian--site.pages.dev-ff7a45)](https://kian-site.pages.dev)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
