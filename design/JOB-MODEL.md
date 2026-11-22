@@ -1615,7 +1615,7 @@ truth table is `crates/kian-superagent/src/job/placement.rs`; the two lattices a
 `crates/kian-cli/tests/job_event_registry.rs`; config lowering and the `target.job` refusal are
 `crates/kian-cli/src/job_config.rs` and `cron_targets_refuse_a_job_key`; the three delivery
 dispositions (`Ok` → `succeeded`, `Timeout` → `needs_operator`, any other error → `failed`) are
-`crates/kian-superagent/tests/job_conductor.rs`. One row is narrower than written, and that is the
+`crates/kian-superagent/tests/job_conductor.rs`. Two rows are narrower than written, and that is the
 truthful unverified list for this slice:
 
 - **The crash row is deterministic windows, not OS kills.** `w1..w8_*` in
