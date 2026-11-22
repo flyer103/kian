@@ -52,7 +52,6 @@ tracing-subscriber.workspace = true
 # tests/stage_projection.rs over a fixture db. A dev-dependency edge
 # crate→assembly is legal (dev-deps may be cyclic); no production edge
 # is added — the bundle still never names kian-cli in src/.
-kian-cli.workspace = true
 # the scripted-HTTP-mock lark tests serve canned Feishu responses
 # from an in-process axum server (no credentials, no network).
 axum.workspace = true

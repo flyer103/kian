@@ -813,7 +813,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
         ts_ms: 1_761_900_000_000,
     })
     .to_string();
-    let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian"});
+    let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian-runtime"});
     let conversation = format!("issue-github:{}", serde_json::to_string(&target).unwrap());
 
     // Router stream: the spawn lineage (task = the stringified
