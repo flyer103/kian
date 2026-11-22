@@ -133,6 +133,13 @@ Nineteen crates, one responsibility each. Dependency direction is the crate form
 `kian-orchestrator` depends only on core + store + seam traits, and no provider, channel or harness
 implementation ever enters its dependency tree.
 
+The split is enforced rather than aesthetic: a `use` of a provider, channel or harness type from
+inside the orchestrator fails to compile, because the edge is absent from that crate's manifest. One
+crate with feature flags cannot promise the same, since a downstream consumer may unify the features
+and link everything anyway. The waist is three crates (`kian-core`, `kian-store`,
+`kian-orchestrator`); everything else is a seam or a thin adapter around one, and that is what the
+long name list at `v0.1.0` buys.
+
 | Crate | One line |
 |-------|----------|
 | `kian-core` | Concept model, the 23 event kinds, session state machine, projection engine, model-context derivation, seam traits |
