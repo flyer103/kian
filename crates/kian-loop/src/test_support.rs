@@ -33,6 +33,7 @@ pub fn agent_def() -> AgentDef {
                 provider: "mock".into(),
                 model: "mock-model".into(),
                 fallback: Vec::new(),
+                profile: None,
             },
         )]),
         tools: vec!["fs_read".into(), "fs_write".into(), "exec".into()],

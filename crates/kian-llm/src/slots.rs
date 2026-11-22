@@ -118,6 +118,7 @@ impl SlotBinding {
             target: SlotTarget {
                 provider: spec.provider.clone(),
                 model: spec.model.clone(),
+                profile: spec.profile.clone(),
             },
             fallback: spec.fallback.clone(),
             migrated: false,
@@ -168,6 +169,7 @@ impl SessionSlots {
                     provider: b.target.provider.clone(),
                     model: b.target.model.clone(),
                     fallback: b.fallback.clone(),
+                    profile: b.target.profile.clone(),
                 };
                 binding_payload(name, &spec)
             })
@@ -201,6 +203,7 @@ impl SessionSlots {
             provider: binding.target.provider.clone(),
             model: binding.target.model.clone(),
             fallback: binding.fallback.clone(),
+            profile: binding.target.profile.clone(),
         };
         let payload = migration_payload(slot, &from, &spec, reason);
         *binding = SlotBinding::from_spec(&spec);
@@ -355,6 +358,7 @@ mod tests {
         SlotTarget {
             provider: provider.into(),
             model: model.into(),
+            profile: None,
         }
     }
 
@@ -363,6 +367,7 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
             fallback: fallback.to_vec(),
+            profile: None,
         }
     }
 

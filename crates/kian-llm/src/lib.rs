@@ -14,13 +14,19 @@
 //! Modules:
 //! - [`provider`] — openai-compat ModelProvider over reqwest/SSE
 //! - [`slots`] — slot resolution and fallback chains (ADR-006)
+//! - [`plan`] — one request plan shared by sender, persistence and budget
 //! - [`turn`] — one provider turn: failover traversal driven by slots
+pub mod plan;
 pub mod provider;
 pub mod slots;
 pub mod turn;
 
 pub use kian_core::seams::{ModelChunk, ModelProvider, ModelRequest, ProviderError, ToolSchema};
 
+pub use plan::{
+    BodyVersion, ESTIMATOR_SOURCE, ESTIMATOR_VERSION, RequestPlan, TokenEstimate,
+    build_request_plan,
+};
 pub use provider::{
     ChatMessage, FROZEN_CHAT_BODY_SHA256, OpenAiCompatConfig, OpenAiCompatProvider, PersistError,
     PersistSink, PersistedRequest, WireFunctionCall, WireToolCall,

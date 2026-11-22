@@ -536,6 +536,19 @@ timeout and reports `timed_out` as an honest error result. Wiring: kian-loop dep
 kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resolution +
 `complete_turn`), matching the §7 crate map edge `KLD → KO`.
 
+**Request plans (ADR-053, phase 1a)**: every provider attempt is produced by the pure function
+`build_request_plan` (`kian-llm::plan`) and travels as one value — body, body version, dialect,
+profile digest, body digest and a coarse token band. The sender sends `plan.body`, the loop
+persists it, the cache checker compares its prefix, and the budget gate reads its estimate, so the
+four consumers can never disagree about what was sent. A slot with no declared profile builds the
+frozen V1 body byte-for-byte; a declared profile builds V2, adding only the declared `thinking`,
+`reasoning_effort` and `max_tokens` fields and stripping `reasoning_content` when the profile
+does not permit reasoning replay. The profile rides `slot/binding` and every `slot/fallback`
+target, is session-immutable, and changes only through `slot/migration`. A fallback attempt builds
+its plan before the `slot/fallback` append, and that event carries the exact body plus the plan
+metadata, so replay reconstructs the retry bytes. The event payload is additive: a profile-less session keeps
+the frozen V1 body, and the plan metadata is recorded next to it.
+
 **The audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
 keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
 payloads replay byte-identically: `"usage": <provider usage JSON verbatim>` when the provider

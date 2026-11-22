@@ -102,6 +102,8 @@ model_profiles: # capability facts, config-first (enforced by the request planne
     context_window: 1000000
     max_output: 384000
     reasoning: true
+    thinking: true # explicit toggle; absent leaves the provider default
+    effort: high # low | high | max; requires reasoning
     vision: true
     strict: true
     cache: true

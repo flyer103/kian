@@ -89,11 +89,65 @@ pub struct InputRow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct SlotName(pub String);
 
+/// The wire dialect a model speaks (ADR-053). Only the openai-compatible
+/// chat-completions dialect exists today; the enum is the extension point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDialect {
+    #[serde(rename = "openai_chat")]
+    OpenAiChat,
+}
+
+/// Declared reasoning effort (ADR-053). The vocabulary is the closed set the
+/// providers accept; an unknown value refuses boot at config parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    High,
+    Max,
+}
+
+/// Declarative capability profile for one (provider, model) target
+/// (ADR-053). Resolved from `model_profiles:` at agent assembly and carried
+/// on the slot binding, so replay knows which plan produced a request.
+/// Absence on a target means the legacy V1 request shape, byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub dialect: ModelDialect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output: Option<u64>,
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Explicit thinking toggle; `None` leaves the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// Explicit effort; only meaningful with reasoning enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default = "default_cache")]
+    pub cache: bool,
+    #[serde(default)]
+    pub vision: bool,
+}
+
+fn default_cache() -> bool {
+    true
+}
+
 /// One concrete (provider, model) target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotTarget {
     pub provider: String,
     pub model: String,
+    /// Capability profile in force for this target (ADR-053); absent means
+    /// the legacy V1 request shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ModelProfile>,
 }
 
 /// Slot → provider/model/fallback mapping (ADR-006). Fixed for a session's
@@ -105,6 +159,10 @@ pub struct SlotSpec {
     /// Fallback chain, tried in order; each switch emits a durable
     /// `slot/fallback` event.
     pub fallback: Vec<SlotTarget>,
+    /// Capability profile of the primary target (ADR-053); absent means the
+    /// legacy V1 request shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ModelProfile>,
 }
 
 /// Budgets consumed with refund semantics (A5): unused remainders are
@@ -248,7 +306,9 @@ mod tests {
                     fallback: vec![SlotTarget {
                         provider: "openai-compat".into(),
                         model: "deepseek-v3".into(),
+                        profile: None,
                     }],
+                    profile: None,
                 },
             )]),
             tools: vec!["fs.read".into(), "fs.write".into()],

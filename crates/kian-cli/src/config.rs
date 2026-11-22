@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use kian_core::model::{AgentDef, Budgets, Permission, SlotName, SlotSpec, SlotTarget};
+use kian_core::model::{
+    AgentDef, Budgets, ModelProfile, Permission, SlotName, SlotSpec, SlotTarget,
+};
 use kian_llm::provider::{DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS};
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_orchestrator::recovery::PolicyConfig;
@@ -4721,14 +4723,16 @@ impl ServeConfig {
     /// The compiled agent definition handed to the loop.
     #[must_use]
     pub fn agent_def(&self) -> AgentDef {
-        agent_def_of(&self.agent)
+        agent_def_of(&self.agent, &self.model_profiles)
     }
 
     /// The compiled definition of a named agent (`None` when the id
     /// is not configured).
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
-        self.agents.get(id).map(agent_def_of)
+        self.agents
+            .get(id)
+            .map(|agent| agent_def_of(agent, &self.model_profiles))
     }
 
     /// Converts the `superagent.roster` section to the bundle's
@@ -4850,7 +4854,10 @@ impl ServeConfig {
 
 /// Compiles one wire-form agent definition into the core [`AgentDef`]
 /// (shared by the default `agent:` section and every `agents:` entry).
-fn agent_def_of(agent: &AgentConfig) -> AgentDef {
+fn agent_def_of(
+    agent: &AgentConfig,
+    profiles: &BTreeMap<String, crate::pricing::ModelProfileConfig>,
+) -> AgentDef {
     AgentDef {
         id: agent.id.clone(),
         version: agent.version,
@@ -4869,8 +4876,10 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
                             .map(|t| SlotTarget {
                                 provider: t.provider.clone(),
                                 model: t.model.clone(),
+                                profile: profile_for(profiles, &t.provider, &t.model),
                             })
                             .collect(),
+                        profile: profile_for(profiles, &spec.provider, &spec.model),
                     },
                 )
             })
@@ -4881,6 +4890,16 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
             wall_clock_ms: agent.budgets.wall_clock_ms,
         },
     }
+}
+
+fn profile_for(
+    profiles: &BTreeMap<String, crate::pricing::ModelProfileConfig>,
+    provider: &str,
+    model: &str,
+) -> Option<ModelProfile> {
+    profiles
+        .get(&format!("{provider}/{model}"))
+        .map(crate::pricing::ModelProfileConfig::model_profile)
 }
 
 // ---------------------------------------------------------------------------
@@ -5936,13 +5955,30 @@ recovery:
     #[test]
     fn pricing_and_model_profiles_parse_and_cross_reference() {
         let yaml = format!(
-            "{}pricing:\n  currency: USD\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      end: \"04:00\"\n      timezone: UTC\n  models:\n    \"openai/gpt-test\": {{ cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }}\nmodel_profiles:\n  \"openai/gpt-test\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true }}\n",
+            "{}pricing:\n  currency: USD\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      end: \"04:00\"\n      timezone: UTC\n  models:\n    \"openai/gpt-test\": {{ cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }}\nmodel_profiles:\n  \"openai/gpt-test\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true, thinking: true, effort: high }}\n  \"openai/gpt-fallback\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true }}\n",
             valid_yaml()
         );
         let cfg = ServeConfig::parse(&yaml).expect("pricing sections parse");
         let book = cfg.price_book().expect("price book builds");
         assert!(book.has_prices());
-        assert_eq!(cfg.model_profiles.len(), 1);
+        assert_eq!(cfg.model_profiles.len(), 2);
+        let agent = cfg.agent_def();
+        let slot = agent
+            .model_slots
+            .get(&SlotName("main".into()))
+            .expect("main slot");
+        let profile = slot.profile.as_ref().expect("slot profile resolved");
+        assert_eq!(profile.thinking, Some(true));
+        assert_eq!(
+            profile.effort,
+            Some(kian_core::model::ReasoningEffort::High)
+        );
+        let fallback = slot.fallback[0]
+            .profile
+            .as_ref()
+            .expect("fallback profile resolved");
+        assert_eq!(fallback.dialect, profile.dialect);
+        assert!(fallback.reasoning);
 
         let undeclared = yaml.replace("\"openai/gpt-test\"", "\"ghost/gpt-test\"");
         let err = ServeConfig::parse(&undeclared).unwrap_err().to_string();
@@ -5951,6 +5987,12 @@ recovery:
         let too_wide = yaml.replace("max_output: 500", "max_output: 2000");
         let err = ServeConfig::parse(&too_wide).unwrap_err().to_string();
         assert!(err.contains("must not exceed context_window"), "{err}");
+
+        let thinking_without_reasoning = yaml.replace("reasoning: true", "reasoning: false");
+        let err = ServeConfig::parse(&thinking_without_reasoning)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("thinking requires reasoning"), "{err}");
     }
 
     #[test]

@@ -58,10 +58,11 @@ use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{Event, EventKind};
 use kian_core::model::{AgentDef, Permission, SlotName};
 use kian_core::seams::{
-    LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
-    ToolCall, ToolProvider, ToolResult,
+    LoopDriver, LoopOutcome, ProviderError, RecoveryAction, RecoveryPolicySource, ToolCall,
+    ToolProvider, ToolResult,
 };
-use kian_llm::provider::{ChatMessage, WireFunctionCall, WireToolCall, build_chat_body};
+use kian_llm::plan::build_request_plan;
+use kian_llm::provider::{ChatMessage, WireFunctionCall, WireToolCall};
 use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
 use kian_orchestrator::{DrainCtx, EngineError};
@@ -946,20 +947,37 @@ impl Inner {
         let chat: Vec<ChatMessage> = messages.iter().filter_map(to_chat_message).collect();
 
         // A2: the audit copy of the exact request is durable BEFORE the
-        // provider is called.
-        let body = build_chat_body(&target.model, &chat, &schemas);
-        let step_request = ctx
-            .append(
-                EventKind::StepRequest,
-                json!({
-                    "slot": self.config.slot.0,
-                    "provider": target.provider,
-                    "model": target.model,
-                    "iteration": iteration,
-                    "body": body,
-                }),
-            )
-            .await;
+        // provider is called. The plan is the single source of the bytes
+        // and of the metadata recorded next to them (ADR-053).
+        let plan = match build_request_plan(target.profile.as_ref(), &target.model, &chat, &schemas)
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return TurnResult {
+                    result: Err(TurnError::Soft {
+                        reason: format!("request plan: {e}"),
+                        audit: recovery_audit(self.policy.as_ref(), provider_error_class(&e)),
+                    }),
+                    usage: None,
+                };
+            }
+        };
+        let body = plan.body.clone();
+        let mut step_payload = json!({
+            "slot": self.config.slot.0,
+            "provider": target.provider,
+            "model": target.model,
+            "iteration": iteration,
+            "body": body,
+            "body_version": plan.body_version,
+            "dialect": plan.dialect,
+            "body_sha256": plan.body_sha256,
+            "estimate": plan.estimate,
+        });
+        if let Some(digest) = &plan.profile_digest {
+            step_payload["profile_digest"] = json!(digest);
+        }
+        let step_request = ctx.append(EventKind::StepRequest, step_payload).await;
         let step_request_seq = match step_request {
             Ok(ev) => ev.seq,
             Err(e) => {
@@ -992,12 +1010,10 @@ impl Inner {
 
         // complete_turn rebuilds the body per (fallback) target so the
         // model name always matches the provider actually called.
-        let slot = self.config.slot.clone();
         let build_chat = chat.clone();
         let build_schemas = schemas.clone();
-        let build = Arc::new(move |t: &kian_core::model::SlotTarget| ModelRequest {
-            slot: slot.clone(),
-            body: build_chat_body(&t.model, &build_chat, &build_schemas),
+        let build = Arc::new(move |t: &kian_core::model::SlotTarget| {
+            build_request_plan(t.profile.as_ref(), &t.model, &build_chat, &build_schemas)
         });
         let mut stream = complete_turn(
             Arc::clone(&self.registry),

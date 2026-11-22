@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
+use kian_core::model::{ModelDialect, ModelProfile, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -267,6 +268,12 @@ pub struct ModelProfileConfig {
     /// Whether the model accepts image content.
     #[serde(default)]
     pub vision: bool,
+    /// Explicit thinking toggle; absent leaves the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    /// Explicit reasoning effort; requires reasoning to be declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffortConfig>,
     /// Whether the model supports strict JSON-schema tool validation.
     #[serde(default)]
     pub strict: bool,
@@ -283,6 +290,8 @@ impl Default for ModelProfileConfig {
             max_output: None,
             reasoning: false,
             vision: false,
+            thinking: None,
+            effort: None,
             strict: false,
             cache: true,
         }
@@ -314,8 +323,54 @@ impl ModelProfileConfig {
                 "model_profiles.\"{key}\".max_output ({max}) must not exceed context_window ({context})"
             ));
         }
+        if self.thinking == Some(true) && !self.reasoning {
+            return Err(format!(
+                "model_profiles.\"{key}\".thinking requires reasoning: true"
+            ));
+        }
+        if self.effort.is_some() && !self.reasoning {
+            return Err(format!(
+                "model_profiles.\"{key}\".effort requires reasoning: true"
+            ));
+        }
+        if self.effort.is_some() && self.thinking == Some(false) {
+            return Err(format!(
+                "model_profiles.\"{key}\".effort cannot be set when thinking is disabled"
+            ));
+        }
         Ok(())
     }
+
+    /// Resolves the wire form carried on the slot binding (ADR-053).
+    #[must_use]
+    pub fn model_profile(&self) -> ModelProfile {
+        ModelProfile {
+            dialect: match self.dialect {
+                Dialect::OpenAiChat => ModelDialect::OpenAiChat,
+            },
+            context_window: self.context_window,
+            max_output: self.max_output,
+            reasoning: self.reasoning,
+            thinking: self.thinking,
+            effort: self.effort.map(|e| match e {
+                ReasoningEffortConfig::Low => ReasoningEffort::Low,
+                ReasoningEffortConfig::High => ReasoningEffort::High,
+                ReasoningEffortConfig::Max => ReasoningEffort::Max,
+            }),
+            strict: self.strict,
+            cache: self.cache,
+            vision: self.vision,
+        }
+    }
+}
+
+/// Declared reasoning effort in the config grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffortConfig {
+    Low,
+    High,
+    Max,
 }
 
 /// The model's wire dialect. Only the OpenAI chat-completions dialect exists

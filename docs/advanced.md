@@ -698,6 +698,30 @@ target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store
 Semantics: [design/CRON-MODEL.md](../design/CRON-MODEL.md); decision:
 [ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
 
+## Model profiles
+
+`model_profiles:` declares what a provider/model pair can do. A slot with no profile keeps the
+frozen V1 request body byte-for-byte; a declared profile builds the V2 body, carrying only the
+declared `thinking`, `effort` and `max_output` fields and deciding whether reasoning is replayed.
+
+```yaml
+model_profiles:
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+    thinking: true       # explicit toggle; absent leaves the provider default
+    effort: high         # low | high | max; requires reasoning: true
+    vision: true
+    strict: true
+    cache: true
+```
+
+The profile is part of the session's slot binding: changing it for a live session requires a
+`slot/migration`, never a silent request-shape change. Semantics:
+[ADR-053](../design/decisions/ADR-053-request-plans-and-model-profiles.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
@@ -711,8 +735,6 @@ pricing:
     - { weekdays: [mon, tue, wed, thu, fri], start: "01:00", end: "04:00", timezone: UTC }
   models:
     deepseek/deepseek-flash: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }
-model_profiles:
-  deepseek/deepseek-flash: { dialect: openai_chat, context_window: 1000000, max_output: 384000, reasoning: true, vision: true, strict: true }
 ```
 
 ```bash

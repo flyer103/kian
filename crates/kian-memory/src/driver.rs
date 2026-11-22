@@ -488,6 +488,7 @@ mod tests {
                     provider: "mock".into(),
                     model: "mock-model".into(),
                     fallback: Vec::new(),
+                    profile: None,
                 },
             )]),
             tools: vec![],

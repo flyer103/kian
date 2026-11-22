@@ -8,6 +8,14 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Request plans make the sent bytes one auditable value (DESIGN §3.2, ADR-053)**. Every provider
+  attempt is now built by a pure planner that returns the body plus its dialect, profile digest,
+  body digest and a coarse token band; the sender, the persistence sink, the cache checker and the
+  upcoming budget gate consume that one value. `model_profiles:` declares thinking, effort and
+  max_output per provider/model and becomes part of the session-immutable slot binding; a
+  profile-less slot still emits the frozen V1 body, and reasoning_content is replayed only when
+  the profile permits reasoning. A fallback attempt builds its plan before the slot/fallback
+  append and persists the exact body there, so replay reconstructs the retry bytes.
 - **A price book turns usage into money without touching the event stream (DESIGN §7, ADR-052)**.
   The new top-level `pricing:` config section declares per-million-token cache-hit, cache-miss and
   output prices plus peak windows (IANA timezone) and holidays; prices are normalized once to
