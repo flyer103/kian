@@ -76,8 +76,9 @@ use crate::outbox::{
     with_attempt_keys,
 };
 use crate::policy::{
-    ImPolicy, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict, StructuredPolicy,
-    im_delivered_payload, im_delivered_payload_full, speak_key, structured_delivered_payload,
+    ImPolicy, SpeakCondition, SpeakContext, SpeakKind, SpeakPolicy, SpeakTracker, SpeakVerdict,
+    StructuredPolicy, im_delivered_payload, im_delivered_payload_full, speak_key,
+    structured_delivered_payload,
 };
 use crate::policy_version::{NO_POLICY_LABEL, PolicyVersion, with_policy_header};
 use crate::provenance::{ChannelEventMarker, parse_channel_marker_lenient};
@@ -713,6 +714,12 @@ pub struct RouterHold {
     /// read per hold; every call inside a hold sees the same inputs, so
     /// the answer never changes mid-hold).
     detail: RwLock<Option<bool>>,
+    /// The per-hold dispatch-acknowledgement slots (`speak_rules`
+    /// `outcome-only`): one slot opens per successful `spawn_worker`
+    /// call and a decision-shaped send spends it. Never persisted — a
+    /// drain replay re-executes the same dispatch, so the slot is
+    /// re-derived, and a new hold starts from zero (DESIGN §4.2).
+    dispatch_acks: RwLock<usize>,
 }
 
 impl std::fmt::Debug for RouterHold {
@@ -734,12 +741,36 @@ impl RouterHold {
     pub fn install(&self, port: Arc<dyn StreamPort>) {
         *self.port.write().expect("router hold lock") = Some(port);
         *self.detail.write().expect("router detail lock") = None;
+        *self.dispatch_acks.write().expect("router ack lock") = 0;
     }
 
     /// The current hold's port, if one was installed.
     #[must_use]
     pub fn port(&self) -> Option<Arc<dyn StreamPort>> {
         self.port.read().expect("router hold lock").clone()
+    }
+
+    /// Opens one acknowledgement slot: a dispatch in this hold owes at
+    /// most one acknowledgement per call.
+    fn open_dispatch_ack(&self) {
+        *self.dispatch_acks.write().expect("router ack lock") += 1;
+    }
+
+    /// The unspent acknowledgement slots of this hold.
+    fn pending_dispatch_acks(&self) -> usize {
+        *self.dispatch_acks.read().expect("router ack lock")
+    }
+
+    /// Spends one slot: the acknowledgement was attempted and dropped.
+    fn spend_dispatch_ack(&self) {
+        let mut acks = self.dispatch_acks.write().expect("router ack lock");
+        *acks = acks.saturating_sub(1);
+    }
+
+    /// A result closes every open slot: the dispatch is spoken for, so
+    /// a later reply is a decision, not the acknowledgement.
+    fn clear_dispatch_acks(&self) {
+        *self.dispatch_acks.write().expect("router ack lock") = 0;
     }
 
     fn detail_mode(&self) -> Option<bool> {
@@ -1133,6 +1164,13 @@ impl RouterTools {
             }
         }
         let key = speak_key(target);
+        // (DESIGN §4.2 `outcome-only`) The dispatch acknowledgement is a
+        // *decision-shaped* send while the hold owes one: a dispatch in
+        // this hold opened a slot and nothing has spent it yet. Derived
+        // per hold, never persisted; every other condition ignores it.
+        let dispatch_ack = rule.when == SpeakCondition::OutcomeOnly
+            && kind == SpeakKind::Decision
+            && self.hold.pending_dispatch_acks() > 0;
         let verdict = {
             let tracker = self.speak_tracker.lock().expect("speak tracker lock");
             let tracker = tracker.as_ref().expect("tracker seeded above");
@@ -1143,9 +1181,20 @@ impl RouterTools {
                     topic: Some(key.as_str()),
                     kind,
                     tracker,
+                    dispatch_ack,
                 },
             )
         };
+        if rule.when == SpeakCondition::OutcomeOnly {
+            if dispatch_ack && verdict != SpeakVerdict::Admit {
+                self.hold.spend_dispatch_ack();
+            }
+            if kind == SpeakKind::Result && verdict == SpeakVerdict::Admit {
+                // The outcome is out: a later reply is a decision, never
+                // the dispatch acknowledgement.
+                self.hold.clear_dispatch_acks();
+            }
+        }
         match verdict {
             SpeakVerdict::Admit => Ok(()),
             SpeakVerdict::Suppress { condition } => {
@@ -2012,6 +2061,11 @@ impl RouterTools {
                 "mandate audit: issued at spawn (immutable, carried verbatim in thread/started)"
             );
         }
+        // The dispatch owes at most one acknowledgement in this hold
+        // (`speak_rules` `outcome-only`, DESIGN §4.2): the slot opens
+        // only after every refusal above, so a refused spawn consumes
+        // nothing.
+        self.hold.open_dispatch_ack();
         Ok(ToolResult {
             call_id: call.id,
             output,

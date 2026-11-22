@@ -2256,9 +2256,9 @@ impl MandateConfig {
 
 /// One `superagent.speak_rules` entry:
 /// `{channel, when: always | ack-first-only | decision-needed |
-/// result-ready | never, per_topic_ack?}` — the condition under which
-/// a send may leave the channel, evaluated before the §4.2 shaping
-/// policies.
+/// result-ready | outcome-only | never, per_topic_ack?}` — the
+/// condition under which a send may leave the channel, evaluated
+/// before the §4.2 shaping policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpeakRuleDef {
@@ -2270,7 +2270,8 @@ pub struct SpeakRuleDef {
     /// spellings refuse to start.
     pub when: String,
     /// For `ack-first-only`: key the confirm-once memory per topic
-    /// rather than per channel. Default false.
+    /// rather than per channel. Default false. Ignored by every other
+    /// condition.
     #[serde(default)]
     pub per_topic_ack: bool,
 }
@@ -2289,7 +2290,7 @@ impl SpeakRuleDef {
         let when = kian_superagent::SpeakCondition::from_code(&self.when).ok_or_else(|| {
             format!(
                 "when `{}` is not one of always | ack-first-only | decision-needed | \
-                     result-ready | never",
+                     result-ready | outcome-only | never",
                 self.when
             )
         })?;
@@ -8469,6 +8470,30 @@ recovery:
             "  speak_rules:\n    - channel: mock-im\n      when: never\n      volume: 3\n  subscriptions:\n",
         );
         assert!(ServeConfig::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn speak_rules_accept_the_outcome_only_condition() {
+        // The condition the phone shape needed: results and decisions
+        // pass, the dispatch acknowledgement does not.
+        let yaml = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: mock-im\n      when: outcome-only\n  subscriptions:\n",
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("outcome-only config");
+        let sa = cfg.superagent.as_ref().unwrap();
+        let policy = sa.speak_policy().expect("converts");
+        let rule = policy.rule_for("mock-im").expect("mock-im gated");
+        assert_eq!(rule.when, kian_superagent::SpeakCondition::OutcomeOnly);
+
+        // A near-miss spelling still refuses to start and the error
+        // names the whole vocabulary.
+        let bad = superagent_yaml().replace(
+            "  subscriptions:\n",
+            "  speak_rules:\n    - channel: mock-im\n      when: outcome\n  subscriptions:\n",
+        );
+        let err = ServeConfig::parse(&bad).unwrap_err();
+        assert!(err.to_string().contains("outcome-only"), "{err}");
     }
 
     #[test]

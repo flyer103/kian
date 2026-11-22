@@ -8,6 +8,16 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Speak-rules gain `outcome-only` (DESIGN §4.2)**. The closed condition vocabulary
+  `always | ack-first-only | decision-needed | result-ready | never` grows a sixth value for the
+  one-conversation channel shape: results and decision prompts are sent, the dispatch
+  acknowledgement after `spawn_worker` is suppressed, so a delegated task reaches the person once,
+  when the outcome is ready. The acknowledgement slot is per execution hold (one per dispatch, the
+  first decision-shaped send spends it, an admitted result closes it) and never persisted — a
+  replay re-derives it from the same tool calls. Suppression stays honest: an error naming the
+  condition, an audit line, the `speak_suppressed` counter, and no `channel/delivered`. No tool
+  schema changes, so a deployment that does not set the condition keeps byte-identical prompts.
+  `examples/mobile-dispatch` now uses it.
 - **A pending `ask` can be answered from a channel for good (CONFIRMATION-MODEL §14d, ADR-051)**.
   `superagent.confirm_answers.channels` opts a channel into the confirmation plane: an inbound
   `approve <code>` / `reject <code> <reason>` is intercepted in the bundle's admission path — before

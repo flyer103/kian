@@ -354,6 +354,14 @@ pub enum SpeakCondition {
     /// Only result deliveries pass — mechanically `deliver_structured`
     /// ([`SpeakKind::Result`]). Progress chatter is suppressed.
     ResultReady,
+    /// Results and decisions pass; the *dispatch acknowledgement* — the
+    /// first decision-shaped send after a `spawn_worker` call in the
+    /// same execution hold — does not. The shape of a one-conversation
+    /// channel (a phone) where the acknowledgement is the noisiest
+    /// message and the result is the one worth a buzz. The caller owns
+    /// the acknowledgement slot (per hold, never persisted); this
+    /// condition only reads the verdict the caller derived.
+    OutcomeOnly,
     /// Nothing leaves the channel. The gate for channels the Router
     /// may listen to but never write.
     Never,
@@ -361,11 +369,12 @@ pub enum SpeakCondition {
 
 impl SpeakCondition {
     /// The complete closed set, in display-table order.
-    pub const ALL: [SpeakCondition; 5] = [
+    pub const ALL: [SpeakCondition; 6] = [
         SpeakCondition::Always,
         SpeakCondition::AckFirstOnly,
         SpeakCondition::DecisionNeeded,
         SpeakCondition::ResultReady,
+        SpeakCondition::OutcomeOnly,
         SpeakCondition::Never,
     ];
 
@@ -377,6 +386,7 @@ impl SpeakCondition {
             SpeakCondition::AckFirstOnly => "ack-first-only",
             SpeakCondition::DecisionNeeded => "decision-needed",
             SpeakCondition::ResultReady => "result-ready",
+            SpeakCondition::OutcomeOnly => "outcome-only",
             SpeakCondition::Never => "never",
         }
     }
@@ -410,6 +420,11 @@ impl SpeakCondition {
             SpeakCondition::ResultReady => {
                 "this channel carries results only — deliver the structured report here \
                  and keep plain-text conversation elsewhere"
+            }
+            SpeakCondition::OutcomeOnly => {
+                "this channel carries results and decisions, but not dispatch \
+                 acknowledgements — do not retry the acknowledgement; the result or the \
+                 decision will be sent when it is ready"
             }
             SpeakCondition::Never => {
                 "this channel is muted for the Router — record the finding in the \
@@ -466,6 +481,13 @@ pub struct SpeakContext<'a> {
     pub kind: SpeakKind,
     /// The ack-once memory (a disposable projection, never persisted).
     pub tracker: &'a SpeakTracker,
+    /// Whether the caller derived this send as the dispatch
+    /// acknowledgement: a decision-shaped send while the hold has an
+    /// unspent acknowledgement slot. Only [`SpeakCondition::OutcomeOnly`]
+    /// reads it — every other condition ignores it, so their behavior
+    /// (and their audit bytes) is unchanged. The condition still
+    /// re-checks the kind, so a stray flag cannot drop a result.
+    pub dispatch_ack: bool,
 }
 
 /// The gate's decision. A suppression names its condition — the Router
@@ -526,6 +548,17 @@ impl SpeakPolicy {
                     condition: rule.when,
                 },
             },
+            SpeakCondition::OutcomeOnly => {
+                // The flag alone cannot drop an outcome: a result is
+                // never the acknowledgement, whatever the caller set.
+                if context.dispatch_ack && context.kind == SpeakKind::Decision {
+                    SpeakVerdict::Suppress {
+                        condition: rule.when,
+                    }
+                } else {
+                    SpeakVerdict::Admit
+                }
+            }
             SpeakCondition::AckFirstOnly => {
                 let already = if rule.per_topic_ack {
                     context

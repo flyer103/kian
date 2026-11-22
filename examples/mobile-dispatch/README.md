@@ -51,9 +51,10 @@ Then, from the phone:
 3. Send a task with no acceptance criteria — the Router asks for the missing piece once instead of
    delegating on a guess.
 
-A delegated task costs **two** messages: a one-line ack when the Router delegates, then the result
-when the report lands. That is the `always` condition doing its job — the closed vocabulary has no
-"results and decisions but no acks" condition, and `ack-first-only` would suppress the result too.
+A delegated task reaches you **once**: the `outcome-only` speak-rule drops the dispatch ack and
+lets the result through, so the buzz you get is the report, not "working on it". Suppressed sends
+still leave an honest tool error the Router sees plus an audit line and a counter, so nothing
+disappears silently.
 
 ### No Mac? Run the shape with a mock channel
 
@@ -96,9 +97,9 @@ the test transport, not a product surface.
   ([design/CONFIRMATION-MODEL.md](../../design/CONFIRMATION-MODEL.md) §14d). Without that key the
   pending call is answered only by the control plane (`kian pending`, `kian confirm`).
 - **One speak condition per channel.** `result-ready` and `decision-needed` are mutually exclusive,
-  so the only way to receive both results and decision prompts is `always` plus the Router prompt's
-  "speak only when a decision or acceptance is needed" rule. A composite condition would need a
-  config change.
+  which is why this example uses `outcome-only` (results and decisions, no dispatch ack). A channel
+  that must also hear progress chatter is a different shape: `always`, with the volume handled on
+  the Router prompt.
 - **Text only, both directions.** An iMessage attachment or screenshot never reaches kian
   (CHANNEL-IMESSAGE §4); ask for evidence in text, or open the desktop.
 - **One handle, one topic.** Follow-ups while a worker is live still route to the Router, which

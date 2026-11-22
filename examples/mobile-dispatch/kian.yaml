@@ -96,12 +96,12 @@ superagent:
     # default); the Router decides whether to delegate or answer.
     - { channel: phone, match: always, route: router }
   speak_rules:
-    # `always` is deliberate: the closed vocabulary offers one condition
-    # per channel, and `result-ready` / `decision-needed` are mutually
-    # exclusive, so neither can carry both results AND decision prompts
-    # to the only channel. The "speak only for a decision or a result"
-    # rule therefore rides the Router prompt (DESIGN §4.2), not the gate.
-    - { channel: phone, when: always }
+    # The phone shape: results and decision prompts go out, the dispatch
+    # acknowledgement does not — so a delegated task reaches you once,
+    # when the outcome is ready. `result-ready` / `decision-needed` are
+    # mutually exclusive and would each drop half the surface;
+    # `outcome-only` is the condition that keeps both (DESIGN §4.2).
+    - { channel: phone, when: outcome-only }
   mandate:
     scopes:
       executor: >-

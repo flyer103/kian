@@ -189,6 +189,7 @@ superagent:
   im: { reply_units: 300 }                            # IM reply budget (default 300)
   speak_rules:
     - { channel: issue-github, when: result-ready }   # whether-to-send gate
+    - { channel: phone, when: outcome-only }          # results + decisions, no ack
   mandate:
     scopes:
       worker: "draft a triage comment; never post unless DRY_RUN=0"
@@ -200,8 +201,14 @@ superagent:
   that many units (a CJK character counts one; a Latin word counts one). The Router's judge prompt
   renders the same number, so the model is told what the policy enforces; the watchdog's
   `escalate` shares it. A `详情` reply is still delivered whole.
-- **Speak-rules** suppress a send with an honest tool error, an audit line and a counter — no send
-  means no `channel/delivered`.
+- **Speak-rules** (`{channel, when, per_topic_ack?}`, one condition per channel, first match wins)
+  gate `reply` and `deliver_structured` over the closed vocabulary `always | ack-first-only |
+  decision-needed | result-ready | outcome-only | never`. A suppressed send is an honest tool error
+  naming the condition, an audit line and a counter — no send means no `channel/delivered`.
+  `outcome-only` is the phone shape: results and decisions go out, the dispatch acknowledgement
+  after `spawn_worker` does not, so a delegated task reaches the person once — when the outcome is
+  ready. The acknowledgement slot belongs to the execution hold (one per dispatch) and is never
+  persisted.
 - **Mandate** is the immutable delegation authority object, carried verbatim into `thread/started`
   and revalidated before follow-ups ([ADR-012](../design/decisions/ADR-012-delegation-mandate.md)).
 - **Outbox** is a disposable projection over send intent + delivery receipt; retries are bounded

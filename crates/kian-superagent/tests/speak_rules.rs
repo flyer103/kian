@@ -27,9 +27,9 @@ use kian_core::model::{Epoch, SessionId};
 use kian_core::seams::{ChannelAdapter, ToolCall, ToolError, ToolProvider, ToolResult};
 use kian_orchestrator::WakeOutcome;
 use kian_superagent::{
-    InboxWriter, MockChannel, RouterHold, RouterProfile, RouterTools, SpeakCondition, SpeakKind,
-    SpeakPolicy, SpeakRule, SpeakTracker, StreamPort, StreamPortError, WorkerSpawner,
-    router_template, worker_template,
+    InboxWriter, MockChannel, RouterHold, RouterProfile, RouterTools, SPAWN_WORKER_TOOL,
+    SpeakCondition, SpeakKind, SpeakPolicy, SpeakRule, SpeakTracker, StreamPort, StreamPortError,
+    WorkerSpawner, router_template, worker_template,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -256,6 +256,7 @@ fn verdict(
         topic: Some(key.as_str()),
         kind,
         tracker,
+        dispatch_ack: false,
     };
     SpeakPolicy::check(rule, &context)
 }
@@ -340,6 +341,47 @@ fn decision_needed_admits_only_decisions_result_ready_only_results() {
 }
 
 #[test]
+fn outcome_only_reads_only_the_dispatch_acknowledgement_flag() {
+    let tracker = SpeakTracker::new();
+    let rule = SpeakRule {
+        channel: "mock-im".into(),
+        when: SpeakCondition::OutcomeOnly,
+        per_topic_ack: false,
+    };
+    let context = |kind: SpeakKind, dispatch_ack: bool| kian_superagent::SpeakContext {
+        channel: "mock-im",
+        topic: None,
+        kind,
+        tracker: &tracker,
+        dispatch_ack,
+    };
+
+    // The acknowledgement — a decision-shaped send the caller derived as
+    // the dispatch ack — is the one send this condition drops.
+    assert_eq!(
+        suppressed_condition(&SpeakPolicy::check(
+            &rule,
+            &context(SpeakKind::Decision, true)
+        )),
+        SpeakCondition::OutcomeOnly
+    );
+    // Anything else passes, whatever the flag says: a later decision is
+    // not the acknowledgement, and a result never is.
+    assert!(admits(&SpeakPolicy::check(
+        &rule,
+        &context(SpeakKind::Decision, false)
+    )));
+    assert!(admits(&SpeakPolicy::check(
+        &rule,
+        &context(SpeakKind::Result, false)
+    )));
+    assert!(admits(&SpeakPolicy::check(
+        &rule,
+        &context(SpeakKind::Result, true)
+    )));
+}
+
+#[test]
 fn ack_first_only_is_topic_scoped_or_channel_scoped_by_config() {
     let mut tracker = SpeakTracker::new();
 
@@ -403,7 +445,7 @@ fn ack_first_only_is_topic_scoped_or_channel_scoped_by_config() {
 fn absent_rules_admit_everything_and_conditions_have_stable_codes() {
     let policy = SpeakPolicy::default();
     assert!(policy.rule_for("mock-im").is_none());
-    // The closed vocabulary is exactly the five conditions, with
+    // The closed vocabulary is exactly the six conditions, with
     // stable serde/audit codes.
     let codes: Vec<&str> = SpeakCondition::ALL.iter().map(|c| c.code()).collect();
     assert_eq!(
@@ -413,6 +455,7 @@ fn absent_rules_admit_everything_and_conditions_have_stable_codes() {
             "ack-first-only",
             "decision-needed",
             "result-ready",
+            "outcome-only",
             "never"
         ]
     );
@@ -593,6 +636,72 @@ async fn suppressed_structured_delivery_never_reaches_the_adapter() {
 // ---------------------------------------------------------------------------
 // Gate 3 — ack-first-only: confirm once, per topic, across restarts
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Gate 4 — outcome-only: the dispatch acknowledgement is dropped, the
+// outcome is not
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn outcome_only_drops_the_acknowledgement_and_keeps_the_outcome() {
+    let (tools, hold, mock, port) = make_tools(
+        sid(14),
+        vec![SpeakRule {
+            channel: "mock-im".into(),
+            when: SpeakCondition::OutcomeOnly,
+            per_topic_ack: false,
+        }],
+    );
+
+    // A dispatch owes one acknowledgement in this hold.
+    invoke(&tools, call(SPAWN_WORKER_TOOL, json!({"task": "the work"})))
+        .await
+        .expect("spawn");
+
+    // The acknowledgement is dropped — honestly: the model sees the
+    // condition, the person sees nothing.
+    let err = invoke(&tools, reply_call(topic_a())).await.unwrap_err();
+    assert!(err.to_string().contains("outcome-only"), "{err}");
+    assert_eq!(mock.deliveries().len(), 0);
+    assert_eq!(port.count_kind(EventKind::ChannelDelivered), 0);
+    assert_eq!(tools.speak_metrics().suppressed(), 1);
+
+    // The slot is spent: the next send is an outcome, not an ack.
+    invoke(&tools, reply_call(topic_a()))
+        .await
+        .expect("the result passes");
+    assert_eq!(mock.deliveries().len(), 1);
+
+    // A second dispatch owes its own acknowledgement.
+    invoke(
+        &tools,
+        call(SPAWN_WORKER_TOOL, json!({"task": "more work"})),
+    )
+    .await
+    .expect("spawn");
+    let err = invoke(&tools, reply_call(topic_a())).await.unwrap_err();
+    assert!(err.to_string().contains("outcome-only"), "{err}");
+
+    // A delivered result closes the slot: a later reply is a decision.
+    invoke(&tools, structured_call(topic_a()))
+        .await
+        .expect("the report passes");
+    invoke(&tools, reply_call(topic_a()))
+        .await
+        .expect("a decision after the result passes");
+    assert_eq!(mock.deliveries().len(), 3);
+    assert_eq!(port.count_kind(EventKind::ChannelDelivered), 3);
+    assert_eq!(tools.speak_metrics().suppressed(), 2);
+
+    // The slots belong to the hold: a new hold (a replay, a fresh
+    // drain) starts from zero, so the acknowledgement slot never
+    // outlives the execution it was derived from.
+    let (_fresh_port, dyn_port) = ScriptedPort::shared(sid(14));
+    hold.install(dyn_port);
+    invoke(&tools, reply_call(topic_b()))
+        .await
+        .expect("a fresh hold owes nothing");
+}
 
 #[tokio::test]
 async fn ack_first_only_suppresses_the_second_ack_and_admits_a_new_topic() {

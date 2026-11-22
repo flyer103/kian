@@ -792,13 +792,19 @@ successful send is followed by a `channel/delivered` event; a policy rejection (
 structured payload missing a section) is an honest error to the loop — never a silent
 send. Composing **before** the shaping policies is the output-side speak-gate (
 `superagent.speak_rules`): a *whether-to-send* decision over the closed condition
-vocabulary `always | ack-first-only | decision-needed | result-ready | never` — a
+vocabulary `always | ack-first-only | decision-needed | result-ready | outcome-only | never` — a
 suppressed send is an honest tool error naming the rule and condition (the model sees it
 and reacts), an audit line + counter, and no send ⇒ no `channel/delivered` (the 
 deliver-or-discard discipline). `ack-first-only` keys its confirm-once memory in
 `SpeakTracker`, a **disposable projection** over the Router's own `channel/delivered`
 events rebuilt from the stream at boot, so "first ack only" survives restarts; absent
-table = every send passes, byte-identical.
+table = every send passes, byte-identical. `outcome-only` drops the **dispatch
+acknowledgement** instead of the outcome: the first reply-shaped send attempted after a
+`spawn_worker` call in the same execution hold is suppressed, results and decisions are
+not. The ack slot is per hold (`RouterHold`, reset when a hold is installed along with
+its details-request slot) and is re-derived by a replay from the same drain's tool
+calls — a claim about the hold, never persisted state, so a person hears once per
+dispatch: when a result or a decision is ready.
 
 Composed after the gate (and after the shaping policies), the **outbox bounded retry**
 (`superagent.outbox` — absent = one attempt, the honest adapter error,
@@ -837,7 +843,7 @@ same answer at the intent's `tool/call` seq and re-sends the intent's exact byte
 
 | Channel | Output policy (bundle built-in templates) |
 |---------|-------------------------------------------|
-| Any channel | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |
+| Any channel | speak-rules: the *whether-to-send* gate (`superagent.speak_rules: [{channel, when, per_topic_ack}]`, first match per channel) evaluated before the shaping policies below; `decision-needed` admits the two-way `reply` surface, `result-ready` admits `deliver_structured`, `ack-first-only` confirms once per topic (or channel), `outcome-only` suppresses the post-dispatch acknowledgement and admits results and decisions, `never` mutes — suppression is honest (tool error + audit + counter), never a silent swallow |
 | IM | ≤300-unit hard rule on normal replies by default — `superagent.im.reply_units` sets the budget, and the judge prompt renders the same number (a CJK character counts one unit; CJK has no inter-word spaces); only direct questions / short conclusions; notify only when a decision or acceptance is needed. A reply answering a details request (`详情` and the closed vocabulary, derived from the stream) takes the full-delivery mode: the complete text, `truncated: false`, additive `detail: true` receipt |
 | GitHub PR/Issue | Structured delivery: problem background / change notes / verification results |
 | GitHub (adapter) | the second *real* adapter beside lark, the "group-chat message + CI events" family (`issues`/`issue_comment`/`pull_request`/`push`/`check_run`/`status`): receive is webhook-shaped deliveries verified by the receiver surface (HMAC precedes parsing) and handed to the adapter, which maps each delivery to one provenance-carrying `ChannelEvent` (delivery id → `event_id` idempotency, repo → `group`, `owner/repo` or an exact `owner/repo#N` key → `topic` from the config table — the table is the receive allowlist —, verbatim sender, adapter-declared `explicit` on @-mentions in human text); send is PR review comment / issue comment / PR description via the REST API, resolving only on 2xx + id acceptance, structured content rendered as markdown sections; token env-only (`KIAN_GITHUB_TOKEN`, fail-closed when send is configured; receive needs none); the channel is untrusted by default |
@@ -1162,7 +1168,7 @@ gap fixes recorded in the closing bullets.
  stay quiet while working"): the output-policy table (§4.2) gains the
  **whether-to-send gate**, `superagent.speak_rules: [{channel, when, per_topic_ack}]`
  over the closed condition vocabulary `always | ack-first-only | decision-needed |
- result-ready | never` (`policy.rs`: `SpeakRule`/`SpeakCondition`/`SpeakPolicy::check`,
+ result-ready | outcome-only | never` (`policy.rs`: `SpeakRule`/`SpeakCondition`/`SpeakPolicy::check`,
  pure). The gate composes **before** `ImPolicy`/`StructuredPolicy` shaping on the
  Router's `reply`/`deliver_structured` tool paths; the send kind is derived from the
  tool (reply = decision, deliver_structured = result), never model-declared. A
@@ -1172,9 +1178,17 @@ gap fixes recorded in the closing bullets.
  event kind for "did not happen"). The `ack-first-only` confirm-once memory is
  `SpeakTracker`: a **disposable projection** over the Router's own `channel/delivered`
  events keyed `(channel, target)`, rebuilt from the stream at boot, so first-ack-only
- survives restarts (constraint 1). Absent table = every send passes, byte-identical
- (zero sanctioned test edits). Full placement note: §4.2 speak-gate paragraph + table
- row.
+ survives restarts (constraint 1). `outcome-only` answers the phone-side shape: an
+ acknowledgement right after `spawn_worker` is the noisiest message a one-conversation
+ channel carries, and it is the one send the model is *told* to make. The condition
+ consumes an **ack slot**: `spawn_worker` opens one per dispatch on the hold,
+ `SpeakKind::Result` sends close it, and `SpeakKind::Decision` sends spend it. The slot
+ lives in `RouterHold` beside the details-request slot — same lifetime, same replay
+ story (a drain replay re-executes the same `spawn_worker` call, so the slot is
+ re-derived, and a new drain starts from zero); it is never persisted, and losing it
+ costs at most one extra acknowledgement. Absent table = every send passes,
+ byte-identical (zero sanctioned test edits). Full placement note: §4.2 speak-gate
+ paragraph + table row.
 - **Follow-up ownership routing ** — reference 002's rule ("a person's
  follow-up belongs to the live Ticket's Executor; the Router may only stop") landed as
  policy over the existing fan-out, zero new event kinds: (1) `registry.rs` gains the
