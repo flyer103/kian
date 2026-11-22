@@ -110,6 +110,12 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
+    /// The artifact retention plan (ADR-055, ADR-058, P3b): present iff
+    /// the `artifacts:` section is configured. [`Server::serve`] spawns
+    /// its GC ticker — strict mtime retention, outside every drain, and
+    /// never a failure path for a request (a reclaimed blob only
+    /// degrades an old result's fidelity; replay keeps the preview).
+    artifact_maintenance: Option<ArtifactMaintenance>,
     /// The resolved `superagent.cron` schedules (CRON-MODEL §3): empty iff
     /// no cron section is configured (or none resolved). [`Server::serve`]
     /// spawns the cron ticker only when this is non-empty — feature-off
@@ -185,6 +191,17 @@ struct ViewsMaintenance {
     interval_ms: u64,
     holder: String,
     board_enabled: bool,
+}
+
+/// The serve-side artifact retention plan (ADR-055, ADR-058, P3b):
+/// present iff the `artifacts:` section is configured. GC runs on its
+/// own ticker, outside every drain; the read path never depends on it.
+#[derive(Clone)]
+struct ArtifactMaintenance {
+    store: Arc<kian_store::ArtifactStore>,
+    interval_ms: u64,
+    max_bytes: u64,
+    retention_days: u64,
 }
 
 /// The serve-side child inactivity plan (MULTIAGENT-MODEL §5.3, pin
@@ -374,21 +391,32 @@ impl Server {
             .map_err(ServeError::Config)?;
         // ADR-055 (P2): the artifact runtime — absent `artifacts:` section =
         // spill off, and the assembled tool set stays byte-identical.
-        let (artifact_store, artifact_runtime) = match config.artifacts.as_ref() {
-            Some(artifacts) => {
-                let dir = artifacts
-                    .resolve_dir(&config.storage)
-                    .map_err(|e| ServeError::Assembly(format!("artifacts: {e}")))?;
-                let store = kian_store::ArtifactStore::open(dir)
-                    .map_err(|e| ServeError::Assembly(format!("artifacts: open store: {e}")))?;
-                let runtime = kian_orchestrator::ArtifactRuntime::new(
-                    store.clone(),
-                    artifacts.inline_max_bytes,
-                );
-                (Some(Arc::new(store)), Some(runtime))
-            }
-            None => (None, None),
-        };
+        // ADR-058 (P3b): the same section arms the serve-side retention
+        // ticker, so a long-running server reclaims by its configured
+        // bounds without an operator command.
+        let (artifact_store, artifact_runtime, artifact_maintenance) =
+            match config.artifacts.as_ref() {
+                Some(artifacts) => {
+                    let dir = artifacts
+                        .resolve_dir(&config.storage)
+                        .map_err(|e| ServeError::Assembly(format!("artifacts: {e}")))?;
+                    let store = Arc::new(kian_store::ArtifactStore::open(dir).map_err(|e| {
+                        ServeError::Assembly(format!("artifacts: open store: {e}"))
+                    })?);
+                    let runtime = kian_orchestrator::ArtifactRuntime::new(
+                        (*store).clone(),
+                        artifacts.inline_max_bytes,
+                    );
+                    let maintenance = ArtifactMaintenance {
+                        store: Arc::clone(&store),
+                        interval_ms: artifacts.gc.interval_ms,
+                        max_bytes: artifacts.gc.max_bytes,
+                        retention_days: artifacts.gc.retention_days,
+                    };
+                    (Some(store), Some(runtime), Some(maintenance))
+                }
+                None => (None, None, None),
+            };
         // Bundle-edge tools mounted beside the local tools. ADR-055: the
         // artifact reader when spill is on. ADR-056 (P2b): the client-side
         // web tools when `web:` is on — the provider key is read here,
@@ -1163,6 +1191,7 @@ impl Server {
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
             views_maintenance,
+            artifact_maintenance,
             // The one process-wide hook bus (provided to the plugin ctx
             // above; the §8/§9 sidecar runtime mounts on it after the
             // inbox rebuild).
@@ -1419,6 +1448,39 @@ impl Server {
                         plan.board_enabled,
                     )
                     .await;
+                }
+            });
+        }
+        // Artifact retention (ADR-055, ADR-058, P3b): each beat reclaims
+        // expired blobs (retention) and then over-budget ones, oldest
+        // mtime first. Strictly outside every drain; a lost or doubled
+        // beat is harmless (idempotent, and a missing blob only lowers
+        // a replay's fidelity — the event stream keeps the preview).
+        if let Some(plan) = self.artifact_maintenance.clone() {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                    plan.interval_ms.max(1),
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let retention_ms = plan.retention_days.saturating_mul(24 * 60 * 60 * 1000);
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match plan.store.gc(now_ms, plan.max_bytes, retention_ms) {
+                        Ok(report) if report.removed > 0 => {
+                            tracing::info!(
+                                removed = report.removed,
+                                bytes_freed = report.bytes_freed,
+                                kept = report.kept,
+                                "artifact gc tick"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "artifact gc tick failed"),
+                    }
                 }
             });
         }

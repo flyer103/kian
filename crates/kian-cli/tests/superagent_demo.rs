@@ -842,6 +842,7 @@ async fn superagent_delegation_audit_export_replays() {
         None,
         Some(&router_out),
         false,
+        false,
     )
     .await
     .expect("export router");
@@ -852,6 +853,7 @@ async fn superagent_delegation_audit_export_replays() {
         None,
         None,
         Some(&worker_out),
+        false,
         false,
     )
     .await

@@ -180,14 +180,16 @@ async fn archive_verify_delete_inspect_with_export_byte_parity() {
     let config = write_config(&cfg_dir, &db, &retention_yaml(&archive_root, 0));
 
     // The pre-archive audit export (the golden bytes).
-    let pre_export = kian_cli::commands::run_export(&config, None, sid, None, None, None, false)
-        .await
-        .expect("pre-archive export");
-    let pre_export_ids = kian_cli::commands::run_export(&config, None, sid, None, None, None, true)
-        .await
-        .expect("pre-archive export --with-event-ids");
+    let pre_export =
+        kian_cli::commands::run_export(&config, None, sid, None, None, None, false, false)
+            .await
+            .expect("pre-archive export");
+    let pre_export_ids =
+        kian_cli::commands::run_export(&config, None, sid, None, None, None, true, false)
+            .await
+            .expect("pre-archive export --with-event-ids");
     let pre_range =
-        kian_cli::commands::run_export(&config, None, sid, Some(2), Some(4), None, false)
+        kian_cli::commands::run_export(&config, None, sid, Some(2), Some(4), None, false, false)
             .await
             .expect("pre-archive range export");
 
@@ -229,19 +231,21 @@ async fn archive_verify_delete_inspect_with_export_byte_parity() {
     assert!(replay_err.contains("session import"), "{replay_err}");
 
     // The audit export is byte-identical from the package.
-    let post_export = kian_cli::commands::run_export(&config, None, sid, None, None, None, false)
-        .await
-        .expect("post-archive export");
+    let post_export =
+        kian_cli::commands::run_export(&config, None, sid, None, None, None, false, false)
+            .await
+            .expect("post-archive export");
     assert_eq!(
         pre_export, post_export,
         "R7 audit invariance: default export"
     );
-    let post_ids = kian_cli::commands::run_export(&config, None, sid, None, None, None, true)
-        .await
-        .expect("post-archive export --with-event-ids");
+    let post_ids =
+        kian_cli::commands::run_export(&config, None, sid, None, None, None, true, false)
+            .await
+            .expect("post-archive export --with-event-ids");
     assert_eq!(pre_export_ids, post_ids, "--with-event-ids parity");
     let post_range =
-        kian_cli::commands::run_export(&config, None, sid, Some(2), Some(4), None, false)
+        kian_cli::commands::run_export(&config, None, sid, Some(2), Some(4), None, false, false)
             .await
             .expect("post-archive range export");
     assert_eq!(pre_range, post_range, "range export parity");

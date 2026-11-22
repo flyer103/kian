@@ -596,14 +596,21 @@ The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md
 placement is [design/DESIGN.md](../design/DESIGN.md) §2.2; the decision record is
 [ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md).
 
+P3b ([ADR-058](../design/decisions/ADR-058-maintenance-artifact-gc-and-export-pinning.md)) adds two
+operational surfaces without changing this contract: `serve` runs a retention GC ticker when the
+`artifacts:` block exists (interval from `artifacts.gc.interval_ms`, default one hour, outside
+drains, non-fatal), and `kian session export --with-artifacts` copies referenced blobs beside the
+output file on request. The stream still carries only references and previews, and a blob that was
+already reclaimed is an honest, documented outcome.
+
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P2 | kian-store, kian-orchestrator, kian-cli | `kian-store::ArtifactStore` (content-addressed put/get, atomic write, id validation, retention+cap GC); append-path spill of successful oversized `tool/result` payloads (preview + ref, `is_error` never spills); `artifact_read` tool + mounted-list wiring; `artifacts:` config (dir, `inline_max_bytes`, GC bounds) and `kian artifacts gc` | landed |
+| P3b | kian-cli | serve-side retention GC ticker armed from `artifacts.gc.interval_ms` (default one hour, outside drains, non-fatal); `kian session export --with-artifacts` pins referenced blobs to `<out>.artifacts/<id>` and reports reclaimed blobs as missing without failing the export | landed |
 
-Non-goals recorded with the phase: no export blob pinning (a later slice; exported sessions carry
-the reference and may age out locally), no per-session quota, no reference counting (kian has no
-session enumeration API and compaction rewrites ranges), no server-side fetch in core, no GC ticker
-inside `serve` in this slice.
+Non-goals recorded with the phase: no per-session quota, no reference counting (kian has no
+session enumeration API and compaction rewrites ranges), no server-side fetch in core. Export blob
+pinning and the serve GC ticker were deferred here and landed in P3b under ADR-058.
 
 ### Client-side web tools (ADR-056, P2b landed)
 

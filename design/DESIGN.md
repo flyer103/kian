@@ -588,6 +588,17 @@ An aged-out blob is a normal, documented outcome that `artifact_read` reports as
 to the mounted tool list; core names neither the tool nor the store policy. Errors never spill, and
 an absent `artifacts:` block keeps every payload byte-identical to legacy.
 
+**Retention and pinning (ADR-058, phase 3b)**: with the block configured, `serve` also runs one GC
+loop beside the snapshot and view tickers — the same `ArtifactStore::gc`, every
+`artifacts.gc.interval_ms` (default one hour), outside every drain, logging a warning when a round
+fails rather than failing a request; `kian artifacts gc` stays the manual path and the two share one
+policy. `kian session export --with-artifacts` (requires `--out`) copies every blob referenced by
+the selected `tool/result` events into a sibling `<out>.artifacts/<id>` directory, so an audit
+package can travel self-sufficient; a blob the ticker already reclaimed is reported as missing in
+the CLI summary and never fails the export. Neither surface adds an event kind or projection rule:
+the stream still carries references and previews, and replay is identical with or without pinned
+blobs.
+
 **Client-side web tools (ADR-056, phase 2b)**: the DeepSeek Search and Fetch HTTP APIs are mounted
 as two ordinary `ToolProvider` tools, `web_search` and `web_fetch`, from the bundle crate
 `kian-web` — never from a core crate, and never as a server-side model capability. Every call is a

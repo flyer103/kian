@@ -512,6 +512,7 @@ impl Default for ToolsConfig {
 ///   gc:
 ///     max_bytes: 10737418240
 ///     retention_days: 30
+///     interval_ms: 3600000
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -567,6 +568,10 @@ pub struct ArtifactGcConfig {
     /// Keep blobs at least this many days.
     #[serde(default = "default_artifact_retention_days")]
     pub retention_days: u64,
+    /// Serve-side GC ticker period, milliseconds (P3b, ADR-058).
+    /// Ignored by the one-shot `kian artifacts gc` command.
+    #[serde(default = "default_artifact_gc_interval_ms")]
+    pub interval_ms: u64,
 }
 
 impl Default for ArtifactGcConfig {
@@ -574,6 +579,7 @@ impl Default for ArtifactGcConfig {
         Self {
             max_bytes: default_artifact_gc_max_bytes(),
             retention_days: default_artifact_retention_days(),
+            interval_ms: default_artifact_gc_interval_ms(),
         }
     }
 }
@@ -586,6 +592,9 @@ fn default_artifact_gc_max_bytes() -> u64 {
 }
 fn default_artifact_retention_days() -> u64 {
     30
+}
+fn default_artifact_gc_interval_ms() -> u64 {
+    60 * 60 * 1000
 }
 
 /// The `web:` section (ADR-056, P2b): the client-side DeepSeek Search /
@@ -4322,6 +4331,11 @@ impl ServeConfig {
             if artifacts.gc.max_bytes == 0 && artifacts.gc.retention_days == 0 {
                 return Err(invalid(
                     "artifacts.gc: at least one of max_bytes / retention_days must be > 0 — a GC with both dimensions off reclaims nothing",
+                ));
+            }
+            if artifacts.gc.interval_ms == 0 {
+                return Err(invalid(
+                    "artifacts.gc.interval_ms must be > 0 (serve would spin)",
                 ));
             }
             artifacts
@@ -10807,6 +10821,27 @@ schedules:
     }
 
     // -- web tools (ADR-056, P2b) ------------------------------------
+
+    #[test]
+    fn artifacts_section_parses_gc_defaults_and_the_serve_interval() {
+        let yaml = format!("{}artifacts: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("artifacts section parses");
+        let artifacts = cfg.artifacts.as_ref().expect("artifacts present");
+        assert_eq!(artifacts.inline_max_bytes, 16 * 1024);
+        assert_eq!(artifacts.gc.max_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(artifacts.gc.retention_days, 30);
+        assert_eq!(artifacts.gc.interval_ms, 60 * 60 * 1000);
+        assert!(artifacts.resolve_dir(&cfg.storage).is_ok());
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "artifact_read"));
+    }
+
+    #[test]
+    fn a_zero_gc_interval_refuses_boot() {
+        let yaml = format!("{}artifacts:\n  gc:\n    interval_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("interval_ms"), "{err}");
+    }
 
     #[test]
     fn web_section_parses_defaults_and_mounts_the_two_tools() {

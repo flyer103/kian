@@ -8,9 +8,11 @@
 //! composed with the local fs/exec tools by `local-tools` whenever the
 //! `artifacts:` section is present.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use kian_core::events::{Event, EventKind};
 use kian_core::seams::{ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema};
 use kian_store::ArtifactStore;
 use serde_json::{Value, json};
@@ -165,6 +167,90 @@ impl ToolProvider for ArtifactReadTool {
             })
         })
     }
+}
+
+/// The artifact ids a JSONL export references, sorted and de-duplicated
+/// (P3b, ADR-058). A spill-shaped `tool/result` carries its reference at
+/// `content.output.artifact.id`; inline results and errors carry none,
+/// so an export from a spill-off assembly pins nothing.
+pub fn referenced_artifact_ids<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for event in events {
+        if !matches!(event.kind, EventKind::ToolResult) {
+            continue;
+        }
+        if let Some(id) = event.bytes["content"]["output"]["artifact"]["id"].as_str()
+            && !id.is_empty()
+        {
+            ids.insert(id.to_string());
+        }
+    }
+    ids
+}
+
+/// What an export pinned: blobs copied beside the JSONL, plus ids whose
+/// blob was already gone (reclaimed by retention GC). A missing blob
+/// never fails the export — the event stream is the truth and the
+/// preview still renders; the report states the degradation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPinReport {
+    pub pinned: usize,
+    pub missing: Vec<String>,
+}
+
+impl ArtifactPinReport {
+    /// The one-line honest summary appended to the export message.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut out = format!("pinned {} artifact(s) beside the export", self.pinned);
+        if !self.missing.is_empty() {
+            out.push_str(&format!(
+                "; {} missing (already reclaimed): {}",
+                self.missing.len(),
+                self.missing.join(", ")
+            ));
+        }
+        out
+    }
+}
+
+/// Copies every referenced blob into `<out>.artifacts/<id>`, a sibling
+/// directory of the exported JSONL (P3b, ADR-058). Content-addressed by
+/// construction: the id is the file name, so a re-export is idempotent
+/// and the pinned tree is verifiable byte-for-byte.
+pub fn pin_artifacts(
+    store: &ArtifactStore,
+    ids: &BTreeSet<String>,
+    out: &std::path::Path,
+) -> Result<ArtifactPinReport, String> {
+    let mut os = out.as_os_str().to_owned();
+    os.push(".artifacts");
+    let dir = std::path::PathBuf::from(os);
+    let mut report = ArtifactPinReport {
+        pinned: 0,
+        missing: Vec::new(),
+    };
+    if ids.is_empty() {
+        return Ok(report);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    for id in ids {
+        match store
+            .get(id)
+            .map_err(|e| format!("artifacts: read {id}: {e}"))?
+        {
+            Some(bytes) => {
+                let path = dir.join(id);
+                std::fs::write(&path, bytes)
+                    .map_err(|e| format!("write {}: {e}", path.display()))?;
+                report.pinned += 1;
+            }
+            None => report.missing.push(id.clone()),
+        }
+    }
+    Ok(report)
 }
 
 /// `kian artifacts gc` — one retention pass over a content-addressed blob tree,
@@ -378,5 +464,62 @@ mod tests {
             "fresh blob kept"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tool_result_event(seq: u64, artifact: Option<&str>) -> Event {
+        let output = match artifact {
+            Some(id) => json!({
+                "artifact": {"id": id, "size": 5, "media_type": "application/json"},
+                "preview": "preview",
+                "truncated": true
+            }),
+            None => json!({"ok": true}),
+        };
+        Event {
+            seq,
+            session: kian_core::model::SessionId(uuid::Uuid::nil()),
+            epoch: kian_core::model::Epoch(1),
+            ts: 1_761_900_000_000,
+            kind: EventKind::ToolResult,
+            bytes: json!({"role": "tool", "content": {"call_id": "c1", "output": output, "is_error": false}}),
+            version: kian_core::events::Event::current_version(),
+        }
+    }
+
+    #[test]
+    fn referenced_ids_come_only_from_spill_shaped_results() {
+        let event = tool_result_event(2, Some(&"a".repeat(64)));
+        let inline = tool_result_event(3, None);
+        let ids = referenced_artifact_ids([&event, &inline]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn export_pinning_copies_blobs_and_reports_missing_ones() {
+        let dir = temp_dir();
+        let store = ArtifactStore::open(&dir).expect("store");
+        let blob = store
+            .put(b"{\"payload\":\"spilled\"}", "application/json")
+            .expect("put");
+        let missing = "b".repeat(64);
+        let mut ids = BTreeSet::new();
+        ids.insert(blob.id.clone());
+        ids.insert(missing.clone());
+        let out = temp_dir().join("session-export.jsonl");
+        let report = pin_artifacts(&store, &ids, &out).expect("pin");
+        assert_eq!(report.pinned, 1);
+        assert_eq!(report.missing, vec![missing.clone()]);
+        let pinned = std::path::PathBuf::from(format!("{}.artifacts", out.display()));
+        assert_eq!(
+            std::fs::read(pinned.join(&blob.id)).expect("pinned blob"),
+            b"{\"payload\":\"spilled\"}"
+        );
+        assert!(
+            report.summary().contains("1 missing (already reclaimed)"),
+            "the report states the degradation honestly"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&pinned);
     }
 }

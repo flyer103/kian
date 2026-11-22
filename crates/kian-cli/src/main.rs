@@ -20,10 +20,11 @@
 //!   from events, verify A2 byte-identity, optionally diff against the
 //!   live server projection.
 //! - `kian session export <uuid> [--since S] [--until U] [--out F]
-//!   [--with-event-ids]` — event interval → JSONL audit package
-//!   (`--with-event-ids` adds the derived event id per line). An
-//!   archived session exports from its verified package, byte-identical
-//!   to the pre-archive export.
+//!   [--with-event-ids] [--with-artifacts]` — event interval → JSONL
+//!   audit package (`--with-event-ids` adds the derived event id per
+//!   line; `--with-artifacts` pins the referenced spilled blobs beside
+//!   the export). An archived session exports from its verified package,
+//!   byte-identical to the pre-archive export.
 //! - `kian archive run|verify` — opt-in export-only retention
 //!   (READ-MODEL §7): package → verify → commit, and package
 //!   re-verification. `kian session import <package>` restores one.
@@ -54,8 +55,8 @@ const USAGE: &str = "usage:
                                          projection + counters
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
                                          re-derive everything from events
-  kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--db <sqlite>] [--config <path>]
-                                         event interval → JSONL audit package (--with-event-ids adds the derived event id)
+  kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--with-artifacts] [--db <sqlite>] [--config <path>]
+                                         event interval → JSONL audit package (--with-event-ids adds the derived event id; --with-artifacts pins spilled blobs)
   kian session import <package-dir> [--db <sqlite>] [--config <path>] [--json]
                                          verify + restore an archive package into a store (replay/forensics)
   kian archive run [--db <sqlite>] [--config <path>] [--json]
@@ -542,6 +543,9 @@ struct SessionArgs {
     /// id to each exported line (export path only; other subcommands
     /// ignore the flag).
     with_event_ids: bool,
+    /// `session export --with-artifacts` — pins every spilled blob the
+    /// exported events reference beside the JSONL (requires --out).
+    with_artifacts: bool,
 }
 
 impl Default for SessionArgs {
@@ -557,6 +561,7 @@ impl Default for SessionArgs {
             reason: None,
             json: false,
             with_event_ids: false,
+            with_artifacts: false,
         }
     }
 }
@@ -604,6 +609,7 @@ fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, S
             },
             "--json" => out.json = true,
             "--with-event-ids" => out.with_event_ids = true,
+            "--with-artifacts" => out.with_artifacts = true,
             other if !other.starts_with("--") => {
                 let sid = kian_cli::commands::parse_session(other)
                     .map_err(|e| format!("{e} ({usage_for})"))?;
@@ -724,6 +730,12 @@ fn session(args: &[String]) -> ExitCode {
             "session replay",
         ),
         "export" => {
+            if parsed.with_artifacts && parsed.out.is_none() {
+                eprintln!(
+                    "kian: session export --with-artifacts requires --out (pinned blobs live in a directory beside the file)"
+                );
+                return ExitCode::from(2);
+            }
             // Export writes the JSONL body itself (stdout or --out).
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -743,6 +755,7 @@ fn session(args: &[String]) -> ExitCode {
                 parsed.until,
                 parsed.out.as_deref(),
                 parsed.with_event_ids,
+                parsed.with_artifacts,
             )) {
                 Ok(out) => {
                     print!("{out}");

@@ -584,9 +584,9 @@ pub async fn run_replay(
 // ---------------------------------------------------------------------------
 
 /// `kian session export <id> [--since S] [--until U] [--out F]
-/// [--with-event-ids]`: writes one frozen v0 envelope per line (the
-/// exact stored bytes, re-serialized identically from the envelope
-/// column). `since`/`until` are inclusive seq bounds.
+/// [--with-event-ids] [--with-artifacts]`: writes one frozen v0 envelope
+/// per line (the exact stored bytes, re-serialized identically from the
+/// envelope column). `since`/`until` are inclusive seq bounds.
 ///
 /// `--with-event-ids` (opt-) adds the derived `event_id`
 /// ([`kian_core::events::event_id`]) to each line — a presentation key
@@ -594,6 +594,13 @@ pub async fn run_replay(
 /// are unchanged; the flag only ever adds a key, and `import_jsonl`
 /// parses the augmented lines unchanged (the envelope ignores unknown
 /// keys), so the field is round-trip-safe, not export-only.
+///
+/// `--with-artifacts` (opt-, requires `--out`) pins every spilled
+/// `tool/result` blob the exported events reference into a sibling
+/// `<out>.artifacts/<id>` directory (ADR-058): the exported audit slice
+/// then survives retention GC. A blob already reclaimed is reported,
+/// never invented — the event stream stays the truth.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_export(
     config_path: &Path,
     db: Option<&Path>,
@@ -602,6 +609,7 @@ pub async fn run_export(
     until: Option<u64>,
     out: Option<&Path>,
     with_event_ids: bool,
+    with_artifacts: bool,
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
@@ -614,7 +622,17 @@ pub async fn run_export(
         .map_err(|e| format!("archive marker read: {e}"))?
     {
         store.close().await;
-        return export_from_package(&m, session, since, until, out, with_event_ids).await;
+        return export_from_package(
+            &m,
+            session,
+            since,
+            until,
+            out,
+            with_event_ids,
+            with_artifacts,
+            config_path,
+        )
+        .await;
     }
     let events = rebuild_session(&store, session).await?;
     store.close().await;
@@ -655,13 +673,18 @@ pub async fn run_export(
     match out {
         Some(path) => {
             std::fs::write(path, &jsonl).map_err(|e| format!("write {}: {e}", path.display()))?;
-            Ok(format!(
+            let mut message = format!(
                 "exported {} events (seq {}..={}) to {}",
                 selected.len(),
                 selected.first().map(|e| e.seq).unwrap_or(0),
                 selected.last().map(|e| e.seq).unwrap_or(0),
                 path.display()
-            ))
+            );
+            if with_artifacts {
+                let ids = crate::artifacts::referenced_artifact_ids(selected.iter().copied());
+                message.push_str(&pin_export_artifacts(config_path, &ids, path)?);
+            }
+            Ok(message)
         }
         None => {
             // JSONL to stdout: the caller (main) prints it verbatim.
@@ -670,11 +693,36 @@ pub async fn run_export(
     }
 }
 
+/// Resolves the configured blob store and pins `ids` beside the export
+/// (P3b, ADR-058). The artifacts section is required: a spill-shaped
+/// result can only exist when spill was configured, so a missing
+/// section means the operator pointed the export at the wrong config.
+fn pin_export_artifacts(
+    config_path: &Path,
+    ids: &std::collections::BTreeSet<String>,
+    out: &Path,
+) -> CmdResult<String> {
+    let config = crate::config::ServeConfig::load(config_path)
+        .map_err(|e| format!("--with-artifacts: config: {e}"))?;
+    let artifacts = config.artifacts.as_ref().ok_or_else(|| {
+        "--with-artifacts requires an `artifacts:` section — no blob store is configured"
+            .to_string()
+    })?;
+    let dir = artifacts
+        .resolve_dir(&config.storage)
+        .map_err(|e| format!("--with-artifacts: {e}"))?;
+    let store = kian_store::ArtifactStore::open(dir)
+        .map_err(|e| format!("--with-artifacts: open store: {e}"))?;
+    let report = crate::artifacts::pin_artifacts(&store, ids, out)?;
+    Ok(format!("; {}", report.summary()))
+}
+
 /// Serves `session export` for an archived session from its package:
 /// the file's hashes are re-verified, then the requested `[since,
 /// until]` lines are emitted with their stored bytes — byte-identical
 /// to the pre-archive export by construction (the same lines, the same
 /// serializer).
+#[allow(clippy::too_many_arguments)]
 async fn export_from_package(
     m: &kian_store::ArchivedMarker,
     session: SessionId,
@@ -682,6 +730,8 @@ async fn export_from_package(
     until: Option<u64>,
     out: Option<&Path>,
     with_event_ids: bool,
+    with_artifacts: bool,
+    config_path: &Path,
 ) -> CmdResult<String> {
     let dir = std::path::Path::new(&m.package_path);
     let manifest = crate::archive::verify_package(dir, Some(session))
@@ -731,14 +781,23 @@ async fn export_from_package(
     match out {
         Some(path) => {
             std::fs::write(path, &jsonl).map_err(|e| format!("write {}: {e}", path.display()))?;
-            Ok(format!(
+            let mut message = format!(
                 "exported {} events (seq {}..={}) to {} (from archive package {})",
                 selected.len(),
                 since,
                 until.min(manifest.last_seq),
                 path.display(),
                 m.package_path
-            ))
+            );
+            if with_artifacts {
+                let events: Vec<Event> = selected
+                    .iter()
+                    .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+                    .collect();
+                let ids = crate::artifacts::referenced_artifact_ids(events.iter());
+                message.push_str(&pin_export_artifacts(config_path, &ids, path)?);
+            }
+            Ok(message)
         }
         None => Ok(jsonl),
     }
@@ -3114,6 +3173,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3167,6 +3227,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3178,6 +3239,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -3189,6 +3251,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -3231,6 +3294,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         )
         .await

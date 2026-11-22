@@ -8,6 +8,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Artifact retention runs inside `serve`, and exports can pin the blobs they reference (DESIGN §2.2, ADR-058)**.
+  With an `artifacts:` block configured, serve now arms a retention GC ticker beside the snapshot
+  and view tickers (`artifacts.gc.interval_ms`, default one hour, outside every drain, a failed
+  round only logs a warning) — the manual `kian artifacts gc` keeps the same policy. `kian session
+  export --with-artifacts` (requires `--out`) copies every referenced blob into a sibling
+  `<out>.artifacts/<id>` directory so an audit package can stay payload-complete; a blob the ticker
+  already reclaimed is reported as missing in the summary and never fails the export. No event,
+  projection or replay rule changes: the stream still carries references plus previews.
+
 - **Long sessions fold old turns under measured context pressure, as audited maintenance turns (DESIGN §3.2, ADR-057)**.
   A new pure planner (`kian-orchestrator::compaction`) keeps the most recent turns verbatim,
   starts after the previous compact, requires a minimum reclaim and returns a strictly-past
