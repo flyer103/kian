@@ -600,6 +600,10 @@ superagent:
 
 - **Fail-closed boot.** A channel name that no mounted adapter provides, or a non-empty list naming a
   channel whose config is not an IM channel, refuses boot. Absent is off, never "all channels".
+- **`ignore` and an answer are contradictory.** A channel listed here must not carry an admission
+  class of `ignore` (boot error): the answer intercept sits *before* the class fast path, so the two
+  would disagree about what the channel means. Resolving this at boot keeps the runtime rule simple —
+  at answer time only R1's three gates are consulted.
 - **The tool is mounted iff the list is non-empty.** Adding it changes the Router's tool block, and
   tool schemas are prompt prefix (constraint 3): the invalidation happens once, at boot, by config —
   which is the only place this codebase allows a prefix-invalidating decision to come from.
