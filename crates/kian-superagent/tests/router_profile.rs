@@ -24,10 +24,10 @@ use kian_loop::{ReActConfig, ReActLoop};
 use kian_orchestrator::{Clock, DrainCtx, Engine, EngineConfig, SystemClock, WakeOutcome};
 use kian_store::EventStore;
 use kian_superagent::{
-    AdmitReceipt, ChannelRegistry, InboxWriteError, InboxWriter, MockChannel, RouterDriver,
-    RouterHold, RouterInbox, RouterProfile, RouterTools, RuleMatcher, ShapingConfig, StreamPort,
-    StreamPortError, SubscriptionRule, SubscriptionRuleSet, SubscriptionService, WorkerSpawner,
-    channel_input_payload, router_template, worker_template,
+    AdmitReceipt, ChannelRegistry, DEFAULT_MAX_WORDS, InboxWriteError, InboxWriter, MockChannel,
+    RouterDriver, RouterHold, RouterInbox, RouterProfile, RouterTools, RuleMatcher, ShapingConfig,
+    StreamPort, StreamPortError, SubscriptionRule, SubscriptionRuleSet, SubscriptionService,
+    WorkerSpawner, channel_input_payload, router_template, worker_template,
 };
 use kian_superagent::{CorrelateBy, Route};
 use serde_json::{Value, json};
@@ -548,12 +548,13 @@ async fn batch_admits_consumed_in_one_sweep_single_judge_turn() {
     );
 }
 
-/// Over-length reply: the §4.2 IM policy truncates at 100 words with
-/// an ellipsis; `channel/delivered{words:100, truncated:true}` lands
-/// after the send.
+/// Over-length reply: the §4.2 IM policy truncates at the unit budget
+/// with an ellipsis; `channel/delivered{words:<budget>,
+/// truncated:true}` lands after the send.
 #[tokio::test]
 async fn over_limit_reply_delivered_truncated_with_channel_delivered() {
-    let over_limit = words(120);
+    let over = DEFAULT_MAX_WORDS as usize + 20;
+    let over_limit = words(over);
     let h = build_harness(
         vec![
             vec![tool_call_chunk(
@@ -582,13 +583,17 @@ async fn over_limit_reply_delivered_truncated_with_channel_delivered() {
     })
     .await;
 
-    // The delivered text is truncated to ≤100 words with an ellipsis.
+    // The delivered text is truncated to the budget with an ellipsis.
     let deliveries = h.mock.deliveries();
     assert_eq!(deliveries.len(), 1);
     let delivered = deliveries[0].delivery.content["text"].as_str().unwrap();
-    assert_eq!(delivered.split_whitespace().count(), 100);
+    assert_eq!(
+        delivered.split_whitespace().count() as u64,
+        DEFAULT_MAX_WORDS
+    );
     assert!(delivered.ends_with('…'));
-    assert!(!delivered.contains("w120"));
+    assert!(!delivered.contains(&format!("w{}", DEFAULT_MAX_WORDS + 1)));
+    assert!(!delivered.contains(&format!("w{over}")));
 
     // channel/delivered after the send, schema, honest truncation.
     let events = h.store.rebuild(h.router).await.unwrap();
@@ -598,7 +603,7 @@ async fn over_limit_reply_delivered_truncated_with_channel_delivered() {
         .expect("channel/delivered");
     assert_eq!(delivered_ev.bytes["channel"], json!("mock-im"));
     assert_eq!(delivered_ev.bytes["policy"], json!("im"));
-    assert_eq!(delivered_ev.bytes["words"], json!(100));
+    assert_eq!(delivered_ev.bytes["words"], json!(DEFAULT_MAX_WORDS));
     assert_eq!(delivered_ev.bytes["truncated"], json!(true));
     assert_eq!(delivered_ev.bytes["target"], json!({"chat_id": 7}));
     // The delivery event trails the successful send: a tool/result for
@@ -611,7 +616,7 @@ async fn over_limit_reply_delivered_truncated_with_channel_delivered() {
     assert_eq!(tool_results[0].bytes["content"]["is_error"], json!(false));
     assert_eq!(
         tool_results[0].bytes["content"]["output"]["words"],
-        json!(100)
+        json!(DEFAULT_MAX_WORDS)
     );
 }
 

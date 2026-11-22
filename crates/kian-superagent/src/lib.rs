@@ -72,7 +72,7 @@
 //! - [`templates`] — the Router/Worker `AgentDef` templates and the
 //!   structural profile rules (workers never hold channel tools)
 //! - [`policy`] — the DESIGN §4.2 channel output policies:
-//!   `ImPolicy` (≤100-word rule, plus the details-request full-delivery
+//!   `ImPolicy` (the unit-budget rule, plus the details-request full-delivery
 //!   mode derived from the event stream) and `StructuredPolicy`
 //!   (section contract, honest rejection) — bundle-only placement
 //! - [`router`] — the resident Router profile: judge prompt +

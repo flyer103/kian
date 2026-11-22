@@ -187,7 +187,7 @@ change (§15).
 - One inbound message may be answered once; nothing here sends to a user with no inbound (§5).
 - **Output shape**: the reply text is plain text (the client renders no markdown). The Router
   prompt forbids markdown/emoji and asks for a complete answer inside the IM budget; the shared IM
-  policy enforces ≤100 **units** on normal replies, where each CJK character counts one unit (CJK
+  policy enforces its unit budget (default 300, `superagent.im.reply_units`) on normal replies, where each CJK character counts one unit (CJK
   has no inter-word spaces, so a whitespace-token count would never trigger). Over-budget text is
   cut at the last complete sentence that keeps at least half the budget, with an honest
   `truncated` receipt; the Router is told to summarize and offer `回复「详情」看完整结果` instead

@@ -803,6 +803,7 @@ impl Server {
                     .transpose()
                     .map_err(ServeError::Config)?,
                 speak: sa.speak_policy().map_err(ServeError::Config)?,
+                im: sa.im_policy().map_err(ServeError::Config)?,
                 followup_ownership: sa.followup_ownership,
                 policy_version,
                 policy_notify_live: sa.policy.notify_live,

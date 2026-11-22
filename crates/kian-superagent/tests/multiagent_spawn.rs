@@ -688,11 +688,11 @@ fn spawn_worker_schema_grows_by_exactly_three_properties_and_one_prompt_line() {
     // The prompt half: one frozen line, appended once, only when on.
     let mut flagged = RouterProfile::new(p2_router(), router_template("mock", "mock-router"));
     flagged.roster_instruction = true;
-    let rendered = flagged.judge.render(0);
+    let rendered = flagged.judge.render(0, flagged.im.max_words);
     let expected_prompt = format!("{rendered}\n\n{ROSTER_INSTRUCTION_PROMPT_LINE}");
     let plain = RouterProfile::new(p2_router(), router_template("mock", "mock-router"));
     assert_eq!(
-        plain.judge.render(0),
+        plain.judge.render(0, plain.im.max_words),
         rendered,
         "flag off renders today's bytes"
     );
@@ -726,8 +726,10 @@ async fn no_roster_keeps_the_p1_schema_prompt_and_spawn_bytes_identical() {
     }
     // Prompt: the default profile renders exactly the judge template.
     assert_eq!(
-        rig.profile.judge.render(0),
-        kian_superagent::JUDGE_PROMPT_TEMPLATE.replace("{inputs}", "0")
+        rig.profile.judge.render(0, rig.profile.im.max_words),
+        kian_superagent::JUDGE_PROMPT_TEMPLATE
+            .replace("{inputs}", "0")
+            .replace("{budget}", &rig.profile.im.max_words.to_string())
     );
 
     // Spawn bytes against the P1 golden.

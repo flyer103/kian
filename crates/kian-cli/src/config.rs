@@ -1431,6 +1431,28 @@ impl DshHarnessConfig {
 // super-agent + endpoint configuration
 // ---------------------------------------------------------------------------
 
+/// The `superagent.im:` output policy (`ImPolicy`, DESIGN §4.2): the
+/// hard unit budget on normal channel replies, where each CJK character
+/// counts one unit. Absent = [`kian_superagent::DEFAULT_MAX_WORDS`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImConfig {
+    #[serde(default = "default_im_reply_units")]
+    pub reply_units: u64,
+}
+
+impl Default for ImConfig {
+    fn default() -> Self {
+        Self {
+            reply_units: default_im_reply_units(),
+        }
+    }
+}
+
+fn default_im_reply_units() -> u64 {
+    kian_superagent::DEFAULT_MAX_WORDS
+}
+
 /// The `superagent:` section. Presence switches `serve` into the
 /// super-agent assembly (bundle plugins, resident Router, subscription
 /// engine); absence keeps the built-in single-agent server byte-for-byte.
@@ -1439,6 +1461,12 @@ impl DshHarnessConfig {
 pub struct SuperAgentConfig {
     pub router: SuperAgentRouterConfig,
     pub worker: SuperAgentWorkerConfig,
+    /// The IM reply budget (`superagent.im.reply_units`): the hard unit
+    /// limit the Router's `reply`, the watchdog's `escalate` and the
+    /// judge prompt all share. Absent = today's default budget,
+    /// byte-identical.
+    #[serde(default)]
+    pub im: ImConfig,
     /// Declarative subscription rules (DESIGN §4.1). Wire form:
     /// `{channel, match: always | {mentions: t} | {topic: t},
     /// route: router | {passthrough: {correlate_by: topic}}}`; converted
@@ -1690,18 +1718,33 @@ impl SuperAgentConfig {
         Ok(kian_superagent::SpeakPolicy::from_rules(rules))
     }
 
+    /// Converts the IM output-policy section to the bundle's
+    /// [`kian_superagent::ImPolicy`], fail-closed: a zero budget
+    /// refuses to start (it would truncate every reply to nothing).
+    pub fn im_policy(&self) -> Result<kian_superagent::ImPolicy, ConfigError> {
+        if self.im.reply_units == 0 {
+            return Err(invalid("superagent.im.reply_units must be > 0".to_owned()));
+        }
+        Ok(kian_superagent::ImPolicy {
+            max_words: self.im.reply_units,
+        })
+    }
+
     /// Converts the policy-version section to the bundle's
     /// [`kian_superagent::PolicyVersion`], fingerprinted against the
-    /// resident profiles' prompt templates (the judge and watchdog
-    /// defaults) so a label always names the template bytes it was
-    /// pinned against. `None` when no version is configured (today's
-    /// bytes, byte-identical).
+    /// resident profiles' effective prompt bytes — the judge template
+    /// with the configured reply budget rendered in, plus the watchdog
+    /// default — so a label always names the prompt bytes it was pinned
+    /// against. `None` when no version is configured (today's bytes,
+    /// byte-identical).
     pub fn policy_version(&self) -> Option<kian_superagent::PolicyVersion> {
         self.policy.version.as_deref().map(|label| {
+            let judge = kian_superagent::JUDGE_PROMPT_TEMPLATE
+                .replace("{budget}", &self.im.reply_units.to_string());
             kian_superagent::PolicyVersion::from_templates(
                 label,
                 &[
-                    ("judge", kian_superagent::JUDGE_PROMPT_TEMPLATE),
+                    ("judge", &judge),
                     ("watchdog", kian_superagent::WATCHDOG_PROMPT_TEMPLATE),
                 ],
             )
@@ -4364,6 +4407,9 @@ impl ServeConfig {
             // declared channels (fail-closed — an unknown condition
             // spelling or an undeclared channel refuses to start).
             sa.speak_policy()?;
+            // the IM reply budget converts cleanly (fail-closed — a
+            // zero budget refuses to start).
+            sa.im_policy()?;
             for (i, rule) in sa.speak_rules.iter().enumerate() {
                 if !sa.channels.contains_key(&rule.channel) {
                     return Err(invalid(format!(
@@ -8105,6 +8151,74 @@ recovery:
         let unknown = superagent_yaml().replace(
             "  router:\n    session_id:",
             "  router:\n    speculation:\n      max_outstanding: 2\n      label: x\n      budget: 9\n    session_id:",
+        );
+        assert!(ServeConfig::parse(&unknown).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // the superagent.im section
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn im_reply_units_defaults_to_the_bundle_budget_and_applies_when_configured() {
+        let cfg = ServeConfig::parse(&superagent_yaml()).expect("golden superagent config");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        assert_eq!(
+            sa.im_policy().unwrap().max_words,
+            kian_superagent::DEFAULT_MAX_WORDS
+        );
+
+        let configured = superagent_yaml().replace(
+            "  worker:\n    agent: worker\n",
+            "  im:\n    reply_units: 250\n  worker:\n    agent: worker\n",
+        );
+        let cfg = ServeConfig::parse(&configured).expect("configured budget parses");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        assert_eq!(sa.im_policy().unwrap().max_words, 250);
+
+        // The policy version fingerprints the *rendered* budget, so a
+        // budget change under the same label is auditable.
+        let labelled = configured.replace(
+            "  im:\n    reply_units: 250\n",
+            "  policy:\n    version: v1\n  im:\n    reply_units: 250\n",
+        );
+        let cfg = ServeConfig::parse(&labelled).expect("labelled budget parses");
+        let sa = cfg.superagent.as_ref().expect("superagent section");
+        let hashes = sa
+            .policy_version()
+            .expect("policy version")
+            .prompt_hashes()
+            .clone();
+        let other = labelled.replace("reply_units: 250", "reply_units: 400");
+        let cfg = ServeConfig::parse(&other).expect("other budget parses");
+        let other_hashes = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .policy_version()
+            .expect("policy version")
+            .prompt_hashes()
+            .clone();
+        assert_ne!(hashes["judge"], other_hashes["judge"]);
+        assert_eq!(hashes["watchdog"], other_hashes["watchdog"]);
+    }
+
+    #[test]
+    fn im_reply_units_rejects_zero_and_unknown_keys() {
+        let zero = superagent_yaml().replace(
+            "  worker:\n    agent: worker\n",
+            "  im:\n    reply_units: 0\n  worker:\n    agent: worker\n",
+        );
+        let err = ServeConfig::parse(&zero).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("superagent.im.reply_units must be > 0"),
+            "{err}"
+        );
+
+        let unknown = superagent_yaml().replace(
+            "  worker:\n    agent: worker\n",
+            "  im:\n    reply_units: 250\n    max_words: 1\n  worker:\n    agent: worker\n",
         );
         assert!(ServeConfig::parse(&unknown).is_err());
     }

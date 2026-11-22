@@ -225,10 +225,14 @@ impl Default for JudgePrompt {
 }
 
 impl JudgePrompt {
-    /// Renders the prompt for a batch of `pending` inputs.
+    /// Renders the prompt for a batch of `pending` inputs under the
+    /// configured reply `budget` (`ImPolicy::max_words`) — the model is
+    /// told the same number the policy enforces.
     #[must_use]
-    pub fn render(&self, pending: usize) -> String {
-        self.template.replace("{inputs}", &pending.to_string())
+    pub fn render(&self, pending: usize, budget: u64) -> String {
+        self.template
+            .replace("{inputs}", &pending.to_string())
+            .replace("{budget}", &budget.to_string())
     }
 
     /// Renders the bootstrap prompt of a re-armed successor:
@@ -238,12 +242,17 @@ impl JudgePrompt {
     /// is rendered once at bootstrap and persisted in the input payload;
     /// replays are byte-identical (constraint-3 pattern).
     #[must_use]
-    pub fn render_re_arm(&self, ended: &[crate::rearm::EndedResident], pending: usize) -> String {
+    pub fn render_re_arm(
+        &self,
+        ended: &[crate::rearm::EndedResident],
+        pending: usize,
+        budget: u64,
+    ) -> String {
         format!(
             "[re-arm] This session re-arms the resident Router; {}. The watch continues on this \
              session; prior issues and thread state live on those streams (recall can read them). ",
             crate::rearm::re_arm_cause(ended)
-        ) + &self.render(pending)
+        ) + &self.render(pending, budget)
     }
 }
 
@@ -390,10 +399,11 @@ impl RouterProfile {
         &self,
         inbox: &dyn InboxWriter,
     ) -> Result<AdmitReceipt, InboxWriteError> {
+        let budget = self.im.max_words;
         let rendered = if self.re_arm.is_empty() {
-            self.judge.render(0)
+            self.judge.render(0, budget)
         } else {
-            self.judge.render_re_arm(&self.re_arm, 0)
+            self.judge.render_re_arm(&self.re_arm, 0, budget)
         };
         // (R12, R2): the frozen membership block is appended after the
         // rendered prompt — never inside the template — and only when
@@ -3302,7 +3312,7 @@ mod tests {
     };
     use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
     use crate::mock::MockChannel;
-    use crate::policy::{ImPolicy, StructuredPolicy};
+    use crate::policy::{DEFAULT_MAX_WORDS, ImPolicy, StructuredPolicy};
     use crate::templates::{
         ROUTER_SLOT, SPAWN_WORKER_TOOL, SuperAgentProfile, router_template, worker_template,
     };
@@ -3337,13 +3347,25 @@ mod tests {
         let prompt = JudgePrompt::default();
         assert!(prompt.template.contains("{inputs}"));
         assert_eq!(JUDGE_PROMPT_TEMPLATE, prompt.template);
-        let rendered = prompt.render(3);
+        let rendered = prompt.render(3, DEFAULT_MAX_WORDS);
         assert!(rendered.contains("Pending inputs in this batch: 3"));
         assert!(!rendered.contains("{inputs}"));
         let custom = JudgePrompt {
             template: "judge {inputs} inputs".into(),
         };
-        assert_eq!(custom.render(0), "judge 0 inputs");
+        assert_eq!(custom.render(0, DEFAULT_MAX_WORDS), "judge 0 inputs");
+    }
+
+    /// The budget sentence renders the *configured* number, never a
+    /// baked-in one: the model is told what the policy enforces.
+    #[test]
+    fn judge_prompt_renders_the_configured_budget() {
+        assert_eq!(JUDGE_PROMPT_TEMPLATE.matches("{budget}").count(), 1);
+        let rendered = JudgePrompt::default().render(0, 42);
+        assert!(rendered.contains("about 42 units"), "{rendered}");
+        assert!(!rendered.contains("{budget}"));
+        let default = JudgePrompt::default().render(0, DEFAULT_MAX_WORDS);
+        assert!(default.contains(&format!("about {DEFAULT_MAX_WORDS} units")));
     }
 
     /// the default template carries the prompt-injection hygiene
@@ -3363,10 +3385,10 @@ mod tests {
         assert!(JUDGE_PROMPT_TEMPLATE.contains(hygiene));
         assert!(JUDGE_PROMPT_TEMPLATE.contains("\"untrusted\": true"));
 
-        let rendered = JudgePrompt::default().render(3);
+        let rendered = JudgePrompt::default().render(3, DEFAULT_MAX_WORDS);
         assert!(rendered.contains(hygiene));
-        // The variable contract is unchanged: exactly one {inputs},
-        // replaced by the pending count, nothing else interpolated.
+        // Exactly one {inputs}, replaced by the pending count; the
+        // budget placeholder is the template's only other variable.
         assert_eq!(JUDGE_PROMPT_TEMPLATE.matches("{inputs}").count(), 1);
         assert!(rendered.contains("Pending inputs in this batch: 3"));
         assert!(!rendered.contains("{inputs}"));
@@ -3523,7 +3545,10 @@ mod tests {
         assert_eq!(admits[0].2.as_deref(), Some(ROUTER_BOOTSTRAP_KEY));
         // Generation 0 is byte-identical to the legacy bootstrap:
         // the plain judge prompt, no re-arm prefix.
-        assert_eq!(admits[0].1, json!(profile.judge.render(0)));
+        assert_eq!(
+            admits[0].1,
+            json!(profile.judge.render(0, profile.im.max_words))
+        );
     }
 
     #[tokio::test]
@@ -3564,13 +3589,15 @@ mod tests {
         assert!(payload.starts_with("[re-arm]"), "got: {payload}");
         assert!(payload.contains(&pinned.0.to_string()));
         assert!(payload.contains("(completed)"));
-        assert!(payload.contains(&profile.judge.render(0)));
+        assert!(payload.contains(&profile.judge.render(0, profile.im.max_words)));
         // Replay-stable: same chain renders byte-identically.
         assert_eq!(payload, &render_successor_prompt(&profile));
     }
 
     fn render_successor_prompt(profile: &RouterProfile) -> String {
-        profile.judge.render_re_arm(&profile.re_arm, 0)
+        profile
+            .judge
+            .render_re_arm(&profile.re_arm, 0, profile.im.max_words)
     }
 
     #[tokio::test]
@@ -3594,7 +3621,10 @@ mod tests {
         let payload = admits[0].1.as_str().expect("prompt payload");
         assert_eq!(
             payload,
-            format!("[policy 2026-11] {}", profile.judge.render(0))
+            format!(
+                "[policy 2026-11] {}",
+                profile.judge.render(0, profile.im.max_words)
+            )
         );
     }
 
@@ -3611,7 +3641,10 @@ mod tests {
             .await
             .unwrap();
         let admits = inbox.admits.lock().unwrap().clone();
-        assert_eq!(admits[0].1, json!(profile.judge.render(0)));
+        assert_eq!(
+            admits[0].1,
+            json!(profile.judge.render(0, profile.im.max_words))
+        );
         let payload = admits[0].1.as_str().expect("prompt payload");
         assert!(!payload.contains("[policy "), "got: {payload}");
     }
@@ -3687,7 +3720,8 @@ mod tests {
         let (rec, dyn_port) = RecordingPort::shared(sid(10));
         hold.install(dyn_port);
 
-        let long_text: String = (1..=120)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -3699,14 +3733,17 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert_eq!(result.output["words"], json!(100));
+        assert_eq!(result.output["words"], json!(DEFAULT_MAX_WORDS));
         assert_eq!(result.output["truncated"], json!(true));
 
         // The delivery on the channel is the truncated text.
         let deliveries = mock.deliveries();
         assert_eq!(deliveries.len(), 1);
         let delivered = deliveries[0].delivery.content["text"].as_str().unwrap();
-        assert_eq!(delivered.split_whitespace().count(), 100);
+        assert_eq!(
+            delivered.split_whitespace().count() as u64,
+            DEFAULT_MAX_WORDS
+        );
         assert!(delivered.ends_with('…'));
 
         // channel/delivered was appended after the send, schema.
@@ -3714,7 +3751,7 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
         assert_eq!(emitted[0].1["policy"], json!("im"));
-        assert_eq!(emitted[0].1["words"], json!(100));
+        assert_eq!(emitted[0].1["words"], json!(DEFAULT_MAX_WORDS));
         assert_eq!(emitted[0].1["truncated"], json!(true));
         assert_eq!(emitted[0].1["channel"], json!("mock-im"));
     }
@@ -3755,7 +3792,8 @@ mod tests {
         let (rec, dyn_port) = RecordingPort::shared_with_events(router, events);
         hold.install(dyn_port);
 
-        let long_text: String = (1..=120)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -3769,7 +3807,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert_eq!(result.output["words"], json!(120));
+        assert_eq!(result.output["words"], json!(DEFAULT_MAX_WORDS + 20));
         assert_eq!(
             result.output["truncated"],
             json!(false),
@@ -3787,7 +3825,7 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
         assert_eq!(emitted[0].1["policy"], json!("im"));
-        assert_eq!(emitted[0].1["words"], json!(120));
+        assert_eq!(emitted[0].1["words"], json!(DEFAULT_MAX_WORDS + 20));
         assert_eq!(emitted[0].1["truncated"], json!(false));
         assert_eq!(emitted[0].1["detail"], json!(true));
     }
@@ -3835,7 +3873,8 @@ mod tests {
         let (_rec, dyn_port) = RecordingPort::shared_with_events(router, events);
         hold.install(dyn_port);
 
-        let long_text: String = (1..=120)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -3874,7 +3913,8 @@ mod tests {
         )];
         let (_rec, dyn_port) = RecordingPort::shared_with_events(router, events);
         hold.install(dyn_port);
-        let long_text: String = (1..=120)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -4999,7 +5039,7 @@ mod tests {
             .unwrap();
         assert!(!reply.is_error);
 
-        // Normal policy path: one IM delivery, ≤100 words, and the
+        // Normal policy path: one IM delivery, within the unit budget, and the
         // emitted audit carries BOTH the marked thread/started and the
         // channel/delivered.
         let deliveries = mock.deliveries();
@@ -5454,7 +5494,7 @@ mod tests {
         // on renders the frozen constant — deterministic, no data.
         assert!(
             !JudgePrompt::default()
-                .render(3)
+                .render(3, DEFAULT_MAX_WORDS)
                 .contains("Execution workers")
         );
         assert!(
@@ -5784,7 +5824,7 @@ mod tests {
         // The frozen block is appended AFTER the rendered prompt (the
         // template text itself is untouched) and carries no catalog
         // data (I6).
-        assert!(payload.starts_with(&profile.judge.render(0)));
+        assert!(payload.starts_with(&profile.judge.render(0, profile.im.max_words)));
         assert!(
             payload.contains(&format!("\n\n{}", WORKER_MEMBERSHIP_PROMPT_BLOCK)),
             "{payload}"
@@ -5802,7 +5842,7 @@ mod tests {
             .as_str()
             .expect("prompt payload")
             .to_string();
-        assert_eq!(legacy_payload, legacy.judge.render(0));
+        assert_eq!(legacy_payload, legacy.judge.render(0, legacy.im.max_words));
     }
 
     #[tokio::test]

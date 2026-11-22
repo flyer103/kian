@@ -47,8 +47,8 @@ pub const IM_POLICY_NAME: &str = "im";
 /// Policy name stamped on `channel/delivered` for structured deliveries.
 pub const STRUCTURED_POLICY_NAME: &str = "structured";
 
-/// The DESIGN §4.2 IM hard rule: ≤100 words.
-pub const DEFAULT_MAX_WORDS: u64 = 100;
+/// The DESIGN §4.2 IM hard rule: ≤300 units.
+pub const DEFAULT_MAX_WORDS: u64 = 300;
 
 /// The DESIGN §4.2 structured-delivery sections (problem background /
 /// change notes / verification results).
@@ -91,7 +91,7 @@ pub struct EnforcedReply {
 /// Counts delivered-text units (the IM budget unit): one unit per
 /// whitespace token plus one unit per CJK character. CJK scripts have no
 /// inter-word spaces, so a whitespace-only count would let an
-/// arbitrarily long Chinese reply through the ≤100-unit budget.
+/// arbitrarily long Chinese reply through the ≤300-unit budget.
 #[must_use]
 pub fn count_words(text: &str) -> u64 {
     let mut units = 0u64;
@@ -699,15 +699,22 @@ mod tests {
     fn over_limit_reply_truncated_at_the_limit_with_ellipsis() {
         let policy = ImPolicy::default();
         assert_eq!(policy.max_words, DEFAULT_MAX_WORDS);
-        let original = words(120);
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let original = words(over);
         let enforced = policy.enforce(&original);
         assert!(enforced.truncated);
-        assert_eq!(enforced.words, 100);
-        // The delivered text carries exactly 100 words (the ellipsis is
-        // punctuation attached to the last kept word, not a token).
-        assert_eq!(count_words(&enforced.text), 100);
+        assert_eq!(enforced.words, DEFAULT_MAX_WORDS);
+        // The delivered text carries exactly the budget in words (the
+        // ellipsis is punctuation attached to the last kept word, not a
+        // token).
+        assert_eq!(count_words(&enforced.text), DEFAULT_MAX_WORDS);
         assert!(enforced.text.ends_with(ELLIPSIS));
-        assert!(!enforced.text.contains(" w101 ") && !enforced.text.contains("w120"));
+        assert!(
+            !enforced
+                .text
+                .contains(&format!(" w{} ", DEFAULT_MAX_WORDS + 1))
+        );
+        assert!(!enforced.text.contains(&format!("w{over}")));
         // The kept prefix is verbatim.
         assert!(enforced.text.starts_with("w1 w2 w3"));
     }
@@ -715,13 +722,13 @@ mod tests {
     #[test]
     fn exact_limit_reply_passes_untruncated() {
         let policy = ImPolicy::default();
-        let exact = words(100);
+        let exact = words(DEFAULT_MAX_WORDS as usize);
         let enforced = policy.enforce(&exact);
         assert_eq!(
             enforced,
             EnforcedReply {
                 text: exact.clone(),
-                words: 100,
+                words: DEFAULT_MAX_WORDS,
                 truncated: false,
             }
         );

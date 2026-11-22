@@ -186,6 +186,7 @@ A few config-first policies sit between the Router and the outside world:
 
 ```yaml
 superagent:
+  im: { reply_units: 300 }                            # IM reply budget (default 300)
   speak_rules:
     - { channel: issue-github, when: result-ready }   # whether-to-send gate
   mandate:
@@ -195,6 +196,10 @@ superagent:
   policy: { version: "2026-11-04.1", notify_live: false }
 ```
 
+- **IM reply budget** (`superagent.im.reply_units`, default 300) caps a normal channel reply at
+  that many units (a CJK character counts one; a Latin word counts one). The Router's judge prompt
+  renders the same number, so the model is told what the policy enforces; the watchdog's
+  `escalate` shares it. A `详情` reply is still delivered whole.
 - **Speak-rules** suppress a send with an honest tool error, an audit line and a counter — no send
   means no `channel/delivered`.
 - **Mandate** is the immutable delegation authority object, carried verbatim into `thread/started`

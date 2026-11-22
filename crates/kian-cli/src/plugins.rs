@@ -572,6 +572,10 @@ pub struct SuperAgentPlugin {
     /// `reply`/`deliver_structured`. Empty = ungated (today's
     /// behavior).
     pub speak: kian_superagent::SpeakPolicy,
+    /// The IM reply budget (`superagent.im.reply_units`): the hard unit
+    /// limit shared by the Router's `reply`, the watchdog's `escalate`
+    /// and the judge prompt's budget sentence.
+    pub im: kian_superagent::ImPolicy,
     /// follow-up ownership (`superagent.followup_ownership`,
     /// default ): live-only fan-out + release-to-fresh-Eval on
     /// all-ended topics, and the `spawn_worker` topic-ownership
@@ -808,6 +812,9 @@ impl Plugin for SuperAgentPlugin {
         let mut profile = RouterProfile::new(self.router_binding.load(), profile.router);
         profile.speculation = self.speculation.clone();
         profile.speak = self.speak.clone();
+        // the IM reply budget rides the profile into both the shaping
+        // tools and the rendered judge prompt.
+        profile.im = self.im.clone();
         // the follow-up-ownership gate rides the profile into the
         // tool surface.
         profile.followup_ownership = self.followup_ownership;
@@ -1210,7 +1217,7 @@ impl Plugin for SuperAgentPlugin {
                 self.router_binding.load(),
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
                 channels.clone(),
-                kian_superagent::ImPolicy::default(),
+                self.im.clone(),
                 watchdog_hold.clone(),
                 Arc::new(kian_superagent::SystemTurnClock),
             );

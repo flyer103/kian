@@ -19,7 +19,7 @@
 //!   invariant 1, and the worker consumes it at its next safe
 //!   boundary);
 //! - `escalate(channel, text)` — a normal channel reply under the IM
-//!   policy (≤100 words, `channel/delivered` on the watchdog's own
+//!   policy (the unit budget, `channel/delivered` on the watchdog's own
 //!   stream).
 //!
 //! Every outcome — no-op, nudge, escalate — is honestly in-stream:
@@ -444,7 +444,7 @@ impl WatchdogTools {
     }
 
     /// The escalation surface: a normal reply under the IM policy —
-    /// the ≤100-word rule shapes the text BEFORE the send, the
+    /// the unit-budget rule shapes the text BEFORE the send, the
     /// delivery goes through the channel adapter, and
     /// `channel/delivered` lands on the watchdog's own stream only
     /// after the send succeeded (the Router `reply` discipline).
@@ -610,6 +610,7 @@ mod tests {
     use crate::inbox::{AdmitReceipt, InboxWriteError, InboxWriter};
     use crate::metrics::ManualTurnClock;
     use crate::mock::MockChannel;
+    use crate::policy::DEFAULT_MAX_WORDS;
     use crate::recall::{RecallPort, RecallPortError};
     use crate::router::{ChannelRegistry, RouterHold};
     use crate::worker::{StreamPort, StreamPortError};
@@ -1086,7 +1087,7 @@ mod tests {
         assert_eq!(inbox.log.lock().unwrap().len(), 2);
     }
 
-    /// `escalate` is a normal reply under the IM policy: the ≤100-word
+    /// `escalate` is a normal reply under the IM policy: the unit-budget
     /// rule shapes the text before the send, the delivery carries the
     /// truncated text, and `channel/delivered` (policy `im`) lands on
     /// the watchdog's own stream after the send.
@@ -1099,7 +1100,8 @@ mod tests {
         });
         hold.install(Arc::clone(&port) as Arc<dyn StreamPort>);
 
-        let long_text: String = (1..=150)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -1111,20 +1113,23 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error);
-        assert_eq!(result.output["words"], json!(100));
+        assert_eq!(result.output["words"], json!(DEFAULT_MAX_WORDS));
         assert_eq!(result.output["truncated"], json!(true));
 
         let deliveries = mock.deliveries();
         assert_eq!(deliveries.len(), 1);
         let delivered = deliveries[0].delivery.content["text"].as_str().unwrap();
-        assert_eq!(delivered.split_whitespace().count(), 100);
+        assert_eq!(
+            delivered.split_whitespace().count() as u64,
+            DEFAULT_MAX_WORDS
+        );
         assert!(delivered.ends_with('…'));
 
         let emitted = port.emitted.lock().unwrap().clone();
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
         assert_eq!(emitted[0].1["policy"], json!("im"));
-        assert_eq!(emitted[0].1["words"], json!(100));
+        assert_eq!(emitted[0].1["words"], json!(DEFAULT_MAX_WORDS));
         assert_eq!(emitted[0].1["channel"], json!("mock-im"));
     }
 

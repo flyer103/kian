@@ -4,7 +4,7 @@
 //! dispatch) → Worker spawns via Thread delegation → worker model
 //! performs scripted tool calls → evidence gate passes → worker
 //! completes → report lands in the Router inbox → Router replies on
-//! the mock channel: an IM reply ≤100 words **and** a structured
+//! the mock channel: an IM reply within the unit budget **and** a structured
 //! delivery (background/changes/verification).
 //!
 //! Everything runs against the real assembled server: the real
@@ -29,16 +29,18 @@ use kian_cli::server::Server;
 use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::SessionId;
 use kian_store::EventStore;
+use kian_superagent::DEFAULT_MAX_WORDS;
 use kian_superagent::delegation_pairs;
 
 const ROUTER_SESSION: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
 const WORK_TASK: &str = "Summarize the changelog and verify the build";
 
-/// The over-limit IM reply (120 whitespace words) — proving the §4.2
-/// cap is enforced on the assembled path, not just in unit tests.
+/// The over-limit IM reply (the policy budget plus 20 whitespace
+/// words) — proving the §4.2 cap is enforced on the assembled path,
+/// not just in unit tests.
 fn over_limit_reply() -> String {
-    (1..=120)
+    (1..=DEFAULT_MAX_WORDS as usize + 20)
         .map(|i| format!("word{i}"))
         .collect::<Vec<_>>()
         .join(" ")
@@ -61,6 +63,7 @@ fn write_superagent_config(
     router_provider: &str,
     worker_provider: &str,
     worker_gate: &str,
+    superagent_extra: &str,
 ) -> PathBuf {
     let sqlite = dir.join("kian.sqlite");
     let yaml = format!(
@@ -92,7 +95,7 @@ agents:
         model: mock-worker
     tools: ["fs_read", "fs_write", "exec"]
 {worker_gate}superagent:
-  router:
+{superagent_extra}  router:
     session_id: "{ROUTER_SESSION}"
     agent: router
     slot: router
@@ -221,10 +224,35 @@ async fn run_superagent_flow(
     worker_gate: &str,
     input_text: &str,
 ) -> S4Run {
+    run_superagent_flow_with_superagent(
+        tag,
+        router_script,
+        worker_script,
+        worker_gate,
+        input_text,
+        "",
+    )
+    .await
+}
+
+async fn run_superagent_flow_with_superagent(
+    tag: &str,
+    router_script: Vec<ScriptedResponse>,
+    worker_script: Vec<ScriptedResponse>,
+    worker_gate: &str,
+    input_text: &str,
+    superagent_extra: &str,
+) -> S4Run {
     let dir = temp_dir(&format!("c28-{tag}"));
     let (router_base, _router_mock) = spawn_scripted_provider(router_script, 0).await;
     let (worker_base, _worker_mock) = spawn_scripted_provider(worker_script, 0).await;
-    let config = write_superagent_config(&dir, &router_base, &worker_base, worker_gate);
+    let config = write_superagent_config(
+        &dir,
+        &router_base,
+        &worker_base,
+        worker_gate,
+        superagent_extra,
+    );
     let (base, server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await
@@ -309,7 +337,7 @@ async fn run_superagent_flow(
 }
 
 /// The standard scripts: judge dispatches, worker acts, router
-/// replies over-limit (120 words — the cap must hold) and delivers the
+/// replies over the unit budget (the cap must hold) and delivers the
 /// structured report.
 fn standard_scripts() -> (Vec<ScriptedResponse>, Vec<ScriptedResponse>) {
     let router = vec![
@@ -563,8 +591,66 @@ async fn superagent_worker_completes_with_evidence() {
 }
 
 // ---------------------------------------------------------------------------
-// the IM reply respects the ≤100-word limit
+// the IM reply respects the unit budget
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn superagent_configured_reply_budget_is_enforced() {
+    force_no_proxy();
+    let (router, worker) = standard_scripts();
+    // A configured budget wins over the default: the same over-budget
+    // scripted reply is cut at the configured number.
+    let run = run_superagent_flow_with_superagent(
+        "configuredbudget",
+        router,
+        worker,
+        PASSING_GATE,
+        "please run the release checklist",
+        "  im:\n    reply_units: 250\n",
+    )
+    .await;
+
+    let delivered = run
+        .router_events
+        .iter()
+        .find(|e| {
+            e.kind == EventKind::ChannelDelivered && e.bytes["policy"] == serde_json::json!("im")
+        })
+        .expect("im channel/delivered");
+    assert_eq!(
+        delivered.bytes["words"],
+        serde_json::json!(250),
+        "{delivered:?}"
+    );
+    assert_eq!(delivered.bytes["truncated"], serde_json::json!(true));
+
+    let runtime = run
+        .server
+        .superagent_runtime()
+        .expect("superagent runtime assembled");
+    let mock = runtime.mock_channel("mock-im").expect("mock-im channel");
+    let deliveries = mock.deliveries();
+    let im = deliveries
+        .iter()
+        .find(|d| d.delivery.content.get("text").is_some())
+        .expect("the im delivery reached the channel");
+    let text = im.delivery.content["text"].as_str().unwrap();
+    assert_eq!(text.split_whitespace().count(), 250);
+    assert!(text.ends_with('…'), "truncation marker present");
+
+    // The judge prompt tells the model the configured number, not a
+    // baked-in default.
+    let prompt = run
+        .router_events
+        .iter()
+        .find(|e| e.kind == EventKind::InputAdmitted)
+        .and_then(|e| e.bytes["content"].as_str())
+        .expect("bootstrap judge prompt");
+    assert!(prompt.contains("about 250 units"), "{prompt}");
+    assert!(!prompt.contains("{budget}"));
+
+    let _ = std::fs::remove_dir_all(&run.dir);
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn superagent_reply_within_word_limit() {
@@ -579,8 +665,8 @@ async fn superagent_reply_within_word_limit() {
     )
     .await;
 
-    // The scripted reply was 120 words; the §4.2 cap held on the
-    // assembled path: the audit event says 100 words, truncated.
+    // The scripted reply was the budget plus 20 words; the §4.2 cap held
+    // on the assembled path: the audit event says the budget, truncated.
     let delivered = run
         .router_events
         .iter()
@@ -590,13 +676,14 @@ async fn superagent_reply_within_word_limit() {
         .expect("im channel/delivered");
     assert_eq!(
         delivered.bytes["words"],
-        serde_json::json!(100),
+        serde_json::json!(DEFAULT_MAX_WORDS),
         "{delivered:?}"
     );
     assert_eq!(delivered.bytes["truncated"], serde_json::json!(true));
-    assert!(delivered.bytes["words"].as_u64().unwrap() <= 100);
+    assert!(delivered.bytes["words"].as_u64().unwrap() <= DEFAULT_MAX_WORDS);
 
-    // The mock channel actually received ≤100 words, cut at the limit.
+    // The mock channel actually received the budget in words, cut at the
+    // limit.
     let runtime = run
         .server
         .superagent_runtime()
@@ -608,9 +695,9 @@ async fn superagent_reply_within_word_limit() {
         .find(|d| d.delivery.content.get("text").is_some())
         .expect("the im delivery reached the channel");
     let text = im.delivery.content["text"].as_str().unwrap();
-    let words = text.split_whitespace().count();
-    assert!(words <= 100, "delivered {words} words");
-    assert_eq!(words, 100, "cut exactly at the limit");
+    let words = text.split_whitespace().count() as u64;
+    assert!(words <= DEFAULT_MAX_WORDS, "delivered {words} words");
+    assert_eq!(words, DEFAULT_MAX_WORDS, "cut exactly at the limit");
     assert!(text.ends_with('…'), "truncation marker present");
 
     let _ = std::fs::remove_dir_all(&run.dir);
@@ -627,7 +714,7 @@ async fn superagent_details_request_reply_is_delivered_whole() {
     // The person answered the Router's `回复「详情」看完整结果` offer.
     let run = run_superagent_flow("details", router, worker, PASSING_GATE, "详情").await;
 
-    // The 120-unit reply was delivered complete: the receipt is the
+    // The over-budget reply was delivered complete: the receipt is the
     // honest full-delivery shape (no cut, the additive `detail` bit).
     let delivered = run
         .router_events
@@ -638,7 +725,7 @@ async fn superagent_details_request_reply_is_delivered_whole() {
         .expect("im channel/delivered");
     assert_eq!(
         delivered.bytes["words"],
-        serde_json::json!(120),
+        serde_json::json!(DEFAULT_MAX_WORDS + 20),
         "{delivered:?}"
     );
     assert_eq!(delivered.bytes["truncated"], serde_json::json!(false));
@@ -848,7 +935,7 @@ async fn superagent_readme_demo_cli_mock_channel_send_against_serve() {
     .await;
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
-    let config = write_superagent_config(&dir, &router_base, &worker_base, "");
+    let config = write_superagent_config(&dir, &router_base, &worker_base, "", "");
     let (base, _server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await
@@ -925,7 +1012,7 @@ async fn superagent_shaping_config_spills_over_cap_channel_event_on_assembled_se
     .await;
     let (worker_base, _worker_mock) =
         spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
-    let config = write_superagent_config(&dir, &router_base, &worker_base, "");
+    let config = write_superagent_config(&dir, &router_base, &worker_base, "", "");
     let yaml = std::fs::read_to_string(&config)
         .unwrap()
         .replacen(
@@ -1031,7 +1118,7 @@ async fn superagent_gate_failed_worker_never_reaches_delivered_done_reply() {
     // A gate the scripted worker can never satisfy.
     let gate = "    evidence_gate:\n      enabled: true\n      checks:\n        - type: min_tool_results\n          n: 1\n      max_retries: 2\n";
 
-    let config = write_superagent_config(&dir, &router_base, &worker_base, gate);
+    let config = write_superagent_config(&dir, &router_base, &worker_base, gate, "");
     let (base, server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
         .await

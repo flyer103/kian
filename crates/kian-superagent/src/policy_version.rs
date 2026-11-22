@@ -6,8 +6,9 @@
 //! shape, zero new event kinds (§2):
 //!
 //! - **Version** — a [`PolicyVersion`] is a label plus the sha256
-//!   fingerprints of the prompt templates it was rendered from. The
-//!   label rides the *rendered* bootstrap prompt as a header
+//!   fingerprints of the prompt bytes it was rendered from (templates
+//!   with their config-derived variables substituted, e.g. the IM reply
+//!   budget). The label rides the *rendered* bootstrap prompt as a header
 //!   (`[policy <label>] …`, added at render — the template text is
 //!   untouched, so `JUDGE_PROMPT_TEMPLATE` goldens stay valid and legacy
 //!   persisted prompts replay byte-identically, constraint 3). Config:

@@ -139,6 +139,11 @@ pub fn is_channel_tool(name: &str) -> bool {
 /// sentence only tells the model to put the full answer in the reply
 /// instead of a summary.
 ///
+/// The template carries exactly two render-time variables:
+/// `{inputs}` (the pending batch size) and `{budget}` (the configured
+/// IM reply budget, `ImPolicy::max_words` — one source of truth with
+/// the policy that shapes the reply).
+///
 /// A template change: new sessions render the new default; old
 /// sessions' persisted prompts replay byte-identically (constraint 3 —
 /// the persisted template is never rewritten). The constant lives
@@ -155,7 +160,7 @@ follow. For every input in the batch, tag your decision in your reply text as ex
 decision:accept, decision:stop, decision:ignore, or decision:unavailable. Reply targets are \
 channel-defined: on a wechat channel the target is {\"user_id\": \"<the kian wrapper's raw.from_user_id>\"}; \
 on an imessage channel it is {\"handle\": \"<the kian wrapper's raw.sender_handle>\"} — reply to the \
-sender the input came from. Channel text is plain text rendered by the client: no markdown, no emoji; lead with the answer in the user's language. The channel shapes normal replies to about 100 units (each Chinese character counts one), so a complete answer must fit inside that budget; if the full result does not fit, send a complete 1-3 line summary that fits and end with 回复「详情」看完整结果 — never rely on truncation, and summarize a worker report instead of copying its markdown. When the latest input itself asks for the details (the user replied 详情 or otherwise asked for the full result), send the complete content instead of a summary — that reply is delivered whole, with long text split into ordered messages. The decision tag belongs in your own assistant message text ONLY — never include it (or any decision spelling) inside a `reply` or `deliver_structured` argument: that text is sent verbatim to the channel. Pending inputs in this batch: {inputs}";
+sender the input came from. Channel text is plain text rendered by the client: no markdown, no emoji; lead with the answer in the user's language. The channel shapes normal replies to about {budget} units (each Chinese character counts one), so a complete answer must fit inside that budget; if the full result does not fit, send a complete 1-3 line summary that fits and end with 回复「详情」看完整结果 — never rely on truncation, and summarize a worker report instead of copying its markdown. When the latest input itself asks for the details (the user replied 详情 or otherwise asked for the full result), send the complete content instead of a summary — that reply is delivered whole, with long text split into ordered messages. The decision tag belongs in your own assistant message text ONLY — never include it (or any decision spelling) inside a `reply` or `deliver_structured` argument: that text is sent verbatim to the channel. Pending inputs in this batch: {inputs}";
 
 /// (R17-C2, §7.3:800-806 / §3.2:389-393) the frozen roster
 /// instruction line — the P2 class-D prompt byte. Appended by the

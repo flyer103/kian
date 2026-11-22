@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **The IM reply budget is configurable and defaults to 300 units (DESIGN §4.2)**.
+  `superagent.im.reply_units` sets `ImPolicy::max_words`; the Router judge prompt renders the same
+  number at bootstrap (`{budget}`), so the model is told what the policy enforces, and the
+  watchdog's `escalate` shares the budget. The default rises from 100 to 300: a normal channel
+  reply now carries a conclusion plus a short findings list instead of routinely truncating and
+  forcing the `回复「详情」看完整结果` round trip. The policy-version fingerprint covers the
+  rendered budget, so a budget change under a pinned label is auditable. Truncation at the budget,
+  the honest `truncated` receipt and the details-request full-delivery mode are unchanged. New
+  sessions render the new prompt bytes; live sessions keep their persisted prompt (cache-byte
+  stability).
+
 - **The fan-in stream takes its tail cursors when the request is accepted (READ-MODEL §4.2)**.
   `GET /events` used to read each listed session's head lazily, on its first poll cycle; an event
   appended between the client opening the stream and that cycle was already behind the head, so a

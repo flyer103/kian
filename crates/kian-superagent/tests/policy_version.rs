@@ -345,7 +345,9 @@ async fn header_rendered_at_bootstrap_and_persisted_byte_golden() {
     // constructed independently of the render path under test.
     let golden = format!(
         "[policy 2026-11] {}",
-        JUDGE_PROMPT_TEMPLATE.replace("{inputs}", "0")
+        JUDGE_PROMPT_TEMPLATE
+            .replace("{inputs}", "0")
+            .replace("{budget}", &kian_superagent::DEFAULT_MAX_WORDS.to_string())
     );
     assert_eq!(bootstrap_prompt(&events), golden);
 
@@ -357,7 +359,12 @@ async fn header_rendered_at_bootstrap_and_persisted_byte_golden() {
     );
     assert_eq!(
         bootstrap_prompt(&events).strip_prefix("[policy 2026-11] "),
-        Some(JUDGE_PROMPT_TEMPLATE.replace("{inputs}", "0").as_str())
+        Some(
+            JUDGE_PROMPT_TEMPLATE
+                .replace("{inputs}", "0")
+                .replace("{budget}", &kian_superagent::DEFAULT_MAX_WORDS.to_string())
+                .as_str()
+        )
     );
 }
 
@@ -617,7 +624,7 @@ async fn absent_config_bootstrap_bytes_are_identical_to_today() {
     // unmodified): the plain judge render, nothing added.
     assert_eq!(
         bootstrap_prompt(&events),
-        JudgePrompt::default().render(0),
+        JudgePrompt::default().render(0, kian_superagent::DEFAULT_MAX_WORDS),
         "absent config renders today's bytes — the golden diff is empty"
     );
     assert!(!bootstrap_prompt(&events).contains("[policy "));

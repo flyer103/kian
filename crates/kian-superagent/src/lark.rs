@@ -32,7 +32,7 @@
 //!   (real IM input is attacker-controllable text by default).
 //!
 //! Output policy is adapter-agnostic by contract: the caller shapes
-//! [`ChannelDelivery::content`] before the send (the ≤100-word IM rule
+//! [`ChannelDelivery::content`] before the send (the IM unit-budget rule
 //! lives in the bundle's `policy` module); this adapter delivers what
 //! it is given.
 

@@ -60,7 +60,7 @@ Kian is **not**:
 1. Install the super-agent profile (bundle): Router session + Worker session templates + subscription rules
 2. Attach channel adapters (IM / GitHub / …) → events land in the Router session inbox
 3. Inside the Router drain: judge events → dispatch in batches → spawn Worker sessions (Thread delegation)
-4. Workers report back on completion; the Router replies on the channel (IM ≤100-unit replies — a details request is delivered whole — / structured PR delivery)
+4. Workers report back on completion; the Router replies on the channel (IM ≤300-unit replies — a details request is delivered whole — / structured PR delivery)
 5. The endpoint daemon (BYOM) executes commands, events flow back; watchdog monitors endpoint health
 ```
 
@@ -121,7 +121,7 @@ plugins: # Cordis-inspired plugin loading
   - name: lark-adapter
     config: {... }
   - name: super-agent-router
-    config: { im_reply_word_limit: 100 }
+    config: { im: { reply_units: 300 } }
 ```
 
 ### 2.4 API surface (v0.1 draft; details in DESIGN)
@@ -151,7 +151,7 @@ Each capability below is proven by named tests; the executed evidence is recorde
 | Crash recovery | kill -9 mid-drain | A half-finished task | session → recoverable → new drain continues, zero lost work |
 | Steer / interrupt | Redirect or stop while running | steer "plan B", interrupt | Redirection lands at a safe boundary; interrupt ≠ failed |
 | Cache stability | Consecutive requests in one session | Requests with unchanged history | Cache hits (stable prefix bytes) observable above expectation |
-| Super-agent demo | IM request → PR delivery | Group-chat message + CI events | Router dispatches Worker; structured PR description; IM reply ≤100 units (a details request is delivered whole) |
+| Super-agent demo | IM request → PR delivery | Group-chat message + CI events | Router dispatches Worker; structured PR description; IM reply ≤300 units (a details request is delivered whole) |
 | BYOM | Endpoint daemon execution | Local repository commands | Cloud loop + endpoint execution; watchdog detects endpoint offline |
 | Harness integration | dsh loop as a worker | Harness config | dsh interaction unchanged, made durable |
 | Audit export | Event-stream interval export | Time/causal interval | A replayable audit package (byte-identical) |

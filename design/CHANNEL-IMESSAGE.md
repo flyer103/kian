@@ -448,7 +448,7 @@ change (§15).
   is unknown and must not be retried blindly. The outbox still retries every error by design
   (bounded `max_attempts`, then parks) — the bridge's `client_id` cache is what makes that retry
   safe in practice (§3.2); the residual duplicate window is §13.6.
-- **Output shape**: plain text (iMessage renders no markdown). The shared IM policy (≤100 units,
+- **Output shape**: plain text (iMessage renders no markdown). The shared IM policy (the unit budget, default 300 via `superagent.im.reply_units`,
   the details-request full-delivery mode) applies unchanged — the adapter is channel-agnostic about
   it.
 - **Proactive sends are possible.** Unlike WeChat, a delivery does not require a prior inbound.

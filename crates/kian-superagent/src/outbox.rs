@@ -1016,6 +1016,7 @@ fn arguments_text(arguments: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::DEFAULT_MAX_WORDS;
     use serde_json::json;
 
     #[test]
@@ -1472,7 +1473,8 @@ mod tests {
     fn details_request_reconstruction_is_the_full_delivery() {
         let im = ImPolicy::default();
         let structured = StructuredPolicy::default();
-        let long: String = (1..=120)
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long: String = (1..=over)
             .map(|i| format!("w{i}"))
             .collect::<Vec<_>>()
             .join(" ");
