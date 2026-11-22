@@ -561,16 +561,10 @@ pub fn child_session_id(thread: Uuid) -> SessionId {
     SessionId(uuid5(thread, "kian:session"))
 }
 
-/// The child's task id, used for its inbox idempotency key.
+/// The child's task id, the identity its spawn roots at.
 #[must_use]
 pub fn step_task_id(run: SessionId, step: &str, attempt: u32) -> Uuid {
     uuid5(run.0, &format!("kian:task:{step}:{attempt}"))
-}
-
-/// The child's inbox idempotency key.
-#[must_use]
-pub fn task_input_key(task: Uuid) -> String {
-    format!("kian:task:{task}")
 }
 
 /// The slot of the alert run that reports `failed_run_id` (§13.3).
@@ -1296,8 +1290,7 @@ mod tests {
         assert_eq!(session, child_session_id(thread));
         assert_ne!(session, run_session("digest", "slot"));
 
-        let task = step_task_id(run, "fetch", 1);
-        assert_eq!(task_input_key(task), format!("kian:task:{task}"));
+        assert_eq!(step_task_id(run, "fetch", 1), step_task_id(run, "fetch", 1));
     }
 
     #[test]

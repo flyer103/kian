@@ -522,7 +522,7 @@ spawn_uid(run, step, n)   = uuid5(run_session, "kian:job:step:" + step + ":" + n
 child_thread_id           = uuid5(run_session, "kian:thread:" + spawn_uid)     # reuses multiagent's shape
 child_session             = SessionId(uuid5(child_thread_id, "kian:session"))   # reuses multiagent's shape
 task_id(run, step, n)     = uuid5(run_session, "kian:task:" + step + ":" + n)
-task_input_key            = "kian:task:" + task_id            # same key shape as WorkerSpawner uses
+child_inbox_key           = "thread:" + child_thread_id      # the key WorkerSpawner admits under
 plan_digest               = "sha256:" + hex(sha256(canonical_json(plan)))
 step_digest               = "sha256:" + hex(sha256(canonical_json(step)))
 alert_run_id              = alert_job + "@alert:" + failed_run_id
@@ -751,7 +751,8 @@ tie-break.
 
 For one ready step, attempt `n`:
 
-1. **Derive** `spawn_uid`, `child_thread_id`, `child_session`, `task_id`, `task_input_key` (§6).
+1. **Derive** `spawn_uid`, `child_thread_id`, `child_session`, `task_id` (§6); the spawner derives
+   the child's inbox key from `child_thread_id` when it admits.
 2. **Check for an existing dispatch record** at that identity on the run stream. If present, this is
    a re-drive: skip to step 5 with the committed placement. (This check is what makes the whole
    sequence idempotent; it costs one scan of the run's own stream.)
@@ -768,9 +769,10 @@ For one ready step, attempt `n`:
 5. **Create the child** (agent steps only): `create_session(child_session, assignee)` if the
    assignee differs (`SpawnSessionWriter`, `crates/kian-superagent/src/worker.rs:689`), then
    `bootstrap(child_session)` if a bootstrap is mounted (`SessionBootstrap`,
-   `crates/kian-superagent/src/bootstrap.rs:24`), then `inbox.admit(child_session, task_message,
-   Some(task_input_key))`, then `inbox.wake(child_session)`. Each of the four is independently
-   idempotent (create-if-absent; bootstrap keyed; admit keyed by `task_input_key`; wake advisory).
+   `crates/kian-superagent/src/bootstrap.rs:24`), then `spawner.admit(spawned)` -- which admits the
+   task row under its thread-scoped key `thread:<child_thread_id>` (`worker.rs:97`) -- then
+   `inbox.wake(child_session)`. Each of the four is independently idempotent (create-if-absent;
+   bootstrap keyed; admit keyed by the thread-scoped key; wake advisory).
 6. **Record the attempt as in flight** — nothing to write: the dispatch record *is* the fact. The
    conductor's derived state sees "dispatched, no terminal fact yet" and observes it next tick.
 
@@ -1462,7 +1464,7 @@ and a takeover that re-drives `drive()` from committed events (constraint 9).
 | W1 | after the trigger admits the run input, before any drain claims it | one inbox row with the `job` marker; no `session/created` for the run | the wake is advisory; the startup scan finds the row and claims it; the drain appends `session/created` on first claim (the engine's `version == 0` path), so the marker is already in the stream when the conductor sees it |
 | W2 | after the claim, before any dispatch | `drain/claimed{epoch}` + the job input | takeover bumps the epoch and re-drives; every step is `pending` and the tick dispatches from scratch. Three consecutive unended claims on one run end it `failed` `crashed` (`MAX_UNENDED_CLAIMS`), and that end fires the alert — a poison run cannot crash-loop invisibly |
 | W3 | after the dispatch record (A2), before `create_session` | the run stream names `(step, attempt, worker, step_digest)`; the child has no events | the record *is* the placement decision (J3); the child's ids are derived from `(run, step, attempt)`, so the same ids come back; `create_session_with` returns early when the stream already exists |
-| W4 | after `create_session`, before `admit` | the child has exactly one event (`session/created`) | the conductor sees a live-but-never-started child and re-`admit`s with the same `task_input_key`; the inbox dedupes on the key with first-write-wins, so a repeat admit cannot produce a second task message |
+| W4 | after `create_session`, before `admit` | the child has exactly one event (`session/created`) | the conductor sees a live-but-never-started child and re-admits it through the spawner, whose key is thread-scoped (`thread:<child_thread_id>`); the inbox dedupes on that key with first-write-wins, so a repeat admit cannot produce a second task message |
 | W5 | after `admit`, before the child drains | one durable input row; the wake may be lost | the startup inbox rebuild re-derives the wake (constraint 6); the child claims, appends `input/admitted`, and runs |
 | W6 | mid-child, anywhere | the child's stream is a prefix; its drain holds a claim with an epoch | the child is recovered independently by the three-layer recovery. The conductor only ever *reads* the child |
 | W7 | after the deliver intent, before the adapter returns | `tool/call` with `call_id: "job:deliver:<step>:<attempt>"`, no result, no receipt | **not auto-retried**: the message may have landed. `needs_operator` plus the alert, with the `call_id` as the audit handle (§13.2) |
