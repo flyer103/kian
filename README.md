@@ -94,7 +94,7 @@ Three ways in, fastest first. Each one ends at the same `kian.yaml`.
 # 1. container (no toolchain; state lives in the volume)
 docker run --rm -p 7433:7433 -e DEEPSEEK_API_KEY \
   -v "$PWD/docker/kian.yaml:/etc/kian/kian.yaml:ro" -v kian-data:/data \
-  ghcr.io/flyer103/kian-runtime
+  ghcr.io/flyer103/kian
 
 # 2. prebuilt archive (swap the triple: Linux x86_64/aarch64, macOS arm64/x86_64)
 mkdir -p ~/.local/bin
