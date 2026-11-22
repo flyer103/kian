@@ -169,6 +169,25 @@ async fn wait_for_job(
     panic!("timed out waiting for job {job_id} to settle");
 }
 
+/// Poll until the sink has recorded `n` deliveries (bounded). The row turning
+/// terminal and the completion landing in the sink are two different moments —
+/// a terminal row is a projection, the delivery is the side effect the caller
+/// asserts on — so the wait condition must be the delivery itself.
+async fn wait_for_deliveries(sink: &RecordingSink, n: usize) -> Vec<AsyncJob> {
+    for _ in 0..1_000 {
+        let seen = sink.delivered.lock().unwrap().clone();
+        if seen.len() >= n {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = sink.delivered.lock().unwrap().clone();
+    panic!(
+        "timed out waiting for {n} completion deliveries; got {}",
+        seen.len()
+    );
+}
+
 /// The pair's schemas are exactly [start, stop], in that stable order
 /// (tool schemas are prompt-prefix content — constraint 3's gate).
 #[tokio::test]
@@ -226,7 +245,7 @@ async fn start_returns_immediately_while_the_command_runs_for_seconds() {
     let row = wait_for_job(&rig.store, job_id, |r| r.status.is_terminal()).await;
     assert_eq!(row.status, AsyncJobStatus::Done);
     assert_eq!(row.result.as_ref().unwrap()["exit_code"], 0);
-    let delivered = rig.sink.delivered.lock().unwrap().clone();
+    let delivered = wait_for_deliveries(&rig.sink, 1).await;
     assert_eq!(delivered.len(), 1, "exactly one completion delivery");
     assert_eq!(delivered[0].job_id, job_id);
     assert_eq!(delivered[0].status, AsyncJobStatus::Done);
@@ -293,7 +312,7 @@ async fn job_id_dedupes_across_a_simulated_recovery() {
         .unwrap();
     let job_id = Uuid::parse_str(first.output["job_id"].as_str().unwrap()).unwrap();
     wait_for_job(&rig1.store, job_id, |r| r.status.is_terminal()).await;
-    assert_eq!(rig1.sink.delivered.lock().unwrap().len(), 1);
+    assert_eq!(wait_for_deliveries(&rig1.sink, 1).await.len(), 1);
     shutdown_keep_db(rig1).await;
 
     // Life 2: reopen the pool, rebuild drivers, replay the same call.
@@ -540,7 +559,7 @@ async fn restart_redrives_pending_and_inflight_jobs() {
             "revived"
         );
     }
-    let delivered = rig.sink.delivered.lock().unwrap().len();
+    let delivered = wait_for_deliveries(&rig.sink, 2).await.len();
     assert_eq!(delivered, 2, "both completions delivered");
 
     // Idempotence: the sweep again re-offers the settled rows but
