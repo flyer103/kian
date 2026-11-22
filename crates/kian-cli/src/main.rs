@@ -32,6 +32,9 @@
 //! - `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N]` — raise a
 //!   session's lifetime budget (ADR-054): one durable control row, resumed
 //!   at the next drain boundary.
+//! - `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
+//!   [--retention-days N] [--json]` — one retention pass over the
+//!   content-addressed tool-result blob tree (ADR-055).
 //!
 //! Read-only commands open the sqlite file in-process (read-only);
 //! mutating commands talk to a running `serve` via `POST /ops/rpc`.
@@ -70,6 +73,9 @@ const USAGE: &str = "usage:
                [--requested-by <who>] [--idempotency-key <key>]
                [--url <base>] [--config <path>] [--json]
                                          raise a session's lifetime budget (durable control row)
+  kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
+               [--retention-days N] [--json]
+                                         retention GC of the tool-result artifact tree (oldest first)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -152,6 +158,7 @@ fn main() -> ExitCode {
         Some("pending") => pending(&args[2..]),
         Some("confirm") => confirm(&args[2..]),
         Some("raise-budget") => raise_budget(&args[2..]),
+        Some("artifacts") => artifacts(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
@@ -438,6 +445,79 @@ fn cost(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("kian: cost failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N] [--retention-days N] [--json]` — one
+/// retention pass over the content-addressed tool-result blob tree (ADR-055).
+fn artifacts(args: &[String]) -> ExitCode {
+    let Some(subcommand) = args.first() else {
+        eprintln!("kian: artifacts expects a subcommand (gc)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    match subcommand.as_str() {
+        "gc" => artifacts_gc(&args[1..]),
+        other => {
+            eprintln!("kian: unknown artifacts subcommand `{other}`\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn artifacts_gc(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut max_bytes: Option<u64> = None;
+    let mut retention_days: Option<u64> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--dir" => match iter.next() {
+                Some(p) => dir = Some(p.into()),
+                None => {
+                    eprintln!("kian: --dir requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--max-bytes" => match iter.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => max_bytes = Some(v),
+                None => {
+                    eprintln!("kian: --max-bytes requires a non-negative integer\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--retention-days" => match iter.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => retention_days = Some(v),
+                None => {
+                    eprintln!("kian: --retention-days requires a non-negative integer\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown artifacts gc option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match kian_cli::artifacts::run_artifacts_gc(&config_path, dir, max_bytes, retention_days, json)
+    {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: artifacts gc failed — {e}");
             ExitCode::from(2)
         }
     }

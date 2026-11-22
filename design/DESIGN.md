@@ -549,6 +549,22 @@ its plan before the `slot/fallback` append, and that event carries the exact bod
 metadata, so replay reconstructs the retry bytes. The event payload is additive: a profile-less session keeps
 the frozen V1 body, and the plan metadata is recorded next to it.
 
+**Tool result artifacts (ADR-055, phase 2)**: a tool result is the payload class that does not belong
+in the log in full. When the operator configures `artifacts:`, the engine's single append path
+(`DrainCtxCore::append_event`) rewrites a successful `tool/result` whose output exceeds
+`inline_max_bytes` into `{artifact:{id,size,media_type},preview,truncated}` **before** the write, so
+the persisted bytes are already what the model sees next turn: no path can persist megabytes and
+later shrink them, and replay — which derives context from events — yields the same preview with or
+without the blob. The blob store (`kian-store::ArtifactStore`) is content-addressed (sha256 hex),
+atomic (temp+rename), path-traversal-proof (ids validated as 64 hex chars) and garbage-collected by
+retention (`kian artifacts gc`: `max_bytes` default 10 GiB, `retention_days` default 30) —
+deliberately without reference counting, because kian has no session enumeration API, compaction
+rewrites ranges, and a refcount would be authoritative state outside the event log (constraint 1).
+An aged-out blob is a normal, documented outcome that `artifact_read` reports as an honest error.
+`artifact_read` is a bundle-edge `ToolProvider` composed with the local tools at assembly and added
+to the mounted tool list; core names neither the tool nor the store policy. Errors never spill, and
+an absent `artifacts:` block keeps every payload byte-identical to legacy.
+
 **The audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
 keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
 payloads replay byte-identically: `"usage": <provider usage JSON verbatim>` when the provider
@@ -1744,7 +1760,7 @@ graph TB
 | crate | Responsibility | Key interfaces |
 |-------|----------------|----------------|
 | kian-core | Concept model, session state machine, six-invariant assertions | `SessionId`, `EventKind`, `Projection`, `seams::*` |
-| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project` |
+| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project`; `ArtifactStore` (content-addressed `tool/result` blobs + retention GC, ADR-055) |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032; v6 bounds the re-drive count, ADR-033), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |

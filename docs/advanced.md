@@ -754,6 +754,41 @@ admitted), `terminal` (session completed/cancelled/rotated — nothing admitted)
 or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
 idle. Semantics: [ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
 
+## Tool result artifacts
+
+A large tool result (a fetch, an OCR page, an `exec` dump) does not belong in the log or in the
+model's context in full. With an `artifacts:` block configured, the engine rewrites any successful
+`tool/result` above `inline_max_bytes` into a content-addressed reference plus a bounded preview
+**before** appending it — so the persisted bytes are exactly what the model sees, and replay works
+with or without the blob. `artifact_read` pages the full payload back on demand.
+
+```yaml
+artifacts:
+  dir: ./kian-artifacts          # default: <sqlite-parent>/artifacts
+  inline_max_bytes: 16384        # results above this spill
+  gc: { max_bytes: 10737418240, retention_days: 30 }
+```
+
+The tool is mounted automatically (it needs no `tools:` entry; agents with an explicit `tools:`
+list keep it available):
+
+```json
+{"id": "<64-hex sha256>", "offset": 0, "limit": 8192}
+```
+
+It returns `{"id","size","offset","content","next_offset"}`; an aged-out blob returns
+`{"error":"artifact expired or unavailable","artifact_id":...}` rather than empty success.
+Collect garbage (oldest first, until both bounds hold):
+
+```bash
+target/debug/kian artifacts gc --config kian.yaml --json
+```
+
+Garbage collection is retention-based, never reference-counted: a blob deleted while a session
+still references it is the normal aged-out case, and replay still produces the recorded preview.
+Export copies the events, not the blobs. Semantics:
+[ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
@@ -786,6 +821,7 @@ Semantics: [ADR-052](../design/decisions/ADR-052-economics-cost-projection.md).
 | `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
 | `kian cost [--json]` | Read-only cost projection over the config `pricing:` book: priced/unpriced requests, peak/off-peak split, exact micro-currency total |
+| `kian artifacts gc [--json]` | Retention-based GC of the content-addressed tool-result blob tree (`max_bytes` + `retention_days`) |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
 | `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids |

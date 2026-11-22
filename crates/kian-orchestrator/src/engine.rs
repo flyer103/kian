@@ -70,7 +70,7 @@ use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::seams::{LoopDriver, LoopOutcome};
 use kian_core::state::{SessionState, project};
-use kian_store::{AdmitOutcome, AppendGuard, EventStore, StoreError};
+use kian_store::{AdmitOutcome, AppendGuard, ArtifactStore, EventStore, StoreError};
 use uuid::Uuid;
 
 use crate::metrics::Metrics;
@@ -135,6 +135,38 @@ impl Default for EngineConfig {
             lease_ttl_ms: 30_000,
             heartbeat_interval_ms: 10_000,
         }
+    }
+}
+
+/// Operator-configured tool-result spill (ADR-055): when present, the
+/// engine's single append path rewrites an oversized successful
+/// `tool/result` into a content-addressed reference plus a bounded preview
+/// before the event is written. Absent = byte-identical legacy behavior.
+#[derive(Debug, Clone)]
+pub struct ArtifactRuntime {
+    store: Arc<ArtifactStore>,
+    inline_max_bytes: usize,
+}
+
+impl ArtifactRuntime {
+    #[must_use]
+    pub fn new(store: ArtifactStore, inline_max_bytes: usize) -> Self {
+        Self {
+            store: Arc::new(store),
+            inline_max_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Arc<ArtifactStore> {
+        &self.store
+    }
+
+    /// Results whose compact JSON exceeds this spill; the preview is one
+    /// quarter of it (ADR-055).
+    #[must_use]
+    pub fn inline_max_bytes(&self) -> usize {
+        self.inline_max_bytes
     }
 }
 
@@ -389,6 +421,8 @@ struct DrainCtxCore {
     interrupt: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     metrics: Arc<Metrics>,
+    /// ADR-055 tool-result spill (engine-configured; `None` = legacy bytes).
+    artifacts: Option<ArtifactRuntime>,
 }
 
 /// The handle surface the engine hands to a [`LoopDriver`]
@@ -433,6 +467,7 @@ impl DrainCtxCore {
     /// store head and the append retried. A stale-epoch rejection
     /// propagates immediately — a fenced drain never fights the fence.
     async fn append_event(&self, kind: EventKind, bytes: Value) -> Result<Event, EngineError> {
+        let bytes = self.spill_tool_result(kind, bytes).await;
         for _ in 0..APPEND_ATTEMPTS {
             let seq = self.seq.load(Ordering::Acquire);
             let event = Event {
@@ -471,6 +506,79 @@ impl DrainCtxCore {
         Err(EngineError::AppendRetryExhausted {
             session: self.session,
         })
+    }
+
+    /// ADR-055: rewrite an oversized successful `tool/result` output into a
+    /// content-addressed reference plus a bounded preview **before** the event
+    /// is written, so the persisted bytes are exactly what the model sees next
+    /// turn and replay needs no blob. Errors never spill; an absent runtime,
+    /// a payload below the bound or an already-spilled payload is untouched.
+    /// A blob write failure degrades honestly to the inline output.
+    async fn spill_tool_result(&self, kind: EventKind, mut payload: Value) -> Value {
+        let Some(runtime) = self.artifacts.as_ref() else {
+            return payload;
+        };
+        if !matches!(kind, EventKind::ToolResult) {
+            return payload;
+        }
+        let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) else {
+            return payload;
+        };
+        if content.get("is_error").and_then(Value::as_bool) == Some(true) {
+            return payload;
+        }
+        let Some(output) = content.get("output") else {
+            return payload;
+        };
+        if output.get("artifact").is_some() {
+            return payload;
+        }
+        let Ok(bytes) = serde_json::to_vec(output) else {
+            return payload;
+        };
+        if bytes.len() <= runtime.inline_max_bytes() {
+            return payload;
+        }
+        let preview_len = (runtime.inline_max_bytes() / 4).max(1).min(bytes.len());
+        let preview = String::from_utf8_lossy(&bytes[..preview_len]).into_owned();
+        let store = Arc::clone(runtime.store());
+        let write = bytes.clone();
+        let artifact = match tokio::task::spawn_blocking(move || {
+            store.put(&write, "application/json")
+        })
+        .await
+        {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    session = %self.session.0,
+                    error = %e,
+                    "tool result spill failed; keeping the inline output (ADR-055)"
+                );
+                return payload;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.session.0,
+                    error = %e,
+                    "tool result spill task failed; keeping the inline output (ADR-055)"
+                );
+                return payload;
+            }
+        };
+        content.insert(
+            "output".to_string(),
+            json!({
+                "artifact": {
+                    "id": artifact.id,
+                    "size": artifact.size,
+                    "media_type": artifact.media_type,
+                },
+                "preview": preview,
+                "truncated": true,
+            }),
+        );
+        payload
     }
 
     /// The spill consumption write: `input/admitted` immediately
@@ -563,6 +671,23 @@ impl DrainCtx {
         metrics: Arc<Metrics>,
         interrupt: Arc<AtomicBool>,
     ) -> Result<Self, EngineError> {
+        Self::with_interrupt_and_artifacts(store, session, epoch, clock, metrics, interrupt, None)
+            .await
+    }
+
+    /// [`DrainCtx::with_interrupt`] plus the ADR-055 spill runtime — the
+    /// engine's `drain_episode` passes the engine-configured runtime so
+    /// oversized tool results spill at the single append path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_interrupt_and_artifacts(
+        store: EventStore,
+        session: SessionId,
+        epoch: Epoch,
+        clock: Arc<dyn Clock>,
+        metrics: Arc<Metrics>,
+        interrupt: Arc<AtomicBool>,
+        artifacts: Option<ArtifactRuntime>,
+    ) -> Result<Self, EngineError> {
         let head = store.head(session).await?;
         Ok(Self {
             core: Arc::new(DrainCtxCore {
@@ -575,6 +700,7 @@ impl DrainCtx {
                 interrupt,
                 clock,
                 metrics,
+                artifacts,
             }),
         })
     }
@@ -980,6 +1106,9 @@ pub struct Engine<D: LoopDriver> {
     /// byte-identical; the kian serve assembly turns it on from
     /// `read_model.snapshots`.
     read_model: crate::snapshots::ReadModelConfig,
+    /// ADR-055 tool-result spill; `None` keeps every payload byte-identical
+    /// to legacy.
+    artifacts: Option<ArtifactRuntime>,
 }
 
 impl<D> Engine<D>
@@ -1006,6 +1135,7 @@ where
             config,
             clock,
             crate::snapshots::ReadModelConfig::default(),
+            None,
         )
     }
 
@@ -1020,7 +1150,34 @@ where
         config: EngineConfig,
         read_model: crate::snapshots::ReadModelConfig,
     ) -> Arc<Self> {
-        Self::assemble(store, driver, config, Arc::new(SystemClock), read_model)
+        Self::assemble(
+            store,
+            driver,
+            config,
+            Arc::new(SystemClock),
+            read_model,
+            None,
+        )
+    }
+
+    /// Engine with the system clock, an explicit read-model config and the
+    /// ADR-055 tool-result spill runtime (the `kian serve` assembly path).
+    #[must_use]
+    pub fn new_with_read_model_and_artifacts(
+        store: EventStore,
+        driver: Arc<D>,
+        config: EngineConfig,
+        read_model: crate::snapshots::ReadModelConfig,
+        artifacts: Option<ArtifactRuntime>,
+    ) -> Arc<Self> {
+        Self::assemble(
+            store,
+            driver,
+            config,
+            Arc::new(SystemClock),
+            read_model,
+            artifacts,
+        )
     }
 
     fn assemble(
@@ -1029,6 +1186,7 @@ where
         config: EngineConfig,
         clock: Arc<dyn Clock>,
         read_model: crate::snapshots::ReadModelConfig,
+        artifacts: Option<ArtifactRuntime>,
     ) -> Arc<Self> {
         let metrics = Arc::new(Metrics::default());
         let engine = Arc::new(Self {
@@ -1041,6 +1199,7 @@ where
             metrics,
             weak: std::sync::OnceLock::new(),
             read_model,
+            artifacts,
         });
         engine
             .weak
@@ -2052,13 +2211,14 @@ where
         // the ctx shares the drain's interrupt flag — an
         // `interrupt` RPC and a consumed current-epoch control row flip
         // the same switch.
-        let ctx = DrainCtx::with_interrupt(
+        let ctx = DrainCtx::with_interrupt_and_artifacts(
             self.store.clone(),
             *session,
             lease.epoch,
             Arc::clone(&self.clock),
             Arc::clone(&self.metrics),
             Arc::clone(interrupt),
+            self.artifacts.clone(),
         )
         .await?;
         let mut claimed = false;
@@ -2515,8 +2675,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BudgetOutcome, Clock, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome,
-        ManualClock, ReleaseOutcome, WakeOutcome,
+        ArtifactRuntime, BudgetOutcome, Clock, DrainCtx, Engine, EngineConfig, EngineError,
+        InterruptOutcome, ManualClock, ReleaseOutcome, WakeOutcome,
     };
     use crate::metrics::Metrics;
     use kian_core::control::BudgetIntent;
@@ -2525,7 +2685,7 @@ mod tests {
     use kian_core::seams::{LoopDriver, LoopOutcome};
     use kian_core::state::{SessionState, project};
     use kian_store::AppendGuard;
-    use kian_store::EventStore;
+    use kian_store::{ArtifactStore, EventStore};
 
     const T0: u64 = 1_761_900_000_000;
 
@@ -6202,5 +6362,161 @@ mod tests {
             BudgetOutcome::Terminal
         );
         cleanup(&path);
+    }
+
+    // -- tool result artifacts (ADR-055) ----------------------------------
+
+    async fn artifact_ctx(
+        store: EventStore,
+        sid: SessionId,
+        dir: &Path,
+        inline_max_bytes: usize,
+    ) -> DrainCtx {
+        let runtime = ArtifactRuntime::new(
+            ArtifactStore::open(dir).expect("open artifacts"),
+            inline_max_bytes,
+        );
+        DrainCtx::with_interrupt_and_artifacts(
+            store,
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+            Some(runtime),
+        )
+        .await
+        .expect("drain ctx")
+    }
+
+    /// An oversized successful `tool/result` output becomes a content
+    /// addressed reference plus a bounded preview at the append path, and
+    /// the persisted bytes are exactly what the next turn sees. Errors and
+    /// small outputs stay inline.
+    #[tokio::test]
+    async fn oversized_tool_outputs_spill_but_errors_never_do() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        ctx.append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+
+        let big = "x".repeat(500);
+        let output = json!({ "stdout": big });
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c1", "output": output.clone(), "is_error": false } }),
+        )
+        .await
+        .unwrap();
+
+        let events = events_of(&store, sid).await;
+        let content = &events.last().unwrap().bytes["content"];
+        let reference = &content["output"];
+        let id = reference["artifact"]["id"].as_str().expect("artifact id");
+        assert_eq!(id.len(), 64, "content addressed sha256 hex");
+        assert_eq!(
+            reference["artifact"]["media_type"],
+            json!("application/json")
+        );
+        assert_eq!(reference["truncated"], json!(true));
+        assert!(
+            !reference["preview"].as_str().unwrap().is_empty(),
+            "the preview is what the model reads next turn"
+        );
+        assert!(
+            reference["preview"].as_str().unwrap().len() <= 64,
+            "the preview is bounded by inline_max_bytes/4"
+        );
+
+        let blobs = ArtifactStore::open(&dir).expect("reopen artifacts");
+        let stored = blobs.get(id).expect("read blob").expect("blob exists");
+        assert_eq!(
+            stored,
+            serde_json::to_vec(&output).unwrap(),
+            "the blob holds the exact inline bytes that would have been persisted"
+        );
+
+        // Small outputs and errors are never spilled.
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c2", "output": json!({ "ok": true }), "is_error": false } }),
+        )
+        .await
+        .unwrap();
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c3", "output": json!({ "stderr": "y".repeat(500) }), "is_error": true } }),
+        )
+        .await
+        .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events[events.len() - 2].bytes["content"]["output"],
+            json!({ "ok": true })
+        );
+        assert_eq!(
+            events.last().unwrap().bytes["content"]["output"],
+            json!({ "stderr": "y".repeat(500) }),
+            "honest errors stay inline so a failure is always readable"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the runtime the append bytes are legacy-identical; an
+    /// already-spilled output is left alone (idempotent re-append).
+    #[tokio::test]
+    async fn spill_is_absent_by_default_and_idempotent_when_present() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let plain = DrainCtx::with_interrupt(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        plain
+            .append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+        let payload = json!({ "content": { "call_id": "c1", "output": json!({ "stdout": "z".repeat(500) }), "is_error": false } });
+        plain
+            .append(EventKind::ToolResult, payload.clone())
+            .await
+            .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events.last().unwrap().bytes,
+            payload,
+            "no runtime = legacy bytes exactly"
+        );
+
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        let pre_spilled = json!({ "content": { "call_id": "c9", "output": { "artifact": { "id": "a".repeat(64), "size": 1, "media_type": "application/json" }, "preview": "p", "truncated": true }, "is_error": false } });
+        ctx.append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+        ctx.append(EventKind::ToolResult, pre_spilled.clone())
+            .await
+            .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events.last().unwrap().bytes,
+            pre_spilled,
+            "already-spilled payloads are not re-spilled"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

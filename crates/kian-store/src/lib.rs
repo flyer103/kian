@@ -27,12 +27,15 @@
 //!   the archived marker, the terminal-only eligibility scan and the
 //!   single-transaction marker-CAS + online-row delete behind a
 //!   verified archive package
+//! - [`artifact`] — the content-addressed tool-result blob tree (ADR-055:
+//!   disposable payload cache, retention GC, never truth)
 //! - [`wake`] — the postgres LISTEN/NOTIFY wake transport (advisory;
 //!   /ADR-009)
 //! - [`migrations`] — adjacent migration chains, one per backend (DESIGN
 //!   §3.3)
 
 pub mod archive;
+pub mod artifact;
 pub mod cron;
 pub mod event_store;
 pub mod inbox;
@@ -46,6 +49,9 @@ mod sqlite;
 
 pub use archive::{
     ArchiveCandidate, ArchiveCommitOutcome, ArchiveError, ArchivedInput, ArchivedMarker,
+};
+pub use artifact::{
+    ArtifactError, ArtifactRef, ArtifactStats, ArtifactStore, ArtifactWindow, GcReport,
 };
 pub use cron::{CronError, CronFiringRow, CronScheduleRow, FiringState, ScheduleUpsert};
 pub use event_store::{AppendGuard, EventStore, Head, StoreError};

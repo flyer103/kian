@@ -576,6 +576,35 @@ Non-goals recorded with the phase: no per-step monetary gate (pricing stays a pr
 no enforcement of wall-clock budgets while idle, no budget on harness-owned (projection-only) loops,
 no automatic compaction or model downgrade as a budget response.
 
+### Tool result artifacts (ADR-055, P2 landed)
+
+Scope: keep a large tool result **out of the log and out of the model's context** while keeping both
+replayable and auditable. A result is the payload class that otherwise grows the event stream, the
+export, the read-model page and every later request body at once.
+
+Semantics: with an `artifacts:` block configured, the engine's single append path rewrites a
+`tool/result` whose successful `content.output` exceeds `inline_max_bytes` (default 16 KiB) into
+`{"artifact":{"id","size","media_type"},"preview":<str>,"truncated":true}` before the event is
+written. The persisted bytes are therefore exactly what the model sees next turn (constraint 2),
+and replay — which derives context from the stream — yields the same preview with or without the
+blob: the content-addressed blob store (`sha256` ids, atomic temp+rename, retention GC) is an
+operator cache, never a second truth. `artifact_read` (a bundle-edge tool mounted beside the local
+tools) serves the full payload in bounded windows and reports an aged-out blob as an honest error.
+Error results never spill; an absent block keeps every legacy payload byte-identical.
+
+The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §3/§4.1; the
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2; the decision record is
+[ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P2 | kian-store, kian-orchestrator, kian-cli | `kian-store::ArtifactStore` (content-addressed put/get, atomic write, id validation, retention+cap GC); append-path spill of successful oversized `tool/result` payloads (preview + ref, `is_error` never spills); `artifact_read` tool + mounted-list wiring; `artifacts:` config (dir, `inline_max_bytes`, GC bounds) and `kian artifacts gc` | landed |
+
+Non-goals recorded with the phase: no export blob pinning (a later slice; exported sessions carry
+the reference and may age out locally), no per-session quota, no reference counting (kian has no
+session enumeration API and compaction rewrites ranges), no server-side fetch in core (P2b web
+tools are a bundle crate that spills through this path), no GC ticker inside `serve` in this slice.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

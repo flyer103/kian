@@ -107,7 +107,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `step/request` | — | DrainActivity | `{"slot":<str>,"provider":<str>,"model":<str>,"iteration":<u64>,"body":<exact request bytes>}`; additive: `"body_version":"v1"\|"v2"`, `"dialect":"openai_chat"`, `"profile_digest":<sha256>`, `"body_sha256":<sha256>`, `"estimate":{"low":<u64>,"high":<u64>,"max_output_tokens"?:<u64>,"source":"chars_v1","estimator_version":1}` ([ADR-053](decisions/ADR-053-request-plans-and-model-profiles.md)) | loop / provider persist hook | **A2**: persisted before the request flies; replay is byte-identical. The additive keys describe the plan that produced `body`; a session with no declared profile keeps the V1 body byte-identical (the additive metadata is still recorded). |
 | `assistant/message` | C | DrainActivity | `{"role":"assistant","content":{"text":<str>,"tool_calls"?:[...],"reasoning_content"?:<str>}}` | loop | The sent bytes are the truth; never rewritten. `reasoning_content` is the provider's thinking-mode reasoning, part of context (replayed on the wire); absent for non-thinking providers and legacy events ([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). |
 | `tool/call` | C | DrainActivity | `{"role":"assistant","content":{"id":<str>,"name":<str>,"arguments":<json>}}`; additive: `"permission":{"evaluated":"allow"\|"deny"\|"ask","policy":"default"\|"configured"\|"hook","matched":<str>,"reason"?}` | loop | **Log-before-execute**: appended before `invoke`. Deny never invokes (ADR-015). `policy:"hook"` is a `tool/pre` veto denial; `matched` then carries `"<plugin>:<hook>"` ([PLUGIN-SPEC](PLUGIN-SPEC.md) §4.4, [ADR-028](decisions/ADR-028-harness-hook-plugins.md)). `ask` never invokes either: the call stays pending until a `control/confirm` answers it and the drain ends `awaiting_input` (ADR-036, [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md)). Additive `"recovered":"not_dispatched"\|"in_flight"` marks a call the drain reconstructed after a crash mid-batch (no `permission` key — no decision was recorded); see §4.2. |
-| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; additive: `"redactions":[{"kind","name","count"}]`, `"confirmation":{"call_id","decision":"approve"\|"reject","requested_by":<str\|null>,"answered_at_ms":<u64>,"expired"?:true}` | loop / exec | Redaction provenance never carries secret values. `confirmation` records which human decision produced the result (§4.2); omitted on ordinary results. Additive `"recovered":"not_dispatched"\|"in_flight"` marks the synthetic honest-error result that closes a crashed tool batch (§4.2). |
+| `tool/result` | C | DrainActivity | `{"role":"tool","content":{"call_id":<str>,"output":<json>,"is_error":<bool>}}`; with `artifacts:` configured, a successful `output` above the inline bound is `{"artifact":{"id","size","media_type"},"preview":<str>,"truncated":true}` (ADR-055, §4.1); additive: `"redactions":[{"kind","name","count"}]`, `"confirmation":{"call_id","decision":"approve"\|"reject","requested_by":<str\|null>,"answered_at_ms":<u64>,"expired"?:true}` | loop / exec | Redaction provenance never carries secret values. `confirmation` records which human decision produced the result (§4.2); omitted on ordinary results. Additive `"recovered":"not_dispatched"\|"in_flight"` marks the synthetic honest-error result that closes a crashed tool batch (§4.2). |
 | `compact` | c | DrainActivity | `{"from_seq":<u64>,"to_seq":<u64>,"summary":{"role":<str>,"content":<json>}}` | recovery reactor | The only deliberate prefix-invalidation point; ranges pairwise-disjoint, `a < b <= seq`. |
 | `slot/binding` | — | DrainActivity | `{"slot":<str>,"spec":{"provider","model","fallback":[...]}}`; additive: a `"profile"` object on `spec` and on each fallback target (`dialect`, `context_window`?, `max_output`?, `reasoning`, `thinking`?, `effort`?, `strict`, `cache`, `vision`) | loop at first use | Slot → provider/model fixed for the session's lifetime (ADR-006); a declared profile is part of that binding and is session-immutable (ADR-053). |
 | `slot/fallback` | — | DrainActivity | `{"slot":<str>,"from":{"provider","model"},"to":{"provider","model"}}`; additive: `"profile"` on each target; additive attempt copy: `"body":<exact request bytes>`, `"body_version"`, `"dialect"`, `"profile_digest"`, `"body_sha256"`, `"estimate"` | provider turn | One fallback-chain switch, persisted before the fallback call. The attempt copy is the exact body the fallback sends, so replay can reconstruct the retry without a second `step/request` (ADR-053). |
@@ -138,6 +138,15 @@ thinking-mode reasoning, persisted verbatim and replayed on the next request whe
 ([ADR-022](decisions/ADR-022-reasoning-content-replay.md)). It is context, not an additive
 provenance key: a legacy assistant message without the key produces byte-identical request bytes,
 and a non-thinking provider never emits it.
+
+When `artifacts:` is configured ([ADR-055](decisions/ADR-055-artifacts-and-tool-result-spill.md)),
+a `tool/result` whose successful `content.output` exceeds `inline_max_bytes` is rewritten **at the
+append** to `{"artifact":{"id","size","media_type"},"preview":<str>,"truncated":true}`. `id` is the
+sha256 hex of the full bytes (content-addressed, so identical payloads dedupe across sessions);
+`preview` is the leading `inline_max_bytes / 4` bytes decoded lossily as UTF-8 and is exactly what
+the model reads in context, now and on every replay; the blob is an operator-managed cache of the
+full payload, never a second truth. Error results (`is_error: true`) never spill. A session that
+did not configure `artifacts:` persists no such shape: the legacy payload is byte-identical.
 
 ### 4.2 Additive provenance keys (non-context)
 
@@ -355,6 +364,7 @@ A new kind is the **last** resort (config → plugin → seam → core primitive
 | `crates/kian-core/src/state.rs` | transition table and projection |
 | `crates/kian-core/src/control.rs` | reserved control-envelope row convention (pre-event) |
 | `crates/kian-core/src/secrets.rs` | redaction report used by `tool/result` provenance |
+| `crates/kian-store/src/artifact.rs` | content-addressed blob store behind `tool/result` artifact references (disposable; ADR-055) |
 | `design/DESIGN.md` §3 | design rationale (links here for the catalog) |
 | `design/decisions/ADR-NNN-*.md` | why a decision was made (append-only) |
 | `crates/kian-cli/tests/docs_map.rs` | doc↔code drift + docs-map link enforcement |

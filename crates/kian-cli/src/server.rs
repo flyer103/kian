@@ -372,6 +372,23 @@ impl Server {
             .exec_env
             .to_policy()
             .map_err(ServeError::Config)?;
+        // ADR-055 (P2): the artifact runtime — absent `artifacts:` section =
+        // spill off, and the assembled tool set stays byte-identical.
+        let (artifact_store, artifact_runtime) = match config.artifacts.as_ref() {
+            Some(artifacts) => {
+                let dir = artifacts
+                    .resolve_dir(&config.storage)
+                    .map_err(|e| ServeError::Assembly(format!("artifacts: {e}")))?;
+                let store = kian_store::ArtifactStore::open(dir)
+                    .map_err(|e| ServeError::Assembly(format!("artifacts: open store: {e}")))?;
+                let runtime = kian_orchestrator::ArtifactRuntime::new(
+                    store.clone(),
+                    artifacts.inline_max_bytes,
+                );
+                (Some(Arc::new(store)), Some(runtime))
+            }
+            None => (None, None),
+        };
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
@@ -379,6 +396,7 @@ impl Server {
                 exec_timeout_ms: config.tools.exec_timeout_ms,
                 env_policy: exec_env_policy,
                 redactor: exec_redactor.clone(),
+                artifacts: artifact_store,
             },
         ];
         // ADR-035: the release path (ops verb + reclaim tick) reads the
@@ -1033,7 +1051,13 @@ impl Server {
         });
         let views_enabled = config.read_model.views.enabled;
         let event_stream_enabled = config.api.event_stream.enabled;
-        let engine = Engine::new_with_read_model(store.clone(), driver, engine_config, read_model);
+        let engine = Engine::new_with_read_model_and_artifacts(
+            store.clone(),
+            driver,
+            engine_config,
+            read_model,
+            artifact_runtime,
+        );
 
         // The bundle's inbox port learns the engine (the cycle
         // breaker closes here, before any wake can fire).

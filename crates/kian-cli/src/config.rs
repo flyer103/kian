@@ -155,6 +155,12 @@ pub struct ServeConfig {
     /// only (no wildcard in OSS).
     #[serde(default)]
     pub api: ApiConfig,
+    /// The `artifacts:` section (ADR-055, P2). `None` (the section
+    /// absent) is tool-result spill **off**: every result stays inline
+    /// and the event bytes are legacy-identical. Present parses
+    /// fail-closed and mounts the `artifact_read` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<ArtifactsConfig>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -489,6 +495,91 @@ impl Default for ToolsConfig {
             exec_redact: ExecRedactSection::default(),
         }
     }
+}
+
+/// The `artifacts:` section (ADR-055, P2): tool-result spill.
+///
+/// ```yaml
+/// artifacts:
+///   dir: ./artifacts
+///   inline_max_bytes: 16384
+///   gc:
+///     max_bytes: 10737418240
+///     retention_days: 30
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// Blob directory. Default: an `artifacts/` sibling of the sqlite
+    /// database file (required under postgres — there is no file path
+    /// to derive it from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Successful tool results larger than this many bytes spill by
+    /// reference: the model reads a bounded preview and pages the rest
+    /// through `artifact_read`.
+    #[serde(default = "default_artifact_inline_max_bytes")]
+    pub inline_max_bytes: usize,
+    /// Retention GC knobs (`kian artifacts gc`).
+    #[serde(default)]
+    pub gc: ArtifactGcConfig,
+}
+
+impl ArtifactsConfig {
+    /// The resolved blob directory, fail-closed when it cannot be
+    /// derived (postgres without an explicit `dir`).
+    pub fn resolve_dir(&self, storage: &StorageConfig) -> Result<std::path::PathBuf, String> {
+        if let Some(dir) = self.dir.as_ref() {
+            if dir.trim().is_empty() {
+                return Err("artifacts.dir must not be empty when present".into());
+            }
+            return Ok(std::path::PathBuf::from(dir));
+        }
+        if storage.is_postgres() {
+            return Err(
+                "artifacts.dir is required under storage.event_store: postgres — there is no sqlite path to derive the blob directory from"
+                    .into(),
+            );
+        }
+        let db = std::path::Path::new(&storage.sqlite);
+        let parent = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Ok(parent.join("artifacts"))
+    }
+}
+
+/// The `artifacts.gc:` sub-section: pure retention, no reference counts
+/// (ADR-055 decision 6). A `0` turns that dimension off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactGcConfig {
+    /// Total blob budget, bytes.
+    #[serde(default = "default_artifact_gc_max_bytes")]
+    pub max_bytes: u64,
+    /// Keep blobs at least this many days.
+    #[serde(default = "default_artifact_retention_days")]
+    pub retention_days: u64,
+}
+
+impl Default for ArtifactGcConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_artifact_gc_max_bytes(),
+            retention_days: default_artifact_retention_days(),
+        }
+    }
+}
+
+fn default_artifact_inline_max_bytes() -> usize {
+    16 * 1024
+}
+fn default_artifact_gc_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_artifact_retention_days() -> u64 {
+    30
 }
 
 /// The `tools.exec_env:` section (fix ①: secrets never reach
@@ -4127,6 +4218,25 @@ impl ServeConfig {
             workers.validate()?;
         }
 
+        // The `artifacts:` section (ADR-055): a positive inline bound, a
+        // GC with at least one live dimension, and a derivable blob
+        // directory (postgres has no sqlite path to derive it from).
+        if let Some(artifacts) = self.artifacts.as_ref() {
+            if artifacts.inline_max_bytes == 0 {
+                return Err(invalid(
+                    "artifacts.inline_max_bytes must be > 0 (every result would spill)",
+                ));
+            }
+            if artifacts.gc.max_bytes == 0 && artifacts.gc.retention_days == 0 {
+                return Err(invalid(
+                    "artifacts.gc: at least one of max_bytes / retention_days must be > 0 — a GC with both dimensions off reclaims nothing",
+                ));
+            }
+            artifacts
+                .resolve_dir(&self.storage)
+                .map_err(|e| invalid(format!("artifacts: {e}")))?;
+        }
+
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
             if sa.channels.is_empty() {
@@ -4723,7 +4833,7 @@ impl ServeConfig {
     /// The compiled agent definition handed to the loop.
     #[must_use]
     pub fn agent_def(&self) -> AgentDef {
-        agent_def_of(&self.agent, &self.model_profiles)
+        self.with_artifact_tools(agent_def_of(&self.agent, &self.model_profiles))
     }
 
     /// The compiled definition of a named agent (`None` when the id
@@ -4732,7 +4842,18 @@ impl ServeConfig {
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
         self.agents
             .get(id)
-            .map(|agent| agent_def_of(agent, &self.model_profiles))
+            .map(|agent| self.with_artifact_tools(agent_def_of(agent, &self.model_profiles)))
+    }
+
+    /// ADR-055: when the `artifacts:` section is enabled the
+    /// `artifact_read` tool is auto-mounted onto every compiled agent
+    /// (the `local-tools` plugin registers it whenever spill is on, so
+    /// the mounted name always resolves). Absent section = untouched.
+    fn with_artifact_tools(&self, mut def: AgentDef) -> AgentDef {
+        if self.artifacts.is_some() && !def.tools.iter().any(|tool| tool == "artifact_read") {
+            def.tools.push("artifact_read".into());
+        }
+        def
     }
 
     /// Converts the `superagent.roster` section to the bundle's

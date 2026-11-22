@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Tool results ride the event stream by reference, and the blob store is disposable (DESIGN §2.2, ADR-055)**.
+  With a new top-level `artifacts:` block configured, the engine rewrites a successful `tool/result`
+  whose output exceeds `inline_max_bytes` (default 16 KiB) into a content-addressed
+  `{artifact:{id,size,media_type},preview,truncated}` **before** the event is appended, so the
+  persisted bytes are exactly what the model sees next turn and replay yields the same preview with
+  or without the blob. `kian-store::ArtifactStore` is sha256-addressed, atomic (temp+rename),
+  path-traversal-proof and collected by retention (`kian artifacts gc`; `max_bytes` default 10 GiB,
+  `retention_days` default 30) — never reference-counted. The new `artifact_read` tool (mounted with
+  the local tools; no `tools:` entry needed) serves the full payload back in bounded windows and
+  reports an aged-out blob as an honest error. Error results never spill, and an absent block keeps
+  every legacy payload byte-identical.
 - **A session-lifetime token budget gates before the request flies (DESIGN §15, ADR-054)**.
   `agents.<name>.budgets.tokens` is a real ceiling now: the loop projects
   `base + Σbudget/raised − Σturn/end.usage`, admits the request plan's worst case
