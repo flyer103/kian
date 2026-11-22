@@ -8,6 +8,16 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A dispatch that never left the process no longer spends the re-drive bound (WORKER-MODEL,
+  ADR-033)**. `RegisteredTransport::dispatch_frame` and the connection manager now fail a frame
+  whose writer is already closed as `ConnectionError::NotWritten` and flip the transport offline
+  instead of reporting a plain transport loss. The queue layer refunds the attempt the claim had
+  just charged (`refund_dispatch_attempt`, holder-scoped, no row below zero), so a worker that
+  registers a moment later still gets its re-drive instead of finding its row `abandoned` for a
+  dispatch the endpoint never received. No status, event or wire change; the refund names the
+  command in a debug/warn line and a failed refund leaves the bound one attempt short, honestly
+  logged.
+
 - **Speak-rules gain `outcome-only` (DESIGN §4.2)**. The closed condition vocabulary
   `always | ack-first-only | decision-needed | result-ready | never` grows a sixth value for the
   one-conversation channel shape: results and decision prompts are sent, the dispatch

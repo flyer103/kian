@@ -191,7 +191,12 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   abandoned here may have run — the audit line says so. A re-dispatch is additionally delayed by
   `workers.queue_redrive_grace_ms` (default 5 s, `0` disables) when the row was dispatched more
   recently than the grace, so a reconnect cannot race an execution that may still be running on the
-  worker; the grace only postpones the dispatch and never settles a row.
+  worker; the grace only postpones the dispatch and never settles a row. A dispatch counts only
+  once it **left the process**: when the connection's writer is already closed, the frame never
+  reaches the endpoint, so the transport fails it as `NotWritten`, flips itself offline, and the
+  queue layer refunds the attempt the claim charged. Without that refund a worker reconnecting a
+  moment after a dead write would find its row abandoned — or its bound spent — for a dispatch the
+  endpoint provably never received.
 - **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
   no "any online worker", no local-exec substitution for a bound session.
 - **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being

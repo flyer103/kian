@@ -922,6 +922,30 @@ impl ExecStore {
         .map_err(QueueStoreError::from)
     }
 
+    /// Refunds one dispatch attempt charged by [`Self::claim_queue_row`] for
+    /// a frame that never left the process (the connection's writer was
+    /// already closed). The endpoint provably never received the command, so
+    /// the at-least-once bound must not count it: without the refund a worker
+    /// that reconnects a moment later could find its row abandoned after a
+    /// dispatch that never happened. Guarded on this holder's claim so a
+    /// foreign replica's attempt is never touched. Returns `true` iff a unit
+    /// was refunded.
+    pub async fn refund_dispatch_attempt(
+        &self,
+        command_id: Uuid,
+        holder: &str,
+    ) -> Result<bool, QueueStoreError> {
+        match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::refund_dispatch_attempt(pool, command_id, holder).await
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::refund_dispatch_attempt(pool, command_id, holder).await
+            }
+        }
+        .map_err(QueueStoreError::from)
+    }
+
     /// Extends this holder's lease on one `exec_queue` row. `false` =
     /// ownership lost (expired and reclaimed elsewhere) or the row
     /// settled — the caller stops heartbeating (a stray late result is

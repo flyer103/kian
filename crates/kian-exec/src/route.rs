@@ -308,7 +308,14 @@ impl RegisteredTransport {
         if self.writer.send(frame).await.is_err() {
             self.pending.lock().unwrap().remove(&id);
             drop(permit);
-            return Err(ConnectionError::TransportClosed);
+            // The writer channel is closed: the frame never left this
+            // process. Retire the transport on the status projection (a
+            // driver must stop dispatching into a dead connection) and
+            // report it distinctly, so the queue layer refunds the attempt
+            // it just charged instead of spending the row's re-drive bound
+            // on a command the endpoint provably never received.
+            self.status.send_modify(|status| status.connected = false);
+            return Err(ConnectionError::NotWritten);
         }
         let outcome = receiver
             .await

@@ -205,6 +205,23 @@ pub(crate) async fn abandon_exhausted(
     Ok(result.rows_affected() == 1)
 }
 
+/// Refunds one dispatch attempt iff this holder claimed the row and one
+/// attempt is on the books. See `ExecStore::refund_dispatch_attempt`.
+pub(crate) async fn refund_dispatch_attempt(
+    pool: &SqlitePool,
+    command_id: Uuid,
+    holder: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE exec_queue SET dispatch_attempts = dispatch_attempts - 1 WHERE command_id = ? AND claimed_by = ? AND dispatch_attempts > 0",
+    )
+    .bind(command_id.to_string())
+    .bind(holder)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Extends the lease iff this holder still owns the row and the row is
 /// live. `false` = ownership was lost (expired and reclaimed by another
 /// replica) or the row settled — the caller stops treating itself as

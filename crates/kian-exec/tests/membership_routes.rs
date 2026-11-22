@@ -398,8 +398,82 @@ async fn loss_then_re_registration_redrives_on_the_same_id() {
     backend.shutdown().await;
 }
 
-// ---------------------------------------------------------------------------
-// A15 — generation-scoped detach
+/// A dispatch whose frame never left the process (the connection's writer
+/// was already closed) must not spend the row's re-drive budget (ADR-033):
+/// the endpoint provably never received the command, so a worker that
+/// registers once the connection is healthy still gets its re-drive. Two
+/// dead-writer generations would otherwise exhaust `1 + max_redrives` and
+/// converge the row to `abandoned` without a single execution.
+#[tokio::test]
+async fn a_write_that_never_left_does_not_spend_the_redrive_budget() {
+    let backend = membership_backend(10_000, WorkerDirectory::new()).await;
+    let id = Uuid::new_v4();
+    let caller = {
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            backend
+                .exec_tracked(id, "builder-1", cmd(&["echo", "again"]), None)
+                .await
+        })
+    };
+
+    // Two generations whose writer is already closed: each driver turn
+    // discovers the dead writer, charges an attempt and refunds it. The
+    // inbound end stays alive, so the connection is only declared dead by
+    // the write failure itself.
+    let mut keep = Vec::new();
+    for generation in [1u64, 2u64] {
+        let (worker, fake) = registered("builder-1", generation);
+        drop(fake.writer_rx);
+        keep.push(fake.inbound_tx);
+        backend
+            .attach_route(
+                "builder-1",
+                RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker)),
+                generation,
+            )
+            .await;
+        // The driver polls every 40 ms: one full turn proves the dead write
+        // was attempted and refunded.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        backend.detach_route("builder-1", generation).await;
+    }
+
+    // A live generation still owns the whole budget, so the row re-drives.
+    let (worker3, mut fake3) = registered("builder-1", 3);
+    backend
+        .attach_route(
+            "builder-1",
+            RouteTransport::Registered(kian_exec::RegisteredTransport::new(worker3)),
+            3,
+        )
+        .await;
+    let frame = tokio::time::timeout(Duration::from_secs(15), fake3.writer_rx.recv())
+        .await
+        .expect("re-drive after two writes that never left")
+        .expect("command frame");
+    let ServerFrame::Command { id: wire_id, .. } = frame else {
+        panic!("expected a command frame");
+    };
+    assert_eq!(wire_id, id, "same command id re-driven (at-least-once)");
+    fake3
+        .inbound_tx
+        .send(EndpointFrame::CommandResult {
+            id: wire_id,
+            result: Some(ok_result("again\n")),
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    caller.await.expect("caller task").expect("caller settles");
+    match backend.store().get(id).await {
+        Ok(Some(row)) => assert_eq!(format!("{:?}", row.status), "Done"),
+        other => panic!("row missing: {other:?}"),
+    }
+    drop(keep);
+    backend.shutdown().await;
+}
 // ---------------------------------------------------------------------------
 
 /// A stale generation's detach is a no-op: it can never remove its

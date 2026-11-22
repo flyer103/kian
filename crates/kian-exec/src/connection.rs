@@ -337,7 +337,16 @@ impl ConnectionManager {
         if handle.writer.send(frame).await.is_err() {
             self.shared.pending.lock().unwrap().remove(&id);
             drop(permit);
-            return Err(ConnectionError::TransportClosed);
+            // The connection's writer is gone: the frame never left this
+            // process. Reflect that on the status projection (the queue
+            // driver stops dispatching into a dead connection) and report it
+            // distinctly, so the driver refunds the dispatch attempt instead
+            // of charging the row's re-drive budget for a command the
+            // endpoint never received.
+            self.shared
+                .status
+                .send_modify(|status| status.connected = false);
+            return Err(ConnectionError::NotWritten);
         }
         // The sender is resolved with the correlated result, or dropped
         // (mapped to a transport error) when the connection dies.

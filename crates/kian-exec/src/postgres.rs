@@ -155,6 +155,21 @@ pub(crate) async fn abandon_exhausted(
     Ok(result.rows_affected() == 1)
 }
 
+pub(crate) async fn refund_dispatch_attempt(
+    pool: &PgPool,
+    command_id: Uuid,
+    holder: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE exec_queue SET dispatch_attempts = dispatch_attempts - 1 WHERE command_id = $1::text AND claimed_by = $2::text AND dispatch_attempts > 0",
+    )
+    .bind(command_id.to_string())
+    .bind(holder)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub(crate) async fn heartbeat_queue_row(
     pool: &PgPool,
     command_id: Uuid,

@@ -33,6 +33,7 @@ use kian_core::seams::{ExecBackend, ExecCommand, ExecError, ExecResult};
 use kian_core::secrets::SecretRedactor;
 
 use crate::connection::ConnectionManager;
+use crate::error::ConnectionError;
 use crate::membership::WorkerDirectory;
 use crate::proto::CommandId;
 use crate::route::RouteTransport;
@@ -1334,6 +1335,35 @@ async fn drive_row_inner(
     let _ = heartbeat.await;
     match outcome {
         Ok(outcome) => core.complete(row.command_id, outcome).await,
+        // The frame never left this process (the connection's writer was
+        // already closed): the endpoint provably never received the
+        // command, so refund the attempt the claim just charged. Charging it
+        // would let a worker that reconnects a moment later find its row
+        // abandoned (or its re-drive bound spent) after a dispatch that
+        // never happened. The transport already flipped itself offline, so
+        // this route stops dispatching until a new connection attaches.
+        Err(ConnectionError::NotWritten) => {
+            match core
+                .store
+                .refund_dispatch_attempt(row.command_id, &core.row_lease_holder)
+                .await
+            {
+                Ok(true) => tracing::debug!(
+                    command_id = %row.command_id,
+                    "command frame never written; dispatch attempt refunded"
+                ),
+                Ok(false) => tracing::debug!(
+                    command_id = %row.command_id,
+                    "command frame never written; no owned attempt to refund"
+                ),
+                Err(e) => tracing::warn!(
+                    command_id = %row.command_id,
+                    error = %e,
+                    "command frame never written and the attempt refund failed; the row's re-drive bound may be one attempt short"
+                ),
+            }
+            return Err("command frame not written; the connection writer is closed".to_string());
+        }
         // Transport loss / manager stop: fail honestly *without* settling
         // the row — the next connect re-drives it (at-least-once). The
         // caller's queue timeout remains the honesty bound.

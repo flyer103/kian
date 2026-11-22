@@ -18,6 +18,13 @@ pub enum ConnectionError {
     /// The transport went away (connection reset, EOF, or peer closed).
     #[error("transport closed")]
     TransportClosed,
+    /// The command frame never left this process: the connection's writer
+    /// channel was already closed when the dispatch tried to write. Distinct
+    /// from [`Self::TransportClosed`] because the endpoint provably never
+    /// received the command — the queue driver refunds the dispatch attempt
+    /// instead of charging the row's at-least-once re-drive budget for it.
+    #[error("command frame not written: the connection writer is closed")]
+    NotWritten,
     /// The peer violated KiandProto (e.g. duplicate hello, non-first
     /// handshake frame).
     #[error("protocol violation: {0}")]
@@ -47,6 +54,7 @@ mod tests {
                 message: "connection refused".into(),
             },
             ConnectionError::TransportClosed,
+            ConnectionError::NotWritten,
             ConnectionError::Protocol("duplicate hello".into()),
             ConnectionError::VersionMismatch {
                 endpoint: 1,
