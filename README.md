@@ -260,6 +260,10 @@ never fail; see the [environment contract](#environment-contract).
 - [examples/issue-watch](examples/issue-watch/README.md) — a resident Router triaging the issues of
   one repository: poll intake → admission classes → `spawn_worker` under a mandate → a speak-rule →
   the outbox. ~15 minutes to a first drafted comment, `DRY_RUN` fail-closed.
+- [examples/mobile-dispatch](examples/mobile-dispatch/README.md) — the same bundle with a phone as
+  the only interface: one iMessage conversation in, bounded work out, the report back inside the IM
+  reply budget. Needs a Mac signed into a dedicated Apple ID; a `mock-im` variant runs the shape
+  with no phone at all.
 - **BYOM** — the hands are not a config flag: run `kiand` on the other machine with its own
   `--workspace-root`, then let a Router delegate to it with `exec_worker`. Section and recording:
   [BYOM execution endpoints](docs/advanced.md#byom-execution-endpoints).
