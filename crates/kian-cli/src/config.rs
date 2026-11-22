@@ -175,6 +175,13 @@ pub struct ServeConfig {
     /// due-wake sweep in serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defer: Option<DeferConfig>,
+    /// The media: section (ADR-060, P5a). None (the section absent) is
+    /// client-side media tools off: the mounted tool set is
+    /// byte-identical and no provider key is read. Present requires an
+    /// artifacts: section and mounts image_ocr / audio_transcribe /
+    /// speech_synthesize beside the local tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaConfig>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -744,6 +751,83 @@ fn default_defer_sweep_interval_ms() -> u64 {
 }
 fn default_defer_max_wait_ms() -> u64 {
     12 * 60 * 60 * 1000
+}
+
+/// The media: section (ADR-060, P5a): client-side media tools (image OCR,
+/// audio transcription, speech synthesis) as audited bundle tools.
+///
+/// ```yaml
+/// media:
+///   base_url: https://api.deepseek.com
+///   api_key_env: DEEPSEEK_API_KEY
+///   timeout_ms: 30000
+///   max_input_bytes: 26214400
+///   default_voice: alloy
+///   default_format: mp3
+/// ```
+///
+/// Absent = media tools off: the mounted tool set is byte-identical.
+/// Present requires an artifacts: section (the input bytes and the
+/// synthesized speech both live in the content-addressed store) and
+/// mounts image_ocr / audio_transcribe / speech_synthesize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Provider origin. The adapter appends /v1/tools/ocr,
+    /// /v1/tools/transcribe and /v1/tools/synthesize.
+    #[serde(default = "default_media_base_url")]
+    pub base_url: String,
+    /// Environment variable holding the provider key, read once at
+    /// serve assembly; a missing value refuses boot (ADR-060 decision 2).
+    #[serde(default = "default_media_api_key_env")]
+    pub api_key_env: String,
+    /// Per-request HTTP timeout, milliseconds.
+    #[serde(default = "default_media_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Largest artifact the adapter will send in one request, bytes.
+    #[serde(default = "default_media_max_input_bytes")]
+    pub max_input_bytes: u64,
+    /// Default voice for speech_synthesize when a call omits one.
+    #[serde(default)]
+    pub default_voice: Option<String>,
+    /// Default synthesis container: mp3, wav or pcm (closed set).
+    #[serde(default = "default_media_format")]
+    pub default_format: String,
+}
+
+impl MediaConfig {
+    /// Reads the provider key from the configured env name, fail-closed.
+    pub fn api_key(&self) -> Result<String, String> {
+        let key = std::env::var(&self.api_key_env).map_err(|_| {
+            format!(
+                "media.api_key_env {} is not set - the client-side media tools need a provider key",
+                self.api_key_env
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(format!(
+                "media.api_key_env {} is set but empty",
+                self.api_key_env
+            ));
+        }
+        Ok(key)
+    }
+}
+
+fn default_media_base_url() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_media_api_key_env() -> String {
+    "DEEPSEEK_API_KEY".into()
+}
+fn default_media_timeout_ms() -> u64 {
+    30_000
+}
+fn default_media_max_input_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+fn default_media_format() -> String {
+    "mp3".into()
 }
 
 /// The `tools.exec_env:` section (fix ①: secrets never reach
@@ -4468,6 +4552,48 @@ impl ServeConfig {
             }
         }
 
+        // The media: section (ADR-060, P5a): the adapter needs the
+        // artifact store in both directions, a parseable http(s) origin,
+        // a positive timeout and a named (non-blank) key env; the format
+        // is the provider closed set.
+        if let Some(media) = self.media.as_ref() {
+            if self.artifacts.is_none() {
+                return Err(invalid(
+                    "media: requires an artifacts: section - the media tools move bytes through the content-addressed store (ADR-060)",
+                ));
+            }
+            let parsed = reqwest::Url::parse(&media.base_url).map_err(|e| {
+                invalid(format!(
+                    "media.base_url {} is not a valid URL: {e}",
+                    media.base_url
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                return Err(invalid(format!(
+                    "media.base_url {} must be an absolute http(s) URL with a host",
+                    media.base_url
+                )));
+            }
+            if media.timeout_ms == 0 {
+                return Err(invalid("media.timeout_ms must be > 0"));
+            }
+            if media.api_key_env.trim().is_empty() {
+                return Err(invalid("media.api_key_env must not be blank"));
+            }
+            if media.max_input_bytes == 0 {
+                return Err(invalid(
+                    "media.max_input_bytes must be > 0 (a zero bound refuses every artifact)",
+                ));
+            }
+            if !kian_media::SPEECH_FORMATS.contains(&media.default_format.as_str()) {
+                return Err(invalid(format!(
+                    "media.default_format {} is not a supported synthesis container (known: {})",
+                    media.default_format,
+                    kian_media::SPEECH_FORMATS.join(", ")
+                )));
+            }
+        }
+
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
             if sa.channels.is_empty() {
@@ -5103,6 +5229,9 @@ impl ServeConfig {
         mount("artifact_read", self.artifacts.is_some());
         mount("web_search", self.web.is_some());
         mount("web_fetch", self.web.is_some());
+        mount("image_ocr", self.media.is_some());
+        mount("audio_transcribe", self.media.is_some());
+        mount("speech_synthesize", self.media.is_some());
         def
     }
 
@@ -11016,6 +11145,90 @@ schedules:
         assert!(err.contains("api_key_env"), "{err}");
 
         let typo = format!("{}web:\n  base_ur: https://example.com\n", valid_yaml());
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "unknown keys refuse boot (deny_unknown_fields)"
+        );
+    }
+
+    // -- media tools (ADR-060, P5a) ----------------------------------
+
+    #[test]
+    fn media_section_parses_defaults_and_mounts_the_three_tools() {
+        let yaml = format!("{}artifacts: {{}}\nmedia: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("media section parses");
+        let media = cfg.media.as_ref().expect("media present");
+        assert_eq!(media.base_url, "https://api.deepseek.com");
+        assert_eq!(media.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(media.timeout_ms, 30_000);
+        assert_eq!(media.max_input_bytes, 25 * 1024 * 1024);
+        assert!(media.default_voice.is_none());
+        assert_eq!(media.default_format, "mp3");
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "image_ocr"));
+        assert!(def.tools.iter().any(|tool| tool == "audio_transcribe"));
+        assert!(def.tools.iter().any(|tool| tool == "speech_synthesize"));
+    }
+
+    #[test]
+    fn absent_media_section_keeps_the_mounted_tool_list_untouched() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("config parses");
+        assert!(cfg.media.is_none());
+        let def = cfg.agent_def();
+        assert!(!def.tools.iter().any(|tool| tool == "image_ocr"));
+        assert!(!def.tools.iter().any(|tool| tool == "audio_transcribe"));
+        assert!(!def.tools.iter().any(|tool| tool == "speech_synthesize"));
+    }
+
+    #[test]
+    fn media_section_misconfigurations_refuse_boot() {
+        let without_store = format!("{}media: {{}}\n", valid_yaml());
+        let err = ServeConfig::parse(&without_store).unwrap_err().to_string();
+        assert!(err.contains("requires an artifacts: section"), "{err}");
+
+        let bad_url = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_url: api.deepseek.com\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_url).unwrap_err().to_string();
+        assert!(err.contains("media.base_url"), "{err}");
+
+        let bad_scheme = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_url: ftp://api.deepseek.com\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_scheme).unwrap_err().to_string();
+        assert!(err.contains("absolute http(s)"), "{err}");
+
+        let zero_timeout = format!("{}artifacts: {{}}\nmedia:\n  timeout_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&zero_timeout).unwrap_err().to_string();
+        assert!(err.contains("media.timeout_ms"), "{err}");
+
+        let blank_env = format!(
+            "{}artifacts: {{}}\nmedia:\n  api_key_env: \"  \"\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&blank_env).unwrap_err().to_string();
+        assert!(err.contains("api_key_env"), "{err}");
+
+        let zero_bytes = format!(
+            "{}artifacts: {{}}\nmedia:\n  max_input_bytes: 0\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&zero_bytes).unwrap_err().to_string();
+        assert!(err.contains("max_input_bytes"), "{err}");
+
+        let bad_format = format!(
+            "{}artifacts: {{}}\nmedia:\n  default_format: flac\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_format).unwrap_err().to_string();
+        assert!(err.contains("default_format"), "{err}");
+
+        let typo = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_ur: https://example.com\n",
+            valid_yaml()
+        );
         assert!(
             ServeConfig::parse(&typo).is_err(),
             "unknown keys refuse boot (deny_unknown_fields)"

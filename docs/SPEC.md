@@ -711,6 +711,37 @@ Non-goals recorded with the phase: no second scheduler or per-row timer, no defe
 interactive inputs or steering, no job deferral (the job runtime is not in this tree), no
 `overlap`/queue policy change, no cost guarantee from deferring.
 
+### Client-side media tools (ADR-060, P5a landed)
+
+Scope: OCR, speech-to-text and text-to-speech as client-side bundle tools over documented HTTP
+shapes, with every input and output byte flowing through the content-addressed artifact store. This
+is the ingest half of the media capability: an image or a recording becomes model-addressable
+without bytes ever entering the prompt, and an operator can turn a local file into an artifact —
+before a channel adapter that can deliver media exists (that is P5b).
+
+Semantics: `media:` mounts `image_ocr`, `audio_transcribe` and `speech_synthesize` beside the local tools
+and requires `artifacts:` (boot refuses without it); an absent section keeps the mounted tool set
+byte-identical. `image_ocr` takes `{"artifact","media_type"?,"prompt"?}` and returns `{"text"}`;
+`audio_transcribe` takes `{"artifact","media_type"?,"language"?}` and returns `{"text"}`;
+`speech_synthesize` takes `{"text","format"?,"voice"?}` and writes the audio blob into the artifact
+store, returning `{"artifact":{"id","size","media_type"}}`. A missing artifact (aged out) or an input
+above `media.max_input_bytes` is refused before any request. Provider failures are honest error results
+with a bounded body; 408/429/5xx are retryable, a 4xx is not. `kian artifacts put <path>` writes a local
+file into the same store and prints the reference. Tool descriptions and result text mark OCR/ASR
+output as untrusted data, never instructions.
+
+The provider protocol is the client-side HTTP adapter described in
+[ADR-060](../design/decisions/ADR-060-client-side-media-tools.md); the blob contract is ADR-055; the
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5a | kian-media, kian-cli | the `kian-media` bundle tools (OCR, ASR, TTS) over the artifact store, the `media:` config section with boot validation, and `kian artifacts put` ingest | landed |
+
+Non-goals recorded with the phase: no channel media delivery (P5b), no vision content parts
+(P5c), no media pricing in the cost projection, no media persisted as an event, no server-side
+media tool in the core.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it

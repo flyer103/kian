@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Client-side media tools and file ingest (ADR-060, P5a).** `media:` mounts
+  `image_ocr`, `audio_transcribe` and `speech_synthesize` as ordinary audited tools over
+  DeepSeek's media HTTP APIs; input bytes are read from and synthesized audio is written into the
+  content-addressed artifact store (ADR-055), so no media rides the prompt inline. `kian artifacts
+  put <path>` turns a local file into an artifact. `media:` requires `artifacts:`; an absent section
+  keeps the tool set byte-identical. Semantics in [SPEC](docs/SPEC.md), placement in
+  [DESIGN](design/DESIGN.md) §2.2.
 - **Batch and scheduled admissions can wait for an off-peak pricing window (DESIGN §2.3, CRON-MODEL §6.1, API-CONTRACT §3.2, ADR-059)**.
   A pure planner beside the price book returns the next off-peak instant, bounded by
   `defer.max_wait_ms`; the ordinary inbox row is persisted with that `eligible_at` and the

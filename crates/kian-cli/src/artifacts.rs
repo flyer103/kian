@@ -327,6 +327,82 @@ pub fn run_artifacts_gc(
     ))
 }
 
+/// `kian artifacts put` — ingest a local file into the content-addressed
+/// blob tree and print its reference (ADR-060).
+///
+/// Bounds and the default directory come from the artifacts: section; an
+/// explicit dir lets an operator ingest into a standalone tree.
+pub fn run_artifacts_put(
+    config_path: &std::path::Path,
+    dir: Option<std::path::PathBuf>,
+    path: &std::path::Path,
+    media_type: Option<String>,
+    json: bool,
+) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let config = match dir {
+        Some(_) => ServeConfig::load(config_path).ok(),
+        None => Some(ServeConfig::load(config_path).map_err(|e| format!("config: {e}"))?),
+    };
+    let dir = match dir {
+        Some(dir) => dir,
+        None => {
+            let config = config.expect("config loads when dir is absent");
+            let artifacts = config.artifacts.as_ref().ok_or_else(|| {
+                "artifacts: the config has no artifacts: section, add one or pass --dir".to_string()
+            })?;
+            artifacts.resolve_dir(&config.storage)?
+        }
+    };
+    let media_type = media_type.unwrap_or_else(|| infer_media_type(path));
+    let store =
+        ArtifactStore::open(&dir).map_err(|e| format!("artifacts: open {}: {e}", dir.display()))?;
+    let reference = store
+        .put(&bytes, media_type.clone())
+        .map_err(|e| format!("artifacts: put {}: {e}", dir.display()))?;
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "dir": dir.display().to_string(),
+            "path": path.display().to_string(),
+            "id": reference.id,
+            "size": reference.size,
+            "media_type": reference.media_type,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    Ok(format!(
+        "kian artifacts put: {} -> {} ({}, {} bytes)\n",
+        path.display(),
+        reference.id,
+        reference.media_type,
+        reference.size,
+    ))
+}
+
+/// The media type guessed from a file extension (the operator override wins).
+fn infer_media_type(path: &std::path::Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +597,62 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&pinned);
+    }
+
+    #[test]
+    fn the_put_command_ingests_a_file_with_an_inferred_media_type() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let source = dir.join("frame.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nbytes").expect("write");
+        let out = run_artifacts_put(
+            std::path::Path::new("/nonexistent/kian.yaml"),
+            Some(dir.clone()),
+            &source,
+            None,
+            true,
+        )
+        .expect("put runs");
+        let report: Value = serde_json::from_str(&out).expect("json report");
+        assert_eq!(report["media_type"], "image/png");
+        assert_eq!(report["size"], 13);
+        let id = report["id"].as_str().expect("id").to_string();
+        let store = ArtifactStore::open(&dir).expect("store");
+        assert_eq!(
+            store.get(&id).expect("get").expect("blob"),
+            b"\x89PNG\r\n\x1a\nbytes".to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_put_command_honours_an_explicit_media_type_and_reports_text() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let source = dir.join("clip.bin");
+        std::fs::write(&source, b"raw").expect("write");
+        let out = run_artifacts_put(
+            std::path::Path::new("/nonexistent/kian.yaml"),
+            Some(dir.clone()),
+            &source,
+            Some("audio/wav".to_string()),
+            false,
+        )
+        .expect("put runs");
+        assert!(out.contains("kian artifacts put:"), "{out}");
+        assert!(out.contains("audio/wav"), "{out}");
+        assert_eq!(
+            infer_media_type(std::path::Path::new("clip.MP3")),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            infer_media_type(std::path::Path::new("clip.webp")),
+            "image/webp"
+        );
+        assert_eq!(
+            infer_media_type(std::path::Path::new("clip")),
+            "application/octet-stream"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

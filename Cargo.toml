@@ -18,6 +18,7 @@ members = [
     "crates/kian-codex",
     "crates/kian-cron",
     "crates/kian-web",
+    "crates/kian-media",
     "crates/kian-cli",
     "crates/kian-imessage-bridge",
     "crates/kiand",
@@ -90,6 +91,9 @@ kian-cron = { path = "crates/kian-cron" }
 # the client-side web tools bundle (ADR-056): DeepSeek Search/Fetch as
 # audited ToolProvider tools, never a core capability.
 kian-web = { path = "crates/kian-web" }
+# the client-side media tools bundle (ADR-060): OCR / ASR / TTS as
+# audited ToolProvider tools over the artifact store, never a core capability.
+kian-media = { path = "crates/kian-media" }
 kian-cli = { path = "crates/kian-cli" }
 kiand = { path = "crates/kiand" }
 

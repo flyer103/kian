@@ -454,7 +454,8 @@ impl Server {
         // Bundle-edge tools mounted beside the local tools. ADR-055: the
         // artifact reader when spill is on. ADR-056 (P2b): the client-side
         // web tools when `web:` is on — the provider key is read here,
-        // once, and a missing value refuses boot.
+        // once, and a missing value refuses boot. ADR-060 (P5a): the media
+        // tools when `media:` is on, under the same key discipline.
         let mut bundle_tools: Vec<Arc<dyn kian_core::seams::ToolProvider>> = Vec::new();
         if let Some(store) = artifact_store.as_ref() {
             bundle_tools.push(Arc::new(crate::artifacts::ArtifactReadTool::new(
@@ -472,6 +473,25 @@ impl Server {
             })
             .map_err(|e| ServeError::Assembly(format!("web: {e}")))?;
             bundle_tools.push(Arc::new(web_tools));
+        }
+        // ADR-060 (P5a): the client-side media tools. They read and write the
+        // same content-addressed store the spill path uses; the provider key is
+        // read here, once, and a missing value refuses boot.
+        if let (Some(media), Some(store)) = (config.media.as_ref(), artifact_store.as_ref()) {
+            let api_key = media.api_key().map_err(ServeError::Assembly)?;
+            let media_tools = kian_media::MediaTools::new(
+                kian_media::MediaToolsConfig {
+                    base_url: media.base_url.clone(),
+                    api_key,
+                    timeout_ms: media.timeout_ms,
+                    max_input_bytes: media.max_input_bytes,
+                    default_voice: media.default_voice.clone(),
+                    default_format: media.default_format.clone(),
+                },
+                Arc::clone(store),
+            )
+            .map_err(|e| ServeError::Assembly(format!("media: {e}")))?;
+            bundle_tools.push(Arc::new(media_tools));
         }
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },

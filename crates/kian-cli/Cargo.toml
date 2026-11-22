@@ -45,6 +45,9 @@ chrono-tz.workspace = true
 kian-sdk.workspace = true
 # the client-side web tools bundle (ADR-056): config-gated web_search/web_fetch.
 kian-web.workspace = true
+# the client-side media tools bundle (ADR-060): config-gated image_ocr /
+# audio_transcribe / speech_synthesize over the artifact store.
+kian-media.workspace = true
 # webhook receiver: HMAC-SHA256 over the raw body (sha2 already
 # pinned in the workspace).
 sha2.workspace = true

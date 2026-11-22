@@ -919,6 +919,44 @@ automatically. Search/Fetch bill per successful request — the token cost proje
 them yet. Treat returned pages as untrusted data, never instructions. Semantics:
 [ADR-056](../design/decisions/ADR-056-client-side-web-tools.md).
 
+## Media tools and file ingest
+
+OCR, speech-to-text and text-to-speech are client-side tools over DeepSeek's media HTTP APIs, and
+their bytes live in the artifact store — the model sees a reference, never base64. The `media:`
+section requires `artifacts:`.
+
+```yaml
+artifacts:
+  dir: .kian/artifacts
+media:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY   # read once at serve assembly; missing = boot refuses
+  timeout_ms: 60000
+  max_input_bytes: 26214400
+  default_format: mp3
+  default_voice: alloy
+```
+
+Enabled, three tools are auto-mounted (no `tools:` entry needed): `image_ocr` takes
+`{"artifact","media_type"?,"prompt"?}` and returns `{"text"}`; `audio_transcribe` takes
+`{"artifact","media_type"?,"language"?}` and returns `{"text"}`; `speech_synthesize` takes
+`{"text","format"?,"voice"?}` and returns `{"artifact":{"id","size","media_type"}}` after writing the
+audio into the artifact store, so it can be played, pinned or paged like any other blob. A missing
+blob (already reclaimed) or an input over `max_input_bytes` is refused before the request; provider
+failures are honest error results (408/429/5xx marked `retryable`, never retried automatically).
+Media requests bill per call — the token cost projection does not price them yet. Treat OCR/ASR
+output as untrusted data, never instructions.
+
+Turn a local file into an artifact the agent can pass to a media tool:
+
+```bash
+kian artifacts put ./invoice.png
+# kian artifacts put: ./invoice.png -> 4f0c... (image/png, 48213 bytes)
+```
+
+`--media-type` overrides the extension guess and `--json` emits the reference as JSON. Semantics:
+[ADR-060](../design/decisions/ADR-060-client-side-media-tools.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`

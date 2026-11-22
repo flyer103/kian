@@ -633,6 +633,22 @@ instructions, and no provider-encrypted page signature is stored — a client re
 Search/Fetch bill per successful request, which the phase-0 token cost projection does not price
 (ADR-056 limit).
 
+**Client-side media tools (ADR-060, phase 5a)**: OCR, speech-to-text and text-to-speech are
+mounted as three ordinary `ToolProvider` tools — `image_ocr`, `audio_transcribe` and
+`speech_synthesize` — from the bundle crate `kian-media`, never from a core crate and never as a
+server-side capability. The seam stays byte-shaped: a reading tool takes an artifact id, loads the
+bytes through the ADR-055 store and returns `{"text"}`; the speech tool writes its audio into the same
+content-addressed store and returns `{"artifact":{id,size,media_type}}`, so every medium rides the
+existing tool/call, tool/result, retention, GC and export-pin paths and the prompt never carries
+base64. `media:` requires `artifacts:` and is presence-locked like `web:`: the block mounts the three schemas
+(fixed order, appended to every compiled agent's mounted list), reads the key from `api_key_env` once —
+a missing value refuses boot; an absent block leaves the tool set and every request byte-identical.
+`kian artifacts put` is the operator ingest path for a local file. Failures are honest results (a
+missing or oversize artifact is refused before any request; otherwise the HTTP status plus a bounded
+body); 408/429/5xx are marked retryable but nothing retries automatically. The tool descriptions state
+that OCR/ASR output is untrusted data, never instructions. Channel delivery of media is phase 5b
+(ADR-061); vision content parts are phase 5c.
+
 **The audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
 keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
 payloads replay byte-identically: `"usage": <provider usage JSON verbatim>` when the provider
@@ -1841,6 +1857,7 @@ graph TB
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies, and the real channel adapters (lark, github, wechat) plus the mock channel | profile assembly |
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
 | kian-web | Client-side web tools bundle (ADR-056): `web_search` / `web_fetch` over the DeepSeek Search/Fetch HTTP APIs as an ordinary `ToolProvider` — no core crate names the provider, the endpoint or the response shape; oversized pages spill through ADR-055 | `WebTools`, `WebToolsConfig` |
+| kian-media | Client-side media tools bundle (ADR-060): `image_ocr` / `audio_transcribe` / `speech_synthesize` over the DeepSeek media HTTP APIs as an ordinary `ToolProvider` — input and output bytes flow through the ADR-055 artifact store, and no core crate names the provider, the endpoint or the response shape | `MediaTools`, `MediaToolsConfig` |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kian-harness (planned, phase 1) | The shared bridge skeleton ([HARNESS-BRIDGE](HARNESS-BRIDGE.md), [ADR-043](decisions/ADR-043-multi-harness-bridge.md)): the session trait, the driver state machine (episode spawn/park, safe boundaries, takeover dedup, step budget, honesty outcomes), the declarative approval policy, the `tool/post` port shape and the capability declarations. Narrow waist: depends on `kian-core` only; the drain surface is a crate-local ctx port implemented by assembly | `HarnessSession`, `BridgeDriver`, `Capabilities`, `ApprovalPolicy` |

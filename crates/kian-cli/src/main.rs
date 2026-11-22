@@ -77,6 +77,8 @@ const USAGE: &str = "usage:
   kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
                [--retention-days N] [--json]
                                          retention GC of the tool-result artifact tree (oldest first)
+  kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]
+                                         ingest a local file into the artifact tree (ADR-060)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -455,11 +457,12 @@ fn cost(args: &[String]) -> ExitCode {
 /// retention pass over the content-addressed tool-result blob tree (ADR-055).
 fn artifacts(args: &[String]) -> ExitCode {
     let Some(subcommand) = args.first() else {
-        eprintln!("kian: artifacts expects a subcommand (gc)\n{USAGE}");
+        eprintln!("kian: artifacts expects a subcommand (gc|put)\n{USAGE}");
         return ExitCode::from(2);
     };
     match subcommand.as_str() {
         "gc" => artifacts_gc(&args[1..]),
+        "put" => artifacts_put(&args[1..]),
         other => {
             eprintln!("kian: unknown artifacts subcommand `{other}`\n{USAGE}");
             ExitCode::from(2)
@@ -519,6 +522,68 @@ fn artifacts_gc(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("kian: artifacts gc failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]`:
+/// ingest a local file into the content-addressed artifact tree (ADR-060).
+fn artifacts_put(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut media_type: Option<String> = None;
+    let mut json = false;
+    let mut file: Option<std::path::PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--dir" => match iter.next() {
+                Some(p) => dir = Some(p.into()),
+                None => {
+                    eprintln!("kian: --dir requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--media-type" => match iter.next() {
+                Some(value) => media_type = Some(value.clone()),
+                None => {
+                    eprintln!("kian: --media-type requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown artifacts put option {other}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            positional => {
+                if file.is_some() {
+                    eprintln!("kian: artifacts put takes exactly one file\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                file = Some(positional.into());
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("kian: artifacts put requires a file path\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    match kian_cli::artifacts::run_artifacts_put(&config_path, dir, &file, media_type, json) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: artifacts put failed — {e}");
             ExitCode::from(2)
         }
     }
