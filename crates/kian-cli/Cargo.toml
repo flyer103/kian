@@ -39,6 +39,9 @@ kian-exec.workspace = true
 # declarations parse their expressions and timezones through it.
 kian-cron.workspace = true
 chrono.workspace = true
+# the pricing book's peak windows and holidays are IANA-timezone
+# aware (ADR-052): wall-clock windows, never a fixed UTC offset.
+chrono-tz.workspace = true
 kian-sdk.workspace = true
 # webhook receiver: HMAC-SHA256 over the raw body (sha2 already
 # pinned in the workspace).

@@ -11,6 +11,9 @@
 //! - `kian usage-stats [--config <path>] [--session <uuid>] [--json]`
 //!   — provider token-usage report: per-store token totals derived
 //!   from `turn/end` usage payloads (verbatim, no pricing).
+//! - `kian cost [--config <path>] [--session <uuid>] [--json]` —
+//!   read-only cost projection: the config price book applied to those
+//!   usage payloads at each attempt's own timestamp (ADR-052).
 //! - `kian session inspect <uuid>` — projection + counters (
 //!   embedded read-only).
 //! - `kian session replay <uuid> [--url <base>]` — re-derive everything
@@ -39,6 +42,8 @@ const USAGE: &str = "usage:
                                          cache-byte stability report
   kian usage-stats [--config <path>] [--session <uuid>] [--json]
                                          provider token-usage report
+  kian cost [--config <path>] [--session <uuid>] [--json]
+                                         priced usage from the config price book
   kian session inspect <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          projection + counters
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
@@ -131,6 +136,7 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[2..]),
         Some("cache-stats") => cache_stats(&args[2..]),
         Some("usage-stats") => usage_stats(&args[2..]),
+        Some("cost") => cost(&args[2..]),
         Some("session") => session(&args[2..]),
         Some("archive") => archive(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
@@ -364,6 +370,66 @@ fn usage_stats(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("kian: usage-stats failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian cost [--config <path>] [--session <uuid>] [--json]` — the
+/// read-only cost projection from the configured store (mirrors
+/// `usage-stats`; ADR-052).
+fn cost(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut session: Option<kian_core::model::SessionId> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match iter.next() {
+                Some(s) => match s.parse::<uuid::Uuid>() {
+                    Ok(u) => session = Some(kian_core::model::SessionId(u)),
+                    Err(_) => {
+                        eprintln!("kian: --session requires a uuid\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --session requires a uuid\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown cost option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("kian: cannot start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(kian_cli::cost::run_cost(&config_path, session, json)) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: cost failed — {e}");
             ExitCode::from(2)
         }
     }

@@ -62,7 +62,7 @@
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
   the event stream stays the only truth.
-- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/workers,
+- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/cost/workers,
   `/metrics`, and a frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
   process plus embedded sqlite is the whole system, with no hosted service required.
@@ -698,6 +698,31 @@ target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store
 Semantics: [design/CRON-MODEL.md](../design/CRON-MODEL.md); decision:
 [ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
 
+## Cost projection
+
+`pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
+prices each turn at its attempt timestamp, including peak windows and holidays.
+
+```yaml
+pricing:
+  currency: USD
+  peak_multiplier: 2.0
+  peak_windows:
+    - { weekdays: [mon, tue, wed, thu, fri], start: "01:00", end: "04:00", timezone: UTC }
+  models:
+    deepseek/deepseek-flash: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }
+model_profiles:
+  deepseek/deepseek-flash: { dialect: openai_chat, context_window: 1000000, max_output: 384000, reasoning: true, vision: true, strict: true }
+```
+
+```bash
+target/debug/kian cost --config kian.yaml --session <uuid>
+target/debug/kian cost --config kian.yaml --json
+```
+
+Unpriced models are counted, never priced at zero; an absent `pricing:` section reports no cost.
+Semantics: [ADR-052](../design/decisions/ADR-052-economics-cost-projection.md).
+
 ## Operator surfaces
 
 | Surface | What it does |
@@ -706,6 +731,7 @@ Semantics: [design/CRON-MODEL.md](../design/CRON-MODEL.md); decision:
 | `kian board [--json]` / `kian tasks --all [--json]` | Read-only delegation task board: one row per task (task_id, assignee, attempt, outcome, gate); refuses with exit 2 while `superagent.board.enabled` is false |
 | `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
+| `kian cost [--json]` | Read-only cost projection over the config `pricing:` book: priced/unpriced requests, peak/off-peak split, exact micro-currency total |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
 | `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids |

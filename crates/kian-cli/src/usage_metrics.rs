@@ -12,18 +12,26 @@
 //!
 //! Field spellings accepted from the verbatim usage object (the
 //! openai-compat provider emits openai spellings; anthropic-style keys
-//! are accepted so future providers need no core change):
+//! and DeepSeek's cache keys are accepted so future providers need no
+//! core change):
 //!
-//! | total | primary key | accepted alias |
+//! | total | primary key | accepted aliases |
 //! |------------------------------|------------------------------|-----------------------------------------|
-//! | `input_tokens` | `input_tokens` | `prompt_tokens` |
-//! | `output_tokens` | `output_tokens` | `completion_tokens` |
-//! | `cache_read_input_tokens` | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens` |
-//! | `cache_creation_input_tokens`| `cache_creation_input_tokens`| — |
+//! | input_tokens | input_tokens | prompt_tokens |
+//! | output_tokens | output_tokens | completion_tokens |
+//! | cache_read_input_tokens | cache_read_input_tokens | prompt_tokens_details.cached_tokens, prompt_cache_hit_tokens |
+//! | cache_miss_input_tokens | cache_miss_input_tokens | prompt_cache_miss_tokens; derived when absent (see below) |
+//! | cache_creation_input_tokens | cache_creation_input_tokens | — |
 //!
-//! A `turn/end` whose usage object yields **none** of the four kinds is
-//! counted under `unknown_usage_requests` (still counted under
-//! `requests_with_usage` — the provider did report something, kian just
+//! cache_miss_input_tokens is the uncached input the provider bills at the
+//! miss price. When the usage object carries no explicit miss field:
+//! openai-style and DeepSeek-style objects include cache hits in the input
+//! total, so miss = input - hit (saturating); anthropic-style objects
+//! report input_tokens net of cache reads, so miss = input.
+//!
+//! A turn/end whose usage object yields none of the recognized kinds is
+//! counted under unknown_usage_requests (still counted under
+//! requests_with_usage — the provider did report something, kian just
 //! does not recognize the spelling).
 
 use kian_core::events::{Event, EventKind};
@@ -42,6 +50,9 @@ pub struct SessionUsageReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Uncached input tokens (billed at the miss price). Derived when the
+    /// provider reports only a hit count.
+    pub cache_miss_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
 }
 
@@ -55,6 +66,7 @@ pub struct UsageStatsReport {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    pub cache_miss_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
 }
 
@@ -67,50 +79,71 @@ impl UsageStatsReport {
         self.input_tokens += s.input_tokens;
         self.output_tokens += s.output_tokens;
         self.cache_read_input_tokens += s.cache_read_input_tokens;
+        self.cache_miss_input_tokens += s.cache_miss_input_tokens;
         self.cache_creation_input_tokens += s.cache_creation_input_tokens;
     }
 }
 
-/// The recognized token kinds of one verbatim usage object. `None` when
-/// the object matches none of them (an unknown spelling).
+/// The recognized token kinds of one verbatim usage object.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct UsageTotals {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
+pub(crate) struct UsageTotals {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) cache_miss_input_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
 }
 
 impl UsageTotals {
-    fn recognized(&self) -> bool {
+    pub(crate) fn recognized(&self) -> bool {
         *self != Self::default()
     }
 }
 
-/// Extracts the four recognized token kinds from a verbatim usage
-/// object (see the module table for the accepted spellings). Saturating:
-/// no field is summed twice from two spellings — the primary key wins.
-fn usage_totals(usage: &serde_json::Value) -> UsageTotals {
+/// Extracts the recognized token kinds from a verbatim usage object (see
+/// the module table for the accepted spellings). The primary spelling
+/// wins; no field is summed twice. When no miss field is present the miss
+/// total is derived from the hit spelling's billing convention.
+pub(crate) fn usage_totals(usage: &serde_json::Value) -> UsageTotals {
     let get = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| usage.get(*k).and_then(serde_json::Value::as_u64))
     };
+    let input = get(&["input_tokens", "prompt_tokens"]).unwrap_or(0);
+    let output = get(&["output_tokens", "completion_tokens"]).unwrap_or(0);
+
+    // anthropic input_tokens is net of cache reads; openai prompt_tokens
+    // and DeepSeek prompt_tokens include them.
+    let anthropic_hit = usage
+        .get("cache_read_input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let openai_hit = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let deepseek_hit = usage
+        .get("prompt_cache_hit_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let (cache_read, hit_included_in_input) = match (anthropic_hit, openai_hit, deepseek_hit) {
+        (Some(hit), _, _) => (hit, false),
+        (None, Some(hit), _) => (hit, true),
+        (None, None, Some(hit)) => (hit, true),
+        (None, None, None) => (0, false),
+    };
+    let cache_miss =
+        get(&["cache_miss_input_tokens", "prompt_cache_miss_tokens"]).unwrap_or_else(|| {
+            if hit_included_in_input {
+                input.saturating_sub(cache_read)
+            } else {
+                input
+            }
+        });
+
     UsageTotals {
-        input_tokens: get(&["input_tokens", "prompt_tokens"]).unwrap_or(0),
-        output_tokens: get(&["output_tokens", "completion_tokens"]).unwrap_or(0),
-        cache_read_input_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                usage
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .unwrap_or(0),
-        cache_creation_input_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: cache_read,
+        cache_miss_input_tokens: cache_miss,
+        cache_creation_input_tokens: get(&["cache_creation_input_tokens"]).unwrap_or(0),
     }
 }
 
@@ -138,6 +171,7 @@ pub fn session_usage_report(session: SessionId, events: &[Event]) -> SessionUsag
         report.input_tokens += totals.input_tokens;
         report.output_tokens += totals.output_tokens;
         report.cache_read_input_tokens += totals.cache_read_input_tokens;
+        report.cache_miss_input_tokens += totals.cache_miss_input_tokens;
         report.cache_creation_input_tokens += totals.cache_creation_input_tokens;
     }
     report
@@ -200,14 +234,27 @@ pub async fn usage_stats_report(
 /// a pure function of the report).
 #[must_use]
 pub fn render_usage_stats(report: &UsageStatsReport) -> String {
+    let cache_total = report
+        .cache_read_input_tokens
+        .saturating_add(report.cache_miss_input_tokens);
+    let hit_rate = if cache_total == 0 {
+        "n/a".to_string()
+    } else {
+        format!(
+            "{:.1}%",
+            report.cache_read_input_tokens as f64 * 100.0 / cache_total as f64
+        )
+    };
     format!(
-        "sessions                {}\nrequests with usage     {}\nunknown usage requests  {}\ninput tokens            {}\noutput tokens           {}\ncache read tokens       {}\ncache creation tokens   {}\n",
+        "sessions                {}\nrequests with usage     {}\nunknown usage requests  {}\ninput tokens            {}\noutput tokens           {}\ncache read tokens       {}\ncache miss tokens       {}\ncache hit rate          {}\ncache creation tokens   {}\n",
         report.sessions,
         report.requests_with_usage,
         report.unknown_usage_requests,
         report.input_tokens,
         report.output_tokens,
         report.cache_read_input_tokens,
+        report.cache_miss_input_tokens,
+        hit_rate,
         report.cache_creation_input_tokens,
     )
 }
@@ -356,6 +403,9 @@ mod tests {
         assert_eq!(r.input_tokens, 111);
         assert_eq!(r.output_tokens, 54);
         assert_eq!(r.cache_read_input_tokens, 63);
+        // openai: 11 prompt tokens include 3 cached -> 8 miss; anthropic:
+        // 100 input tokens are net of 60 cache reads -> 100 miss.
+        assert_eq!(r.cache_miss_input_tokens, 108);
         assert_eq!(r.cache_creation_input_tokens, 7);
     }
 
@@ -371,6 +421,31 @@ mod tests {
         let r = session_usage_report(SessionId(Uuid::nil()), &b.build());
         assert_eq!(r.input_tokens, 10);
         assert_eq!(r.output_tokens, 2);
+        assert_eq!(r.unknown_usage_requests, 0);
+    }
+
+    /// DeepSeek spellings: prompt_cache_hit_tokens is the cache read;
+    /// the miss total is explicit when reported and derived otherwise.
+    #[test]
+    fn deepseek_cache_keys_are_recognized() {
+        let mut b = B::new();
+        b.turn_end(json!({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 800, "prompt_cache_miss_tokens": 200
+        }}));
+        b.turn_end(json!({"usage": {
+            "prompt_tokens": 100, "completion_tokens": 1,
+            "prompt_cache_hit_tokens": 90
+        }}));
+        b.turn_end(json!({"usage": {
+            "prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_cache_hit_tokens": 9, "prompt_cache_miss_tokens": 7
+        }}));
+        let r = session_usage_report(SessionId(Uuid::nil()), &b.build());
+        assert_eq!(r.requests_with_usage, 3);
+        assert_eq!(r.input_tokens, 1110);
+        assert_eq!(r.cache_read_input_tokens, 899);
+        assert_eq!(r.cache_miss_input_tokens, 217);
         assert_eq!(r.unknown_usage_requests, 0);
     }
 
@@ -425,6 +500,7 @@ mod tests {
         assert_eq!(report.input_tokens, 25);
         assert_eq!(report.output_tokens, 10);
         assert_eq!(report.cache_read_input_tokens, 0);
+        assert_eq!(report.cache_miss_input_tokens, 25);
         assert_eq!(report.cache_creation_input_tokens, 0);
 
         // Single-session restriction folds exactly that session.
@@ -438,6 +514,7 @@ mod tests {
                 input_tokens: 25,
                 output_tokens: 10,
                 cache_read_input_tokens: 0,
+                cache_miss_input_tokens: 25,
                 cache_creation_input_tokens: 0,
             }
         );
@@ -450,6 +527,7 @@ mod tests {
                 input_tokens: 25,
                 output_tokens: 10,
                 cache_read_input_tokens: 0,
+                cache_miss_input_tokens: 25,
                 cache_creation_input_tokens: 0,
             }
         );

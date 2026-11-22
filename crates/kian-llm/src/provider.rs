@@ -534,8 +534,12 @@ fn map_error_status(status: reqwest::StatusCode, body: &str) -> ProviderError {
     match code {
         429 => ProviderError::RateLimited,
         408 => ProviderError::Transport(format!("HTTP {code}: {snippet}")),
-        400 | 413 if is_context_overflow(body) => ProviderError::ContextOverflow,
-        400 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
+        // 400/413/422 are request-shape failures: failover to another
+        // provider would send the same rejected bytes and burn budget.
+        // The context markers are the one recoverable shape (route to
+        // compress_then_retry, never to failover).
+        400 | 413 | 422 if is_context_overflow(body) => ProviderError::ContextOverflow,
+        400 | 413 | 422 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
         _ => ProviderError::Unavailable(format!("HTTP {code}: {snippet}")),
     }
 }
@@ -556,6 +560,9 @@ fn map_error_payload(err: &Value) -> ProviderError {
     }
     if is_context_overflow(msg) || typ.contains("context") {
         return ProviderError::ContextOverflow;
+    }
+    if matches!(code, Some(400 | 422)) || typ.contains("invalid_request") {
+        return ProviderError::InvalidResponse(msg.to_string());
     }
     ProviderError::Unavailable(msg.to_string())
 }
@@ -1119,6 +1126,22 @@ mod tests {
                     r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
                 ),
             ),
+            (
+                "/e400plain",
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":{"message":"bad request"}}"#),
+            ),
+            (
+                "/e422",
+                ResponseTemplate::new(422)
+                    .set_body_string(r#"{"error":{"message":"tool schema is invalid"}}"#),
+            ),
+            (
+                "/e422ctx",
+                ResponseTemplate::new(422).set_body_string(
+                    r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
+                ),
+            ),
         ] {
             Mock::given(method("POST"))
                 .and(path(p))
@@ -1136,6 +1159,19 @@ mod tests {
             ("/e429", ProviderError::RateLimited),
             ("/e500", ProviderError::Unavailable("HTTP 500: boom".into())),
             ("/e400", ProviderError::ContextOverflow),
+            (
+                "/e400plain",
+                ProviderError::InvalidResponse(
+                    "HTTP 400: {\"error\":{\"message\":\"bad request\"}}".into(),
+                ),
+            ),
+            (
+                "/e422",
+                ProviderError::InvalidResponse(
+                    "HTTP 422: {\"error\":{\"message\":\"tool schema is invalid\"}}".into(),
+                ),
+            ),
+            ("/e422ctx", ProviderError::ContextOverflow),
         ] {
             let provider =
                 OpenAiCompatProvider::new(config(&server.uri(), p), Arc::new(sink.clone()));

@@ -345,7 +345,7 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `engine` | object | In-memory engine counters (drain depth, drains started, state transitions, wakes…) — reset with the process |
 | `pending_wake_depth` | integer | In-process pending wake registry depth |
 | `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}` |
-| `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization |
+| `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization. Nested counters are additive: the cache-miss count is always reported (an explicit miss spelling wins; otherwise it is derived from the hit spelling's billing convention, and with no cache spelling all input is miss), and the CLI derives a hit rate at render. Pricing is a separate CLI projection over a config book and never appears here |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
 | `memory` | object or `null` | Counters of the memory assembly: dream counters (dreams, read/parse/append failures, notes appended/deduped) and, when `memory.session` is configured (P2), the injection counters `injected_sessions`/`injected_items`/`injected_bytes`/`injected_truncations`/`injected_skips`; `null` when no `memory:` section assembled |
 | `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |

@@ -151,7 +151,7 @@ implementation ever enters its dependency tree.
 | `kian-harness` | Shared external-harness skeleton: driver state machine, approval policy, fixtures and the capability types the three bridges share |
 | `kian-claude` | Claude Code adapter: `stream-json` child, `can_use_tool` approvals, interrupt |
 | `kian-codex` | Codex adapter: `app-server` JSON-RPC child, server-initiated approvals, interrupt |
-| `kian-cli` | The `kian` binary: `serve` assembly, operator CLI (`inspect`/`replay`/`export`/`wake-now`), the GitHub webhook receiver |
+| `kian-cli` | The `kian` binary: `serve` assembly, operator CLI (`inspect`/`replay`/`export`/`wake-now`/`usage-stats`/`cost`), the GitHub webhook receiver |
 | `kiand` | The endpoint daemon binary (`kian-endpoint` + a thin main) |
 | `kian-imessage-bridge` | The macOS-side iMessage bridge: loopback HTTP over `imsg rpc` for the `type: imessage` channel |
 
@@ -164,6 +164,7 @@ Status is recorded here and in the [CHANGELOG](../CHANGELOG.md). "Default-green"
 |------------|--------|----------------|
 | Crash recovery: `kill -9` mid-drain, restart, no lost work | **done** — default-green | `crates/kian-cli/tests/chaos_recovery.rs`: six kill points (after admit, after claim, mid-provider-turn, mid-tool, before/after the end write) over repeated runs on the same sqlite — no lost work, no half-terminated session, monotone epochs; stale-epoch writes are rejected |
 | Steer / interrupt semantics and honesty | **done** — default-green | `crates/kian-cli/tests/steer_interrupt.rs`: steer lands at the next safe boundary (no input inside an in-flight provider turn); interrupt settles on abort and resumes honestly (interrupt ≠ failed); idle/terminal interrupts are no-ops |
+| Cost projection: exact micro-currency from a config price book, peak/off-peak aware | **done** (phase 0, read-only) — default-green | `crates/kian-cli/tests/cost_projection.rs` + `crates/kian-cli/src/cost.rs` tests: a real store and a real `pricing:` book price two attempts at 38/77 micro-USD; unpriced models are counted, never priced at zero; no event carries a price (ADR-052) |
 | Cache-byte stability | **done** — default-green | `crates/kian-cli/tests/cache_stability.rs`: consecutive requests share the byte prefix; only `compact` breaks it and counts under the `compact` cause; `unexpected_prefix_change` stays zero — exposed on `GET /metrics` and `kian cache-stats` |
 | Super-agent demo: IM request → Router judges → Worker completes → ≤300-unit reply + structured delivery | **done** — default-green | `crates/kian-cli/tests/superagent_demo.rs` (10 tests) plus the negative path where a gate-failed worker never reaches delivered |
 | BYOM: cloud loop + `kiand` execution + watchdog detects an offline endpoint | **done** — default-green | `crates/kian-cli/tests/byom_e2e.rs`: exec round-trip through the durable queue, kill -9 while queued → row parks honestly, watchdog health input within the documented bound, reconnect drains, timeout is an honest error |

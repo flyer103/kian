@@ -96,6 +96,33 @@ models: # model slots (P6: determinism in Kian)
     provider: deepseek
     model: deepseek-chat-v4
 
+model_profiles: # capability facts, config-first (enforced by the request planner from phase 1)
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+    vision: true
+    strict: true
+    cache: true
+
+pricing: # read-only cost projection (kian cost, ADR-052); absent = cost unavailable
+  currency: USD
+  peak_multiplier: 2.0 # applied inside a peak window
+  peak_windows:
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "01:00"
+      end: "04:00"
+      timezone: UTC
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "06:00"
+      end: "10:00"
+      timezone: UTC
+  holidays: ["2026-10-01"] # off-peak regardless of weekday
+  holiday_timezone: Asia/Shanghai
+  models: # off-peak base prices, per million tokens
+    deepseek/deepseek-flash: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }
+
 sessions:
   default_agent: default # points at an agent definition
   inbox_admission: durable # A7
@@ -172,7 +199,7 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, tickets,
+  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, cost, tickets,
   channel credentials (`kian wechat login` — the QR flow writes the WeChat channel's credential
   file; no other channel needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
@@ -339,9 +366,14 @@ surfaces: the README's operator-surface section.
 | Final record | This record + DESIGN/README/CHANGELOG alignment + docs-map link check | landed |
 
 Out of scope (recorded, not silently dropped): the `ask` permission/confirmation plane
-(ADR-015 records the shape; blocking confirmation is a separate design decision), token pricing/cost
-conversion (usage persists verbatim; pricing is a projection-layer decision), CMA wire
+(ADR-015 records the shape; blocking confirmation is a separate design decision), CMA wire
 compatibility, and cross-replica interrupt latency beyond "next safe boundary" (ADR-014).
+
+Cost conversion is no longer out of scope at the projection layer: usage still persists verbatim
+and no event carries a price, but `kian cost` prices a stream from the deployment's config
+`pricing:` book and reports exact integer micro-currency totals ([ADR-052](../design/decisions/ADR-052-economics-cost-projection.md)).
+The core never normalizes or stores cost, and the book is a deployment fact rather than event
+state, so editing a price re-renders history instead of corrupting it.
 
 ### Agent memory (P1–P2, P3a and P3b-1 landed; P3b designed)
 

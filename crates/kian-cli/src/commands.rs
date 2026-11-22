@@ -344,10 +344,11 @@ pub async fn run_inspect(
     // usage lines render only when the stream observed usage.
     if let Some(u) = &report.usage {
         out.push_str(&format!(
-            "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
+            "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache miss     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
             u.input_tokens,
             u.output_tokens,
             u.cache_read_input_tokens,
+            u.cache_miss_input_tokens,
             u.cache_creation_input_tokens,
             u.requests_with_usage,
             u.unknown_usage_requests,

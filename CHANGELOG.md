@@ -8,6 +8,30 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A price book turns usage into money without touching the event stream (DESIGN §7, ADR-052)**.
+  The new top-level `pricing:` config section declares per-million-token cache-hit, cache-miss and
+  output prices plus peak windows (IANA timezone) and holidays; prices are normalized once to
+  integer micro-USD so cost is exact integer arithmetic. `kian cost [--config] [--session] [--json]`
+  is a pure projection: it attributes each `turn/end` usage payload to the last `step/request` or
+  `slot/fallback` target, quotes at the attempt timestamp, and reports priced/unpriced requests,
+  unknown-usage requests and the peak/off-peak split. An unpriced model is counted, never priced at
+  zero; no event or wire shape changes, and editing the book re-renders history.
+- **Usage projections learn the cache-miss side of the bill (ADR-052)**. `kian usage-stats`,
+  `GET /metrics` and `session inspect` now report `cache_miss_input_tokens` alongside the hit and
+  creation counters, recognize DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+  spellings (deriving a miss count when only hits are reported), and render a cache hit rate. The
+  materialized usage view gains the field as a required column, so an old row falls back to an
+  honest full scan.
+- **A rejected DeepSeek request is no longer retried on a fallback (ADR-052)**. HTTP 422 — and an
+  in-band 400/422 error payload — now classifies as `InvalidResponse` instead of `Unavailable`;
+  only genuine transport/provider-down errors fail over. This stops a schema-rejected request from
+  burning a fallback slot, and context-window 422s still map to `ContextOverflow`.
+- **Model capability facts are config-first (ADR-052)**. The new top-level `model_profiles:`
+  section declares a model's dialect, context window, maximum output, and reasoning/vision/strict/
+  cache support. It is parsed and validated at boot now (unknown keys, bad keys or `max_output >
+  context_window` refuse to start) and consumed by the request planner from phase 1; no request
+  byte changes in this phase.
+
 - **A dispatch that never left the process no longer spends the re-drive bound (WORKER-MODEL,
   ADR-033)**. `RegisteredTransport::dispatch_frame` and the connection manager now fail a frame
   whose writer is already closed as `ConnectionError::NotWritten` and flip the transport offline

@@ -60,6 +60,18 @@ pub struct ServeConfig {
     pub agent: AgentConfig,
     /// openai-compatible endpoints the slots may target.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// The `pricing:` section (ADR-052): the read-only cost projection's
+    /// price book. Absent = no pricing; `kian cost` reports unavailable.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pricing::PricingConfig::is_empty"
+    )]
+    pub pricing: crate::pricing::PricingConfig,
+    /// The `model_profiles:` section (ADR-052): declarative provider/model
+    /// capability metadata. Parsed and validated here; the request planner
+    /// consumes it from phase 1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_profiles: BTreeMap<String, crate::pricing::ModelProfileConfig>,
     /// Enabled built-in plugins (validated against the known set).
     #[serde(default = "default_plugins")]
     pub plugins: Vec<String>,
@@ -3581,6 +3593,11 @@ impl ServeConfig {
             .collect()
     }
 
+    /// Builds the normalized price book from the `pricing:` section.
+    pub fn price_book(&self) -> Result<crate::pricing::PriceBook, ConfigError> {
+        self.pricing.book().map_err(invalid)
+    }
+
     /// Cross-reference validation (references resolve, semantics sane).
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Storage: the backend picks its required section, and any
@@ -3644,6 +3661,28 @@ impl ServeConfig {
                 self.listen
             ))
         })?;
+
+        // pricing + model_profiles (ADR-052): normalize the book
+        // fail-closed; capability profiles are declared metadata until the
+        // phase-1 request planner consumes them.
+        self.pricing.book().map_err(invalid)?;
+        for key in self.pricing.models.keys() {
+            let (provider, _model) = crate::pricing::split_model_key(key).map_err(invalid)?;
+            if !self.providers.contains_key(provider) {
+                return Err(invalid(format!(
+                    "pricing.models key `{key}` names provider `{provider}`, which is not declared under providers"
+                )));
+            }
+        }
+        for (key, profile) in &self.model_profiles {
+            let (provider, _model) = crate::pricing::split_model_key(key).map_err(invalid)?;
+            if !self.providers.contains_key(provider) {
+                return Err(invalid(format!(
+                    "model_profiles key `{key}` names provider `{provider}`, which is not declared under providers"
+                )));
+            }
+            profile.validate(key).map_err(invalid)?;
+        }
 
         // read_model.snapshots: sane bounds (fail-closed, never a
         // silently-degenerate maintenance loop).
@@ -5892,6 +5931,26 @@ recovery:
       action: fail
 "#
         .into()
+    }
+
+    #[test]
+    fn pricing_and_model_profiles_parse_and_cross_reference() {
+        let yaml = format!(
+            "{}pricing:\n  currency: USD\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      end: \"04:00\"\n      timezone: UTC\n  models:\n    \"openai/gpt-test\": {{ cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }}\nmodel_profiles:\n  \"openai/gpt-test\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true }}\n",
+            valid_yaml()
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("pricing sections parse");
+        let book = cfg.price_book().expect("price book builds");
+        assert!(book.has_prices());
+        assert_eq!(cfg.model_profiles.len(), 1);
+
+        let undeclared = yaml.replace("\"openai/gpt-test\"", "\"ghost/gpt-test\"");
+        let err = ServeConfig::parse(&undeclared).unwrap_err().to_string();
+        assert!(err.contains("not declared under providers"), "{err}");
+
+        let too_wide = yaml.replace("max_output: 500", "max_output: 2000");
+        let err = ServeConfig::parse(&too_wide).unwrap_err().to_string();
+        assert!(err.contains("must not exceed context_window"), "{err}");
     }
 
     #[test]

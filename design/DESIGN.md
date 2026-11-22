@@ -548,9 +548,16 @@ the declarative table's disposition names; context-projection and slot errors cl
 `usage: Option<Value>` for transport. The `kian usage-stats` command, the `GET /metrics`
 `"usage"` aggregate and the `session inspect` usage lines are pure projections over these
 payloads (`kian-cli::usage_metrics`, pattern of ): per-session and per-store totals for
-`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` plus
-`requests_with_usage` / `unknown_usage_requests` counts. Usage is never normalized or priced in
-core (§15).
+`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_miss_input_tokens`,
+`cache_creation_input_tokens` plus `requests_with_usage` / `unknown_usage_requests` counts. The
+parser learns every provider spelling of the same facts (DeepSeek's `prompt_cache_hit_tokens` /
+`prompt_cache_miss_tokens`, OpenAI's `prompt_tokens_details.cached_tokens`, Anthropic's
+`cache_read_input_tokens`), derives a miss count when the provider only reports a hit count, and
+the CLI derives a cache hit rate at render time. `kian cost` additionally quotes the deployment's
+config `pricing:` book ([ADR-052](decisions/ADR-052-economics-cost-projection.md)) and reports
+priced/unpriced requests, the peak/off-peak split and an exact integer micro-currency total. Cost
+is likewise a pure projection: no event carries a price or a cost, usage is never normalized or
+priced in core (§15), and editing the book re-renders history rather than rewriting the stream.
 
  Payload additions on the frozen contracts (same discipline as —
 additive top-level keys **outside `content`**, omitted when unset, never in
