@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A session-lifetime token budget gates before the request flies (DESIGN §15, ADR-054)**.
+  `agents.<name>.budgets.tokens` is a real ceiling now: the loop projects
+  `base + Σbudget/raised − Σturn/end.usage`, admits the request plan's worst case
+  (`estimate.high + max_output`) and refuses the turn **before** any `step/request` is persisted, so
+  a parked session ends `awaiting_budget` (`running → idle`, resumable) instead of overspending.
+  The ceiling is pinned on `session/created.budgets` when configured (replay never depends on
+  today's config); an unconfigured agent keeps the legacy byte-identical stream. `kian raise-budget`
+  and the `raise_budget` RPC admit one durable reserved control row (idempotent, outcomes
+  `accepted`/`deduplicated`/`terminal`) that the owning drain consumes into the new `budget/raised`
+  kind and wakes; the control plane never touches execution. Wall-clock raises are projected but not
+  enforced while a drain is idle, and usage-less turns spend nothing (unknown, never assumed).
 - **Request plans make the sent bytes one auditable value (DESIGN §3.2, ADR-053)**. Every provider
   attempt is now built by a pure planner that returns the body plus its dialect, profile digest,
   body digest and a coarse token band; the sender, the persistence sink, the cache checker and the

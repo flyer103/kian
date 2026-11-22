@@ -2,7 +2,7 @@
 //! wire method, mirroring the server's dispatch exactly:
 //!
 //! - control plane (`POST /rpc`): `create_session`, `submit`, `steer`,
-//!   `queue`, `interrupt`, `projection`;
+//!   `queue`, `interrupt`, `raise_budget`, `projection`;
 //! - ops plane (`POST /ops/rpc`): `wake_now`, `recovery_budget_reset`,
 //!   `mock_channel_send`, `release_worker`.
 //!
@@ -39,6 +39,12 @@ pub struct InterruptResult {
 /// (CONFIRMATION-MODEL §9).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ConfirmResult {
+    pub outcome: String,
+}
+
+/// `raise_budget` → `{"outcome": "accepted" | "deduplicated" | "terminal"}` (ADR-054).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RaiseBudgetResult {
     pub outcome: String,
 }
 
@@ -221,6 +227,40 @@ impl KianClient {
             params["requested_by"] = json!(who);
         }
         let result = self.rpc("confirm", params).await?;
+        Self::parse(result)
+    }
+
+    /// Control plane: raise a session's lifetime budget (ADR-054). It
+    /// admits ONE durable reserved control row (idempotent) that the
+    /// owning drain consumes into `budget/raised`; the outcome is the
+    /// server's honest receipt (`accepted` / `deduplicated` /
+    /// `terminal`). At least one amount must be positive.
+    pub async fn raise_budget(
+        &self,
+        session: &str,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<&str>,
+        requested_by: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<RaiseBudgetResult, ClientError> {
+        let mut params = json!({"session": session});
+        if let Some(tokens) = tokens {
+            params["tokens"] = json!(tokens);
+        }
+        if let Some(ms) = wall_clock_ms {
+            params["wall_clock_ms"] = json!(ms);
+        }
+        if let Some(reason) = reason {
+            params["reason"] = json!(reason);
+        }
+        if let Some(who) = requested_by {
+            params["requested_by"] = json!(who);
+        }
+        if let Some(key) = idempotency_key {
+            params["idempotency_key"] = json!(key);
+        }
+        let result = self.rpc("raise_budget", params).await?;
         Self::parse(result)
     }
 

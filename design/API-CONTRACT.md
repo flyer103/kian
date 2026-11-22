@@ -84,7 +84,9 @@ suffix.
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
 new documented code. The confirmation plane introduces **no** new code: its non-normal answers are
-`outcome` values (`not_pending`/`expired`), and its refusals reuse `-32001`/`-32007`/`-32602`.
+`outcome` values (`not_pending`/`expired`), and its refusals reuse `-32001`/`-32007`/`-32602`. The
+budget plane likewise adds no code: its non-normal answers are `outcome` values
+(`deduplicated`/`terminal`), and its refusals reuse `-32001`/`-32007`/`-32602`.
 
 ### 2.3 Values
 
@@ -121,6 +123,7 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 | `queue` | same as `submit` | `{"deduplicated":<bool>}` |
 | `interrupt` | `{"session":"<uuid>"}` | `{"outcome":"requested" \| "not_draining"}` |
 | `confirm` | `{"session":"<uuid>","call_id":"<str>","decision":"approve" \| "reject","reason":"<str>"?,"requested_by":"<str>"?}` | `{"outcome":"accepted" \| "not_pending" \| "expired"}` |
+| `raise_budget` | `{"session":"<uuid>","tokens":<u64>?,"wall_clock_ms":<u64>?,"reason":"<str>"?,"requested_by":"<str>"?,"idempotency_key":"<str>"?}` | `{"outcome":"accepted" \| "deduplicated" \| "terminal"}` |
 | `pending` | `{"session":"<uuid>"}` | `{"pending":[{"call_id","tool","arguments","requested_at_ms","expired"}]}` |
 | `projection` | `{"session":"<uuid>","since":<u64>?}` | `{"version":<u64>,"state":"<see §2.3>"}` or `{"version":<u64>,"unchanged":true}` |
 
@@ -149,6 +152,15 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   `expired` = the ask lapsed under `confirmation.ttl_ms` and a durable reject-with-`expired` row was
   admitted so the session resumes (the caller's decision was **not** applied). An archived session
   is `-32007`. A malformed `call_id`/`decision` is `-32602`.
+- `raise_budget` adds to one session's lifetime token/wall-clock budget (ADR-054). It admits ONE
+  reserved budget row under `idempotency_key` (caller-supplied wins, else
+  `budget:<session>:<tokens>:<wall_clock_ms>:<requested_at_ms>`) and wakes; the owning drain
+  consumes it into a `budget/raised` event. It writes nothing else and never touches execution, so
+  there is no `requested`/`not_draining` distinction — the row is the outcome. `accepted` = the
+  row is durable; `deduplicated` = an identical row already exists; `terminal` = the session is
+  completed/cancelled/rotated, so nothing was admitted (no event is minted for a dead session).
+  Both amounts absent or zero is `-32602`; unknown session `-32001`; archived `-32007`. Wall-clock
+  raises are recorded and projected but not enforced (ADR-054 §Limits).
 - `pending` is a pure read of one session's stream: the unanswered asks in call order with the TTL
   overlay computed at read time (`expired` is a liveness overlay, never persisted). Unknown session
   `-32001`, archived `-32007`.
@@ -261,7 +273,7 @@ session's durable stream, resumable per connection via `Last-Event-ID` (READ-MOD
 ### 5.2 Termination and resumption
 
 The stream closes after the first `session/ended` event, whatever its reason. Terminal ends
-(`completed`, `cancelled`, `rotated`) freeze the projection. An `interrupted`/`failed`/`awaiting_input` end is
+(`completed`, `cancelled`, `rotated`) freeze the projection. An `interrupted`/`failed`/`awaiting_input`/`awaiting_budget` end is
 state-preserving (`running → idle`), so a resumed session appends later events; those are observed
 on a **new connection**.
 

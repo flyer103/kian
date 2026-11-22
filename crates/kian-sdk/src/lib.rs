@@ -18,7 +18,7 @@
 //!
 //! - [`KianClient`] — the transport (`rpc`/`ops`) and the typed surface
 //!   v1 (`create_session`, `submit`, `steer`, `queue`, `interrupt`,
-//!   `projection`, the `events` SSE helper, the ops wrappers, and the
+//!   `raise_budget`, `projection`, the `events` SSE helper, the ops wrappers, and the
 //!   pure derived-event-id helper `KianClient::event_id`).
 //! - [`ClientError`] — typed, matchable errors (never string-parsed).
 //! - [`SseFrame`] — one parsed frame of the event stream.
@@ -39,5 +39,6 @@ pub use sse::SseFrame;
 pub use transport::KianClient;
 pub use typed::{
     ConfirmResult, CreateSessionResult, InputAck, InterruptResult, MockSendReceipt, PendingAsk,
-    PendingResult, ProjectionResult, ProjectionVersioned, ResetReceipt, WakeOutcome,
+    PendingResult, ProjectionResult, ProjectionVersioned, RaiseBudgetResult, ResetReceipt,
+    WakeOutcome,
 };

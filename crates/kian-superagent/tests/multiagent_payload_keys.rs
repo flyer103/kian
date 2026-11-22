@@ -1112,7 +1112,7 @@ async fn evidence_ref_points_at_the_committed_verdict_seq() {
 
 /// The exhaustive spelling match: adding or removing an `EventKind`
 /// variant breaks this function's compile, and the pinned count pins
-/// the catalog at 23 (EVENT-MODEL §3). The migration chain is pinned
+/// the catalog at 24 (EVENT-MODEL §3). The migration chain is pinned
 /// at its landed nine entries (v0..=v8) — P4 adds payload keys only.
 /// [anchors.md rule 5]
 #[test]
@@ -1141,6 +1141,7 @@ fn no_new_event_kind_route_table_or_migration() {
             InputSpilled => "input/spilled",
             ControlInterrupt => "control/interrupt",
             ControlConfirm => "control/confirm",
+            BudgetRaised => "budget/raised",
             MemoryNote => "memory/note",
             SessionEnded { .. } => "session/ended",
         }
@@ -1168,16 +1169,13 @@ fn no_new_event_kind_route_table_or_migration() {
         InputSpilled,
         ControlInterrupt,
         ControlConfirm,
+        BudgetRaised,
         MemoryNote,
         SessionEnded {
             reason: EndReason::Completed,
         },
     ];
-    assert_eq!(
-        all.len(),
-        23,
-        "the kind catalog is 23 after control/confirm"
-    );
+    assert_eq!(all.len(), 24, "the kind catalog is 24 after budget/raised");
     assert_eq!(spelling(all[0]), "session/created");
 
     let chain = kian_store::migrations::chain();

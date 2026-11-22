@@ -165,8 +165,8 @@ through an explicit transition table. `session/created`→create; `drain/claimed
 resume, or takeover: a second claim with no end write in between is the crash-recovery stream
 shape and projects `running→running` (safety against true double-claims is the store's epoch
 fence, not the projection); `session/ended{reason}`→end write, where `completed`/`cancelled`/`rotated` are
-terminal and freeze the stream, while `interrupted`/`failed` release ownership cleanly and return
-the session to `idle` (honest labeling lives in the events; resume = new claim; the final end
+terminal and freeze the stream, while `interrupted`/`failed`/`awaiting_input`/`awaiting_budget`
+release ownership cleanly and return the session to `idle` (honest labeling lives in the events; resume = new claim; the final end
 write records the final outcome); `input/admitted` and `thread/started` 
 preserve `idle`/`running`/`recoverable` — `thread/started` is appended to the worker's
 stream after `session/created` but before the first `drain/claimed`, and to the Router's
@@ -1512,6 +1512,7 @@ Unified semantics (portable across harnesses/channels):
 | `queue(msg)` | Queue an input without interrupting the current drain |
 | `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-036](decisions/ADR-036-durable-confirmation-plane.md)) |
 | `pending(session)` | The session's unanswered asks with the TTL overlay — a pure read, no writes |
+| `raise_budget(tokens?, wall_clock_ms?, reason?)` | Add to a session's lifetime budget; ONE durable control row consumed into `budget/raised`, idempotent, never touches execution. Contract: [ADR-054](decisions/ADR-054-session-budget-gate.md) |
 
 Implementation: JSON-RPC over HTTP (axum) + SSE event stream. All control-plane operations **only
 write the inbox / read projections** (the layered iron rule), never touching execution directly.
@@ -1523,7 +1524,8 @@ restating the wire.
 
  Refinement (the surface, as implemented by `kian-cli`): the wire is `POST /rpc` carrying
 `{jsonrpc, id, method, params}` with the method set `create_session`, `submit`, `steer`, `queue`,
-`interrupt`, `projection` (standard JSON-RPC error codes; unknown session = -32001), plus
+`interrupt`, `projection`, and (since their planes landed) `confirm`, `pending`, `raise_budget`
+(standard JSON-RPC error codes; unknown session = -32001), plus
 `GET /sessions/{id}/events` — SSE frames `event: kian` (one per store event, interval-poll of the
 event stream, strictly increasing seq), `event: done` after `session/ended`, `event: error` for an
 unknown session. `confirm`/`pending` are implemented since the confirmation plane landed
@@ -1983,7 +1985,19 @@ wake transport is an advisory accelerator — availability never depends on it.
 - Token usage is a durable fact: providers' `usage` objects persist verbatim on `turn/end`
  (drain-activity, never context-bearing) and `kian usage-stats` / `GET /metrics` project token
  totals from them. Pricing/cost conversion is deliberately a projection-layer decision outside
- core — the event stream carries the provider's own numbers, unnormalized.
+ core — the event stream carries the provider's own numbers, unnormalized. `kian cost` prices each
+  attempt at its own timestamp against the config `pricing:` book (ADR-052); an unpriced model is
+  counted, never priced at zero.
+- **Session token budget (ADR-054).** A session-lifetime token ceiling, declared per agent
+  (`agents.<name>.budgets.tokens`) and pinned on `session/created.budgets` when configured, gates
+  *before* a provider request is sent: the loop builds the request plan, projects
+  `base + Σbudget/raised − Σturn/end.usage`, and refuses the turn when `spent + estimate.high +
+  max_output` would exceed the ceiling — so no bytes are persisted, no request flies, and the drain
+  ends `awaiting_budget` (`running → idle`, resumable, honest). A raise is a durable reserved
+  control row consumed into `budget/raised` (idempotent, never context); the control plane never
+  touches execution. Wall-clock raises are recorded and projected but not enforced while a drain is
+  idle. Usage-less turns spend nothing in the projection (unknown, never assumed). With no
+  configured budget the projection has no ceiling and behavior is byte-identical legacy.
 
 ## 16. Migration and compatibility
 

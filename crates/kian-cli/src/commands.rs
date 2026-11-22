@@ -2229,6 +2229,72 @@ pub async fn run_confirm(
     ))
 }
 
+/// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+/// [--requested-by <who>] [--idempotency-key <key>] [--url <base>] [--config <path>]
+/// [--json]`: admits one durable budget-raise control row (ADR-054). The RPC result is the honest
+/// outcome — `accepted`, `deduplicated` or `terminal`; the effect is observed on the event stream.
+pub struct RaiseBudgetRequest<'a> {
+    pub session: SessionId,
+    pub tokens: Option<u64>,
+    pub wall_clock_ms: Option<u64>,
+    pub reason: Option<&'a str>,
+    pub requested_by: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+}
+
+pub async fn run_raise_budget(
+    config_path: &Path,
+    url: Option<&str>,
+    req: RaiseBudgetRequest<'_>,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let mut params = json!({"session": req.session.0.to_string()});
+    if let Some(tokens) = req.tokens {
+        params["tokens"] = json!(tokens);
+    }
+    if let Some(ms) = req.wall_clock_ms {
+        params["wall_clock_ms"] = json!(ms);
+    }
+    if let Some(reason) = req.reason {
+        params["reason"] = json!(reason);
+    }
+    if let Some(who) = req.requested_by {
+        params["requested_by"] = json!(who);
+    }
+    if let Some(key) = req.idempotency_key {
+        params["idempotency_key"] = json!(key);
+    }
+    let result = client
+        .rpc("raise_budget", params)
+        .await
+        .map_err(|e| format!("raise-budget: {e}"))?;
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": req.session.0.to_string(),
+            "tokens": req.tokens,
+            "wall_clock_ms": req.wall_clock_ms,
+            "outcome": outcome,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let meaning = match outcome.as_str() {
+        "accepted" => "the raise is durable; the drain consumes it and resumes",
+        "deduplicated" => "an identical raise was already admitted; nothing new was written",
+        "terminal" => "the session is terminal; no raise was admitted",
+        _ => "unknown outcome",
+    };
+    Ok(format!(
+        "session {}\noutcome             {}\n{}\n",
+        req.session.0, outcome, meaning,
+    ))
+}
+
 /// `kian workers release <id> [--reason <text>] [--url <base>]
 /// [--config <path>] [--json]`: close the worker's live bound thread and
 /// free its 1:1 slot (ADR-035). Refused honestly while the thread is

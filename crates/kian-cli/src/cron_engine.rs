@@ -543,7 +543,7 @@ impl CronTickStore for DurableCronTickStore {
                         ev.kind,
                         EventKind::SessionEnded {
                             reason: r
-                        } if r != EndReason::AwaitingInput
+                        } if r != EndReason::AwaitingInput && r != EndReason::AwaitingBudget
                     )
             }) else {
                 continue;
@@ -566,7 +566,7 @@ impl CronTickStore for DurableCronTickStore {
                     Some("cancelled".to_string()),
                 ),
                 // Excluded by the scan above; kept exhaustive.
-                EndReason::AwaitingInput => continue,
+                EndReason::AwaitingInput | EndReason::AwaitingBudget => continue,
                 // A rotated resident firing never happens (rotation is a
                 // boot-time Router action, not a cron target); record an
                 // honest failure if it ever does.

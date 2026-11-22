@@ -26,7 +26,7 @@ pub mod snapshots;
 pub mod wake;
 
 pub use engine::{
-    Clock, ConfirmOutcome, DrainCtx, DrainHandle, Engine, EngineConfig, EngineError,
+    BudgetOutcome, Clock, ConfirmOutcome, DrainCtx, DrainHandle, Engine, EngineConfig, EngineError,
     InterruptOutcome, ManualClock, PendingConfirmation, ReleaseOutcome, RotateOutcome, SystemClock,
     WakeOutcome,
 };

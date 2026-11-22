@@ -722,6 +722,38 @@ The profile is part of the session's slot binding: changing it for a live sessio
 `slot/migration`, never a silent request-shape change. Semantics:
 [ADR-053](../design/decisions/ADR-053-request-plans-and-model-profiles.md).
 
+## Session budgets
+
+`agents.<name>.budgets.tokens` is a real ceiling: the loop builds the request plan, projects
+`base + Σbudget/raised − Σturn/end.usage`, and refuses the turn when the worst case
+(`estimate.high + max_output`) would exceed it — no request is sent and no `step/request` is
+written. The session ends `awaiting_budget` (`running → idle`, resumable); a raise resumes it.
+
+```yaml
+agents:
+  worker:
+    id: worker
+    budgets: { tokens: 5000000, wall_clock_ms: 3600000 }
+    model_slots:
+      main: { provider: deepseek, model: deepseek-flash }
+    tools: ["fs_list", "fs_read", "fs_write", "exec"]
+```
+
+A configured budget is pinned on `session/created` (replay never depends on today's config); a
+session with no budget keeps the legacy stream. Raise a parked (or running) session:
+
+```bash
+target/debug/kian raise-budget <uuid> --tokens 2000000 --reason "extend the audit"
+target/debug/kian raise-budget <uuid> --tokens 2000000 --idempotency-key topup-1 --json
+curl -s localhost:7433/rpc -H 'content-type: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"raise_budget","params":{"session":"<uuid>","tokens":2000000}}'
+```
+
+Outcomes: `accepted` (durable row, the drain resumes), `deduplicated` (identical raise already
+admitted), `terminal` (session completed/cancelled/rotated — nothing admitted). Both amounts absent
+or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
+idle. Semantics: [ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`

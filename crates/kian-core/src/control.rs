@@ -39,6 +39,8 @@ const CONTROL_TYPE: &str = "control";
 const INTERRUPT_ACTION: &str = "interrupt";
 /// The confirmation action discriminator.
 const CONFIRM_ACTION: &str = "confirm";
+/// The budget-raise action discriminator.
+const BUDGET_ACTION: &str = "budget";
 
 /// A parsed interrupt intent from a reserved control-envelope row.
 ///
@@ -377,12 +379,155 @@ impl ConfirmIntent {
     }
 }
 
+/// A parsed budget-raise intent from a reserved control-envelope row
+/// (ADR-054): one durable addition to the session's token/wall-clock
+/// allowance. Pure data — the same intent serializes to the inbox row
+/// (envelope) and to the `budget/raised` audit event payload, so the event
+/// reproduces exactly what was requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetIntent {
+    /// Tokens added to the session budget.
+    pub tokens: Option<u64>,
+    /// Wall-clock milliseconds added to the session budget (recorded, not
+    /// enforced while a drain is idle — ADR-054).
+    pub wall_clock_ms: Option<u64>,
+    /// Free-form operator reason, or `null`.
+    pub reason: Option<String>,
+    /// Who requested the raise (operator/replica identity), or `null`.
+    pub requested_by: Option<String>,
+    /// Unix epoch milliseconds at admit time.
+    pub requested_at_ms: u64,
+}
+
+impl BudgetIntent {
+    /// Whether `payload` is the reserved budget envelope (a single
+    /// `{"kian": {"type": "control", "action": "budget", ...}}` key).
+    #[must_use]
+    pub fn is_control_envelope(payload: &Value) -> bool {
+        Self::parse(payload).is_some()
+    }
+
+    /// Parses the reserved budget envelope, or `None` for any payload that
+    /// is not exactly it. Omitted quantities parse as `None`; the engine
+    /// validates "at least one positive amount" before minting a row.
+    #[must_use]
+    pub fn parse(payload: &Value) -> Option<Self> {
+        let obj = payload.as_object()?;
+        if obj.len() != 1 {
+            return None;
+        }
+        let inner = obj.get(ENVELOPE_KEY)?.as_object()?;
+        if inner.get("type").and_then(Value::as_str) != Some(CONTROL_TYPE)
+            || inner.get("action").and_then(Value::as_str) != Some(BUDGET_ACTION)
+        {
+            return None;
+        }
+        Some(Self {
+            tokens: inner.get("tokens").and_then(Value::as_u64),
+            wall_clock_ms: inner.get("wall_clock_ms").and_then(Value::as_u64),
+            reason: inner
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            requested_by: inner
+                .get("requested_by")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            requested_at_ms: inner
+                .get("requested_at_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The reserved envelope payload for this intent (the inbox row's
+    /// `payload`).
+    #[must_use]
+    pub fn envelope(&self) -> Value {
+        let mut inner = json!({
+            "type": CONTROL_TYPE,
+            "action": BUDGET_ACTION,
+            "requested_at_ms": self.requested_at_ms,
+        });
+        let map = inner.as_object_mut().expect("literal object");
+        map.insert(
+            "tokens".into(),
+            self.tokens.map_or(Value::Null, |tokens| json!(tokens)),
+        );
+        map.insert(
+            "wall_clock_ms".into(),
+            self.wall_clock_ms.map_or(Value::Null, |ms| json!(ms)),
+        );
+        map.insert(
+            "reason".into(),
+            self.reason
+                .as_ref()
+                .map_or(Value::Null, |reason| json!(reason)),
+        );
+        map.insert(
+            "requested_by".into(),
+            self.requested_by
+                .as_ref()
+                .map_or(Value::Null, |by| json!(by)),
+        );
+        json!({ ENVELOPE_KEY: inner })
+    }
+
+    /// The `budget/raised` event payload for this intent.
+    #[must_use]
+    pub fn event_payload(&self) -> Value {
+        let mut payload = json!({
+            "action": BUDGET_ACTION,
+            "requested_at_ms": self.requested_at_ms,
+        });
+        let map = payload.as_object_mut().expect("literal object");
+        if let Some(tokens) = self.tokens {
+            map.insert("tokens".into(), json!(tokens));
+        }
+        if let Some(ms) = self.wall_clock_ms {
+            map.insert("wall_clock_ms".into(), json!(ms));
+        }
+        map.insert(
+            "reason".into(),
+            self.reason
+                .as_ref()
+                .map_or(Value::Null, |reason| json!(reason)),
+        );
+        map.insert(
+            "requested_by".into(),
+            self.requested_by
+                .as_ref()
+                .map_or(Value::Null, |by| json!(by)),
+        );
+        payload
+    }
+
+    /// The fallback inbox idempotency key: a caller-supplied key wins;
+    /// this one dedupes an exact replay of the same amount at the same
+    /// millisecond.
+    #[must_use]
+    pub fn idempotency_key(
+        session: &SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        requested_at_ms: u64,
+    ) -> String {
+        format!(
+            "budget:{}:{}:{}:{}",
+            session.0,
+            tokens.unwrap_or(0),
+            wall_clock_ms.unwrap_or(0),
+            requested_at_ms
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{ConfirmDecision, ConfirmIntent, InterruptIntent};
+    use super::{BudgetIntent, ConfirmDecision, ConfirmIntent, InterruptIntent};
     use crate::model::SessionId;
 
     fn intent() -> InterruptIntent {
@@ -581,6 +726,69 @@ mod tests {
         assert_eq!(
             ConfirmIntent::idempotency_key(&sid, "call-1"),
             format!("confirm:{}:call-1", sid.0)
+        );
+    }
+
+    /// The budget envelope round-trips, carries nulls honestly, and the
+    /// action-agnostic reserved-shape guard recognizes it.
+    #[test]
+    fn budget_envelope_round_trips_and_is_a_reserved_control_shape() {
+        let i = BudgetIntent {
+            tokens: Some(2_000_000),
+            wall_clock_ms: Some(60_000),
+            reason: Some("long-horizon task".into()),
+            requested_by: Some("alice".into()),
+            requested_at_ms: 1_762_000_000_000,
+        };
+        let envelope = i.envelope();
+        assert_eq!(
+            envelope,
+            json!({"kian": {"type": "control", "action": "budget",
+                            "tokens": 2_000_000_u64, "wall_clock_ms": 60_000_u64,
+                            "reason": "long-horizon task", "requested_by": "alice",
+                            "requested_at_ms": 1_762_000_000_000_u64}})
+        );
+        assert_eq!(BudgetIntent::parse(&envelope), Some(i.clone()));
+        assert!(BudgetIntent::is_control_envelope(&envelope));
+        assert!(ConfirmIntent::is_reserved_shape(&envelope));
+
+        let minimal = json!({"kian": {"type": "control", "action": "budget"}});
+        assert_eq!(
+            BudgetIntent::parse(&minimal),
+            Some(BudgetIntent {
+                tokens: None,
+                wall_clock_ms: None,
+                reason: None,
+                requested_by: None,
+                requested_at_ms: 0,
+            })
+        );
+        // The event payload omits absent quantities instead of spelling
+        // them as null.
+        let event = i.event_payload();
+        assert_eq!(event["action"], json!("budget"));
+        assert_eq!(event["tokens"], json!(2_000_000_u64));
+        assert_eq!(event.get("stale"), None);
+        assert_eq!(
+            BudgetIntent::parse(&json!({"kian": {"type": "control", "action": "cancel"}})),
+            None
+        );
+        assert!(!BudgetIntent::is_control_envelope(
+            &json!({"kian": {"type": "control", "action": "interrupt"}})
+        ));
+    }
+
+    /// The fallback idempotency key dedupes an exact amount replay.
+    #[test]
+    fn budget_idempotency_key_is_deterministic() {
+        let sid = SessionId(Uuid::nil());
+        assert_eq!(
+            BudgetIntent::idempotency_key(&sid, Some(10), Some(20), 30),
+            format!("budget:{}:10:20:30", sid.0)
+        );
+        assert_eq!(
+            BudgetIntent::idempotency_key(&sid, None, None, 0),
+            format!("budget:{}:0:0:0", sid.0)
         );
     }
 }

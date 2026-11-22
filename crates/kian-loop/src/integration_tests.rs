@@ -17,11 +17,11 @@ use uuid::Uuid;
 
 use kian_core::context::derive_model_context;
 use kian_core::events::{EndReason, Event, EventKind};
-use kian_core::model::{Permission, SessionId, SlotName};
+use kian_core::model::{AgentDef, Budgets, Permission, SessionId, SlotName};
 use kian_core::seams::{PolicyRule, RecoveryAction, ToolCall, ToolResult};
 use kian_core::state::{SessionState, project};
 use kian_llm::ProviderRegistry;
-use kian_orchestrator::{Engine, EngineConfig};
+use kian_orchestrator::{BudgetOutcome, Engine, EngineConfig};
 use kian_store::EventStore;
 
 use crate::react::{CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop};
@@ -91,6 +91,35 @@ async fn harness(
     let mut registry = ProviderRegistry::new();
     registry.register("mock", provider.clone());
     let react = ReActLoop::with_config(agent_def(), Arc::new(registry), tools, policy, config);
+    let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+/// A harness bound to an explicit agent definition (the budget gate reads
+/// the agent's declared budgets when the stream pins none).
+async fn harness_with_agent(
+    agent: AgentDef,
+    turns: Vec<Vec<Result<kian_core::seams::ModelChunk, kian_core::seams::ProviderError>>>,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent,
+        Arc::new(registry),
+        Arc::new(crate::test_support::NoopTools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    );
     let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
     (
         Harness {
@@ -786,6 +815,127 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
         .count();
     assert_eq!(turns, 2, "exactly max_iterations turns may run");
     assert_eq!(seen.lock().unwrap().len(), 2);
+    cleanup_db(&h.db_path);
+}
+
+// -- session token budget gate (ADR-054) ------------------------------------
+
+/// A pinned session token budget refuses the next request BEFORE the
+/// `step/request` is persisted: the drain ends the resumable
+/// `awaiting_budget`, the provider is never called, and the gate's
+/// projection rides `turn/end`. The pin is authoritative over the
+/// agent's (absent) declaration.
+#[tokio::test]
+async fn token_budget_gate_ends_awaiting_budget_before_the_request() {
+    let (h, provider) = harness_with_agent(agent_def(), vec![vec![text_chunk("unused")]]).await;
+    let sid = h
+        .engine
+        .create_session_with(SessionId::new(), json!({"budgets": {"tokens": 1}}))
+        .await
+        .expect("create");
+    h.engine
+        .admit(sid, json!("hello"), None)
+        .await
+        .expect("admit");
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::AwaitingBudget)
+        })
+        .await,
+        "the token budget gate never ended the drain"
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "a request flew past the budget gate"
+    );
+    let events = events_of(&h.store, sid).await;
+    assert_eq!(
+        kinds(&events),
+        [
+            "session/created",
+            "drain/claimed",
+            "input/admitted",
+            "slot/binding",
+            "turn/start",
+            "turn/end",
+            "session/ended",
+        ],
+        "a refused request must not persist a step/request"
+    );
+    let turn_end = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::TurnEnd)
+        .expect("turn/end");
+    assert_eq!(turn_end.bytes["outcome"], json!("awaiting_budget"));
+    assert!(
+        turn_end.bytes["budget"]["estimate"].as_u64().unwrap_or(0) > 1,
+        "turn/end carries the worst-case estimate the gate refused"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// A durable budget raise is the wake that resumes the `awaiting_budget`
+/// settle: the next drain consumes `budget/raised`, the gate passes, and
+/// exactly one request flies to completion.
+#[tokio::test]
+async fn a_durable_budget_raise_resumes_the_awaiting_budget_session() {
+    let mut agent = agent_def();
+    agent.budgets = Budgets {
+        tokens: Some(1),
+        wall_clock_ms: None,
+    };
+    let (h, provider) = harness_with_agent(agent, vec![vec![text_chunk("done")]]).await;
+    let sid = h.engine.create_session().await.expect("create");
+    h.engine
+        .admit(sid, json!("hello"), None)
+        .await
+        .expect("admit");
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::AwaitingBudget)
+        })
+        .await,
+        "the agent-declared budget never gated the drain"
+    );
+    assert_eq!(
+        h.engine
+            .raise_budget(
+                sid,
+                Some(1_000_000),
+                None,
+                Some("resume".into()),
+                Some("test".into()),
+                None,
+            )
+            .await
+            .expect("raise"),
+        BudgetOutcome::Accepted
+    );
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::Completed)
+        })
+        .await,
+        "the raise did not resume the awaiting_budget session"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the resumed drain flies exactly one request"
+    );
+    let events = events_of(&h.store, sid).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev.kind == EventKind::BudgetRaised)
+            .count(),
+        1,
+        "the raise is one durable budget/raised event"
+    );
+    assert!(
+        kinds(&events).contains(&"assistant/message"),
+        "the resumed request produced a real answer"
+    );
     cleanup_db(&h.db_path);
 }
 

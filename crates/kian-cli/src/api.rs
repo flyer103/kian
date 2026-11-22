@@ -71,6 +71,18 @@ pub trait ControlPlane: Send + Sync {
         reason: Option<String>,
         requested_by: Option<String>,
     ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>>;
+    /// Raises a session's lifetime budget (ADR-054): a durable reserved
+    /// control row plus a wake. Never touches execution — the drain
+    /// consumes it into `budget/raised`.
+    fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<BudgetWireOutcome, ControlError>>;
     /// The pending asks of one session with the TTL overlay: a pure read.
     fn pending(&self, session: SessionId) -> BoxFuture<'_, Result<Vec<PendingView>, ControlError>>;
     fn projection(&self, session: SessionId) -> BoxFuture<'_, Result<SessionState, ControlError>>;
@@ -150,6 +162,29 @@ impl ConfirmWireOutcome {
     }
 }
 
+/// The `raise_budget` wire outcome (ADR-054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetWireOutcome {
+    /// The row is durable; the projection adds it when a drain consumes it.
+    Accepted,
+    /// An exact replay of the same raise already has its durable row.
+    Deduplicated,
+    /// The session is terminal — a raise would be unconsumable inbox junk.
+    Terminal,
+}
+
+impl BudgetWireOutcome {
+    /// The wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Deduplicated => "deduplicated",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 /// One pending confirmation as the `pending` read reports it
 /// (CONFIRMATION-MODEL §9).
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +219,10 @@ pub enum ControlError {
         session: SessionId,
         archived_at: u64,
     },
+    /// ADR-054: a raise with both amounts absent or zero is a client
+    /// error (`-32602`), never a durable row.
+    #[error("invalid budget raise: {reason}")]
+    InvalidBudget { reason: String },
     #[error("{0}")]
     Internal(String),
 }
@@ -318,6 +357,7 @@ fn control_err(e: ControlError) -> (i64, String) {
                 session.0
             ),
         ),
+        ControlError::InvalidBudget { reason } => (CODE_INVALID_PARAMS, reason),
         ControlError::Internal(msg) => (CODE_INTERNAL, msg),
     }
 }
@@ -393,6 +433,27 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
                 .map_err(control_err)?;
             Ok(json!({"outcome": outcome.as_str()}))
         }
+        "raise_budget" => {
+            let session = session_params(params)?;
+            let tokens = optional_u64(params, "tokens")?;
+            let wall_clock_ms = optional_u64(params, "wall_clock_ms")?;
+            let reason = optional_string(params, "reason")?;
+            let requested_by = optional_string(params, "requested_by")?;
+            let idempotency_key = optional_string(params, "idempotency_key")?;
+            let outcome = state
+                .plane
+                .raise_budget(
+                    session,
+                    tokens,
+                    wall_clock_ms,
+                    reason,
+                    requested_by,
+                    idempotency_key,
+                )
+                .await
+                .map_err(control_err)?;
+            Ok(json!({"outcome": outcome.as_str()}))
+        }
         "pending" => {
             let session = session_params(params)?;
             let pending = state.plane.pending(session).await.map_err(control_err)?;
@@ -431,7 +492,7 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         other => Err((
             CODE_METHOD_NOT_FOUND,
             format!(
-                "unknown method `{other}` (baseline set: create_session, submit, steer, interrupt, queue, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
+                "unknown method `{other}` (baseline set: create_session, submit, steer, interrupt, queue, confirm, raise_budget, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
             ),
         )),
     }
@@ -522,6 +583,18 @@ fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
 
 /// An optional string param: absent/null → `None`; any other non-string
 /// type is `-32602` (never silently ignored).
+fn optional_u64(params: &Value, name: &str) -> Result<Option<u64>, (i64, String)> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            (
+                CODE_INVALID_PARAMS,
+                format!("`{name}` must be a non-negative integer when present"),
+            )
+        }),
+    }
+}
+
 fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (i64, String)> {
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),

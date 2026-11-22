@@ -19,17 +19,20 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use kian_core::events::{Event, EventKind};
-use kian_core::model::SessionId;
+use kian_core::model::{Budgets, SessionId};
 use kian_core::state::SessionState;
 use kian_exec::ExecStore;
 use kian_llm::provider::OpenAiCompatConfig;
 use kian_loop::react::{ReActConfig, ReActLoop};
 use kian_orchestrator::recovery::PolicyTable;
-use kian_orchestrator::{Engine, EngineConfig, EngineError, InterruptOutcome};
+use kian_orchestrator::{BudgetOutcome, Engine, EngineConfig, EngineError, InterruptOutcome};
 use kian_plugin::{Ctx as PluginCtx, Disposer, PluginError};
 use kian_store::EventStore;
 
-use crate::api::{ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics, PendingView};
+use crate::api::{
+    BudgetWireOutcome, ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics,
+    PendingView,
+};
 use crate::config::{DshHarnessConfig, ServeConfig};
 use crate::cron_engine::EngineTurn;
 use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
@@ -63,6 +66,10 @@ pub enum ServeError {
 pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
+    /// The config-declared default agent budgets pinned into every
+    /// `session/created` this server creates (ADR-054): the projection's
+    /// authoritative base, replayable from the stream alone.
+    default_budgets: Budgets,
     sse_poll_ms: u64,
     /// Recovery-sweep period. Equals `drain.heartbeat_interval_ms`;
     /// see [`Server::serve`] for the documented bound.
@@ -1094,9 +1101,11 @@ impl Server {
             },
             _ => None,
         };
+        let default_budgets = config.agent_def().budgets;
         let server = Self {
             engine,
             store,
+            default_budgets,
             sse_poll_ms: config.sse.poll_interval_ms,
             recovery_tick_ms: config.drain.heartbeat_interval_ms,
             pg_pool: pg_pool.clone(),
@@ -1860,9 +1869,20 @@ impl kian_superagent::SessionBootstrap for MemorySessionBootstrap {
 impl ControlPlane for Server {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
         Box::pin(async move {
+            // ADR-054: configured budgets are pinned into
+            // `session/created` so replay derives the same base without the
+            // config file. Absent limits pin nothing (a create with no
+            // budgets stays byte-identical to the legacy `{}`).
+            let begin = if self.default_budgets.tokens.is_some()
+                || self.default_budgets.wall_clock_ms.is_some()
+            {
+                serde_json::json!({"budgets": &self.default_budgets})
+            } else {
+                serde_json::json!({})
+            };
             let sid = self
                 .engine
-                .create_session()
+                .create_session_with(SessionId::new(), begin)
                 .await
                 .map_err(internal("create_session"))?;
             // P2 (kian-101): the creation-time memory injection
@@ -1974,6 +1994,41 @@ impl ControlPlane for Server {
                 kian_orchestrator::ConfirmOutcome::UnknownSession => {
                     Err(ControlError::UnknownSession { session })
                 }
+            }
+        })
+    }
+
+    fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<BudgetWireOutcome, ControlError>> {
+        Box::pin(async move {
+            self.refuse_archived(session).await?;
+            match self
+                .engine
+                .raise_budget(
+                    session,
+                    tokens,
+                    wall_clock_ms,
+                    reason,
+                    requested_by,
+                    idempotency_key,
+                )
+                .await
+            {
+                Ok(BudgetOutcome::Accepted) => Ok(BudgetWireOutcome::Accepted),
+                Ok(BudgetOutcome::Deduplicated) => Ok(BudgetWireOutcome::Deduplicated),
+                Ok(BudgetOutcome::Terminal) => Ok(BudgetWireOutcome::Terminal),
+                Ok(BudgetOutcome::UnknownSession) => Err(ControlError::UnknownSession { session }),
+                Err(EngineError::InvalidBudget { reason }) => {
+                    Err(ControlError::InvalidBudget { reason })
+                }
+                Err(e) => Err(internal("raise_budget")(e)),
             }
         })
     }

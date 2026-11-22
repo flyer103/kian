@@ -84,14 +84,14 @@ constraint 3: cache-byte stability).
 |---|---|---|
 | Created | `session/created` | `None → idle` |
 | Claimed | `drain/claimed` | `idle/recoverable → running` (running stays running) |
-| Ended | `session/ended{reason}` | `running → completed/cancelled/rotated` (terminal) for `completed`/`cancelled`/`rotated`; `running → idle` (resumable) for `interrupted`/`failed`/`awaiting_input` |
+| Ended | `session/ended{reason}` | `running → completed/cancelled/rotated` (terminal) for `completed`/`cancelled`/`rotated`; `running → idle` (resumable) for `interrupted`/`failed`/`awaiting_input`/`awaiting_budget` |
 | State-preserving | `input/admitted` (Input trigger), `thread/started` (Thread trigger) | preserves `idle`/`running`/`recoverable` |
 | DrainActivity | all other kinds | legal only while `running` (or `archived` where the table allows) |
 
 State is **read only from the projection** (`project(events)`), never from a column or cached
 field. `recoverable` and `archived` are liveness/ops overlays, not event-sourced transitions.
 
-## 3. Kind catalog (23, additions-only)
+## 3. Kind catalog (24, additions-only)
 
 Payload schemas below are the **frozen** shape at schema v0 unless marked additive. "Additive"
 keys are optional, omitted when unset, and leave legacy event bytes byte-identical. Emitters name
@@ -99,7 +99,7 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 
 | Kind | Ctx | State | Payload (payload = `bytes`) | Emitter | Notes |
 |---|---|---|---|---|---|
-| `session/created` | — | Created | `{}`; additive (BEGIN-only, [HARNESS-BRIDGE](HARNESS-BRIDGE.md) §4.7): `"bridge":{"name":<str>,"request_bytes":"exact"\|"unavailable"}` | orchestrator (spawn seam) | First event of a stream. `bridge` marks a spawned worker session whose loop is an external harness and states whether the assembled model request is observable (`exact`, persisted as `step/request`) or not (`unavailable`, projection-only). Absent on kian-owned loops and on the API's plain sessions, so those streams stay byte-identical. Audit metadata only. |
+| `session/created` | — | Created | `{}`; additive (BEGIN-only, [HARNESS-BRIDGE](HARNESS-BRIDGE.md) §4.7): `"bridge":{"name":<str>,"request_bytes":"exact"\|"unavailable"}`; additive (BEGIN-only, [ADR-054](decisions/ADR-054-session-budget-gate.md)): `"budgets":{"tokens":<u64\|null>,"wall_clock_ms":<u64\|null>}` | orchestrator (spawn seam) | First event of a stream. `bridge` marks a spawned worker session whose loop is an external harness and states whether the assembled model request is observable (`exact`, persisted as `step/request`) or not (`unavailable`, projection-only). Absent on kian-owned loops and on the API's plain sessions, so those streams stay byte-identical. Audit metadata only. |
 | `input/admitted` | C | Input | `{"role":"<non-empty>","content":<any>,"synthetic"?:true}`; additive: `"dream":{"source_session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>,"scope":<str>}`, `"memory":{"scope":<str>,"notes":[<event-id>...],"bytes":<u64>,"items":<u64>,"truncated":<bool>,"source_seq":<u64>,"redactions":[{"kind","name","count"}]}` (the creation-time injection marker, §4.2) | orchestrator (drain consumption) | Durable inbox row consumed into context. `synthetic` marks steer-injected content (strippable, A6). `dream` (§4.2) is the ops-set dream marker — trusted routing/provenance, never read from content. |
 | `drain/claimed` | — | Claimed | `{"holder":<str>,"epoch":<u64>}` | orchestrator | Claim audit. Epoch is the fencing token; claim admission is conditional (ADR-009). |
 | `turn/start` | — | DrainActivity | `{"iteration":<u64>}` | loop | Brackets one provider request cycle. Iteration derived from the stream. |
@@ -120,8 +120,9 @@ the subsystem that owns the payload schema; the core kind set stays provider/cha
 | `input/spilled` | — | DrainActivity | `{"event_id":<str>,"channel":<str>,"topic":<str\|null>,"raw":<verbatim channel payload>}` | orchestrator (consumption) | Non-context sibling of the Inline `input/admitted`; recall reads the raw from here. |
 | `control/interrupt` | — | DrainActivity | `{"action":"interrupt","reason":<str\|null>,"requested_by":<str\|null>,"requested_at_ms":<u64>,"target_epoch":<u64\|null>,"stale"?:true}` | orchestrator (consumption) | Durable interrupt intent audit (ADR-014). Never a message, never context. |
 | `control/confirm` | — | DrainActivity | `{"action":"confirm","call_id":<str>,"decision":"approve"\|"reject","reason":<str\|null>,"requested_by":<str\|null>,"answered_at_ms":<u64>,"expired"?:true}` | orchestrator (consumption) | Durable confirmation intent audit (ADR-036): the human's answer to a pending `ask`, recorded before any effect. The loop applies it in call order and appends the answered `tool/result`. Never a message, never context. |
+| `budget/raised` | — | DrainActivity | `{"action":"budget","requested_at_ms":<u64>,"tokens":<u64>?,"wall_clock_ms":<u64>?,"reason":<str\|null>,"requested_by":<str\|null>}` | orchestrator (consumption) | Durable budget-raise audit (ADR-054): a reserved control row consumed at a drain boundary adds to the session-lifetime projection (`base + Σraised − Σspent`). Both amounts absent is refused before admission, so at least one is present. Never a message, never context. |
 | `memory/note` | — | DrainActivity | `{"subject":<non-empty str>,"text":<str>,"status":"candidate"\|"verified"\|"stale","derived_from":[{"session":<uuid-str>,"start_seq":<u64>,"end_seq":<u64>}],"verified_by"?:{"method":"transcript"\|"evidence_gate"\|"human","ref":<str>}}`; additive: `"redactions":[{"kind","name","count"}]` | memory dreamer drain | A note is a claim (MEMORY-MODEL): non-context, append-only, latest-per-subject; the fold lives in `kian-core::memory`. `text` passes the secret redactor before append (§4.2). |
-| `session/ended` | — | Ended | envelope-level `"reason":"completed"\|"cancelled"\|"interrupted"\|"failed"\|"awaiting_input"\|"rotated"`; `bytes: {}`; additive: `"rotated_to":<uuid-str>` plus `"events"`/`"migrated"` on a boot rotation's `rotated` end (ADR-040); additive: `"released":{"worker":<str>,"thread":<uuid-str>,"by":<str>,"reason":<str>}` present only on a release's `cancelled` end (ADR-035); additive: `"crashed":{"takeovers":<u64>,"reason":<str>}` present only on the `failed` end a takeover chain writes after `MAX_UNENDED_CLAIMS` claims without an end (ADR-041) | orchestrator | **One atomic append** with the transition (`NoHalfTerminated`). `interrupted`/`failed`/`awaiting_input` return the session to `idle` (resumable); `completed`/`cancelled`/`rotated` are terminal. A release closes an idle-ended worker thread with a `drain/claimed` + this `cancelled` end in one atomic batch (the claim is the fence; the state machine is unchanged). A crash-looping takeover chain ends with one `failed` end carrying `crashed` instead of re-driving forever (ADR-041). |
+| `session/ended` | — | Ended | envelope-level `"reason":"completed"\|"cancelled"\|"interrupted"\|"failed"\|"awaiting_input"\|"awaiting_budget"\|"rotated"`; `bytes: {}`; additive: `"rotated_to":<uuid-str>` plus `"events"`/`"migrated"` on a boot rotation's `rotated` end (ADR-040); additive: `"released":{"worker":<str>,"thread":<uuid-str>,"by":<str>,"reason":<str>}` present only on a release's `cancelled` end (ADR-035); additive: `"crashed":{"takeovers":<u64>,"reason":<str>}` present only on the `failed` end a takeover chain writes after `MAX_UNENDED_CLAIMS` claims without an end (ADR-041) | orchestrator | **One atomic append** with the transition (`NoHalfTerminated`). `interrupted`/`failed`/`awaiting_input`/`awaiting_budget` return the session to `idle` (resumable); `completed`/`cancelled`/`rotated` are terminal. A release closes an idle-ended worker thread with a `drain/claimed` + this `cancelled` end in one atomic batch (the claim is the fence; the state machine is unchanged). A crash-looping takeover chain ends with one `failed` end carrying `crashed` instead of re-driving forever (ADR-041). |
 
 ## 4. Cross-cutting payload contracts
 
@@ -232,13 +233,14 @@ only `compact` may invalidate the prefix (`unexpected_prefix_change` must stay z
 - Ordering is `seq` per session; drains append under `expectedSeq` CAS + epoch fence.
 - Channel admission is idempotent per `(session, event_id)`; inbox admission is idempotent per
   `(session, idempotency_key)`; `control/interrupt` is idempotent per
-  `interrupt:<session>:<target_epoch>`.
+  `interrupt:<session>:<target_epoch>`; `budget/raised` per
+  `budget:<session>:<tokens>:<wall_clock_ms>:<requested_at_ms>` (a caller key wins, ADR-054).
 - **Derived event id** (never stored): `evt_` + `uuid5(session.0, "kian:event:<seq>")`.
   Mirrored in `kian-sdk`; exposed by `session export --with-event-ids`; not an envelope field.
 
 ### 4.5 Reserved inbox-row envelopes (pre-event, NOT event kinds)
 
-The control plane writes only inbox rows; the drain consumes them into events. Six reserved
+The control plane writes only inbox rows; the drain consumes them into events. Seven reserved
 row-payload shapes must not be confused with event payloads:
 
 | Row payload | Consumed into |
@@ -249,6 +251,7 @@ row-payload shapes must not be confused with event payloads:
 | `{"content":X,"memory":M}` | ONE `input/admitted` `{role:"system",content:X,synthetic:true,memory:M}` (M is the creation-time injection marker, §4.2) |
 | `{"kian":{"type":"control","action":"interrupt",...}}` | `control/interrupt` (never a message) |
 | `{"kian":{"type":"control","action":"confirm",...}}` | `control/confirm` (never a message; the loop applies the decision) |
+| `{"kian":{"type":"control","action":"budget",...}}` | `budget/raised` (never a message; adds to the session budget projection) |
 
 Every envelope is an **exact key-set match**: a row payload with extra keys is ordinary content —
 the `synthetic` arm consumes only at exactly `{synthetic,content}` (kian-96, review N-1), so a public

@@ -52,6 +52,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
+use kian_core::budget::project_budget;
 use kian_core::confirmation::{PendingCall, confirmable, confirmations, pending_calls};
 use kian_core::context::{Message, derive_model_context};
 use kian_core::control::{ConfirmDecision, ConfirmIntent};
@@ -344,6 +345,7 @@ impl LoopDriver for ReActLoop {
                         Flow::TurnDone => LoopOutcome::TurnDone,
                         Flow::Settled | Flow::Deferred => LoopOutcome::Settled,
                         Flow::Stopped(reason) => LoopOutcome::Stopped { reason },
+                        Flow::AwaitingBudget(budget) => LoopOutcome::AwaitingBudget { budget },
                         Flow::Soft(reason) => LoopOutcome::SoftFailed { reason },
                     };
                     if !matches!(outcome, LoopOutcome::TurnDone) {
@@ -370,6 +372,9 @@ enum Flow {
     Deferred,
     /// An intentional stop condition fired.
     Stopped(String),
+    /// The session token budget gate refused the next request (ADR-054):
+    /// no bytes were persisted, the drain ends `awaiting_budget`.
+    AwaitingBudget(Value),
     /// Soft failure — routed to the recovery policy; never `completed`.
     Soft(String),
 }
@@ -396,6 +401,9 @@ enum TurnError {
     /// Hard error (store/append failure): honest `failed`, never retried
     /// by the loop. Also carries the recovery audit.
     Fatal { error: LoopError, audit: Value },
+    /// The session token budget gate refused before any request bytes
+    /// were persisted (ADR-054). Carries the projection the gate saw.
+    AwaitingBudget { budget: Value },
 }
 
 /// Loop-level failures. Every one degrades honestly to a soft report —
@@ -808,6 +816,15 @@ impl Inner {
                     Flow::Settled
                 }
             }
+            Err(TurnError::AwaitingBudget { budget }) => {
+                let payload = json!({
+                    "iteration": iteration,
+                    "outcome": "awaiting_budget",
+                    "budget": &budget,
+                });
+                let _ = ctx.end_turn_with(payload).await;
+                return Ok(Flow::AwaitingBudget(budget));
+            }
             Err(TurnError::Soft { reason, audit }) => {
                 let mut payload = json!({
                     "iteration": iteration,
@@ -962,6 +979,40 @@ impl Inner {
                 };
             }
         };
+        // ADR-054: the session token budget gate. The estimate is the
+        // worst case these bytes imply (prompt upper bound plus the
+        // declared output cap); a would-be overspend refuses BEFORE the
+        // `step/request` is persisted — persist-what-you-send covers the
+        // requests that fly, and this one does not.
+        let budget = match ctx.events().await {
+            Ok(events) => project_budget(&events, &self.agent.budgets),
+            Err(e) => {
+                return TurnResult {
+                    result: Err(TurnError::Soft {
+                        reason: format!("budget projection: {e}"),
+                        audit: json!({"class": "internal", "action": "none"}),
+                    }),
+                    usage: None,
+                };
+            }
+        };
+        let estimate = plan
+            .estimate
+            .high
+            .saturating_add(plan.estimate.max_output_tokens.unwrap_or(0));
+        if budget.would_exceed_tokens(estimate) {
+            return TurnResult {
+                result: Err(TurnError::AwaitingBudget {
+                    budget: json!({
+                        "limit": budget.tokens_limit,
+                        "raised": budget.tokens_raised,
+                        "spent": budget.tokens_spent,
+                        "estimate": estimate,
+                    }),
+                }),
+                usage: None,
+            };
+        }
         let body = plan.body.clone();
         let mut step_payload = json!({
             "slot": self.config.slot.0,

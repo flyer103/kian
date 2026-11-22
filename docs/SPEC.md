@@ -201,7 +201,7 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, cost, tickets,
+  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, cost, raise-budget, tickets,
   channel credentials (`kian wechat login` — the QR flow writes the WeChat channel's credential
   file; no other channel needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
@@ -543,6 +543,38 @@ pin them together.
 | P3a | kian-superagent, kian-cli | Channel-side answers: a closed-vocabulary IM reply (`approve <code>`) resolved by the adapter against the pending set and written through the existing `confirm` seam — never model-interpreted, never a free-text decision ([CONFIRMATION-MODEL §14d](../design/CONFIRMATION-MODEL.md#14d-phase-3a--channel-answers-closed-vocabulary-landed)) | landed (owner gate 2026-11-22; L3 live-phone check manual) |
 | P3b | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening) | not started |
 | P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
+
+### Session token budget (ADR-054, P1b landed)
+
+Scope: a **session-lifetime token ceiling** an operator can declare per agent and raise while a
+session is parked. It closes the gap the original `Budgets` type recorded but never enforced (A5:
+"budget consumption" was observable, not binding) and makes cost a pre-send decision rather than a
+post-hoc report.
+
+Semantics: `agents.<name>.budgets.tokens` is the base ceiling; a configured budget is pinned on
+`session/created.budgets` (a BEGIN-only additive key) so replay never depends on today's config, and
+an unconfigured one leaves the event byte-identical to legacy. The gate runs inside the loop at the
+provider-turn safe boundary, **after** the request plan is built and **before** `step/request` is
+appended: the projection `base + Σbudget/raised − Σ turn/end.usage` must admit
+`estimate.high + max_output`, or the turn is refused with no bytes persisted and no request sent,
+and the drain ends `awaiting_budget` (`running → idle`, resumable, honest). A raise is a durable
+reserved control row (`kian raise-budget` / `raise_budget` RPC, idempotent) that the owning drain
+consumes into `budget/raised` and wakes; the control plane never touches execution. Wall-clock
+raises are projected but not enforced while a drain is idle; a usage-less turn spends nothing
+(unknown, never assumed).
+
+The normative contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §2.3/§3/§4.4; the
+wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; the decision record is
+[ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P1b | kian-core, kian-loop, kian-orchestrator | `kian-core::budget` projection (`base + Σraised − Σspent`, DeepSeek/OpenAI usage spellings); the seventh end reason `awaiting_budget` (`running → idle`); the `budget/raised` kind + reserved budget row envelope; the pre-send gate (`estimate.high + max_output`, no `step/request` on refusal); `session/created.budgets` pin | landed |
+| P1b-wire | kian-cli, kian-sdk | `raise_budget` RPC + `ControlPlane` method + CLI (`kian raise-budget`); no new error code (reuses `-32602`/`-32001`/`-32007`; outcomes `accepted`/`deduplicated`/`terminal`) | landed |
+
+Non-goals recorded with the phase: no per-step monetary gate (pricing stays a projection, ADR-052),
+no enforcement of wall-clock budgets while idle, no budget on harness-owned (projection-only) loops,
+no automatic compaction or model downgrade as a budget response.
 
 ### Resident rotation (ADR-040)
 

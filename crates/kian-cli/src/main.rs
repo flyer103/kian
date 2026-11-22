@@ -29,6 +29,9 @@
 //!   re-verification. `kian session import <package>` restores one.
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
 //!   `kian recovery budget reset <uuid>` — operator actions.
+//! - `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N]` — raise a
+//!   session's lifetime budget (ADR-054): one durable control row, resumed
+//!   at the next drain boundary.
 //!
 //! Read-only commands open the sqlite file in-process (read-only);
 //! mutating commands talk to a running `serve` via `POST /ops/rpc`.
@@ -63,6 +66,10 @@ const USAGE: &str = "usage:
   kian confirm <uuid> <call-id> (--approve|--reject) [--reason <text>]
                [--requested-by <who>] [--url <base>] [--config <path>] [--json]
                                          answer a pending ask (durable control row)
+  kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+               [--requested-by <who>] [--idempotency-key <key>]
+               [--url <base>] [--config <path>] [--json]
+                                         raise a session's lifetime budget (durable control row)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -144,6 +151,7 @@ fn main() -> ExitCode {
         Some("memory") => memory(&args[2..]),
         Some("pending") => pending(&args[2..]),
         Some("confirm") => confirm(&args[2..]),
+        Some("raise-budget") => raise_budget(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
@@ -844,6 +852,120 @@ fn confirm(args: &[String]) -> ExitCode {
             json,
         ),
         "confirm",
+    )
+}
+
+/// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+/// [--requested-by <who>] [--idempotency-key <key>] [--url <base>]
+/// [--config <path>] [--json]` (durable budget raise, ADR-054).
+fn raise_budget(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut url: Option<String> = None;
+    let mut json = false;
+    let mut tokens: Option<u64> = None;
+    let mut wall_clock_ms: Option<u64> = None;
+    let mut reason: Option<String> = None;
+    let mut requested_by: Option<String> = None;
+    let mut idempotency_key: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    let parse_u64 = |flag: &str, value: Option<&String>| -> Result<u64, String> {
+        let value = value.ok_or_else(|| format!("{flag} requires a value"))?;
+        value
+            .parse::<u64>()
+            .map_err(|e| format!("{flag} requires a non-negative integer: {e}"))
+    };
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--url" => match iter.next() {
+                Some(u) => url = Some(u.clone()),
+                None => {
+                    eprintln!("kian: --url requires a base URL\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--tokens" => match parse_u64("--tokens", iter.next()) {
+                Ok(v) => tokens = Some(v),
+                Err(e) => {
+                    eprintln!("kian: {e}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--wall-clock-ms" => match parse_u64("--wall-clock-ms", iter.next()) {
+                Ok(v) => wall_clock_ms = Some(v),
+                Err(e) => {
+                    eprintln!("kian: {e}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--reason" => match iter.next() {
+                Some(r) => reason = Some(r.clone()),
+                None => {
+                    eprintln!("kian: --reason requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--requested-by" => match iter.next() {
+                Some(w) => requested_by = Some(w.clone()),
+                None => {
+                    eprintln!("kian: --requested-by requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--idempotency-key" => match iter.next() {
+                Some(k) => idempotency_key = Some(k.clone()),
+                None => {
+                    eprintln!("kian: --idempotency-key requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown flag `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other => positionals.push(other.to_string()),
+        }
+    }
+    let Some(session) = positionals.first() else {
+        eprintln!("kian: raise-budget requires <session-uuid>\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let session = match kian_cli::commands::parse_session(session) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kian: invalid session uuid `{session}`: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if tokens.unwrap_or(0) == 0 && wall_clock_ms.unwrap_or(0) == 0 {
+        eprintln!(
+            "kian: raise-budget requires --tokens and/or --wall-clock-ms (positive)\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
+    run_command(
+        kian_cli::commands::run_raise_budget(
+            &config,
+            url.as_deref(),
+            kian_cli::commands::RaiseBudgetRequest {
+                session,
+                tokens,
+                wall_clock_ms,
+                reason: reason.as_deref(),
+                requested_by: requested_by.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+            },
+            json,
+        ),
+        "raise-budget",
     )
 }
 

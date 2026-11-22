@@ -65,7 +65,7 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use kian_core::confirmation::{PendingCall, effective_decision, is_expired, pending_calls};
-use kian_core::control::{ConfirmDecision, ConfirmIntent};
+use kian_core::control::{BudgetIntent, ConfirmDecision, ConfirmIntent};
 use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::seams::{LoopDriver, LoopOutcome};
@@ -172,6 +172,11 @@ pub enum EngineError {
     /// produce).
     #[error("context: {0}")]
     Context(#[from] kian_core::context::ContextError),
+    /// A budget raise must add at least one positive amount (ADR-054):
+    /// an empty or zero raise would mint a durable row that can never
+    /// change the projection.
+    #[error("invalid budget raise: {reason}")]
+    InvalidBudget { reason: String },
 }
 
 /// What a [`Engine::wake`] call did.
@@ -210,6 +215,21 @@ pub enum ConfirmOutcome {
     Expired,
     /// No such session (empty event stream).
     UnknownSession,
+}
+
+/// What an [`Engine::raise_budget`] call did (ADR-054). The raise is a
+/// durable control row; the drain consumes it into a `budget/raised`
+/// event and resumes an `awaiting_budget` session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetOutcome {
+    /// The row is durable; the projection adds it when a drain consumes it.
+    Accepted,
+    /// An exact replay of the same raise already has its durable row.
+    Deduplicated,
+    /// No such session (empty event stream).
+    UnknownSession,
+    /// The session is terminal — a raise would be unconsumable inbox junk.
+    Terminal,
 }
 
 /// One pending confirmation as the `pending` read reports it.
@@ -758,6 +778,22 @@ impl DrainCtx {
                     }
                     self.bind_consumed(&r, ev.seq).await?;
                 }
+                Consumption::Budget(intent) => {
+                    // The audit append first, then the binding (the same
+                    // admit-before-consume ordering as every other row).
+                    // The final control-only take leaves raises eligible:
+                    // consuming one there would strand the fresh budget
+                    // behind an end write with no wake.
+                    if control_only {
+                        continue;
+                    }
+                    let ev = self
+                        .core
+                        .append_event(EventKind::BudgetRaised, intent.event_payload())
+                        .await?;
+                    self.bind_consumed(&r, ev.seq).await?;
+                    report.control_budget = true;
+                }
                 Consumption::Confirm(intent) => {
                     // The durable decision first, then the binding (the
                     // same admit-before-consume ordering as everything
@@ -795,7 +831,9 @@ impl DrainCtx {
                                 self.core.append_input_pair(admitted, spill).await?;
                             admitted_ev.seq
                         }
-                        Consumption::Control(_) | Consumption::Confirm(_) => {
+                        Consumption::Control(_)
+                        | Consumption::Confirm(_)
+                        | Consumption::Budget(_) => {
                             unreachable!("matched above")
                         }
                     };
@@ -917,6 +955,8 @@ enum Supervised {
     SoftFailed {
         reason: String,
     },
+    /// The token budget gate refused the next provider request (ADR-054).
+    AwaitingBudget,
     /// The driver stream ended without a terminal outcome — treated as
     /// an honest failure, never `completed` (constraint 7).
     StreamEnded,
@@ -1703,6 +1743,59 @@ where
         })
     }
 
+    /// Raises the session-lifetime token/wall-clock budget (ADR-054): a
+    /// durable reserved control row plus a wake. The control plane writes
+    /// only the inbox row — the owning drain consumes it into a
+    /// `budget/raised` event and the projection adds it. A raise is the
+    /// wake that releases an `awaiting_budget` settle, so an idle session
+    /// resumes without a new message.
+    ///
+    /// At least one amount must be positive: a zero raise would mint a
+    /// row that can never change the projection. Terminal sessions
+    /// refuse (their rows would be unconsumable junk); unknown sessions
+    /// are an honest [`BudgetOutcome::UnknownSession`]. A caller key wins;
+    /// otherwise the key is per (session, amount, millisecond), so an
+    /// exact replay dedupes to one row while two intentional raises in
+    /// different milliseconds both land.
+    pub async fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Result<BudgetOutcome, EngineError> {
+        if tokens.unwrap_or(0) == 0 && wall_clock_ms.unwrap_or(0) == 0 {
+            return Err(EngineError::InvalidBudget {
+                reason: "tokens and wall_clock_ms are both absent or zero".into(),
+            });
+        }
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(BudgetOutcome::UnknownSession);
+        }
+        if project(&events)?.is_terminal() {
+            return Ok(BudgetOutcome::Terminal);
+        }
+        let now = self.clock.now_ms();
+        let intent = BudgetIntent {
+            tokens,
+            wall_clock_ms,
+            reason,
+            requested_by,
+            requested_at_ms: now,
+        };
+        let key = idempotency_key
+            .unwrap_or_else(|| BudgetIntent::idempotency_key(&session, tokens, wall_clock_ms, now));
+        let outcome = self.admit(session, intent.envelope(), Some(key)).await?;
+        Ok(if outcome.deduplicated {
+            BudgetOutcome::Deduplicated
+        } else {
+            BudgetOutcome::Accepted
+        })
+    }
+
     /// The session's pending confirmations with the TTL overlay
     /// (CONFIRMATION-MODEL §9). `None` = no such session.
     pub async fn pending_confirmations(
@@ -1744,6 +1837,7 @@ where
             // confirm row, which the same scan sees as a control row.
             let has_control_row = inbox.eligible.iter().any(|row| {
                 ConfirmIntent::parse(&row.payload).is_some()
+                    || BudgetIntent::parse(&row.payload).is_some()
                     || kian_core::control::InterruptIntent::parse(&row.payload).is_some()
             });
             let events = self.store.rebuild(inbox.session).await?;
@@ -2070,6 +2164,7 @@ where
             }
             let report = ctx.take_eligible_inputs_report().await?;
             let took_confirm = report.control_confirm;
+            let took_budget = report.control_budget;
             let taken = report.messages;
             // a current-epoch control row consumed by that take
             // flips the shared flag — honor it now, before the
@@ -2078,7 +2173,7 @@ where
                 end_reason = EndReason::Interrupted;
                 break 'episodes;
             }
-            if taken.is_empty() && !takeover && !took_confirm {
+            if taken.is_empty() && !takeover && !took_confirm && !took_budget {
                 if !claimed {
                     return Ok(DrainOutcome::ReleasedClean);
                 }
@@ -2125,6 +2220,17 @@ where
                     // will intercept this before the end write.
                     tracing::warn!(session = %session.0, reason, "soft failure");
                     end_reason = EndReason::Failed;
+                    break 'episodes;
+                }
+                Supervised::AwaitingBudget => {
+                    // ADR-054: the token budget refused the next request.
+                    // The end is resumable (running -> idle); a durable
+                    // budget-raise row is the wake that resumes it.
+                    tracing::info!(
+                        session = %session.0,
+                        "budget exhausted: ending awaiting_budget"
+                    );
+                    end_reason = EndReason::AwaitingBudget;
                     break 'episodes;
                 }
                 Supervised::StreamEnded => {
@@ -2219,6 +2325,13 @@ where
                         Supervised::SoftFailed { reason }
                     }
                 }
+                LoopOutcome::AwaitingBudget { .. } => {
+                    if interrupted() {
+                        Supervised::Interrupted
+                    } else {
+                        Supervised::AwaitingBudget
+                    }
+                }
             };
             return supervised;
         }
@@ -2258,6 +2371,10 @@ async fn heartbeat_loop(
 struct TakeReport {
     messages: Vec<InputRow>,
     control_interrupt: bool,
+    /// A budget-raise row was consumed into `budget/raised` (ADR-054): the
+    /// drain must drive the loop even with no message row, because the
+    /// raise is what releases an `awaiting_budget` settle.
+    control_budget: bool,
     /// A confirmation answer was consumed into `control/confirm`. The
     /// drain must still drive the loop: the answer's effect is applied by
     /// the loop, so a wake that only carried a decision is real work
@@ -2306,6 +2423,10 @@ enum Consumption {
     /// the decision at its next turn start; the row is bound to the
     /// event's seq like any other consumption.
     Confirm(ConfirmIntent),
+    /// The reserved budget envelope (ADR-054): a `budget/raised` audit
+    /// event, never a message. The row is bound to the event's seq like
+    /// any other consumption.
+    Budget(BudgetIntent),
 }
 
 fn consumption_plan(row: &InputRow) -> Consumption {
@@ -2314,6 +2435,9 @@ fn consumption_plan(row: &InputRow) -> Consumption {
     }
     if let Some(intent) = ConfirmIntent::parse(&row.payload) {
         return Consumption::Confirm(intent);
+    }
+    if let Some(intent) = BudgetIntent::parse(&row.payload) {
+        return Consumption::Budget(intent);
     }
     if let Some(obj) = row.payload.as_object() {
         // kian-96 (kian-95 review N-1): the steer wrapper is exactly
@@ -2391,10 +2515,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Clock, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome, ManualClock,
-        ReleaseOutcome, WakeOutcome,
+        BudgetOutcome, Clock, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome,
+        ManualClock, ReleaseOutcome, WakeOutcome,
     };
     use crate::metrics::Metrics;
+    use kian_core::control::BudgetIntent;
     use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
     use kian_core::model::{Epoch, InputRow, SessionId};
     use kian_core::seams::{LoopDriver, LoopOutcome};
@@ -5880,6 +6005,201 @@ mod tests {
                 .count(),
             0,
             "the bounded taker must not drive the crashed episode"
+        );
+        cleanup(&path);
+    }
+
+    // -- session token budget gate (ADR-054) --------------------------------
+
+    /// `awaiting_budget` is a resumable settle, not a terminal state: the
+    /// control plane admits a budget raise as a durable row only (never an
+    /// event), and the next drain consumes it into `budget/raised` before
+    /// settling normally.
+    #[tokio::test]
+    async fn awaiting_budget_is_resumable_by_a_budget_raise() {
+        let (store, path) = open_store().await;
+        let driver = Arc::new(ScriptedDriver::scripted(vec![
+            vec![
+                Step::BeginTurn,
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::AwaitingBudget {
+                    budget: json!({"limit": 1000, "raised": 0, "spent": 990, "estimate": 500}),
+                }),
+            ],
+            vec![Step::Outcome(LoopOutcome::Settled)],
+        ]));
+        let eng = engine(&store, Arc::clone(&driver));
+        let sid = eng.create_session().await.expect("session");
+        eng.admit(sid, json!("long task"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid).await.last().is_some_and(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::SessionEnded {
+                            reason: EndReason::AwaitingBudget
+                        }
+                    )
+                })
+            })
+            .await,
+            "the drain ends awaiting_budget"
+        );
+        assert_eq!(projection_of(&store, sid).await, SessionState::Idle);
+        assert_eq!(
+            eng.raise_budget(
+                sid,
+                Some(5_000),
+                None,
+                Some("resume".into()),
+                Some("test".into()),
+                None,
+            )
+            .await
+            .expect("raise"),
+            BudgetOutcome::Accepted
+        );
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the raise resumes the session to completion"
+        );
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1,
+            "the raise is one durable event"
+        );
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: EndReason::Completed
+            }
+        ));
+        cleanup(&path);
+    }
+
+    /// An exact replay of a raise dedupes to the same durable row: the row is
+    /// the identity, so two identical control-plane calls can never double the
+    /// projection.
+    #[tokio::test]
+    async fn an_exact_budget_raise_replay_dedupes_to_one_row() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let driver = Arc::new(ScriptedDriver::scripted(vec![
+            vec![
+                Step::TakeInputs,
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::TurnDone),
+            ],
+            vec![Step::TakeInputs, Step::Outcome(LoopOutcome::Settled)],
+        ]));
+        let eng = engine(&store, Arc::clone(&driver));
+        let sid = eng.create_session().await.expect("session");
+        eng.admit(sid, json!("work"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await,
+            "the drain reaches its first turn"
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(500), None, None, None, None)
+                .await
+                .expect("raise"),
+            BudgetOutcome::Accepted
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(500), None, None, None, None)
+                .await
+                .expect("replay"),
+            BudgetOutcome::Deduplicated
+        );
+        let eligible = store.eligible_inputs(sid, T0).await.expect("eligible");
+        assert_eq!(eligible.len(), 1, "the replay is one durable row");
+        assert!(BudgetIntent::parse(&eligible[0].payload).is_some());
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the resumed drain settles"
+        );
+        assert_eq!(
+            events_of(&store, sid)
+                .await
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1,
+            "one row, one event"
+        );
+        cleanup(&path);
+    }
+
+    /// Raises validate their amounts; unknown ids are honest; a terminal
+    /// session refuses (its row would be unconsumable junk). A wall-clock-only
+    /// raise is durable but never gates the token budget.
+    #[tokio::test]
+    async fn budget_raises_validate_amounts_and_terminal_sessions() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = eng.create_session().await.expect("session");
+        let err = eng
+            .raise_budget(sid, None, Some(0), None, None, None)
+            .await
+            .expect_err("zero raise refused");
+        assert!(matches!(err, EngineError::InvalidBudget { .. }), "{err}");
+        assert_eq!(
+            eng.raise_budget(SessionId::new(), Some(10), None, None, None, None)
+                .await
+                .expect("unknown"),
+            BudgetOutcome::UnknownSession
+        );
+        assert_eq!(
+            eng.raise_budget(sid, None, Some(60_000), Some("time".into()), None, None,)
+                .await
+                .expect("wall raise"),
+            BudgetOutcome::Accepted
+        );
+        eng.admit(sid, json!("finish"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await
+        );
+        assert_eq!(
+            events_of(&store, sid)
+                .await
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(10), None, None, None, None)
+                .await
+                .expect("late raise"),
+            BudgetOutcome::Terminal
         );
         cleanup(&path);
     }
