@@ -58,6 +58,7 @@
 //!   never the token)
 pub mod api;
 pub mod archive;
+pub mod artifacts;
 pub mod async_bridge;
 pub mod cache_metrics;
 #[doc(hidden)]
@@ -65,19 +66,23 @@ pub mod capture;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod cost;
 pub mod cron_cli;
 pub mod cron_engine;
 pub mod cron_tick;
 pub mod cron_worktree;
+pub mod defer;
 mod harness_hooks;
 pub mod imessage_check;
 pub mod job_cli;
 pub mod job_config;
 pub mod job_runtime;
+pub mod media_edge;
 pub mod memory;
 pub mod multiagent_tick;
 pub mod ops;
 pub mod plugins;
+pub mod pricing;
 pub mod rotation;
 pub mod server;
 pub mod sidecars;

@@ -1,5 +1,5 @@
 //! JOB-MODEL §18.4: "a registry test: every event kind the conductor
-//! writes is one of EVENT-MODEL's 23" — checked here, not asserted in
+//! writes is one of EVENT-MODEL's 24" — checked here, not asserted in
 //! prose. The catalog stays normative in `design/EVENT-MODEL.md`; this
 //! test reads it, then reads the production (pre-`#[cfg(test)]`) part of
 //! every file that carries job semantics and proves every kind it names
@@ -111,7 +111,7 @@ fn the_job_runtime_only_names_catalogued_kinds() {
         .expect("crates/kian-core/src/events.rs");
 
     let catalog = catalog_kinds(&model);
-    assert_eq!(catalog.len(), 23, "EVENT-MODEL §3 must list 23 kinds");
+    assert_eq!(catalog.len(), 24, "EVENT-MODEL §3 must list 24 kinds");
     let by_variant = variant_kinds(&events_rs);
 
     let mut named: BTreeSet<String> = BTreeSet::new();

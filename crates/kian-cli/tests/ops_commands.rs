@@ -155,6 +155,7 @@ async fn replay_export_wake_reset_lease_over_the_real_server() {
         None,
         None,
         false,
+        false,
     )
     .await
     .expect("export");

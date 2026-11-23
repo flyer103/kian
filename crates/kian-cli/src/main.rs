@@ -11,21 +11,31 @@
 //! - `kian usage-stats [--config <path>] [--session <uuid>] [--json]`
 //!   — provider token-usage report: per-store token totals derived
 //!   from `turn/end` usage payloads (verbatim, no pricing).
+//! - `kian cost [--config <path>] [--session <uuid>] [--json]` —
+//!   read-only cost projection: the config price book applied to those
+//!   usage payloads at each attempt's own timestamp (ADR-053).
 //! - `kian session inspect <uuid>` — projection + counters (
 //!   embedded read-only).
 //! - `kian session replay <uuid> [--url <base>]` — re-derive everything
 //!   from events, verify A2 byte-identity, optionally diff against the
 //!   live server projection.
 //! - `kian session export <uuid> [--since S] [--until U] [--out F]
-//!   [--with-event-ids]` — event interval → JSONL audit package
-//!   (`--with-event-ids` adds the derived event id per line). An
-//!   archived session exports from its verified package, byte-identical
-//!   to the pre-archive export.
+//!   [--with-event-ids] [--with-artifacts]` — event interval → JSONL
+//!   audit package (`--with-event-ids` adds the derived event id per
+//!   line; `--with-artifacts` pins the referenced spilled blobs beside
+//!   the export). An archived session exports from its verified package,
+//!   byte-identical to the pre-archive export.
 //! - `kian archive run|verify` — opt-in export-only retention
 //!   (READ-MODEL §7): package → verify → commit, and package
 //!   re-verification. `kian session import <package>` restores one.
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
 //!   `kian recovery budget reset <uuid>` — operator actions.
+//! - `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N]` — raise a
+//!   session's lifetime budget (ADR-055): one durable control row, resumed
+//!   at the next drain boundary.
+//! - `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
+//!   [--retention-days N] [--json]` — one retention pass over the
+//!   content-addressed tool-result blob tree (ADR-056).
 //!
 //! Read-only commands open the sqlite file in-process (read-only);
 //! mutating commands talk to a running `serve` via `POST /ops/rpc`.
@@ -39,12 +49,14 @@ const USAGE: &str = "usage:
                                          cache-byte stability report
   kian usage-stats [--config <path>] [--session <uuid>] [--json]
                                          provider token-usage report
+  kian cost [--config <path>] [--session <uuid>] [--json]
+                                         priced usage from the config price book
   kian session inspect <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          projection + counters
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
                                          re-derive everything from events
-  kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--db <sqlite>] [--config <path>]
-                                         event interval → JSONL audit package (--with-event-ids adds the derived event id)
+  kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--with-artifacts] [--db <sqlite>] [--config <path>]
+                                         event interval → JSONL audit package (--with-event-ids adds the derived event id; --with-artifacts pins spilled blobs)
   kian session import <package-dir> [--db <sqlite>] [--config <path>] [--json]
                                          verify + restore an archive package into a store (replay/forensics)
   kian archive run [--db <sqlite>] [--config <path>] [--json]
@@ -58,6 +70,15 @@ const USAGE: &str = "usage:
   kian confirm <uuid> <call-id> (--approve|--reject) [--reason <text>]
                [--requested-by <who>] [--url <base>] [--config <path>] [--json]
                                          answer a pending ask (durable control row)
+  kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+               [--requested-by <who>] [--idempotency-key <key>]
+               [--url <base>] [--config <path>] [--json]
+                                         raise a session's lifetime budget (durable control row)
+  kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
+               [--retention-days N] [--json]
+                                         retention GC of the tool-result artifact tree (oldest first)
+  kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]
+                                         ingest a local file into the artifact tree (ADR-061)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -139,6 +160,7 @@ fn main() -> ExitCode {
         Some("serve") => serve(&args[2..]),
         Some("cache-stats") => cache_stats(&args[2..]),
         Some("usage-stats") => usage_stats(&args[2..]),
+        Some("cost") => cost(&args[2..]),
         Some("session") => session(&args[2..]),
         Some("archive") => archive(&args[2..]),
         Some("wake-now") => wake_now(&args[2..]),
@@ -146,6 +168,8 @@ fn main() -> ExitCode {
         Some("memory") => memory(&args[2..]),
         Some("pending") => pending(&args[2..]),
         Some("confirm") => confirm(&args[2..]),
+        Some("raise-budget") => raise_budget(&args[2..]),
+        Some("artifacts") => artifacts(&args[2..]),
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
@@ -391,6 +415,202 @@ fn usage_stats(args: &[String]) -> ExitCode {
     }
 }
 
+/// `kian cost [--config <path>] [--session <uuid>] [--json]` — the
+/// read-only cost projection from the configured store (mirrors
+/// `usage-stats`; ADR-053).
+fn cost(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut session: Option<kian_core::model::SessionId> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match iter.next() {
+                Some(s) => match s.parse::<uuid::Uuid>() {
+                    Ok(u) => session = Some(kian_core::model::SessionId(u)),
+                    Err(_) => {
+                        eprintln!("kian: --session requires a uuid\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --session requires a uuid\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown cost option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("kian: cannot start async runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(kian_cli::cost::run_cost(&config_path, session, json)) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: cost failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N] [--retention-days N] [--json]` — one
+/// retention pass over the content-addressed tool-result blob tree (ADR-056).
+fn artifacts(args: &[String]) -> ExitCode {
+    let Some(subcommand) = args.first() else {
+        eprintln!("kian: artifacts expects a subcommand (gc|put)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    match subcommand.as_str() {
+        "gc" => artifacts_gc(&args[1..]),
+        "put" => artifacts_put(&args[1..]),
+        other => {
+            eprintln!("kian: unknown artifacts subcommand `{other}`\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn artifacts_gc(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut max_bytes: Option<u64> = None;
+    let mut retention_days: Option<u64> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--dir" => match iter.next() {
+                Some(p) => dir = Some(p.into()),
+                None => {
+                    eprintln!("kian: --dir requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--max-bytes" => match iter.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => max_bytes = Some(v),
+                None => {
+                    eprintln!("kian: --max-bytes requires a non-negative integer\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--retention-days" => match iter.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(v) => retention_days = Some(v),
+                None => {
+                    eprintln!("kian: --retention-days requires a non-negative integer\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown artifacts gc option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match kian_cli::artifacts::run_artifacts_gc(&config_path, dir, max_bytes, retention_days, json)
+    {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: artifacts gc failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]`:
+/// ingest a local file into the content-addressed artifact tree (ADR-061).
+fn artifacts_put(args: &[String]) -> ExitCode {
+    let mut config_path = std::path::PathBuf::from("kian.yaml");
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut media_type: Option<String> = None;
+    let mut json = false;
+    let mut file: Option<std::path::PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config_path = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--dir" => match iter.next() {
+                Some(p) => dir = Some(p.into()),
+                None => {
+                    eprintln!("kian: --dir requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--media-type" => match iter.next() {
+                Some(value) => media_type = Some(value.clone()),
+                None => {
+                    eprintln!("kian: --media-type requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown artifacts put option {other}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            positional => {
+                if file.is_some() {
+                    eprintln!("kian: artifacts put takes exactly one file\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                file = Some(positional.into());
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("kian: artifacts put requires a file path\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    match kian_cli::artifacts::run_artifacts_put(&config_path, dir, &file, media_type, json) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: artifacts put failed — {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // session commands
 // ---------------------------------------------------------------------------
@@ -410,6 +630,9 @@ struct SessionArgs {
     /// id to each exported line (export path only; other subcommands
     /// ignore the flag).
     with_event_ids: bool,
+    /// `session export --with-artifacts` — pins every spilled blob the
+    /// exported events reference beside the JSONL (requires --out).
+    with_artifacts: bool,
 }
 
 impl Default for SessionArgs {
@@ -425,6 +648,7 @@ impl Default for SessionArgs {
             reason: None,
             json: false,
             with_event_ids: false,
+            with_artifacts: false,
         }
     }
 }
@@ -472,6 +696,7 @@ fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, S
             },
             "--json" => out.json = true,
             "--with-event-ids" => out.with_event_ids = true,
+            "--with-artifacts" => out.with_artifacts = true,
             other if !other.starts_with("--") => {
                 let sid = kian_cli::commands::parse_session(other)
                     .map_err(|e| format!("{e} ({usage_for})"))?;
@@ -592,6 +817,12 @@ fn session(args: &[String]) -> ExitCode {
             "session replay",
         ),
         "export" => {
+            if parsed.with_artifacts && parsed.out.is_none() {
+                eprintln!(
+                    "kian: session export --with-artifacts requires --out (pinned blobs live in a directory beside the file)"
+                );
+                return ExitCode::from(2);
+            }
             // Export writes the JSONL body itself (stdout or --out).
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -611,6 +842,7 @@ fn session(args: &[String]) -> ExitCode {
                 parsed.until,
                 parsed.out.as_deref(),
                 parsed.with_event_ids,
+                parsed.with_artifacts,
             )) {
                 Ok(out) => {
                     print!("{out}");
@@ -800,6 +1032,120 @@ fn confirm(args: &[String]) -> ExitCode {
             json,
         ),
         "confirm",
+    )
+}
+
+/// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+/// [--requested-by <who>] [--idempotency-key <key>] [--url <base>]
+/// [--config <path>] [--json]` (durable budget raise, ADR-055).
+fn raise_budget(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut url: Option<String> = None;
+    let mut json = false;
+    let mut tokens: Option<u64> = None;
+    let mut wall_clock_ms: Option<u64> = None;
+    let mut reason: Option<String> = None;
+    let mut requested_by: Option<String> = None;
+    let mut idempotency_key: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    let parse_u64 = |flag: &str, value: Option<&String>| -> Result<u64, String> {
+        let value = value.ok_or_else(|| format!("{flag} requires a value"))?;
+        value
+            .parse::<u64>()
+            .map_err(|e| format!("{flag} requires a non-negative integer: {e}"))
+    };
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--url" => match iter.next() {
+                Some(u) => url = Some(u.clone()),
+                None => {
+                    eprintln!("kian: --url requires a base URL\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--tokens" => match parse_u64("--tokens", iter.next()) {
+                Ok(v) => tokens = Some(v),
+                Err(e) => {
+                    eprintln!("kian: {e}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--wall-clock-ms" => match parse_u64("--wall-clock-ms", iter.next()) {
+                Ok(v) => wall_clock_ms = Some(v),
+                Err(e) => {
+                    eprintln!("kian: {e}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--reason" => match iter.next() {
+                Some(r) => reason = Some(r.clone()),
+                None => {
+                    eprintln!("kian: --reason requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--requested-by" => match iter.next() {
+                Some(w) => requested_by = Some(w.clone()),
+                None => {
+                    eprintln!("kian: --requested-by requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--idempotency-key" => match iter.next() {
+                Some(k) => idempotency_key = Some(k.clone()),
+                None => {
+                    eprintln!("kian: --idempotency-key requires a value\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                eprintln!("kian: unknown flag `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other => positionals.push(other.to_string()),
+        }
+    }
+    let Some(session) = positionals.first() else {
+        eprintln!("kian: raise-budget requires <session-uuid>\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let session = match kian_cli::commands::parse_session(session) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("kian: invalid session uuid `{session}`: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if tokens.unwrap_or(0) == 0 && wall_clock_ms.unwrap_or(0) == 0 {
+        eprintln!(
+            "kian: raise-budget requires --tokens and/or --wall-clock-ms (positive)\n{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
+    run_command(
+        kian_cli::commands::run_raise_budget(
+            &config,
+            url.as_deref(),
+            kian_cli::commands::RaiseBudgetRequest {
+                session,
+                tokens,
+                wall_clock_ms,
+                reason: reason.as_deref(),
+                requested_by: requested_by.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+            },
+            json,
+        ),
+        "raise-budget",
     )
 }
 

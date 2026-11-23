@@ -298,6 +298,9 @@ async fn live_dsh_peer_positive_env_gated() {
         LoopOutcome::TurnDone => {
             eprintln!("live peer stream ended at a turn boundary (TurnDone was the last outcome)");
         }
+        LoopOutcome::AwaitingBudget { budget } => {
+            eprintln!("live peer paused on the token budget gate: {budget}");
+        }
         LoopOutcome::SoftFailed { reason } => {
             // The peer's ready handshake is the floor for any failure
             // attribution: without it nothing about the peer half is

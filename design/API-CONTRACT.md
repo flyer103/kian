@@ -84,7 +84,9 @@ suffix.
 
 Codes are append-only: existing codes never change meaning or get reused; a new failure class gets a
 new documented code. The confirmation plane introduces **no** new code: its non-normal answers are
-`outcome` values (`not_pending`/`expired`), and its refusals reuse `-32001`/`-32007`/`-32602`.
+`outcome` values (`not_pending`/`expired`), and its refusals reuse `-32001`/`-32007`/`-32602`. The
+budget plane likewise adds no code: its non-normal answers are `outcome` values
+(`deduplicated`/`terminal`), and its refusals reuse `-32001`/`-32007`/`-32602`.
 
 ### 2.3 Values
 
@@ -116,11 +118,12 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 | Method | Params | Result |
 |---|---|---|
 | `create_session` | `{}` (or `null`) | `{"session":"<uuid>"}` |
-| `submit` | `{"session":"<uuid>","content":<any>,"idempotency_key":"<string>"?}` | `{"deduplicated":<bool>}` |
-| `steer` | same as `submit` | `{"deduplicated":<bool>}` |
-| `queue` | same as `submit` | `{"deduplicated":<bool>}` |
+| `submit` | `{"session":"<uuid>","content":<any>,"idempotency_key":"<string>"?,"defer":"off_peak"?}` | `{"deduplicated":<bool>}`; additive with `defer`: `{"deduplicated","deferred","eligible_at_ms"}` |
+| `steer` | same as `submit`, without `defer` | `{"deduplicated":<bool>}` |
+| `queue` | `submit` params including optional `defer` | same as `submit` |
 | `interrupt` | `{"session":"<uuid>"}` | `{"outcome":"requested" \| "not_draining"}` |
 | `confirm` | `{"session":"<uuid>","call_id":"<str>","decision":"approve" \| "reject","reason":"<str>"?,"requested_by":"<str>"?}` | `{"outcome":"accepted" \| "not_pending" \| "expired"}` |
+| `raise_budget` | `{"session":"<uuid>","tokens":<u64>?,"wall_clock_ms":<u64>?,"reason":"<str>"?,"requested_by":"<str>"?,"idempotency_key":"<str>"?}` | `{"outcome":"accepted" \| "deduplicated" \| "terminal"}` |
 | `pending` | `{"session":"<uuid>"}` | `{"pending":[{"call_id","tool","arguments","requested_at_ms","expired"}]}` |
 | `projection` | `{"session":"<uuid>","since":<u64>?}` | `{"version":<u64>,"state":"<see §2.3>"}` or `{"version":<u64>,"unchanged":true}` |
 
@@ -135,6 +138,16 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   at the next provider-turn safe boundary and never inside an in-flight provider turn.
 - `queue` uses the same admit path; the input is promoted at the next safe boundary and never
   interrupts the current turn.
+- `defer` (ADR-060) is opt-in and additive. The closed value `off_peak` plans the admission
+  against the configured `pricing.peak_windows`/`pricing.holidays` calendar and admits the
+  durable row with a future `eligible_at`, so no drain consumes it before an off-peak instant.
+  The result reports the planned instant and whether the row was actually deferred: a next off
+  peak beyond `defer.max_wait_ms`, or an admit instant that is already off peak, admits
+  immediately with `deferred:false` and the recorded reason says why. Deferral requires a
+  configured `defer:` section; without one the request is refused `-32602` (it is never
+  silently run now). A request without `defer` keeps the byte-identical result above.
+  `eligible_at` is a not-before gate, not a promise that a drain starts at that instant;
+  `steer` never defers — interactive steering is never delayed.
 - `interrupt` requests an abort. The intent is durable (ADR-014): whenever work may still be in
   flight the server also admits a control-envelope inbox row that the owning drain consumes into a
   `control/interrupt` event, so the intent survives a drain crash and crosses replicas.
@@ -149,6 +162,15 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   `expired` = the ask lapsed under `confirmation.ttl_ms` and a durable reject-with-`expired` row was
   admitted so the session resumes (the caller's decision was **not** applied). An archived session
   is `-32007`. A malformed `call_id`/`decision` is `-32602`.
+- `raise_budget` adds to one session's lifetime token/wall-clock budget (ADR-055). It admits ONE
+  reserved budget row under `idempotency_key` (caller-supplied wins, else
+  `budget:<session>:<tokens>:<wall_clock_ms>:<requested_at_ms>`) and wakes; the owning drain
+  consumes it into a `budget/raised` event. It writes nothing else and never touches execution, so
+  there is no `requested`/`not_draining` distinction — the row is the outcome. `accepted` = the
+  row is durable; `deduplicated` = an identical row already exists; `terminal` = the session is
+  completed/cancelled/rotated, so nothing was admitted (no event is minted for a dead session).
+  Both amounts absent or zero is `-32602`; unknown session `-32001`; archived `-32007`. Wall-clock
+  raises are recorded and projected but not enforced (ADR-055 §Limits).
 - `pending` is a pure read of one session's stream: the unanswered asks in call order with the TTL
   overlay computed at read time (`expired` is a liveness overlay, never persisted). Unknown session
   `-32001`, archived `-32007`.
@@ -261,7 +283,7 @@ session's durable stream, resumable per connection via `Last-Event-ID` (READ-MOD
 ### 5.2 Termination and resumption
 
 The stream closes after the first `session/ended` event, whatever its reason. Terminal ends
-(`completed`, `cancelled`, `rotated`) freeze the projection. An `interrupted`/`failed`/`awaiting_input` end is
+(`completed`, `cancelled`, `rotated`) freeze the projection. An `interrupted`/`failed`/`awaiting_input`/`awaiting_budget` end is
 state-preserving (`running → idle`), so a resumed session appends later events; those are observed
 on a **new connection**.
 
@@ -345,7 +367,7 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `engine` | object | In-memory engine counters (drain depth, drains started, state transitions, wakes…) — reset with the process |
 | `pending_wake_depth` | integer | In-process pending wake registry depth |
 | `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}` |
-| `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization |
+| `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization. Nested counters are additive: the cache-miss count is always reported (an explicit miss spelling wins; otherwise it is derived from the hit spelling's billing convention, and with no cache spelling all input is miss), and the CLI derives a hit rate at render. Pricing is a separate CLI projection over a config book and never appears here |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
 | `memory` | object or `null` | Counters of the memory assembly: dream counters (dreams, read/parse/append failures, notes appended/deduped) and, when `memory.session` is configured (P2), the injection counters `injected_sessions`/`injected_items`/`injected_bytes`/`injected_truncations`/`injected_skips`; `null` when no `memory:` section assembled |
 | `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |

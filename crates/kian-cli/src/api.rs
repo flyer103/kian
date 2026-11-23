@@ -25,6 +25,7 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use kian_core::events::Event;
@@ -60,6 +61,29 @@ pub trait ControlPlane: Send + Sync {
         content: Value,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<bool, ControlError>>;
+    /// ADR-060: submits one turn with an explicit deferral policy. The
+    /// row is durable before this returns, with its eligibility instant
+    /// stamped on it; a control plane with no defer: section refuses.
+    fn submit_deferred(
+        &self,
+        _session: SessionId,
+        _content: Value,
+        _idempotency_key: Option<String>,
+        _policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<DeferredAdmission, ControlError>> {
+        async { Err(ControlError::DeferralUnavailable) }.boxed()
+    }
+    /// ADR-060: queues one turn with an explicit deferral policy. Same
+    /// semantics as submit_deferred; the queue/steer marker is unchanged.
+    fn queue_deferred(
+        &self,
+        _session: SessionId,
+        _content: Value,
+        _idempotency_key: Option<String>,
+        _policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<DeferredAdmission, ControlError>> {
+        async { Err(ControlError::DeferralUnavailable) }.boxed()
+    }
     fn interrupt(&self, session: SessionId) -> BoxFuture<'_, Result<String, ControlError>>;
     /// Answers one pending ask (CONFIRMATION-MODEL §5/§9): a durable
     /// reserved control row plus a wake. Never touches execution.
@@ -71,6 +95,18 @@ pub trait ControlPlane: Send + Sync {
         reason: Option<String>,
         requested_by: Option<String>,
     ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>>;
+    /// Raises a session's lifetime budget (ADR-055): a durable reserved
+    /// control row plus a wake. Never touches execution — the drain
+    /// consumes it into `budget/raised`.
+    fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<BudgetWireOutcome, ControlError>>;
     /// The pending asks of one session with the TTL overlay: a pure read.
     fn pending(&self, session: SessionId) -> BoxFuture<'_, Result<Vec<PendingView>, ControlError>>;
     fn projection(&self, session: SessionId) -> BoxFuture<'_, Result<SessionState, ControlError>>;
@@ -150,6 +186,29 @@ impl ConfirmWireOutcome {
     }
 }
 
+/// The `raise_budget` wire outcome (ADR-055).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetWireOutcome {
+    /// The row is durable; the projection adds it when a drain consumes it.
+    Accepted,
+    /// An exact replay of the same raise already has its durable row.
+    Deduplicated,
+    /// The session is terminal — a raise would be unconsumable inbox junk.
+    Terminal,
+}
+
+impl BudgetWireOutcome {
+    /// The wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Deduplicated => "deduplicated",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 /// One pending confirmation as the `pending` read reports it
 /// (CONFIRMATION-MODEL §9).
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +218,19 @@ pub struct PendingView {
     pub arguments: Value,
     pub requested_at_ms: u64,
     pub expired: bool,
+}
+
+/// The deferred submit/queue outcome (ADR-060): the row is durable and
+/// carries an eligibility instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredAdmission {
+    /// An exact replay of the same row already exists.
+    pub deduplicated: bool,
+    /// The instant stamped on the durable row.
+    pub eligible_at_ms: u64,
+    /// True when that instant is in the future because a policy asked for
+    /// it; false when the row is immediately eligible.
+    pub deferred: bool,
 }
 
 /// Control-plane failures.
@@ -184,6 +256,14 @@ pub enum ControlError {
         session: SessionId,
         archived_at: u64,
     },
+    /// ADR-055: a raise with both amounts absent or zero is a client
+    /// error (`-32602`), never a durable row.
+    #[error("invalid budget raise: {reason}")]
+    InvalidBudget { reason: String },
+    /// ADR-060: the caller asked to defer but this server has no defer:
+    /// section, so it cannot promise a future eligibility instant.
+    #[error("deferral is not configured (no defer: section)")]
+    DeferralUnavailable,
     #[error("{0}")]
     Internal(String),
 }
@@ -318,6 +398,11 @@ fn control_err(e: ControlError) -> (i64, String) {
                 session.0
             ),
         ),
+        ControlError::InvalidBudget { reason } => (CODE_INVALID_PARAMS, reason),
+        ControlError::DeferralUnavailable => (
+            CODE_INVALID_PARAMS,
+            "deferral is not configured (no `defer:` section)".to_string(),
+        ),
         ControlError::Internal(msg) => (CODE_INTERNAL, msg),
     }
 }
@@ -331,15 +416,28 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         }
         "submit" => {
             let (session, content, key) = input_params(params)?;
-            let dedup = state
-                .plane
-                .submit(session, content, key)
-                .await
-                .map_err(control_err)?;
-            Ok(json!({"deduplicated": dedup}))
+            match defer_param(params)? {
+                Some(policy) => {
+                    let admission = state
+                        .plane
+                        .submit_deferred(session, content, key, policy)
+                        .await
+                        .map_err(control_err)?;
+                    Ok(deferred_result(&admission))
+                }
+                None => {
+                    let dedup = state
+                        .plane
+                        .submit(session, content, key)
+                        .await
+                        .map_err(control_err)?;
+                    Ok(json!({"deduplicated": dedup}))
+                }
+            }
         }
         "steer" => {
             let (session, content, key) = input_params(params)?;
+            reject_defer_param(params, "steer")?;
             let dedup = state
                 .plane
                 .steer(session, content, key)
@@ -349,12 +447,24 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         }
         "queue" => {
             let (session, content, key) = input_params(params)?;
-            let dedup = state
-                .plane
-                .queue(session, content, key)
-                .await
-                .map_err(control_err)?;
-            Ok(json!({"deduplicated": dedup}))
+            match defer_param(params)? {
+                Some(policy) => {
+                    let admission = state
+                        .plane
+                        .queue_deferred(session, content, key, policy)
+                        .await
+                        .map_err(control_err)?;
+                    Ok(deferred_result(&admission))
+                }
+                None => {
+                    let dedup = state
+                        .plane
+                        .queue(session, content, key)
+                        .await
+                        .map_err(control_err)?;
+                    Ok(json!({"deduplicated": dedup}))
+                }
+            }
         }
         "interrupt" => {
             let session = session_params(params)?;
@@ -389,6 +499,27 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
             let outcome = state
                 .plane
                 .confirm(session, call_id, decision, reason, requested_by)
+                .await
+                .map_err(control_err)?;
+            Ok(json!({"outcome": outcome.as_str()}))
+        }
+        "raise_budget" => {
+            let session = session_params(params)?;
+            let tokens = optional_u64(params, "tokens")?;
+            let wall_clock_ms = optional_u64(params, "wall_clock_ms")?;
+            let reason = optional_string(params, "reason")?;
+            let requested_by = optional_string(params, "requested_by")?;
+            let idempotency_key = optional_string(params, "idempotency_key")?;
+            let outcome = state
+                .plane
+                .raise_budget(
+                    session,
+                    tokens,
+                    wall_clock_ms,
+                    reason,
+                    requested_by,
+                    idempotency_key,
+                )
                 .await
                 .map_err(control_err)?;
             Ok(json!({"outcome": outcome.as_str()}))
@@ -431,7 +562,7 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
         other => Err((
             CODE_METHOD_NOT_FOUND,
             format!(
-                "unknown method `{other}` (baseline set: create_session, submit, steer, interrupt, queue, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
+                "unknown method `{other}` (baseline set: create_session, submit, steer, interrupt, queue, confirm, raise_budget, projection; events is the SSE endpoint GET /sessions/{{id}}/events)"
             ),
         )),
     }
@@ -520,8 +651,62 @@ fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
     session_of(params)
 }
 
+/// The optional defer param (ADR-060): absent means immediate; the only
+/// accepted value is "off_peak". Anything else is -32602, never silently
+/// ignored.
+fn defer_param(params: &Value) -> Result<Option<crate::defer::DeferPolicy>, (i64, String)> {
+    match params.get("defer") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            crate::defer::DeferPolicy::parse(raw)
+                .map(Some)
+                .ok_or_else(|| {
+                    (
+                        CODE_INVALID_PARAMS,
+                        "defer must be \"off_peak\" (the only deferral policy)".to_string(),
+                    )
+                })
+        }
+        Some(_) => Err((
+            CODE_INVALID_PARAMS,
+            "defer must be a string when present".to_string(),
+        )),
+    }
+}
+
+/// Steering is an interactive correction: it is never delayed (ADR-060).
+fn reject_defer_param(params: &Value, method: &str) -> Result<(), (i64, String)> {
+    if params.get("defer").is_some_and(|value| !value.is_null()) {
+        return Err((
+            CODE_INVALID_PARAMS,
+            format!("{method} cannot defer: interactive steering is never delayed (ADR-060)"),
+        ));
+    }
+    Ok(())
+}
+
+fn deferred_result(admission: &DeferredAdmission) -> Value {
+    json!({
+        "deduplicated": admission.deduplicated,
+        "deferred": admission.deferred,
+        "eligible_at_ms": admission.eligible_at_ms,
+    })
+}
+
 /// An optional string param: absent/null → `None`; any other non-string
 /// type is `-32602` (never silently ignored).
+fn optional_u64(params: &Value, name: &str) -> Result<Option<u64>, (i64, String)> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            (
+                CODE_INVALID_PARAMS,
+                format!("`{name}` must be a non-negative integer when present"),
+            )
+        }),
+    }
+}
+
 fn optional_string(params: &Value, name: &str) -> Result<Option<String>, (i64, String)> {
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),
@@ -1405,5 +1590,254 @@ mod tests {
         assert_eq!(end.subscribers, 0);
         assert_eq!(end.sessions_watched, 0);
         assert_eq!(end.events_sent, 0);
+    }
+
+    // -- deferred admissions (ADR-060, P4) ------------------------------
+
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+    use kian_core::events::Event;
+    use kian_core::model::SessionId;
+    use kian_core::state::SessionState;
+    use serde_json::Value;
+
+    use super::{
+        AppState, BudgetWireOutcome, ConfirmWireOutcome, ControlError, ControlPlane,
+        DeferredAdmission, EventTailRead, ProjectionRead, control_err, dispatch,
+    };
+
+    /// A control plane that records the deferred calls; the methods these
+    /// tests never reach are unreachable on purpose.
+    #[derive(Default)]
+    struct RecordingPlane {
+        deferred: Mutex<Vec<(crate::defer::DeferPolicy, Option<String>)>>,
+        submits: AtomicUsize,
+    }
+
+    impl ControlPlane for RecordingPlane {
+        fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
+            Box::pin(async { unreachable!("create_session is not exercised") })
+        }
+        fn submit(
+            &self,
+            _session: SessionId,
+            _content: Value,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<bool, ControlError>> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(false) })
+        }
+        fn submit_deferred(
+            &self,
+            _session: SessionId,
+            _content: Value,
+            idempotency_key: Option<String>,
+            policy: crate::defer::DeferPolicy,
+        ) -> BoxFuture<'_, Result<DeferredAdmission, ControlError>> {
+            if let Ok(mut seen) = self.deferred.lock() {
+                seen.push((policy, idempotency_key));
+            }
+            Box::pin(async {
+                Ok(DeferredAdmission {
+                    deduplicated: false,
+                    eligible_at_ms: 1_800_000_000_000,
+                    deferred: true,
+                })
+            })
+        }
+        fn queue_deferred(
+            &self,
+            _session: SessionId,
+            _content: Value,
+            idempotency_key: Option<String>,
+            policy: crate::defer::DeferPolicy,
+        ) -> BoxFuture<'_, Result<DeferredAdmission, ControlError>> {
+            if let Ok(mut seen) = self.deferred.lock() {
+                seen.push((policy, idempotency_key));
+            }
+            Box::pin(async {
+                Ok(DeferredAdmission {
+                    deduplicated: false,
+                    eligible_at_ms: 1_800_000_000_000,
+                    deferred: true,
+                })
+            })
+        }
+        fn steer(
+            &self,
+            _session: SessionId,
+            _content: Value,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<bool, ControlError>> {
+            Box::pin(async { unreachable!("steer is not exercised") })
+        }
+        fn queue(
+            &self,
+            _session: SessionId,
+            _content: Value,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<bool, ControlError>> {
+            Box::pin(async { unreachable!("queue is not exercised") })
+        }
+        fn interrupt(&self, _session: SessionId) -> BoxFuture<'_, Result<String, ControlError>> {
+            Box::pin(async { unreachable!("interrupt is not exercised") })
+        }
+        fn confirm(
+            &self,
+            _session: SessionId,
+            _call_id: String,
+            _decision: kian_core::control::ConfirmDecision,
+            _reason: Option<String>,
+            _requested_by: Option<String>,
+        ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>> {
+            Box::pin(async { unreachable!("confirm is not exercised") })
+        }
+        fn raise_budget(
+            &self,
+            _session: SessionId,
+            _tokens: Option<u64>,
+            _wall_clock_ms: Option<u64>,
+            _reason: Option<String>,
+            _requested_by: Option<String>,
+            _idempotency_key: Option<String>,
+        ) -> BoxFuture<'_, Result<BudgetWireOutcome, ControlError>> {
+            Box::pin(async { unreachable!("raise_budget is not exercised") })
+        }
+        fn pending(
+            &self,
+            _session: SessionId,
+        ) -> BoxFuture<'_, Result<Vec<super::PendingView>, ControlError>> {
+            Box::pin(async { unreachable!("pending is not exercised") })
+        }
+        fn projection(
+            &self,
+            _session: SessionId,
+        ) -> BoxFuture<'_, Result<SessionState, ControlError>> {
+            Box::pin(async { Ok(SessionState::Idle) })
+        }
+        fn session_events(
+            &self,
+            _session: SessionId,
+        ) -> BoxFuture<'_, Result<Vec<Event>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn projection_versioned(
+            &self,
+            _session: SessionId,
+            _since: Option<u64>,
+        ) -> BoxFuture<'_, Result<ProjectionRead, ControlError>> {
+            Box::pin(async {
+                Ok(ProjectionRead {
+                    version: 0,
+                    unchanged: true,
+                    state: None,
+                })
+            })
+        }
+        fn session_events_after(
+            &self,
+            _session: SessionId,
+            _after: u64,
+        ) -> BoxFuture<'_, Result<EventTailRead, ControlError>> {
+            Box::pin(async {
+                Ok(EventTailRead {
+                    version: 0,
+                    events: Vec::new(),
+                    terminal: false,
+                })
+            })
+        }
+        fn session_version(&self, _session: SessionId) -> BoxFuture<'_, Result<u64, ControlError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    fn recording_state() -> (AppState, Arc<RecordingPlane>) {
+        let plane = Arc::new(RecordingPlane::default());
+        let plane_dyn: Arc<dyn ControlPlane> = plane.clone();
+        (
+            AppState {
+                plane: plane_dyn,
+                sse_poll_ms: 1_000,
+                event_stream: None,
+            },
+            plane,
+        )
+    }
+
+    #[tokio::test]
+    async fn submit_with_defer_off_peak_returns_the_planned_instant() {
+        let (state, plane) = recording_state();
+        let params = json!({
+            "session": uuid_str(1),
+            "content": "batch job",
+            "defer": "off_peak",
+            "idempotency_key": "k1",
+        });
+        let out = dispatch(&state, "submit", &params)
+            .await
+            .expect("deferred submit");
+        assert_eq!(
+            out,
+            json!({"deduplicated": false, "deferred": true, "eligible_at_ms": 1_800_000_000_000u64})
+        );
+        let seen = plane.deferred.lock().expect("deferred calls");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, crate::defer::DeferPolicy::OffPeak);
+        assert_eq!(seen[0].1.as_deref(), Some("k1"));
+        assert_eq!(
+            plane.submits.load(Ordering::SeqCst),
+            0,
+            "a deferred submit never takes the immediate path"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undeferred_submit_keeps_the_old_response_shape() {
+        let (state, plane) = recording_state();
+        let params = json!({"session": uuid_str(1), "content": "now please"});
+        let out = dispatch(&state, "submit", &params).await.expect("submit");
+        assert_eq!(out, json!({"deduplicated": false}));
+        assert_eq!(plane.submits.load(Ordering::SeqCst), 1);
+        assert!(plane.deferred.lock().expect("calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_defer_values_are_client_errors() {
+        let (state, _plane) = recording_state();
+        let bad = json!({"session": uuid_str(1), "content": "x", "defer": "offpeak"});
+        let (code, message) = dispatch(&state, "submit", &bad)
+            .await
+            .expect_err("an unknown policy is refused");
+        assert_eq!(code, CODE_INVALID_PARAMS);
+        assert!(message.contains("off_peak"), "{message}");
+
+        let wrong_type = json!({"session": uuid_str(1), "content": "x", "defer": 5});
+        let (code, message) = dispatch(&state, "queue", &wrong_type)
+            .await
+            .expect_err("a non-string defer is refused");
+        assert_eq!(code, CODE_INVALID_PARAMS);
+        assert!(message.contains("string"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn steering_never_defers() {
+        let (state, _plane) = recording_state();
+        let params = json!({"session": uuid_str(1), "content": "x", "defer": "off_peak"});
+        let (code, message) = dispatch(&state, "steer", &params)
+            .await
+            .expect_err("steer refuses deferral");
+        assert_eq!(code, CODE_INVALID_PARAMS);
+        assert!(message.contains("never delayed"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_defer_section_maps_to_invalid_params() {
+        let (code, message) = control_err(ControlError::DeferralUnavailable);
+        assert_eq!(code, CODE_INVALID_PARAMS);
+        assert!(message.contains("not configured"), "{message}");
     }
 }

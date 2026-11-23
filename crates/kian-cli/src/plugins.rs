@@ -142,6 +142,11 @@ pub struct LocalToolsPlugin {
     /// the exec output redactor (`tools.exec_redact`, default
     /// on; built at assembly from every secret name kian.yaml names).
     pub redactor: kian_core::secrets::SecretRedactor,
+    /// Bundle-edge tool providers mounted beside the local tools:
+    /// `artifact_read` when `artifacts:` is on (ADR-056), the web tools
+    /// when `web:` is on (ADR-057). Empty keeps the provider set
+    /// byte-identical (local tools only).
+    pub extras: Vec<Arc<dyn ToolProvider>>,
 }
 
 impl Plugin for LocalToolsPlugin {
@@ -158,7 +163,15 @@ impl Plugin for LocalToolsPlugin {
             .with_exec_timeout(self.exec_timeout_ms)
             .with_env_policy(self.env_policy)
             .with_redactor(self.redactor);
-        ctx.provide::<dyn ToolProvider>(Arc::new(tools) as Arc<dyn ToolProvider>)
+        let provider: Arc<dyn ToolProvider> = if self.extras.is_empty() {
+            Arc::new(tools) as Arc<dyn ToolProvider>
+        } else {
+            let mut providers: Vec<Arc<dyn ToolProvider>> =
+                vec![Arc::new(tools) as Arc<dyn ToolProvider>];
+            providers.extend(self.extras);
+            Arc::new(crate::superagent::CombinedTools::new(providers))
+        };
+        ctx.provide::<dyn ToolProvider>(provider)
     }
 }
 
@@ -706,6 +719,10 @@ pub struct SuperAgentPlugin {
     /// projections and resolves invoking sessions from committed
     /// `tool/call` events). Only used when `async_tools` is on.
     pub event_store: kian_store::EventStore,
+    /// ADR-062: the channel-edge media processor, mounted only when
+    /// `media:` is configured. `None` = every channel pump keeps its
+    /// exact bytes and no media envelope is ever preprocessed.
+    pub media_edge: Option<Arc<crate::media_edge::MediaEdge>>,
 }
 
 impl Plugin for SuperAgentPlugin {
@@ -1877,6 +1894,7 @@ impl Plugin for SuperAgentPlugin {
             wechat_channels: self.wechat_channels,
             imessage_channels: self.imessage_channels,
             adapters,
+            media: self.media_edge,
             worker_gate: self.worker_gate,
             subscription_metrics,
             router_metrics,

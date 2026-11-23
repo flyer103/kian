@@ -344,10 +344,11 @@ pub async fn run_inspect(
     // usage lines render only when the stream observed usage.
     if let Some(u) = &report.usage {
         out.push_str(&format!(
-            "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
+            "usage input tokens   {}\nusage output tokens  {}\nusage cache read     {}\nusage cache miss     {}\nusage cache creation {}\nusage requests       {} ({} unknown)\n",
             u.input_tokens,
             u.output_tokens,
             u.cache_read_input_tokens,
+            u.cache_miss_input_tokens,
             u.cache_creation_input_tokens,
             u.requests_with_usage,
             u.unknown_usage_requests,
@@ -373,7 +374,27 @@ pub struct ContextMismatch {
 pub struct ModelContextCheck {
     pub requests_checked: u64,
     pub byte_identical: u64,
+    /// Requests whose recorded body carries dialect content parts
+    /// (ADR-063 vision). Their per-message bytes are not re-derivable
+    /// offline — the image data URLs live only in the recorded body, and
+    /// the event stream deliberately holds artifact references, not
+    /// base64 — so they are counted here and left out of the byte diff
+    /// instead of being reported as mismatches.
+    pub vision_requests: u64,
     pub mismatches: Vec<ContextMismatch>,
+}
+
+/// Whether one recorded body message carries dialect content parts
+/// (ADR-063): a `content` array whose items name a `type`.
+fn message_has_content_parts(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str).is_some())
+        })
 }
 
 /// For every `step/request` event, re-derives the model context from
@@ -416,14 +437,20 @@ pub fn check_model_context(events: &[Event]) -> ModelContextCheck {
             }
             Err(e) => format!("(derive failed: {e})"),
         };
-        let recorded = serde_json::to_string(
-            &ev.bytes
-                .get("body")
-                .and_then(|b| b.get("messages"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .unwrap_or_default();
+        let recorded_messages = ev
+            .bytes
+            .get("body")
+            .and_then(|b| b.get("messages"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if recorded_messages
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(message_has_content_parts))
+        {
+            out.vision_requests += 1;
+            continue;
+        }
+        let recorded = serde_json::to_string(&recorded_messages).unwrap_or_default();
         if derived == recorded {
             out.byte_identical += 1;
         } else {
@@ -551,6 +578,14 @@ pub async fn run_replay(
     } else {
         format!("VIOLATED ({})", violations.join("; "))
     };
+    let vision_line = if model_context.vision_requests == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({} vision request(s) carry content parts not re-derivable offline)",
+            model_context.vision_requests
+        )
+    };
     let mismatch_line = if model_context.mismatches.is_empty() {
         String::new()
     } else {
@@ -564,7 +599,7 @@ pub async fn run_replay(
         )
     };
     let body = format!(
-        "session             {}\nevents              {}\nderived state       {}\n{live_line}\ninvariants          {invariants_line}\nmodel context       {} of {} requests byte-identical{mismatch_line}\n",
+        "session             {}\nevents              {}\nderived state       {}\n{live_line}\ninvariants          {invariants_line}\nmodel context       {} of {} requests byte-identical{vision_line}{mismatch_line}\n",
         session.0,
         events.len(),
         serde_json::to_value(derived_state).unwrap_or_default(),
@@ -583,9 +618,9 @@ pub async fn run_replay(
 // ---------------------------------------------------------------------------
 
 /// `kian session export <id> [--since S] [--until U] [--out F]
-/// [--with-event-ids]`: writes one frozen v0 envelope per line (the
-/// exact stored bytes, re-serialized identically from the envelope
-/// column). `since`/`until` are inclusive seq bounds.
+/// [--with-event-ids] [--with-artifacts]`: writes one frozen v0 envelope
+/// per line (the exact stored bytes, re-serialized identically from the
+/// envelope column). `since`/`until` are inclusive seq bounds.
 ///
 /// `--with-event-ids` (opt-) adds the derived `event_id`
 /// ([`kian_core::events::event_id`]) to each line — a presentation key
@@ -593,6 +628,13 @@ pub async fn run_replay(
 /// are unchanged; the flag only ever adds a key, and `import_jsonl`
 /// parses the augmented lines unchanged (the envelope ignores unknown
 /// keys), so the field is round-trip-safe, not export-only.
+///
+/// `--with-artifacts` (opt-, requires `--out`) pins every spilled
+/// `tool/result` blob the exported events reference into a sibling
+/// `<out>.artifacts/<id>` directory (ADR-059): the exported audit slice
+/// then survives retention GC. A blob already reclaimed is reported,
+/// never invented — the event stream stays the truth.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_export(
     config_path: &Path,
     db: Option<&Path>,
@@ -601,6 +643,7 @@ pub async fn run_export(
     until: Option<u64>,
     out: Option<&Path>,
     with_event_ids: bool,
+    with_artifacts: bool,
 ) -> CmdResult<String> {
     let db = resolve_db(db, config_path)?;
     let store = open_reader(&db).await?;
@@ -613,7 +656,17 @@ pub async fn run_export(
         .map_err(|e| format!("archive marker read: {e}"))?
     {
         store.close().await;
-        return export_from_package(&m, session, since, until, out, with_event_ids).await;
+        return export_from_package(
+            &m,
+            session,
+            since,
+            until,
+            out,
+            with_event_ids,
+            with_artifacts,
+            config_path,
+        )
+        .await;
     }
     let events = rebuild_session(&store, session).await?;
     store.close().await;
@@ -654,13 +707,18 @@ pub async fn run_export(
     match out {
         Some(path) => {
             std::fs::write(path, &jsonl).map_err(|e| format!("write {}: {e}", path.display()))?;
-            Ok(format!(
+            let mut message = format!(
                 "exported {} events (seq {}..={}) to {}",
                 selected.len(),
                 selected.first().map(|e| e.seq).unwrap_or(0),
                 selected.last().map(|e| e.seq).unwrap_or(0),
                 path.display()
-            ))
+            );
+            if with_artifacts {
+                let ids = crate::artifacts::referenced_artifact_ids(selected.iter().copied());
+                message.push_str(&pin_export_artifacts(config_path, &ids, path)?);
+            }
+            Ok(message)
         }
         None => {
             // JSONL to stdout: the caller (main) prints it verbatim.
@@ -669,11 +727,36 @@ pub async fn run_export(
     }
 }
 
+/// Resolves the configured blob store and pins `ids` beside the export
+/// (P3b, ADR-059). The artifacts section is required: a spill-shaped
+/// result can only exist when spill was configured, so a missing
+/// section means the operator pointed the export at the wrong config.
+fn pin_export_artifacts(
+    config_path: &Path,
+    ids: &std::collections::BTreeSet<String>,
+    out: &Path,
+) -> CmdResult<String> {
+    let config = crate::config::ServeConfig::load(config_path)
+        .map_err(|e| format!("--with-artifacts: config: {e}"))?;
+    let artifacts = config.artifacts.as_ref().ok_or_else(|| {
+        "--with-artifacts requires an `artifacts:` section — no blob store is configured"
+            .to_string()
+    })?;
+    let dir = artifacts
+        .resolve_dir(&config.storage)
+        .map_err(|e| format!("--with-artifacts: {e}"))?;
+    let store = kian_store::ArtifactStore::open(dir)
+        .map_err(|e| format!("--with-artifacts: open store: {e}"))?;
+    let report = crate::artifacts::pin_artifacts(&store, ids, out)?;
+    Ok(format!("; {}", report.summary()))
+}
+
 /// Serves `session export` for an archived session from its package:
 /// the file's hashes are re-verified, then the requested `[since,
 /// until]` lines are emitted with their stored bytes — byte-identical
 /// to the pre-archive export by construction (the same lines, the same
 /// serializer).
+#[allow(clippy::too_many_arguments)]
 async fn export_from_package(
     m: &kian_store::ArchivedMarker,
     session: SessionId,
@@ -681,6 +764,8 @@ async fn export_from_package(
     until: Option<u64>,
     out: Option<&Path>,
     with_event_ids: bool,
+    with_artifacts: bool,
+    config_path: &Path,
 ) -> CmdResult<String> {
     let dir = std::path::Path::new(&m.package_path);
     let manifest = crate::archive::verify_package(dir, Some(session))
@@ -730,14 +815,23 @@ async fn export_from_package(
     match out {
         Some(path) => {
             std::fs::write(path, &jsonl).map_err(|e| format!("write {}: {e}", path.display()))?;
-            Ok(format!(
+            let mut message = format!(
                 "exported {} events (seq {}..={}) to {} (from archive package {})",
                 selected.len(),
                 since,
                 until.min(manifest.last_seq),
                 path.display(),
                 m.package_path
-            ))
+            );
+            if with_artifacts {
+                let events: Vec<Event> = selected
+                    .iter()
+                    .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+                    .collect();
+                let ids = crate::artifacts::referenced_artifact_ids(events.iter());
+                message.push_str(&pin_export_artifacts(config_path, &ids, path)?);
+            }
+            Ok(message)
         }
         None => Ok(jsonl),
     }
@@ -2228,6 +2322,72 @@ pub async fn run_confirm(
     ))
 }
 
+/// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
+/// [--requested-by <who>] [--idempotency-key <key>] [--url <base>] [--config <path>]
+/// [--json]`: admits one durable budget-raise control row (ADR-055). The RPC result is the honest
+/// outcome — `accepted`, `deduplicated` or `terminal`; the effect is observed on the event stream.
+pub struct RaiseBudgetRequest<'a> {
+    pub session: SessionId,
+    pub tokens: Option<u64>,
+    pub wall_clock_ms: Option<u64>,
+    pub reason: Option<&'a str>,
+    pub requested_by: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+}
+
+pub async fn run_raise_budget(
+    config_path: &Path,
+    url: Option<&str>,
+    req: RaiseBudgetRequest<'_>,
+    json: bool,
+) -> CmdResult<String> {
+    let client = KianClient::new(resolve_url(url, config_path)?);
+    let mut params = json!({"session": req.session.0.to_string()});
+    if let Some(tokens) = req.tokens {
+        params["tokens"] = json!(tokens);
+    }
+    if let Some(ms) = req.wall_clock_ms {
+        params["wall_clock_ms"] = json!(ms);
+    }
+    if let Some(reason) = req.reason {
+        params["reason"] = json!(reason);
+    }
+    if let Some(who) = req.requested_by {
+        params["requested_by"] = json!(who);
+    }
+    if let Some(key) = req.idempotency_key {
+        params["idempotency_key"] = json!(key);
+    }
+    let result = client
+        .rpc("raise_budget", params)
+        .await
+        .map_err(|e| format!("raise-budget: {e}"))?;
+    let outcome = result
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    if json {
+        return serde_json::to_string_pretty(&json!({
+            "session": req.session.0.to_string(),
+            "tokens": req.tokens,
+            "wall_clock_ms": req.wall_clock_ms,
+            "outcome": outcome,
+        }))
+        .map_err(|e| e.to_string());
+    }
+    let meaning = match outcome.as_str() {
+        "accepted" => "the raise is durable; the drain consumes it and resumes",
+        "deduplicated" => "an identical raise was already admitted; nothing new was written",
+        "terminal" => "the session is terminal; no raise was admitted",
+        _ => "unknown outcome",
+    };
+    Ok(format!(
+        "session {}\noutcome             {}\n{}\n",
+        req.session.0, outcome, meaning,
+    ))
+}
+
 /// `kian workers release <id> [--reason <text>] [--url <base>]
 /// [--config <path>] [--json]`: close the worker's live bound thread and
 /// free its 1:1 slot (ADR-035). Refused honestly while the thread is
@@ -2945,6 +3105,29 @@ mod tests {
         assert!(check.mismatches[0].recorded.contains("REWRITTEN"));
     }
 
+    /// ADR-063: a request whose recorded body carries dialect content parts
+    /// (image data URLs) is counted as a vision request instead of being
+    /// reported as a divergence — the base64 exists only in the recorded
+    /// body, never re-derivable from the stream.
+    #[test]
+    fn vision_requests_are_counted_not_reported_as_divergence() {
+        let recorded = json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is on this invoice?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+            ]}
+        ]);
+        let events = honest_stream(recorded);
+        let check = check_model_context(&events);
+        assert_eq!(check.requests_checked, 1);
+        assert_eq!(check.vision_requests, 1);
+        assert_eq!(check.byte_identical, 0);
+        assert!(
+            check.mismatches.is_empty(),
+            "vision bodies are honestly skipped, not called divergences"
+        );
+    }
+
     /// Export → import round-trip at the unit level: an imported JSONL
     /// stream is byte-identical and projects the same state.
     #[tokio::test]
@@ -3047,6 +3230,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3100,6 +3284,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3111,6 +3296,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -3122,6 +3308,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -3164,6 +3351,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         )
         .await

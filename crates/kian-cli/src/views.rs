@@ -127,6 +127,7 @@ pub struct UsageEntry {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    pub cache_miss_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
 }
 
@@ -308,6 +309,7 @@ impl UsageEntry {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_miss_input_tokens: self.cache_miss_input_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
         }
     }
@@ -363,6 +365,7 @@ fn usage_entry(report: &crate::usage_metrics::SessionUsageReport) -> UsageEntry 
         input_tokens: report.input_tokens,
         output_tokens: report.output_tokens,
         cache_read_input_tokens: report.cache_read_input_tokens,
+        cache_miss_input_tokens: report.cache_miss_input_tokens,
         cache_creation_input_tokens: report.cache_creation_input_tokens,
     }
 }

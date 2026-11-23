@@ -381,6 +381,7 @@ async fn corrupt_view_is_discarded_and_the_gate_hides_views() {
             input_tokens: 123_456,
             output_tokens: 0,
             cache_read_input_tokens: 0,
+            cache_miss_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
         .unwrap(),

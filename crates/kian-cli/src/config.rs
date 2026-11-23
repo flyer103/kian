@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use kian_core::model::{AgentDef, Budgets, Permission, SlotName, SlotSpec, SlotTarget};
+use kian_core::model::{
+    AgentDef, Budgets, ModelProfile, Permission, SlotName, SlotSpec, SlotTarget,
+};
 use kian_llm::provider::{DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS};
 use kian_loop::evidence::EvidenceGateConfig;
 use kian_orchestrator::recovery::PolicyConfig;
@@ -60,6 +62,18 @@ pub struct ServeConfig {
     pub agent: AgentConfig,
     /// openai-compatible endpoints the slots may target.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// The `pricing:` section (ADR-053): the read-only cost projection's
+    /// price book. Absent = no pricing; `kian cost` reports unavailable.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::pricing::PricingConfig::is_empty"
+    )]
+    pub pricing: crate::pricing::PricingConfig,
+    /// The `model_profiles:` section (ADR-053): declarative provider/model
+    /// capability metadata. Parsed and validated here; the request planner
+    /// consumes it from phase 1.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_profiles: BTreeMap<String, crate::pricing::ModelProfileConfig>,
     /// Enabled built-in plugins (validated against the known set).
     #[serde(default = "default_plugins")]
     pub plugins: Vec<String>,
@@ -141,6 +155,33 @@ pub struct ServeConfig {
     /// only (no wildcard in OSS).
     #[serde(default)]
     pub api: ApiConfig,
+    /// The `artifacts:` section (ADR-056, P2). `None` (the section
+    /// absent) is tool-result spill **off**: every result stays inline
+    /// and the event bytes are legacy-identical. Present parses
+    /// fail-closed and mounts the `artifact_read` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<ArtifactsConfig>,
+    /// The `web:` section (ADR-057, P2b). `None` (the section absent)
+    /// is client-side web tools **off**: the tool set is byte-identical
+    /// and no provider key is read. Present mounts `web_search` /
+    /// `web_fetch` beside the local tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebConfig>,
+    /// The `defer:` section (ADR-060, P4). `None` (the section absent)
+    /// is off-peak deferral **off**: an API `defer` request is refused,
+    /// a cron schedule cannot declare `defer: off_peak`, and every
+    /// admission stays byte-identical to before. Present parses
+    /// fail-closed, requires peak windows in `pricing:`, and arms the
+    /// due-wake sweep in serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer: Option<DeferConfig>,
+    /// The media: section (ADR-061, P5a). None (the section absent) is
+    /// client-side media tools off: the mounted tool set is
+    /// byte-identical and no provider key is read. Present requires an
+    /// artifacts: section and mounts image_ocr / audio_transcribe /
+    /// speech_synthesize beside the local tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaConfig>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -475,6 +516,318 @@ impl Default for ToolsConfig {
             exec_redact: ExecRedactSection::default(),
         }
     }
+}
+
+/// The `artifacts:` section (ADR-056, P2): tool-result spill.
+///
+/// ```yaml
+/// artifacts:
+///   dir: ./artifacts
+///   inline_max_bytes: 16384
+///   gc:
+///     max_bytes: 10737418240
+///     retention_days: 30
+///     interval_ms: 3600000
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// Blob directory. Default: an `artifacts/` sibling of the sqlite
+    /// database file (required under postgres — there is no file path
+    /// to derive it from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Successful tool results larger than this many bytes spill by
+    /// reference: the model reads a bounded preview and pages the rest
+    /// through `artifact_read`.
+    #[serde(default = "default_artifact_inline_max_bytes")]
+    pub inline_max_bytes: usize,
+    /// Retention GC knobs (`kian artifacts gc`).
+    #[serde(default)]
+    pub gc: ArtifactGcConfig,
+}
+
+impl ArtifactsConfig {
+    /// The resolved blob directory, fail-closed when it cannot be
+    /// derived (postgres without an explicit `dir`).
+    pub fn resolve_dir(&self, storage: &StorageConfig) -> Result<std::path::PathBuf, String> {
+        if let Some(dir) = self.dir.as_ref() {
+            if dir.trim().is_empty() {
+                return Err("artifacts.dir must not be empty when present".into());
+            }
+            return Ok(std::path::PathBuf::from(dir));
+        }
+        if storage.is_postgres() {
+            return Err(
+                "artifacts.dir is required under storage.event_store: postgres — there is no sqlite path to derive the blob directory from"
+                    .into(),
+            );
+        }
+        let db = std::path::Path::new(&storage.sqlite);
+        let parent = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Ok(parent.join("artifacts"))
+    }
+}
+
+/// The `artifacts.gc:` sub-section: pure retention, no reference counts
+/// (ADR-056 decision 6). A `0` turns that dimension off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactGcConfig {
+    /// Total blob budget, bytes.
+    #[serde(default = "default_artifact_gc_max_bytes")]
+    pub max_bytes: u64,
+    /// Keep blobs at least this many days.
+    #[serde(default = "default_artifact_retention_days")]
+    pub retention_days: u64,
+    /// Serve-side GC ticker period, milliseconds (P3b, ADR-059).
+    /// Ignored by the one-shot `kian artifacts gc` command.
+    #[serde(default = "default_artifact_gc_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl Default for ArtifactGcConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_artifact_gc_max_bytes(),
+            retention_days: default_artifact_retention_days(),
+            interval_ms: default_artifact_gc_interval_ms(),
+        }
+    }
+}
+
+fn default_artifact_inline_max_bytes() -> usize {
+    16 * 1024
+}
+fn default_artifact_gc_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_artifact_retention_days() -> u64 {
+    30
+}
+fn default_artifact_gc_interval_ms() -> u64 {
+    60 * 60 * 1000
+}
+
+/// The `web:` section (ADR-057, P2b): the client-side DeepSeek Search /
+/// Fetch tools. Protocol-only — the adapter speaks the documented
+/// request/response shapes, never a provider SDK.
+///
+/// ```yaml
+/// web:
+///   base_url: https://api.deepseek.com
+///   api_key_env: DEEPSEEK_API_KEY
+///   timeout_ms: 30000
+///   search:
+///     max_results: 10
+///     need_content: false
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Provider origin. The adapter appends `/v1/tools/search` and
+    /// `/v1/tools/fetch`.
+    #[serde(default = "default_web_base_url")]
+    pub base_url: String,
+    /// Environment variable holding the provider key — read once at
+    /// serve assembly; a missing value refuses boot (ADR-057 decision 2).
+    #[serde(default = "default_web_api_key_env")]
+    pub api_key_env: String,
+    /// Per-request HTTP timeout, milliseconds.
+    #[serde(default = "default_web_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Search defaults (a call may override them within the closed range).
+    #[serde(default)]
+    pub search: WebSearchConfig,
+}
+
+impl WebConfig {
+    /// Reads the provider key from the configured env name, fail-closed.
+    pub fn api_key(&self) -> Result<String, String> {
+        let key = std::env::var(&self.api_key_env).map_err(|_| {
+            format!(
+                "web.api_key_env `{}` is not set — the client-side web tools need a provider key",
+                self.api_key_env
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(format!(
+                "web.api_key_env `{}` is set but empty",
+                self.api_key_env
+            ));
+        }
+        Ok(key)
+    }
+}
+
+/// The `web.search:` sub-section: defaults a `web_search` call inherits
+/// when it omits `count` / `need_content`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    /// Default result page size (1–50; the tool may override it).
+    #[serde(default = "default_web_max_results")]
+    pub max_results: u64,
+    /// Default whether each result carries its extracted page content.
+    #[serde(default)]
+    pub need_content: bool,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            max_results: default_web_max_results(),
+            need_content: false,
+        }
+    }
+}
+
+fn default_web_base_url() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_web_api_key_env() -> String {
+    "DEEPSEEK_API_KEY".into()
+}
+fn default_web_timeout_ms() -> u64 {
+    30_000
+}
+fn default_web_max_results() -> u64 {
+    10
+}
+
+/// The `defer:` section (ADR-060, P4): explicit off-peak deferral for
+/// batch admissions.
+///
+/// ```yaml
+/// defer:
+///   sweep_interval_ms: 5000
+///   max_wait_ms: 43200000
+/// ```
+///
+/// Absent = deferral **off**: the API refuses `defer`, cron refuses
+/// `defer: off_peak`, and no ticker arms. Present requires
+/// `pricing.peak_windows` (without them every minute is off peak and
+/// deferral would be a lie) and arms the due-wake sweep; it never
+/// changes the bytes of an admission that does not ask to defer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferConfig {
+    /// The due-wake sweep cadence, milliseconds. Latency only: an absent
+    /// or late sweep never consumes a deferred row early (the store's
+    /// `eligible_at` gate refuses it).
+    #[serde(default = "default_defer_sweep_interval_ms")]
+    pub sweep_interval_ms: u64,
+    /// Longest wait a deferred admission may take before it runs
+    /// immediately instead (the why-didn't-wait bound, ADR-060).
+    #[serde(default = "default_defer_max_wait_ms")]
+    pub max_wait_ms: u64,
+}
+
+impl Default for DeferConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval_ms: default_defer_sweep_interval_ms(),
+            max_wait_ms: default_defer_max_wait_ms(),
+        }
+    }
+}
+
+impl DeferConfig {
+    /// Builds the off-peak planner over a price book.
+    #[must_use]
+    pub fn calendar(
+        &self,
+        book: std::sync::Arc<crate::pricing::PriceBook>,
+    ) -> crate::defer::DeferCalendar {
+        crate::defer::DeferCalendar::new(book, self.max_wait_ms)
+    }
+}
+
+fn default_defer_sweep_interval_ms() -> u64 {
+    5_000
+}
+fn default_defer_max_wait_ms() -> u64 {
+    12 * 60 * 60 * 1000
+}
+
+/// The media: section (ADR-061, P5a): client-side media tools (image OCR,
+/// audio transcription, speech synthesis) as audited bundle tools.
+///
+/// ```yaml
+/// media:
+///   base_url: https://api.deepseek.com
+///   api_key_env: DEEPSEEK_API_KEY
+///   timeout_ms: 30000
+///   max_input_bytes: 26214400
+///   default_voice: alloy
+///   default_format: mp3
+/// ```
+///
+/// Absent = media tools off: the mounted tool set is byte-identical.
+/// Present requires an artifacts: section (the input bytes and the
+/// synthesized speech both live in the content-addressed store) and
+/// mounts image_ocr / audio_transcribe / speech_synthesize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Provider origin. The adapter appends /v1/tools/ocr,
+    /// /v1/tools/transcribe and /v1/tools/synthesize.
+    #[serde(default = "default_media_base_url")]
+    pub base_url: String,
+    /// Environment variable holding the provider key, read once at
+    /// serve assembly; a missing value refuses boot (ADR-061 decision 2).
+    #[serde(default = "default_media_api_key_env")]
+    pub api_key_env: String,
+    /// Per-request HTTP timeout, milliseconds.
+    #[serde(default = "default_media_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Largest artifact the adapter will send in one request, bytes.
+    #[serde(default = "default_media_max_input_bytes")]
+    pub max_input_bytes: u64,
+    /// Default voice for speech_synthesize when a call omits one.
+    #[serde(default)]
+    pub default_voice: Option<String>,
+    /// Default synthesis container: mp3, wav or pcm (closed set).
+    #[serde(default = "default_media_format")]
+    pub default_format: String,
+}
+
+impl MediaConfig {
+    /// Reads the provider key from the configured env name, fail-closed.
+    pub fn api_key(&self) -> Result<String, String> {
+        let key = std::env::var(&self.api_key_env).map_err(|_| {
+            format!(
+                "media.api_key_env {} is not set - the client-side media tools need a provider key",
+                self.api_key_env
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(format!(
+                "media.api_key_env {} is set but empty",
+                self.api_key_env
+            ));
+        }
+        Ok(key)
+    }
+}
+
+fn default_media_base_url() -> String {
+    "https://api.deepseek.com".into()
+}
+fn default_media_api_key_env() -> String {
+    "DEEPSEEK_API_KEY".into()
+}
+fn default_media_timeout_ms() -> u64 {
+    30_000
+}
+fn default_media_max_input_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+fn default_media_format() -> String {
+    "mp3".into()
 }
 
 /// The `tools.exec_env:` section (fix ①: secrets never reach
@@ -3593,6 +3946,11 @@ impl ServeConfig {
             .collect()
     }
 
+    /// Builds the normalized price book from the `pricing:` section.
+    pub fn price_book(&self) -> Result<crate::pricing::PriceBook, ConfigError> {
+        self.pricing.book().map_err(invalid)
+    }
+
     /// Cross-reference validation (references resolve, semantics sane).
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Storage: the backend picks its required section, and any
@@ -3656,6 +4014,28 @@ impl ServeConfig {
                 self.listen
             ))
         })?;
+
+        // pricing + model_profiles (ADR-053): normalize the book
+        // fail-closed; capability profiles are declared metadata until the
+        // phase-1 request planner consumes them.
+        self.pricing.book().map_err(invalid)?;
+        for key in self.pricing.models.keys() {
+            let (provider, _model) = crate::pricing::split_model_key(key).map_err(invalid)?;
+            if !self.providers.contains_key(provider) {
+                return Err(invalid(format!(
+                    "pricing.models key `{key}` names provider `{provider}`, which is not declared under providers"
+                )));
+            }
+        }
+        for (key, profile) in &self.model_profiles {
+            let (provider, _model) = crate::pricing::split_model_key(key).map_err(invalid)?;
+            if !self.providers.contains_key(provider) {
+                return Err(invalid(format!(
+                    "model_profiles key `{key}` names provider `{provider}`, which is not declared under providers"
+                )));
+            }
+            profile.validate(key).map_err(invalid)?;
+        }
 
         // read_model.snapshots: sane bounds (fail-closed, never a
         // silently-degenerate maintenance loop).
@@ -4098,6 +4478,134 @@ impl ServeConfig {
             workers.validate()?;
         }
 
+        // The `artifacts:` section (ADR-056): a positive inline bound, a
+        // GC with at least one live dimension, and a derivable blob
+        // directory (postgres has no sqlite path to derive it from).
+        if let Some(artifacts) = self.artifacts.as_ref() {
+            if artifacts.inline_max_bytes == 0 {
+                return Err(invalid(
+                    "artifacts.inline_max_bytes must be > 0 (every result would spill)",
+                ));
+            }
+            if artifacts.gc.max_bytes == 0 && artifacts.gc.retention_days == 0 {
+                return Err(invalid(
+                    "artifacts.gc: at least one of max_bytes / retention_days must be > 0 — a GC with both dimensions off reclaims nothing",
+                ));
+            }
+            if artifacts.gc.interval_ms == 0 {
+                return Err(invalid(
+                    "artifacts.gc.interval_ms must be > 0 (serve would spin)",
+                ));
+            }
+            artifacts
+                .resolve_dir(&self.storage)
+                .map_err(|e| invalid(format!("artifacts: {e}")))?;
+        }
+
+        // The `web:` section (ADR-057, P2b): a parseable http(s) origin,
+        // a positive timeout, a search page size inside the provider's
+        // documented 1–50 range, and a named (non-blank) key env. The
+        // key **value** check is a serve-startup check (assembly reads
+        // the env once), exactly like the workers' `token_env`.
+        if let Some(web) = self.web.as_ref() {
+            let parsed = reqwest::Url::parse(&web.base_url).map_err(|e| {
+                invalid(format!(
+                    "web.base_url `{}` is not a valid URL: {e}",
+                    web.base_url
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                return Err(invalid(format!(
+                    "web.base_url `{}` must be an absolute http(s) URL with a host",
+                    web.base_url
+                )));
+            }
+            if web.timeout_ms == 0 {
+                return Err(invalid("web.timeout_ms must be > 0"));
+            }
+            if web.api_key_env.trim().is_empty() {
+                return Err(invalid("web.api_key_env must not be blank"));
+            }
+            if !(1..=50).contains(&web.search.max_results) {
+                return Err(invalid(format!(
+                    "web.search.max_results must be between 1 and 50 (got {})",
+                    web.search.max_results
+                )));
+            }
+        }
+
+        // The `defer:` section (ADR-060, P4): deferral is only
+        // meaningful when the price book declares peak windows (without
+        // them every minute is off peak and every defer: off_peak would
+        // run immediately), and the wait cap must be real.
+        if let Some(defer) = self.defer.as_ref() {
+            if defer.sweep_interval_ms < 100 {
+                return Err(invalid(
+                    "defer.sweep_interval_ms must be >= 100 (serve would spin)",
+                ));
+            }
+            if defer.max_wait_ms == 0 {
+                return Err(invalid(
+                    "defer.max_wait_ms must be > 0 (a zero cap makes defer: off_peak a lie)",
+                ));
+            }
+            if self.pricing.peak_windows.is_empty() {
+                return Err(invalid(
+                    "defer: requires pricing.peak_windows — with no peak window the price book                      is off peak forever and every deferral would run immediately",
+                ));
+            }
+            let book = self
+                .price_book()
+                .map_err(|e| invalid(format!("defer: pricing is unusable: {e}")))?;
+            if !book.has_off_peak_minute() {
+                return Err(invalid(
+                    "defer: the configured peak windows cover the whole week — no off-peak                      instant exists, so defer: off_peak could never wait",
+                ));
+            }
+        }
+
+        // The media: section (ADR-061, P5a): the adapter needs the
+        // artifact store in both directions, a parseable http(s) origin,
+        // a positive timeout and a named (non-blank) key env; the format
+        // is the provider closed set.
+        if let Some(media) = self.media.as_ref() {
+            if self.artifacts.is_none() {
+                return Err(invalid(
+                    "media: requires an artifacts: section - the media tools move bytes through the content-addressed store (ADR-061)",
+                ));
+            }
+            let parsed = reqwest::Url::parse(&media.base_url).map_err(|e| {
+                invalid(format!(
+                    "media.base_url {} is not a valid URL: {e}",
+                    media.base_url
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+                return Err(invalid(format!(
+                    "media.base_url {} must be an absolute http(s) URL with a host",
+                    media.base_url
+                )));
+            }
+            if media.timeout_ms == 0 {
+                return Err(invalid("media.timeout_ms must be > 0"));
+            }
+            if media.api_key_env.trim().is_empty() {
+                return Err(invalid("media.api_key_env must not be blank"));
+            }
+            if media.max_input_bytes == 0 {
+                return Err(invalid(
+                    "media.max_input_bytes must be > 0 (a zero bound refuses every artifact)",
+                ));
+            }
+            if !kian_media::SPEECH_FORMATS.contains(&media.default_format.as_str()) {
+                return Err(invalid(format!(
+                    "media.default_format {} is not a supported synthesis container (known: {})",
+                    media.default_format,
+                    kian_media::SPEECH_FORMATS.join(", ")
+                )));
+            }
+        }
+
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
             if sa.channels.is_empty() {
@@ -4433,6 +4941,18 @@ impl ServeConfig {
                 Some(sa.router.session_id.as_str()),
                 sa.router.rotate_after_events.is_some(),
             )?;
+            // ADR-060: a schedule may only declare defer: off_peak when
+            // the defer: section exists — otherwise the firing would be
+            // admitted with a future eligibility instant that nothing
+            // plans and no sweep looks for.
+            for schedule in &resolved_cron {
+                if schedule.defer == crate::defer::DeferPolicy::OffPeak && self.defer.is_none() {
+                    return Err(invalid(format!(
+                        "superagent.cron schedule `{}` declares defer: off_peak but no defer:                          section exists — add the section (sweep_interval_ms, max_wait_ms) or                          drop the schedule key (ADR-060)",
+                        schedule.id
+                    )));
+                }
+            }
             uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
                 invalid(format!(
                     "superagent.router.session_id `{}` is not a uuid",
@@ -4705,14 +5225,37 @@ impl ServeConfig {
     /// The compiled agent definition handed to the loop.
     #[must_use]
     pub fn agent_def(&self) -> AgentDef {
-        agent_def_of(&self.agent)
+        self.with_bundle_tools(agent_def_of(&self.agent, &self.model_profiles))
     }
 
     /// The compiled definition of a named agent (`None` when the id
     /// is not configured).
     #[must_use]
     pub fn named_agent_def(&self, id: &str) -> Option<AgentDef> {
-        self.agents.get(id).map(agent_def_of)
+        self.agents
+            .get(id)
+            .map(|agent| self.with_bundle_tools(agent_def_of(agent, &self.model_profiles)))
+    }
+
+    /// The bundle-edge tools ride the mounted list, not the YAML: when a
+    /// section is enabled its tool names are appended to every compiled
+    /// agent — `artifact_read` for `artifacts:` (ADR-056), `web_search`
+    /// / `web_fetch` for `web:` (ADR-057). The matching plugin always
+    /// registers those names whenever the section is on, so the mounted
+    /// name resolves; absent sections leave the list untouched.
+    fn with_bundle_tools(&self, mut def: AgentDef) -> AgentDef {
+        let mut mount = |name: &str, enabled: bool| {
+            if enabled && !def.tools.iter().any(|tool| tool == name) {
+                def.tools.push(name.into());
+            }
+        };
+        mount("artifact_read", self.artifacts.is_some());
+        mount("web_search", self.web.is_some());
+        mount("web_fetch", self.web.is_some());
+        mount("image_ocr", self.media.is_some());
+        mount("audio_transcribe", self.media.is_some());
+        mount("speech_synthesize", self.media.is_some());
+        def
     }
 
     /// Converts the `superagent.roster` section to the bundle's
@@ -4834,7 +5377,10 @@ impl ServeConfig {
 
 /// Compiles one wire-form agent definition into the core [`AgentDef`]
 /// (shared by the default `agent:` section and every `agents:` entry).
-fn agent_def_of(agent: &AgentConfig) -> AgentDef {
+fn agent_def_of(
+    agent: &AgentConfig,
+    profiles: &BTreeMap<String, crate::pricing::ModelProfileConfig>,
+) -> AgentDef {
     AgentDef {
         id: agent.id.clone(),
         version: agent.version,
@@ -4853,8 +5399,10 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
                             .map(|t| SlotTarget {
                                 provider: t.provider.clone(),
                                 model: t.model.clone(),
+                                profile: profile_for(profiles, &t.provider, &t.model),
                             })
                             .collect(),
+                        profile: profile_for(profiles, &spec.provider, &spec.model),
                     },
                 )
             })
@@ -4865,6 +5413,16 @@ fn agent_def_of(agent: &AgentConfig) -> AgentDef {
             wall_clock_ms: agent.budgets.wall_clock_ms,
         },
     }
+}
+
+fn profile_for(
+    profiles: &BTreeMap<String, crate::pricing::ModelProfileConfig>,
+    provider: &str,
+    model: &str,
+) -> Option<ModelProfile> {
+    profiles
+        .get(&format!("{provider}/{model}"))
+        .map(crate::pricing::ModelProfileConfig::model_profile)
 }
 
 // ---------------------------------------------------------------------------
@@ -5225,6 +5783,13 @@ pub struct CronScheduleDef {
     /// defaults, an object sets `repo`/`root`/`base`/`keep_on_failure`).
     #[serde(default)]
     pub worktree: Option<CronWorktreeDef>,
+    /// Off-peak deferral (ADR-060). Absent = the firing is admitted
+    /// immediately, byte-identical to before; `off_peak` holds the
+    /// durable inbox row until the next off-peak instant within
+    /// `defer.max_wait_ms`. A worktree-isolated schedule refuses it: an
+    /// isolated firing has no inbox row to hold.
+    #[serde(default)]
+    pub defer: Option<crate::defer::DeferPolicy>,
 }
 
 /// Wire form of a schedule's `worktree:` policy (§6): `true` for §6's
@@ -5391,6 +5956,8 @@ pub struct CronRuntimeSchedule {
     pub timeout_ms: u64,
     /// The §6 worktree isolation plan; `None` = resident-engine dispatch.
     pub worktree: Option<CronWorktreePlan>,
+    /// Off-peak deferral of this schedule's firings (ADR-060).
+    pub defer: crate::defer::DeferPolicy,
 }
 
 impl CronRuntimeSchedule {
@@ -5721,6 +6288,17 @@ impl CronSection {
                 }
             };
 
+            // ADR-060: off-peak deferral holds a durable inbox row; a
+            // worktree-isolated firing has no inbox row to hold, so the
+            // combination is refused rather than silently ignored.
+            let defer = def.defer.unwrap_or_default();
+            if defer == crate::defer::DeferPolicy::OffPeak && worktree.is_some() {
+                fail(
+                    "defer: off_peak is only supported for resident (session) schedules —                      a worktree-isolated firing has no inbox row to defer (ADR-060)"
+                        .to_string(),
+                );
+            }
+
             if errors.len() > before {
                 continue;
             }
@@ -5741,6 +6319,7 @@ impl CronSection {
                 max_concurrent,
                 timeout_ms,
                 worktree,
+                defer,
             });
         }
 
@@ -5923,6 +6502,49 @@ recovery:
       action: fail
 "#
         .into()
+    }
+
+    #[test]
+    fn pricing_and_model_profiles_parse_and_cross_reference() {
+        let yaml = format!(
+            "{}pricing:\n  currency: USD\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      end: \"04:00\"\n      timezone: UTC\n  models:\n    \"openai/gpt-test\": {{ cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }}\nmodel_profiles:\n  \"openai/gpt-test\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true, thinking: true, effort: high }}\n  \"openai/gpt-fallback\": {{ dialect: openai_chat, context_window: 1000, max_output: 500, reasoning: true }}\n",
+            valid_yaml()
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("pricing sections parse");
+        let book = cfg.price_book().expect("price book builds");
+        assert!(book.has_prices());
+        assert_eq!(cfg.model_profiles.len(), 2);
+        let agent = cfg.agent_def();
+        let slot = agent
+            .model_slots
+            .get(&SlotName("main".into()))
+            .expect("main slot");
+        let profile = slot.profile.as_ref().expect("slot profile resolved");
+        assert_eq!(profile.thinking, Some(true));
+        assert_eq!(
+            profile.effort,
+            Some(kian_core::model::ReasoningEffort::High)
+        );
+        let fallback = slot.fallback[0]
+            .profile
+            .as_ref()
+            .expect("fallback profile resolved");
+        assert_eq!(fallback.dialect, profile.dialect);
+        assert!(fallback.reasoning);
+
+        let undeclared = yaml.replace("\"openai/gpt-test\"", "\"ghost/gpt-test\"");
+        let err = ServeConfig::parse(&undeclared).unwrap_err().to_string();
+        assert!(err.contains("not declared under providers"), "{err}");
+
+        let too_wide = yaml.replace("max_output: 500", "max_output: 2000");
+        let err = ServeConfig::parse(&too_wide).unwrap_err().to_string();
+        assert!(err.contains("must not exceed context_window"), "{err}");
+
+        let thinking_without_reasoning = yaml.replace("reasoning: true", "reasoning: false");
+        let err = ServeConfig::parse(&thinking_without_reasoning)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("thinking requires reasoning"), "{err}");
     }
 
     #[test]
@@ -10500,5 +11122,285 @@ schedules:
         let no_harness = with_harness("    capture:\n      max_body_bytes: 4096\n");
         let err = ServeConfig::parse(&no_harness).unwrap_err().to_string();
         assert!(err.contains("requires a `claude` or `codex`"), "{err}");
+    }
+
+    // -- web tools (ADR-057, P2b) ------------------------------------
+
+    #[test]
+    fn artifacts_section_parses_gc_defaults_and_the_serve_interval() {
+        let yaml = format!("{}artifacts: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("artifacts section parses");
+        let artifacts = cfg.artifacts.as_ref().expect("artifacts present");
+        assert_eq!(artifacts.inline_max_bytes, 16 * 1024);
+        assert_eq!(artifacts.gc.max_bytes, 10 * 1024 * 1024 * 1024);
+        assert_eq!(artifacts.gc.retention_days, 30);
+        assert_eq!(artifacts.gc.interval_ms, 60 * 60 * 1000);
+        assert!(artifacts.resolve_dir(&cfg.storage).is_ok());
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "artifact_read"));
+    }
+
+    #[test]
+    fn a_zero_gc_interval_refuses_boot() {
+        let yaml = format!("{}artifacts:\n  gc:\n    interval_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&yaml).unwrap_err().to_string();
+        assert!(err.contains("interval_ms"), "{err}");
+    }
+
+    #[test]
+    fn web_section_parses_defaults_and_mounts_the_two_tools() {
+        let yaml = format!("{}web: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("web section parses");
+        let web = cfg.web.as_ref().expect("web present");
+        assert_eq!(web.base_url, "https://api.deepseek.com");
+        assert_eq!(web.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(web.timeout_ms, 30_000);
+        assert_eq!(web.search.max_results, 10);
+        assert!(!web.search.need_content);
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "web_search"));
+        assert!(def.tools.iter().any(|tool| tool == "web_fetch"));
+    }
+
+    #[test]
+    fn absent_web_section_keeps_the_mounted_tool_list_untouched() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("config parses");
+        assert!(cfg.web.is_none());
+        let def = cfg.agent_def();
+        assert!(!def.tools.iter().any(|tool| tool == "web_search"));
+        assert!(!def.tools.iter().any(|tool| tool == "web_fetch"));
+    }
+
+    #[test]
+    fn web_section_misconfigurations_refuse_boot() {
+        let bad_url = format!("{}web:\n  base_url: api.deepseek.com\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_url).unwrap_err().to_string();
+        assert!(err.contains("web.base_url"), "{err}");
+
+        let bad_scheme = format!("{}web:\n  base_url: ftp://api.deepseek.com\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_scheme).unwrap_err().to_string();
+        assert!(err.contains("absolute http(s)"), "{err}");
+
+        let zero_timeout = format!("{}web:\n  timeout_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&zero_timeout).unwrap_err().to_string();
+        assert!(err.contains("web.timeout_ms"), "{err}");
+
+        let bad_count = format!("{}web:\n  search:\n    max_results: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&bad_count).unwrap_err().to_string();
+        assert!(err.contains("max_results"), "{err}");
+
+        let blank_env = format!("{}web:\n  api_key_env: \"  \"\n", valid_yaml());
+        let err = ServeConfig::parse(&blank_env).unwrap_err().to_string();
+        assert!(err.contains("api_key_env"), "{err}");
+
+        let typo = format!("{}web:\n  base_ur: https://example.com\n", valid_yaml());
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "unknown keys refuse boot (deny_unknown_fields)"
+        );
+    }
+
+    // -- media tools (ADR-061, P5a) ----------------------------------
+
+    #[test]
+    fn media_section_parses_defaults_and_mounts_the_three_tools() {
+        let yaml = format!("{}artifacts: {{}}\nmedia: {{}}\n", valid_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("media section parses");
+        let media = cfg.media.as_ref().expect("media present");
+        assert_eq!(media.base_url, "https://api.deepseek.com");
+        assert_eq!(media.api_key_env, "DEEPSEEK_API_KEY");
+        assert_eq!(media.timeout_ms, 30_000);
+        assert_eq!(media.max_input_bytes, 25 * 1024 * 1024);
+        assert!(media.default_voice.is_none());
+        assert_eq!(media.default_format, "mp3");
+        let def = cfg.agent_def();
+        assert!(def.tools.iter().any(|tool| tool == "image_ocr"));
+        assert!(def.tools.iter().any(|tool| tool == "audio_transcribe"));
+        assert!(def.tools.iter().any(|tool| tool == "speech_synthesize"));
+    }
+
+    #[test]
+    fn absent_media_section_keeps_the_mounted_tool_list_untouched() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("config parses");
+        assert!(cfg.media.is_none());
+        let def = cfg.agent_def();
+        assert!(!def.tools.iter().any(|tool| tool == "image_ocr"));
+        assert!(!def.tools.iter().any(|tool| tool == "audio_transcribe"));
+        assert!(!def.tools.iter().any(|tool| tool == "speech_synthesize"));
+    }
+
+    #[test]
+    fn media_section_misconfigurations_refuse_boot() {
+        let without_store = format!("{}media: {{}}\n", valid_yaml());
+        let err = ServeConfig::parse(&without_store).unwrap_err().to_string();
+        assert!(err.contains("requires an artifacts: section"), "{err}");
+
+        let bad_url = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_url: api.deepseek.com\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_url).unwrap_err().to_string();
+        assert!(err.contains("media.base_url"), "{err}");
+
+        let bad_scheme = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_url: ftp://api.deepseek.com\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_scheme).unwrap_err().to_string();
+        assert!(err.contains("absolute http(s)"), "{err}");
+
+        let zero_timeout = format!("{}artifacts: {{}}\nmedia:\n  timeout_ms: 0\n", valid_yaml());
+        let err = ServeConfig::parse(&zero_timeout).unwrap_err().to_string();
+        assert!(err.contains("media.timeout_ms"), "{err}");
+
+        let blank_env = format!(
+            "{}artifacts: {{}}\nmedia:\n  api_key_env: \"  \"\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&blank_env).unwrap_err().to_string();
+        assert!(err.contains("api_key_env"), "{err}");
+
+        let zero_bytes = format!(
+            "{}artifacts: {{}}\nmedia:\n  max_input_bytes: 0\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&zero_bytes).unwrap_err().to_string();
+        assert!(err.contains("max_input_bytes"), "{err}");
+
+        let bad_format = format!(
+            "{}artifacts: {{}}\nmedia:\n  default_format: flac\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&bad_format).unwrap_err().to_string();
+        assert!(err.contains("default_format"), "{err}");
+
+        let typo = format!(
+            "{}artifacts: {{}}\nmedia:\n  base_ur: https://example.com\n",
+            valid_yaml()
+        );
+        assert!(
+            ServeConfig::parse(&typo).is_err(),
+            "unknown keys refuse boot (deny_unknown_fields)"
+        );
+    }
+
+    // -- off-peak deferral (ADR-060, P4) --------------------------------
+
+    /// A pricing block with one real peak window, so the defer section has
+    /// something to plan against (its validation refuses boot without one).
+    fn peak_pricing_yaml() -> String {
+        "pricing:\n  peak_windows:\n    - weekdays: [mon]\n      start: \"01:00\"\n      \
+         end: \"04:00\"\n      timezone: UTC\n"
+            .to_string()
+    }
+
+    fn cron_audit_block(defer: bool) -> String {
+        let decl = if defer {
+            "        defer: off_peak\n"
+        } else {
+            ""
+        };
+        format!(
+            "superagent:\n  cron:\n    schedules:\n      - id: audit\n        expr: \"@daily\"\n        \
+             target: {{ channel: mock-im, topic: audit }}\n        prompt: audit\n{decl}"
+        )
+    }
+
+    #[test]
+    fn defer_section_parses_defaults_and_plans_against_pricing() {
+        let yaml = format!("{}{}defer: {{}}\n", valid_yaml(), peak_pricing_yaml());
+        let cfg = ServeConfig::parse(&yaml).expect("defer section parses");
+        let defer = cfg.defer.as_ref().expect("defer present");
+        assert_eq!(defer.sweep_interval_ms, 5_000);
+        assert_eq!(defer.max_wait_ms, 12 * 60 * 60 * 1000);
+        let book = std::sync::Arc::new(cfg.price_book().expect("price book builds"));
+        let calendar = defer.calendar(book);
+        // Monday 2026-11-23 02:00 UTC sits inside the fixture window.
+        let inside = chrono::DateTime::parse_from_rfc3339("2026-11-23T02:00:00Z")
+            .expect("fixture instant")
+            .timestamp_millis() as u64;
+        let plan = calendar.plan(crate::defer::DeferPolicy::OffPeak, inside);
+        assert!(plan.deferred, "a peak instant waits for the next off peak");
+        assert_eq!(plan.eligible_at_ms, inside + 2 * 60 * 60 * 1000);
+        let immediate = calendar.plan(crate::defer::DeferPolicy::Immediate, inside);
+        assert!(!immediate.deferred);
+        assert_eq!(immediate.eligible_at_ms, inside);
+    }
+
+    #[test]
+    fn defer_section_misconfigurations_refuse_boot() {
+        let fast_sweep = format!(
+            "{}{}defer:\n  sweep_interval_ms: 99\n",
+            valid_yaml(),
+            peak_pricing_yaml()
+        );
+        let err = ServeConfig::parse(&fast_sweep).unwrap_err().to_string();
+        assert!(err.contains("sweep_interval_ms"), "{err}");
+
+        let zero_cap = format!(
+            "{}{}defer:\n  max_wait_ms: 0\n",
+            valid_yaml(),
+            peak_pricing_yaml()
+        );
+        let err = ServeConfig::parse(&zero_cap).unwrap_err().to_string();
+        assert!(err.contains("max_wait_ms"), "{err}");
+
+        let no_windows = format!("{}defer: {{}}\n", valid_yaml());
+        let err = ServeConfig::parse(&no_windows).unwrap_err().to_string();
+        assert!(err.contains("pricing.peak_windows"), "{err}");
+
+        let always_peak = format!(
+            "{}pricing:\n  peak_windows:\n    - weekdays: [mon, tue, wed, thu, fri, sat, sun]\n      \
+             start: \"00:00\"\n      end: \"24:00\"\n      timezone: UTC\ndefer: {{}}\n",
+            valid_yaml()
+        );
+        let err = ServeConfig::parse(&always_peak).unwrap_err().to_string();
+        assert!(err.contains("off-peak"), "{err}");
+    }
+
+    #[test]
+    fn cron_defer_requires_the_defer_section_and_resolves_per_schedule() {
+        let base = format!("{}{}", superagent_yaml(), peak_pricing_yaml());
+        let sectioned = base.replacen("superagent:\n", &cron_audit_block(true), 1);
+        let err = ServeConfig::parse(&sectioned).unwrap_err().to_string();
+        assert!(err.contains("audit"), "{err}");
+        assert!(err.contains("defer: off_peak"), "{err}");
+
+        let with_section = format!("{}defer: {{}}\n", sectioned);
+        let cfg = ServeConfig::parse(&with_section).expect("defer section resolves the schedule");
+        let sa = cfg.superagent.as_ref().expect("superagent");
+        assert_eq!(sa.cron.schedules[0].id, "audit");
+        let resolved = sa
+            .cron
+            .to_runtime(&sa.channels, chrono::Utc::now())
+            .expect("schedule resolves");
+        assert_eq!(resolved[0].defer, crate::defer::DeferPolicy::OffPeak);
+
+        // An immediate declaration stays immediate and needs no defer section.
+        let immediate = base.replacen("superagent:\n", &cron_audit_block(false), 1);
+        let cfg = ServeConfig::parse(&immediate).expect("immediate schedule parses");
+        let resolved = cfg
+            .superagent
+            .as_ref()
+            .expect("superagent")
+            .cron
+            .to_runtime(
+                &cfg.superagent.as_ref().expect("superagent").channels,
+                chrono::Utc::now(),
+            )
+            .expect("schedule resolves");
+        assert_eq!(resolved[0].defer, crate::defer::DeferPolicy::Immediate);
+    }
+
+    #[test]
+    fn a_worktree_schedule_cannot_declare_off_peak_deferral() {
+        let err = cron_section_from(
+            "schedules:\n  - id: audit\n    expr: \"@daily\"\n    \
+             target: { channel: cron-jobs, topic: audit }\n    prompt: audit\n    \
+             defer: off_peak\n    worktree: true\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only supported for resident"), "{err}");
     }
 }

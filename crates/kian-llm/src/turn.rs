@@ -16,8 +16,9 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use kian_core::model::{SlotName, SlotTarget};
 use kian_core::seams::{ModelChunk, ModelProvider, ModelRequest, ProviderError};
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::plan::RequestPlan;
 use crate::slots::{FallbackCursor, SlotBinding};
 
 /// Registry of named [`ModelProvider`] implementations — the seam surface
@@ -69,11 +70,14 @@ fn is_failover_class(e: &ProviderError) -> bool {
     )
 }
 
+type RequestPlanBuilder =
+    Arc<dyn Fn(&SlotTarget) -> Result<RequestPlan, ProviderError> + Send + Sync>;
+
 struct TurnCtx {
     registry: Arc<ProviderRegistry>,
     slot: SlotName,
     binding: SlotBinding,
-    build: Arc<dyn Fn(&SlotTarget) -> ModelRequest + Send + Sync>,
+    build: RequestPlanBuilder,
     event_sink: Arc<dyn SlotEventSink>,
 }
 
@@ -101,7 +105,7 @@ pub fn complete_turn(
     registry: Arc<ProviderRegistry>,
     slot: SlotName,
     binding: SlotBinding,
-    build: Arc<dyn Fn(&SlotTarget) -> ModelRequest + Send + Sync>,
+    build: RequestPlanBuilder,
     event_sink: Arc<dyn SlotEventSink>,
 ) -> BoxStream<'static, Result<ModelChunk, ProviderError>> {
     let ctx = Arc::new(TurnCtx {
@@ -132,7 +136,14 @@ async fn turn_step(
                         return Some((Err(no_provider_error(&ctx, &target)), TurnState::Done));
                     }
                     Some(provider) => {
-                        let inner = provider.complete((ctx.build)(&target));
+                        let plan = match (ctx.build)(&target) {
+                            Ok(plan) => plan,
+                            Err(e) => return Some((Err(e), TurnState::Done)),
+                        };
+                        let inner = provider.complete(ModelRequest {
+                            slot: ctx.slot.clone(),
+                            body: plan.body,
+                        });
                         state = TurnState::Running {
                             inner,
                             cursor,
@@ -161,9 +172,17 @@ async fn turn_step(
                     if emitted || !is_failover_class(&e) {
                         return Some((Err(e), TurnState::Done));
                     }
-                    let Some(switch) = cursor.advance() else {
+                    let Some(mut switch) = cursor.advance() else {
                         return Some((Err(e), TurnState::Done));
                     };
+                    // Build the exact fallback attempt before persisting:
+                    // the event must carry the bytes the next call sends,
+                    // so replay can reconstruct the retry (ADR-054).
+                    let plan = match (ctx.build)(&switch.to) {
+                        Ok(plan) => plan,
+                        Err(err) => return Some((Err(err), TurnState::Done)),
+                    };
+                    attach_plan(&mut switch.payload, &plan);
                     // Persist the slot/fallback event before switching;
                     // if persistence fails we do NOT silently continue.
                     if let Err(err) = ctx
@@ -184,7 +203,10 @@ async fn turn_step(
                             return Some((Err(no_provider_error(&ctx, &target)), TurnState::Done));
                         }
                         Some(provider) => {
-                            let next = provider.complete((ctx.build)(&target));
+                            let next = provider.complete(ModelRequest {
+                                slot: ctx.slot.clone(),
+                                body: plan.body,
+                            });
                             state = TurnState::Running {
                                 inner: next,
                                 cursor,
@@ -205,6 +227,19 @@ async fn turn_step(
             },
             TurnState::Done => return None,
         }
+    }
+}
+
+/// Adds the attempt metadata every persisted fallback carries. The body is
+/// included because it is the exact byte copy the retry sends.
+fn attach_plan(payload: &mut Value, plan: &RequestPlan) {
+    payload["body"] = plan.body.clone();
+    payload["body_version"] = json!(plan.body_version);
+    payload["dialect"] = json!(plan.dialect);
+    payload["body_sha256"] = json!(plan.body_sha256);
+    payload["estimate"] = json!(plan.estimate);
+    if let Some(digest) = &plan.profile_digest {
+        payload["profile_digest"] = json!(digest);
     }
 }
 
@@ -231,7 +266,6 @@ mod tests {
     use crate::provider::{
         ChatMessage, DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS, DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
         OpenAiCompatConfig, OpenAiCompatProvider, PersistError, PersistSink, PersistedRequest,
-        build_chat_body,
     };
     use crate::slots::SlotResolver;
 
@@ -250,6 +284,7 @@ mod tests {
     #[derive(Clone)]
     struct OrderingSink {
         log: Arc<Mutex<Vec<String>>>,
+        payloads: Arc<Mutex<Vec<Value>>>,
     }
 
     impl PersistSink for OrderingSink {
@@ -269,11 +304,13 @@ mod tests {
     impl SlotEventSink for OrderingSink {
         fn persist_fallback(&self, payload: Value) -> BoxFuture<'static, Result<(), String>> {
             let log = self.log.clone();
+            let payloads = self.payloads.clone();
             async move {
                 log.lock().unwrap().push(format!(
                     "fallback:{}",
                     payload["to"]["model"].as_str().unwrap_or("?")
                 ));
+                payloads.lock().unwrap().push(payload);
                 Ok(())
             }
             .boxed()
@@ -308,6 +345,7 @@ mod tests {
                     provider: provider.into(),
                     model: model.into(),
                     fallback: fallback.to_vec(),
+                    profile: None,
                 },
             )]),
             tools: vec![],
@@ -345,6 +383,7 @@ mod tests {
 
         let sink = OrderingSink {
             log: Arc::new(Mutex::new(Vec::new())),
+            payloads: Arc::new(Mutex::new(Vec::new())),
         };
         let mut registry = ProviderRegistry::new();
         registry.register(
@@ -368,15 +407,20 @@ mod tests {
             &[SlotTarget {
                 provider: "backup".into(),
                 model: "model-b".into(),
+                profile: None,
             }],
         );
         let slots = resolver.bind_session(SessionId::new());
         let main = SlotName("main".into());
         let binding = slots.binding(&main).unwrap().clone();
 
-        let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
-            slot: SlotName("main".into()),
-            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
+        let build = Arc::new(|t: &SlotTarget| {
+            crate::plan::build_request_plan(
+                None,
+                &t.model,
+                &[ChatMessage::plain("user", "hello")],
+                &[],
+            )
         });
 
         let stream = complete_turn(
@@ -402,6 +446,19 @@ mod tests {
             sink.log.lock().unwrap().as_slice(),
             ["req:model-a", "fallback:model-b", "req:model-b"]
         );
+
+        // The fallback event carries the exact attempt: body and metadata
+        // are persisted before the fallback call (ADR-054).
+        {
+            let payloads = sink.payloads.lock().unwrap();
+            let payload = payloads.first().expect("fallback payload");
+            assert_eq!(payload["body"]["model"], serde_json::json!("model-b"));
+            assert_eq!(payload["body_version"], serde_json::json!("v1"));
+            assert_eq!(payload["dialect"], serde_json::json!("openai_chat"));
+            assert_eq!(payload["body_sha256"].as_str().map(str::len), Some(64));
+            assert!(payload["estimate"]["high"].as_u64().unwrap() > 0);
+            assert_eq!(payload["to"]["model"], serde_json::json!("model-b"));
+        }
 
         // Exactly one request hit each provider, and the fallback request
         // carried the fallback model.
@@ -436,6 +493,7 @@ mod tests {
 
         let sink = OrderingSink {
             log: Arc::new(Mutex::new(Vec::new())),
+            payloads: Arc::new(Mutex::new(Vec::new())),
         };
         let mut registry = ProviderRegistry::new();
         registry.register(
@@ -459,15 +517,20 @@ mod tests {
             &[SlotTarget {
                 provider: "backup".into(),
                 model: "model-b".into(),
+                profile: None,
             }],
         );
         let slots = resolver.bind_session(SessionId::new());
         let main = SlotName("main".into());
         let binding = slots.binding(&main).unwrap().clone();
 
-        let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
-            slot: SlotName("main".into()),
-            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
+        let build = Arc::new(|t: &SlotTarget| {
+            crate::plan::build_request_plan(
+                None,
+                &t.model,
+                &[ChatMessage::plain("user", "hello")],
+                &[],
+            )
         });
 
         let stream = complete_turn(
@@ -522,6 +585,7 @@ mod tests {
 
         let sink = OrderingSink {
             log: Arc::new(Mutex::new(Vec::new())),
+            payloads: Arc::new(Mutex::new(Vec::new())),
         };
         let mut registry = ProviderRegistry::new();
         registry.register(
@@ -545,15 +609,20 @@ mod tests {
             &[SlotTarget {
                 provider: "backup".into(),
                 model: "model-b".into(),
+                profile: None,
             }],
         );
         let slots = resolver.bind_session(SessionId::new());
         let main = SlotName("main".into());
         let binding = slots.binding(&main).unwrap().clone();
 
-        let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
-            slot: SlotName("main".into()),
-            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
+        let build = Arc::new(|t: &SlotTarget| {
+            crate::plan::build_request_plan(
+                None,
+                &t.model,
+                &[ChatMessage::plain("user", "hello")],
+                &[],
+            )
         });
 
         let stream = complete_turn(
@@ -582,6 +651,7 @@ mod tests {
     async fn unknown_provider_name_is_an_explicit_error() {
         let sink = OrderingSink {
             log: Arc::new(Mutex::new(Vec::new())),
+            payloads: Arc::new(Mutex::new(Vec::new())),
         };
         let registry = ProviderRegistry::new();
 
@@ -590,9 +660,13 @@ mod tests {
         let main = SlotName("main".into());
         let binding = slots.binding(&main).unwrap().clone();
 
-        let build = Arc::new(|t: &SlotTarget| kian_core::seams::ModelRequest {
-            slot: SlotName("main".into()),
-            body: build_chat_body(&t.model, &[ChatMessage::plain("user", "hello")], &[]),
+        let build = Arc::new(|t: &SlotTarget| {
+            crate::plan::build_request_plan(
+                None,
+                &t.model,
+                &[ChatMessage::plain("user", "hello")],
+                &[],
+            )
         });
 
         let out: Vec<_> = complete_turn(

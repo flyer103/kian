@@ -96,6 +96,35 @@ models: # model slots (P6: determinism in Kian)
     provider: deepseek
     model: deepseek-chat-v4
 
+model_profiles: # capability facts, config-first (enforced by the request planner from phase 1)
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+    thinking: true # explicit toggle; absent leaves the provider default
+    effort: high # low | high | max; requires reasoning
+    vision: true
+    strict: true
+    cache: true
+
+pricing: # read-only cost projection (kian cost, ADR-053); absent = cost unavailable
+  currency: USD
+  peak_multiplier: 2.0 # applied inside a peak window
+  peak_windows:
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "01:00"
+      end: "04:00"
+      timezone: UTC
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "06:00"
+      end: "10:00"
+      timezone: UTC
+  holidays: ["2026-10-01"] # off-peak regardless of weekday
+  holiday_timezone: Asia/Shanghai
+  models: # off-peak base prices, per million tokens
+    deepseek/deepseek-flash: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }
+
 sessions:
   default_agent: default # points at an agent definition
   inbox_admission: durable # A7
@@ -172,7 +201,7 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, tickets,
+  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, cost, raise-budget, tickets,
   channel credentials (`kian wechat login` — the QR flow writes the WeChat channel's credential
   file; no other channel needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
@@ -339,9 +368,14 @@ surfaces: the README's operator-surface section.
 | Final record | This record + DESIGN/README/CHANGELOG alignment + docs-map link check | landed |
 
 Out of scope (recorded, not silently dropped): the `ask` permission/confirmation plane
-(ADR-015 records the shape; blocking confirmation is a separate design decision), token pricing/cost
-conversion (usage persists verbatim; pricing is a projection-layer decision), CMA wire
+(ADR-015 records the shape; blocking confirmation is a separate design decision), CMA wire
 compatibility, and cross-replica interrupt latency beyond "next safe boundary" (ADR-014).
+
+Cost conversion is no longer out of scope at the projection layer: usage still persists verbatim
+and no event carries a price, but `kian cost` prices a stream from the deployment's config
+`pricing:` book and reports exact integer micro-currency totals ([ADR-053](../design/decisions/ADR-053-economics-cost-projection.md)).
+The core never normalizes or stores cost, and the book is a deployment fact rather than event
+state, so editing a price re-renders history instead of corrupting it.
 
 ### Agent memory (P1–P2, P3a and P3b-1 landed; P3b designed)
 
@@ -509,6 +543,263 @@ pin them together.
 | P3a | kian-superagent, kian-cli | Channel-side answers: a closed-vocabulary IM reply (`approve <code>`) resolved by the adapter against the pending set and written through the existing `confirm` seam — never model-interpreted, never a free-text decision ([CONFIRMATION-MODEL §14d](../design/CONFIRMATION-MODEL.md#14d-phase-3a--channel-answers-closed-vocabulary-landed)) | landed (owner gate 2026-11-22; L3 live-phone check manual) |
 | P3b | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening) | not started |
 | P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
+
+### Session token budget (ADR-055, P1b landed)
+
+Scope: a **session-lifetime token ceiling** an operator can declare per agent and raise while a
+session is parked. It closes the gap the original `Budgets` type recorded but never enforced (A5:
+"budget consumption" was observable, not binding) and makes cost a pre-send decision rather than a
+post-hoc report.
+
+Semantics: `agents.<name>.budgets.tokens` is the base ceiling; a configured budget is pinned on
+`session/created.budgets` (a BEGIN-only additive key) so replay never depends on today's config, and
+an unconfigured one leaves the event byte-identical to legacy. The gate runs inside the loop at the
+provider-turn safe boundary, **after** the request plan is built and **before** `step/request` is
+appended: the projection `base + Σbudget/raised − Σ turn/end.usage` must admit
+`estimate.high + max_output`, or the turn is refused with no bytes persisted and no request sent,
+and the drain ends `awaiting_budget` (`running → idle`, resumable, honest). A raise is a durable
+reserved control row (`kian raise-budget` / `raise_budget` RPC, idempotent) that the owning drain
+consumes into `budget/raised` and wakes; the control plane never touches execution. Wall-clock
+raises are projected but not enforced while a drain is idle; a usage-less turn spends nothing
+(unknown, never assumed).
+
+The normative contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §2.3/§3/§4.4; the
+wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; the decision record is
+[ADR-055](../design/decisions/ADR-055-session-budget-gate.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P1b | kian-core, kian-loop, kian-orchestrator | `kian-core::budget` projection (`base + Σraised − Σspent`, DeepSeek/OpenAI usage spellings); the seventh end reason `awaiting_budget` (`running → idle`); the `budget/raised` kind + reserved budget row envelope; the pre-send gate (`estimate.high + max_output`, no `step/request` on refusal); `session/created.budgets` pin | landed |
+| P1b-wire | kian-cli, kian-sdk | `raise_budget` RPC + `ControlPlane` method + CLI (`kian raise-budget`); no new error code (reuses `-32602`/`-32001`/`-32007`; outcomes `accepted`/`deduplicated`/`terminal`) | landed |
+
+Non-goals recorded with the phase: no per-step monetary gate (pricing stays a projection, ADR-053),
+no enforcement of wall-clock budgets while idle, no budget on harness-owned (projection-only) loops,
+no automatic compaction or model downgrade as a budget response.
+
+### Tool result artifacts (ADR-056, P2 landed)
+
+Scope: keep a large tool result **out of the log and out of the model's context** while keeping both
+replayable and auditable. A result is the payload class that otherwise grows the event stream, the
+export, the read-model page and every later request body at once.
+
+Semantics: with an `artifacts:` block configured, the engine's single append path rewrites a
+`tool/result` whose successful `content.output` exceeds `inline_max_bytes` (default 16 KiB) into
+`{"artifact":{"id","size","media_type"},"preview":<str>,"truncated":true}` before the event is
+written. The persisted bytes are therefore exactly what the model sees next turn (constraint 2),
+and replay — which derives context from the stream — yields the same preview with or without the
+blob: the content-addressed blob store (`sha256` ids, atomic temp+rename, retention GC) is an
+operator cache, never a second truth. `artifact_read` (a bundle-edge tool mounted beside the local
+tools) serves the full payload in bounded windows and reports an aged-out blob as an honest error.
+Error results never spill; an absent block keeps every legacy payload byte-identical.
+
+The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §3/§4.1; the
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2; the decision record is
+[ADR-056](../design/decisions/ADR-056-artifacts-and-tool-result-spill.md).
+
+P3b ([ADR-059](../design/decisions/ADR-059-maintenance-artifact-gc-and-export-pinning.md)) adds two
+operational surfaces without changing this contract: `serve` runs a retention GC ticker when the
+`artifacts:` block exists (interval from `artifacts.gc.interval_ms`, default one hour, outside
+drains, non-fatal), and `kian session export --with-artifacts` copies referenced blobs beside the
+output file on request. The stream still carries only references and previews, and a blob that was
+already reclaimed is an honest, documented outcome.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P2 | kian-store, kian-orchestrator, kian-cli | `kian-store::ArtifactStore` (content-addressed put/get, atomic write, id validation, retention+cap GC); append-path spill of successful oversized `tool/result` payloads (preview + ref, `is_error` never spills); `artifact_read` tool + mounted-list wiring; `artifacts:` config (dir, `inline_max_bytes`, GC bounds) and `kian artifacts gc` | landed |
+| P3b | kian-cli | serve-side retention GC ticker armed from `artifacts.gc.interval_ms` (default one hour, outside drains, non-fatal); `kian session export --with-artifacts` pins referenced blobs to `<out>.artifacts/<id>` and reports reclaimed blobs as missing without failing the export | landed |
+
+Non-goals recorded with the phase: no per-session quota, no reference counting (kian has no
+session enumeration API and compaction rewrites ranges), no server-side fetch in core. Export blob
+pinning and the serve GC ticker were deferred here and landed in P3b under ADR-059.
+
+### Client-side web tools (ADR-057, P2b landed)
+
+Scope: give the loop web search and URL reading as ordinary audited tool calls on the operator's own
+provider key — without adding a provider capability to core and without a second truth for page
+content.
+
+Semantics: a `web:` block (protocol-only: `base_url`, `api_key_env`, `timeout_ms`,
+`search.max_results`, `search.need_content`) mounts two bundle tools, `web_search` and
+`web_fetch`, assembled from the `kian-web` crate. Every call is a normal `tool/call` +
+`tool/result`: the documented Search/Fetch request JSON is persisted before the request flies, the
+provider's response object is the result content, and a large page spills by reference through the
+ADR-056 path instead of being truncated. Failures are honest `is_error` results carrying the HTTP
+status and a bounded body (408/429/5xx marked retryable, nothing retried automatically);
+out-of-contract arguments are refused without a request. An absent `web:` block leaves the tool set
+and every request byte-identical; present, the key is read once at serve assembly and a missing
+value refuses boot. Returned pages are untrusted data and no provider-encrypted signature is
+retained.
+
+The normative decision record is [ADR-057](../design/decisions/ADR-057-client-side-web-tools.md);
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2/§7. Search/Fetch bill per successful
+request; the phase-0 cost projection prices model tokens only (request-count pricing is a later
+slice).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P2b | kian-web, kian-cli | `kian-web` bundle `ToolProvider` (`web_search`/`web_fetch` over the documented Search/Fetch HTTP APIs; honest classified failures; out-of-contract arguments refused without a request); `web:` config with boot validation and fail-closed key read; presence-locked mounting beside the local tools | landed |
+
+Non-goals recorded with the phase: no server-side web tools in core, no citation/signature
+retention, no automatic retry loop, no request-count cost in the phase-0 projection.
+
+### Context compaction (ADR-058, P3 landed)
+
+Scope: keep a long session inside its declared context window without rewriting history, and keep
+compaction economically honest and observable. Folding is the only deliberate prefix-invalidation
+point (constraint 3), so it is a bounded, evidence-driven decision - never a background chore and
+never a cost optimization.
+
+Semantics: `kian-orchestrator::compaction` exposes a pure planner
+(`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
+after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
+with an explicit reason. The loop folds under two triggers only: a declared
+`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90),
+or the provider's authoritative `ContextOverflow` answer. The summary is produced by an ordinary
+persisted maintenance turn - `turn/start`, `step/request` with `purpose: "compact"`, the
+summary, then `compact` - using the session's bound slot/provider with one request and no
+fallback; the summarizer is not routed through `turn/request` / `turn/response` hook ports. The
+`compact` event is appended only after the summary exists; a failed summarizer leaves the
+projection untouched and its request is still persisted and priced. Ordinary turns reserve ten
+percent of the budget allowance for maintenance requests, so the session can always pay for the
+compaction that prevents the overflow deadlock. At most two folds run per drain episode.
+Observability follows the purpose: cache metrics pair only ordinary requests, and `kian cost`
+reports maintenance requests apart from turns.
+
+The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md)
+§3/§4.2/§4.3; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2; the decision record is
+[ADR-058](../design/decisions/ADR-058-production-compaction-and-maintenance-reserve.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P3 | kian-orchestrator, kian-loop, kian-core, kian-cli | the pure compaction planner (settings/pressure/trigger/plan, keep-recent-turns fold, minimum reclaim, strictly-past disjoint ranges); preventive and reactive folds in the ReAct loop as persisted maintenance turns (`purpose: "compact"`, summary request, `compact` on success only); per-episode fold bound; the maintenance budget reserve; purpose-aware cache metrics and cost reporting | landed |
+
+Non-goals recorded with the phase: no price-aware break-even planner, no separate compaction
+scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
+enforcement of the reserve.
+
+### Off-peak deferral (ADR-060, P4 landed)
+
+Scope: let a deliberately submitted batch admission or a scheduled firing wait for an off-peak
+pricing window, without introducing a second scheduler and without ever delaying interactive work.
+
+Semantics: the planner is pure and lives in `kian-cli` beside the price book. Given the current
+instant and the configured peak/holiday calendar it returns the next off-peak instant, bounded by
+`defer.max_wait_ms`; when the bound is exceeded, or the admit instant is already off peak, the
+admission runs immediately and the recorded reason says why it did not wait (a `deferred: false`
+decision is an honest record, never a silent skip). Deferral is opt-in only: the JSON-RPC
+`submit`/`queue` methods accept `defer: "off_peak"`, and a cron resident schedule declares
+`defer: off_peak` (absent keeps today's immediate bytes). The admission path persists the ordinary
+durable inbox row with the planned `eligible_at`; the store's existing eligibility predicate is
+the hard gate, so no wake can consume the row early and no second timer system exists. A serve-side
+due-wake sweep, armed only by a `defer:` section, re-runs the startup eligibility scan to wake
+sessions whose rows became due; a late sweep adds latency only. Interactive inputs — CLI runs,
+chat, channel messages, steering — never defer, and a cron worktree firing cannot defer (an
+isolated external job has no inbox row). The cron decision rides the admitted payload as a
+non-context additive `defer` key; no new event kind is involved.
+
+The normative wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; the scheduling
+semantics are [design/CRON-MODEL.md](../design/CRON-MODEL.md) §3.1/§3.3/§6.1; the event contract is
+[design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §4.2; the placement is
+[design/DESIGN.md](../design/DESIGN.md) §2.3; the decision record is
+[ADR-060](../design/decisions/ADR-060-off-peak-deferral.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P4 | kian-cli, kian-orchestrator | the pure off-peak planner over `pricing.peak_windows`/holidays (bounded by `defer.max_wait_ms`, immediate when already off peak or the bound is exceeded); `Engine::admit_at` over the existing `eligible_at` hard gate; the serve due-wake sweep; the optional `defer:` config section with boot validation; `defer: off_peak` on cron resident schedules; additive `defer` on `submit`/`queue` and the non-context payload decision | landed |
+
+Non-goals recorded with the phase: no second scheduler or per-row timer, no deferral of
+interactive inputs or steering, no job deferral (the job runtime is not in this tree), no
+`overlap`/queue policy change, no cost guarantee from deferring.
+
+### Client-side media tools (ADR-061, P5a landed)
+
+Scope: OCR, speech-to-text and text-to-speech as client-side bundle tools over documented HTTP
+shapes, with every input and output byte flowing through the content-addressed artifact store. This
+is the ingest half of the media capability: an image or a recording becomes model-addressable
+without bytes ever entering the prompt, and an operator can turn a local file into an artifact —
+before a channel adapter that can deliver media exists (that is P5b).
+
+Semantics: `media:` mounts `image_ocr`, `audio_transcribe` and `speech_synthesize` beside the local tools
+and requires `artifacts:` (boot refuses without it); an absent section keeps the mounted tool set
+byte-identical. `image_ocr` takes `{"artifact","media_type"?,"prompt"?}` and returns `{"text"}`;
+`audio_transcribe` takes `{"artifact","media_type"?,"language"?}` and returns `{"text"}`;
+`speech_synthesize` takes `{"text","format"?,"voice"?}` and writes the audio blob into the artifact
+store, returning `{"artifact":{"id","size","media_type"}}`. A missing artifact (aged out) or an input
+above `media.max_input_bytes` is refused before any request. Provider failures are honest error results
+with a bounded body; 408/429/5xx are retryable, a 4xx is not. `kian artifacts put <path>` writes a local
+file into the same store and prints the reference. Tool descriptions and result text mark OCR/ASR
+output as untrusted data, never instructions.
+
+The provider protocol is the client-side HTTP adapter described in
+[ADR-061](../design/decisions/ADR-061-client-side-media-tools.md); the blob contract is ADR-056; the
+placement is [design/DESIGN.md](../design/DESIGN.md) §2.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5a | kian-media, kian-cli | the `kian-media` bundle tools (OCR, ASR, TTS) over the artifact store, the `media:` config section with boot validation, and `kian artifacts put` ingest | landed |
+
+Non-goals recorded with the phase: no channel media delivery (P5b), no vision content parts
+(P5c), no media pricing in the cost projection, no media persisted as an event, no server-side
+media tool in the core.
+
+### Channel-edge media (ADR-062, P5b landed)
+
+Scope: inbound images and voice messages become durable text context at the channel edge, before the
+turn exists, while their bytes live in the artifact store. This is the second half of the P5 media
+capability: P5a made media addressable; P5b makes what a person *sent* readable by the model.
+
+Semantics: the assembly's channel pump (`kian-cli`) runs one optional edge before
+`SubscriptionService::handle_event`. An adapter event whose payload carries the additive `media`
+array — items `{"kind":"image"|"audio","media_type","base64"[,"language"]}`, absent from every
+text event so existing payload bytes are unchanged — is processed item by item: the bytes are written
+to the artifact store (ADR-056), `image_ocr` / `audio_transcribe` (ADR-061) produce the transcript, and
+the item is rewritten to `{"kind","media_type","artifact","size","transcript"}` or
+`{"kind","media_type","error"}`. Transcripts are appended to the payload's `text` under
+`[image transcript]` / `[voice message transcript]` markers, in item order. Base64 never re-enters the
+payload, no message is dropped, and every failure (decode, provider, oversize, missing blob) is an
+honest per-item `error` that does not block admission. A payload without `media` is passed through
+byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is not a channel
+capability yet: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+
+The edge contract is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md); the tool protocol is
+ADR-061; the blobs are ADR-056; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5b | kian-cli | the channel-pump media edge: the typed inbound media envelope, artifact-backed OCR/ASR transcripts appended to the admitted text, honest per-item failures | landed |
+
+Non-goals recorded with the phase: no real-adapter media ingestion (WeChat CDN download and iMessage
+attachments remain those channels' phase 2), no outbound audio send, no TTS call behind the model's
+back, no media pricing, no new event kind and no queue or batching at the edge.
+
+### Vision inputs (ADR-063, P5c landed)
+
+Scope: let a vision-capable model see an image without leaving the event log. A user input payload
+may carry its content as `{"text": <string>, "images": [{"artifact": <content id>,
+"media_type": <IANA type>}]}`; downstream this becomes a dialect-level content-parts message.
+
+Semantics: the loop resolves each referenced blob through the artifact store
+(`DrainCtx::artifact_bytes`) and attaches the bytes to the chat message it derives. Only a target
+whose `model_profiles:` entry declares `vision: true` takes this path: the V2 request plan rewrites
+exactly those messages to OpenAI content parts (`[{"type":"text","text":...},{"type":"image_url",
+"image_url":{"url":"data:<media_type>;base64,<bytes>"}}]`); the frozen V1 body (no profile) and
+every image-free V2 body keep their exact bytes, because the image field is `#[serde(skip)]`. At
+most 4 images per message and 8 MiB per image; a missing, oversized or malformed reference drops
+that image with a warning and the text envelope still reaches the model (a reclaimed blob degrades
+the answer, never fails the turn). The exact base64 bytes are persisted on `step/request` by
+persist-what-you-send; an offline replay cannot re-derive them from the stream alone, so
+`kian session replay` counts such requests as vision requests instead of byte-identity mismatches.
+
+The contract is [ADR-063](../design/decisions/ADR-063-vision-content-parts.md); the artifacts are
+ADR-056; the profile knob is ADR-054; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P5c | kian-llm, kian-loop, kian-orchestrator | dialect-level vision: artifact-backed image bytes on vision-profile messages as OpenAI content parts, bounded and honestly degradable | landed |
+
+Non-goals recorded with the phase: no real vision provider wired in the tree (scripted-provider L2
+evidence), no image pricing, no images outside `role: user`, no replay re-derivation from the
+artifact store, no automatic vision from channel media (that edge transcribes to text).
 
 ### Resident rotation (ADR-040)
 

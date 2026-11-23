@@ -88,6 +88,13 @@ pub enum EndReason {
     /// stopped the drain) and `failed` (a failure).
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
+    /// The drain stopped because the session's token budget cannot fund
+    /// the next provider turn (ADR-055): `running -> idle` (resumable), not
+    /// terminal. A `budget/raised` input plus its wake re-opens the turn;
+    /// deliberately distinct from `failed` (a failure) and `interrupted`
+    /// (an owner stopped the drain).
+    #[serde(rename = "awaiting_budget")]
+    AwaitingBudget,
     /// A resident session was retired by rotation (ADR-040): a
     /// deliberate, operator-policy retirement (`running -> rotated`,
     /// terminal, frozen), never a failure and never an "it finished its
@@ -257,6 +264,15 @@ pub enum EventKind {
     #[serde(rename = "control/confirm")]
     ControlConfirm,
 
+    /// A durable budget raise (ADR-055): a control-plane intent consumed by
+    /// the owning drain appended the tokens it adds to the session budget.
+    /// Payload schema: `{"tokens"?: u64, "wall_clock_ms"?: u64,
+    /// "reason": string|null, "requested_by": string|null,
+    /// "requested_at_ms": u64}`. Drain activity (default mapping);
+    /// not context-bearing — the kind never enters a model request.
+    #[serde(rename = "budget/raised")]
+    BudgetRaised,
+
     /// Terminal end write: session end + state transition in one atomic
     /// append (NoHalfTerminated, constraint 4).
     #[serde(rename = "session/ended")]
@@ -290,6 +306,7 @@ impl EventKind {
             Self::ControlInterrupt => "control/interrupt",
             Self::MemoryNote => "memory/note",
             Self::ControlConfirm => "control/confirm",
+            Self::BudgetRaised => "budget/raised",
             Self::SessionEnded { .. } => "session/ended",
         }
     }
@@ -364,6 +381,7 @@ mod tests {
             ),
             (EventKind::MemoryNote, r#"{"kind":"memory/note"}"#),
             (EventKind::ControlConfirm, r#"{"kind":"control/confirm"}"#),
+            (EventKind::BudgetRaised, r#"{"kind":"budget/raised"}"#),
             (
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
@@ -377,13 +395,14 @@ mod tests {
             assert_eq!(&back, kind);
             assert_eq!(kind.as_str(), tag_of(golden));
         }
-        // The durable set is exactly the twenty-three kinds above (the
+        // The durable set is exactly the twenty-four kinds above (the
         // fourteen v0-frozen kinds + the additive
         // `recovery/budget-reset` + the four additive bundle kinds
         // + the additive `input/spilled` + the additive
         // `control/interrupt` + the additive `memory/note` + the
-        // additive `control/confirm`; additions-only, no renames).
-        assert_eq!(cases.len(), 23);
+        // additive `control/confirm` + the additive `budget/raised`;
+        // additions-only, no renames).
+        assert_eq!(cases.len(), 24);
     }
 
     /// Additions-only regression: every pre-existing kind's golden

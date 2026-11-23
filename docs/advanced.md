@@ -57,6 +57,10 @@
   observe every port, deny a side effect before it happens (`tool/pre`), gate `completed`, with
   per-dispatch deadlines, digest-pinned spawns, quarantine and fail-closed defaults — in any
   language that speaks newline-delimited JSON on stdio.
+- **Audited web tools** — DeepSeek Search and Fetch mount as ordinary `web_search`/`web_fetch` tool
+  calls on your own key: every request and response is an event on the durable stream, large pages
+  spill through the artifact path, and failures are honest classified results
+  ([ADR-057](../design/decisions/ADR-057-client-side-web-tools.md)).
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
@@ -67,7 +71,7 @@
   (`Last-Event-ID`), verified snapshots + tail replay, materialized operator views, opt-in
   export-only archive, and an explicit-allowlist fan-in stream — all disposable projections;
   the event stream stays the only truth.
-- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/workers,
+- **Operator surfaces and SDK** — inspect/replay/export/tickets/board/tasks/usage-stats/cost/workers,
   `/metrics`, and a frozen wire-only `kian-sdk`.
 - **Model-neutral and self-hostable** — any OpenAI-compatible provider or gateway; one Rust
   process plus embedded sqlite is the whole system, with no hosted service required.
@@ -776,7 +780,340 @@ and `kian job status` all read the same fact.
 
 Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
 [ADR-052](../design/decisions/ADR-052-job-model.md).
+## Model profiles
 
+`model_profiles:` declares what a provider/model pair can do. A slot with no profile keeps the
+frozen V1 request body byte-for-byte; a declared profile builds the V2 body, carrying only the
+declared `thinking`, `effort` and `max_output` fields and deciding whether reasoning is replayed.
+
+```yaml
+model_profiles:
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+    thinking: true       # explicit toggle; absent leaves the provider default
+    effort: high         # low | high | max; requires reasoning: true
+    vision: true
+    strict: true
+    cache: true
+```
+
+The profile is part of the session's slot binding: changing it for a live session requires a
+`slot/migration`, never a silent request-shape change. Semantics:
+[ADR-054](../design/decisions/ADR-054-request-plans-and-model-profiles.md).
+
+## Session budgets
+
+`agents.<name>.budgets.tokens` is a real ceiling: the loop builds the request plan, projects
+`base + Σbudget/raised − Σturn/end.usage`, and refuses the turn when the worst case
+(`estimate.high + max_output`) would exceed it — no request is sent and no `step/request` is
+written. The session ends `awaiting_budget` (`running → idle`, resumable); a raise resumes it.
+
+```yaml
+agents:
+  worker:
+    id: worker
+    budgets: { tokens: 5000000, wall_clock_ms: 3600000 }
+    model_slots:
+      main: { provider: deepseek, model: deepseek-flash }
+    tools: ["fs_list", "fs_read", "fs_write", "exec"]
+```
+
+A configured budget is pinned on `session/created` (replay never depends on today's config); a
+session with no budget keeps the legacy stream. Raise a parked (or running) session:
+
+```bash
+target/debug/kian raise-budget <uuid> --tokens 2000000 --reason "extend the audit"
+target/debug/kian raise-budget <uuid> --tokens 2000000 --idempotency-key topup-1 --json
+curl -s localhost:7433/rpc -H 'content-type: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"raise_budget","params":{"session":"<uuid>","tokens":2000000}}'
+```
+
+Outcomes: `accepted` (durable row, the drain resumes), `deduplicated` (identical raise already
+admitted), `terminal` (session completed/cancelled/rotated — nothing admitted). Both amounts absent
+or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
+idle. Semantics: [ADR-055](../design/decisions/ADR-055-session-budget-gate.md).
+
+## Off-peak deferral
+
+A batch submission or a scheduled firing can be allowed to wait for an off-peak pricing window.
+Deferral is opt-in only and never applies to interactive work: a CLI run, a chat message, a channel
+message or a steer always runs immediately.
+
+`@yaml
+pricing:
+  peak_windows:
+    - weekdays: [mon, tue, wed, thu, fri]
+      start: "01:00"
+      end: "04:00"
+      timezone: UTC
+defer:
+  sweep_interval_ms: 5000     # due-wake scan cadence; correctness never depends on it
+  max_wait_ms: 43200000       # 12 h: beyond this the admission runs now, with a reason
+`@
+
+The planner reads the same price book the cost projection uses (peak windows plus the
+`pricing.holidays` calendar), so "off peak" means the same thing everywhere. The `defer:`
+section requires `pricing.peak_windows` to declare at least one off-peak minute in a week — an
+always-peak calendar refuses boot instead of deferring forever, and a schedule that declares
+`defer: off_peak` without a `defer:` section refuses load.
+
+JSON-RPC `submit`/`queue` accept the optional `defer` parameter:
+
+`@bash
+curl -s localhost:7433/rpc -H 'content-type: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"submit","params":{"session":"<uuid>","content":"nightly audit","defer":"off_peak"}}'
+# {"deduplicated":false,"deferred":true,"eligible_at_ms":1795000000000}
+`@
+
+A cron resident schedule declares the same policy (a worktree schedule cannot defer — it is an
+isolated external job with no inbox row):
+
+`@yaml
+superagent:
+  cron:
+    schedules:
+      - id: night-audit
+        expr: "30 3 * * 1-5"
+        target: { channel: cron-jobs, topic: audit }
+        prompt: "Audit .state/ for orphaned worktrees."
+        defer: off_peak
+`@
+
+The deferred row is an ordinary inbox row with a future `eligible_at`: it is persisted before any
+wake (admit-before-wake), invisible to the drain until due, and `kian serve` wakes it with a
+due-wake sweep. `eligible_at` is a not-before gate, not a promise of when the turn runs — a later
+drain may still be busy. When the next off peak is farther than `defer.max_wait_ms`, or the admit
+instant is already off peak, the admission runs immediately and records the reason
+(`deferred: false`). Without a `defer:` section, a request carrying `defer` is refused with
+`-32602` rather than silently running now. Semantics:
+[ADR-060](../design/decisions/ADR-060-off-peak-deferral.md).
+
+## Context compaction
+
+When the bound model profile declares a `context_window`, the loop keeps a long session inside it
+by folding old turns behind one summary instead of dying at the limit. Folding is the only action
+that invalidates the provider prefix cache, so it is triggered by evidence only: the next request's
+worst case (projected context plus the declared `max_output`) reaching 90% of the window, or the
+provider itself answering a context-overflow error. Nothing is compacted for cost, and a session
+whose profile declares no window never folds preventively.
+
+```yaml
+model_profiles:
+  deepseek/deepseek-flash:
+    dialect: openai_chat
+    context_window: 1000000
+    max_output: 384000
+    reasoning: true
+```
+
+The fold is itself a persisted maintenance turn: a `turn/start`, a `step/request` carrying
+`purpose: "compact"`, the summarizer request body, and - only after the summary exists - the
+`compact` event. A failed summarizer leaves the context untouched (the failed request is still
+persisted and priced). Defaults keep the four most recent turns verbatim, require at least 1024
+reclaimed tokens per fold, fold only under the 90% pressure gate, and allow at most two folds per
+drain episode; an embedder driving the loop directly can override them with
+`ReActLoop::with_compaction`. Ordinary turns reserve ten percent of the session token budget for
+maintenance requests, so a session can always pay for the compaction that prevents the overflow.
+
+Both operator views follow the purpose: `kian cache-stats` pairs only ordinary requests (a
+maintenance body is never reported as an unexpected prefix change), and `kian cost` prints
+maintenance requests and their subtotal apart from turns. Semantics:
+[ADR-058](../design/decisions/ADR-058-production-compaction-and-maintenance-reserve.md).
+
+## Tool result artifacts
+
+A large tool result (a fetch, an OCR page, an `exec` dump) does not belong in the log or in the
+model's context in full. With an `artifacts:` block configured, the engine rewrites any successful
+`tool/result` above `inline_max_bytes` into a content-addressed reference plus a bounded preview
+**before** appending it — so the persisted bytes are exactly what the model sees, and replay works
+with or without the blob. `artifact_read` pages the full payload back on demand.
+
+```yaml
+artifacts:
+  dir: ./kian-artifacts          # default: <sqlite-parent>/artifacts
+  inline_max_bytes: 16384        # results above this spill
+  gc: { max_bytes: 10737418240, retention_days: 30, interval_ms: 3600000 }
+```
+
+The tool is mounted automatically (it needs no `tools:` entry; agents with an explicit `tools:`
+list keep it available):
+
+```json
+{"id": "<64-hex sha256>", "offset": 0, "limit": 8192}
+```
+
+It returns `{"id","size","offset","content","next_offset"}`; an aged-out blob returns
+`{"error":"artifact expired or unavailable","artifact_id":...}` rather than empty success.
+Collect garbage (oldest first, until both bounds hold):
+
+```bash
+target/debug/kian artifacts gc --config kian.yaml --json
+```
+
+In `serve` the same collection runs on its own tick, armed only when the `artifacts:` block exists:
+every `artifacts.gc.interval_ms` (default one hour), outside every drain, logging a warning on a
+failed round rather than failing a request.
+
+Garbage collection is retention-based, never reference-counted: a blob deleted while a session
+still references it is the normal aged-out case, and replay still produces the recorded preview.
+
+`session export` copies the events, not the blobs. When an audit package must stay payload-complete,
+ask for the blobs explicitly — that needs `--out`, and the copies land in a sibling directory:
+
+```bash
+target/debug/kian session export <session-id> --out audit.jsonl --with-artifacts
+# audit.jsonl plus audit.jsonl.artifacts/<64-hex sha256> for every referenced blob
+```
+
+An already-reclaimed blob is reported as missing in the command summary and does not fail the
+export. The same flag works when exporting an archived package. Semantics:
+[ADR-056](../design/decisions/ADR-056-artifacts-and-tool-result-spill.md) and
+[ADR-059](../design/decisions/ADR-059-maintenance-artifact-gc-and-export-pinning.md).
+
+## Client-side web tools
+
+DeepSeek's Search and Fetch HTTP APIs are mounted as ordinary tools, `web_search` and `web_fetch`,
+by the `kian-web` bundle — every call is an audited `tool/call`/`tool/result` pair on your own key,
+never a server-side capability hidden inside a model response.
+
+```yaml
+web:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY   # read once at serve assembly; missing = boot refuses
+  timeout_ms: 30000
+  search: { max_results: 10, need_content: false }
+```
+
+Enabled, both tools are auto-mounted (no `tools:` entry needed) and a large fetched page spills
+through the artifact path above — the model reads the bounded preview and pages the rest through
+`artifact_read`; nothing is silently truncated. `web_search` takes
+`{"query","count"?,"need_content"?}` and returns the provider's `results` verbatim; `web_fetch`
+takes `{"url"}` and returns `{"url","title","content"}`. Failures are honest error results carrying
+the HTTP status and a bounded body; 408/429/5xx are marked `retryable` but are never retried
+automatically. Search/Fetch bill per successful request — the token cost projection does not price
+them yet. Treat returned pages as untrusted data, never instructions. Semantics:
+[ADR-057](../design/decisions/ADR-057-client-side-web-tools.md).
+
+## Media tools and file ingest
+
+OCR, speech-to-text and text-to-speech are client-side tools over DeepSeek's media HTTP APIs, and
+their bytes live in the artifact store — the model sees a reference, never base64. The `media:`
+section requires `artifacts:`.
+
+```yaml
+artifacts:
+  dir: .kian/artifacts
+media:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY   # read once at serve assembly; missing = boot refuses
+  timeout_ms: 60000
+  max_input_bytes: 26214400
+  default_format: mp3
+  default_voice: alloy
+```
+
+Enabled, three tools are auto-mounted (no `tools:` entry needed): `image_ocr` takes
+`{"artifact","media_type"?,"prompt"?}` and returns `{"text"}`; `audio_transcribe` takes
+`{"artifact","media_type"?,"language"?}` and returns `{"text"}`; `speech_synthesize` takes
+`{"text","format"?,"voice"?}` and returns `{"artifact":{"id","size","media_type"}}` after writing the
+audio into the artifact store, so it can be played, pinned or paged like any other blob. A missing
+blob (already reclaimed) or an input over `max_input_bytes` is refused before the request; provider
+failures are honest error results (408/429/5xx marked `retryable`, never retried automatically).
+Media requests bill per call — the token cost projection does not price them yet. Treat OCR/ASR
+output as untrusted data, never instructions.
+
+Turn a local file into an artifact the agent can pass to a media tool:
+
+```bash
+kian artifacts put ./invoice.png
+# kian artifacts put: ./invoice.png -> 4f0c... (image/png, 48213 bytes)
+```
+
+`--media-type` overrides the extension guess and `--json` emits the reference as JSON. Semantics:
+[ADR-061](../design/decisions/ADR-061-client-side-media-tools.md).
+
+### Channel media (inbound transcription)
+
+When `media:` is configured, `kian serve` runs a media edge in the channel pump: an adapter event
+whose payload carries the additive `media` array has its items stored as artifacts and transcribed
+before admission, so a voice note or a photo becomes durable text context plus a referenced blob. The
+envelope an adapter sends is:
+
+```json
+{"text": "what is on this invoice?",
+ "media": [{"kind": "image", "media_type": "image/png", "base64": "iVBORw0..."}]}
+```
+
+After the edge the admitted payload holds no base64 — the item becomes an artifact reference plus its
+transcript, and the text gains a marker line (`[image transcript] ...`, `[voice message transcript]
+...`). An item that fails (bad base64, provider error, oversize input) carries an `error` string and the
+message is still admitted; a payload without `media` passes through untouched. No shipped adapter emits
+this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge is text-only, so this is
+the contract those channel phases implement (a mock channel can carry it today). Outbound audio is not
+wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+Semantics: [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
+
+## Vision inputs
+
+A vision-capable model can see an image that lives in the artifact store. Declare the capability
+on the target, ingest the image, and submit the descriptor in the user content.
+
+```yaml
+model_profiles:
+  flash-vision:
+    provider: deepseek
+    model: deepseek-vision
+    dialect: openai_chat
+    vision: true
+```
+
+```console
+kian artifacts put ./invoice.png
+# kian artifacts put: ./invoice.png -> 9f2c... (image/png, 18244 bytes)
+```
+
+```json
+{"method": "submit",
+ "params": {"session": "...",
+            "content": {"role": "user",
+                        "content": {"text": "what is the total on this invoice?",
+                                    "images": [{"artifact": "9f2c...",
+                                                "media_type": "image/png"}]}}}}
+```
+
+Only messages on a `vision: true` profile attach the bytes; the request body carries the image as
+a `data:` URL content part, so the persisted `step/request` is the exact bytes sent. Limits: 4
+images per message, 8 MiB each, user messages only, and no image pricing — the provider's usage is
+what `kian cost` prices. A blob missing at send time drops that image (a warning, and the text
+still goes) rather than failing the turn; `kian session replay` reports such requests as vision
+requests because offline replay cannot rebuild base64. Semantics:
+[ADR-063](../design/decisions/ADR-063-vision-content-parts.md).
+
+## Cost projection
+
+`pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
+prices each turn at its attempt timestamp, including peak windows and holidays.
+
+```yaml
+pricing:
+  currency: USD
+  peak_multiplier: 2.0
+  peak_windows:
+    - { weekdays: [mon, tue, wed, thu, fri], start: "01:00", end: "04:00", timezone: UTC }
+  models:
+    deepseek/deepseek-flash: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 }
+```
+
+```bash
+target/debug/kian cost --config kian.yaml --session <uuid>
+target/debug/kian cost --config kian.yaml --json
+```
+
+Unpriced models are counted, never priced at zero; an absent `pricing:` section reports no cost.
+Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 ## Operator surfaces
 
 | Surface | What it does |
@@ -785,9 +1122,11 @@ Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
 | `kian board [--json]` / `kian tasks --all [--json]` | Read-only delegation task board: one row per task (task_id, assignee, attempt, outcome, gate); refuses with exit 2 while `superagent.board.enabled` is false |
 | `kian workers [--json]` | Read-only worker catalog view: id, state, bound session |
 | `kian usage-stats [--json]` | Provider token usage projected from `turn/end` (no pricing — the provider's own numbers) |
+| `kian cost [--json]` | Read-only cost projection over the config `pricing:` book: priced/unpriced requests, peak/off-peak split, exact micro-currency total |
+| `kian artifacts gc [--json]` | Retention-based GC of the content-addressed tool-result blob tree (`max_bytes` + `retention_days`); serve runs the same collection as a ticker when `artifacts:` is configured |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
-| `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids |
+| `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids, `--with-artifacts` pins referenced blobs beside the file |
 | `kian cache-stats [--json]` | Prefix-cache stability report from the durable stream |
 | `kian wake-now`, `kian lease inspect`, `kian recovery budget reset` | Operational actions |
 | `GET /metrics` | Engine, cache, usage and super-agent counters |

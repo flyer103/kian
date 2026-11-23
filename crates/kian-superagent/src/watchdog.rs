@@ -217,6 +217,7 @@ pub fn watchdog_template(provider: &str, model: &str, version: u64) -> AgentDef 
                 provider: provider.into(),
                 model: model.into(),
                 fallback: Vec::new(),
+                profile: None,
             },
         )]),
         tools: WATCHDOG_TOOLS.iter().map(|t| (*t).to_string()).collect(),

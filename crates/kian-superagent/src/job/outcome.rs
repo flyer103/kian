@@ -170,6 +170,9 @@ pub fn attempt_outcome(
         // The child asked a question: the conductor cannot answer it, so
         // a person must (§11.1).
         EndReason::AwaitingInput => AttemptOutcome::NeedsOperator,
+        // A child parked on its token budget needs an operator to raise it;
+        // the conductor cannot (ADR-055).
+        EndReason::AwaitingBudget => AttemptOutcome::NeedsOperator,
         EndReason::Interrupted => AttemptOutcome::Interrupted,
         // An owner stop is not a failure (constraint 7): the attempt did
         // not finish its work, and it is not evidence of a broken step.

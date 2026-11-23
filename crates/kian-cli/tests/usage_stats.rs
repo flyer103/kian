@@ -120,6 +120,7 @@ async fn usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store() {
     assert!(out.contains("usage input tokens   11"), "{out}");
     assert!(out.contains("usage output tokens  4"), "{out}");
     assert!(out.contains("usage cache read     3"), "{out}");
+    assert!(out.contains("usage cache miss     8"), "{out}");
     assert!(out.contains("usage cache creation 0"), "{out}");
     assert!(out.contains("usage requests       1 (0 unknown)"), "{out}");
 
@@ -136,6 +137,7 @@ async fn usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store() {
     assert_eq!(inspect["usage"]["requests_with_usage"], json!(2));
     assert_eq!(inspect["usage"]["unknown_usage_requests"], json!(1));
     assert_eq!(inspect["usage"]["input_tokens"], json!(100));
+    assert_eq!(inspect["usage"]["cache_miss_input_tokens"], json!(100));
     assert_eq!(inspect["usage"]["cache_creation_input_tokens"], json!(7));
 
     // … and is absent for a usage-free session.
@@ -178,6 +180,8 @@ async fn usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store() {
             && text1.contains("input tokens            111")
             && text1.contains("output tokens           54")
             && text1.contains("cache read tokens       63")
+            && text1.contains("cache miss tokens       108")
+            && text1.contains("cache hit rate          36.8%")
             && text1.contains("cache creation tokens   7"),
         "{text1}"
     );
@@ -198,6 +202,7 @@ async fn usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store() {
             "input_tokens": 111,
             "output_tokens": 54,
             "cache_read_input_tokens": 63,
+            "cache_miss_input_tokens": 108,
             "cache_creation_input_tokens": 7,
         })
     );

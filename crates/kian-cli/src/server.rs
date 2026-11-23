@@ -19,17 +19,20 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use kian_core::events::{Event, EventKind};
-use kian_core::model::SessionId;
+use kian_core::model::{Budgets, SessionId};
 use kian_core::state::SessionState;
 use kian_exec::ExecStore;
 use kian_llm::provider::OpenAiCompatConfig;
 use kian_loop::react::{ReActConfig, ReActLoop};
 use kian_orchestrator::recovery::PolicyTable;
-use kian_orchestrator::{Engine, EngineConfig, EngineError, InterruptOutcome};
+use kian_orchestrator::{BudgetOutcome, Engine, EngineConfig, EngineError, InterruptOutcome};
 use kian_plugin::{Ctx as PluginCtx, Disposer, PluginError};
 use kian_store::EventStore;
 
-use crate::api::{ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics, PendingView};
+use crate::api::{
+    BudgetWireOutcome, ConfirmWireOutcome, ControlError, ControlPlane, EventStreamMetrics,
+    PendingView,
+};
 use crate::config::{DshHarnessConfig, ServeConfig};
 use crate::cron_engine::EngineTurn;
 use crate::memory::{MemoryAssembly, MemoryLoopDriver, render_transcript};
@@ -63,6 +66,10 @@ pub enum ServeError {
 pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
+    /// The config-declared default agent budgets pinned into every
+    /// `session/created` this server creates (ADR-055): the projection's
+    /// authoritative base, replayable from the stream alone.
+    default_budgets: Budgets,
     sse_poll_ms: u64,
     /// Recovery-sweep period. Equals `drain.heartbeat_interval_ms`;
     /// see [`Server::serve`] for the documented bound.
@@ -103,6 +110,18 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
+    /// The artifact retention plan (ADR-056, ADR-059, P3b): present iff
+    /// the `artifacts:` section is configured. [`Server::serve`] spawns
+    /// its GC ticker — strict mtime retention, outside every drain, and
+    /// never a failure path for a request (a reclaimed blob only
+    /// degrades an old result's fidelity; replay keeps the preview).
+    artifact_maintenance: Option<ArtifactMaintenance>,
+    /// The off-peak deferral plan (ADR-060): present iff the defer:
+    /// section is configured. serve arms the due-wake ticker and the cron
+    /// planner only then; absent refuses API defer requests, forbids a
+    /// cron schedule declaring defer: off_peak at load time, and changes
+    /// no admission bytes.
+    defer: Option<DeferRuntime>,
     /// The resolved `superagent.cron` schedules (CRON-MODEL §3): empty iff
     /// no cron section is configured (or none resolved). [`Server::serve`]
     /// spawns the cron ticker only when this is non-empty — feature-off
@@ -184,6 +203,27 @@ struct ViewsMaintenance {
     interval_ms: u64,
     holder: String,
     board_enabled: bool,
+}
+
+/// The serve-side artifact retention plan (ADR-056, ADR-059, P3b):
+/// present iff the `artifacts:` section is configured. GC runs on its
+/// own ticker, outside every drain; the read path never depends on it.
+#[derive(Clone)]
+struct ArtifactMaintenance {
+    store: Arc<kian_store::ArtifactStore>,
+    interval_ms: u64,
+    max_bytes: u64,
+    retention_days: u64,
+}
+
+/// The serve-side off-peak deferral plan (ADR-060): present iff the
+/// defer: section is configured. The calendar is a pure read; correctness
+/// never depends on the sweep — a durable row's eligible_at is the hard
+/// gate and the ticker only shortens the wait.
+#[derive(Clone)]
+struct DeferRuntime {
+    calendar: crate::defer::DeferCalendar,
+    sweep_interval_ms: u64,
 }
 
 /// The serve-side child inactivity plan (MULTIAGENT-MODEL §5.3, pin
@@ -371,6 +411,101 @@ impl Server {
             .exec_env
             .to_policy()
             .map_err(ServeError::Config)?;
+        // ADR-056 (P2): the artifact runtime — absent `artifacts:` section =
+        // spill off, and the assembled tool set stays byte-identical.
+        // ADR-059 (P3b): the same section arms the serve-side retention
+        // ticker, so a long-running server reclaims by its configured
+        // bounds without an operator command.
+        let (artifact_store, artifact_runtime, artifact_maintenance) =
+            match config.artifacts.as_ref() {
+                Some(artifacts) => {
+                    let dir = artifacts
+                        .resolve_dir(&config.storage)
+                        .map_err(|e| ServeError::Assembly(format!("artifacts: {e}")))?;
+                    let store = Arc::new(kian_store::ArtifactStore::open(dir).map_err(|e| {
+                        ServeError::Assembly(format!("artifacts: open store: {e}"))
+                    })?);
+                    let runtime = kian_orchestrator::ArtifactRuntime::new(
+                        (*store).clone(),
+                        artifacts.inline_max_bytes,
+                    );
+                    let maintenance = ArtifactMaintenance {
+                        store: Arc::clone(&store),
+                        interval_ms: artifacts.gc.interval_ms,
+                        max_bytes: artifacts.gc.max_bytes,
+                        retention_days: artifacts.gc.retention_days,
+                    };
+                    (Some(store), Some(runtime), Some(maintenance))
+                }
+                None => (None, None, None),
+            };
+        // ADR-060: the off-peak planner. Absent defer: section = deferral
+        // off: API defer requests are refused (-32602), a cron schedule may
+        // not declare defer: off_peak (load-time error), and no due-wake
+        // ticker is armed.
+        let defer_runtime = match config.defer.as_ref() {
+            Some(defer) => {
+                let book = Arc::new(
+                    config
+                        .price_book()
+                        .map_err(|e| ServeError::Assembly(format!("defer: price book: {e}")))?,
+                );
+                Some(DeferRuntime {
+                    calendar: defer.calendar(book),
+                    sweep_interval_ms: defer.sweep_interval_ms,
+                })
+            }
+            None => None,
+        };
+        // Bundle-edge tools mounted beside the local tools. ADR-056: the
+        // artifact reader when spill is on. ADR-057 (P2b): the client-side
+        // web tools when `web:` is on — the provider key is read here,
+        // once, and a missing value refuses boot. ADR-061 (P5a): the media
+        // tools when `media:` is on, under the same key discipline.
+        // ADR-062 (P5b): the media tools instance is kept beside the
+        // mounted provider so the channel-edge processor can call the same
+        // OCR/ASR surface the model can call.
+        let mut media_tools_ref: Option<Arc<kian_media::MediaTools>> = None;
+        let mut bundle_tools: Vec<Arc<dyn kian_core::seams::ToolProvider>> = Vec::new();
+        if let Some(store) = artifact_store.as_ref() {
+            bundle_tools.push(Arc::new(crate::artifacts::ArtifactReadTool::new(
+                Arc::clone(store),
+            )));
+        }
+        if let Some(web) = config.web.as_ref() {
+            let api_key = web.api_key().map_err(ServeError::Assembly)?;
+            let web_tools = kian_web::WebTools::new(kian_web::WebToolsConfig {
+                base_url: web.base_url.clone(),
+                api_key,
+                timeout_ms: web.timeout_ms,
+                max_results: web.search.max_results,
+                need_content: web.search.need_content,
+            })
+            .map_err(|e| ServeError::Assembly(format!("web: {e}")))?;
+            bundle_tools.push(Arc::new(web_tools));
+        }
+        // ADR-061 (P5a): the client-side media tools. They read and write the
+        // same content-addressed store the spill path uses; the provider key is
+        // read here, once, and a missing value refuses boot.
+        if let (Some(media), Some(store)) = (config.media.as_ref(), artifact_store.as_ref()) {
+            let api_key = media.api_key().map_err(ServeError::Assembly)?;
+            let media_tools = kian_media::MediaTools::new(
+                kian_media::MediaToolsConfig {
+                    base_url: media.base_url.clone(),
+                    api_key,
+                    timeout_ms: media.timeout_ms,
+                    max_input_bytes: media.max_input_bytes,
+                    default_voice: media.default_voice.clone(),
+                    default_format: media.default_format.clone(),
+                },
+                Arc::clone(store),
+            )
+            .map_err(|e| ServeError::Assembly(format!("media: {e}")))?;
+            let media_tools = Arc::new(media_tools);
+            let mounted: Arc<dyn kian_core::seams::ToolProvider> = media_tools.clone();
+            bundle_tools.push(mounted);
+            media_tools_ref = Some(media_tools);
+        }
         let mut plugins = kian_plugin::kian_plugins![
             OpenAiCompatPlugin { providers },
             LocalToolsPlugin {
@@ -378,8 +513,19 @@ impl Server {
                 exec_timeout_ms: config.tools.exec_timeout_ms,
                 env_policy: exec_env_policy,
                 redactor: exec_redactor.clone(),
+                extras: bundle_tools,
             },
         ];
+        // ADR-062 (P5b): the channel-edge media processor shares the media
+        // tools and the artifact store assembled above. Absent `media:` =
+        // None, and every channel pump keeps its exact bytes.
+        let media_edge = match (media_tools_ref.as_ref(), artifact_store.as_ref()) {
+            (Some(tools), Some(store)) => Some(Arc::new(crate::media_edge::MediaEdge::new(
+                Arc::clone(tools),
+                Arc::clone(store),
+            ))),
+            _ => None,
+        };
         // ADR-035: the release path (ops verb + reclaim tick) reads the
         // same durable queue to gate on live command rows, so keep one
         // clone before the remote-exec plugin takes ownership.
@@ -879,6 +1025,7 @@ impl Server {
                 recall: sa.recall.clone(),
                 harness_mounts,
                 event_store: store.clone(),
+                media_edge,
             });
             None // services resolve from the Ctx after activation
         } else {
@@ -1032,7 +1179,13 @@ impl Server {
         });
         let views_enabled = config.read_model.views.enabled;
         let event_stream_enabled = config.api.event_stream.enabled;
-        let engine = Engine::new_with_read_model(store.clone(), driver, engine_config, read_model);
+        let engine = Engine::new_with_read_model_and_artifacts(
+            store.clone(),
+            driver,
+            engine_config,
+            read_model,
+            artifact_runtime,
+        );
 
         // The bundle's inbox port learns the engine (the cycle
         // breaker closes here, before any wake can fire).
@@ -1127,9 +1280,11 @@ impl Server {
             },
             _ => None,
         };
+        let default_budgets = config.agent_def().budgets;
         let server = Self {
             engine,
             store,
+            default_budgets,
             sse_poll_ms: config.sse.poll_interval_ms,
             recovery_tick_ms: config.drain.heartbeat_interval_ms,
             pg_pool: pg_pool.clone(),
@@ -1141,6 +1296,8 @@ impl Server {
             startup_order: Arc::clone(&startup_order),
             snapshot_maintenance,
             views_maintenance,
+            artifact_maintenance,
+            defer: defer_runtime,
             // The one process-wide hook bus (provided to the plugin ctx
             // above; the §8/§9 sidecar runtime mounts on it after the
             // inbox rebuild).
@@ -1333,6 +1490,31 @@ impl Server {
                 }
             });
         }
+        // Deferred admissions (ADR-060): each beat wakes sessions whose
+        // durable rows became eligible. A sweep, not a per-row timer: a
+        // missed or doubled beat only changes latency, because the store's
+        // eligible_at comparison is the hard gate and no wake can consume a
+        // row early. Armed only when the defer: section exists (feature-off
+        // arms no timer).
+        if let Some(plan) = self.defer.clone() {
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                    plan.sweep_interval_ms.max(1),
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    match engine.due_wake_sweep().await {
+                        Ok(0) => {}
+                        Ok(woken) => {
+                            tracing::info!(sessions = woken, "deferred wake sweep");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "deferred wake sweep failed"),
+                    }
+                }
+            });
+        }
         // Snapshot maintenance (READ-MODEL §9, P1): a ticker whose each
         // beat builds verified snapshots for candidate sessions under a
         // per-session maintenance lease — strictly outside every drain
@@ -1401,6 +1583,39 @@ impl Server {
                 }
             });
         }
+        // Artifact retention (ADR-056, ADR-059, P3b): each beat reclaims
+        // expired blobs (retention) and then over-budget ones, oldest
+        // mtime first. Strictly outside every drain; a lost or doubled
+        // beat is harmless (idempotent, and a missing blob only lowers
+        // a replay's fidelity — the event stream keeps the preview).
+        if let Some(plan) = self.artifact_maintenance.clone() {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                    plan.interval_ms.max(1),
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let retention_ms = plan.retention_days.saturating_mul(24 * 60 * 60 * 1000);
+                loop {
+                    ticker.tick().await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    match plan.store.gc(now_ms, plan.max_bytes, retention_ms) {
+                        Ok(report) if report.removed > 0 => {
+                            tracing::info!(
+                                removed = report.removed,
+                                bytes_freed = report.bytes_freed,
+                                kept = report.kept,
+                                "artifact gc tick"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "artifact gc tick failed"),
+                    }
+                }
+            });
+        }
         // Cron ticker (CRON-MODEL §5.2): the declared `superagent.cron`
         // schedules are decided here. Due-ness, the catch-up policy and the
         // coalesce window are `cron_tick::tick_once`'s business, not this
@@ -1417,11 +1632,17 @@ impl Server {
                 tokio::runtime::Handle::current(),
                 schedules.clone(),
             );
-            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(EngineTurn::new(
+            let mut turn = EngineTurn::new(
                 Arc::clone(&self.engine),
                 tokio::runtime::Handle::current(),
                 self.session_bootstrap.clone(),
-            ));
+            );
+            // ADR-060: the planner is armed only with the defer: section;
+            // without it an immediate firing keeps its exact old bytes.
+            if let Some(defer) = self.defer.as_ref() {
+                turn = turn.with_deferral(defer.calendar.clone());
+            }
+            let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(turn);
             let mut resident_dispatch = crate::cron_engine::ResidentDispatcher::new(turn);
             if let Some(catalog) = self.job_catalog.clone() {
                 resident_dispatch = resident_dispatch.with_jobs(catalog);
@@ -1898,9 +2119,20 @@ impl kian_superagent::SessionBootstrap for MemorySessionBootstrap {
 impl ControlPlane for Server {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
         Box::pin(async move {
+            // ADR-055: configured budgets are pinned into
+            // `session/created` so replay derives the same base without the
+            // config file. Absent limits pin nothing (a create with no
+            // budgets stays byte-identical to the legacy `{}`).
+            let begin = if self.default_budgets.tokens.is_some()
+                || self.default_budgets.wall_clock_ms.is_some()
+            {
+                serde_json::json!({"budgets": &self.default_budgets})
+            } else {
+                serde_json::json!({})
+            };
             let sid = self
                 .engine
-                .create_session()
+                .create_session_with(SessionId::new(), begin)
                 .await
                 .map_err(internal("create_session"))?;
             // P2 (kian-101): the creation-time memory injection
@@ -1970,6 +2202,61 @@ impl ControlPlane for Server {
         })
     }
 
+    fn submit_deferred(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+        policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<crate::api::DeferredAdmission, ControlError>> {
+        Box::pin(async move {
+            // Port (a′): the admission observation is identical to submit —
+            // deferral changes the row's eligibility instant, not its shape.
+            self.observe_api_admission(session, &content, false).await;
+            let plan = match self.defer.as_ref() {
+                Some(defer) => defer.calendar.plan(policy, self.engine.now_ms()),
+                None => return Err(ControlError::DeferralUnavailable),
+            };
+            let admitted = self
+                .engine
+                .admit_at(session, content, idempotency_key, plan.eligible_at_ms)
+                .await
+                .map_err(internal("submit_deferred"))?;
+            Ok(crate::api::DeferredAdmission {
+                deduplicated: admitted.deduplicated,
+                eligible_at_ms: plan.eligible_at_ms,
+                deferred: plan.deferred,
+            })
+        })
+    }
+
+    fn queue_deferred(
+        &self,
+        session: SessionId,
+        content: serde_json::Value,
+        idempotency_key: Option<String>,
+        policy: crate::defer::DeferPolicy,
+    ) -> BoxFuture<'_, Result<crate::api::DeferredAdmission, ControlError>> {
+        Box::pin(async move {
+            // Port (a′): the queue row shares submit's ingress.
+            self.observe_api_admission(session, &content, false).await;
+            let plan = match self.defer.as_ref() {
+                Some(defer) => defer.calendar.plan(policy, self.engine.now_ms()),
+                None => return Err(ControlError::DeferralUnavailable),
+            };
+            let admitted = self
+                .engine
+                .admit_at(session, content, idempotency_key, plan.eligible_at_ms)
+                .await
+                .map_err(internal("queue_deferred"))?;
+            Ok(crate::api::DeferredAdmission {
+                deduplicated: admitted.deduplicated,
+                eligible_at_ms: plan.eligible_at_ms,
+                deferred: plan.deferred,
+            })
+        })
+    }
+
     fn interrupt(&self, session: SessionId) -> BoxFuture<'_, Result<String, ControlError>> {
         Box::pin(async move {
             match self.engine.interrupt(session).await {
@@ -2012,6 +2299,41 @@ impl ControlPlane for Server {
                 kian_orchestrator::ConfirmOutcome::UnknownSession => {
                     Err(ControlError::UnknownSession { session })
                 }
+            }
+        })
+    }
+
+    fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<'_, Result<BudgetWireOutcome, ControlError>> {
+        Box::pin(async move {
+            self.refuse_archived(session).await?;
+            match self
+                .engine
+                .raise_budget(
+                    session,
+                    tokens,
+                    wall_clock_ms,
+                    reason,
+                    requested_by,
+                    idempotency_key,
+                )
+                .await
+            {
+                Ok(BudgetOutcome::Accepted) => Ok(BudgetWireOutcome::Accepted),
+                Ok(BudgetOutcome::Deduplicated) => Ok(BudgetWireOutcome::Deduplicated),
+                Ok(BudgetOutcome::Terminal) => Ok(BudgetWireOutcome::Terminal),
+                Ok(BudgetOutcome::UnknownSession) => Err(ControlError::UnknownSession { session }),
+                Err(EngineError::InvalidBudget { reason }) => {
+                    Err(ControlError::InvalidBudget { reason })
+                }
+                Err(e) => Err(internal("raise_budget")(e)),
             }
         })
     }

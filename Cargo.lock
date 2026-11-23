@@ -1128,6 +1128,7 @@ version = "0.1.1"
 dependencies = [
  "axum",
  "chrono",
+ "chrono-tz",
  "criterion",
  "futures",
  "hmac",
@@ -1141,12 +1142,14 @@ dependencies = [
  "kian-harness",
  "kian-llm",
  "kian-loop",
+ "kian-media",
  "kian-memory",
  "kian-orchestrator",
  "kian-plugin",
  "kian-sdk",
  "kian-store",
  "kian-superagent",
+ "kian-web",
  "reqwest",
  "serde",
  "serde_json",
@@ -1158,6 +1161,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -1304,6 +1308,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kian-media"
+version = "0.1.1"
+dependencies = [
+ "futures",
+ "kian-core",
+ "kian-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "kian-memory"
 version = "0.1.1"
 dependencies = [
@@ -1405,6 +1425,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "kian-web"
+version = "0.1.1"
+dependencies = [
+ "futures",
+ "kian-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

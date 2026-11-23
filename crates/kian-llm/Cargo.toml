@@ -20,7 +20,7 @@ uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 futures.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
-sha2.workspace = true

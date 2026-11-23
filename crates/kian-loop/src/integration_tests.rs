@@ -17,16 +17,17 @@ use uuid::Uuid;
 
 use kian_core::context::derive_model_context;
 use kian_core::events::{EndReason, Event, EventKind};
-use kian_core::model::{Permission, SessionId, SlotName};
+use kian_core::model::{AgentDef, Budgets, Permission, SessionId, SlotName};
 use kian_core::seams::{PolicyRule, RecoveryAction, ToolCall, ToolResult};
 use kian_core::state::{SessionState, project};
 use kian_llm::ProviderRegistry;
-use kian_orchestrator::{Engine, EngineConfig};
+use kian_orchestrator::{ArtifactRuntime, BudgetOutcome, Engine, EngineConfig, ReadModelConfig};
 use kian_store::EventStore;
 
 use crate::react::{CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop};
 use crate::test_support::{
-    HookTools, RecordingPolicy, ScriptedProvider, agent_def, text_chunk, tool_call_chunk,
+    HookTools, NoopPolicy, NoopTools, RecordingPolicy, ScriptedProvider, agent_def, text_chunk,
+    tool_call_chunk,
 };
 use crate::tools::LocalTools;
 
@@ -91,6 +92,35 @@ async fn harness(
     let mut registry = ProviderRegistry::new();
     registry.register("mock", provider.clone());
     let react = ReActLoop::with_config(agent_def(), Arc::new(registry), tools, policy, config);
+    let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+/// A harness bound to an explicit agent definition (the budget gate reads
+/// the agent's declared budgets when the stream pins none).
+async fn harness_with_agent(
+    agent: AgentDef,
+    turns: Vec<Vec<Result<kian_core::seams::ModelChunk, kian_core::seams::ProviderError>>>,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent,
+        Arc::new(registry),
+        Arc::new(crate::test_support::NoopTools),
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    );
     let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
     (
         Harness {
@@ -786,6 +816,127 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
         .count();
     assert_eq!(turns, 2, "exactly max_iterations turns may run");
     assert_eq!(seen.lock().unwrap().len(), 2);
+    cleanup_db(&h.db_path);
+}
+
+// -- session token budget gate (ADR-055) ------------------------------------
+
+/// A pinned session token budget refuses the next request BEFORE the
+/// `step/request` is persisted: the drain ends the resumable
+/// `awaiting_budget`, the provider is never called, and the gate's
+/// projection rides `turn/end`. The pin is authoritative over the
+/// agent's (absent) declaration.
+#[tokio::test]
+async fn token_budget_gate_ends_awaiting_budget_before_the_request() {
+    let (h, provider) = harness_with_agent(agent_def(), vec![vec![text_chunk("unused")]]).await;
+    let sid = h
+        .engine
+        .create_session_with(SessionId::new(), json!({"budgets": {"tokens": 1}}))
+        .await
+        .expect("create");
+    h.engine
+        .admit(sid, json!("hello"), None)
+        .await
+        .expect("admit");
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::AwaitingBudget)
+        })
+        .await,
+        "the token budget gate never ended the drain"
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "a request flew past the budget gate"
+    );
+    let events = events_of(&h.store, sid).await;
+    assert_eq!(
+        kinds(&events),
+        [
+            "session/created",
+            "drain/claimed",
+            "input/admitted",
+            "slot/binding",
+            "turn/start",
+            "turn/end",
+            "session/ended",
+        ],
+        "a refused request must not persist a step/request"
+    );
+    let turn_end = events
+        .iter()
+        .find(|ev| ev.kind == EventKind::TurnEnd)
+        .expect("turn/end");
+    assert_eq!(turn_end.bytes["outcome"], json!("awaiting_budget"));
+    assert!(
+        turn_end.bytes["budget"]["estimate"].as_u64().unwrap_or(0) > 1,
+        "turn/end carries the worst-case estimate the gate refused"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// A durable budget raise is the wake that resumes the `awaiting_budget`
+/// settle: the next drain consumes `budget/raised`, the gate passes, and
+/// exactly one request flies to completion.
+#[tokio::test]
+async fn a_durable_budget_raise_resumes_the_awaiting_budget_session() {
+    let mut agent = agent_def();
+    agent.budgets = Budgets {
+        tokens: Some(1),
+        wall_clock_ms: None,
+    };
+    let (h, provider) = harness_with_agent(agent, vec![vec![text_chunk("done")]]).await;
+    let sid = h.engine.create_session().await.expect("create");
+    h.engine
+        .admit(sid, json!("hello"), None)
+        .await
+        .expect("admit");
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::AwaitingBudget)
+        })
+        .await,
+        "the agent-declared budget never gated the drain"
+    );
+    assert_eq!(
+        h.engine
+            .raise_budget(
+                sid,
+                Some(1_000_000),
+                None,
+                Some("resume".into()),
+                Some("test".into()),
+                None,
+            )
+            .await
+            .expect("raise"),
+        BudgetOutcome::Accepted
+    );
+    assert!(
+        wait_for(10_000, || async {
+            ended_reason(&h.store, sid).await == Some(EndReason::Completed)
+        })
+        .await,
+        "the raise did not resume the awaiting_budget session"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the resumed drain flies exactly one request"
+    );
+    let events = events_of(&h.store, sid).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev.kind == EventKind::BudgetRaised)
+            .count(),
+        1,
+        "the raise is one durable budget/raised event"
+    );
+    assert!(
+        kinds(&events).contains(&"assistant/message"),
+        "the resumed request produced a real answer"
+    );
     cleanup_db(&h.db_path);
 }
 
@@ -1778,6 +1929,570 @@ async fn coincident_declared_and_hook_deny_name_one_denier() {
         fired.iter().filter(|l| **l == "tool_post").count(),
         1,
         "tool/post observes the coincident-deny arm too (uniform surface)"
+    );
+    cleanup_db(&h.db_path);
+}
+
+// -- acceptance: production compaction (ADR-058) ---------------------------
+
+/// Builds an agent definition with an explicit slot profile and budgets.
+fn profiled_agent_def(
+    profile: Option<kian_core::model::ModelProfile>,
+    budgets: Budgets,
+    tools: Vec<String>,
+) -> AgentDef {
+    AgentDef {
+        id: "react-test".into(),
+        version: 1,
+        model_slots: BTreeMap::from([(
+            SlotName("main".into()),
+            kian_core::model::SlotSpec {
+                provider: "mock".into(),
+                model: "mock-model".into(),
+                fallback: Vec::new(),
+                profile,
+            },
+        )]),
+        tools,
+        budgets,
+    }
+}
+
+fn windowed_profile(window: u64, max_output: u64) -> kian_core::model::ModelProfile {
+    kian_core::model::ModelProfile {
+        dialect: kian_core::model::ModelDialect::OpenAiChat,
+        context_window: Some(window),
+        max_output: Some(max_output),
+        reasoning: false,
+        thinking: None,
+        effort: None,
+        strict: false,
+        cache: true,
+        vision: false,
+    }
+}
+
+fn fold_settings(keep_recent_turns: usize) -> kian_orchestrator::compaction::CompactionSettings {
+    kian_orchestrator::compaction::CompactionSettings {
+        keep_recent_turns,
+        min_reclaim_tokens: 1,
+        trigger_percent: 90,
+    }
+}
+
+/// Harness with an explicit agent definition and compaction tuning.
+async fn harness_compacting(
+    agent: AgentDef,
+    turns: Vec<ScriptedChunksArgs>,
+    tools: Arc<dyn kian_core::seams::ToolProvider>,
+    compaction: kian_orchestrator::compaction::CompactionSettings,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent,
+        Arc::new(registry),
+        tools,
+        Arc::new(crate::test_support::NoopPolicy),
+        ReActConfig::default(),
+    )
+    .with_compaction(compaction);
+    let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+type ScriptedChunksArgs =
+    Vec<Result<kian_core::seams::ModelChunk, kian_core::seams::ProviderError>>;
+
+fn step_purposes(events: &[Event]) -> Vec<Option<String>> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::StepRequest))
+        .map(|e| {
+            e.bytes
+                .get("purpose")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn compact_payloads(events: &[Event]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Compact))
+        .map(|e| e.bytes.clone())
+        .collect()
+}
+
+async fn wait_for_end(h: &Harness, sid: SessionId, want: EndReason) -> bool {
+    wait_for(10_000, || async {
+        ended_reason(&h.store, sid).await == Some(want)
+    })
+    .await
+}
+
+/// Preventive arm: a declared window under pressure folds old turns into a
+/// persisted summary before the next request, the maintenance request is a
+/// normal persisted step/request with purpose=compact, and the final answer
+/// still settles honestly. Two folds are allowed per episode; the fold
+/// rounds never rewrite history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preventive_pressure_compacts_before_the_request_and_the_summary_is_persisted() {
+    let agent = profiled_agent_def(
+        Some(windowed_profile(300, 50)),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "missing_tool", json!({}))],
+        vec![tool_call_chunk("call-2", "missing_tool", json!({}))],
+        vec![text_chunk("summary A")],
+        vec![text_chunk("summary B")],
+        vec![text_chunk("done")],
+    ];
+    let (h, provider) = harness_compacting(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(1),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("do the thing")).await;
+    assert_eq!(reason, EndReason::Completed);
+
+    let events = events_of(&h.store, sid).await;
+    let compacts = compact_payloads(&events);
+    assert_eq!(compacts.len(), 2, "two folds cap one episode");
+    let started_at: Vec<u64> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::TurnStart))
+        .map(|e| e.seq)
+        .collect();
+    for payload in &compacts {
+        let from = payload["from_seq"].as_u64().unwrap();
+        let to = payload["to_seq"].as_u64().unwrap();
+        assert!(from < to && to < payload["produced_by"]["step_seq"].as_u64().unwrap());
+        assert!(
+            !payload["summary"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!payload["reason"].as_str().unwrap().is_empty());
+        assert!(payload["folded_messages"].as_u64().unwrap() > 0);
+        assert!(payload["reclaimed_tokens"].as_u64().unwrap() > 0);
+        assert!(started_at.contains(&to), "fold boundary is a turn start");
+    }
+
+    let purposes = step_purposes(&events);
+    assert_eq!(
+        purposes
+            .iter()
+            .filter(|p| p.as_deref() == Some("compact"))
+            .count(),
+        2,
+        "both summary requests are persisted with purpose=compact"
+    );
+    assert_eq!(
+        purposes.len(),
+        provider.requests().len(),
+        "A2: one audit copy per request"
+    );
+
+    // The compact turn is an honest turn of its own, marked by purpose.
+    let compact_turns: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::TurnEnd) && e.bytes["purpose"] == json!("compact"))
+        .collect();
+    assert_eq!(compact_turns.len(), 2);
+    for ev in compact_turns {
+        assert_eq!(ev.bytes["outcome"], json!("compacted"));
+    }
+
+    // The maintenance request used the frozen summarizer frame; the compact
+    // events carry the only reference to the requests that produced them.
+    let summary_requests: Vec<Value> = provider
+        .requests()
+        .into_iter()
+        .filter(|body| {
+            body["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("summarize conversation history"))
+        })
+        .collect();
+    assert_eq!(summary_requests.len(), 2);
+
+    // Context derivation projects the summary, never the folded raw turns.
+    let messages = derive_model_context(&events).expect("context derives");
+    let flat: String = messages
+        .iter()
+        .map(|m| m.content.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        flat.contains("summary B"),
+        "the latest summary is in the context"
+    );
+    assert!(!flat.contains("do the thing"), "folded raw turns are gone");
+    cleanup_db(&h.db_path);
+}
+
+/// Reactive arm: a provider context overflow folds the old turns and the
+/// next iteration retries the smaller request; the failed request stays
+/// accounted in the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reactive_overflow_compacts_then_retries_the_smaller_request() {
+    let agent = profiled_agent_def(
+        None,
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "missing_tool", json!({}))],
+        vec![Err(kian_core::seams::ProviderError::ContextOverflow)],
+        vec![text_chunk("folded summary")],
+        vec![text_chunk("done")],
+    ];
+    let (h, provider) = harness_compacting(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(1),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("do the thing")).await;
+    assert_eq!(
+        reason,
+        EndReason::Completed,
+        "an overflow is recovered, not failed"
+    );
+
+    let events = events_of(&h.store, sid).await;
+    let compacts = compact_payloads(&events);
+    assert_eq!(compacts.len(), 1);
+    assert_eq!(
+        compacts[0]["reason"],
+        json!("provider reported context overflow"),
+        "the reactive arm names its trigger"
+    );
+    let soft_ends: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EventKind::TurnEnd)
+                && e.bytes["outcome"] == json!("soft_failure")
+                && e.bytes["error"]["class"] == json!("context_overflow")
+        })
+        .collect();
+    assert_eq!(
+        soft_ends.len(),
+        1,
+        "the failed request is evidenced honestly"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2]["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("summarize conversation history")),
+        "the maintenance turn is the third request"
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("folded summary"),
+        "the retry carries the summary in its context"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// The ordinary-turn gate reserves the maintenance share (ADR-058) and a
+/// raise releases the resulting awaiting_budget settle; a session without a
+/// declared window never compacts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_reserve_parks_the_turn_and_a_budget_raise_resumes_it() {
+    let agent = profiled_agent_def(
+        None,
+        Budgets {
+            tokens: Some(3000),
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![
+            tool_call_chunk("call-1", "missing_tool", json!({})),
+            usage_chunk(json!({"prompt_tokens": 1500, "completion_tokens": 500})),
+        ],
+        vec![text_chunk("done")],
+    ];
+    let (h, provider) = harness_compacting(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(4),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    h.engine
+        .admit(sid, json!("x".repeat(3000)), None)
+        .await
+        .expect("admit");
+    let _ = h.engine.wake(sid);
+    assert!(
+        wait_for_end(&h, sid, EndReason::AwaitingBudget).await,
+        "the reserve blocks the ordinary turn"
+    );
+
+    let events = events_of(&h.store, sid).await;
+    let gate = events
+        .iter()
+        .find(|e| {
+            matches!(e.kind, EventKind::TurnEnd) && e.bytes["outcome"] == json!("awaiting_budget")
+        })
+        .expect("gate turn/end");
+    assert_eq!(gate.bytes["budget"]["limit"], json!(3000));
+    assert_eq!(gate.bytes["budget"]["spent"], json!(2000));
+    assert_eq!(
+        gate.bytes["budget"]["reserve"],
+        json!(300),
+        "10% of the allowance is kept for maintenance"
+    );
+    assert!(
+        compact_payloads(&events).is_empty(),
+        "no window, no preventive fold"
+    );
+
+    h.engine
+        .raise_budget(
+            sid,
+            Some(3000),
+            None,
+            Some("reserve test".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("raise");
+    assert!(
+        wait_for_end(&h, sid, EndReason::Completed).await,
+        "the raise releases the settle and the turn completes"
+    );
+    let events = events_of(&h.store, sid).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::BudgetRaised))
+            .count(),
+        1,
+        "the raise is a durable event"
+    );
+    assert_eq!(provider.requests().len(), 2);
+    cleanup_db(&h.db_path);
+}
+
+// -- acceptance: vision content parts (ADR-063) -----------------------------
+
+fn vision_profile() -> kian_core::model::ModelProfile {
+    kian_core::model::ModelProfile {
+        dialect: kian_core::model::ModelDialect::OpenAiChat,
+        context_window: None,
+        max_output: None,
+        reasoning: false,
+        thinking: None,
+        effort: None,
+        strict: false,
+        cache: true,
+        vision: true,
+    }
+}
+
+/// Engine harness with an explicit artifact runtime so the loop can read
+/// referenced image blobs (ADR-063) through `DrainCtx::artifact_bytes`.
+async fn harness_with_artifacts(
+    agent: AgentDef,
+    turns: Vec<ScriptedChunksArgs>,
+    artifacts: Option<ArtifactRuntime>,
+) -> (Harness, Arc<ScriptedProvider>) {
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent,
+        Arc::new(registry),
+        Arc::new(NoopTools),
+        Arc::new(NoopPolicy),
+        ReActConfig::default(),
+    );
+    let engine = Engine::new_with_read_model_and_artifacts(
+        store.clone(),
+        Arc::new(react),
+        EngineConfig::default(),
+        ReadModelConfig::default(),
+        artifacts,
+    );
+    (
+        Harness {
+            engine,
+            store,
+            db_path,
+        },
+        provider,
+    )
+}
+
+/// What a client submits: the payload IS the model content. The engine's
+/// admission wraps it as `{"role":"user","content": payload}`, so this
+/// object becomes one user message whose content is the ADR-063 envelope.
+fn image_envelope(artifact: &str) -> Value {
+    json!({
+        "text": "what is on this invoice?",
+        "images": [{"artifact": artifact, "media_type": "image/png"}]
+    })
+}
+
+/// ADR-063 L2: a user message referencing an artifact image is rendered as
+/// dialect content parts (text + image_url data URL) for a vision profile;
+/// the bytes come from the artifact runtime, and the internal carrier field
+/// never reaches the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vision_profile_sends_artifact_images_as_content_parts() {
+    let dir = std::env::temp_dir().join(format!("kian-loop-vision-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let reference = blobs.put(b"hi", "image/png").expect("put blob");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(
+        agent,
+        vec![vec![text_chunk("the invoice total is 42")]],
+        Some(artifacts),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&reference.id)).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let messages = requests[0]["messages"].as_array().expect("messages");
+    let last = messages.last().expect("user message");
+    assert_eq!(last["role"], json!("user"));
+    assert_eq!(
+        last["content"],
+        json!([
+            {"type": "text", "text": "what is on this invoice?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+        ]),
+        "the artifact bytes fly as one dialect image part"
+    );
+    assert_eq!(
+        last.get("images"),
+        None,
+        "the internal carrier never reaches the wire"
+    );
+
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-063 honesty: neither a missing blob nor a non-vision profile changes
+/// the wire shape into content parts — the envelope's text still flies, and
+/// a non-vision target keeps the legacy compact-JSON conversion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_blob_or_a_non_vision_profile_keeps_the_text_only_shape() {
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(agent, vec![vec![text_chunk("ok")]], None).await;
+    let sid = h.engine.create_session().await.expect("create");
+    let missing = "f".repeat(64);
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&missing)).await,
+        EndReason::Completed
+    );
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    assert_eq!(
+        last["content"],
+        json!("what is on this invoice?"),
+        "a reclaimed artifact degrades to the envelope text, never a failed turn"
+    );
+    cleanup_db(&h.db_path);
+
+    let muted = kian_core::model::ModelProfile {
+        vision: false,
+        ..vision_profile()
+    };
+    let agent = profiled_agent_def(
+        Some(muted),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(agent, vec![vec![text_chunk("ok")]], None).await;
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&missing)).await,
+        EndReason::Completed
+    );
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    let content = last["content"]
+        .as_str()
+        .expect("a non-vision target keeps the compact-JSON string");
+    assert!(
+        content.contains("images") && content.contains(&missing),
+        "the legacy fallback carries the envelope verbatim: {content}"
     );
     cleanup_db(&h.db_path);
 }

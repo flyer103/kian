@@ -17,6 +17,8 @@ members = [
     "crates/kian-claude",
     "crates/kian-codex",
     "crates/kian-cron",
+    "crates/kian-web",
+    "crates/kian-media",
     "crates/kian-cli",
     "crates/kian-imessage-bridge",
     "crates/kiand",
@@ -90,8 +92,13 @@ kian-claude = { version = "0.1.1", path = "crates/kian-claude" }
 kian-codex = { version = "0.1.1", path = "crates/kian-codex" }
 # the cron scheduling core (CRON-MODEL §2, §5) — pure: no I/O, no clock.
 kian-cron = { version = "0.1.1", path = "crates/kian-cron" }
+# the client-side web tools bundle (ADR-057): DeepSeek Search/Fetch as
+# audited ToolProvider tools, never a core capability.
+kian-web = { version = "0.1.1", path = "crates/kian-web" }
+# the client-side media tools bundle (ADR-061): OCR / ASR / TTS as
+# audited ToolProvider tools over the artifact store, never a core capability.
+kian-media = { version = "0.1.1", path = "crates/kian-media" }
 kian-cli = { version = "0.1.1", path = "crates/kian-cli" }
 kiand = { version = "0.1.1", path = "crates/kiand" }
-
 [profile.release]
 lto = "thin"

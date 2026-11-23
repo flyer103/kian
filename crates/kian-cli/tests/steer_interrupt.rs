@@ -445,6 +445,7 @@ async fn steer_lands_at_next_safe_boundary_with_strippable_synthetic_marker() {
         None,
         None,
         false,
+        false,
     )
     .await
     .expect("export");
@@ -612,6 +613,7 @@ async fn interrupt_mid_tool_settles_on_abort_and_resumes_honestly() {
         None,
         None,
         None,
+        false,
         false,
     )
     .await

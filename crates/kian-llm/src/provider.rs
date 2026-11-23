@@ -120,6 +120,28 @@ pub struct ChatMessage {
     /// (ADR-022, DESIGN §3.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Images attached to this user message (ADR-063).
+    ///
+    /// Never serialized: the frozen body may not grow a field, so the plan
+    /// builder renders the bytes as content parts only for a profile that
+    /// declares `vision` and every other body stays byte-identical.
+    #[serde(skip)]
+    pub images: Vec<ChatImage>,
+}
+
+/// One image attached to a user message (ADR-063).
+///
+/// The bytes ride the in-memory chat message only. The plan builder renders
+/// them into the persisted `step/request` body as OpenAI content parts under
+/// a vision-capable profile; `#[serde(skip)]` on the field keeps the frozen
+/// V1 body and every image-free V2 body identical to the pre-vision
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatImage {
+    /// The IANA media type carried in the `data:` URL.
+    pub media_type: String,
+    /// The image bytes resolved from the artifact store.
+    pub bytes: Vec<u8>,
 }
 
 impl ChatMessage {
@@ -132,6 +154,7 @@ impl ChatMessage {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 }
@@ -534,8 +557,12 @@ fn map_error_status(status: reqwest::StatusCode, body: &str) -> ProviderError {
     match code {
         429 => ProviderError::RateLimited,
         408 => ProviderError::Transport(format!("HTTP {code}: {snippet}")),
-        400 | 413 if is_context_overflow(body) => ProviderError::ContextOverflow,
-        400 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
+        // 400/413/422 are request-shape failures: failover to another
+        // provider would send the same rejected bytes and burn budget.
+        // The context markers are the one recoverable shape (route to
+        // compress_then_retry, never to failover).
+        400 | 413 | 422 if is_context_overflow(body) => ProviderError::ContextOverflow,
+        400 | 413 | 422 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
         _ => ProviderError::Unavailable(format!("HTTP {code}: {snippet}")),
     }
 }
@@ -556,6 +583,9 @@ fn map_error_payload(err: &Value) -> ProviderError {
     }
     if is_context_overflow(msg) || typ.contains("context") {
         return ProviderError::ContextOverflow;
+    }
+    if matches!(code, Some(400 | 422)) || typ.contains("invalid_request") {
+        return ProviderError::InvalidResponse(msg.to_string());
     }
     ProviderError::Unavailable(msg.to_string())
 }
@@ -1119,6 +1149,22 @@ mod tests {
                     r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
                 ),
             ),
+            (
+                "/e400plain",
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":{"message":"bad request"}}"#),
+            ),
+            (
+                "/e422",
+                ResponseTemplate::new(422)
+                    .set_body_string(r#"{"error":{"message":"tool schema is invalid"}}"#),
+            ),
+            (
+                "/e422ctx",
+                ResponseTemplate::new(422).set_body_string(
+                    r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
+                ),
+            ),
         ] {
             Mock::given(method("POST"))
                 .and(path(p))
@@ -1136,6 +1182,19 @@ mod tests {
             ("/e429", ProviderError::RateLimited),
             ("/e500", ProviderError::Unavailable("HTTP 500: boom".into())),
             ("/e400", ProviderError::ContextOverflow),
+            (
+                "/e400plain",
+                ProviderError::InvalidResponse(
+                    "HTTP 400: {\"error\":{\"message\":\"bad request\"}}".into(),
+                ),
+            ),
+            (
+                "/e422",
+                ProviderError::InvalidResponse(
+                    "HTTP 422: {\"error\":{\"message\":\"tool schema is invalid\"}}".into(),
+                ),
+            ),
+            ("/e422ctx", ProviderError::ContextOverflow),
         ] {
             let provider =
                 OpenAiCompatProvider::new(config(&server.uri(), p), Arc::new(sink.clone()));
@@ -1240,6 +1299,7 @@ mod tests {
                     },
                 }]),
                 reasoning_content: None,
+                images: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -1247,6 +1307,7 @@ mod tests {
                 tool_call_id: Some("call-1".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                images: Vec::new(),
             },
         ];
         let a = build_chat_body("kimi-k2", &messages, &tools);
@@ -1282,6 +1343,7 @@ mod tests {
                     },
                 }]),
                 reasoning_content: None,
+                images: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -1289,6 +1351,7 @@ mod tests {
                 tool_call_id: Some("call-9".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                images: Vec::new(),
             },
         ];
         let body = build_chat_body("m1", &round_trip, &[]);

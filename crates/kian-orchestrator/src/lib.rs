@@ -15,9 +15,11 @@
 //! Modules:
 //! - [`engine`] — Admit → Wake → Drain → Promote (DESIGN §2.3)
 //! - [`wake`] — the foldable/losable pendingWake registry
+//! - [`compaction`] — compaction planner: the pure fold-range decision (ADR-058)
 //! - [`metrics`] — orchestrator counters: state transitions, drain
 //!   depth/duration, pendingWake traffic
 //! - [`recovery`] — three-layer recovery (DESIGN §2.4)
+pub mod compaction;
 pub mod engine;
 pub mod metrics;
 pub mod read;
@@ -25,10 +27,14 @@ pub mod recovery;
 pub mod snapshots;
 pub mod wake;
 
+pub use compaction::{
+    CompactionPlan, CompactionPressure, CompactionSettings, CompactionTrigger,
+    estimate_context_tokens, message_bytes, plan_compaction,
+};
 pub use engine::{
-    Clock, ConfirmOutcome, DrainCtx, DrainHandle, Engine, EngineConfig, EngineError,
-    InterruptOutcome, ManualClock, PendingConfirmation, ReleaseOutcome, RotateOutcome, SystemClock,
-    WakeOutcome,
+    ArtifactRuntime, BudgetOutcome, Clock, ConfirmOutcome, DrainCtx, DrainHandle, Engine,
+    EngineConfig, EngineError, InterruptOutcome, ManualClock, PendingConfirmation, ReleaseOutcome,
+    RotateOutcome, SystemClock, WakeOutcome,
 };
 pub use metrics::{Metrics, MetricsSnapshot};
 pub use read::{EventTail, VersionedProjection};

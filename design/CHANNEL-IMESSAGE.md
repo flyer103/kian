@@ -621,6 +621,12 @@ SIP off), rich sends/effects/polls, multi-account (more than one bridge/Apple ID
 not `imsg`-based, kian-side cursor persistence, and any iMessage-specific prompt tuning beyond the
 channel-target sentence.
 
+The typed side of inbound media is designed even though the adapter side is not built: ADR-062 defines
+the additive `media` payload envelope (`{"kind","media_type","base64"[,"language"]}` items) and the
+assembly-side media edge that stores each item as an artifact, transcribes it and appends the
+transcript to the admitted text. A future iMessage media phase (the bridge grows attachment reads) hands
+the adapter's `ChannelEvent` payload in that shape; nothing else on this channel changes.
+
 ## 12. Acceptance
 
 **L1 — default-green, no Mac, no network** (landed: `crates/kian-superagent/tests/imessage_channel.rs`,

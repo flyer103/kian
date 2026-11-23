@@ -1555,7 +1555,7 @@ the spawn point."
 **(5) `design/EVENT-MODEL.md`.** No new kind. Three additive class-A keys and one wrapper key, all
 absent by default: `input/admitted.job` (A1), `thread/started.job` (A2), `evidence/verdict.job` at the
 step and run gates (A3), and `kian.parent` inside the delegation wrapper JSON (A5). `session/ended`
-carries nothing: the engine owns that write, so the run outcome is recorded in the run verdict (§5.5). The catalog stays at 23 kinds, and the existing
+carries nothing: the engine owns that write, so the run outcome is recorded in the run verdict (§5.5). The catalog stays at 24 kinds, and the existing
 additive-key discipline (readers ignore unknown keys; writers set them only when the feature is on)
 means an old reader sees byte-identical behaviour.
 
@@ -1603,7 +1603,7 @@ discipline.
 | L1 | canonical plan JSON and `plan_digest` against a golden fixture | J2's freeze is byte-stable across restarts and refactors |
 | L1 | `admissible()` truth table: capability mismatch, offline worker, `allow_offline`, repeat exclusion, empty set | §9.2's exclusions, including the spec's vultr-down case |
 | L1 | attempt lattice and run lattice as pure functions over synthetic verdict lists | §11's first-match-wins and the rule that `unverified` is never `succeeded` |
-| L1 | a registry test: every event kind the conductor writes is one of EVENT-MODEL's 23 | "no new event kind" is checked, not asserted |
+| L1 | a registry test: every event kind the conductor writes is one of EVENT-MODEL's 24 | "no new event kind" is checked, not asserted |
 | L2 | config lowering: `jobs.triggers` becomes `CronRuntimeSchedule { target: Job }`, and the user-facing schema **rejects** `target.job` | one scheduler, no second config surface |
 | L2 | conductor crash simulation: kill the drain mid-tick at each of W1–W8 and re-drive | §17's table is executable, not prose |
 | L2 | the deliver action against a fake adapter for every `SendDisposition` | §13.2's receipt discipline and the `needs_operator` branches |

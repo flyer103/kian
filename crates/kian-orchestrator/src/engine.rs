@@ -65,12 +65,12 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use kian_core::confirmation::{PendingCall, effective_decision, is_expired, pending_calls};
-use kian_core::control::{ConfirmDecision, ConfirmIntent};
+use kian_core::control::{BudgetIntent, ConfirmDecision, ConfirmIntent};
 use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::seams::{LoopDriver, LoopOutcome};
 use kian_core::state::{SessionState, project};
-use kian_store::{AdmitOutcome, AppendGuard, EventStore, StoreError};
+use kian_store::{AdmitOutcome, AppendGuard, ArtifactStore, EventStore, StoreError};
 use uuid::Uuid;
 
 use crate::metrics::Metrics;
@@ -138,6 +138,38 @@ impl Default for EngineConfig {
     }
 }
 
+/// Operator-configured tool-result spill (ADR-056): when present, the
+/// engine's single append path rewrites an oversized successful
+/// `tool/result` into a content-addressed reference plus a bounded preview
+/// before the event is written. Absent = byte-identical legacy behavior.
+#[derive(Debug, Clone)]
+pub struct ArtifactRuntime {
+    store: Arc<ArtifactStore>,
+    inline_max_bytes: usize,
+}
+
+impl ArtifactRuntime {
+    #[must_use]
+    pub fn new(store: ArtifactStore, inline_max_bytes: usize) -> Self {
+        Self {
+            store: Arc::new(store),
+            inline_max_bytes,
+        }
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Arc<ArtifactStore> {
+        &self.store
+    }
+
+    /// Results whose compact JSON exceeds this spill; the preview is one
+    /// quarter of it (ADR-056).
+    #[must_use]
+    pub fn inline_max_bytes(&self) -> usize {
+        self.inline_max_bytes
+    }
+}
+
 /// Typed engine failures. Rejected CAS writes surface as
 /// [`StoreError::StaleEpoch`] / [`StoreError::SeqMismatch`] — a fenced
 /// drain abandons; it never retries against a newer epoch.
@@ -172,6 +204,11 @@ pub enum EngineError {
     /// produce).
     #[error("context: {0}")]
     Context(#[from] kian_core::context::ContextError),
+    /// A budget raise must add at least one positive amount (ADR-055):
+    /// an empty or zero raise would mint a durable row that can never
+    /// change the projection.
+    #[error("invalid budget raise: {reason}")]
+    InvalidBudget { reason: String },
 }
 
 /// What a [`Engine::wake`] call did.
@@ -210,6 +247,21 @@ pub enum ConfirmOutcome {
     Expired,
     /// No such session (empty event stream).
     UnknownSession,
+}
+
+/// What an [`Engine::raise_budget`] call did (ADR-055). The raise is a
+/// durable control row; the drain consumes it into a `budget/raised`
+/// event and resumes an `awaiting_budget` session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetOutcome {
+    /// The row is durable; the projection adds it when a drain consumes it.
+    Accepted,
+    /// An exact replay of the same raise already has its durable row.
+    Deduplicated,
+    /// No such session (empty event stream).
+    UnknownSession,
+    /// The session is terminal — a raise would be unconsumable inbox junk.
+    Terminal,
 }
 
 /// One pending confirmation as the `pending` read reports it.
@@ -369,6 +421,8 @@ struct DrainCtxCore {
     interrupt: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     metrics: Arc<Metrics>,
+    /// ADR-056 tool-result spill (engine-configured; `None` = legacy bytes).
+    artifacts: Option<ArtifactRuntime>,
 }
 
 /// The handle surface the engine hands to a [`LoopDriver`]
@@ -413,6 +467,7 @@ impl DrainCtxCore {
     /// store head and the append retried. A stale-epoch rejection
     /// propagates immediately — a fenced drain never fights the fence.
     async fn append_event(&self, kind: EventKind, bytes: Value) -> Result<Event, EngineError> {
+        let bytes = self.spill_tool_result(kind, bytes).await;
         for _ in 0..APPEND_ATTEMPTS {
             let seq = self.seq.load(Ordering::Acquire);
             let event = Event {
@@ -451,6 +506,79 @@ impl DrainCtxCore {
         Err(EngineError::AppendRetryExhausted {
             session: self.session,
         })
+    }
+
+    /// ADR-056: rewrite an oversized successful `tool/result` output into a
+    /// content-addressed reference plus a bounded preview **before** the event
+    /// is written, so the persisted bytes are exactly what the model sees next
+    /// turn and replay needs no blob. Errors never spill; an absent runtime,
+    /// a payload below the bound or an already-spilled payload is untouched.
+    /// A blob write failure degrades honestly to the inline output.
+    async fn spill_tool_result(&self, kind: EventKind, mut payload: Value) -> Value {
+        let Some(runtime) = self.artifacts.as_ref() else {
+            return payload;
+        };
+        if !matches!(kind, EventKind::ToolResult) {
+            return payload;
+        }
+        let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) else {
+            return payload;
+        };
+        if content.get("is_error").and_then(Value::as_bool) == Some(true) {
+            return payload;
+        }
+        let Some(output) = content.get("output") else {
+            return payload;
+        };
+        if output.get("artifact").is_some() {
+            return payload;
+        }
+        let Ok(bytes) = serde_json::to_vec(output) else {
+            return payload;
+        };
+        if bytes.len() <= runtime.inline_max_bytes() {
+            return payload;
+        }
+        let preview_len = (runtime.inline_max_bytes() / 4).max(1).min(bytes.len());
+        let preview = String::from_utf8_lossy(&bytes[..preview_len]).into_owned();
+        let store = Arc::clone(runtime.store());
+        let write = bytes.clone();
+        let artifact = match tokio::task::spawn_blocking(move || {
+            store.put(&write, "application/json")
+        })
+        .await
+        {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    session = %self.session.0,
+                    error = %e,
+                    "tool result spill failed; keeping the inline output (ADR-056)"
+                );
+                return payload;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.session.0,
+                    error = %e,
+                    "tool result spill task failed; keeping the inline output (ADR-056)"
+                );
+                return payload;
+            }
+        };
+        content.insert(
+            "output".to_string(),
+            json!({
+                "artifact": {
+                    "id": artifact.id,
+                    "size": artifact.size,
+                    "media_type": artifact.media_type,
+                },
+                "preview": preview,
+                "truncated": true,
+            }),
+        );
+        payload
     }
 
     /// The spill consumption write: `input/admitted` immediately
@@ -543,6 +671,23 @@ impl DrainCtx {
         metrics: Arc<Metrics>,
         interrupt: Arc<AtomicBool>,
     ) -> Result<Self, EngineError> {
+        Self::with_interrupt_and_artifacts(store, session, epoch, clock, metrics, interrupt, None)
+            .await
+    }
+
+    /// [`DrainCtx::with_interrupt`] plus the ADR-056 spill runtime — the
+    /// engine's `drain_episode` passes the engine-configured runtime so
+    /// oversized tool results spill at the single append path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_interrupt_and_artifacts(
+        store: EventStore,
+        session: SessionId,
+        epoch: Epoch,
+        clock: Arc<dyn Clock>,
+        metrics: Arc<Metrics>,
+        interrupt: Arc<AtomicBool>,
+        artifacts: Option<ArtifactRuntime>,
+    ) -> Result<Self, EngineError> {
         let head = store.head(session).await?;
         Ok(Self {
             core: Arc::new(DrainCtxCore {
@@ -555,6 +700,7 @@ impl DrainCtx {
                 interrupt,
                 clock,
                 metrics,
+                artifacts,
             }),
         })
     }
@@ -758,6 +904,22 @@ impl DrainCtx {
                     }
                     self.bind_consumed(&r, ev.seq).await?;
                 }
+                Consumption::Budget(intent) => {
+                    // The audit append first, then the binding (the same
+                    // admit-before-consume ordering as every other row).
+                    // The final control-only take leaves raises eligible:
+                    // consuming one there would strand the fresh budget
+                    // behind an end write with no wake.
+                    if control_only {
+                        continue;
+                    }
+                    let ev = self
+                        .core
+                        .append_event(EventKind::BudgetRaised, intent.event_payload())
+                        .await?;
+                    self.bind_consumed(&r, ev.seq).await?;
+                    report.control_budget = true;
+                }
                 Consumption::Confirm(intent) => {
                     // The durable decision first, then the binding (the
                     // same admit-before-consume ordering as everything
@@ -795,7 +957,9 @@ impl DrainCtx {
                                 self.core.append_input_pair(admitted, spill).await?;
                             admitted_ev.seq
                         }
-                        Consumption::Control(_) | Consumption::Confirm(_) => {
+                        Consumption::Control(_)
+                        | Consumption::Confirm(_)
+                        | Consumption::Budget(_) => {
                             unreachable!("matched above")
                         }
                     };
@@ -872,6 +1036,46 @@ impl DrainCtx {
             .is_empty())
     }
 
+    /// Reads one artifact blob by id for the driver (ADR-063 vision
+    /// inputs). `None` when no artifact runtime is configured, the blob
+    /// has aged out, or the store read fails — the driver degrades the
+    /// request (drops that image), never the turn: a reclaimed artifact
+    /// lowers fidelity, it does not break replay or honesty.
+    pub async fn artifact_bytes(&self, id: &str) -> Option<Vec<u8>> {
+        let runtime = self.core.artifacts.as_ref()?;
+        let store = Arc::clone(runtime.store());
+        let artifact_id = id.to_owned();
+        match tokio::task::spawn_blocking(move || store.get(&artifact_id)).await {
+            Ok(Ok(Some(bytes))) => Some(bytes),
+            Ok(Ok(None)) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    "artifact is not available (aged out or never stored); the request degrades (ADR-063)"
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    error = %e,
+                    "artifact read failed; the request degrades (ADR-063)"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %self.core.session.0,
+                    artifact = %id,
+                    error = %e,
+                    "artifact read task failed; the request degrades (ADR-063)"
+                );
+                None
+            }
+        }
+    }
+
     /// The end write (constraint 4): `session/ended` as one atomic
     /// append via `append_end`.
     pub async fn end_session(&self, reason: EndReason) -> Result<Event, EngineError> {
@@ -917,6 +1121,8 @@ enum Supervised {
     SoftFailed {
         reason: String,
     },
+    /// The token budget gate refused the next provider request (ADR-055).
+    AwaitingBudget,
     /// The driver stream ended without a terminal outcome — treated as
     /// an honest failure, never `completed` (constraint 7).
     StreamEnded,
@@ -940,6 +1146,9 @@ pub struct Engine<D: LoopDriver> {
     /// byte-identical; the kian serve assembly turns it on from
     /// `read_model.snapshots`.
     read_model: crate::snapshots::ReadModelConfig,
+    /// ADR-056 tool-result spill; `None` keeps every payload byte-identical
+    /// to legacy.
+    artifacts: Option<ArtifactRuntime>,
 }
 
 impl<D> Engine<D>
@@ -966,6 +1175,7 @@ where
             config,
             clock,
             crate::snapshots::ReadModelConfig::default(),
+            None,
         )
     }
 
@@ -980,7 +1190,34 @@ where
         config: EngineConfig,
         read_model: crate::snapshots::ReadModelConfig,
     ) -> Arc<Self> {
-        Self::assemble(store, driver, config, Arc::new(SystemClock), read_model)
+        Self::assemble(
+            store,
+            driver,
+            config,
+            Arc::new(SystemClock),
+            read_model,
+            None,
+        )
+    }
+
+    /// Engine with the system clock, an explicit read-model config and the
+    /// ADR-056 tool-result spill runtime (the `kian serve` assembly path).
+    #[must_use]
+    pub fn new_with_read_model_and_artifacts(
+        store: EventStore,
+        driver: Arc<D>,
+        config: EngineConfig,
+        read_model: crate::snapshots::ReadModelConfig,
+        artifacts: Option<ArtifactRuntime>,
+    ) -> Arc<Self> {
+        Self::assemble(
+            store,
+            driver,
+            config,
+            Arc::new(SystemClock),
+            read_model,
+            artifacts,
+        )
     }
 
     fn assemble(
@@ -989,6 +1226,7 @@ where
         config: EngineConfig,
         clock: Arc<dyn Clock>,
         read_model: crate::snapshots::ReadModelConfig,
+        artifacts: Option<ArtifactRuntime>,
     ) -> Arc<Self> {
         let metrics = Arc::new(Metrics::default());
         let engine = Arc::new(Self {
@@ -1001,6 +1239,7 @@ where
             metrics,
             weak: std::sync::OnceLock::new(),
             read_model,
+            artifacts,
         });
         engine
             .weak
@@ -1405,16 +1644,53 @@ where
         idempotency_key: Option<String>,
     ) -> Result<AdmitOutcome, EngineError> {
         let outcome = self.admit_row(session, content, idempotency_key).await?;
-        // wake transport (ADR-009 decision 4): publish the advisory
-        // cross-replica hint. The admit INSERT above is a single
-        // statement, so it has *committed* by the time we get here —
-        // the notify can never be observed before its row is visible
-        // (durable-before-wake holds for remote replicas too). The
-        // notify is best-effort: a failure is logged and skipped (a
-        // wake is losable by invariant; the sweep ticker and each
-        // replica's startup scan bound the miss). sqlite is a no-op —
-        // the in-process registry below is the single-process
-        // transport.
+        self.publish_admit_wake(session).await;
+        Ok(outcome)
+    }
+
+    /// Admits one input at an explicit eligibility instant (ADR-060):
+    /// the durable row is written exactly like Engine::admit, but a
+    /// row that is not yet eligible does NOT wake. The due-wake
+    /// sweep (or a later admission, or a restart) wakes the session when
+    /// the instant arrives, and the store's eligible_at gate refuses
+    /// early consumption regardless — the wake is never the correctness
+    /// mechanism, only the latency one.
+    pub async fn admit_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        eligible_at_ms: u64,
+    ) -> Result<AdmitOutcome, EngineError> {
+        let outcome = self
+            .admit_row_at(session, content, idempotency_key, eligible_at_ms)
+            .await?;
+        if eligible_at_ms > self.clock.now_ms() {
+            return Ok(outcome);
+        }
+        self.publish_admit_wake(session).await;
+        Ok(outcome)
+    }
+
+    /// The engine's wall clock reading, milliseconds (ADR-060: the
+    /// deferral planner and the cron sinks plan against the same clock
+    /// the inbox rows are stamped with).
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// The advisory wake half of Engine::admit: publish the
+    /// cross-replica hint, then wake the in-process registry.
+    ///
+    /// wake transport (ADR-009 decision 4): the admit INSERT is a single
+    /// statement, so it has *committed* by the time we get here — the
+    /// notify can never be observed before its row is visible
+    /// (durable-before-wake holds for remote replicas too). The notify is
+    /// best-effort: a failure is logged and skipped (a wake is losable by
+    /// invariant; the sweep ticker and each replica's startup scan bound
+    /// the miss). sqlite is a no-op — the in-process registry below is the
+    /// single-process transport.
+    async fn publish_admit_wake(&self, session: SessionId) {
         if let Err(e) = self.store.notify_wake(session).await {
             tracing::warn!(
                 session = %session.0,
@@ -1423,7 +1699,6 @@ where
             );
         }
         self.wake(session);
-        Ok(outcome)
     }
 
     /// Admits one input **quietly** (MEMORY-MODEL §6, P2 plan §2.2):
@@ -1456,16 +1731,29 @@ where
         idempotency_key: Option<String>,
     ) -> Result<AdmitOutcome, EngineError> {
         let now = self.clock.now_ms();
+        self.admit_row_at(session, content, idempotency_key, now)
+            .await
+    }
+
+    /// The durable-row write with an explicit eligibility instant
+    /// (ADR-060). Constraint 6 still holds: the row is durable BEFORE any
+    /// wake may fire; on any store failure the caller returns without
+    /// touching the registry.
+    async fn admit_row_at(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: Option<String>,
+        eligible_at_ms: u64,
+    ) -> Result<AdmitOutcome, EngineError> {
         let input = InputRow {
             id: Uuid::new_v4(),
             session,
             payload: content,
-            admitted_at: now,
-            eligible_at: now,
+            admitted_at: self.clock.now_ms(),
+            eligible_at: eligible_at_ms,
             idempotency_key,
         };
-        // Constraint 6: the row is durable BEFORE any wake may fire.
-        // On any store failure we return without touching the registry.
         Ok(self.store.admit(input).await?)
     }
 
@@ -1703,6 +1991,59 @@ where
         })
     }
 
+    /// Raises the session-lifetime token/wall-clock budget (ADR-055): a
+    /// durable reserved control row plus a wake. The control plane writes
+    /// only the inbox row — the owning drain consumes it into a
+    /// `budget/raised` event and the projection adds it. A raise is the
+    /// wake that releases an `awaiting_budget` settle, so an idle session
+    /// resumes without a new message.
+    ///
+    /// At least one amount must be positive: a zero raise would mint a
+    /// row that can never change the projection. Terminal sessions
+    /// refuse (their rows would be unconsumable junk); unknown sessions
+    /// are an honest [`BudgetOutcome::UnknownSession`]. A caller key wins;
+    /// otherwise the key is per (session, amount, millisecond), so an
+    /// exact replay dedupes to one row while two intentional raises in
+    /// different milliseconds both land.
+    pub async fn raise_budget(
+        &self,
+        session: SessionId,
+        tokens: Option<u64>,
+        wall_clock_ms: Option<u64>,
+        reason: Option<String>,
+        requested_by: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Result<BudgetOutcome, EngineError> {
+        if tokens.unwrap_or(0) == 0 && wall_clock_ms.unwrap_or(0) == 0 {
+            return Err(EngineError::InvalidBudget {
+                reason: "tokens and wall_clock_ms are both absent or zero".into(),
+            });
+        }
+        let events = self.store.rebuild(session).await?;
+        if events.is_empty() {
+            return Ok(BudgetOutcome::UnknownSession);
+        }
+        if project(&events)?.is_terminal() {
+            return Ok(BudgetOutcome::Terminal);
+        }
+        let now = self.clock.now_ms();
+        let intent = BudgetIntent {
+            tokens,
+            wall_clock_ms,
+            reason,
+            requested_by,
+            requested_at_ms: now,
+        };
+        let key = idempotency_key
+            .unwrap_or_else(|| BudgetIntent::idempotency_key(&session, tokens, wall_clock_ms, now));
+        let outcome = self.admit(session, intent.envelope(), Some(key)).await?;
+        Ok(if outcome.deduplicated {
+            BudgetOutcome::Deduplicated
+        } else {
+            BudgetOutcome::Accepted
+        })
+    }
+
     /// The session's pending confirmations with the TTL overlay
     /// (CONFIRMATION-MODEL §9). `None` = no such session.
     pub async fn pending_confirmations(
@@ -1735,6 +2076,26 @@ where
     /// projects terminal and exits without writing anything), so they are
     /// audit facts, not a pending wake (CRON-MODEL §5.1).
     pub async fn startup_rebuild(&self) -> Result<usize, EngineError> {
+        self.scan_eligible_sessions().await
+    }
+
+    /// The due-wake sweep (ADR-060 decision 5): re-derives the wake
+    /// registry from the inbox so a deferred row whose eligible_at has
+    /// come due wakes its session without a per-row timer. The wake
+    /// registry holds no timers by design; correctness never depends on
+    /// this ticker (a later admission or a restart finds the row too, and
+    /// the store's eligible_at gate refuses early consumption either way),
+    /// so an absent or late sweep only adds latency. Returns the number of
+    /// sessions woken.
+    pub async fn due_wake_sweep(&self) -> Result<usize, EngineError> {
+        self.scan_eligible_sessions().await
+    }
+
+    /// The shared inbox scanner behind the startup rebuild and the
+    /// due-wake sweep: registers a pending wake for every session with
+    /// eligible-but-unconsumed input, then wakes them. Neither caller
+    /// reads a timer.
+    async fn scan_eligible_sessions(&self) -> Result<usize, EngineError> {
         let inboxes = self.store.startup_scan(self.clock.now_ms()).await?;
         let mut sessions: Vec<SessionId> = Vec::with_capacity(inboxes.len());
         for inbox in &inboxes {
@@ -1744,6 +2105,7 @@ where
             // confirm row, which the same scan sees as a control row.
             let has_control_row = inbox.eligible.iter().any(|row| {
                 ConfirmIntent::parse(&row.payload).is_some()
+                    || BudgetIntent::parse(&row.payload).is_some()
                     || kian_core::control::InterruptIntent::parse(&row.payload).is_some()
             });
             let events = self.store.rebuild(inbox.session).await?;
@@ -1958,13 +2320,14 @@ where
         // the ctx shares the drain's interrupt flag — an
         // `interrupt` RPC and a consumed current-epoch control row flip
         // the same switch.
-        let ctx = DrainCtx::with_interrupt(
+        let ctx = DrainCtx::with_interrupt_and_artifacts(
             self.store.clone(),
             *session,
             lease.epoch,
             Arc::clone(&self.clock),
             Arc::clone(&self.metrics),
             Arc::clone(interrupt),
+            self.artifacts.clone(),
         )
         .await?;
         let mut claimed = false;
@@ -2070,6 +2433,7 @@ where
             }
             let report = ctx.take_eligible_inputs_report().await?;
             let took_confirm = report.control_confirm;
+            let took_budget = report.control_budget;
             let taken = report.messages;
             // a current-epoch control row consumed by that take
             // flips the shared flag — honor it now, before the
@@ -2078,7 +2442,7 @@ where
                 end_reason = EndReason::Interrupted;
                 break 'episodes;
             }
-            if taken.is_empty() && !takeover && !took_confirm {
+            if taken.is_empty() && !takeover && !took_confirm && !took_budget {
                 if !claimed {
                     return Ok(DrainOutcome::ReleasedClean);
                 }
@@ -2125,6 +2489,17 @@ where
                     // will intercept this before the end write.
                     tracing::warn!(session = %session.0, reason, "soft failure");
                     end_reason = EndReason::Failed;
+                    break 'episodes;
+                }
+                Supervised::AwaitingBudget => {
+                    // ADR-055: the token budget refused the next request.
+                    // The end is resumable (running -> idle); a durable
+                    // budget-raise row is the wake that resumes it.
+                    tracing::info!(
+                        session = %session.0,
+                        "budget exhausted: ending awaiting_budget"
+                    );
+                    end_reason = EndReason::AwaitingBudget;
                     break 'episodes;
                 }
                 Supervised::StreamEnded => {
@@ -2219,6 +2594,13 @@ where
                         Supervised::SoftFailed { reason }
                     }
                 }
+                LoopOutcome::AwaitingBudget { .. } => {
+                    if interrupted() {
+                        Supervised::Interrupted
+                    } else {
+                        Supervised::AwaitingBudget
+                    }
+                }
             };
             return supervised;
         }
@@ -2258,6 +2640,10 @@ async fn heartbeat_loop(
 struct TakeReport {
     messages: Vec<InputRow>,
     control_interrupt: bool,
+    /// A budget-raise row was consumed into `budget/raised` (ADR-055): the
+    /// drain must drive the loop even with no message row, because the
+    /// raise is what releases an `awaiting_budget` settle.
+    control_budget: bool,
     /// A confirmation answer was consumed into `control/confirm`. The
     /// drain must still drive the loop: the answer's effect is applied by
     /// the loop, so a wake that only carried a decision is real work
@@ -2309,6 +2695,10 @@ enum Consumption {
     /// the decision at its next turn start; the row is bound to the
     /// event's seq like any other consumption.
     Confirm(ConfirmIntent),
+    /// The reserved budget envelope (ADR-055): a `budget/raised` audit
+    /// event, never a message. The row is bound to the event's seq like
+    /// any other consumption.
+    Budget(BudgetIntent),
 }
 
 fn consumption_plan(row: &InputRow) -> Consumption {
@@ -2317,6 +2707,9 @@ fn consumption_plan(row: &InputRow) -> Consumption {
     }
     if let Some(intent) = ConfirmIntent::parse(&row.payload) {
         return Consumption::Confirm(intent);
+    }
+    if let Some(intent) = BudgetIntent::parse(&row.payload) {
+        return Consumption::Budget(intent);
     }
     if let Some(obj) = row.payload.as_object() {
         // kian-96 (kian-95 review N-1): the steer wrapper is exactly
@@ -2395,6 +2788,21 @@ fn consumption_plan(row: &InputRow) -> Consumption {
                 json!({"role": "user", "content": content, "cron": cron, "job": job}),
             );
         }
+        if obj.len() == 3
+            && let (Some(content), Some(cron), Some(defer)) =
+                (obj.get("content"), obj.get("cron"), obj.get("defer"))
+        {
+            // ADR-060: an off-peak firing carries the scheduler's deferral
+            // decision beside the proof. The decision is additive and
+            // non-context (derive_model_context reads role/content only), so
+            // the model still receives the prompt alone.
+            return Consumption::Single(json!({
+                "role": "user",
+                "content": content,
+                "cron": cron,
+                "defer": defer,
+            }));
+        }
     }
     Consumption::Single(json!({"role": "user", "content": row.payload}))
 }
@@ -2414,16 +2822,17 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Clock, Consumption, DrainCtx, Engine, EngineConfig, EngineError, InterruptOutcome,
-        ManualClock, ReleaseOutcome, WakeOutcome, consumption_plan,
+        ArtifactRuntime, BudgetOutcome, Clock, Consumption, DrainCtx, Engine, EngineConfig,
+        EngineError, InterruptOutcome, ManualClock, ReleaseOutcome, WakeOutcome, consumption_plan,
     };
     use crate::metrics::Metrics;
+    use kian_core::control::BudgetIntent;
     use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
     use kian_core::model::{Epoch, InputRow, SessionId};
     use kian_core::seams::{LoopDriver, LoopOutcome};
     use kian_core::state::{SessionState, project};
     use kian_store::AppendGuard;
-    use kian_store::EventStore;
+    use kian_store::{ArtifactStore, EventStore};
 
     const T0: u64 = 1_761_900_000_000;
 
@@ -2667,6 +3076,71 @@ mod tests {
         let scan = store.startup_scan(T0).await.expect("scan");
         assert_eq!(scan.len(), 1);
         assert_eq!(scan[0].eligible.len(), 1);
+        cleanup(&path);
+    }
+
+    /// ADR-060: a row admitted with a future eligibility instant is
+    /// durable immediately but arms nothing — it is invisible to the
+    /// eligible scan and cannot be consumed early. When the clock reaches
+    /// the instant, the due-wake sweep (not a per-row timer) wakes the
+    /// session and the row drains.
+    #[tokio::test]
+    async fn a_deferred_row_is_invisible_until_due_and_the_sweep_wakes_it() {
+        let (store, path) = open_store().await;
+        let clock = Arc::new(ManualClock::new(T0));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig::default(),
+            clock.clone(),
+        );
+        let sid = SessionId::new();
+        let due = T0 + 60_000;
+
+        let outcome = eng
+            .admit_at(sid, json!("batch task"), Some("defer-1".into()), due)
+            .await
+            .expect("deferred admit");
+        assert!(!outcome.deduplicated);
+        assert!(!eng.is_draining(&sid), "a deferred admit must not wake");
+        assert_eq!(eng.pending_wake_depth(), 0, "no wake is registered");
+        assert!(
+            store.startup_scan(T0).await.expect("scan").is_empty(),
+            "the row is not eligible yet"
+        );
+        let due_scan = store.startup_scan(due).await.expect("scan");
+        assert_eq!(due_scan.len(), 1, "the row is durable");
+        assert_eq!(due_scan[0].eligible.len(), 1);
+        assert_eq!(
+            eng.due_wake_sweep().await.expect("sweep"),
+            0,
+            "nothing is due yet"
+        );
+        assert!(!eng.is_draining(&sid));
+
+        // A repeated deferred admit dedupes even while the first is pending.
+        let again = eng
+            .admit_at(sid, json!("batch task"), Some("defer-1".into()), due)
+            .await
+            .expect("repeat");
+        assert!(again.deduplicated, "same key, same row");
+
+        clock.advance(60_000);
+        assert_eq!(eng.now_ms(), due);
+        assert_eq!(eng.due_wake_sweep().await.expect("sweep"), 1);
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the due row drains after the sweep"
+        );
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "one row was consumed: {events:#?}");
         cleanup(&path);
     }
 
@@ -3337,6 +3811,71 @@ mod tests {
         assert!(
             !with_marker.contains("night-audit@"),
             "the firing marker must never enter model context"
+        );
+        cleanup(&path);
+    }
+
+    /// ADR-060: the deferred cron envelope — exactly
+    /// `{"content": X, "cron": M, "defer": D}` — consumes to ONE
+    /// `input/admitted` carrying the prompt and both additive keys, and the
+    /// deferral decision leaves the projected model context byte-identical.
+    #[tokio::test]
+    async fn deferred_cron_envelope_consumes_to_one_admitted_with_the_decision() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let ctx = spill_ctx(&store, sid, Epoch(1)).await;
+
+        let cron = json!({
+            "schedule_id": "night-audit",
+            "firing_id": "night-audit@2026-11-18T03:30:00Z",
+            "fire_time": "2026-11-18T03:30:00Z",
+            "target": {"channel": "cron-jobs", "topic": "audit"},
+        });
+        let defer = json!({
+            "policy": "off_peak",
+            "deferred": true,
+            "eligible_at_ms": 1_795_000_000_000u64,
+            "reason": "next off-peak at 1795000000000",
+        });
+        let prompt = "audit .state/";
+        store
+            .admit(row(
+                sid,
+                7,
+                json!({"content": prompt, "cron": cron.clone(), "defer": defer.clone()}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ctx.take_eligible_inputs().await.unwrap().len(), 1);
+
+        let events = events_of(&store, sid).await;
+        let admitted: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::InputAdmitted)
+            .collect();
+        assert_eq!(admitted.len(), 1, "exactly one input/admitted event");
+        assert_eq!(
+            admitted[0].bytes,
+            json!({"role": "user", "content": prompt, "cron": cron, "defer": defer}),
+            "the deferral decision rides the admitted payload verbatim"
+        );
+        let mut bare = events.clone();
+        for ev in &mut bare {
+            if ev.kind == EventKind::InputAdmitted {
+                ev.bytes.as_object_mut().unwrap().remove("defer");
+            }
+        }
+        let with_decision =
+            serde_json::to_string(&kian_core::context::derive_model_context(&events).unwrap())
+                .unwrap();
+        let without_decision =
+            serde_json::to_string(&kian_core::context::derive_model_context(&bare).unwrap())
+                .unwrap();
+        assert_eq!(with_decision, without_decision);
+        assert!(with_decision.contains("audit .state/"));
+        assert!(
+            !with_decision.contains("off_peak"),
+            "the deferral decision must never enter model context"
         );
         cleanup(&path);
     }
@@ -5960,5 +6499,395 @@ mod tests {
             "the bounded taker must not drive the crashed episode"
         );
         cleanup(&path);
+    }
+
+    // -- session token budget gate (ADR-055) --------------------------------
+
+    /// `awaiting_budget` is a resumable settle, not a terminal state: the
+    /// control plane admits a budget raise as a durable row only (never an
+    /// event), and the next drain consumes it into `budget/raised` before
+    /// settling normally.
+    #[tokio::test]
+    async fn awaiting_budget_is_resumable_by_a_budget_raise() {
+        let (store, path) = open_store().await;
+        let driver = Arc::new(ScriptedDriver::scripted(vec![
+            vec![
+                Step::BeginTurn,
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::AwaitingBudget {
+                    budget: json!({"limit": 1000, "raised": 0, "spent": 990, "estimate": 500}),
+                }),
+            ],
+            vec![Step::Outcome(LoopOutcome::Settled)],
+        ]));
+        let eng = engine(&store, Arc::clone(&driver));
+        let sid = eng.create_session().await.expect("session");
+        eng.admit(sid, json!("long task"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid).await.last().is_some_and(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::SessionEnded {
+                            reason: EndReason::AwaitingBudget
+                        }
+                    )
+                })
+            })
+            .await,
+            "the drain ends awaiting_budget"
+        );
+        assert_eq!(projection_of(&store, sid).await, SessionState::Idle);
+        assert_eq!(
+            eng.raise_budget(
+                sid,
+                Some(5_000),
+                None,
+                Some("resume".into()),
+                Some("test".into()),
+                None,
+            )
+            .await
+            .expect("raise"),
+            BudgetOutcome::Accepted
+        );
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the raise resumes the session to completion"
+        );
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1,
+            "the raise is one durable event"
+        );
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: EndReason::Completed
+            }
+        ));
+        cleanup(&path);
+    }
+
+    /// An exact replay of a raise dedupes to the same durable row: the row is
+    /// the identity, so two identical control-plane calls can never double the
+    /// projection.
+    #[tokio::test]
+    async fn an_exact_budget_raise_replay_dedupes_to_one_row() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let driver = Arc::new(ScriptedDriver::scripted(vec![
+            vec![
+                Step::TakeInputs,
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::TurnDone),
+            ],
+            vec![Step::TakeInputs, Step::Outcome(LoopOutcome::Settled)],
+        ]));
+        let eng = engine(&store, Arc::clone(&driver));
+        let sid = eng.create_session().await.expect("session");
+        eng.admit(sid, json!("work"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                events_of(&store, sid)
+                    .await
+                    .iter()
+                    .any(|e| e.kind == EventKind::TurnStart)
+            })
+            .await,
+            "the drain reaches its first turn"
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(500), None, None, None, None)
+                .await
+                .expect("raise"),
+            BudgetOutcome::Accepted
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(500), None, None, None, None)
+                .await
+                .expect("replay"),
+            BudgetOutcome::Deduplicated
+        );
+        let eligible = store.eligible_inputs(sid, T0).await.expect("eligible");
+        assert_eq!(eligible.len(), 1, "the replay is one durable row");
+        assert!(BudgetIntent::parse(&eligible[0].payload).is_some());
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await,
+            "the resumed drain settles"
+        );
+        assert_eq!(
+            events_of(&store, sid)
+                .await
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1,
+            "one row, one event"
+        );
+        cleanup(&path);
+    }
+
+    /// Raises validate their amounts; unknown ids are honest; a terminal
+    /// session refuses (its row would be unconsumable junk). A wall-clock-only
+    /// raise is durable but never gates the token budget.
+    #[tokio::test]
+    async fn budget_raises_validate_amounts_and_terminal_sessions() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = eng.create_session().await.expect("session");
+        let err = eng
+            .raise_budget(sid, None, Some(0), None, None, None)
+            .await
+            .expect_err("zero raise refused");
+        assert!(matches!(err, EngineError::InvalidBudget { .. }), "{err}");
+        assert_eq!(
+            eng.raise_budget(SessionId::new(), Some(10), None, None, None, None)
+                .await
+                .expect("unknown"),
+            BudgetOutcome::UnknownSession
+        );
+        assert_eq!(
+            eng.raise_budget(sid, None, Some(60_000), Some("time".into()), None, None,)
+                .await
+                .expect("wall raise"),
+            BudgetOutcome::Accepted
+        );
+        eng.admit(sid, json!("finish"), Some("k1".into()))
+            .await
+            .expect("admit");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, sid).await == SessionState::Completed
+            })
+            .await
+        );
+        assert_eq!(
+            events_of(&store, sid)
+                .await
+                .iter()
+                .filter(|e| e.kind == EventKind::BudgetRaised)
+                .count(),
+            1
+        );
+        assert_eq!(
+            eng.raise_budget(sid, Some(10), None, None, None, None)
+                .await
+                .expect("late raise"),
+            BudgetOutcome::Terminal
+        );
+        cleanup(&path);
+    }
+
+    // -- tool result artifacts (ADR-056) ----------------------------------
+
+    async fn artifact_ctx(
+        store: EventStore,
+        sid: SessionId,
+        dir: &Path,
+        inline_max_bytes: usize,
+    ) -> DrainCtx {
+        let runtime = ArtifactRuntime::new(
+            ArtifactStore::open(dir).expect("open artifacts"),
+            inline_max_bytes,
+        );
+        DrainCtx::with_interrupt_and_artifacts(
+            store,
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+            Some(runtime),
+        )
+        .await
+        .expect("drain ctx")
+    }
+
+    /// ADR-063: the driver reads image bytes through the artifact runtime;
+    /// a missing blob and an absent runtime both degrade to `None` (drop
+    /// the image, keep the turn) instead of failing.
+    #[tokio::test]
+    async fn artifact_bytes_round_trip_and_degrade_honestly() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        let blobs = ArtifactStore::open(&dir).expect("open artifacts");
+        let reference = blobs.put(b"hi", "image/png").expect("put blob");
+        assert_eq!(
+            ctx.artifact_bytes(&reference.id).await,
+            Some(b"hi".to_vec())
+        );
+        assert_eq!(
+            ctx.artifact_bytes(&"a".repeat(64)).await,
+            None,
+            "an aged-out id degrades instead of erroring"
+        );
+        let plain = DrainCtx::with_interrupt(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plain.artifact_bytes(&reference.id).await,
+            None,
+            "no runtime means no image bytes, never a failure"
+        );
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An oversized successful `tool/result` output becomes a content
+    /// addressed reference plus a bounded preview at the append path, and
+    /// the persisted bytes are exactly what the next turn sees. Errors and
+    /// small outputs stay inline.
+    #[tokio::test]
+    async fn oversized_tool_outputs_spill_but_errors_never_do() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        ctx.append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+
+        let big = "x".repeat(500);
+        let output = json!({ "stdout": big });
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c1", "output": output.clone(), "is_error": false } }),
+        )
+        .await
+        .unwrap();
+
+        let events = events_of(&store, sid).await;
+        let content = &events.last().unwrap().bytes["content"];
+        let reference = &content["output"];
+        let id = reference["artifact"]["id"].as_str().expect("artifact id");
+        assert_eq!(id.len(), 64, "content addressed sha256 hex");
+        assert_eq!(
+            reference["artifact"]["media_type"],
+            json!("application/json")
+        );
+        assert_eq!(reference["truncated"], json!(true));
+        assert!(
+            !reference["preview"].as_str().unwrap().is_empty(),
+            "the preview is what the model reads next turn"
+        );
+        assert!(
+            reference["preview"].as_str().unwrap().len() <= 64,
+            "the preview is bounded by inline_max_bytes/4"
+        );
+
+        let blobs = ArtifactStore::open(&dir).expect("reopen artifacts");
+        let stored = blobs.get(id).expect("read blob").expect("blob exists");
+        assert_eq!(
+            stored,
+            serde_json::to_vec(&output).unwrap(),
+            "the blob holds the exact inline bytes that would have been persisted"
+        );
+
+        // Small outputs and errors are never spilled.
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c2", "output": json!({ "ok": true }), "is_error": false } }),
+        )
+        .await
+        .unwrap();
+        ctx.append(
+            EventKind::ToolResult,
+            json!({ "content": { "call_id": "c3", "output": json!({ "stderr": "y".repeat(500) }), "is_error": true } }),
+        )
+        .await
+        .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events[events.len() - 2].bytes["content"]["output"],
+            json!({ "ok": true })
+        );
+        assert_eq!(
+            events.last().unwrap().bytes["content"]["output"],
+            json!({ "stderr": "y".repeat(500) }),
+            "honest errors stay inline so a failure is always readable"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the runtime the append bytes are legacy-identical; an
+    /// already-spilled output is left alone (idempotent re-append).
+    #[tokio::test]
+    async fn spill_is_absent_by_default_and_idempotent_when_present() {
+        let (store, path) = open_store().await;
+        let dir = path.with_extension("artifacts");
+        let sid = SessionId::new();
+        let plain = DrainCtx::with_interrupt(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        plain
+            .append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+        let payload = json!({ "content": { "call_id": "c1", "output": json!({ "stdout": "z".repeat(500) }), "is_error": false } });
+        plain
+            .append(EventKind::ToolResult, payload.clone())
+            .await
+            .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events.last().unwrap().bytes,
+            payload,
+            "no runtime = legacy bytes exactly"
+        );
+
+        let sid = SessionId::new();
+        let ctx = artifact_ctx(store.clone(), sid, &dir, 64).await;
+        let pre_spilled = json!({ "content": { "call_id": "c9", "output": { "artifact": { "id": "a".repeat(64), "size": 1, "media_type": "application/json" }, "preview": "p", "truncated": true }, "is_error": false } });
+        ctx.append(EventKind::SessionCreated, json!({}))
+            .await
+            .unwrap();
+        ctx.append(EventKind::ToolResult, pre_spilled.clone())
+            .await
+            .unwrap();
+        let events = events_of(&store, sid).await;
+        assert_eq!(
+            events.last().unwrap().bytes,
+            pre_spilled,
+            "already-spilled payloads are not re-spilled"
+        );
+
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -615,6 +615,7 @@ impl JobsSection {
                     max_concurrent,
                     timeout_ms: DEFAULT_CRON_TIMEOUT_MS,
                     worktree: None,
+                    defer: crate::defer::DeferPolicy::Immediate,
                 });
                 if let Some(job) = jobs.get_mut(&def.job) {
                     job.triggers.push(schedule_id);

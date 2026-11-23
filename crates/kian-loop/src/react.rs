@@ -52,18 +52,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::stream::{BoxStream, StreamExt};
+use kian_core::budget::project_budget;
 use kian_core::confirmation::{PendingCall, confirmable, confirmations, pending_calls};
-use kian_core::context::{Message, derive_model_context};
+use kian_core::context::{Message, context_provenance, derive_model_context};
 use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{Event, EventKind};
-use kian_core::model::{AgentDef, Permission, SlotName};
+use kian_core::model::{AgentDef, ModelProfile, Permission, SlotName};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
     ToolCall, ToolProvider, ToolResult,
 };
-use kian_llm::provider::{ChatMessage, WireFunctionCall, WireToolCall, build_chat_body};
+use kian_llm::plan::build_request_plan;
+use kian_llm::provider::{ChatImage, ChatMessage, WireFunctionCall, WireToolCall};
 use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
+use kian_orchestrator::compaction::{
+    CompactionPlan, CompactionPressure, CompactionSettings, CompactionTrigger,
+    estimate_context_tokens, plan_compaction,
+};
 use kian_orchestrator::{DrainCtx, EngineError};
 use serde_json::{Value, json};
 
@@ -76,6 +82,30 @@ pub const CLASS_EMPTY_RESPONSE: &str = "empty_response";
 
 /// Iteration budget default: stops honest loops that never converge.
 pub const DEFAULT_MAX_ITERATIONS: usize = 32;
+
+/// How many maintenance compactions one drain episode may run (ADR-058).
+/// The loop never compacts in a cycle: each fold is bounded, and two are
+/// enough to clear a window that one fold could not.
+const MAX_COMPACTIONS_PER_EPISODE: usize = 2;
+
+/// Output reserve assumed for a profile that declares no output cap, when
+/// deciding whether the next request is close to the window.
+const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 4_096;
+
+/// Upper bound on images attached to one user message (ADR-063).
+const MAX_IMAGES_PER_MESSAGE: usize = 4;
+
+/// Upper bound on one attached image byte payload (ADR-063).
+const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Upper bound on the transcript handed to the summarizer, in characters.
+/// The model already cost the context; the transcript only has to carry
+/// the decisions and facts forward, not every byte.
+const MAX_TRANSCRIPT_CHARS: usize = 120_000;
+
+/// The summarizer's system prompt. Frozen text: it is a model-visible
+/// input of a persisted request, so it must not change silently.
+const SUMMARY_SYSTEM_PROMPT: &str = "You summarize conversation history for an execution runtime. Preserve the user's goals and constraints, decisions and their reasons, exact file paths/commands/identifiers, tool results that matter, and unresolved TODOs or failures. Reply with the summary only, in English.";
 
 /// How a loop's iteration budget is scoped (ADR-024).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,6 +168,7 @@ impl Default for ReActConfig {
     }
 }
 
+#[derive(Clone)]
 struct Inner {
     registry: Arc<ProviderRegistry>,
     tools: Arc<dyn ToolProvider>,
@@ -158,6 +189,9 @@ struct Inner {
     /// an eighth interception port (§4's seven are frozen); it is the
     /// guard's own seam.
     set_guard: Option<Arc<dyn kian_plugin::hooks::SessionSetGuard>>,
+    /// ADR-058 compaction tuning. The default folds old turns only under
+    /// context pressure; it never spends a provider call to save money.
+    compaction: CompactionSettings,
 }
 
 /// The built-in async ReAct [`LoopDriver`] (DESIGN §6.2). Cheap to clone.
@@ -255,7 +289,24 @@ impl ReActLoop {
             gate,
             hooks,
             set_guard,
+            compaction: CompactionSettings::default(),
         }))
+    }
+
+    /// Replaces the compaction tuning (ADR-058). The default keeps the
+    /// last four turns, folds only at 90% of the declared window, and
+    /// requires a meaningful reclaim.
+    #[must_use]
+    pub fn with_compaction(self, compaction: CompactionSettings) -> Self {
+        let mut inner = (*self.0).clone();
+        inner.compaction = compaction.normalized();
+        Self(Arc::new(inner))
+    }
+
+    /// The mounted compaction settings.
+    #[must_use]
+    pub fn compaction_settings(&self) -> CompactionSettings {
+        self.0.compaction
     }
 
     #[must_use]
@@ -287,6 +338,9 @@ struct LoopState {
     /// Per-episode turn count for [`BudgetScope::PerEpisode`]; reset per
     /// drive stream (ADR-024).
     drain_iterations: usize,
+    /// Maintenance compactions this episode has run (ADR-058), bounded by
+    /// [`MAX_COMPACTIONS_PER_EPISODE`].
+    compactions: usize,
 }
 
 impl LoopDriver for ReActLoop {
@@ -300,6 +354,7 @@ impl LoopDriver for ReActLoop {
                 done: false,
                 begun: false,
                 drain_iterations: 0,
+                compactions: 0,
             },
             move |mut st| {
                 let inner = Arc::clone(&inner);
@@ -339,10 +394,14 @@ impl LoopDriver for ReActLoop {
                             });
                         }
                     }
-                    let outcome = match inner.iteration(&st.ctx, &mut st.drain_iterations).await {
+                    let outcome = match inner
+                        .iteration(&st.ctx, &mut st.drain_iterations, &mut st.compactions)
+                        .await
+                    {
                         Flow::TurnDone => LoopOutcome::TurnDone,
                         Flow::Settled | Flow::Deferred => LoopOutcome::Settled,
                         Flow::Stopped(reason) => LoopOutcome::Stopped { reason },
+                        Flow::AwaitingBudget(budget) => LoopOutcome::AwaitingBudget { budget },
                         Flow::Soft(reason) => LoopOutcome::SoftFailed { reason },
                     };
                     if !matches!(outcome, LoopOutcome::TurnDone) {
@@ -369,6 +428,9 @@ enum Flow {
     Deferred,
     /// An intentional stop condition fired.
     Stopped(String),
+    /// The session token budget gate refused the next request (ADR-055):
+    /// no bytes were persisted, the drain ends `awaiting_budget`.
+    AwaitingBudget(Value),
     /// Soft failure — routed to the recovery policy; never `completed`.
     Soft(String),
 }
@@ -395,6 +457,9 @@ enum TurnError {
     /// Hard error (store/append failure): honest `failed`, never retried
     /// by the loop. Also carries the recovery audit.
     Fatal { error: LoopError, audit: Value },
+    /// The session token budget gate refused before any request bytes
+    /// were persisted (ADR-055). Carries the projection the gate saw.
+    AwaitingBudget { budget: Value },
 }
 
 /// Loop-level failures. Every one degrades honestly to a soft report —
@@ -412,8 +477,13 @@ pub enum LoopError {
 
 impl Inner {
     /// One ReAct iteration.
-    async fn iteration(&self, ctx: &DrainCtx, drain_iterations: &mut usize) -> Flow {
-        let flow = match self.run_iteration(ctx, drain_iterations).await {
+    async fn iteration(
+        &self,
+        ctx: &DrainCtx,
+        drain_iterations: &mut usize,
+        compactions: &mut usize,
+    ) -> Flow {
+        let flow = match self.run_iteration(ctx, drain_iterations, compactions).await {
             Ok(flow) => flow,
             Err(e) => return Flow::Soft(format!("loop error: {e}")),
         };
@@ -707,6 +777,7 @@ impl Inner {
         &self,
         ctx: &DrainCtx,
         drain_iterations: &mut usize,
+        compactions: &mut usize,
     ) -> Result<Flow, LoopError> {
         // 1. Promote newly eligible inputs at this safe boundary (we are
         //    between provider turns here; DrainCtx refuses otherwise —
@@ -782,7 +853,19 @@ impl Inner {
             *drain_iterations += 1;
         }
 
-        // 4. The provider turn. begin/end bracket every outcome (including
+        // 4. Preventive compaction (ADR-058): when the declared window says
+        //    this request is close to overflowing, fold old turns first. The
+        //    fold is a maintenance turn of its own; the next iteration
+        //    derives the smaller context from the new stream.
+        if let Some(trigger) = preventive_trigger(&binding, &messages)
+            && let Some(flow) = self
+                .compact_now(ctx, &binding, iteration, trigger, compactions)
+                .await?
+        {
+            return Ok(flow);
+        }
+
+        // 5. The provider turn. begin/end bracket every outcome (including
         //    soft failures) so turn events stay balanced in the stream.
         ctx.begin_turn_with(json!({"iteration": iteration})).await?;
         let turn = self
@@ -807,6 +890,15 @@ impl Inner {
                     Flow::Settled
                 }
             }
+            Err(TurnError::AwaitingBudget { budget }) => {
+                let payload = json!({
+                    "iteration": iteration,
+                    "outcome": "awaiting_budget",
+                    "budget": &budget,
+                });
+                let _ = ctx.end_turn_with(payload).await;
+                return Ok(Flow::AwaitingBudget(budget));
+            }
             Err(TurnError::Soft { reason, audit }) => {
                 let mut payload = json!({
                     "iteration": iteration,
@@ -817,6 +909,26 @@ impl Inner {
                     payload["usage"] = u.clone();
                 }
                 let _ = ctx.end_turn_with(payload).await;
+                // ADR-058 reactive arm: a provider context overflow is the
+                // authoritative pressure reading — fold the old turns and
+                // let the next iteration retry the (now smaller) request.
+                // The failed request above is already accounted and stays
+                // in the stream; nothing about it is rewritten.
+                let overflow = audit.get("class").and_then(Value::as_str)
+                    == Some(kian_orchestrator::recovery::ErrorClass::ContextOverflow.name());
+                if overflow
+                    && let Some(flow) = self
+                        .compact_now(
+                            ctx,
+                            &binding,
+                            iteration,
+                            CompactionTrigger::Overflow,
+                            compactions,
+                        )
+                        .await?
+                {
+                    return Ok(flow);
+                }
                 return Ok(Flow::Soft(reason));
             }
             Err(TurnError::Fatal { error, audit }) => {
@@ -925,6 +1037,63 @@ impl Inner {
         Ok(fresh.binding(&self.config.slot)?.clone())
     }
 
+    /// Builds the chat messages for this turn, attaching artifact-backed
+    /// images to user messages when the bound target declares `vision`
+    /// (ADR-063). Without the capability the conversion is exactly
+    /// [`to_chat_message`]: no bytes load and each content keeps the
+    /// compact JSON fallback it had before this capability existed.
+    async fn chat_messages(
+        &self,
+        ctx: &DrainCtx,
+        profile: Option<&ModelProfile>,
+        messages: &[Message],
+    ) -> Vec<ChatMessage> {
+        let vision = profile.is_some_and(|p| p.vision);
+        let mut chat = Vec::with_capacity(messages.len());
+        for message in messages {
+            let Some(mut chat_message) = to_chat_message(message) else {
+                continue;
+            };
+            if vision
+                && message.role == "user"
+                && let Some((text, references)) = vision_envelope(&message.content)
+            {
+                chat_message.content = text;
+                chat_message.images = self.load_images(ctx, &references).await;
+            }
+            chat.push(chat_message);
+        }
+        chat
+    }
+
+    /// Loads the referenced image blobs for one user message (ADR-063).
+    ///
+    /// Bounded and honest: a missing, unreadable or oversized blob drops
+    /// that image with a warning, and the envelope's text still flies (an
+    /// artifact reclaimed by GC degrades the answer, never the turn).
+    async fn load_images(&self, ctx: &DrainCtx, references: &[ImageReference]) -> Vec<ChatImage> {
+        let mut images = Vec::new();
+        for (artifact, media_type) in references.iter().take(MAX_IMAGES_PER_MESSAGE) {
+            let Some(bytes) = ctx.artifact_bytes(artifact).await else {
+                continue;
+            };
+            if bytes.len() > MAX_VISION_IMAGE_BYTES {
+                tracing::warn!(
+                    artifact = %artifact,
+                    bytes = bytes.len(),
+                    limit = MAX_VISION_IMAGE_BYTES,
+                    "vision image is over the byte bound; the image is skipped (ADR-063)"
+                );
+                continue;
+            }
+            images.push(ChatImage {
+                media_type: media_type.clone(),
+                bytes,
+            });
+        }
+        images
+    }
+
     /// Runs one provider turn: persist the A2 audit copy, call the slot
     /// (with fallback traversal), assemble the streamed response, then
     /// either dispatch tool calls (log-before-execute) or return a final
@@ -943,23 +1112,80 @@ impl Inner {
         // array order — serialization contract).
         let mut schemas = self.tools.schemas();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
-        let chat: Vec<ChatMessage> = messages.iter().filter_map(to_chat_message).collect();
+        let chat = self
+            .chat_messages(ctx, target.profile.as_ref(), messages)
+            .await;
 
         // A2: the audit copy of the exact request is durable BEFORE the
-        // provider is called.
-        let body = build_chat_body(&target.model, &chat, &schemas);
-        let step_request = ctx
-            .append(
-                EventKind::StepRequest,
-                json!({
-                    "slot": self.config.slot.0,
-                    "provider": target.provider,
-                    "model": target.model,
-                    "iteration": iteration,
-                    "body": body,
+        // provider is called. The plan is the single source of the bytes
+        // and of the metadata recorded next to them (ADR-054).
+        let plan = match build_request_plan(target.profile.as_ref(), &target.model, &chat, &schemas)
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return TurnResult {
+                    result: Err(TurnError::Soft {
+                        reason: format!("request plan: {e}"),
+                        audit: recovery_audit(self.policy.as_ref(), provider_error_class(&e)),
+                    }),
+                    usage: None,
+                };
+            }
+        };
+        // ADR-055: the session token budget gate. The estimate is the
+        // worst case these bytes imply (prompt upper bound plus the
+        // declared output cap); a would-be overspend refuses BEFORE the
+        // `step/request` is persisted — persist-what-you-send covers the
+        // requests that fly, and this one does not.
+        let budget = match ctx.events().await {
+            Ok(events) => project_budget(&events, &self.agent.budgets),
+            Err(e) => {
+                return TurnResult {
+                    result: Err(TurnError::Soft {
+                        reason: format!("budget projection: {e}"),
+                        audit: json!({"class": "internal", "action": "none"}),
+                    }),
+                    usage: None,
+                };
+            }
+        };
+        let estimate = plan
+            .estimate
+            .high
+            .saturating_add(plan.estimate.max_output_tokens.unwrap_or(0));
+        // ADR-058: ordinary turns may not eat the maintenance reserve;
+        // compaction (the only maintenance turn) may draw it.
+        let reserve = budget.maintenance_reserve_tokens().unwrap_or(0);
+        if budget.would_exceed_tokens_reserving(estimate, reserve) {
+            return TurnResult {
+                result: Err(TurnError::AwaitingBudget {
+                    budget: json!({
+                        "limit": budget.tokens_limit,
+                        "raised": budget.tokens_raised,
+                        "spent": budget.tokens_spent,
+                        "estimate": estimate,
+                        "reserve": reserve,
+                    }),
                 }),
-            )
-            .await;
+                usage: None,
+            };
+        }
+        let body = plan.body.clone();
+        let mut step_payload = json!({
+            "slot": self.config.slot.0,
+            "provider": target.provider,
+            "model": target.model,
+            "iteration": iteration,
+            "body": body,
+            "body_version": plan.body_version,
+            "dialect": plan.dialect,
+            "body_sha256": plan.body_sha256,
+            "estimate": plan.estimate,
+        });
+        if let Some(digest) = &plan.profile_digest {
+            step_payload["profile_digest"] = json!(digest);
+        }
+        let step_request = ctx.append(EventKind::StepRequest, step_payload).await;
         let step_request_seq = match step_request {
             Ok(ev) => ev.seq,
             Err(e) => {
@@ -992,12 +1218,10 @@ impl Inner {
 
         // complete_turn rebuilds the body per (fallback) target so the
         // model name always matches the provider actually called.
-        let slot = self.config.slot.clone();
         let build_chat = chat.clone();
         let build_schemas = schemas.clone();
-        let build = Arc::new(move |t: &kian_core::model::SlotTarget| ModelRequest {
-            slot: slot.clone(),
-            body: build_chat_body(&t.model, &build_chat, &build_schemas),
+        let build = Arc::new(move |t: &kian_core::model::SlotTarget| {
+            build_request_plan(t.profile.as_ref(), &t.model, &build_chat, &build_schemas)
         });
         let mut stream = complete_turn(
             Arc::clone(&self.registry),
@@ -1381,6 +1605,238 @@ impl Inner {
             usage,
         }
     }
+
+    /// One maintenance compaction turn (ADR-058): fold the planned event
+    /// range into a persisted summary and end this iteration. Returns
+    /// Some(flow) when the iteration must stop — TurnDone asks for a new
+    /// iteration over the smaller context, AwaitingBudget and Soft report
+    /// what the maintenance turn already recorded. None means no fold
+    /// applies (too few turns, nothing to reclaim, planner refusal).
+    async fn compact_now(
+        &self,
+        ctx: &DrainCtx,
+        binding: &SlotBinding,
+        iteration: usize,
+        trigger: CompactionTrigger,
+        compactions: &mut usize,
+    ) -> Result<Option<Flow>, LoopError> {
+        if *compactions >= MAX_COMPACTIONS_PER_EPISODE {
+            return Ok(None);
+        }
+        let events = ctx.events().await?;
+        let plan = match plan_compaction(&events, &self.compaction, Some(&trigger)) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    session = %ctx.session().0,
+                    error = %e,
+                    "compaction planner refused the stream"
+                );
+                return Ok(None);
+            }
+        };
+        let transcript = match render_folded_transcript(&events, &plan) {
+            Ok(transcript) => transcript,
+            Err(e) => {
+                tracing::warn!(
+                    session = %ctx.session().0,
+                    error = %e,
+                    "compaction transcript refused the stream"
+                );
+                return Ok(None);
+            }
+        };
+        let target = binding.target.clone();
+        let chat = summary_chat(&transcript);
+        let request = match build_request_plan(target.profile.as_ref(), &target.model, &chat, &[]) {
+            Ok(request) => request,
+            Err(e) => return Ok(Some(Flow::Soft(format!("compact request plan: {e}")))),
+        };
+        let estimate = request
+            .estimate
+            .high
+            .saturating_add(request.estimate.max_output_tokens.unwrap_or(0));
+        // Maintenance may draw the reserve ordinary turns leave alone, but
+        // it still never overdraws the allowance itself (ADR-058).
+        let budget = project_budget(&events, &self.agent.budgets);
+        if budget.would_exceed_tokens(estimate) {
+            return Ok(Some(Flow::AwaitingBudget(json!({
+                "limit": budget.tokens_limit,
+                "raised": budget.tokens_raised,
+                "spent": budget.tokens_spent,
+                "estimate": estimate,
+                "purpose": "compact",
+            }))));
+        }
+
+        ctx.begin_turn_with(json!({"iteration": iteration, "purpose": "compact"}))
+            .await?;
+        let mut step_payload = json!({
+            "slot": self.config.slot.0,
+            "provider": target.provider,
+            "model": target.model,
+            "iteration": iteration,
+            "purpose": "compact",
+            "body": request.body.clone(),
+            "body_version": request.body_version,
+            "dialect": request.dialect,
+            "body_sha256": request.body_sha256,
+            "estimate": request.estimate,
+        });
+        if let Some(digest) = &request.profile_digest {
+            step_payload["profile_digest"] = json!(digest);
+        }
+        let step_request_seq = match ctx.append(EventKind::StepRequest, step_payload).await {
+            Ok(event) => event.seq,
+            Err(e) => {
+                let _ = ctx
+                    .end_turn_with(json!({
+                        "iteration": iteration,
+                        "purpose": "compact",
+                        "outcome": "error",
+                        "error": {"class": "internal", "action": "none"},
+                    }))
+                    .await;
+                return Err(e.into());
+            }
+        };
+        // Maintenance uses the session's own slot and provider; it is not a
+        // model turn, so it takes no fallback traversal (ADR-058).
+        let Some(provider) = self.registry.get(&target.provider) else {
+            let audit = recovery_audit(
+                self.policy.as_ref(),
+                kian_orchestrator::recovery::ErrorClass::Unknown,
+            );
+            let _ = ctx
+                .end_turn_with(json!({
+                    "iteration": iteration,
+                    "purpose": "compact",
+                    "outcome": "soft_failure",
+                    "error": audit,
+                }))
+                .await;
+            return Ok(Some(Flow::Soft(format!(
+                "compact: provider {} is not registered",
+                target.provider
+            ))));
+        };
+        let mut stream = provider.complete(ModelRequest {
+            slot: self.config.slot.clone(),
+            body: request.body,
+        });
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls: BTreeMap<u64, CallAcc> = BTreeMap::new();
+        let mut usage: Option<Value> = None;
+        let mut stream_error: Option<ProviderError> = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if let Some(u) = chunk.usage.as_ref().filter(|u| !u.is_null()) {
+                        usage = Some(u.clone());
+                    }
+                    if !chunk.delta.is_null() {
+                        assemble_delta(&chunk.delta, &mut text, &mut reasoning, &mut calls);
+                    }
+                }
+                Err(e) => {
+                    stream_error = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = stream_error {
+            let audit = recovery_audit(self.policy.as_ref(), provider_error_class(&e));
+            let mut payload = json!({
+                "iteration": iteration,
+                "purpose": "compact",
+                "outcome": "soft_failure",
+                "error": audit,
+            });
+            if let Some(u) = usage.as_ref() {
+                payload["usage"] = u.clone();
+            }
+            let _ = ctx.end_turn_with(payload).await;
+            return Ok(Some(Flow::Soft(format!(
+                "compact summary request failed: {e}"
+            ))));
+        }
+        let summary = text.trim().to_string();
+        if summary.is_empty() {
+            let audit = recovery_audit(
+                self.policy.as_ref(),
+                kian_orchestrator::recovery::ErrorClass::EmptyResponse,
+            );
+            let mut payload = json!({
+                "iteration": iteration,
+                "purpose": "compact",
+                "outcome": "soft_failure",
+                "error": audit,
+            });
+            if let Some(u) = usage.as_ref() {
+                payload["usage"] = u.clone();
+            }
+            let _ = ctx.end_turn_with(payload).await;
+            return Ok(Some(Flow::Soft(
+                "compact summary request returned an empty response".to_string(),
+            )));
+        }
+        // The compact event is the one observable point where the prefix is
+        // invalidated (constraint 3); it lands only after the summary exists.
+        let compact_seq = match ctx
+            .append(
+                EventKind::Compact,
+                json!({
+                    "from_seq": plan.from_seq,
+                    "to_seq": plan.to_seq,
+                    "summary": {"role": "assistant", "content": {"text": summary}},
+                    "produced_by": {"step_seq": step_request_seq},
+                    "reason": plan.reason,
+                    "folded_messages": plan.folded_messages,
+                    "reclaimed_tokens": plan.reclaimed_tokens,
+                }),
+            )
+            .await
+        {
+            Ok(event) => event.seq,
+            Err(e) => {
+                let _ = ctx
+                    .end_turn_with(json!({
+                        "iteration": iteration,
+                        "purpose": "compact",
+                        "outcome": "error",
+                        "error": {"class": "internal", "action": "none"},
+                    }))
+                    .await;
+                return Err(e.into());
+            }
+        };
+        let mut payload = json!({
+            "iteration": iteration,
+            "purpose": "compact",
+            "outcome": "compacted",
+            "compact_seq": compact_seq,
+            "from_seq": plan.from_seq,
+            "to_seq": plan.to_seq,
+        });
+        if let Some(u) = usage.as_ref() {
+            payload["usage"] = u.clone();
+        }
+        if let Err(e) = ctx.end_turn_with(payload).await {
+            return Err(e.into());
+        }
+        *compactions += 1;
+        tracing::info!(
+            session = %ctx.session().0,
+            from_seq = plan.from_seq,
+            to_seq = plan.to_seq,
+            folded_messages = plan.folded_messages,
+            reclaimed_tokens = plan.reclaimed_tokens,
+            "context compacted (ADR-058)"
+        );
+        Ok(Some(Flow::TurnDone))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1867,77 @@ fn loop_error_class(e: &LoopError) -> kian_orchestrator::recovery::ErrorClass {
             kian_orchestrator::recovery::ErrorClass::Unknown
         }
     }
+}
+
+/// The class of a provider error via the existing pure classifier
+/// `classify(RecoveryError::Provider(e))`.
+fn preventive_trigger(binding: &SlotBinding, messages: &[Message]) -> Option<CompactionTrigger> {
+    let profile = binding.target.profile.as_ref()?;
+    let window = profile.context_window?;
+    if window == 0 {
+        return None;
+    }
+    let incoming = estimate_context_tokens(messages)
+        .saturating_add(profile.max_output.unwrap_or(DEFAULT_OUTPUT_RESERVE_TOKENS));
+    Some(CompactionTrigger::Pressure(CompactionPressure {
+        context_window_tokens: window,
+        incoming_estimate_tokens: incoming,
+    }))
+}
+
+/// Renders the planned fold as plain text for the summarizer: the
+/// projected roles and contents of the messages sourced from the fold
+/// range, bounded so one huge tool result cannot make the maintenance
+/// request itself overflow.
+fn render_folded_transcript(
+    events: &[Event],
+    plan: &CompactionPlan,
+) -> Result<String, kian_core::context::ContextError> {
+    let messages = derive_model_context(events)?;
+    let provenance = context_provenance(events)?;
+    let mut out = String::new();
+    for (message, source) in messages.iter().zip(provenance.iter()) {
+        if !(plan.from_seq..plan.to_seq).contains(source) {
+            continue;
+        }
+        let body = match &message.content {
+            Value::String(text) => text.clone(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        let line = format!("{}: {body}\n", message.role);
+        if out.len().saturating_add(line.len()) > MAX_TRANSCRIPT_CHARS {
+            let room = MAX_TRANSCRIPT_CHARS.saturating_sub(out.len());
+            out.push_str(take_chars(&line, room));
+            out.push_str("\n[... transcript truncated ...]\n");
+            break;
+        }
+        out.push_str(&line);
+    }
+    Ok(out)
+}
+
+/// Prefix of `text` holding at most `max` characters (never splits a
+/// UTF-8 boundary).
+fn take_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+/// The frozen summarizer request: one system frame plus the bounded
+/// transcript. Persisted verbatim as the maintenance turn's step/request
+/// (persist-what-you-send).
+fn summary_chat(transcript: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::plain("system", SUMMARY_SYSTEM_PROMPT),
+        ChatMessage::plain(
+            "user",
+            format!(
+                "Compress the following earlier conversation into one dense summary. The summary will replace these turns in the model context.\n\n{transcript}"
+            ),
+        ),
+    ]
 }
 
 /// The class of a provider error via the existing pure classifier
@@ -1555,6 +2082,53 @@ pub fn to_chat_message(m: &Message) -> Option<ChatMessage> {
         "assistant" => assistant_message(&m.content),
         _ => Some(string_or_compact(&m.role, &m.content)),
     }
+}
+
+/// One image reference in a vision envelope: the artifact id and its media type.
+type ImageReference = (String, String);
+
+/// The text to send plus the image references parsed out of a vision envelope.
+type VisionEnvelope = (Option<String>, Vec<ImageReference>);
+
+/// The ADR-063 vision envelope: a user message content object
+/// `{"text": <string>, "images": [{"artifact": <id>, "media_type": <type>}]}`.
+///
+/// Returns the text to send and the referenced blobs, or `None` when the
+/// payload is not an envelope with at least one usable reference (both keys
+/// are required on an item). A malformed descriptor therefore never changes
+/// the bytes: the legacy compact-JSON conversion still applies.
+fn vision_envelope(content: &Value) -> Option<VisionEnvelope> {
+    let object = content.as_object()?;
+    let references = object.get("images")?.as_array()?;
+    let mut usable = Vec::new();
+    for item in references {
+        let Some(entry) = item.as_object() else {
+            continue;
+        };
+        let Some(artifact) = entry
+            .get("artifact")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(media_type) = entry
+            .get("media_type")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        usable.push((artifact.to_owned(), media_type.to_owned()));
+    }
+    if usable.is_empty() {
+        return None;
+    }
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some((text, usable))
 }
 
 /// The permission decision for one tool call (ADR-015). Evaluated
@@ -1762,6 +2336,7 @@ fn string_or_compact(role: &str, content: &Value) -> ChatMessage {
         tool_call_id: None,
         tool_calls: None,
         reasoning_content: None,
+        images: Vec::new(),
     }
 }
 
@@ -1779,6 +2354,7 @@ fn tool_result_message(content: &Value) -> ChatMessage {
             tool_call_id: Some(call_id.to_owned()),
             tool_calls: None,
             reasoning_content: None,
+            images: Vec::new(),
         };
     }
     ChatMessage {
@@ -1787,6 +2363,7 @@ fn tool_result_message(content: &Value) -> ChatMessage {
         tool_call_id: Some(String::new()),
         tool_calls: None,
         reasoning_content: None,
+        images: Vec::new(),
     }
 }
 
@@ -1837,6 +2414,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
             tool_call_id: None,
             tool_calls: calls,
             reasoning_content: reasoning_field(obj),
+            images: Vec::new(),
         });
     }
     // The per-call `tool/call` transcript duplicate: the enclosing
@@ -1851,6 +2429,7 @@ fn assistant_message(content: &Value) -> Option<ChatMessage> {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: reasoning_field(obj),
+            images: Vec::new(),
         });
     }
     Some(string_or_compact("assistant", content))
