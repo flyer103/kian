@@ -7,13 +7,13 @@
 
 ### 0.1 Goals
 
-- : Full Admit→Wake→Drain→Promote semantics on single-machine (sqlite) mode; (kill -9
- recovery) with zero lost work.
-- : NoSplitBrainWrite — when two processes contend for one session, stale-epoch writes are
+- G1: Full Admit→Wake→Drain→Promote semantics on single-machine (sqlite) mode; kill -9
+ recovery with zero lost work.
+- G2: NoSplitBrainWrite — when two processes contend for one session, stale-epoch writes are
  always rejected by the EventStore (expectedSeq CAS + epoch comparison).
-- : The exact bytes of every model request are persisted (A2); replaying the same event stream
+- G3: The exact bytes of every model request are persisted (A2); replaying the same event stream
  is byte-identical.
-- : Cache hit rate and invalidation causes become first-class observability metrics (A3);
+- G4: Cache hit rate and invalidation causes become first-class observability metrics (A3);
  compression is the only deliberate invalidation point.
 - G5: The super-agent reference architecture (Router/Worker/event subscriptions/BYOM) runs as a
  bundle on top of the core without modifying core crates.
@@ -1127,7 +1127,7 @@ graph LR
     worker-to-all-replicas, relays and cross-instance dispatch are out of scope (owner decision,
     ADR-021 §Deferred); a second server is a different deployment with a different membership. The
     shared token also does **not** prove per-worker identity (any holder may claim any id) — an
-    accepted single-operator limitation with mTLS recorded as the R13 fix.
+    accepted single-operator limitation; mTLS is the planned fix.
 - **The two axes of separation**: where execution runs (ExecBackend provider: local /
  remote-endpoint / sandbox / cloud machine) and who the loop is (LoopDriver seam, see §6.2) —
  independently pluggable.
@@ -1426,12 +1426,12 @@ gap fixes recorded in the closing bullets.
   which sit after the prefix in the conversation. This is the cache-byte axiom (constraint 3) applied
   to a live set: a dynamic catalog in the prefix would invalidate a resident Router's cached prefix
   every time a worker joined or left, i.e. exactly when the deployment is churning. The one deliberate
-  invalidation point in this feature is the **upgrade** itself: R12's policy version renders the new
-  instruction line for new sessions, live sessions keep their persisted prompts, and the drift
-  machinery reports the mismatch instead of rewriting anything. Residual cost recorded honestly:
-  `list_workers` results are ordinary context and grow with the catalog, so a large catalog costs
-  tokens on every result — bounded by the small number of real workers, and the reason the row shape
-  stays minimal (id, optional description, state, bound session/thread).
+  invalidation point in this feature is the **upgrade** itself: the worker-membership policy version
+  renders the new instruction line for new sessions, live sessions keep their persisted prompts, and
+  the drift machinery reports the mismatch instead of rewriting anything. Residual cost recorded
+  honestly: `list_workers` results are ordinary context and grow with the catalog, so a large catalog
+  costs tokens on every result — bounded by the small number of real workers, and the reason the row
+  shape stays minimal (id, optional description, state, bound session/thread).
 - **Delegation mandate (ADR-012)** — the authority object separating *what to
  do* (task) from *with what authority* (Mandate; references 001/002) lands as an
  **additive `"mandate"` object on the -frozen delegation wrapper** (the 
@@ -1599,7 +1599,7 @@ capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-int
   `kian job list|status|run|cancel`; no new event kind, table or route
   ([JOB-MODEL](JOB-MODEL.md), [ADR-052](decisions/ADR-052-job-model.md)).
 
-### 4.8 Multiagent bundle (R14, designed)
+### 4.8 Multiagent bundle (designed)
 
 The bundle's multiagent contract — a parent session delegating a **child session** via `Thread`, the
 named-agent roster, and the board ruling — is specified normatively in
@@ -1846,8 +1846,8 @@ sandboxed tier (wasm) is **not** part of the contract — it is gated on a disti
 untrusted-third-party isolation trigger. The contract (hook points and payloads, the seven port methods
 at their nine call sites, capability grants, the manifest and stdio ABI, per-worker resolution and its
 two-scope v1 grammar, session consistency, failure/quarantine policy and the trust model) is
-[PLUGIN-SPEC.md](PLUGIN-SPEC.md); the rationale, alternatives and the review ledger (including the
-FINAL review's F1–F10 closure) are [ADR-028](decisions/ADR-028-harness-hook-plugins.md). Dependency
+[PLUGIN-SPEC.md](PLUGIN-SPEC.md); the rationale, alternatives and the review ledger are
+[ADR-028](decisions/ADR-028-harness-hook-plugins.md). Dependency
 shape: `kian-loop` gains an edge on `kian-plugin` (the port views live there) **and** receives the bus
 by injection; `kian-plugin` gains one **workspace** dependency edge, `sha2` (already pinned, no new
 package); `kian-dsh` gains **none** — its single v1 port is crate-local, keeping its `kian-core`-only
@@ -1944,8 +1944,8 @@ read-only verbs ride `kian-memory` + `kian-cli` (MEMORY-MODEL §7.1). Persisted 
 (P3b) remain designed. Placement and
 non-goals are fixed by [MEMORY-MODEL.md](MEMORY-MODEL.md) §8/§12.
 
-**Channels (bundle, ADR-018 — round 10, landed).** The real `ChannelAdapter` implementations
-live in `kian-superagent` — `lark`, `github`, the round-10 `wechat`, and the mock channel; the seam
+**Channels (bundle, ADR-018, landed).** The real `ChannelAdapter` implementations live in
+`kian-superagent` — `lark`, `github`, the `wechat` channel, and the mock channel; the seam
 definition stays in `kian-core::seams`. The WeChat channel is **best-effort by contract** and
 poll-shaped: one long-poll loop per configured channel, `message_id` → `event_id` (lossless decimal
 string), the config `topics` table as the receive allowlist, reply-only sends keyed by the latest

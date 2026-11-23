@@ -216,7 +216,7 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 - `mock_channel_send` requires the super-agent assembly and a configured mock channel; an unknown
   channel is `-32000` with the configured channel list in the message. The injected `event_id` is
   the subscription admit's idempotency key, so re-injecting the same id never double-admits.
-- `memory_dream` (round 8, MEMORY-MODEL Phase 1) requires a `memory:` section (`-32005` otherwise).
+- `memory_dream` (MEMORY-MODEL Phase 1) requires a `memory:` section (`-32005` otherwise).
   `session` is the operator-created memory session (`kian memory create`); `source` names the
   session whose half-open range `[from_seq, to_seq)` is consolidated. The range must satisfy
   `1 <= from_seq < to_seq <=` the source head (the source's last event seq + 1, read from the
@@ -307,7 +307,7 @@ emits `done` immediately.
   is normative in §5.4 (tail-only, explicit allowlist ≤ 64, `id: <uuid>:<seq>`, no wildcard,
   HTTP 400 on malformed/over-cap, one `event: error` per unknown listed session then continue).
 - ~~Planned error code (P2b, append-only registry): `-32005 archived`~~ — **landed as
-  `-32007 archived`** (§2.2): the round-8 memory surface had already taken `-32005`/`-32006`,
+  `-32007 archived`** (§2.2): the memory surface had already taken `-32005`/`-32006`,
   and the registry is append-only, so `archived` is the next free code. Every read of an
   archived session (`projection`, the SSE stream) answers `-32007` / one `event: error` frame
   with package guidance — never `unknown_session`, never a silent truncation.

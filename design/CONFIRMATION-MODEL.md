@@ -1,6 +1,6 @@
 # Kian — Confirmation Model (normative design, phase 1)
 
-> **Status: phase 1 landed (owner gate 2026-11-15).** This file owns the confirmation-plane
+> **Status: phase 1 landed.** This file owns the confirmation-plane
 > semantics: what an `ask` is, how a pending tool call is derived, how the answer is admitted, and
 > when a session ends into a resumable wait. Rationale:
 > [ADR-036](decisions/ADR-036-durable-confirmation-plane.md). The catalog deltas — the new kind
@@ -421,7 +421,7 @@ L3 (a UI card) is out of phase 1; the `pending` read is its seam.
 |---|---|---|
 | 1 | This document's core: config `ask`, deferral, `awaiting_input`, `control/confirm`, `confirm`/`pending`, CLI, plain sessions, the R1b promote gate, the §15.6 crash repair | landed |
 | 2 | Superagent integration: the worker ends `awaiting_input` without `thread/completed`; the completion gate gains a waiting path; follow-ups resume the same session (removes the `stage.rs` "fresh Eval only" deviation); the ticket stage gains `awaiting-confirmation`; `ask` allowed on worker agents | **landed** (the waiting end writes no completion pair; the liveness projection keeps the worker live; the ticket stage arm is `awaiting-confirmation`; `ask` parses on a worker agent. The completed/failed ticket "fresh Eval only" deviation is unchanged — it applies to ended tickets, not waiting ones) |
-| 3a | Channel-side answers: a closed-vocabulary IM reply mapped to a `confirm` by the adapter, never by the model (§14d) | **landed** (owner gate 2026-11-22; §14d X9 rows 1–7 green at L1/L2, row 8 is a manual live-phone check) |
+| 3a | Channel-side answers: a closed-vocabulary IM reply mapped to a `confirm` by the adapter, never by the model (§14d) | **landed** (§14d X9 rows 1–7 green at L1/L2, row 8 is a manual live-phone check) |
 | 3b | Hook `ask` verdict (`tool/pre` defers) + the ordering with the declarative gate, a PLUGIN-SPEC widening | not started |
 | 4 | Automatic expiry without a control-plane touch (a timer-channel row per pending call or one bounded sweeper), and a read-model snapshot carrying the pending set | not started |
 
@@ -460,8 +460,8 @@ observed the honest close-out rather than an identical re-issue — see ADR-050'
 
 ## 14d. Phase-3a — channel answers, closed vocabulary (landed)
 
-> **Status: landed (owner gate 2026-11-22).** This is the channel half of phase 3 only; the hook
-> `ask` verdict stays 3b. The three things the gate reviewed: **X0** (the sender handle is the
+> **Status: landed.** This is the channel half of phase 3 only; the hook `ask` verdict stays 3b.
+> The three boundaries this section is built around: **X0** (the sender handle is the
 > authenticator, so the code is a correlation token and not a secret), **X2/X5** (the boundary
 > between "a line of text is a decision" and "a line of text is a task"), and **X3** (which sessions
 > a code is allowed to resolve against).

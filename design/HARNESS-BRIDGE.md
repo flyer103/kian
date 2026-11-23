@@ -1,13 +1,12 @@
 # Harness bridges — the external-harness integration contract
 
-- **Status**: phase 1, draft for the confirmation gate (2026-11-19). Normative for every
-  session whose loop is owned by an external harness. The dsh wire contract stays
-  [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document generalizes the
-  *kian-side* contract and adds Claude Code and Codex bridges
+- **Status**: phase 1. Normative for every session whose loop is owned by an external harness.
+  The dsh wire contract stays [ADR-010](decisions/ADR-010-dsh-session-mapping.md); this document
+  generalizes the *kian-side* contract and adds Claude Code and Codex bridges
   ([ADR-043](decisions/ADR-043-multi-harness-bridge.md)). The open-step inactivity bound is
-  [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (accepted, owner gate 2026-11-20);
+  [ADR-044](decisions/ADR-044-harness-step-inactivity-bound.md) (accepted);
   per-agent harness selection (one serve, many worker loops) is
-  [ADR-049](decisions/ADR-049-per-agent-harness-selection.md) (accepted, owner gate 2026-11-20).
+  [ADR-049](decisions/ADR-049-per-agent-harness-selection.md) (accepted).
 - **Owners**: `kian-harness` (shared skeleton), `kian-claude` (Claude Code adapter),
   `kian-codex` (Codex adapter). `kian-dsh` keeps its v0 contract; convergence is phase 3.
 - **Read this with**: [SPEC](../docs/SPEC.md) §2.2 C, [DESIGN](DESIGN.md) §6.2/§7/§16,

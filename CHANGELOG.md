@@ -569,7 +569,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   (cache stability). New control-plane methods `confirm`/`pending` (+ SDK + `kian confirm` /
   `kian pending`), no new error code. Fail-closed boundaries: unknown permission values refuse boot,
   and `ask` on a superagent worker agent refuses boot until phase 2 (no worker waiting path).
-- **Worker binding release + idle reclaim (R18)**. A worker thread that ended `interrupted`/`failed`
+- **Worker binding release + idle reclaim**. A worker thread that ended `interrupted`/`failed`
   no longer holds its 1:1 slot forever: `release_worker` / `kian workers release <id>` closes it with
   one atomic `drain/claimed` + `session/ended{cancelled}` batch (fresh claim epoch; additive
   `released` end payload), and a `kian serve` maintenance tick reclaims stale idle-ended threads
@@ -586,7 +586,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `kian cron list|run-now|logs|rm` CLI, and a non-context `cron` proof on the admitted input
   (prompt bytes unchanged). Contract: [design/CRON-MODEL.md](design/CRON-MODEL.md),
   [ADR-034](design/decisions/ADR-034-cron-scheduler.md), [docs/SPEC.md](docs/SPEC.md) §5.
-- **Multiagent P4: `depends_on` + `group`, readiness gating (round 17, C7)**. With
+- **Multiagent P4: `depends_on` + `group`, readiness gating**. With
   `superagent.board.gating: true`, `spawn_worker` grows `depends_on` (task keys) and `group`: the
   spawn is refused — before any side effect, from the primary only — until every named task has a
   successful completion (`empty_output` never releases; `completed_unverified` only under a policy
@@ -597,7 +597,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   validates `all` | `any` | `quorum:<n>` and refuses to boot on `any`/`quorum:<n>` (no evaluation
   site in v1 — deferred with fan-in). Gating off is byte-identical P3. Contract:
   [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §4.4/§7.3, [docs/SPEC.md](docs/SPEC.md) §5.
-- **Multiagent roster: the per-assignee child surface and the output-schema gate (round 17, C1–C3)**.
+- **Multiagent roster: the per-assignee child surface and the output-schema gate**.
   `superagent.roster` names delegation entries over `agents:` definitions; `spawn_worker` grows
   `agent`/`task_key`/`output_schema` and `kian agents` lists the roster. A roster-spawned child runs
   its entry's own slots/budgets with the structural `agent.tools ∩ tools_allow` surface (denied tools
@@ -607,8 +607,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `invalid_output`, preserving the raw answer. Roster off is byte-identical to the pre-roster bundle.
   Contract: [design/DESIGN.md](design/DESIGN.md) §4.8 and
   [design/MULTIAGENT-MODEL.md](design/MULTIAGENT-MODEL.md) §7.3.
-- **Delegation task board — the read-only operator surface (kian board / kian tasks, round 17, C5)**. Two new
-  `kian` verbs over the fifth view's rows (R17 C4): `kian board [--db] [--config] [--json]`
+- **Delegation task board — the read-only operator surface (kian board / kian tasks)**. Two new
+  `kian` verbs over the fifth view's rows: `kian board [--db] [--config] [--json]`
   renders one row per delegated task (`task_id`, `assignee`, `attempt`, `outcome`,
   `thread_status`, `gate`, the derived evidence pointer) in deterministic `task_id` order, and
   `kian tasks --all` prints the same rows flat (`--all` is required in v1; the bare form refuses
@@ -633,7 +633,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   [WORKER-MODEL §4](design/WORKER-MODEL.md), placement [DESIGN](design/DESIGN.md),
   decision [ADR-033](design/decisions/ADR-033-bounded-queue-redrive.md).
 
-- **Hook plugins — the two-tier harness-extension contract (round 16, [PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
+- **Hook plugins — the two-tier harness-extension contract ([PLUGIN-SPEC](../design/PLUGIN-SPEC.md) v2.2,
   [ADR-028](../design/decisions/ADR-028-harness-hook-plugins.md))**. A closed hook vocabulary over seven
   interception ports (admission, turn, tool, recovery, settlement) with a tier-0 compile-time registry
   (`kian-plugin::hooks`) and a tier-1 sidecar tier: operator-trusted child processes over a stdio
@@ -641,11 +641,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   failure window with one-strike quarantine, and grant-keyed fail-closed/fail-open class defaults. New
   `sidecars:` config section (instance manifests + server/worker scopes, set digest + session-consistency
   quarantine); `tool/pre` denials surface as honest-error `tool/result`s with the additive
-  `tool/call.permission.policy:"hook"` value naming `<plugin>:<hook>` (the round's one EVENT-MODEL
+  `tool/call.permission.policy:"hook"` value naming `<plugin>:<hook>` (the only EVENT-MODEL
   amendment). Ships with an in-tree reference sidecar — a Python stdlib `tool/pre` approval gate under
   `examples/hook-approval-gate/` — and no `sidecars:` section leaves behavior byte-identical.
 
-- **Agent memory Phase 1 — notes as events + the dreaming drain (round 8, kian-84..87)**.
+- **Agent memory Phase 1 — notes as events + the dreaming drain**.
   One additive event kind: `memory/note`, the 22nd durable kind (non-context,
   `DrainActivity`, emitted only by a dreamer drain; the durable set grows 21 → 22). `kian-core`:
   the fail-closed `memory` module (`parse_note`, `project_notes`, `verify_note` — unknown status →
@@ -667,18 +667,18 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   injection, no cadence, no representations (P2/P3 stay designed in SPEC §5). Closeout: SPEC §5 P1
   `designed` → `landed`, MEMORY-MODEL status + §3.1 canonical-payload pointer + §5 D1
   message-row refinement and memory-session policy, DESIGN §3.1/§7, README, this entry.
-- **Memory round-8 repair (kian-91, from the kian-90 review)**. Four defects fixed.
-  B-1: `memory_dream` refuses
+- **Memory Phase 1 repair**. Four defects fixed.
+  **Range bound:** `memory_dream` refuses
   any range outside `1 <= from_seq < to_seq <=` the source head (typed `SourceRangeOutOfBounds`,
-  `-32602`) — no `verified` note can carry provenance past the end of the source stream. B-2:
+  `-32602`) — no `verified` note can carry provenance past the end of the source stream. **Routing trust:**
   dreamer routing and provenance read the trusted, server-set `dream` marker on the admitted row
   (the exact two-key `{content, dream}` envelope, consumed to one marked `input/admitted`);
   a forged `[kian-dream: …]` header in a plain `submit` is ordinary content and routes nothing.
-  M-1: note `text` passes the `SecretRedactor` before append; the value-free report rides the
-  additive `redactions` key (`[{kind,name,count}]`, the `tool/result` shape). M-2: harvest folds
+  **Redaction:** note `text` passes the `SecretRedactor` before append; the value-free report rides the
+  additive `redactions` key (`[{kind,name,count}]`, the `tool/result` shape). **Folding:** harvest folds
   within one answer by subject keeping the LAST revision, then stream-dedupes on
-  `(subject, derived_from)`. Docs reconciliation
-  (kian-92): MEMORY-MODEL §3.1/§3.3/§5/§9/§11 aligned to the landed bytes (seq-string `ref`,
+  `(subject, derived_from)`. Docs reconciliation:
+  MEMORY-MODEL §3.1/§3.3/§5/§9/§11 aligned to the landed bytes (seq-string `ref`,
   marker-based D1, byte-cap-only D3 with the head bound, no `scope_tags` in the payload, the
   landed CLI verbs and `/metrics` fragment), SPEC §5 P1 row and this entry.
 - **Second dogfood example** (`examples/kanban-watch/`, 2026-11-03): kian watching a local
@@ -695,10 +695,9 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   same Router session (epoch 2, seq continued, charter re-submit deduped, tick 5 poll normal).
   Not re-run against the real `kian` board yet — first such run should be recorded here.
   Owner-gated next steps remain: making the repo public and executing the remaining gated
-  surfaces with real credentials (live provider smoke, live lark channel). Tracked on the
-  kanban board, not here.
-- **Read model P0 — versions, unchanged/delta reads, resumable SSE, drain context cache
-  (round 9, R9-02)**. The serving-form contract's first phase
+  surfaces with real credentials (live provider smoke, live lark channel).
+- **Read model P0 — versions, unchanged/delta reads, resumable SSE, drain context cache**.
+  The serving-form contract's first phase
   (`design/READ-MODEL.md` §3/§4.1; API-CONTRACT §3.1/§3.2/§5 promoted from planned §5.3):
   `projection` gains `version` (u64 = `head.next_seq - 1`) and the optional `since` —
   `since == version` answers `{"version":V,"unchanged":true}` with no state and costs exactly
@@ -716,8 +715,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `projection_since`, `ProjectionVersioned`, optional `version` on `ProjectionResult`,
   `SseFrame::KianWithId`, `events_from`; old fixtures still parse. Zero new event kinds;
   migration chains untouched. READ-MODEL §11 P0 `planned` → `landed`; DESIGN §3.2 pointer updated.
-- **Read model P1 — verified snapshots (state + model context) and tail replay (round 9,
-  R9-03)**. The serving-form contract's second phase
+- **Read model P1 — verified snapshots (state + model context) and tail replay**.
+  The serving-form contract's second phase
   (`design/READ-MODEL.md` §5/§9/§11): migration **v3** appended to BOTH chains (v0–v2 frozen) adds
   `projection_snapshots` —
   `(session, version, state, context, context_provenance, digest, verified, created_at)` — and
@@ -746,8 +745,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `kian serve` spawns the maintenance ticker. Zero new event kinds; no history rewrite; no
   request-byte change (snapshot path bytes == `context_to_bytes` of the full derivation). READ-MODEL
   §11 P1 `planned` → `landed` + header updated.
-- **Read model P2a — materialized views (directory, usage, ticket stage, kind index) (round 9,
-  R9-04)**. The serving-form contract's third phase
+- **Read model P2a — materialized views (directory, usage, ticket stage, kind index)**.
+  The serving-form contract's third phase
   (`design/READ-MODEL.md` §6/§9/§11): migration **v4** appended to BOTH chains (v0–v3 frozen) adds
   one physical `view_rows`
   table (logical views
@@ -794,7 +793,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   view **486 µs** vs **30.5 ms** full derivation (≈63×); usage aggregate **1.63 ms** vs
   **28.4 ms** (≈17×); one maintenance rebuild of all four views **66.5 ms**, off the serving
   path. READ-MODEL §11 P2a `planned` → `landed` + header updated.
-- **Read model P2b — opt-in export-only retention, archive verify/import (R9-05)**. Retention is strictly opt-in (`retention:` in `kian.yaml`, default **off** —
+- **Read model P2b — opt-in export-only retention, archive verify/import**. Retention is strictly
+  opt-in (`retention:` in `kian.yaml`, default **off** —
   absent/vague parses fail-closed: an enabled retention without `archive_dir` or without at
   least one online-window threshold (`min_age_ms`/`min_bytes`) refuses to start;
   `retention_defaults_to_off`, `retention_enabled_parses_fail_closed`). Migration v5
@@ -816,8 +816,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   terminal-only — the last committed event must be `session/ended`
   (`candidates_lists_terminal_sessions_only`,
   `candidates_ignores_a_mid_stream_end_event`). Reads answer the typed `archived` error:
-  `-32007` (API-CONTRACT §2.2; the plan's planned `-32005` had been taken by the round-8
-  memory registry, so `archived` is the next free code) on `projection` and the SSE stream
+  `-32007` (API-CONTRACT §2.2; the planned `-32005` had been taken by the memory registry, so
+  `archived` is the next free code) on `projection` and the SSE stream
   (`archived_error_maps_to_the_archived_code`); `session inspect` reports archived + the
   package path; `session export` serves the package byte-identically (hashes re-verified on
   the way out); `session replay` refuses online replay pointing at import. `kian archive
@@ -828,7 +828,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `planned` → `landed` + §7 landed shape +
   header; API-CONTRACT §2.2/§3.2/§3.3/§5.3 updated. No new event kind; no transparent cold
   tier; no automatic retention cadence.
-- **Read model P3 — explicit-allowlist fan-in event stream (round 9, R9-06)**.
+- **Read model P3 — explicit-allowlist fan-in event stream**.
   `GET /events?sessions=<uuid,...>[&kinds=<kind,...>]` (API-CONTRACT §5.4, normative; change
   class additive): an explicit allowlist of at most 64 sessions per connection (counted before
   dedup), **no wildcard** (`*` refused by name — the owner gate), HTTP 400 with a plain-text
@@ -860,9 +860,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   boundary and the allowlist is explicit ids only. READ-MODEL §4.2 landed shape + §11 P3
   `planned` → `landed` + header; API-CONTRACT §1/§5.3/§5.4/§6/§10.2. No new event kind; the
   planned `read` metrics object remains planned (P0-owned surface).
-- **Read model review R9-08 fixes — package identity, archived aggregate reads, snapshot trust
-  (R9-08a)**. Fixes the three findings of the round-9 independent review
-  (REQUEST-CHANGES; fix card opened from it). **F1 package identity:**
+- **Read model review fixes — package identity, archived aggregate reads, snapshot trust**.
+  Fixes three findings of an independent review. **Package identity:**
   `session import`/`archive verify` now refuse a package whose rows name a different session
   than its manifest — `verify_package` cross-checks every `events.jsonl` event's and every
   `inputs.jsonl` row's `session` against `manifest.session`, refusing with the line number and
@@ -870,12 +869,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   every hash check; a hash-consistent identity-inconsistent package previously imported,
   restoring events under one id while reporting another). `verify_package` now returns the
   parsed rows (`VerifiedPackage`) and `run_import` appends exactly those rows — the files are
-  never re-read after verification (the verify/use gap is closed). **F3 archived aggregate
+  never re-read after verification (the verify/use gap is closed). **Archived aggregate
   reads:** `usage-stats --session` and `cache-stats --session` check the archived marker first
   and refuse with the package path and import guidance — never a silent zero report (R7's
   "any read whose range touches archived data MUST report `archived` explicitly";
   READ-MODEL §7 read behavior updated). Whole-store aggregates are unchanged (online window
-  only). **F2 snapshot trust documented:** READ-MODEL §5 gains the explicit trust boundary —
+  only). **Snapshot trust documented:** READ-MODEL §5 gains the explicit trust boundary —
   load-time verification is builder attestation + digest↔columns integrity; a
   poisoned-but-self-consistent row (columns rewritten together with a recomputed
   `kian-snapshot-v1` digest, `verified=1`) is not detectable at load and is served; the table
@@ -885,16 +884,16 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   unverified rows) only — it is not a general tamper guarantee, and the new
   `self_consistent_poisoned_snapshot_is_served_builder_attestation_only` pins the documented
   (served) behaviour so the claim and the test agree. No Merkle/proof mechanism (a deliberate
-  non-goal). **F5 note (SDK compat):** `SseFrame` (`kian-sdk/src/sse.rs`) is not `#[non_exhaustive]`;
+  non-goal). **SDK compat note:** `SseFrame` (`kian-sdk/src/sse.rs`) is not `#[non_exhaustive]`;
   marking it is itself a source-compat change for downstream exhaustive matches, so the
   decision is deliberately deferred to the SDK freeze — downstream matches should carry a `_`
-  arm meanwhile. Docs drift (F4) and default-on maintenance cost (F6) are owned by follow-up
-  cards, not this change. No new event kind; no wire change; no migration.
+  arm meanwhile. Docs drift and default-on maintenance cost are owned by follow-up
+  work, not this change. No new event kind; no wire change; no migration.
 
 ## 2026-11-15 — worker enrollment + worker-declared capabilities (ADR-031, ADR-032)
 
 A device worker (the iPhone design in [docs/runbook-ios-worker.md](docs/runbook-ios-worker.md))
-exposed three gaps in the R12 worker domain; this change closes them with per-worker enrollment, a
+exposed three gaps in the worker domain; this change closes them with per-worker enrollment, a
 worker-declared capability list on the wire, and a configurable dynamic queue bound. ADR-031's
 config-owned capability catalog was superseded by ADR-032 before release; the final shape is
 wire-declared.
@@ -902,8 +901,8 @@ wire-declared.
 - **Per-worker tokens (ADR-031 D1)** — `workers.token_env` is now optional; `workers.tokens` maps an
   id to its own env-var name. A listed id authenticates only against its own token (constant-time,
   env-only, redacting); `workers.enrolled_only: true` admits only listed ids and forbids the shared
-  fallback. The R12 shared-token impersonation limitation **narrows** (a shared-token holder can no
-  longer replace an enrolled id); it does not disappear in hybrid mode, and mTLS stays the R13 fix.
+  fallback. The shared-token impersonation limitation **narrows** (a shared-token holder can no
+  longer replace an enrolled id); it does not disappear in hybrid mode, and mTLS stays the planned fix.
   Refusals reuse `bad_token` — strict mode reveals nothing about whether an id is enrolled.
 - **Worker-declared capabilities (ADR-032, KiandProto v3)** — `register.capabilities` is an optional
   list the worker sends about itself. The worker validates its own list at startup (lowercase
@@ -970,7 +969,7 @@ the user saw 14 minutes of silence. The real result was discarded
 - **Docs** — new ADR-030; WORKER-MODEL §4 rewritten (the old bullet claimed `queue_timeout` was a
   "bound on an absent worker" while the code also bounded running commands); DESIGN crate map
   updated. The record was minted as ADR-028 and renumbered to ADR-030 on merge: the
-  harness-hook plugin record that landed in parallel (R13) already held 028, so the series had
+  harness-hook plugin record that landed in parallel already held 028, so the series had
   two claimants. `docs_map` now also asserts ADR numbers are **unique**
   (`adr_series_is_contiguous_from_001_and_unique`) — contiguity alone never caught it.
   No EVENT-MODEL/API-CONTRACT change: `tool/result.output` is opaque JSON and no wire or
@@ -1113,8 +1112,8 @@ state; both are isolated from the resident-budget change on a separate branch.
 
 ## 2026-11-14 — README corrections + owner-run remote deployment (documentation only)
 
-- **README (corrected)** — `exec_worker` is required whenever worker membership is on: the R11
-  sentence "with exactly one worker the argument may be omitted" was superseded by R12 (the schema
+- **README (corrected)** — `exec_worker` is required whenever worker membership is on: the earlier
+  sentence "with exactly one worker the argument may be omitted" was superseded (the schema
   is a plain string and the single-pin default is refused) but survived in the README. The worker
   section now states how a laptop reaches a private listener (SSH tunnel, or a Tailscale
   `100.64.0.0/10` address — in the private set; `workers.allow_public` is the recorded escape hatch,
@@ -1146,14 +1145,14 @@ state; both are isolated from the resident-budget change on a separate branch.
 
 ## 2026-11-09 — runtime worker membership (self-registration, dynamic join/leave)
 
-Round 12 (cards kian-128..135): workers join and leave a running `kian serve` at runtime.
+Workers join and leave a running `kian serve` at runtime.
 [ADR-021](design/decisions/ADR-021-runtime-worker-membership.md) is the decision record
 (supersedes ADR-020 D5/D6/D7 only — the static catalog surfaces); the worker-domain contract is
 [WORKER-MODEL.md](design/WORKER-MODEL.md) (new normative doc); the wire is
 KiandProto **v1** ([API-CONTRACT](design/API-CONTRACT.md) §8). **No new event kind (the durable set
 stays 22), no new table, no migration, no new HTTP surface, no core change.**
 
-- **Protocol v1 (kian-129)** — `PROTOCOL_VERSION = 1` in both halves with dual goldens; new frames
+- **Protocol v1** — `PROTOCOL_VERSION = 1` in both halves with dual goldens; new frames
   `register {endpoint_id, description?, token, version, max_concurrent}` (worker-dial), `bye`
   (endpoint side), `rejected {reason, detail?}`; a closed five-reason refusal set
   (`version_mismatch` / `bad_token` / `duplicate_static` / `id_conflict` / `disabled`, no serde
@@ -1161,77 +1160,76 @@ stays 22), no new table, no migration, no new HTTP surface, no core change.**
   `welcome.heartbeat_ms = max(1, offline_after_ms/3)` server-directed. Legacy static endpoints keep
   `hello`→`welcome` at v1. Upgrade order kian-first, no v0 shim: a v0 peer gets a typed refusal +
   audit line, never a half-compatible connection.
-- **Registration listener (kian-129)** — private-bind-only (`workers.listen`; loopback/RFC1918/
+- **Registration listener** — private-bind-only (`workers.listen`; loopback/RFC1918/
   CGNAT/ULA — wildcard counts as public; `allow_public: true` overrides), env-only shared token
   (`workers.token_env`, constant-time compare, one attempt per connection, 5-refusals/60 s per-peer
   window, clock-injected in tests), handshake discipline (register must be the first frame, 10 s
   deadline, no half-registered state), duplicate-id replace (serialized per id, old connection
   closed, generation+1, audited) and `duplicate_static` pin protection.
-- **Membership directory (kian-130)** — runtime-only `WorkerDirectory`; state is **computed**
+- **Membership directory** — runtime-only `WorkerDirectory`; state is **computed**
   (`online` = live connection ∧ fresh heartbeat; `draining` = teardown window; else `offline`);
   durable projection is the existing `endpoint_registry` row — no migration; the existing heartbeat
   watchdog covers dynamic members unchanged (absence admits the ordinary `endpoint_health` input).
   Stale ids are never pruned: offline-known binding stays honest. `kian workers [--json]` is the
   read-only operator verb (description/version absent after a restart until re-registration).
-- **Queue-first dispatch (kian-130)** — `exec` enqueues durably by the bound worker id with no
+- **Queue-first dispatch** — `exec` enqueues durably by the bound worker id with no
   live-route requirement; rows park `pending` until the worker registers or the honest
   `queue_timeout` abandons them; runtime routes attach/detach with membership and re-drive
   `pending`+`inflight`; no cross-worker dispatch, no failover, callers survive route swaps.
-- **Router surface (kian-131)** — `spawn_worker.exec_worker` is a plain non-empty string (no enum,
+- **Router surface** — `spawn_worker.exec_worker` is a plain non-empty string (no enum,
   no catalog block — the ADR-020 D5–D7 supersede); one frozen prompt instruction line appended only
   when membership is on; new read-only Router-only `list_workers` tool (sorted by id, membership
   data only in results); spawn validation against the runtime catalog (unknown refused naming known
   ids, offline-known allowed with the `offline — commands will queue` note, busy refused naming the
-  owner); lazy per-worker side cache, never evicted; per-side async pairs carried (S3).
-- **Two reviewer-found defects fixed** — B1 the constant-time token fold truncated the length
+  owner); lazy per-worker side cache, never evicted; per-side async pairs carried.
+- **Two reviewer-found defects fixed** — the constant-time token fold truncated the length
   mismatch to a byte (token + 256k NULs compared equal) — it now folds as
-  `u8::from(a.len() != b.len())`; B2 `kiand` lacked worker-side identity/description validation
+  `u8::from(a.len() != b.len())`; `kiand` lacked worker-side identity/description validation
   (malformed id ⇒ `id_conflict` ⇒ unbounded retry) — register mode now validates both at startup,
   exit 2, no dial.
-- **Closeout (kian-135, this entry)** — API-CONTRACT §8 v1 (handshake, frames, reason set, upgrade
+- **Closeout (this entry)** — API-CONTRACT §8 v1 (handshake, frames, reason set, upgrade
   order) + §9.1/§9.2 goldens; WORKER-MODEL.md (proposed → normative) wired into the docs map
-  (`docs_map` AUTHORED 10 → 11); ADR-021 status → landed; SPEC §5 R12 section (membership,
-  single-instance boundary, shared-token limitation, R13 deferrals); README feature bullet + runtime
-  membership advanced-usage example + docs-map row; this entry.
-- **Deferred with the round** — mTLS/per-worker identity and token rotation without restart (R13);
+  (`docs_map` AUTHORED 10 → 11); ADR-021 status → landed; SPEC §5 worker-membership section
+  (membership, single-instance boundary, shared-token limitation, deferred mTLS); README feature
+  bullet + runtime membership advanced-usage example + docs-map row; this entry.
+- **Deferred** — mTLS/per-worker identity and token rotation without restart;
   live rebind/retirement/takeover (unchanged, ADR-020/021 §Deferred); multi-instance membership
   federation (out of scope, single kian instance by design); persisting description/version across
-  a restart and a stale-id TTL (open questions recorded in the round spec §11); deployment
+  a restart and a stale-id TTL (open questions recorded in the contract); deployment
   (Vultr/WeChat) stays the owner's discussion.
-- **Owner follow-up (applied)** — the closeout run could not update AGENTS.md's docs-map list
-  (protected file; the required consent timed out), so it landed in the owner follow-up docs
-  commit: `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
+- **Owner follow-up (applied)** — AGENTS.md's docs-map list gained the worker-domain bullet in a
+  follow-up commit: `design/WORKER-MODEL.md` — normative worker-domain contract (membership lifecycle,
   binding/dispatch, catalog, security boundary); any worker-membership semantic change starts here.
   `docs_map` does not gate AGENTS.md content, so no test was affected.
 
 ## 2026-11-08 — durable per-session execution-worker binding (`exec_worker`)
 
-Round 11 (cards kian-122..127): every delegated super-agent worker session is durably bound 1:1 to
+Every delegated super-agent worker session is durably bound 1:1 to
 one `kiand` execution worker. [ADR-020](design/decisions/ADR-020-durable-worker-binding.md) is the
 decision record; DESIGN §4.1/§4.3/§4.7 and EVENT-MODEL §4.2/§6.3 carry the semantics. **No new
 event kind (the durable set stays 22), no new table, no wire/API change, no core change** — the
 durable footprint is two additive `exec_worker` keys on events that already existed.
 
-- **Config / catalog (kian-123)** — `endpoints[]` gains an optional `description` (fail-closed:
+- **Config / catalog** — `endpoints[]` gains an optional `description` (fail-closed:
   non-empty, ≤200 chars, no control characters — it is prompt-prefix content); duplicate ids still
   refuse; `superagent.harness.dsh` × non-empty `endpoints:` now refuses boot (the dsh harness never
   mounts the kian `exec`, so a binding there would be audit fiction). The worker catalog (ids +
   descriptions, config order) feeds the `spawn_worker` schema enum and the Router prompt block.
   Zero endpoints = feature off, byte-identical everywhere (wrapper, `thread/started`, schema,
   prompt, routing).
-- **Binding bytes (kian-123)** — the delegation wrapper and both sides' `thread/started` gain the
+- **Binding bytes** — the delegation wrapper and both sides' `thread/started` gain the
   additive top-level key `exec_worker: <endpoints[].id>` (`worker` keeps meaning the worker
   *session* uuid); readers classify absent=Unbound / non-empty string=Bound / anything else
   (incl. empty, wrong type, disagreeing copies)=Malformed → honest refusal, never a guess.
   `SpawnRequest` carries the choice through one struct; the Router side emits `thread/started`
   **before** admitting the task row (lineage-before-admit), bounding the crash window: a
   never-started reservation is released after `queue_timeout_ms` with an audit line.
-- **Router surface (kian-123)** — `spawn_worker` gains the `exec_worker` argument: required with
+- **Router surface** — `spawn_worker` gains the `exec_worker` argument: required with
   ≥2 workers (refusal lists the catalog), omittable with exactly 1 (bound to that worker and
   recorded — never silently unbound), refused with 0. The spawn result echoes the choice. The
   prompt gains the catalog block (ids + descriptions + the choice rule) appended only when the
   catalog is non-empty, so zero-endpoint renders are byte-identical.
-- **1:1 exclusivity (kian-123)** — a worker has at most one live bound worker session. The check
+- **1:1 exclusivity** — a worker has at most one live bound worker session. The check
   is a pure stream-derived function (`bound_workers` + status-aware `thread_liveness` +
   `busy_owner`: `thread/completed{completed}`/`session/ended{completed,cancelled}` release,
   `{failed,interrupted}` hold; NeverStarted held only inside the `queue_timeout_ms` window; read
@@ -1239,22 +1237,22 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   `WorkerStreamsPort` (implemented in `kian-cli`; the `RecallPort` precedent — the iron rule
   holds, no store symbol in `kian-superagent`). A busy refusal names the owning worker session
   uuid and thread id and leaves zero inbox rows / threads / `thread/started` / provider calls.
-- **Per-worker routing (kian-123 + B1 fix)** — assembly prebuilds one worker side per endpoint
+- **Per-worker routing** — assembly prebuilds one worker side per endpoint
   (its own `exec` `RemoteExecTool`, its own async `start`/`stop` pair bound to that endpoint —
   the async row already carries `endpoint_id`); `SuperAgentDriver` selects the side per drive
   from the session's own stream binding: `Bound` → that worker; unconfigured bound id → a
   **refusing** `exec` side (honest tool error, no queue row, no re-route, no local run);
   `Malformed` → refusing side; legacy `Unbound` → the first **configured** endpoint (config
-  order, not map-key order — review B1 fixed with an L1 regression test and an L2 leg using
+  order, not map-key order — the review defect fixed with an L1 regression test and an L2 leg using
   non-alphabetical ids) with exactly one per-session audit line. No resident routing state;
   a `kian serve` restart re-derives the binding from the stream.
 - **Reviewer-found defect fixed** — the legacy-unbound route used `BTreeMap` key order instead of
   config order; `worker_order` is now carried through `with_worker_sides`, so an unbound session
   resolves to the first configured endpoint (a non-alphabetical configuration is covered).
-- **Deferred with the round** — live rebind of a session to a different worker id (ADR-020
+- **Deferred** — live rebind of a session to a different worker id (ADR-020
   §Deferred: durable intent + queue fencing + seq-range projection, owner gate), deployment
   tooling.
-- **Closeout (kian-127)** — SPEC §5 worker-binding section, README feature bullet + BYOM
+- **Closeout** — SPEC §5 worker-binding section, README feature bullet + BYOM
   advanced-usage example, this entry.
 
 ## 2026-11-08 — agent-memory P3b-1: index-accelerated memory reads (`scan_kind`)
@@ -1266,7 +1264,7 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   read path is byte-identical. Persisted representations, dreaming cadence, the agent-side
   memory tool and governed cross-scope reads stay designed (P3b remainder + ADR-019 track —
   moved, not dropped).
-- **Store (kian-116)** — adjacent migration v6 on both chains adds `idx_events_session_kind_seq`
+- **Store** — adjacent migration v6 on both chains adds `idx_events_session_kind_seq`
   over `events (session, kind, seq)`; `EventStore::scan_kind(session, kind)` returns the
   session's events of one kind in seq order (`WHERE session = ? AND kind = ? ORDER BY seq`),
   served by the index (EXPLAIN QUERY PLAN: index-named plan, no `SCAN events` table scan). A
@@ -1274,17 +1272,17 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   open never migrates. Tests (new only): `scan_kind_parity_with_scan_then_filter_on_a_mixed_stream`,
   `scan_kind_works_on_a_read_only_store` (kian-store), and the env-gated pg twin
   `pg_scan_kind_parity_index_and_read_only_pool`.
-- **CLI reads (kian-117)** — every memory read path in `kian-cli` goes through
+- **CLI reads** — every memory read path in `kian-cli` goes through
   `scan_kind(MemoryNote)`: the shared `memory_notes` helper (list/search/map/verify),
   `run_memory_show`, and the creation-time injection's source-session read. Test (new only):
   `injection_payload_byte_identical_on_a_mixed_source_stream` — the admitted `{content, memory}`
   payload is byte-identical to the pre-change full-rebuild read (including the `source_seq`
   pin) on a source stream interleaving notes with non-note events, and the injection read
   leaves the source stream untouched.
-- **Failure path (kian-120 M1, accepted)** — the switched memory reads surface `StoreError` text
+- **Failure path (accepted)** — the switched memory reads surface `StoreError` text
   directly instead of the old `InboxError::Store` `store error: …` prefix; every successful-output
   path is byte-identical (old-vs-new binary comparison).
-- **Closeout (kian-119, this entry)** — MEMORY-MODEL §6's cost note and §7.1's cost bound now
+- **Closeout (this entry)** — MEMORY-MODEL §6's cost note and §7.1's cost bound now
   record **O(memory/note events)** via the index-accelerated kind scan (a recorded bound, not
   a perf claim); READ-MODEL §6 notes the memory read paths consume the truth table through the
   declared per-session kind index (the `audit_kind_index` idea) — not a view, not a snapshot,
@@ -1299,7 +1297,7 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   the CLI verbs open the store read-only; a missing store is an error, never a created file. This
   slice needs **no dreaming run** because nothing is persisted — a persisted representation
   (wiki-as-notes) stays designed (P3b) and would follow MEMORY-MODEL §7 R3.
-- **`kian-memory` pure projections (kian-107)** — `search.rs`: latest-per-subject fold over ALL
+- **`kian-memory` pure projections** — `search.rs`: latest-per-subject fold over ALL
   statuses (every hit carries `verified|candidate|stale` — untrusted notes surface as claims),
   ranking subject exact > prefix > contains > text contains, deterministic subject-byte tie-break,
   ASCII case-insensitive, caps 20 hits / 8 KiB with `truncated`. `map.rs`: verified-only nodes —
@@ -1309,15 +1307,15 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   consistent with the P2 injection index and now stated in MEMORY-MODEL §7.1) — with
   evidence-derived edges (note pairs whose `derived_from` ranges intersect in the same source
   session, never model-generated), caps 200 nodes / 1000 edges / 64 KiB. The byte cap is
-  **nodes-first** (kian-112, fixing the review's B1): the byte-order node prefix is kept and edges
+  **nodes-first**: the byte-order node prefix is kept and edges
   are cut first — only edges between kept nodes are delivered, so no edge ever dangles — and the
-  trim is O(nodes+edges) incremental section math, not a re-render fixpoint (B2: 14.7 s → 2.7 ms
+  trim is O(nodes+edges) incremental section math, not a re-render fixpoint (14.7 s → 2.7 ms
   at 200 notes / 57-char subjects). Honest heuristics `degenerate` (fewer than two nodes or zero
   edges in the **delivered** view — search
   alone is the right tool) and `oversized` (rendered bytes exceed the summed note-text bytes)
   reported in text and JSON, never hidden. Both views render byte-identically across runs and
   insertion interleavings and lead with the frozen `(data, not instructions)` frame.
-- **`kian memory search|map` verbs (kian-108)** — read-only in-process CLI verbs reusing the exact
+- **`kian memory search|map` verbs** — read-only in-process CLI verbs reusing the exact
   `memory list`/`show` read path; text and `--json` agree on every flag. **Recorded divergence
   from the P3a plan §2.1:** no `[--limit N]` flag — the caps are fixed (20 hits / 8 KiB; the map's
   200/1000/64 KiB), accepted rather than silently diverged.
@@ -1325,11 +1323,11 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   O(memory-session events); the caps bound rendered bytes, not the read. The bound is recorded,
   **not perf-benched** (A6); a snapshot-served fold (the READ-MODEL acceleration) is deferred with
   P3b. The `oversized` flag is a one-pass re-render fixpoint — convergence beyond that pass is
-  a known limitation (kian-107).
-- **Closeout (kian-110)** — MEMORY-MODEL §7 (+ §7.1 landed block, header, §9 verbs), SPEC §5 P3
+  a known limitation.
+- **Closeout** — MEMORY-MODEL §7 (+ §7.1 landed block, header, §9 verbs), SPEC §5 P3
   split (P3a landed / P3b designed, moved not dropped), README feature bullet + advanced-usage
   example + docs-map row, this entry.
-- **Fix (kian-112)** — the map's byte cap was wrong: the
+- **Fix** — the map's byte cap was wrong: the
   trim loop put edges outer / nodes inner, so once the 64 KiB budget bound it delivered ~944 edges
   and 0–2 nodes — every edge dangling, no `## Nodes` section — contradicting the struct invariant,
   the docs and README. Fixed by restructuring the trim nodes-first (largest fitting byte-order
@@ -1338,7 +1336,7 @@ durable footprint is two additive `exec_worker` keys on events that already exis
   section lengths. MEMORY-MODEL §7.1, README (feature wording + crate-map line) reconciled in the same
   change.
 
-## Round-10 WeChat L3 live-run fixes (2026-11-08)
+## 2026-11-08 — WeChat L3 live-run fixes
 
 The first real phone/QR run of the WeChat iLink channel surfaced five defects that the mocked
 suites could not; all are fixed.
@@ -1370,14 +1368,14 @@ suites could not; all are fixed.
   ordinary `input/admitted`), no new crate, no table/migration. Four additive deltas only:
   `Engine::admit_quiet` + the `memory` row arm, the additive non-context `memory` provenance key,
   the `memory.session`/`memory.inject` config block, and the pure renderer.
-- **Quiet admit + the `memory` row arm (kian-99)** — `Engine::admit_quiet` writes a durable inbox
+- **Quiet admit + the `memory` row arm** — `Engine::admit_quiet` writes a durable inbox
   row without waking (no NOTIFY, no drain; same idempotency semantics as `admit` via a shared
   `admit_row` helper). The consumption plan gains one arm: a row payload of exactly
   `{"content":X,"memory":M}` consumes to ONE `input/admitted`
   `{role:"system",content:X,synthetic:true,memory:M}`; a superset shape is ordinary content. The
   public wire (`submit`/`steer`/`queue`) refuses the exact two-key shape with `-32602` (the fifth
   reserved envelope), so only the server's create path can land the marker.
-- **Deterministic index renderer (kian-100)** — `kian-memory` `index.rs`:
+- **Deterministic index renderer** — `kian-memory` `index.rs`:
   `render_memory_index(notes, cfg)` filters verified-only (latest verified per subject, subject
   byte order), renders the full claims within both caps, degrades over either cap to the index
   form (subject + one-line excerpt ≤ 120 chars, whole entries dropped until the byte cap fits,
@@ -1387,7 +1385,7 @@ suites could not; all are fixed.
   (env-sourced known values would break cross-machine determinism), with
   `render_memory_index_with` as the assembly seam for the configured redactor; the value-free
   report rides provenance.
-- **Config + creation-time injection (kian-101)** — `memory.session` (the source memory session
+- **Config + creation-time injection** — `memory.session` (the source memory session
   uuid; absent = injection off, byte-identical) and `memory.inject {max_items, max_bytes}`
   (fail-closed; defaults 20 / 4096). The server's create path, after `engine.create_session` and
   before the RPC returns, rebuilds the source stream, folds, renders, applies the identity
@@ -1395,13 +1393,13 @@ suites could not; all are fixed.
   under idempotency key `memory-inject:<session>`; every failure is honest degradation (inject
   nothing + `injected_skips`, never a failed creation). New `GET /metrics` `memory` keys:
   `injected_sessions/items/bytes/truncations/skips` (present only when injection is configured).
-- **Closeout docs (kian-103)** — MEMORY-MODEL §6 reconciled with the landed behavior (status
-  P2 landed; I1–I9 updated; I10 exclusions added; the F1 restart window recorded; §9 metrics),
+- **Closeout docs** — MEMORY-MODEL §6 reconciled with the landed behavior (status
+  P2 landed; I1–I9 updated; I10 exclusions added; the restart window recorded; §9 metrics),
   SPEC §5 P2 row → landed, DESIGN §3.2 creation-time path + constraint-3 argument, DESIGN §7
   crate map, README feature bullet + advanced-usage example + docs/crate map rows, this entry.
-  EVENT-MODEL §3/§4.2/§4.5 were reconciled with the payload changes in the kian-99/101 changes.
+  EVENT-MODEL §3/§4.2/§4.5 were reconciled with the payload changes in the two changes above.
 
-## 2026-11-08 — round-10 WeChat iLink channel: adapter, config/CLI, login
+## 2026-11-08 — WeChat iLink channel: adapter, config/CLI, login
 
 - **`design/CHANNEL-WECHAT.md` (normative)** — the `type: wechat` channel contract: the frozen
   iLink protocol mapping (endpoints, headers, `WeixinMessage`, the `sendmessage` payload), the
@@ -1428,47 +1426,47 @@ suites could not; all are fixed.
   channel (registry, consumers, poll-driver order), token redaction. 9 tests including the
   real-`Server` + sqlite end-to-end: one inbound admitted exactly once across replay **and**
   process restart; channel failure leaves session state untouched.
-- **R10-06a review fixes (folded into both commits)** — the four findings of the independent
+- **Review fixes (folded into both commits)** — the four findings of the independent
   review: the send-path allowlist hole (blocker: token cache moved admit-only + the §9 send
   gate), the vacuous restart leg (baseline-before-respawn), login abort on a normal long-poll
   timeout, and missing-`ret` minting a delivered receipt; plus minors (api_base doc/code match,
   verify-code wording, dead stub removed, `0700` credential parent, `-14` observability note,
   baseurl-vs-api_base UNVERIFIED item)
 - **No new surface, no wire, no event kind** — `API-CONTRACT.md` and `EVENT-MODEL.md` show zero
-  diff across the round; no `kian-core`/`kian-store`/`kian-orchestrator` change; no new HTTP
+  diff across the change; no `kian-core`/`kian-store`/`kian-orchestrator` change; no new HTTP
   route
 
-## 2026-11-08 — round-9 closeout: read model docs landed — documentation only
+## 2026-11-08 — read model docs landed — documentation only
 
-- **Scope**: documentation reconciliation for the read-model round (P0–P3 + the R9-08 fixes +
-  R9-10 incremental rebuild). No code, no wire, no migration, no event kind.
+- **Scope**: documentation reconciliation for the read model (P0–P3 + the review fixes +
+  the incremental rebuild). No code, no wire, no migration, no event kind.
 - **README**: Features gains the read-model line (versioned unchanged/delta reads, resumable
   SSE, verified snapshots + tail replay, operator views, opt-in export-only archive,
   allowlist fan-in — all disposable projections; the stream stays the only truth); Docs map row
   re-worded from "proposed" to "the normative serving-form contract"; new Advanced usage section
   (unchanged `projection` poll, opt-in `retention:` config, `kian archive run|verify`).
-- **SPEC §5**: "Read model and serving form" flips to **(P0–P3 landed)** with the round-9
-  commit range; all five phase rows `designed` → `landed`.
+- **SPEC §5**: "Read model and serving form" flips to **(P0–P3 landed)**; all five phase rows
+  `designed` → `landed`.
 - **READ-MODEL**: title `(proposed)` → `(normative)`; header rewritten to "accepted and fully
-  landed" (ADR-017, owner-gated 2026-11-07) with the phase summary; R1 gains the §5
-  load-time-trust-boundary pointer (re-review residual); §7 read-behavior "any read" narrowed
+  landed" (ADR-017) with the phase summary; R1 gains the §5
+  load-time-trust-boundary pointer (review residual); §7 read-behavior "any read" narrowed
   to the enumerated surfaces with an honest scope note (memory surfaces answer `unknown
   session` — they do not consult the marker); the §4.2 512-frame batch now points at
-  API-CONTRACT §5.4 as its normative home (F4 duplicate).
-- **DESIGN §3.2**: the serving-form pointer tag "P0 landed" → "landed" (F4).
+  API-CONTRACT §5.4 as its normative home.
+- **DESIGN §3.2**: the serving-form pointer tag "P0 landed" → "landed".
 - **Residuals (owner-pending, not blocking)**: `AGENTS.md` docs-map bullet for
-  `design/READ-MODEL.md` (plan §1.6) and the `21-kind` → `22-kind` catalog count (F4) were
-  **not** applied — AGENTS.md is a protected file and the write required owner approval that
-  did not arrive in this run. `SseFrame #[non_exhaustive]` stays deferred to the SDK freeze
-  (F5, recorded with its reason in the R9-08a entry).
+  `design/READ-MODEL.md` and the `21-kind` → `22-kind` catalog count were
+  **not** applied — AGENTS.md is a protected file and the write required owner approval.
+  `SseFrame #[non_exhaustive]` stays deferred to the SDK freeze
+  (recorded with its reason in the review-fixes entry above).
 
-## 2026-11-08 — read model R9-10: incremental view rebuild
+## 2026-11-08 — read model: incremental view rebuild
 
-- **Problem (R9-08 F6, follow-up card t_988f5de3).** The default-on view maintenance ticker
+- **Problem.** The default-on view maintenance ticker
   (`read_model.views`, enabled, `interval_ms` 60 000) did recurring O(total history) work on the
   serving runtime: every tick re-read and re-folded every session's whole stream (CHANGELOG P2a
   bench: 66.5 ms at 1 000 sessions / 5.2k events, growing linearly).
-- **Remedy chosen (1 + 3 of the card's candidates; the default stays ON — an idle tick is now
+- **Remedy chosen (incremental head scan + kind-filtered reads; the default stays ON — an idle tick is now
   near-free, so the 60 s cadence costs ~0.01–0.1 % of one core even at 10k sessions).** The
   rebuild is **incremental**: one index-only `GROUP BY session` heads scan diffs live heads
   against the stored rows' `row_version`s; only moved/new sessions are re-read and re-folded,

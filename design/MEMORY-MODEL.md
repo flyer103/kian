@@ -1,8 +1,8 @@
 # Kian — Memory Model (normative)
 
-> **Status: accepted (owner gate, 2026-11-07); Phase 1 (notes + dreaming) landed 2026-11-07;
-> Phase 2 (creation-time injection, §6) landed 2026-11-08; Phase 3a (read-time retrieval +
-> representations, §7) landed 2026-11-08.** Persisted representations (§7 R3) remain designed;
+> **Status: accepted; Phase 1 (notes + dreaming) landed; Phase 2 (creation-time injection, §6)
+> landed; Phase 3a (read-time retrieval + representations, §7) landed.** Persisted representations
+> (§7 R3) remain designed;
 > SPEC §5 records P1/P2/P3a as `landed` and P3b as `designed`.
 >
 > **Change protocol:** any memory semantic change starts here. The event payload bytes are
@@ -201,7 +201,7 @@ consumes the row into ONE `input/admitted` carrying the message plus the additiv
   session replays the same first event; re-injecting would change the prefix. Landed mechanics: the
   quiet admit carries the idempotency key `memory-inject:<session-id>` (a repeated admit dedupes at
   the store), and no code path re-injects — the row is an ordinary inbox row consumed once.
-  **Known restart-window behavior (QA finding F1, accepted):** a session that crosses a server
+  **Known restart-window behavior (accepted):** a session that crosses a server
   restart between `create` and its first submit has its quiet row woken by the NoLostWork startup
   rebuild, so the index drains **alone** as the session's first provider turn. Exactly-once, prefix
   stability and `unexpected_prefix_change == 0` still hold; the deviations are one extra provider

@@ -1,8 +1,8 @@
 # Multiagent model — the multiagent-domain contract
 
-- **Status**: implemented through P4 in code + tests (R15–R17: the delegation core, the P2 roster
-  and spawn inputs, the P3 task board, and the P4 `depends_on`/`group` arguments, readiness gating
-  and audit key groups behind `superagent.board.gating`). **No live-run evidence exists** — nothing
+- **Status**: implemented through P4 in code + tests (the delegation core, the P2 roster and spawn
+  inputs, the P3 task board, and the P4 `depends_on`/`group` arguments, readiness gating and audit
+  key groups behind `superagent.board.gating`). **No live-run evidence exists** — nothing
   here has run against a live provider or a multi-session production store; §10 says exactly what
   is unverified. Every normative sentence remains a requirement the tests pin, not a claim about
   observed behavior.
@@ -76,9 +76,9 @@ it.
 
 ### 0.2 Where the load-bearing claims are anchored
 
-`file:line` numbers are verified against tree `037aee5`. This round adds one additive subsection
-(DESIGN §4.8, +13 lines), so **DESIGN line numbers after it shift**; the section reference is the
-durable citation and the line range is the evidence of record.
+`file:line` numbers are verified against tree `037aee5`. DESIGN line numbers after §4.8 shift when
+that section grows; the section reference is the durable citation and the line range is the evidence
+of record.
 
 | Claim in this file | Anchor |
 |---|---|
@@ -460,9 +460,8 @@ validated after a restart and `invalid_output` is underivable.
 
 ## 4. The board ruling (normative)
 
-This is the answer to the round's second question: *does cross-session multiagent need a durable
-task-board entity?* The ruling is a constraint consequence, not a preference, and the draft states it
-as MUST/MUST NOT.
+This answers the open question: *does cross-session multiagent need a durable task-board entity?* The
+ruling is a constraint consequence, not a preference, and the draft states it as MUST/MUST NOT.
 
 ### 4.1 No board entity, ever
 
@@ -761,14 +760,14 @@ view-machinery switch READ-MODEL owns.
 Unknown or malformed values refuse to boot (the fail-closed config discipline used by the permission
 table and `workers.token_env`); an absent block is not an error and changes nothing.
 
-> **`join` narrowing (R17, P4 landing note).** Config accepts and validates `all` | `any` |
+> **`join` narrowing (P4 landing note).** Config accepts and validates `all` | `any` |
 > `quorum:<n>` (n ≥ 1), but **v1 evaluates only `all`** — the one shape with an evaluation site
 > (one spawn, one parent). `any` and `quorum:<n>` **refuse to boot** naming the missing evaluation
 > site and the §9 deferral; they are *not* accepted-and-ignored, because a silent accept would
 > imply any-of success (§5.3's `join` row, §9:882-888). This narrows the accepted *bootable* value
 > set, is reversible, and touches no bytes.
 
-### 7.2 The P4 additive payload keys (landed R17; owner gate; one-way)
+### 7.2 The P4 additive payload keys (landed; one-way)
 
 Two key groups on events that already exist, both **class A** (§0.3): outside `content`, non-context,
 omitted when unset, leaving legacy bytes byte-identical (EVENT-MODEL §4.2, §6.3):
@@ -916,17 +915,17 @@ duplicate child. Every row is an audit line plus an honest error at the seam.
 - **No mid-session model/policy change** for a child (a different model is a different session).
 - **No implicit history inheritance**: the wrapper is the only inherited byte range; a fork/full-history
   mode is not part of this contract.
-- **No plugin/hook dependency.** `design/PLUGIN-SPEC.md` (in flight, R13) is a forward reference only:
+- **No plugin/hook dependency.** `design/PLUGIN-SPEC.md` is a forward reference only:
   this contract does not require it and cites no line numbers into it.
 - Deployment remains the owner's later discussion.
 
 ## 10. UNVERIFIED (must stay visible)
 
-- **Implemented through P4, but with no live-run evidence.** R15–R17 landed the delegation core,
-  the P2 roster and spawn inputs, the P3 task board, and the P4 `depends_on`/`group` arguments,
-  readiness gating and the §7.2 audit key groups — all pinned by tests, none of it run against a
-  live provider, a live child delegation, or a multi-session production store. Every rule above is
-  now a requirement the tests pin, not an observation of shipped behavior.
+- **Implemented through P4, but with no live-run evidence.** The phased implementation landed the
+  delegation core, the P2 roster and spawn inputs, the P3 task board, and the P4 `depends_on`/`group`
+  arguments, readiness gating and the §7.2 audit key groups — all pinned by tests, none of it run
+  against a live provider, a live child delegation, or a multi-session production store. Every rule
+  above is now a requirement the tests pin, not an observation of shipped behavior.
 - **Spawn exactly-once is not claimed and not measured.** The `unknown` window (§2.1) is a design
   admission; a fault-injection experiment that crashes between the committed `tool/call` and the
   `thread/started` write would be the first honest measurement of it, and it does not exist yet.
@@ -936,7 +935,7 @@ duplicate child. Every row is an audit line plus an honest error at the seam.
   delegation topologies and task boards separately; none measures an event-sourced lineage plus a
   materialized board. The design is composed from adjacent evidence, not validated as a whole — the
   evidence base and its nine primary citations are in [ADR-029](decisions/ADR-029-multiagent-delegation-and-board.md)
-  §Context, so the *why* outlives this ticket directory.
+  §Context, so the *why* outlives this file.
 - **The `max_children: 4` default and `max_depth: 1` are policy decisions, not findings.** The
   literature defines no general depth or fan-out contract; both numbers are config and may be
   revisited without a contract change.
@@ -967,31 +966,27 @@ Three rules bind every change here: **a board is never truth** (M1, M7), **a chi
 session** (M2), and **authority only narrows** (M3). A change that violates one of these is not a
 change to this contract — it is a supersession of it, with an ADR.
 
-## 12. Drafting corrections (recorded here; the decision log is not re-edited)
+## 12. Drafting corrections
 
-This file implements the Round 14 decision log D1–D8. Where drafting departs from a shorthand in that
-log — or from the first draft of this file — the departure is recorded here, in the repository, rather
-than by editing a frozen record or leaving the reason in a ticket directory.
+The final text departs from earlier drafts in the places below. Each departure is recorded here, in
+the repository, rather than by editing a frozen record or leaving the reason in a ticket directory.
 
-| # | Correction | Stays inside |
-|---|---|---|
-| 1 | Key name `task` → namespaced `multiagent` (`thread/started` already carries `"task"`) | D3 |
-| 2 | Join admission reuses the existing `{"synthetic":true,"content":X}` envelope and `(session, idempotency_key)`; no sixth envelope | D3 |
-| 3 | Child thread and session ids are derived from `spawn_uid` | D1 |
-| 4 | `outcome` is derived in the join; the persisted key is P4 | D1, D3 |
-| 5 | The P2 schema change is labelled constraint-3-relevant (golden in the same change, drift reported, live prompts never rewritten) | D2 |
-| 6 | `outcome` moved from a top-level `thread/completed.outcome` into the `multiagent` group, so one placement rule covers every key (§7.2) | D3 |
-| 7 | **Task namespace is parent-local.** The log's `uuid5(board_scope, "kian:task:<key>")` is not adopted: `task_id = uuid5(parent_session, …)`, and cross-parent fan-in is deferred *with* its namespace (§1, §9). Reason: under M10/D1 a cross-parent namespace buys nothing until fan-in exists, and without an atomic fenced claim on one authoritative stream it is unsafe (two parents can each observe "no live claim" and each spawn); the extra authoritative stream that would fix it is exactly what D3's board-entity refusal forbids. | supersedes one clause of D3.4 **within** D3 — the board stays a protocol, not a table |
-| 8 | The byte boundary is drawn once, as four classes (§0.3). "P1–P3 need no payload change" is stated as "no event-payload **key set** changes before P4", with P1's wrapper/report content named explicitly | D1–D3 |
-| 9 | `unknown` is a **spawn** outcome and never a `thread/completed.outcome` value | D1 (honest tier statement) |
-| 10 | `empty_output` is a task-outcome value, excluded from every success set at every policy setting | constraint 7, M6 |
-| 11 | `input_required` is a live, resumable child with **no** completion — never a terminal child that is then "answered" | constraint 7; EVENT-MODEL:123 |
-| 12 | The join target is `thread/started.parent` from the child's own stream, not the assembly's Router | D1 (lineage is durable) |
-| 13 | The spawn's resolution (entry, `AgentDef` + version, policy version) is pinned in the wrapper; a replay rehydrates instead of consulting live config | D1 + AGENTS.md constraint 13 |
-| 14 | The expected `output_schema` is declared at P2 and validated **once, in the child**; the join reads the committed verdict instead of re-validating | D1 (one carrier, one validation) |
+| # | Correction |
+|---|---|
+| 1 | Key name `task` → namespaced `multiagent` (`thread/started` already carries `"task"`) |
+| 2 | Join admission reuses the existing `{"synthetic":true,"content":X}` envelope and `(session, idempotency_key)`; no sixth envelope |
+| 3 | Child thread and session ids are derived from `spawn_uid` |
+| 4 | `outcome` is derived in the join; the persisted key is P4 |
+| 5 | The P2 schema change is labelled constraint-3-relevant (golden in the same change, drift reported, live prompts never rewritten) |
+| 6 | `outcome` moved from a top-level `thread/completed.outcome` into the `multiagent` group, so one placement rule covers every key (§7.2) |
+| 7 | **Task namespace is parent-local.** A global `uuid5(board_scope, "kian:task:<key>")` is not adopted: `task_id = uuid5(parent_session, …)`, and cross-parent fan-in is deferred *with* its namespace (§1, §9). Reason: under M10 a cross-parent namespace buys nothing until fan-in exists, and without an atomic fenced claim on one authoritative stream it is unsafe (two parents can each observe "no live claim" and each spawn); the extra authoritative stream that would fix it is exactly what the board-entity refusal forbids (§4.1). |
+| 8 | The byte boundary is drawn once, as four classes (§0.3). "P1–P3 need no payload change" is stated as "no event-payload **key set** changes before P4", with P1's wrapper/report content named explicitly |
+| 9 | `unknown` is a **spawn** outcome and never a `thread/completed.outcome` value |
+| 10 | `empty_output` is a task-outcome value, excluded from every success set at every policy setting |
+| 11 | `input_required` is a live, resumable child with **no** completion — never a terminal child that is then "answered" |
+| 12 | The join target is `thread/started.parent` from the child's own stream, not the assembly's Router |
+| 13 | The spawn's resolution (entry, `AgentDef` + version, policy version) is pinned in the wrapper; a replay rehydrates instead of consulting live config |
+| 14 | The expected `output_schema` is declared at P2 and validated **once, in the child**; the join reads the committed verdict instead of re-validating |
 
-A note on typography, since the first draft's verification claim was loose: this file uses `∩`, `≥`,
-`→` and `←` as mathematical symbols. They are typographic, not a language breach (AGENTS.md
-constraint 12), and they are not "symbols already used in the existing normative docs" — `∩`/`≥`/`←`
-appear in no other `design/` or `design/decisions/` file (`→` and `≤`/`≈`/`≠`/`∈` are used elsewhere).
-The claim was wrong; the usage is deliberate.
+A note on typography: `∩`, `≥`, `→` and `←` are used here as mathematical symbols. They are
+typographic, not a language breach (AGENTS.md constraint 12).

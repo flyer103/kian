@@ -6,10 +6,10 @@
 > sole truth and the only source of session state (`EVENT-MODEL.md`; AGENTS.md constraint 1).
 > Wire shapes are normative in `API-CONTRACT.md`; execution mechanics are in `DESIGN.md`.
 >
-> Status: **accepted and fully landed** ([ADR-017](decisions/ADR-017-read-model-and-snapshots.md),
-> owner-gated 2026-11-07; round 9). **P0** — version + unchanged/delta reads, resumable
-> per-session streams, the drain context cache. **P1** — verified snapshots of state + model
-> context with provenance, tail replay, the maintenance builder. **P2a** — materialized views:
+> Status: **accepted and fully landed**
+> ([ADR-017](decisions/ADR-017-read-model-and-snapshots.md)). **P0** — version + unchanged/delta
+> reads, resumable per-session streams, the drain context cache. **P1** — verified snapshots of state
+> + model context with provenance, tail replay, the maintenance builder. **P2a** — materialized views:
 > session directory, usage, ticket stage, cache, the kind index (incremental rebuild). **P2b** —
 > opt-in export-only retention: the archive package, the two-phase verified commit,
 > `session import`, the `-32007 archived` read error. **P3** — the explicit-allowlist fan-in
@@ -177,7 +177,7 @@ Landed shape (P3):
   result. If verification metadata is missing, replay fails, or the tail exceeds the configured
   cap, the reader MUST rebuild from the stream (honest fallback) — never serve a partially
   applied snapshot.
-- **Trust boundary (R9-08).** Load-time verification is **builder attestation + digest↔columns
+- **Trust boundary.** Load-time verification is **builder attestation + digest↔columns
   integrity**, nothing more: the `verified` flag and the digest are written by the builder the
   table already trusts, so a row whose stored columns were rewritten *together with a recomputed
   digest* (a poisoned-but-self-consistent row) is **not detectable at load and is served** — the
@@ -234,11 +234,11 @@ Landed shape (P2a):
   precedent as v4's `idx_events_kind_ts`; `CONCURRENTLY` is not available inside the migration
   transaction). Schedule upgrades accordingly.
 - **`session_cache` was declared additively by the P2a change** (per §10's additive protocol):
-  the round-9 plan requires `kian cache-stats` to be served from views when fresh, and §6 had
+  the read-model plan requires `kian cache-stats` to be served from views when fresh, and §6 had
   declared no view over the prefix-stability counters. Its source is the `step/request` audit
   copies (the A2 bytes) and `compact` events; it reports the same per-session counters
   `kian cache-stats` derives.
-- **`task_board` was declared additively by the R17 C4 change** (MULTIAGENT-MODEL §4.2/§4.3):
+- **`task_board` was declared additively by the multiagent change** (MULTIAGENT-MODEL §4.2/§4.3):
   a logical view over the same v4 `view_rows`/`view_state` tables — one row per delegation **task**
   (keyed by the wrapper's `task_id`, `BTreeMap`-ordered), derived exactly like the honest full-stream
   derivation and published through the same one-transaction version flip under the `views:all` lease,
@@ -263,7 +263,7 @@ Landed shape (P2a):
   predecessor — unlike snapshots (R6 insert-only) this is safe because the whole version flips
   atomically and no reader may treat a view as truth. Rebuilds run under the `views:all`
   maintenance lease (liveness only), the store key pinned before any stream is read.
-- **Incremental rebuild (R9-10).** The maintenance tick is incremental: a session whose head is
+- **Incremental rebuild.** The maintenance tick is incremental: a session whose head is
   unchanged since the last publication is *reused*, not re-derived — a stored row whose
   `row_version` equals the live head was derived from an identical stream (streams are
   append-only under CAS guards, so the head determines the stream). An unchanged store is a
@@ -308,7 +308,7 @@ Rules:
   package path; `session export` reads the package and MUST be byte-identical; `session replay`
   refuses online replay with import guidance. The per-session aggregate reads
   (`usage-stats --session`, `cache-stats --session`) refuse with the archived marker and import
-  guidance — never a silent zero report (R7; R9-08 F3). Whole-store aggregates report the online
+  guidance — never a silent zero report (R7). Whole-store aggregates report the online
   window only. (Scope note: the memory surfaces — `kian memory list/show/verify --session` — do
   not consult the archive marker; an archived id answers the same explicit `unknown session` as
   any absent one. The `archived` marker surfaces exactly on the read paths enumerated above,
@@ -345,11 +345,11 @@ Landed shape (P2b):
   delete exists in exactly one guarded site (`kian-store`'s archive module; the crate's
   append-only review assertion carves out that file alone).
 - **Reads.** `projection` and the SSE stream answer `-32007 archived` (API-CONTRACT §2.2;
-  the planned `-32005` had been taken by the round-8 memory registry) with package guidance.
+  the planned `-32005` had been taken by the memory registry) with package guidance.
   `session inspect` reports archived + the package path; `session export` serves the package
   byte-identically (hashes re-verified on the way out); `session replay` refuses online replay
   with import guidance; the per-session aggregate reads (`usage-stats --session`,
-  `cache-stats --session`) refuse the same way (R9-08 F3 — never a silent zero report).
+  `cache-stats --session`) refuse the same way (never a silent zero report).
 - **Import.** `kian session import <package>` verifies the manifest, refuses a corrupt package,
   a package whose rows name a different session than its manifest (every event and input row's
   session is cross-checked against `manifest.session`; the manifest is not self-hashed, so
@@ -382,7 +382,7 @@ Landed shape (P2b):
   after a verified package exists. It never rewrites events or changes event bytes.
 - It reports counters on `/metrics` (planned additive namespace `read` / `event_stream`;
   API-CONTRACT owns the exact keys).
-- **Per-tick cost is proportional to the change (R9-10), not to total history.** The view
+- **Per-tick cost is proportional to the change, not to total history.** The view
   rebuilder's whole-store reads are index-only aggregates (session heads, pending-inbox counts);
   streams are re-read and re-folded only for sessions whose head moved, and the folds yield to
   the runtime between sessions. The snapshot builder's candidate scan stays an index-only

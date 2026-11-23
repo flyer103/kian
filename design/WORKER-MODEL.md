@@ -1,7 +1,6 @@
 # Worker model — the worker-domain contract
 
-- **Status**: normative (landed with Round 12; ADR-021 implemented and reviewed — acceptance and
-  review evidence in the board's `shared/round12/` and the CHANGELOG R12 entry).
+- **Status**: normative; the contract is implemented.
   **Amended 2026-11-18**: binding release by thread close, the explicit release verb and the
   bounded idle reclaim ([ADR-035](decisions/ADR-035-worker-release-and-idle-reclaim.md)).
 - **Date**: 2026-11-08
@@ -283,8 +282,8 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
 - **Enrollment narrows the shared-token limitation.** A listed id authenticates only with its own
   token: the shared token cannot replace it. With `workers.enrolled_only: true` (requires a
   non-empty enrollment map and forbids `token_env`) only listed ids are admitted at all. In hybrid
-  mode (both configured) an unlisted id still falls back to the shared token — the R12 limitation
-  **narrows, it does not disappear**. **mTLS / per-worker certificates is the R13 fix** and remains
+  mode (both configured) an unlisted id still falls back to the shared token — the limitation
+  **narrows, it does not disappear**. **mTLS / per-worker certificates is the planned fix** and remains
   a prerequisite for any hosted or multi-tenant use; per-worker bearer tokens are not a substitute
   ([ADR-031](decisions/ADR-031-worker-enrollment.md)).
 - **No new inbound HTTP surface.** The listener is the KiandProto socket, not an HTTP route; `/rpc`,
@@ -347,7 +346,7 @@ seam.
 - **One kian instance.** A worker registers to exactly one `kian serve`. There is no federation, no
   relay, no "register to all replicas", no cross-instance dispatch. A second kian is a different
   deployment with a different membership.
-- **No live rebind / retirement / takeover.** R12 guarantees only that the *same* worker id coming
+- **No live rebind / retirement / takeover.** The contract guarantees only that the *same* worker id coming
   back reattaches to its binding. A permanently lost worker ends in the honest timeout. The rebind
   design (durable intent, fencing for the old worker's queued rows, a seq-range projection rule) is
   recorded in ADR-020 §Deferred and ADR-021 §Deferred and is an owner gate, not a spec detail.
@@ -358,7 +357,7 @@ seam.
   (`cancelled` is terminal). The old thread's command rows are never cancelled by a release — the
   release gate requires the queue to have no live row, so there is nothing to cancel.
 - **No mTLS and no per-worker certificates; no token rotation without restart.** Per-worker bearer
-  tokens (ADR-031) narrow the shared-token hole but are not an identity proof; the R13 fix remains
+  tokens (ADR-031) narrow the shared-token hole but are not an identity proof; the planned fix remains
   mTLS. Rotation today is "set a new env value and restart".
 - **No worker pools**: 1:1 stays.
 - **Capabilities are declarations, not authority.** The worker declares them in `register` (v3);
@@ -385,8 +384,8 @@ seam.
 
 ## 10. UNVERIFIED (must stay visible)
 
-- The real v0→v1 upgrade window has not been exercised with an old build in this round; the typed
-  refusal is verified at L1 and the process-level window stays unverified until R12-06 measures it.
+- The real v0→v1 upgrade window has not been exercised with an old build; the typed
+  refusal is verified at L1 and the process-level window stays unverified until it is measured.
 - Process-death windows (kian dying mid-handshake or mid-command, worker dying mid-command) are
   reproduced only where the L2 harness can inject a kill; the L1 fixtures cover the *states* those
   windows leave behind, not the death itself.
@@ -404,7 +403,7 @@ seam.
 - The global `workers.queue_timeout_ms` trade-off is documented, not measured: no test exercises a
   phone-length bound against a static worker's timeout expectation.
 - No L3 (real deployment) evidence exists for this contract.
-- The v1 → v2 upgrade window has not been exercised with a real old worker binary in this round; the
+- The v1 → v2 upgrade window has not been exercised with a real old worker binary; the
   typed refusal is L1 and the queue's legacy-row decode is tested, but the cross-version deployment
   window stays unverified until measured.
 - Binding release/reclaim (ADR-035) is exercised at L1/L2 (state gates, claim+batch, tick, CLI/RPC);

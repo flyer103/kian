@@ -6,8 +6,7 @@
 > config and CLI surfaces, the receive allowlist, dedupe, the cursor bound, and the degradation
 > table. It defines **no** new event kind, **no** new server surface and **no** core concept.
 >
-> Status: **normative** (round 10: contract landed with the adapter by ADR-018; owner-approved
-> route 2026-11-07, L1/L2 landed 2026-11-08 — review PASS after the R10-06a security fix). The
+> Status: **normative** (contract landed with the adapter by ADR-018). The
 > adapter lives in `kian-superagent`, the config/CLI half in `kian-cli`; both are held to this
 > contract. Rationale: [ADR-018](decisions/ADR-018-wechat-ilink-channel.md).
 >
@@ -63,8 +62,8 @@ graph LR
 
 ## 2. Protocol mapping (frozen facts, verified 2026-11-07)
 
-These facts are the frozen design input for round 10. Changing any row is a protocol change and
-starts in this file (§15); it is not re-researched per implementation card.
+These facts are frozen design input. Changing any row is a protocol change and starts
+in this file (§15); it is not re-researched per implementation.
 
 ### 2.1 Endpoints
 
@@ -75,7 +74,7 @@ starts in this file (§15); it is not re-researched per implementation card.
 | Receive | `POST /ilink/bot/getupdates` | `{get_updates_buf, base_info}` | `{ret, errcode, errmsg, msgs[], get_updates_buf, longpolling_timeout_ms}` |
 | Send | `POST /ilink/bot/sendmessage` | `{msg, base_info}` (§2.4) | `{message_id, ret, errmsg}` |
 
-Phase 2 only (not implemented in round 10): `GET /ilink/bot/getconfig` (`typing_ticket`),
+Phase 2 only (not implemented): `GET /ilink/bot/getconfig` (`typing_ticket`),
 `POST /ilink/bot/sendtyping` (`status` 1/2), `msg/notifystart`, `msg/notifystop`, and the media CDN
 `https://novac2c.cdn.weixin.qq.com/c2c`.
 
@@ -393,7 +392,7 @@ stays `Unavailable` after a re-login until the process restarts.
 
 ## 12. Non-goals (phase 2)
 
-Explicitly out of scope for round 10, recorded so they are not silently half-built: inbound media
+Explicitly out of scope, recorded so they are not silently half-built: inbound media
 (image/voice/file/video download and the media CDN), outbound media, typing indicator
 (`getconfig`/`sendtyping`), `notifystart`/`notifystop`, group chats (`group_id` non-empty),
 multi-account (more than one `type: wechat`), proactive push (any send without an inbound
@@ -429,7 +428,7 @@ system proxy).
 **L3 — env-gated, owner-run, never faked**: a real QR scan with a phone, then the unverified items
 of §14 measured and recorded (empty-cursor replay across downtime, `-14` lifetime and re-login
 behavior, `iLink-*`/`base_info` acceptance, the real text-length limit and rate limits). The
-manual steps and their outcomes belong in the round's QA record and CHANGELOG, stated as
+manual steps and their outcomes belong in the verification record, stated as
 unverified until actually executed.
 
 **First live L3 run (2026-11-08, owner phone)** — results, recorded here as evidence:
@@ -488,5 +487,5 @@ code — changes **here first**, and the adapter, its mock and its tests are rec
 change (the EVENT-MODEL discipline applied to the channel). Credential, allowlist, dedupe and
 cursor semantics (§5/§6/§9/§10) also start here; a change that would add a persisted cursor, a new
 event kind, a new server surface, a proactive send or media support needs an ADR, not an edit to
-this file. An upstream protocol break is recorded as a dated note in this section plus the round's
+this file. An upstream protocol break is recorded as a dated note in this section plus a
 CHANGELOG entry, and may park the channel honestly rather than guess.

@@ -176,6 +176,13 @@ when the owner asks. Negative results commit documentation only — never broken
 - `design/decisions/ADR-NNN-*.md` — the why, append-only; superseding writes a new ADR that links
   the old one.
 
+**The docs are timeless.** A design or contract document states what the system does and why, not
+how it got there: never cite iteration rounds, work-item ids, board/ticket paths, gate dates or
+review stamps as authority. Cite the decision record for the why and the observable behavior for
+the what; progress narrative belongs in the pull request or `CHANGELOG.md`. Labels that identify an
+object inside the document itself (goals G1–G6, invariants M1–M10, phases P0/P1, kind ids) stay —
+they are its own vocabulary, not process provenance.
+
 ## README policy
 
 `README.md` is the landing page, not a changelog and not a manual: a stranger should understand it

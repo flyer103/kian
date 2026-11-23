@@ -118,7 +118,7 @@ prefix byte.
 
 ## Non-goals (phase 1)
 
-- mTLS / per-worker certificates (R13) — per-worker bearer tokens narrow the shared-token hole,
+- mTLS / per-worker certificates — per-worker bearer tokens narrow the shared-token hole,
   they do not close it.
 - Static-pin capabilities (`hello.capabilities`); capability-based spawn validation/enforcement.
 - Per-id queue timeouts, rebind, failover, worker pools.

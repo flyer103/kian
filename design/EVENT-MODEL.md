@@ -222,7 +222,7 @@ These keys ride the payload **outside `content`**, are audit-only, and are omitt
   which machine it runs on, and legitimate because only **new** message bytes carry it. Legacy
   wrapper bytes and every persisted `step/request.body` stay untouched, so history is not rewritten
   and no live session's prefix changes as a result of the record itself.
-- `thread/started` / `thread/completed` (R17-C6, MULTIAGENT-MODEL §7.2, P4): `"spawn_uid"` and the
+- `thread/started` / `thread/completed` (MULTIAGENT-MODEL §7.2, P4): `"spawn_uid"` and the
   namespaced `"multiagent"` group — the task facts the audit needs (`task_id`, `assignee`,
   `attempt`, `depends_on[]`, `group?` on the parent's `thread/started`; `task_id`, `assignee` on the
   child's; `task_id`, `outcome`, `evidence_ref?`, `contract?` on the child's `thread/completed`).

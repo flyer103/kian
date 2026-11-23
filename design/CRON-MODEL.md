@@ -8,8 +8,8 @@
 > (`EVENT-MODEL.md`). Execution mechanics are in `DESIGN.md`; session/worker lifecycle is in
 > `WORKER-MODEL.md`.
 >
-> Status: **P0 and P1 landed** ([ADR-034](decisions/ADR-034-cron-scheduler.md), owner gate
-> 2026-11-18; P2 partially: disk-cap GC landed, store-scoped rows designed). This document
+> Status: **P0 and P1 landed** ([ADR-034](decisions/ADR-034-cron-scheduler.md); P2 partially:
+> disk-cap GC landed, store-scoped rows designed). This document
 > **supersedes** the `READ-MODEL.md` §7 "Cadence" scope statement that keeps cron cadence out of
 > scope: retention cadence, schedule cadence and every other wall-clock cadence are owned here.
 > **P0** — config shape, next-fire math, durable cursor, `kian cron list|rm`, `skip` overlap,

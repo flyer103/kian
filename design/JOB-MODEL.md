@@ -9,8 +9,8 @@
 > binding, capability declarations and dispatch by `WORKER-MODEL.md`; delegation and task outcomes
 > by `MULTIAGENT-MODEL.md`.
 >
-> Status: **approved by the owner 2026-11-22; P0 and P1 landed** (the inventory is the
-> **Implementation status** paragraph closing §0).
+> Status: **P0 and P1 landed** (the inventory is the **Implementation status** paragraph closing
+> §0).
 > [ADR-052](decisions/ADR-052-job-model.md) is accepted (the carrier decision, the derivation table
 > and the freeze rule); the amendments it lists in §18.2 land with the code that needs them. Every
 > claim about pre-existing behaviour cites `file:line` and was read, not assumed. The
@@ -98,7 +98,7 @@ sweep-side alerting (§13.3), event triggers, `max_parallel > 1` and cross-run d
 
 ### 1.1 The concrete need
 
-The driving case is one operator's daily digest (`~/kian-scheduler-spec.md`): at 09:00 Asia/Shanghai
+The driving case is one operator's daily digest: at 09:00 Asia/Shanghai
 fetch model rankings, Hacker News and Hugging Face; summarize in Chinese; send one iMessage; report
 whether it *really* left the building; alert if it did not. Today it is a launchd plist running
 `run.sh` on a Mac, which SSHes to a VPS, which calls an LLM over HTTP, which shells back out to a
@@ -120,15 +120,15 @@ alternative — solve the digest with a big prompt plus `&&` — is not a smalle
 absence of one: placement, retry and verification end up encoded in prose, and the runtime cannot
 report on work it cannot name.
 
-### 1.2 What the spec conflates
+### 1.2 What one config object conflates
 
-The spec is a *requirements* document, and it folds four independent decisions into one config
-object: `CronSchedule.steps[]` carries the trigger (cron/tz/catch-up), the plan (steps, depends_on,
-prompt, output_schema), the placement (requires, exec_worker_pin) and the evidence (a delivery poll)
-in one struct. Fusing them is what forces the spec's own open questions (§20, "does
-`max_concurrent` mean per task or per step?"). Separating them answers most of them by construction.
+A single config object folds four independent decisions into one shape. `CronSchedule.steps[]`
+carries the trigger (cron/tz/catch-up), the plan (steps, depends_on, prompt, output_schema), the
+placement (requires, exec_worker_pin) and the evidence (a delivery poll) in one struct. Fusing them
+is what forces the open questions of §20 ("does `max_concurrent` mean per task or per step?").
+Separating them answers most of them by construction.
 
-| Spec ask | Axis | Where it lives today | Gap this contract fills |
+| Ask | Axis | Where it lives today | Gap this contract fills |
 |---|---|---|---|
 | Fire at 09:00 Asia/Shanghai, catch-up `latest` | trigger | `CRON-MODEL.md` §2, §5 — landed | a schedule cannot name a *job*, only a session or a channel topic |
 | Never hardcode a hostname in the work | placement | `WORKER-MODEL.md` §3 capabilities; `worker.rs` registration cache | capabilities exist as a *declaration*; nothing selects on them |
@@ -253,7 +253,7 @@ it loses nothing.
 **J2 — The plan is frozen at admit.** The run's first `input/admitted` carries the canonicalised
 plan and its digest. The conductor executes that plan, byte for byte. A config edit after admit
 never affects a live run; a re-drive re-reads the committed copy. *Why:* constraint 13 plus the
-spec's own R2/R4 (a run must be explainable after the config moved). *Observable:* the run's plan
+requirement that a run stay explainable after the config moved. *Observable:* the run's plan
 digest is on its stream; a mismatch between config and the frozen digest is a fact, not an error.
 
 **J3 — Placement is computed once per attempt and committed before the child exists.** The dispatch
@@ -282,7 +282,7 @@ through one `session/ended`.
 whose checks the plan declared. A child's `completed` end, a zero exit status, and a report that
 merely *claims* success are **never** success by themselves. An attempt that ends without
 evaluable evidence is `unverified`, which is a first-class non-success (AGENTS.md constraint 7;
-the spec's R5 exists precisely because `exit 0` lied).
+the rule exists precisely because `exit 0` lied).
 
 **J8 — A retry is a new attempt, never a re-drive of the old one.** New identity, new child, new
 placement. A step never rebinds a worker, never waits for a worker to come back, and never re-sends
@@ -297,7 +297,7 @@ the previous attempt provably did not reach the effect. Otherwise the outcome is
 bytes}` pointing into committed, immutable event bytes: no TTL, no storage, replayable forever. A
 binary artifact is a blob path + digest + TTL, and a missing blob is `artifact_unavailable`
 (the check fails), never an empty string. An artifact over its declared cap is a **failed attempt**,
-never a truncation (the spec's R4, honoured).
+never a truncation (the cap is a contract, honoured).
 
 **J11 — One clock per stage.** `timeout_ms` bounds exactly one *attempt* and is observed by the
 conductor. `deadline_ms` bounds exactly one *run* and is observed by the conductor. Neither is used
@@ -597,7 +597,7 @@ jobs:
       job: digest
       expr: "0 9 * * *"
       tz: Asia/Shanghai
-      catch_up: latest                 # skip | latest (the spec's run_once); "all" is not a cron policy
+      catch_up: latest                 # skip | latest (run-once); "all" is not a cron policy
       overlap: skip
 
   alerts:
@@ -649,12 +649,12 @@ because no cursor belongs to a plan.
 | `action` | `agent` \| `deliver` | `agent` | `agent`: a child session bound to a worker. `deliver`: an in-conductor channel action (§13). P3 adds `exec` (a bare endpoint command, no model). |
 | `prompt` | string | — | Required for `agent`. The task message, verbatim, plus the frozen inputs. |
 | `requires` | string[] | `[]` | Capability names the worker must declare (`crates/kian-core/src/worker.rs:13-33`: ≤16, ≤64 bytes, `[a-z0-9]` first then `[a-z0-9._-]`). `[]` = any worker. |
-| `pin` | string | absent | Exact worker id; when present, `requires` must be a subset of that worker's declared capabilities (V6). Renamed from the spec's `exec_worker_pin` to match the existing `exec_worker` verb. |
+| `pin` | string | absent | Exact worker id; when present, `requires` must be a subset of that worker's declared capabilities (V6). Named `pin` to match the existing `exec_worker` verb. |
 | `allow_offline` | bool | `false` | Admit an `Offline` worker as the last-ranked candidate (§9.2). Default `false`: a step cannot progress without tools, so dispatching to an offline worker is a guaranteed timeout. |
 | `prefer` | string[] | the job's `limits.prefer`, else `[]` | Worker ids this step would rather run on, in order; a *soft* tie-break inside the deterministic sort key (§9.3). Ids that are absent or unrecognised rank nothing and never fail a load — a preferred machine may simply be gone today. Distinct from `pin`, which is a hard constraint. |
 | `depends_on` | string[] | `[]` | Step ids that must reach a success outcome first (§8.1). |
 | `inputs` | ref[] | `[]` | `{step, name}` artifact references; the producer's `produces.name` must exist (V5). |
-| `produces` | spec | absent | `{name, media: text\|binary, max_bytes}`. At most one per step in v1; absent = no artifact (§12). |
+| `produces` | object | absent | `{name, media: text\|binary, max_bytes}`. At most one per step in v1; absent = no artifact (§12). |
 | `output_schema` | object | absent | JSON object passed to the child as its structured-output tool schema (the existing `WorkerSpawner` `output_schema` path, `crates/kian-superagent/src/worker.rs:984`). |
 | `timeout_ms` | u64 | `300000` | One attempt (§8.5). Observed, not enforced, for `agent` steps — see §8.5's honesty box. |
 | `retries` | u8 | `0` | Extra attempts: total = `retries + 1`, ≤ 5 (V8). |
@@ -714,7 +714,7 @@ stated. `deny_unknown_fields` on every struct, matching `CronSection`.
 | V22 | `prefer` entries are non-empty, ≤ 128 bytes, unique within one list | `invalid prefer list` |
 
 V21 deserves its own sentence: a plan that cannot produce evidence is not a plan, it is a prompt with
-extra steps. The spec's R5 is the reason.
+extra steps. Evidence is the reason.
 
 ## 8. Readiness, dispatch, observation, retries
 
@@ -758,7 +758,7 @@ For one ready step, attempt `n`:
    sequence idempotent; it costs one scan of the run's own stream.)
 3. **Select placement** (§9): candidates from `requires`/`pin` × the binding view; deterministic
    order; empty ⇒ the run fails `no_candidate` with the candidate table in the verdict and **no
-   child is created** (the spec's "no available worker within 5 s" — satisfied in microseconds, at
+   child is created** ("no available worker within 5 s" — satisfied in microseconds, at
    refusal time, not by a timeout).
 4. **Commit the dispatch record**: one `thread/started` on the **run** stream carrying
    `{thread_id, parent: run_session, worker: <chosen worker session or "" for deliver>, pinned_version,
@@ -913,16 +913,16 @@ candidates(step, catalog) :=
 `catalog` is the existing `WorkerDirectoryPort` (`crates/kian-superagent/src/directory.rs`):
 read-only, disposable, no events, no rows, no wakes; capabilities are sanitized declarations
 (`crates/kian-core/src/worker.rs`, `MAX_CAPABILITIES = 16`). Two properties are inherited and stated
-because the spec's requirements depend on them:
+because the requirements depend on them:
 
 * **Capability is a declaration, not authority** (`design/WORKER-MODEL.md` §9; J15). A worker that
   *declares* `net.unrestricted` but lacks the network is simply a step that fails. Nothing in the
-  selector can grant or verify a privilege — so the spec's R7 "capability used to refuse privilege
+  selector can grant or verify a privilege — so "capability used to refuse privilege
   escalation" is realised as *selection*, and enforcement stays with the worker's own tool grants.
 * **An offline worker is still a valid binding target** (`design/WORKER-MODEL.md`): the child session
   is server-side; only its tool calls park. A *step*, however, cannot progress without tools, so an
   `Offline` worker is admitted only when the step declares `allow_offline: true` (default `false`,
-  §7.2). That default is what makes the spec's "no available worker within 5 s" true by
+  §7.2). That default is what makes "no available worker within 5 s" true by
   construction instead of by a 300 s timeout, and the dispatch record's rationale names the state
   rank it used, so "the digest ran on a worker that was asleep" is explainable after the fact.
 
@@ -938,7 +938,7 @@ repeat-exclusion  := { w | w is the worker of any earlier attempt of this step,
 The repeat exclusion is **derived, not stored**: every earlier attempt's `thread/started.job` record
 (A2) names its worker and attempt number, so the set is a pure function of the run stream (J1). It
 exists because a retry is a second chance *on a different machine*, not a coin flip on the same one.
-Without it the spec's "vultr is down ⇒ deliver locally" fails permanently: a still-`Online` vultr
+Without it "vultr is down ⇒ deliver locally" fails permanently: a still-`Online` vultr
 whose network just died keeps winning the same sort key, so every retry repeats the same failure. A
 step whose exclusions empty the admissible set fails `no_candidate`, and the verdict's `detail` names
 which exclusion did it ("no worker declares `net.unrestricted`" vs "`vultr` already failed attempt
@@ -954,8 +954,9 @@ declared_rank := index in the step's prefer:[worker_id, ...] list
 id            := worker id, byte order
 ```
 
-Total, deterministic, and computable by any reader from the catalog plus the config. The spec proposed
-"online → most recent success → lexicographic". **Most recent success is dropped**, deliberately:
+Total, deterministic, and computable by any reader from the catalog plus the config. A plausible
+"online → most recent success → lexicographic" rule was considered. **Most recent success is dropped**,
+deliberately:
 
 * it is hidden global state (which run succeeded where) that a restarted server recomputes
   differently if any history is pruned;
@@ -982,7 +983,7 @@ A candidate whose binding view says it already carries a live binding is skipped
 | `candidates ≠ ∅` but all busy | **transient contention** | defer the step; re-try placement on a later tick; after `defer_budget_ms` (default 300000) fail `no_candidate` | a deferral writes **nothing** (a verdict per tick would flood the stream); the eventual refusal writes the same one-verdict shape with `checks: [{name: "all_busy", detail}]` |
 | chosen worker refused at admit (`busy` race, stale cache) | **race** | skip to the next candidate in the same tick; if none, treat as "all busy" | the dispatch failure settles the attempt `failed` with `checks: [{name: "dispatch", detail}]` |
 
-This split is what the spec's R3 actually needs: "empty candidate ⇒ fail + alert" (a typo in
+This split is what the rule "empty candidate ⇒ fail + alert" actually needs (a typo in
 `requires` must be loud, immediately) versus "the only capable worker is busy right now" (must wait,
 and must not silently drop the day's digest).
 
@@ -1186,7 +1187,7 @@ and the next tick re-harvests under the same `call_id`, so the pair is idempoten
 
 ### 12.2 Caps, and the refusal to truncate
 
-* `produces.max_bytes` in `1..=262144` (the spec's 256 KiB), validated at load (V11).
+* `produces.max_bytes` in `1..=262144` (256 KiB), validated at load (V11).
 * Over-cap = **attempt failure**, verdict `artifact_within_cap: false` with the observed size in
   `detail`. Never truncation: a truncated digest is a wrong digest that looks right.
 * Inlining into the next step's message has its own cap (`limits.inline_max_bytes`, default 65536).
@@ -1196,7 +1197,7 @@ and the next tick re-harvests under the same `call_id`, so the pair is idempoten
 * Binary (`media: binary`) is **designed, not v1**: it needs a worker-to-server upload seam plus a
   blob root, neither of which exists (`design/EVENT-MODEL.md` has no artifact kind and the worker
   surface has no upload tool). V11 refuses `media: binary` in v1 with `binary artifacts are P3`. The
-  spec's "binary by reference only" is therefore honoured *by refusal*, which is the honest reading:
+  "binary by reference only" is therefore honoured *by refusal*, which is the honest reading:
   a reference to bytes the runtime cannot fetch is not a reference.
 
 ### 12.3 What the run stream does *not* carry
@@ -1210,25 +1211,25 @@ with 32 steps and 32 artifacts adds about 32 small tool pairs. That is the whole
 
 ### 13.1 Why delivery is a conductor action, not an agent step
 
-The spec models delivery as a worker step with an `imessage.send` capability, plus a hand-rolled poll
-of `chat.db` for `is_sent = 1 AND error = 0`. kian already does better, and the model must not
-regress it:
+A worker step with an `imessage.send` capability, plus a hand-rolled poll of `chat.db` for
+`is_sent = 1 AND error = 0`, is the obvious first model. kian already does better, and the design
+must not regress it:
 
 * the channel adapter is **server-side** (`ChannelAdapter::send`, `crates/kian-core/src/seams.rs:357`;
   iMessage implementation in `crates/kian-superagent/src/imessage.rs:539` next to the bridge client);
 * the recipient allowlist is the topics table, and an off-allowlist target is an honest
   `DeliveryFailed` — *the send path is the enforcement point*;
 * the adapter returns an honest receipt or an honest error with a disposition
-  (`not_started` / `may_have_completed` / `still_in_flight`), which is precisely the spec's R5
+  (`not_started` / `may_have_completed` / `still_in_flight`), which is precisely
   "success = a real delivery receipt", already implemented;
 * a worker-executed `imsg send` would bypass the allowlist, the echo guard, the part splitting, and
   the honest dispositions, and would replace a verified receipt with an exit status — the exact
-  failure the spec is trying to escape.
+  failure this design exists to escape.
 
 So a `deliver` step runs **in the conductor's own drain**, on the server, through the mounted
 `ChannelRegistry` (the same adapter instance the Router's `reply` tool uses). The delivery is
 consequently *not* placed: there is no worker candidate, no capability, no binding. This is also why
-the spec's R7 "the vultr worker must be refused for iMessage delivery" needs no rule: a worker is
+the requirement "the vultr worker must be refused for iMessage delivery" needs no rule: a worker is
 never a candidate for a delivery in the first place.
 
 ### 13.2 The deliver step, step by step
@@ -1290,7 +1291,7 @@ session for slot `alert:<failed_run_id>`. Consequences, all desirable:
   whose own failure alerts nobody (an alert job has no `on_failure_of` — V20 forbids chains).
 * **Independence is validated, not assumed** (V12): an alert whose channel equals a delivery channel
   of the failing job is a config error, because the commonest failure mode *is* that channel being
-  down. The spec's R6 asks exactly for this.
+  down. The rule exists exactly for this.
 * **The alert is itself evidenced**: its run has a receipt on its own stream, so "we alerted" is a
   fact, not a claim.
 * The alert's own delivery failure does not retry forever: it follows 13.2 (unknown leads to
@@ -1302,7 +1303,7 @@ settlement sweep still marks the firing failed after its stranded grace
 operator surface (`kian job status`, `kian cron logs`); the designed fix is sweep-side alerting (a
 sweep that admits the alert row when it settles a failed firing), P2.
 
-### 13.4 The spec's kill switch
+### 13.4 The kill switch
 
 `KIAN_DIGEST_DISABLE=1` is a shell-level kill switch, and kian's equivalent is the trigger's
 `enabled: false` (`design/CRON-MODEL.md`: declared-but-off schedules are validated and listed, never
@@ -1496,7 +1497,7 @@ primitive (last)**. The job model is deliberately almost entirely rungs 1 and 2.
 |---|---|---|
 | **1 — config** | the `jobs:` section (§7.1); triggers lowered into the existing cron runtime vector; validation V1–V21 at load | Nothing new is *executed* by configuration: it describes a plan that the conductor interprets. Config is already the only way a schedule exists (`design/CRON-MODEL.md` §11). |
 | **2 — plugin (bundle)** | the `JobLoopDriver` decorator, the plan/step types, the readiness and settlement functions, the two job-owned checks, the `deliver` action, the status projection, the `kian job` verb group | All of it is policy: which step runs where, when a retry is legal, what counts as success. Each is a decision inside a drain, which is the bundle's licence (`design/DESIGN.md` §4.7, constraint 10). |
-| **3 — seam (with an ADR)** | *not taken in v1*; named if ever needed: (a) a cancellation seam so `control/interrupt` cancels an in-flight tool future, making step timeouts *enforced* (§8.5); (b) a channel-side idempotency key so send-then-crash can be retried (closes W7); (c) a worker-to-server artifact upload seam for binary artifacts (§12) | Each is a real seam, each needs its own ADR, none is needed to run the spec's case |
+| **3 — seam (with an ADR)** | *not taken in v1*; named if ever needed: (a) a cancellation seam so `control/interrupt` cancels an in-flight tool future, making step timeouts *enforced* (§8.5); (b) a channel-side idempotency key so send-then-crash can be retried (closes W7); (c) a worker-to-server artifact upload seam for binary artifacts (§12) | Each is a real seam, each needs its own ADR, none is needed to run the driving case |
 | **4 — core primitive** | *nothing* | A `job` table, a `Run` entity or a dispatcher daemon would each be pre-event state (ADR-014) and would contradict J1 and §4.1 of `design/MULTIAGENT-MODEL.md` |
 
 The narrow-waist test holds: `kian-core`, `kian-store` and `kian-orchestrator` gain **no** code, and
@@ -1601,14 +1602,14 @@ discipline.
 | Level | Test | Proves |
 |---|---|---|
 | L1 | canonical plan JSON and `plan_digest` against a golden fixture | J2's freeze is byte-stable across restarts and refactors |
-| L1 | `admissible()` truth table: capability mismatch, offline worker, `allow_offline`, repeat exclusion, empty set | §9.2's exclusions, including the spec's vultr-down case |
+| L1 | `admissible()` truth table: capability mismatch, offline worker, `allow_offline`, repeat exclusion, empty set | §9.2's exclusions, including the vultr-down case |
 | L1 | attempt lattice and run lattice as pure functions over synthetic verdict lists | §11's first-match-wins and the rule that `unverified` is never `succeeded` |
 | L1 | a registry test: every event kind the conductor writes is one of EVENT-MODEL's 24 | "no new event kind" is checked, not asserted |
 | L2 | config lowering: `jobs.triggers` becomes `CronRuntimeSchedule { target: Job }`, and the user-facing schema **rejects** `target.job` | one scheduler, no second config surface |
 | L2 | conductor crash simulation: kill the drain mid-tick at each of W1–W8 and re-drive | §17's table is executable, not prose |
 | L2 | the deliver action against a fake adapter for every `SendDisposition` | §13.2's receipt discipline and the `needs_operator` branches |
-| L3 | the digest end to end: real trigger, real worker, real iMessage adapter to a test handle; assert the receipt event, never a process exit code | the spec's acceptance lines (§19.3) |
-| L3 | worker fallback: the selected worker goes offline, the next candidate wins; both unavailable, the step refuses within seconds and the run raises exactly one alert | the two scenarios the spec cares most about |
+| L3 | the digest end to end: real trigger, real worker, real iMessage adapter to a test handle; assert the receipt event, never a process exit code | §19.3's acceptance lines |
+| L3 | worker fallback: the selected worker goes offline, the next candidate wins; both unavailable, the step refuses within seconds and the run raises exactly one alert | the two scenarios that matter most |
 
 **As landed (P0–P1).** The rows above are executed at these levels. The canonical-bytes and
 digest row is pinned by a golden fixture (`crates/kian-superagent/src/job/plan.rs`); the admissible
@@ -1667,7 +1668,7 @@ tick after the deadline.
 **P1 — the plan is a DAG.** `depends_on`, `inputs`/`produces` as text artifact refs, per-step
 `retries` with the derived backoff, per-step `timeout_ms`, `deadline_ms`, the attempt and run lattices
 in full, and the effect ledger's `needs_operator` outcome.
-*Exit:* the spec's three-step digest (fetch → summarize → deliver) with the fetch retried once on a
+*Exit:* the three-step digest (fetch → summarize → deliver) with the fetch retried once on a
 second worker, and a forced timeout producing `timed_out` rather than a hang.
 
 **P2 — the operating surface.** `accept_unverified`, `kian job resume --assume-no-effect`, schema
@@ -1684,12 +1685,12 @@ cancellation seam, and per-step cost accounting from `turn/end` usage.
 1` with the exclusivity view hardened; cross-run dependencies.
 *Exit:* two jobs chained by "when B's artifact appears in A" without a new mechanism.
 
-### 19.3 The spec's acceptance lines, mapped
+### 19.3 Acceptance lines, mapped
 
-Each line of `~/kian-scheduler-spec.md`'s acceptance section becomes an observable predicate, a
-verification level, and the phase that first proves it.
+Each acceptance line becomes an observable predicate, a verification level, and the phase that
+first proves it.
 
-| The spec asks | The observable predicate | Level | Phase |
+| The requirement | The observable predicate | Level | Phase |
 |---|---|---|---|
 | three days at 09:00, each with `chat.db` showing `is_sent = 1` | three run streams whose end carries `job.outcome = succeeded` and whose deliver step has a `channel/delivered` receipt; the `call_id` on the receipt is the message that landed | L3 | P0 |
 | vultr down, the digest still arrives | an attempt 1 `timed_out` on the remote worker, attempt 2 `succeeded` on the local one, both in the same run stream | L3 | P1 |
@@ -1700,7 +1701,7 @@ verification level, and the phase that first proves it.
 | `KIAN_DIGEST_DISABLE=1`: no delivery, no alert storm | the trigger's `enabled: false` ⇒ the sweep skips the slot with reason `disabled`; no run, therefore no alert | L1 | P0 |
 | fetch with `timeout_ms: 1000` fails the firing with a timeout error kind | the attempt is `timed_out` and the run's end carries `reason: "timeout"`; the cron firing is `failed` with the same reason | L2 | P1 |
 
-Two of these deserve a note because the spec's phrasing hides an ambiguity:
+Two of these deserve a note because the phrasing hides an ambiguity:
 
 * **"no duplicate delivery" cannot be absolute.** The honest statement is at-most-one receipt *and* at
   most one intent per attempt, with the send-then-crash window (W7) surfacing as `needs_operator`
@@ -1727,26 +1728,26 @@ The rollback story is the reason the footprint matters.
   explains what was sent, even though nothing will send again.
 * **In-flight runs** are listed by `kian job list --active` and stopped by `kian job cancel <run>`,
   which is a control-plane row and therefore legal at any moment (constraint 9).
-* **The spec's ten uncommitted changes** (§7 of the spec's risk list) are not a reason to widen this
-  change: the job model touches no file those changes touch, except `crates/kian-cli/src/config.rs`
-  and `main.rs`, which are the two files any config-shaped feature must touch regardless.
+* **Unrelated in-progress edits** are not a reason to widen this change: the job model touches no
+  file they touch, except `crates/kian-cli/src/config.rs` and `main.rs`, which are the two files any
+  config-shaped feature must touch regardless.
 
-## 20. The spec's own open risks, answered
+## 20. Open risks, answered
 
-The spec closes with a list of things it could not settle. Each gets a decision here, with the reason
-and the place it lands, because an unanswered risk in a spec becomes an argument in review.
+Open questions are settled here, each with its decision, the reason for it and the place it
+lands, because an unanswered risk becomes an argument in review.
 
-| The spec's worry | Decision | Why |
+| The open question | Decision | Why |
 |---|---|---|
 | Is the capability vocabulary an enum or an open string? | **An open, validated, namespaced string.** Not an enum. | An enum needs a recompile per capability, which contradicts the config-first ladder and would make a new machine's abilities a release event. `crates/kian-core/src/worker.rs` already owns the grammar (lowercase start, then `[a-z0-9._-]`, ≤ 64 bytes, ≤ 16 per worker, sanitized) and the plan's `requires` is validated by the same function, so there is exactly one definition. Governance is three small rules: capabilities are *properties of a machine*, never of a person or a task; the dotted prefix names the domain (`net.`, `fs.`, `channel.`) so a vocabulary can grow without collisions; and a plan may ship before the worker that satisfies it (a load-time warning, a dispatch-time `no_candidate`) so configuration and fleet move independently. |
 | A worker cannot be *verified* to honour a capability it declares. | **Accepted, and moved out of the trust boundary.** | This is `design/WORKER-MODEL.md` §9's position and it is the right one: a capability is a claim used for *eligibility*, and a claim can be wrong. What must not be claimed is enforcement. The protection comes from the shape of the effects instead: a sensitive effect is a conductor action (delivery, which never enters a worker), and everything else is verified *after the fact* by a check on the produced artifact or receipt. A worker that lies produces a failed verdict, not a silent privilege escalation. |
 | Artifact location and TTL cleanup. | **Text artifacts have no location and no TTL** (they are refs into immutable streams, §12). Binary artifacts are not in v1. | Adding a blob store now would add the first mutable content store to a system whose axiom is that history is immutable. When binary lands (P3), GC is a refcount scan over run streams and TTL is a *completeness* bound, not a disk-reclaim mechanism: a missing blob is `artifact_unavailable`, never a truncated file. |
 | Timezone and DST, "later". | **Already solved, not by this contract.** | `kian-cron` carries IANA zones, the gap-is-skip and overlap-is-run-once rules, and DST tests (`design/CRON-MODEL.md` §2). The job model inherits them by lowering triggers into the same runtime vector. Its only clock statement is §8.7: a run's deadline is measured from *event* timestamps, so a wall-clock jump stretches a deadline instead of expiring a run. |
-| Does `max_concurrent` mean per task or per step? | **Two distinct names, never one word.** The trigger's existing `max_concurrent` bounds *runs of one schedule* and keeps its cron meaning. The new `limits.max_parallel` bounds *steps of one run* and is 1 in v1. | The spec conflated them because it only ever had one step. Two knobs with two names cost nothing and avoid the class of bug where raising one silently changes the other. |
+| Does `max_concurrent` mean per task or per step? | **Two distinct names, never one word.** The trigger's existing `max_concurrent` bounds *runs of one schedule* and keeps its cron meaning. The new `limits.max_parallel` bounds *steps of one run* and is 1 in v1. | The two were conflated because early designs only ever had one step. Two knobs with two names cost nothing and avoid the class of bug where raising one silently changes the other. |
 | Capability used to *forbid* privilege escalation (the vultr worker must never send iMessage). | **Structural, not policed.** | A `deliver` step is not placed at all: it runs in the conductor, against the server-side channel adapter with its allowlist and echo guard (§13). No worker is ever a candidate for a send, so the escalation cannot be expressed, let alone attempted. This is stronger than a selector rule and needs no configuration. |
 | Secrets "env or a 0600 file, never in logs". | **The plan holds no secrets, and the conductor never reads one.** | A step's credentials are the worker's own launch environment (`design/WORKER-MODEL.md` §6, env-only tokens); the server-side secrets a deliver step needs live in the adapter's own config. Two consequences follow: prompts are *persisted* (constraint 2), so a secret typed into a prompt is persisted forever — hence validation V17 rejects secret-shaped literals in step text; and a deliver step's target comes from configuration, never from model output, so a prompt injection cannot redirect a message. |
 | `retries` semantics. | **`retries` means extra attempts**: total = `retries + 1`, capped at 5, and additionally bounded by the run's attempt budget (§8.6). | Matches `crates/kian-superagent/src/outbox.rs`'s `MAX_ATTEMPTS = 6` shape (initial + 5) without importing the constant, and it is the reading that makes `retries: 0` mean "do not retry", which is what an operator expects. |
-| Same-day idempotence (R1). | **The slot token is the idempotency key, and a manual run is a different slot.** | `{job}@{slot}` with `slot = fire_time` for cron, `manual:<ULID>` for a person, `alert:<run>` for an alert (§6). Claiming the slot is the existing `claim_firing` insert-first-wins (`crates/kian-store/src/cron.rs`), so a double tick, a restart and a catch-up sweep all converge on one run. A manual run cannot collide with a cron run because it is a different token — and it *should* be able to, since a person asking twice is two requests. |
+| Same-day idempotence. | **The slot token is the idempotency key, and a manual run is a different slot.** | `{job}@{slot}` with `slot = fire_time` for cron, `manual:<ULID>` for a person, `alert:<run>` for an alert (§6). Claiming the slot is the existing `claim_firing` insert-first-wins (`crates/kian-store/src/cron.rs`), so a double tick, a restart and a catch-up sweep all converge on one run. A manual run cannot collide with a cron run because it is a different token — and it *should* be able to, since a person asking twice is two requests. |
 | The ten uncommitted changes on the branch. | **Not a reason to widen or narrow this design.** | They are unrelated working-tree state. §19.4 states the real rollback: delete the config section; the additive surface means no migration. |
 
 ## 21. Open questions, and what is deliberately not here
@@ -1758,7 +1759,7 @@ blocks P0.
 
 | # | Question | Current position | When it must be settled |
 |---|---|---|---|
-| Q1 | Does the conductor need `max_parallel > 1` at all? | No. v1 is 1, and the exclusivity view is explicitly a best-effort projection until it is hardened. Sequential steps already cover every case the spec has. | P4, with the binding view's CAS story |
+| Q1 | Does the conductor need `max_parallel > 1` at all? | No. v1 is 1, and the exclusivity view is explicitly a best-effort projection until it is hardened. Sequential steps already cover every case that matters. | P4, with the binding view's CAS story |
 | Q2 | Does `pin` survive? | Yes, as an operator escape hatch (a plan can name a specific machine), validated ⊆ the declared set and never a substitute for `requires`. It is *not* a scheduling feature; when it makes a plan non-portable that is the plan author's explicit choice. | already settled here; revisit if a fleet wants per-plan affinity |
 | Q3 | Is `deliver` really a step, or a special run-level field? | A step. Uniform verification, uniform status, uniform alerting outweigh the special-casing, and the fact that it is *not placed* is expressed as policy on the step, not as a second kind of thing in the schema. | keep |
 | Q4 | Should verification be an open DSL? | No. `CheckSpec` in `crates/kian-loop/src/evidence.rs` is a closed enum for a reason: a check must be a pure predicate the reviewer can read. P2 adds exactly one more (`report_matches_schema`) rather than a language. | P2, if a second real need appears |
@@ -1792,7 +1793,7 @@ Stated explicitly so no reader assumes these exist, and so the phase plan above 
 
 ## Closing: what this contract claims, and what it asks the owner to decide
 
-**The claim.** The scheduler spec is not a request for a scheduler. It is a request for four
+**The claim.** The driving case is not a request for a scheduler. It is a request for four
 separable things — *when* (trigger), *what* (plan), *where* (placement) and *whether it really
 happened* (evidence) — and only the first of those already exists. Adding the other three as
 vocabulary inside the existing engine, rather than as an engine beside it, is what makes the
