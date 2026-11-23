@@ -73,7 +73,7 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
 ## Commands
 
 ```bash
-./scripts/selfcheck.sh     # all four gates, serialized exactly as CI runs them
+./scripts/selfcheck.sh     # pre-push scope: the full gates when the change can break the workspace
 cargo build --workspace
 cargo test  --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -81,11 +81,14 @@ cargo fmt --all -- --check
 ```
 
 These are the CI gates on every push ([`.github/workflows/gates.yml`](.github/workflows/gates.yml)).
-`scripts/selfcheck.sh` is the same set in the same serialized shape; the pre-push hook calls it, so
-enable it once per clone with `git config core.hooksPath .githooks` (`KIAN_SELFCHECK=quick git push`
-skips the suite, `KIAN_SELFCHECK=off git push` skips the hook entirely). A red CI run is then the
-exception, not the first evidence. A docs-only change that skips the full workspace run must still
-keep links and crate mappings consistent: `cargo test -p kian-cli --test docs_map`.
+`scripts/selfcheck.sh` is the pre-push body and defaults to `scoped`: a docs-only diff runs
+`docs_map`, a crate change builds the workspace (dependents still compile) and runs that crate's
+clippy and serialized tests, and a workspace-level change — any `Cargo.toml`/`Cargo.lock`,
+`kian-core`, `kian-store`, `kian-orchestrator` — runs the full set. `KIAN_SELFCHECK=full` forces the
+full set, `quick` runs fmt + clippy only, `off` skips the hook entirely; CI is unchanged and still
+runs every gate on every push, so a local green is a prediction, not a substitute. Enable the hook
+once per clone with `git config core.hooksPath .githooks`. A docs-only change must still keep links
+and crate mappings consistent — `cargo test -p kian-cli --test docs_map`, which the scoped hook runs.
 
 ## Repo layout
 
