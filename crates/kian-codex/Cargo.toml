@@ -12,7 +12,7 @@ categories.workspace = true
 
 [dependencies]
 kian-core.workspace = true
-kian-harness = { path = "../kian-harness", version = "0.1.0" }
+kian-harness = { path = "../kian-harness", version = "0.2.0" }
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
