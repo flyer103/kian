@@ -181,7 +181,7 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         // The cron resident sink (`EngineTurn`): a scheduled firing is an
         // internal producer (operator config, same class as a watchdog timer),
         // so it bypasses `admit/pre` by the §3.4.3 matrix (CRON-MODEL §6.1).
-        // ADR-059 (P4) adds the deferred delivery path through one shared
+        // ADR-060 (P4) adds the deferred delivery path through one shared
         // helper: the textual .admit( sites are the helper's engine call plus
         // its two callers (immediate deliver and deliver_at), one producer.
         file: "kian-cli/src/cron_engine.rs",
@@ -189,6 +189,33 @@ const PRODUCER_FILES: &[ProducerFile] = &[
     },
     ProducerFile {
         file: "kian-cli/src/superagent.rs",
+        admits: 2,
+    },
+    ProducerFile {
+        // `kian job run` / `kian job cancel` admit the operator's control rows
+        // directly: a manual slot and a cancel are internal producers (operator
+        // intent, the same class as a watchdog timer), not inbound channel
+        // traffic, so they bypass `admit/pre` by the §3.4.3 matrix
+        // (JOB-MODEL §15.3).
+        file: "kian-cli/src/job_cli.rs",
+        admits: 2,
+    },
+    ProducerFile {
+        // The alert sink: a failed run admits one alert run's first row through
+        // `AlertPort` (JOB-MODEL §13.3). An alert is an internal producer of the
+        // completion class, so it bypasses `admit/pre` by the §3.4.3 matrix.
+        file: "kian-cli/src/job_runtime.rs",
+        admits: 1,
+    },
+    ProducerFile {
+        // The conductor's admissions are a step's child task rows, and they go
+        // through `WorkerSpawner::admit` (the row above), the same path the
+        // Router uses — the conductor writes no inbox row itself. Both call
+        // sites are the same producer class (§8.3): a fresh dispatch admits the
+        // row it just recorded as `thread/started`, and the re-drive of a
+        // recorded dispatch (f9113ef) admits the child its ids derive to. It
+        // appears here because the count is textual (JOB-MODEL §8.3).
+        file: "kian-superagent/src/job/conduct.rs",
         admits: 2,
     },
     ProducerFile {

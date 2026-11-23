@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 kian-core.workspace = true
@@ -40,12 +44,12 @@ kian-exec.workspace = true
 kian-cron.workspace = true
 chrono.workspace = true
 # the pricing book's peak windows and holidays are IANA-timezone
-# aware (ADR-052): wall-clock windows, never a fixed UTC offset.
+# aware (ADR-053): wall-clock windows, never a fixed UTC offset.
 chrono-tz.workspace = true
 kian-sdk.workspace = true
-# the client-side web tools bundle (ADR-056): config-gated web_search/web_fetch.
+# the client-side web tools bundle (ADR-057): config-gated web_search/web_fetch.
 kian-web.workspace = true
-# the client-side media tools bundle (ADR-060): config-gated image_ocr /
+# the client-side media tools bundle (ADR-061): config-gated image_ocr /
 # audio_transcribe / speech_synthesize over the artifact store.
 kian-media.workspace = true
 # webhook receiver: HMAC-SHA256 over the raw body (sha2 already
@@ -58,7 +62,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
-# the channel-edge media processor (ADR-061) speaks the ADR-060 HTTP
+# the channel-edge media processor (ADR-062) speaks the ADR-061 HTTP
 # contract; its tests drive a real mock server, like the media crate's.
 wiremock.workspace = true
 # the rate-limit rejection's audit line is asserted by capturing

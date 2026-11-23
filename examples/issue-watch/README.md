@@ -23,7 +23,7 @@ kian serve --config kian.yaml                     # terminal 1
 ./run.sh                                          # terminal 2: submit the charter, follow the stream
 ```
 
-Open an issue on `flyer103/kian` (or change `github.poll.repo` in `kian.yaml` to your own repo).
+Open an issue on `flyer103/kian-runtime` (or change `github.poll.repo` in `kian.yaml` to your own repo).
 Within one poll interval the Router judges it and a worker drafts a comment.
 
 `DRY_RUN` is fail-closed: the worker only posts when `DRY_RUN=0` is exported. Everything else is a

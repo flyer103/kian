@@ -111,6 +111,7 @@ pub mod github;
 pub mod imessage;
 pub mod inbox;
 pub mod intake;
+pub mod job;
 pub mod lark;
 pub mod metrics;
 pub mod mock;

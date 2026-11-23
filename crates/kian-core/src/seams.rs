@@ -217,7 +217,7 @@ pub enum LoopOutcome {
     /// policy table.
     SoftFailed { reason: String },
     /// The session-lifetime token budget refused the next provider
-    /// request (ADR-054): the drain ends `awaiting_budget` (resumable,
+    /// request (ADR-055): the drain ends `awaiting_budget` (resumable,
     /// running -> idle) instead of spending past the limit. `budget` is
     /// the projection the gate evaluated (`limit`, `raised`, `spent`,
     /// `estimate`), carried for the end-of-drain audit line.

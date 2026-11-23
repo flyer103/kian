@@ -62,14 +62,14 @@ pub struct ServeConfig {
     pub agent: AgentConfig,
     /// openai-compatible endpoints the slots may target.
     pub providers: BTreeMap<String, ProviderConfig>,
-    /// The `pricing:` section (ADR-052): the read-only cost projection's
+    /// The `pricing:` section (ADR-053): the read-only cost projection's
     /// price book. Absent = no pricing; `kian cost` reports unavailable.
     #[serde(
         default,
         skip_serializing_if = "crate::pricing::PricingConfig::is_empty"
     )]
     pub pricing: crate::pricing::PricingConfig,
-    /// The `model_profiles:` section (ADR-052): declarative provider/model
+    /// The `model_profiles:` section (ADR-053): declarative provider/model
     /// capability metadata. Parsed and validated here; the request planner
     /// consumes it from phase 1.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -155,19 +155,19 @@ pub struct ServeConfig {
     /// only (no wildcard in OSS).
     #[serde(default)]
     pub api: ApiConfig,
-    /// The `artifacts:` section (ADR-055, P2). `None` (the section
+    /// The `artifacts:` section (ADR-056, P2). `None` (the section
     /// absent) is tool-result spill **off**: every result stays inline
     /// and the event bytes are legacy-identical. Present parses
     /// fail-closed and mounts the `artifact_read` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<ArtifactsConfig>,
-    /// The `web:` section (ADR-056, P2b). `None` (the section absent)
+    /// The `web:` section (ADR-057, P2b). `None` (the section absent)
     /// is client-side web tools **off**: the tool set is byte-identical
     /// and no provider key is read. Present mounts `web_search` /
     /// `web_fetch` beside the local tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<WebConfig>,
-    /// The `defer:` section (ADR-059, P4). `None` (the section absent)
+    /// The `defer:` section (ADR-060, P4). `None` (the section absent)
     /// is off-peak deferral **off**: an API `defer` request is refused,
     /// a cron schedule cannot declare `defer: off_peak`, and every
     /// admission stays byte-identical to before. Present parses
@@ -175,7 +175,7 @@ pub struct ServeConfig {
     /// due-wake sweep in serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defer: Option<DeferConfig>,
-    /// The media: section (ADR-060, P5a). None (the section absent) is
+    /// The media: section (ADR-061, P5a). None (the section absent) is
     /// client-side media tools off: the mounted tool set is
     /// byte-identical and no provider key is read. Present requires an
     /// artifacts: section and mounts image_ocr / audio_transcribe /
@@ -518,7 +518,7 @@ impl Default for ToolsConfig {
     }
 }
 
-/// The `artifacts:` section (ADR-055, P2): tool-result spill.
+/// The `artifacts:` section (ADR-056, P2): tool-result spill.
 ///
 /// ```yaml
 /// artifacts:
@@ -573,7 +573,7 @@ impl ArtifactsConfig {
 }
 
 /// The `artifacts.gc:` sub-section: pure retention, no reference counts
-/// (ADR-055 decision 6). A `0` turns that dimension off.
+/// (ADR-056 decision 6). A `0` turns that dimension off.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactGcConfig {
@@ -583,7 +583,7 @@ pub struct ArtifactGcConfig {
     /// Keep blobs at least this many days.
     #[serde(default = "default_artifact_retention_days")]
     pub retention_days: u64,
-    /// Serve-side GC ticker period, milliseconds (P3b, ADR-058).
+    /// Serve-side GC ticker period, milliseconds (P3b, ADR-059).
     /// Ignored by the one-shot `kian artifacts gc` command.
     #[serde(default = "default_artifact_gc_interval_ms")]
     pub interval_ms: u64,
@@ -612,7 +612,7 @@ fn default_artifact_gc_interval_ms() -> u64 {
     60 * 60 * 1000
 }
 
-/// The `web:` section (ADR-056, P2b): the client-side DeepSeek Search /
+/// The `web:` section (ADR-057, P2b): the client-side DeepSeek Search /
 /// Fetch tools. Protocol-only — the adapter speaks the documented
 /// request/response shapes, never a provider SDK.
 ///
@@ -633,7 +633,7 @@ pub struct WebConfig {
     #[serde(default = "default_web_base_url")]
     pub base_url: String,
     /// Environment variable holding the provider key — read once at
-    /// serve assembly; a missing value refuses boot (ADR-056 decision 2).
+    /// serve assembly; a missing value refuses boot (ADR-057 decision 2).
     #[serde(default = "default_web_api_key_env")]
     pub api_key_env: String,
     /// Per-request HTTP timeout, milliseconds.
@@ -698,7 +698,7 @@ fn default_web_max_results() -> u64 {
     10
 }
 
-/// The `defer:` section (ADR-059, P4): explicit off-peak deferral for
+/// The `defer:` section (ADR-060, P4): explicit off-peak deferral for
 /// batch admissions.
 ///
 /// ```yaml
@@ -721,7 +721,7 @@ pub struct DeferConfig {
     #[serde(default = "default_defer_sweep_interval_ms")]
     pub sweep_interval_ms: u64,
     /// Longest wait a deferred admission may take before it runs
-    /// immediately instead (the why-didn't-wait bound, ADR-059).
+    /// immediately instead (the why-didn't-wait bound, ADR-060).
     #[serde(default = "default_defer_max_wait_ms")]
     pub max_wait_ms: u64,
 }
@@ -753,7 +753,7 @@ fn default_defer_max_wait_ms() -> u64 {
     12 * 60 * 60 * 1000
 }
 
-/// The media: section (ADR-060, P5a): client-side media tools (image OCR,
+/// The media: section (ADR-061, P5a): client-side media tools (image OCR,
 /// audio transcription, speech synthesis) as audited bundle tools.
 ///
 /// ```yaml
@@ -778,7 +778,7 @@ pub struct MediaConfig {
     #[serde(default = "default_media_base_url")]
     pub base_url: String,
     /// Environment variable holding the provider key, read once at
-    /// serve assembly; a missing value refuses boot (ADR-060 decision 2).
+    /// serve assembly; a missing value refuses boot (ADR-061 decision 2).
     #[serde(default = "default_media_api_key_env")]
     pub api_key_env: String,
     /// Per-request HTTP timeout, milliseconds.
@@ -1990,6 +1990,18 @@ pub struct SuperAgentConfig {
     /// [`reject_cron_targeting_the_watchdog`].
     #[serde(default)]
     pub cron: CronSection,
+    /// (JOB-MODEL §7.1) the declared jobs (`superagent.jobs`): reusable
+    /// plans, their wall-clock triggers and the failure alerts. A trigger
+    /// lowers into the same cron runtime vector as a
+    /// [`CronTarget::Job`] schedule — one scheduler, one cursor, one
+    /// claim table — and the resolved plan is frozen into the run's first
+    /// input row at fire time, so a later config edit cannot change a run
+    /// already admitted. Absent (the default) = no jobs declared, nothing
+    /// lowered, empty catalog. Validated fail-closed by
+    /// [`crate::job_config::JobsSection::resolve`] (JOB-MODEL §7.4
+    /// V1..V22).
+    #[serde(default)]
+    pub jobs: crate::job_config::JobsSection,
 }
 
 /// 's default: follow-up ownership is **on** — the honest default
@@ -4003,7 +4015,7 @@ impl ServeConfig {
             ))
         })?;
 
-        // pricing + model_profiles (ADR-052): normalize the book
+        // pricing + model_profiles (ADR-053): normalize the book
         // fail-closed; capability profiles are declared metadata until the
         // phase-1 request planner consumes them.
         self.pricing.book().map_err(invalid)?;
@@ -4466,7 +4478,7 @@ impl ServeConfig {
             workers.validate()?;
         }
 
-        // The `artifacts:` section (ADR-055): a positive inline bound, a
+        // The `artifacts:` section (ADR-056): a positive inline bound, a
         // GC with at least one live dimension, and a derivable blob
         // directory (postgres has no sqlite path to derive it from).
         if let Some(artifacts) = self.artifacts.as_ref() {
@@ -4490,7 +4502,7 @@ impl ServeConfig {
                 .map_err(|e| invalid(format!("artifacts: {e}")))?;
         }
 
-        // The `web:` section (ADR-056, P2b): a parseable http(s) origin,
+        // The `web:` section (ADR-057, P2b): a parseable http(s) origin,
         // a positive timeout, a search page size inside the provider's
         // documented 1–50 range, and a named (non-blank) key env. The
         // key **value** check is a serve-startup check (assembly reads
@@ -4522,7 +4534,7 @@ impl ServeConfig {
             }
         }
 
-        // The `defer:` section (ADR-059, P4): deferral is only
+        // The `defer:` section (ADR-060, P4): deferral is only
         // meaningful when the price book declares peak windows (without
         // them every minute is off peak and every defer: off_peak would
         // run immediately), and the wait cap must be real.
@@ -4552,14 +4564,14 @@ impl ServeConfig {
             }
         }
 
-        // The media: section (ADR-060, P5a): the adapter needs the
+        // The media: section (ADR-061, P5a): the adapter needs the
         // artifact store in both directions, a parseable http(s) origin,
         // a positive timeout and a named (non-blank) key env; the format
         // is the provider closed set.
         if let Some(media) = self.media.as_ref() {
             if self.artifacts.is_none() {
                 return Err(invalid(
-                    "media: requires an artifacts: section - the media tools move bytes through the content-addressed store (ADR-060)",
+                    "media: requires an artifacts: section - the media tools move bytes through the content-addressed store (ADR-061)",
                 ));
             }
             let parsed = reqwest::Url::parse(&media.base_url).map_err(|e| {
@@ -4908,7 +4920,18 @@ impl ServeConfig {
             // unsupported-policy gates, and the watchdog cross-reference
             // (rule 7: a wall-clock judge must not fight the interval
             // watchdog for the same session).
-            let resolved_cron = sa.cron.to_runtime(&sa.channels, chrono::Utc::now())?;
+            let mut resolved_cron = sa.cron.to_runtime(&sa.channels, chrono::Utc::now())?;
+            // (JOB-MODEL §7.1a, §18.2 amendment 1) job triggers lower into
+            // the same runtime vector, so the cron ticker, cursor, misfire
+            // policy and claim table stay the only scheduler. Schedule ids
+            // share one namespace: a job trigger may not shadow a declared
+            // cron schedule, so the taken set is seeded from the cron ids.
+            let taken: std::collections::BTreeSet<String> = resolved_cron
+                .iter()
+                .map(|schedule| schedule.id.clone())
+                .collect();
+            let resolved_jobs = sa.jobs.resolve(&sa.channels, &taken, chrono::Utc::now())?;
+            resolved_cron.extend(resolved_jobs.schedules);
             reject_cron_targeting_the_watchdog(
                 &resolved_cron,
                 sa.watchdog.as_ref().map(|w| w.session_id.as_str()),
@@ -4918,14 +4941,14 @@ impl ServeConfig {
                 Some(sa.router.session_id.as_str()),
                 sa.router.rotate_after_events.is_some(),
             )?;
-            // ADR-059: a schedule may only declare defer: off_peak when
+            // ADR-060: a schedule may only declare defer: off_peak when
             // the defer: section exists — otherwise the firing would be
             // admitted with a future eligibility instant that nothing
             // plans and no sweep looks for.
             for schedule in &resolved_cron {
                 if schedule.defer == crate::defer::DeferPolicy::OffPeak && self.defer.is_none() {
                     return Err(invalid(format!(
-                        "superagent.cron schedule `{}` declares defer: off_peak but no defer:                          section exists — add the section (sweep_interval_ms, max_wait_ms) or                          drop the schedule key (ADR-059)",
+                        "superagent.cron schedule `{}` declares defer: off_peak but no defer:                          section exists — add the section (sweep_interval_ms, max_wait_ms) or                          drop the schedule key (ADR-060)",
                         schedule.id
                     )));
                 }
@@ -5216,8 +5239,8 @@ impl ServeConfig {
 
     /// The bundle-edge tools ride the mounted list, not the YAML: when a
     /// section is enabled its tool names are appended to every compiled
-    /// agent — `artifact_read` for `artifacts:` (ADR-055), `web_search`
-    /// / `web_fetch` for `web:` (ADR-056). The matching plugin always
+    /// agent — `artifact_read` for `artifacts:` (ADR-056), `web_search`
+    /// / `web_fetch` for `web:` (ADR-057). The matching plugin always
     /// registers those names whenever the section is on, so the mounted
     /// name resolves; absent sections leave the list untouched.
     fn with_bundle_tools(&self, mut def: AgentDef) -> AgentDef {
@@ -5760,7 +5783,7 @@ pub struct CronScheduleDef {
     /// defaults, an object sets `repo`/`root`/`base`/`keep_on_failure`).
     #[serde(default)]
     pub worktree: Option<CronWorktreeDef>,
-    /// Off-peak deferral (ADR-059). Absent = the firing is admitted
+    /// Off-peak deferral (ADR-060). Absent = the firing is admitted
     /// immediately, byte-identical to before; `off_peak` holds the
     /// durable inbox row until the next off-peak instant within
     /// `defer.max_wait_ms`. A worktree-isolated schedule refuses it: an
@@ -5859,6 +5882,14 @@ pub enum CronTarget {
         /// A non-empty routing topic.
         topic: String,
     },
+    /// Run a declared job (`design/JOB-MODEL.md` §7.1a). Runtime-only: the
+    /// operator-facing `cron.schedules[*].target` never accepts it; a
+    /// `jobs.triggers` entry is lowered into this shape at load so one
+    /// scheduler, one cursor and one claim table serve both.
+    Job {
+        /// The job id, resolved against the mounted job catalog at fire time.
+        job: String,
+    },
 }
 
 /// The overlap policy (§5.1), wire and resolved form.
@@ -5925,7 +5956,7 @@ pub struct CronRuntimeSchedule {
     pub timeout_ms: u64,
     /// The §6 worktree isolation plan; `None` = resident-engine dispatch.
     pub worktree: Option<CronWorktreePlan>,
-    /// Off-peak deferral of this schedule's firings (ADR-059).
+    /// Off-peak deferral of this schedule's firings (ADR-060).
     pub defer: crate::defer::DeferPolicy,
 }
 
@@ -6257,13 +6288,13 @@ impl CronSection {
                 }
             };
 
-            // ADR-059: off-peak deferral holds a durable inbox row; a
+            // ADR-060: off-peak deferral holds a durable inbox row; a
             // worktree-isolated firing has no inbox row to hold, so the
             // combination is refused rather than silently ignored.
             let defer = def.defer.unwrap_or_default();
             if defer == crate::defer::DeferPolicy::OffPeak && worktree.is_some() {
                 fail(
-                    "defer: off_peak is only supported for resident (session) schedules —                      a worktree-isolated firing has no inbox row to defer (ADR-059)"
+                    "defer: off_peak is only supported for resident (session) schedules —                      a worktree-isolated firing has no inbox row to defer (ADR-060)"
                         .to_string(),
                 );
             }
@@ -8178,7 +8209,8 @@ recovery:
         )
     }
 
-    const GITHUB_SECTION: &str = "      github:\n        topics:\n          flyer103/kian: ci\n";
+    const GITHUB_SECTION: &str =
+        "      github:\n        topics:\n          flyer103/kian-runtime: ci\n";
 
     #[test]
     fn github_channel_config_parses_with_defaults() {
@@ -8189,7 +8221,7 @@ recovery:
         assert_eq!(github.api_base, "https://api.github.com");
         assert_eq!(
             github.topics,
-            BTreeMap::from([("flyer103/kian".to_string(), "ci".to_string())])
+            BTreeMap::from([("flyer103/kian-runtime".to_string(), "ci".to_string())])
         );
         assert!(github.events.is_empty());
         assert!(!github.send, "send defaults off (receive-only)");
@@ -10293,6 +10325,23 @@ schedules:
     }
 
     /// The target resolves fail-closed (§3.2) and an empty prompt refuses.
+    /// JOB-MODEL §18.4: the operator cron surface keeps exactly two
+    /// target shapes (`session`, or `channel` + `topic`); a job is admitted
+    /// by `superagent.jobs.triggers`, never by a schedule target. The
+    /// runtime-only `CronTarget::Job` has no wire form: this YAML is
+    /// otherwise valid, so the parse error is the refusal.
+    #[test]
+    fn cron_targets_refuse_a_job_key() {
+        let err = serde_yaml::from_str::<CronSection>(
+            "schedules:\n  - id: digest\n    expr: \"@daily\"\n    target: { job: digest }\n    prompt: go\n",
+        )
+        .expect_err("a job target must not parse");
+        assert!(
+            err.to_string().contains("CronTargetDef"),
+            "the refusal must come from the target shape: {err}"
+        );
+    }
+
     #[test]
     fn cron_target_and_prompt_are_fail_closed() {
         let undeclared = cron_section_from(
@@ -11075,7 +11124,7 @@ schedules:
         assert!(err.contains("requires a `claude` or `codex`"), "{err}");
     }
 
-    // -- web tools (ADR-056, P2b) ------------------------------------
+    // -- web tools (ADR-057, P2b) ------------------------------------
 
     #[test]
     fn artifacts_section_parses_gc_defaults_and_the_serve_interval() {
@@ -11151,7 +11200,7 @@ schedules:
         );
     }
 
-    // -- media tools (ADR-060, P5a) ----------------------------------
+    // -- media tools (ADR-061, P5a) ----------------------------------
 
     #[test]
     fn media_section_parses_defaults_and_mounts_the_three_tools() {
@@ -11235,7 +11284,7 @@ schedules:
         );
     }
 
-    // -- off-peak deferral (ADR-059, P4) --------------------------------
+    // -- off-peak deferral (ADR-060, P4) --------------------------------
 
     /// A pricing block with one real peak window, so the defer section has
     /// something to plan against (its validation refuses boot without one).

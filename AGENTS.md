@@ -151,6 +151,15 @@ when the owner asks. Negative results commit documentation only — never broken
   lifecycle, binding/dispatch, catalog/discovery, security boundary, version policy and
   degradation. **Any worker-membership semantic change starts here**; wire shapes stay in
   API-CONTRACT, event kinds in EVENT-MODEL, placement in DESIGN.
+- `design/JOB-MODEL.md` — the normative declarative-plan contract (source of truth, P0/P1 landed): the
+  four axes (trigger / plan / placement / evidence) and their isolation rule, a run as an ordinary
+  session whose driver is a stateless conductor that parks, the plan frozen at admit with its digest,
+  the identity derivations, the `jobs:` declaration and its validation, readiness / dispatch /
+  retry / deadlines, the placement selector (capability is eligibility, never authority), the effect
+  ledger, verdicts and the outcome lattice, artifacts by reference, delivery as a conductor action
+  and alerts as runs, and the additive event keys. **Any job/plan or step-placement semantic change
+  starts here**; triggers stay in CRON-MODEL, binding in WORKER-MODEL, kinds in EVENT-MODEL, wire
+  shapes in API-CONTRACT.
 - `design/PLUGIN-SPEC.md` — the normative hook-plugin contract (source of truth): the two-tier
   model (compile-time handlers + operator-trusted stdio sidecars), hook vocabulary and payload
   catalog, interception ports, capability grants, manifest and stdio ABI, per-worker resolution,

@@ -67,7 +67,7 @@ pub struct Server {
     engine: Arc<Engine<ServeLoopDriver>>,
     store: EventStore,
     /// The config-declared default agent budgets pinned into every
-    /// `session/created` this server creates (ADR-054): the projection's
+    /// `session/created` this server creates (ADR-055): the projection's
     /// authoritative base, replayable from the stream alone.
     default_budgets: Budgets,
     sse_poll_ms: u64,
@@ -110,13 +110,13 @@ pub struct Server {
     /// — the rebuilder runs outside every drain under the `views:all`
     /// maintenance lease.
     views_maintenance: Option<ViewsMaintenance>,
-    /// The artifact retention plan (ADR-055, ADR-058, P3b): present iff
+    /// The artifact retention plan (ADR-056, ADR-059, P3b): present iff
     /// the `artifacts:` section is configured. [`Server::serve`] spawns
     /// its GC ticker — strict mtime retention, outside every drain, and
     /// never a failure path for a request (a reclaimed blob only
     /// degrades an old result's fidelity; replay keeps the preview).
     artifact_maintenance: Option<ArtifactMaintenance>,
-    /// The off-peak deferral plan (ADR-059): present iff the defer:
+    /// The off-peak deferral plan (ADR-060): present iff the defer:
     /// section is configured. serve arms the due-wake ticker and the cron
     /// planner only then; absent refuses API defer requests, forbids a
     /// cron schedule declaring defer: off_peak at load time, and changes
@@ -129,6 +129,12 @@ pub struct Server {
     cron_schedules: Vec<crate::config::CronRuntimeSchedule>,
     /// The §5.4 process-wide worktree concurrency ceiling (global config).
     cron_max_concurrent: u32,
+    /// The resolved job catalog (JOB-MODEL §7.1): present iff
+    /// `superagent.jobs` resolved at arm time. The cron ticker mounts it on
+    /// the resident dispatcher, which is the only reader — a job firing
+    /// admits one input row carrying the frozen plan, and the conductor
+    /// never consults this config again (§4 J2).
+    job_catalog: Option<Arc<crate::job_config::JobCatalog>>,
     /// The child inactivity maintenance plan (MULTIAGENT-MODEL §5.3:587,
     /// plan pin P5): present iff the superagent bundle configures
     /// `superagent.multiagent` limits. [`Server::serve`] spawns its
@@ -199,7 +205,7 @@ struct ViewsMaintenance {
     board_enabled: bool,
 }
 
-/// The serve-side artifact retention plan (ADR-055, ADR-058, P3b):
+/// The serve-side artifact retention plan (ADR-056, ADR-059, P3b):
 /// present iff the `artifacts:` section is configured. GC runs on its
 /// own ticker, outside every drain; the read path never depends on it.
 #[derive(Clone)]
@@ -210,7 +216,7 @@ struct ArtifactMaintenance {
     retention_days: u64,
 }
 
-/// The serve-side off-peak deferral plan (ADR-059): present iff the
+/// The serve-side off-peak deferral plan (ADR-060): present iff the
 /// defer: section is configured. The calendar is a pure read; correctness
 /// never depends on the sweep — a durable row's eligible_at is the hard
 /// gate and the ticker only shortens the wait.
@@ -405,9 +411,9 @@ impl Server {
             .exec_env
             .to_policy()
             .map_err(ServeError::Config)?;
-        // ADR-055 (P2): the artifact runtime — absent `artifacts:` section =
+        // ADR-056 (P2): the artifact runtime — absent `artifacts:` section =
         // spill off, and the assembled tool set stays byte-identical.
-        // ADR-058 (P3b): the same section arms the serve-side retention
+        // ADR-059 (P3b): the same section arms the serve-side retention
         // ticker, so a long-running server reclaims by its configured
         // bounds without an operator command.
         let (artifact_store, artifact_runtime, artifact_maintenance) =
@@ -433,7 +439,7 @@ impl Server {
                 }
                 None => (None, None, None),
             };
-        // ADR-059: the off-peak planner. Absent defer: section = deferral
+        // ADR-060: the off-peak planner. Absent defer: section = deferral
         // off: API defer requests are refused (-32602), a cron schedule may
         // not declare defer: off_peak (load-time error), and no due-wake
         // ticker is armed.
@@ -451,12 +457,12 @@ impl Server {
             }
             None => None,
         };
-        // Bundle-edge tools mounted beside the local tools. ADR-055: the
-        // artifact reader when spill is on. ADR-056 (P2b): the client-side
+        // Bundle-edge tools mounted beside the local tools. ADR-056: the
+        // artifact reader when spill is on. ADR-057 (P2b): the client-side
         // web tools when `web:` is on — the provider key is read here,
-        // once, and a missing value refuses boot. ADR-060 (P5a): the media
+        // once, and a missing value refuses boot. ADR-061 (P5a): the media
         // tools when `media:` is on, under the same key discipline.
-        // ADR-061 (P5b): the media tools instance is kept beside the
+        // ADR-062 (P5b): the media tools instance is kept beside the
         // mounted provider so the channel-edge processor can call the same
         // OCR/ASR surface the model can call.
         let mut media_tools_ref: Option<Arc<kian_media::MediaTools>> = None;
@@ -478,7 +484,7 @@ impl Server {
             .map_err(|e| ServeError::Assembly(format!("web: {e}")))?;
             bundle_tools.push(Arc::new(web_tools));
         }
-        // ADR-060 (P5a): the client-side media tools. They read and write the
+        // ADR-061 (P5a): the client-side media tools. They read and write the
         // same content-addressed store the spill path uses; the provider key is
         // read here, once, and a missing value refuses boot.
         if let (Some(media), Some(store)) = (config.media.as_ref(), artifact_store.as_ref()) {
@@ -510,7 +516,7 @@ impl Server {
                 extras: bundle_tools,
             },
         ];
-        // ADR-061 (P5b): the channel-edge media processor shares the media
+        // ADR-062 (P5b): the channel-edge media processor shares the media
         // tools and the artifact store assembled above. Absent `media:` =
         // None, and every channel pump keeps its exact bytes.
         let media_edge = match (media_tools_ref.as_ref(), artifact_store.as_ref()) {
@@ -1199,13 +1205,40 @@ impl Server {
         // already validated the section, so resolution failing here can
         // only mean a channel target moved: arming nothing is the
         // fail-closed choice, and an empty set arms no timer at all.
-        let cron_schedules: Vec<crate::config::CronRuntimeSchedule> = match superagent_cfg {
-            Some(sa) => sa
-                .cron
-                .to_runtime(&sa.channels, chrono::Utc::now())
-                .unwrap_or_default(),
-            None => Vec::new(),
+        // Job triggers lower into the same runtime vector (JOB-MODEL
+        // §7.1a): one scheduler, one cursor, one claim table. A job
+        // schedule is armed only when its catalog resolved with it — a
+        // firing with no mounted catalog could not admit a run, so arming
+        // it would only produce a failing tick.
+        let (cron_schedules, job_catalog): (
+            Vec<crate::config::CronRuntimeSchedule>,
+            Option<Arc<crate::job_config::JobCatalog>>,
+        ) = match superagent_cfg {
+            Some(sa) => {
+                let mut schedules = sa
+                    .cron
+                    .to_runtime(&sa.channels, chrono::Utc::now())
+                    .unwrap_or_default();
+                let taken: std::collections::BTreeSet<String> = schedules
+                    .iter()
+                    .map(|schedule| schedule.id.clone())
+                    .collect();
+                match sa.jobs.resolve(&sa.channels, &taken, chrono::Utc::now()) {
+                    Ok(resolved) => {
+                        schedules.extend(resolved.schedules);
+                        (schedules, Some(Arc::new(resolved.catalog)))
+                    }
+                    Err(_) => (schedules, None),
+                }
+            }
+            None => (Vec::new(), None),
         };
+        // (JOB-MODEL §13.3) the alert port learns the catalogue it admits
+        // against. Without it a failed run is still recorded honestly; only
+        // the pushed alert is missing, never invented.
+        if let (Some(services), Some(catalog)) = (superagent.as_ref(), job_catalog.as_ref()) {
+            services.job_alerts.install(Arc::clone(catalog));
+        }
         let cron_max_concurrent = superagent_cfg
             .as_ref()
             .map_or(crate::config::DEFAULT_CRON_GLOBAL_MAX_CONCURRENT, |sa| {
@@ -1271,6 +1304,7 @@ impl Server {
             hooks,
             cron_schedules,
             cron_max_concurrent,
+            job_catalog,
             // The child inactivity plan is armed only when the
             // superagent bundle configures `superagent.multiagent`
             // limits — C5's config surface feeds this via
@@ -1456,7 +1490,7 @@ impl Server {
                 }
             });
         }
-        // Deferred admissions (ADR-059): each beat wakes sessions whose
+        // Deferred admissions (ADR-060): each beat wakes sessions whose
         // durable rows became eligible. A sweep, not a per-row timer: a
         // missed or doubled beat only changes latency, because the store's
         // eligible_at comparison is the hard gate and no wake can consume a
@@ -1549,7 +1583,7 @@ impl Server {
                 }
             });
         }
-        // Artifact retention (ADR-055, ADR-058, P3b): each beat reclaims
+        // Artifact retention (ADR-056, ADR-059, P3b): each beat reclaims
         // expired blobs (retention) and then over-budget ones, oldest
         // mtime first. Strictly outside every drain; a lost or doubled
         // beat is harmless (idempotent, and a missing blob only lowers
@@ -1603,14 +1637,18 @@ impl Server {
                 tokio::runtime::Handle::current(),
                 self.session_bootstrap.clone(),
             );
-            // ADR-059: the planner is armed only with the defer: section;
+            // ADR-060: the planner is armed only with the defer: section;
             // without it an immediate firing keeps its exact old bytes.
             if let Some(defer) = self.defer.as_ref() {
                 turn = turn.with_deferral(defer.calendar.clone());
             }
             let turn: Arc<dyn crate::cron_engine::ResidentTurn> = Arc::new(turn);
+            let mut resident_dispatch = crate::cron_engine::ResidentDispatcher::new(turn);
+            if let Some(catalog) = self.job_catalog.clone() {
+                resident_dispatch = resident_dispatch.with_jobs(catalog);
+            }
             let resident: Arc<dyn crate::cron_tick::CronDispatcher + Send + Sync> =
-                Arc::new(crate::cron_engine::ResidentDispatcher::new(turn));
+                Arc::new(resident_dispatch);
             // Selection rule: a schedule that declares `worktree:` is
             // dispatched to the worktree-backed arm; every other schedule goes
             // to the resident engine.
@@ -2081,7 +2119,7 @@ impl kian_superagent::SessionBootstrap for MemorySessionBootstrap {
 impl ControlPlane for Server {
     fn create_session(&self) -> BoxFuture<'_, Result<SessionId, ControlError>> {
         Box::pin(async move {
-            // ADR-054: configured budgets are pinned into
+            // ADR-055: configured budgets are pinned into
             // `session/created` so replay derives the same base without the
             // config file. Absent limits pin nothing (a create with no
             // budgets stays byte-identical to the legacy `{}`).

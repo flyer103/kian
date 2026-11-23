@@ -13,7 +13,7 @@
 //!   from `turn/end` usage payloads (verbatim, no pricing).
 //! - `kian cost [--config <path>] [--session <uuid>] [--json]` —
 //!   read-only cost projection: the config price book applied to those
-//!   usage payloads at each attempt's own timestamp (ADR-052).
+//!   usage payloads at each attempt's own timestamp (ADR-053).
 //! - `kian session inspect <uuid>` — projection + counters (
 //!   embedded read-only).
 //! - `kian session replay <uuid> [--url <base>]` — re-derive everything
@@ -31,11 +31,11 @@
 //! - `kian wake-now <uuid>` / `kian lease inspect` /
 //!   `kian recovery budget reset <uuid>` — operator actions.
 //! - `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N]` — raise a
-//!   session's lifetime budget (ADR-054): one durable control row, resumed
+//!   session's lifetime budget (ADR-055): one durable control row, resumed
 //!   at the next drain boundary.
 //! - `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N]
 //!   [--retention-days N] [--json]` — one retention pass over the
-//!   content-addressed tool-result blob tree (ADR-055).
+//!   content-addressed tool-result blob tree (ADR-056).
 //!
 //! Read-only commands open the sqlite file in-process (read-only);
 //! mutating commands talk to a running `serve` via `POST /ops/rpc`.
@@ -78,7 +78,7 @@ const USAGE: &str = "usage:
                [--retention-days N] [--json]
                                          retention GC of the tool-result artifact tree (oldest first)
   kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]
-                                         ingest a local file into the artifact tree (ADR-060)
+                                         ingest a local file into the artifact tree (ADR-061)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
   kian tickets [--db <sqlite>] [--config <path>] [--json]
@@ -139,6 +139,14 @@ const USAGE: &str = "usage:
                                          recent firings: state, fire time, duration, skip reason
   kian cron rm <id> [--config <path>] [--json]
                                          drop the store row (the config declaration still needs editing)
+  kian job list [--config <path>] [--json]
+                                         declared jobs: steps, plan digest, triggers, alerts
+  kian job status <run|job> [--config <path>] [--json]
+                                         a run's steps and attempts, or a job's recent firings
+  kian job run <job> [--slot <token>] [--config <path>] [--json]
+                                         admit one manual run (a fresh manual:<token> slot by default)
+  kian job cancel <run> [--config <path>] [--json]
+                                         ask the run's conductor to end the run cancelled
   kian --version                        print the version
 ";
 
@@ -165,6 +173,7 @@ fn main() -> ExitCode {
         Some("lease") => lease(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
+        Some("job") => job(&args[2..]),
         Some("workers") => workers(&args[2..]),
         Some("board") => board(&args[2..]),
         Some("tasks") => tasks(&args[2..]),
@@ -179,6 +188,19 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("kian: unknown command `{other}`\n{USAGE}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn job(args: &[String]) -> ExitCode {
+    match kian_cli::job_cli::run(args) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kian: {}", e.message());
+            ExitCode::from(e.exit_code())
         }
     }
 }
@@ -395,7 +417,7 @@ fn usage_stats(args: &[String]) -> ExitCode {
 
 /// `kian cost [--config <path>] [--session <uuid>] [--json]` — the
 /// read-only cost projection from the configured store (mirrors
-/// `usage-stats`; ADR-052).
+/// `usage-stats`; ADR-053).
 fn cost(args: &[String]) -> ExitCode {
     let mut config_path = std::path::PathBuf::from("kian.yaml");
     let mut session: Option<kian_core::model::SessionId> = None;
@@ -454,7 +476,7 @@ fn cost(args: &[String]) -> ExitCode {
 }
 
 /// `kian artifacts gc [--config <path>] [--dir <path>] [--max-bytes N] [--retention-days N] [--json]` — one
-/// retention pass over the content-addressed tool-result blob tree (ADR-055).
+/// retention pass over the content-addressed tool-result blob tree (ADR-056).
 fn artifacts(args: &[String]) -> ExitCode {
     let Some(subcommand) = args.first() else {
         eprintln!("kian: artifacts expects a subcommand (gc|put)\n{USAGE}");
@@ -528,7 +550,7 @@ fn artifacts_gc(args: &[String]) -> ExitCode {
 }
 
 /// `kian artifacts put <file> [--config <path>] [--dir <path>] [--media-type <type>] [--json]`:
-/// ingest a local file into the content-addressed artifact tree (ADR-060).
+/// ingest a local file into the content-addressed artifact tree (ADR-061).
 fn artifacts_put(args: &[String]) -> ExitCode {
     let mut config_path = std::path::PathBuf::from("kian.yaml");
     let mut dir: Option<std::path::PathBuf> = None;
@@ -1015,7 +1037,7 @@ fn confirm(args: &[String]) -> ExitCode {
 
 /// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
 /// [--requested-by <who>] [--idempotency-key <key>] [--url <base>]
-/// [--config <path>] [--json]` (durable budget raise, ADR-054).
+/// [--config <path>] [--json]` (durable budget raise, ADR-055).
 fn raise_budget(args: &[String]) -> ExitCode {
     let mut config = std::path::PathBuf::from("kian.yaml");
     let mut url: Option<String> = None;

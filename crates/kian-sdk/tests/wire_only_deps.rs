@@ -59,8 +59,13 @@ fn no_kian_crate_dependency_anywhere() {
 #[test]
 fn sdk_carries_its_own_version() {
     let manifest = include_str!("../Cargo.toml");
+    // The rule is "carries its own literal version", not a specific number:
+    // the SDK bumps on its own cadence, so pinning the value here would make
+    // every SDK release edit this test for no reason.
     assert!(
-        manifest.contains("version = \"0.1.0\""),
+        manifest
+            .lines()
+            .any(|l| l.trim_start().starts_with("version = \"")),
         "kian-sdk must pin its own version"
     );
     let inherits_workspace = manifest.lines().any(|l| {

@@ -805,15 +805,16 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
     // thread key, correlation = the freeform event id.
     let wrapper_string = channel_input_payload(&ChannelEvent {
         channel: "issue-github".into(),
-        event_id: "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z".into(),
-        topic: Some("issue-github:flyer103/kian#6".into()),
+        event_id: "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z".into(),
+        topic: Some("issue-github:flyer103/kian-runtime#6".into()),
         sender: None,
-        group: Some("flyer103/kian".into()),
+        group: Some("flyer103/kian-runtime".into()),
         payload: json!({"text": "triage this issue"}),
         ts_ms: 1_761_900_000_000,
     })
     .to_string();
-    let target = json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian"});
+    let target =
+        json!({"kind":"issue_comment","number":6,"owner":"flyer103","repo":"kian-runtime"});
     let conversation = format!("issue-github:{}", serde_json::to_string(&target).unwrap());
 
     // Router stream: the spawn lineage (task = the stringified
@@ -827,7 +828,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
         },
         worker,
         &json!({"role": "user", "content": {
-            "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+            "correlation": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z",
             "task": wrapper_string}}),
     );
     let router_events = vec![
@@ -838,7 +839,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
             json!({"role": "assistant", "content": {"id": "call-6", "name": "deliver_structured",
                 "arguments": {"channel": "issue-github", "target": target,
                               "payload": {"background": "b", "changes": "c", "verification": "v"},
-                              "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z"}}}),
+                              "correlation": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z"}}}),
         ),
         (
             EventKind::ToolResult,
@@ -861,7 +862,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
         },
         worker,
         &json!({"role": "user", "content": {
-            "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+            "correlation": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z",
             "task": wrapper_string}}),
     );
     let worker_events = vec![
@@ -869,7 +870,7 @@ async fn run_tickets_surfaces_the_live_parked_delivery_by_conversation() {
         (
             EventKind::InputAdmitted,
             json!({"role": "user", "content": {
-                "correlation": "poll:issues:flyer103/kian#6:2026-11-03T21:31:04Z",
+                "correlation": "poll:issues:flyer103/kian-runtime#6:2026-11-03T21:31:04Z",
                 "task": wrapper_string}}),
         ),
         (EventKind::ThreadStarted, worker_started),

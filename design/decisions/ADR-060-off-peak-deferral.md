@@ -1,13 +1,13 @@
-# ADR-059: Off-peak deferral is an inbox eligibility gate, not a second scheduler
+# ADR-060: Off-peak deferral is an inbox eligibility gate, not a second scheduler
 
 Status: accepted (owner-approved roadmap semantics, 2026-11-22; P4 slice)
 Supersedes: none
-Related: ADR-052 (price book), ADR-054 (session budget gate), CRON-MODEL,
+Related: ADR-053 (price book), ADR-055 (session budget gate), CRON-MODEL,
 DESIGN section 2.3 (admit-wake-drain), EVENT-MODEL (input/admitted)
 
 ## Context
 
-Provider peak pricing (ADR-052) makes some wall-clock windows cost up to
+Provider peak pricing (ADR-053) makes some wall-clock windows cost up to
 the configured peak multiplier. Batch-shaped work - cron firings, jobs,
 explicit API submissions - is indifferent to *when* the result arrives and
 would rather run off peak. Interactive work is not: a user waiting on

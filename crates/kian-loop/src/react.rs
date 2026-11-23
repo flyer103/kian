@@ -83,7 +83,7 @@ pub const CLASS_EMPTY_RESPONSE: &str = "empty_response";
 /// Iteration budget default: stops honest loops that never converge.
 pub const DEFAULT_MAX_ITERATIONS: usize = 32;
 
-/// How many maintenance compactions one drain episode may run (ADR-057).
+/// How many maintenance compactions one drain episode may run (ADR-058).
 /// The loop never compacts in a cycle: each fold is bounded, and two are
 /// enough to clear a window that one fold could not.
 const MAX_COMPACTIONS_PER_EPISODE: usize = 2;
@@ -92,10 +92,10 @@ const MAX_COMPACTIONS_PER_EPISODE: usize = 2;
 /// deciding whether the next request is close to the window.
 const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 4_096;
 
-/// Upper bound on images attached to one user message (ADR-062).
+/// Upper bound on images attached to one user message (ADR-063).
 const MAX_IMAGES_PER_MESSAGE: usize = 4;
 
-/// Upper bound on one attached image byte payload (ADR-062).
+/// Upper bound on one attached image byte payload (ADR-063).
 const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper bound on the transcript handed to the summarizer, in characters.
@@ -189,7 +189,7 @@ struct Inner {
     /// an eighth interception port (§4's seven are frozen); it is the
     /// guard's own seam.
     set_guard: Option<Arc<dyn kian_plugin::hooks::SessionSetGuard>>,
-    /// ADR-057 compaction tuning. The default folds old turns only under
+    /// ADR-058 compaction tuning. The default folds old turns only under
     /// context pressure; it never spends a provider call to save money.
     compaction: CompactionSettings,
 }
@@ -293,7 +293,7 @@ impl ReActLoop {
         }))
     }
 
-    /// Replaces the compaction tuning (ADR-057). The default keeps the
+    /// Replaces the compaction tuning (ADR-058). The default keeps the
     /// last four turns, folds only at 90% of the declared window, and
     /// requires a meaningful reclaim.
     #[must_use]
@@ -338,7 +338,7 @@ struct LoopState {
     /// Per-episode turn count for [`BudgetScope::PerEpisode`]; reset per
     /// drive stream (ADR-024).
     drain_iterations: usize,
-    /// Maintenance compactions this episode has run (ADR-057), bounded by
+    /// Maintenance compactions this episode has run (ADR-058), bounded by
     /// [`MAX_COMPACTIONS_PER_EPISODE`].
     compactions: usize,
 }
@@ -428,7 +428,7 @@ enum Flow {
     Deferred,
     /// An intentional stop condition fired.
     Stopped(String),
-    /// The session token budget gate refused the next request (ADR-054):
+    /// The session token budget gate refused the next request (ADR-055):
     /// no bytes were persisted, the drain ends `awaiting_budget`.
     AwaitingBudget(Value),
     /// Soft failure — routed to the recovery policy; never `completed`.
@@ -458,7 +458,7 @@ enum TurnError {
     /// by the loop. Also carries the recovery audit.
     Fatal { error: LoopError, audit: Value },
     /// The session token budget gate refused before any request bytes
-    /// were persisted (ADR-054). Carries the projection the gate saw.
+    /// were persisted (ADR-055). Carries the projection the gate saw.
     AwaitingBudget { budget: Value },
 }
 
@@ -853,7 +853,7 @@ impl Inner {
             *drain_iterations += 1;
         }
 
-        // 4. Preventive compaction (ADR-057): when the declared window says
+        // 4. Preventive compaction (ADR-058): when the declared window says
         //    this request is close to overflowing, fold old turns first. The
         //    fold is a maintenance turn of its own; the next iteration
         //    derives the smaller context from the new stream.
@@ -909,7 +909,7 @@ impl Inner {
                     payload["usage"] = u.clone();
                 }
                 let _ = ctx.end_turn_with(payload).await;
-                // ADR-057 reactive arm: a provider context overflow is the
+                // ADR-058 reactive arm: a provider context overflow is the
                 // authoritative pressure reading — fold the old turns and
                 // let the next iteration retry the (now smaller) request.
                 // The failed request above is already accounted and stays
@@ -1039,7 +1039,7 @@ impl Inner {
 
     /// Builds the chat messages for this turn, attaching artifact-backed
     /// images to user messages when the bound target declares `vision`
-    /// (ADR-062). Without the capability the conversion is exactly
+    /// (ADR-063). Without the capability the conversion is exactly
     /// [`to_chat_message`]: no bytes load and each content keeps the
     /// compact JSON fallback it had before this capability existed.
     async fn chat_messages(
@@ -1066,7 +1066,7 @@ impl Inner {
         chat
     }
 
-    /// Loads the referenced image blobs for one user message (ADR-062).
+    /// Loads the referenced image blobs for one user message (ADR-063).
     ///
     /// Bounded and honest: a missing, unreadable or oversized blob drops
     /// that image with a warning, and the envelope's text still flies (an
@@ -1082,7 +1082,7 @@ impl Inner {
                     artifact = %artifact,
                     bytes = bytes.len(),
                     limit = MAX_VISION_IMAGE_BYTES,
-                    "vision image is over the byte bound; the image is skipped (ADR-062)"
+                    "vision image is over the byte bound; the image is skipped (ADR-063)"
                 );
                 continue;
             }
@@ -1118,7 +1118,7 @@ impl Inner {
 
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called. The plan is the single source of the bytes
-        // and of the metadata recorded next to them (ADR-053).
+        // and of the metadata recorded next to them (ADR-054).
         let plan = match build_request_plan(target.profile.as_ref(), &target.model, &chat, &schemas)
         {
             Ok(plan) => plan,
@@ -1132,7 +1132,7 @@ impl Inner {
                 };
             }
         };
-        // ADR-054: the session token budget gate. The estimate is the
+        // ADR-055: the session token budget gate. The estimate is the
         // worst case these bytes imply (prompt upper bound plus the
         // declared output cap); a would-be overspend refuses BEFORE the
         // `step/request` is persisted — persist-what-you-send covers the
@@ -1153,7 +1153,7 @@ impl Inner {
             .estimate
             .high
             .saturating_add(plan.estimate.max_output_tokens.unwrap_or(0));
-        // ADR-057: ordinary turns may not eat the maintenance reserve;
+        // ADR-058: ordinary turns may not eat the maintenance reserve;
         // compaction (the only maintenance turn) may draw it.
         let reserve = budget.maintenance_reserve_tokens().unwrap_or(0);
         if budget.would_exceed_tokens_reserving(estimate, reserve) {
@@ -1606,7 +1606,7 @@ impl Inner {
         }
     }
 
-    /// One maintenance compaction turn (ADR-057): fold the planned event
+    /// One maintenance compaction turn (ADR-058): fold the planned event
     /// range into a persisted summary and end this iteration. Returns
     /// Some(flow) when the iteration must stop — TurnDone asks for a new
     /// iteration over the smaller context, AwaitingBudget and Soft report
@@ -1658,7 +1658,7 @@ impl Inner {
             .high
             .saturating_add(request.estimate.max_output_tokens.unwrap_or(0));
         // Maintenance may draw the reserve ordinary turns leave alone, but
-        // it still never overdraws the allowance itself (ADR-057).
+        // it still never overdraws the allowance itself (ADR-058).
         let budget = project_budget(&events, &self.agent.budgets);
         if budget.would_exceed_tokens(estimate) {
             return Ok(Some(Flow::AwaitingBudget(json!({
@@ -1702,7 +1702,7 @@ impl Inner {
             }
         };
         // Maintenance uses the session's own slot and provider; it is not a
-        // model turn, so it takes no fallback traversal (ADR-057).
+        // model turn, so it takes no fallback traversal (ADR-058).
         let Some(provider) = self.registry.get(&target.provider) else {
             let audit = recovery_audit(
                 self.policy.as_ref(),
@@ -1833,7 +1833,7 @@ impl Inner {
             to_seq = plan.to_seq,
             folded_messages = plan.folded_messages,
             reclaimed_tokens = plan.reclaimed_tokens,
-            "context compacted (ADR-057)"
+            "context compacted (ADR-058)"
         );
         Ok(Some(Flow::TurnDone))
     }
@@ -2090,7 +2090,7 @@ type ImageReference = (String, String);
 /// The text to send plus the image references parsed out of a vision envelope.
 type VisionEnvelope = (Option<String>, Vec<ImageReference>);
 
-/// The ADR-062 vision envelope: a user message content object
+/// The ADR-063 vision envelope: a user message content object
 /// `{"text": <string>, "images": [{"artifact": <id>, "media_type": <type>}]}`.
 ///
 /// Returns the text to send and the referenced blobs, or `None` when the

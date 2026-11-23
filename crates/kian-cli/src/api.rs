@@ -61,7 +61,7 @@ pub trait ControlPlane: Send + Sync {
         content: Value,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<bool, ControlError>>;
-    /// ADR-059: submits one turn with an explicit deferral policy. The
+    /// ADR-060: submits one turn with an explicit deferral policy. The
     /// row is durable before this returns, with its eligibility instant
     /// stamped on it; a control plane with no defer: section refuses.
     fn submit_deferred(
@@ -73,7 +73,7 @@ pub trait ControlPlane: Send + Sync {
     ) -> BoxFuture<'_, Result<DeferredAdmission, ControlError>> {
         async { Err(ControlError::DeferralUnavailable) }.boxed()
     }
-    /// ADR-059: queues one turn with an explicit deferral policy. Same
+    /// ADR-060: queues one turn with an explicit deferral policy. Same
     /// semantics as submit_deferred; the queue/steer marker is unchanged.
     fn queue_deferred(
         &self,
@@ -95,7 +95,7 @@ pub trait ControlPlane: Send + Sync {
         reason: Option<String>,
         requested_by: Option<String>,
     ) -> BoxFuture<'_, Result<ConfirmWireOutcome, ControlError>>;
-    /// Raises a session's lifetime budget (ADR-054): a durable reserved
+    /// Raises a session's lifetime budget (ADR-055): a durable reserved
     /// control row plus a wake. Never touches execution — the drain
     /// consumes it into `budget/raised`.
     fn raise_budget(
@@ -186,7 +186,7 @@ impl ConfirmWireOutcome {
     }
 }
 
-/// The `raise_budget` wire outcome (ADR-054).
+/// The `raise_budget` wire outcome (ADR-055).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetWireOutcome {
     /// The row is durable; the projection adds it when a drain consumes it.
@@ -220,7 +220,7 @@ pub struct PendingView {
     pub expired: bool,
 }
 
-/// The deferred submit/queue outcome (ADR-059): the row is durable and
+/// The deferred submit/queue outcome (ADR-060): the row is durable and
 /// carries an eligibility instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeferredAdmission {
@@ -256,11 +256,11 @@ pub enum ControlError {
         session: SessionId,
         archived_at: u64,
     },
-    /// ADR-054: a raise with both amounts absent or zero is a client
+    /// ADR-055: a raise with both amounts absent or zero is a client
     /// error (`-32602`), never a durable row.
     #[error("invalid budget raise: {reason}")]
     InvalidBudget { reason: String },
-    /// ADR-059: the caller asked to defer but this server has no defer:
+    /// ADR-060: the caller asked to defer but this server has no defer:
     /// section, so it cannot promise a future eligibility instant.
     #[error("deferral is not configured (no defer: section)")]
     DeferralUnavailable,
@@ -651,7 +651,7 @@ fn session_params(params: &Value) -> Result<SessionId, (i64, String)> {
     session_of(params)
 }
 
-/// The optional defer param (ADR-059): absent means immediate; the only
+/// The optional defer param (ADR-060): absent means immediate; the only
 /// accepted value is "off_peak". Anything else is -32602, never silently
 /// ignored.
 fn defer_param(params: &Value) -> Result<Option<crate::defer::DeferPolicy>, (i64, String)> {
@@ -674,12 +674,12 @@ fn defer_param(params: &Value) -> Result<Option<crate::defer::DeferPolicy>, (i64
     }
 }
 
-/// Steering is an interactive correction: it is never delayed (ADR-059).
+/// Steering is an interactive correction: it is never delayed (ADR-060).
 fn reject_defer_param(params: &Value, method: &str) -> Result<(), (i64, String)> {
     if params.get("defer").is_some_and(|value| !value.is_null()) {
         return Err((
             CODE_INVALID_PARAMS,
-            format!("{method} cannot defer: interactive steering is never delayed (ADR-059)"),
+            format!("{method} cannot defer: interactive steering is never delayed (ADR-060)"),
         ));
     }
     Ok(())
@@ -1592,7 +1592,7 @@ mod tests {
         assert_eq!(end.events_sent, 0);
     }
 
-    // -- deferred admissions (ADR-059, P4) ------------------------------
+    // -- deferred admissions (ADR-060, P4) ------------------------------
 
     use std::sync::Arc;
     use std::sync::Mutex;

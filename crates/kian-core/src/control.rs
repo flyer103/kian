@@ -380,7 +380,7 @@ impl ConfirmIntent {
 }
 
 /// A parsed budget-raise intent from a reserved control-envelope row
-/// (ADR-054): one durable addition to the session's token/wall-clock
+/// (ADR-055): one durable addition to the session's token/wall-clock
 /// allowance. Pure data — the same intent serializes to the inbox row
 /// (envelope) and to the `budget/raised` audit event payload, so the event
 /// reproduces exactly what was requested.
@@ -389,7 +389,7 @@ pub struct BudgetIntent {
     /// Tokens added to the session budget.
     pub tokens: Option<u64>,
     /// Wall-clock milliseconds added to the session budget (recorded, not
-    /// enforced while a drain is idle — ADR-054).
+    /// enforced while a drain is idle — ADR-055).
     pub wall_clock_ms: Option<u64>,
     /// Free-form operator reason, or `null`.
     pub reason: Option<String>,

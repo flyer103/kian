@@ -1,9 +1,14 @@
 [package]
 name = "kian-superagent"
+description = "Super-agent bundle: Router/Worker, subscriptions, channels and the declarative job conductor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # DESIGN §7: `kian-superagent` is the super-agent *bundle* (ADR-003) —
 # Router/Worker templates, subscription rules, channel framework. It is
@@ -51,7 +56,6 @@ tracing-subscriber.workspace = true
 # tests/stage_projection.rs over a fixture db. A dev-dependency edge
 # crate→assembly is legal (dev-deps may be cyclic); no production edge
 # is added — the bundle still never names kian-cli in src/.
-kian-cli.workspace = true
 # the scripted-HTTP-mock lark tests serve canned Feishu responses
 # from an in-process axum server (no credentials, no network).
 axum.workspace = true

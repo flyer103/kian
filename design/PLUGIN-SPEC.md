@@ -494,7 +494,7 @@ a wedged or absent plugin cannot delay them (R2).
 | channel-borne input (subscriptions fan-out) | yes — **one evaluation per inbound event**, covering the whole target set (§4.1) | **yes**, but audit-only — no inbox row is written for any target, so the drop is real; in v1 **no** receipt, NACK or error code reaches the sender, because no inbound refusal wire exists (§4.1, §16.15) |
 | API-borne input (`submit`) | yes — observe only | **no** — there is no wire to express a refusal; extending the receipt or adding an error code is deferred (§16.3). On a dead/quarantined/timed-out sidecar the observation lapses and the input is admitted unchanged, with one audit line (§11.1: the default is per origin, and an observe-only subscriber has no verdict to lose) |
 | queue/steer (`queue`, `steer`) | yes — observe only | no — same reason (deferral §16.3) and the same failure default: the observation lapses, the input proceeds |
-| internal producers: watchdog timers, async completion, memory injection, subscription pings, cron firings | **no** | n/a — recorded limitation (§17): these write rows through paths that do not pass the admission port |
+| internal producers: watchdog timers, async completion, memory injection, subscription pings, cron firings, job runs ([JOB-MODEL](JOB-MODEL.md) §5.2: a cron trigger, `kian job run`, `kian job cancel`, and an alert admitted by a failing run) | **no** | n/a — recorded limitation (§17): these write rows through paths that do not pass the admission port |
 
 **The failure default follows the veto column, not the hook name.** Only the channel row is
 veto-capable, so only the channel row can fail closed; on the observe-only rows a handler that is

@@ -177,7 +177,7 @@ async fn turn_step(
                     };
                     // Build the exact fallback attempt before persisting:
                     // the event must carry the bytes the next call sends,
-                    // so replay can reconstruct the retry (ADR-053).
+                    // so replay can reconstruct the retry (ADR-054).
                     let plan = match (ctx.build)(&switch.to) {
                         Ok(plan) => plan,
                         Err(err) => return Some((Err(err), TurnState::Done)),
@@ -448,7 +448,7 @@ mod tests {
         );
 
         // The fallback event carries the exact attempt: body and metadata
-        // are persisted before the fallback call (ADR-053).
+        // are persisted before the fallback call (ADR-054).
         {
             let payloads = sink.payloads.lock().unwrap();
             let payload = payloads.first().expect("fallback payload");

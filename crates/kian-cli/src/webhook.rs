@@ -473,7 +473,7 @@ mod tests {
             "action": "created",
             "issue": {"number": 9, "title": "build broken", "body": "panic in CI"},
             "comment": {"id": 99, "body": "please take a look"},
-            "repository": {"id": 1, "full_name": "flyer103/kian"},
+            "repository": {"id": 1, "full_name": "flyer103/kian-runtime"},
             "sender": {"login": "reporter", "type": "User"}
         })
     }

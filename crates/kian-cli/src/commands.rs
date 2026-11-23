@@ -375,7 +375,7 @@ pub struct ModelContextCheck {
     pub requests_checked: u64,
     pub byte_identical: u64,
     /// Requests whose recorded body carries dialect content parts
-    /// (ADR-062 vision). Their per-message bytes are not re-derivable
+    /// (ADR-063 vision). Their per-message bytes are not re-derivable
     /// offline — the image data URLs live only in the recorded body, and
     /// the event stream deliberately holds artifact references, not
     /// base64 — so they are counted here and left out of the byte diff
@@ -385,7 +385,7 @@ pub struct ModelContextCheck {
 }
 
 /// Whether one recorded body message carries dialect content parts
-/// (ADR-062): a `content` array whose items name a `type`.
+/// (ADR-063): a `content` array whose items name a `type`.
 fn message_has_content_parts(message: &Value) -> bool {
     message
         .get("content")
@@ -631,7 +631,7 @@ pub async fn run_replay(
 ///
 /// `--with-artifacts` (opt-, requires `--out`) pins every spilled
 /// `tool/result` blob the exported events reference into a sibling
-/// `<out>.artifacts/<id>` directory (ADR-058): the exported audit slice
+/// `<out>.artifacts/<id>` directory (ADR-059): the exported audit slice
 /// then survives retention GC. A blob already reclaimed is reported,
 /// never invented — the event stream stays the truth.
 #[allow(clippy::too_many_arguments)]
@@ -728,7 +728,7 @@ pub async fn run_export(
 }
 
 /// Resolves the configured blob store and pins `ids` beside the export
-/// (P3b, ADR-058). The artifacts section is required: a spill-shaped
+/// (P3b, ADR-059). The artifacts section is required: a spill-shaped
 /// result can only exist when spill was configured, so a missing
 /// section means the operator pointed the export at the wrong config.
 fn pin_export_artifacts(
@@ -2324,7 +2324,7 @@ pub async fn run_confirm(
 
 /// `kian raise-budget <uuid> [--tokens N] [--wall-clock-ms N] [--reason <text>]
 /// [--requested-by <who>] [--idempotency-key <key>] [--url <base>] [--config <path>]
-/// [--json]`: admits one durable budget-raise control row (ADR-054). The RPC result is the honest
+/// [--json]`: admits one durable budget-raise control row (ADR-055). The RPC result is the honest
 /// outcome — `accepted`, `deduplicated` or `terminal`; the effect is observed on the event stream.
 pub struct RaiseBudgetRequest<'a> {
     pub session: SessionId,
@@ -3105,7 +3105,7 @@ mod tests {
         assert!(check.mismatches[0].recorded.contains("REWRITTEN"));
     }
 
-    /// ADR-062: a request whose recorded body carries dialect content parts
+    /// ADR-063: a request whose recorded body carries dialect content parts
     /// (image data URLs) is counted as a vision request instead of being
     /// reported as a divergence — the base64 exists only in the recorded
     /// body, never re-derivable from the stream.

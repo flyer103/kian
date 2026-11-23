@@ -89,7 +89,7 @@ pub enum EndReason {
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
     /// The drain stopped because the session's token budget cannot fund
-    /// the next provider turn (ADR-054): `running -> idle` (resumable), not
+    /// the next provider turn (ADR-055): `running -> idle` (resumable), not
     /// terminal. A `budget/raised` input plus its wake re-opens the turn;
     /// deliberately distinct from `failed` (a failure) and `interrupted`
     /// (an owner stopped the drain).
@@ -264,7 +264,7 @@ pub enum EventKind {
     #[serde(rename = "control/confirm")]
     ControlConfirm,
 
-    /// A durable budget raise (ADR-054): a control-plane intent consumed by
+    /// A durable budget raise (ADR-055): a control-plane intent consumed by
     /// the owning drain appended the tokens it adds to the session budget.
     /// Payload schema: `{"tokens"?: u64, "wall_clock_ms"?: u64,
     /// "reason": string|null, "requested_by": string|null,

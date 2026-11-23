@@ -138,7 +138,7 @@ impl Default for EngineConfig {
     }
 }
 
-/// Operator-configured tool-result spill (ADR-055): when present, the
+/// Operator-configured tool-result spill (ADR-056): when present, the
 /// engine's single append path rewrites an oversized successful
 /// `tool/result` into a content-addressed reference plus a bounded preview
 /// before the event is written. Absent = byte-identical legacy behavior.
@@ -163,7 +163,7 @@ impl ArtifactRuntime {
     }
 
     /// Results whose compact JSON exceeds this spill; the preview is one
-    /// quarter of it (ADR-055).
+    /// quarter of it (ADR-056).
     #[must_use]
     pub fn inline_max_bytes(&self) -> usize {
         self.inline_max_bytes
@@ -204,7 +204,7 @@ pub enum EngineError {
     /// produce).
     #[error("context: {0}")]
     Context(#[from] kian_core::context::ContextError),
-    /// A budget raise must add at least one positive amount (ADR-054):
+    /// A budget raise must add at least one positive amount (ADR-055):
     /// an empty or zero raise would mint a durable row that can never
     /// change the projection.
     #[error("invalid budget raise: {reason}")]
@@ -249,7 +249,7 @@ pub enum ConfirmOutcome {
     UnknownSession,
 }
 
-/// What an [`Engine::raise_budget`] call did (ADR-054). The raise is a
+/// What an [`Engine::raise_budget`] call did (ADR-055). The raise is a
 /// durable control row; the drain consumes it into a `budget/raised`
 /// event and resumes an `awaiting_budget` session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,7 +421,7 @@ struct DrainCtxCore {
     interrupt: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
     metrics: Arc<Metrics>,
-    /// ADR-055 tool-result spill (engine-configured; `None` = legacy bytes).
+    /// ADR-056 tool-result spill (engine-configured; `None` = legacy bytes).
     artifacts: Option<ArtifactRuntime>,
 }
 
@@ -508,7 +508,7 @@ impl DrainCtxCore {
         })
     }
 
-    /// ADR-055: rewrite an oversized successful `tool/result` output into a
+    /// ADR-056: rewrite an oversized successful `tool/result` output into a
     /// content-addressed reference plus a bounded preview **before** the event
     /// is written, so the persisted bytes are exactly what the model sees next
     /// turn and replay needs no blob. Errors never spill; an absent runtime,
@@ -553,7 +553,7 @@ impl DrainCtxCore {
                 tracing::warn!(
                     session = %self.session.0,
                     error = %e,
-                    "tool result spill failed; keeping the inline output (ADR-055)"
+                    "tool result spill failed; keeping the inline output (ADR-056)"
                 );
                 return payload;
             }
@@ -561,7 +561,7 @@ impl DrainCtxCore {
                 tracing::warn!(
                     session = %self.session.0,
                     error = %e,
-                    "tool result spill task failed; keeping the inline output (ADR-055)"
+                    "tool result spill task failed; keeping the inline output (ADR-056)"
                 );
                 return payload;
             }
@@ -675,7 +675,7 @@ impl DrainCtx {
             .await
     }
 
-    /// [`DrainCtx::with_interrupt`] plus the ADR-055 spill runtime — the
+    /// [`DrainCtx::with_interrupt`] plus the ADR-056 spill runtime — the
     /// engine's `drain_episode` passes the engine-configured runtime so
     /// oversized tool results spill at the single append path.
     #[allow(clippy::too_many_arguments)]
@@ -1036,7 +1036,7 @@ impl DrainCtx {
             .is_empty())
     }
 
-    /// Reads one artifact blob by id for the driver (ADR-062 vision
+    /// Reads one artifact blob by id for the driver (ADR-063 vision
     /// inputs). `None` when no artifact runtime is configured, the blob
     /// has aged out, or the store read fails — the driver degrades the
     /// request (drops that image), never the turn: a reclaimed artifact
@@ -1051,7 +1051,7 @@ impl DrainCtx {
                 tracing::warn!(
                     session = %self.core.session.0,
                     artifact = %id,
-                    "artifact is not available (aged out or never stored); the request degrades (ADR-062)"
+                    "artifact is not available (aged out or never stored); the request degrades (ADR-063)"
                 );
                 None
             }
@@ -1060,7 +1060,7 @@ impl DrainCtx {
                     session = %self.core.session.0,
                     artifact = %id,
                     error = %e,
-                    "artifact read failed; the request degrades (ADR-062)"
+                    "artifact read failed; the request degrades (ADR-063)"
                 );
                 None
             }
@@ -1069,7 +1069,7 @@ impl DrainCtx {
                     session = %self.core.session.0,
                     artifact = %id,
                     error = %e,
-                    "artifact read task failed; the request degrades (ADR-062)"
+                    "artifact read task failed; the request degrades (ADR-063)"
                 );
                 None
             }
@@ -1121,7 +1121,7 @@ enum Supervised {
     SoftFailed {
         reason: String,
     },
-    /// The token budget gate refused the next provider request (ADR-054).
+    /// The token budget gate refused the next provider request (ADR-055).
     AwaitingBudget,
     /// The driver stream ended without a terminal outcome — treated as
     /// an honest failure, never `completed` (constraint 7).
@@ -1146,7 +1146,7 @@ pub struct Engine<D: LoopDriver> {
     /// byte-identical; the kian serve assembly turns it on from
     /// `read_model.snapshots`.
     read_model: crate::snapshots::ReadModelConfig,
-    /// ADR-055 tool-result spill; `None` keeps every payload byte-identical
+    /// ADR-056 tool-result spill; `None` keeps every payload byte-identical
     /// to legacy.
     artifacts: Option<ArtifactRuntime>,
 }
@@ -1201,7 +1201,7 @@ where
     }
 
     /// Engine with the system clock, an explicit read-model config and the
-    /// ADR-055 tool-result spill runtime (the `kian serve` assembly path).
+    /// ADR-056 tool-result spill runtime (the `kian serve` assembly path).
     #[must_use]
     pub fn new_with_read_model_and_artifacts(
         store: EventStore,
@@ -1648,7 +1648,7 @@ where
         Ok(outcome)
     }
 
-    /// Admits one input at an explicit eligibility instant (ADR-059):
+    /// Admits one input at an explicit eligibility instant (ADR-060):
     /// the durable row is written exactly like Engine::admit, but a
     /// row that is not yet eligible does NOT wake. The due-wake
     /// sweep (or a later admission, or a restart) wakes the session when
@@ -1672,7 +1672,7 @@ where
         Ok(outcome)
     }
 
-    /// The engine's wall clock reading, milliseconds (ADR-059: the
+    /// The engine's wall clock reading, milliseconds (ADR-060: the
     /// deferral planner and the cron sinks plan against the same clock
     /// the inbox rows are stamped with).
     pub fn now_ms(&self) -> u64 {
@@ -1736,7 +1736,7 @@ where
     }
 
     /// The durable-row write with an explicit eligibility instant
-    /// (ADR-059). Constraint 6 still holds: the row is durable BEFORE any
+    /// (ADR-060). Constraint 6 still holds: the row is durable BEFORE any
     /// wake may fire; on any store failure the caller returns without
     /// touching the registry.
     async fn admit_row_at(
@@ -1991,7 +1991,7 @@ where
         })
     }
 
-    /// Raises the session-lifetime token/wall-clock budget (ADR-054): a
+    /// Raises the session-lifetime token/wall-clock budget (ADR-055): a
     /// durable reserved control row plus a wake. The control plane writes
     /// only the inbox row — the owning drain consumes it into a
     /// `budget/raised` event and the projection adds it. A raise is the
@@ -2079,7 +2079,7 @@ where
         self.scan_eligible_sessions().await
     }
 
-    /// The due-wake sweep (ADR-059 decision 5): re-derives the wake
+    /// The due-wake sweep (ADR-060 decision 5): re-derives the wake
     /// registry from the inbox so a deferred row whose eligible_at has
     /// come due wakes its session without a per-row timer. The wake
     /// registry holds no timers by design; correctness never depends on
@@ -2492,7 +2492,7 @@ where
                     break 'episodes;
                 }
                 Supervised::AwaitingBudget => {
-                    // ADR-054: the token budget refused the next request.
+                    // ADR-055: the token budget refused the next request.
                     // The end is resumable (running -> idle); a durable
                     // budget-raise row is the wake that resumes it.
                     tracing::info!(
@@ -2640,7 +2640,7 @@ async fn heartbeat_loop(
 struct TakeReport {
     messages: Vec<InputRow>,
     control_interrupt: bool,
-    /// A budget-raise row was consumed into `budget/raised` (ADR-054): the
+    /// A budget-raise row was consumed into `budget/raised` (ADR-055): the
     /// drain must drive the loop even with no message row, because the
     /// raise is what releases an `awaiting_budget` settle.
     control_budget: bool,
@@ -2674,9 +2674,12 @@ struct TakeReport {
 /// only). The envelopes are row-level conventions
 /// only — the committed event payload contracts are unchanged (the
 /// marker rides EVENT-MODEL §4.2's additive provenance keys). Like the
-/// steer wrapper before it, each exact two-key shape is reserved: a
-/// plain payload of that precise shape is read as an envelope, not
-/// content.
+/// steer wrapper before it, each exact shape is reserved: a plain payload
+/// of that precise key set is read as an envelope, not content. The job
+/// envelope is the newest family — `{"content": X, "job": M}` for an
+/// operator admit and `{"content": X, "cron": C, "job": M}` for a firing
+/// (JOB-MODEL §14 A1); the frozen plan rides top-level so the conductor
+/// classifies on it alone.
 enum Consumption {
     /// One `input/admitted` event (the entire legacy surface).
     Single(Value),
@@ -2692,7 +2695,7 @@ enum Consumption {
     /// the decision at its next turn start; the row is bound to the
     /// event's seq like any other consumption.
     Confirm(ConfirmIntent),
-    /// The reserved budget envelope (ADR-054): a `budget/raised` audit
+    /// The reserved budget envelope (ADR-055): a `budget/raised` audit
     /// event, never a message. The row is bound to the event's seq like
     /// any other consumption.
     Budget(BudgetIntent),
@@ -2765,11 +2768,31 @@ fn consumption_plan(row: &InputRow) -> Consumption {
             // bytes).
             return Consumption::Single(json!({"role": "user", "content": content, "cron": cron}));
         }
+        if obj.len() == 2
+            && let (Some(content), Some(job)) = (obj.get("content"), obj.get("job"))
+        {
+            // JOB-MODEL §14 A1: a run's first row. The plan and its digest
+            // ride as an additive, non-context key (derive_model_context
+            // reads role/content only) and the conductor classifies on this
+            // key alone — never on the prompt text.
+            return Consumption::Single(json!({"role": "user", "content": content, "job": job}));
+        }
+        if obj.len() == 3
+            && let (Some(content), Some(cron), Some(job)) =
+                (obj.get("content"), obj.get("cron"), obj.get("job"))
+        {
+            // JOB-MODEL §7.1a: a firing that starts a run carries the
+            // scheduler's proof beside the plan (CRON-MODEL §6.1 keeps that
+            // proof additive the same way).
+            return Consumption::Single(
+                json!({"role": "user", "content": content, "cron": cron, "job": job}),
+            );
+        }
         if obj.len() == 3
             && let (Some(content), Some(cron), Some(defer)) =
                 (obj.get("content"), obj.get("cron"), obj.get("defer"))
         {
-            // ADR-059: an off-peak firing carries the scheduler's deferral
+            // ADR-060: an off-peak firing carries the scheduler's deferral
             // decision beside the proof. The decision is additive and
             // non-context (derive_model_context reads role/content only), so
             // the model still receives the prompt alone.
@@ -2799,8 +2822,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ArtifactRuntime, BudgetOutcome, Clock, DrainCtx, Engine, EngineConfig, EngineError,
-        InterruptOutcome, ManualClock, ReleaseOutcome, WakeOutcome,
+        ArtifactRuntime, BudgetOutcome, Clock, Consumption, DrainCtx, Engine, EngineConfig,
+        EngineError, InterruptOutcome, ManualClock, ReleaseOutcome, WakeOutcome, consumption_plan,
     };
     use crate::metrics::Metrics;
     use kian_core::control::BudgetIntent;
@@ -3056,7 +3079,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// ADR-059: a row admitted with a future eligibility instant is
+    /// ADR-060: a row admitted with a future eligibility instant is
     /// durable immediately but arms nothing — it is invisible to the
     /// eligible scan and cannot be consumed early. When the clock reaches
     /// the instant, the due-wake sweep (not a per-row timer) wakes the
@@ -3792,7 +3815,7 @@ mod tests {
         cleanup(&path);
     }
 
-    /// ADR-059: the deferred cron envelope — exactly
+    /// ADR-060: the deferred cron envelope — exactly
     /// `{"content": X, "cron": M, "defer": D}` — consumes to ONE
     /// `input/admitted` carrying the prompt and both additive keys, and the
     /// deferral decision leaves the projected model context byte-identical.
@@ -4201,6 +4224,61 @@ mod tests {
             admitted[0].bytes
         );
         cleanup(&path);
+    }
+    /// JOB-MODEL §14 A1: a run's first row is `{content, job}` (an
+    /// operator's `kian job run`) or `{content, cron, job}` (a firing),
+    /// and each consumes to ONE message with the frozen plan riding as a
+    /// top-level additive key. The conductor classifies a run on that key
+    /// alone, so a nested marker would silently hand the run to the
+    /// default loop.
+    #[test]
+    fn job_rows_promote_the_frozen_plan_to_the_top_level() {
+        let sid = SessionId::new();
+        let plan = json!({"id": "digest", "steps": []});
+        let manual = consumption_plan(&row(
+            sid,
+            1,
+            json!({"content": "run the digest", "job": plan.clone()}),
+        ));
+        let Consumption::Single(bytes) = manual else {
+            panic!("a job row consumes to one message");
+        };
+        assert_eq!(
+            bytes,
+            json!({"role": "user", "content": "run the digest", "job": plan.clone()})
+        );
+
+        let fired = consumption_plan(&row(
+            sid,
+            2,
+            json!({"content": "run the digest", "cron": {"firing": "f1"}, "job": plan.clone()}),
+        ));
+        let Consumption::Single(bytes) = fired else {
+            panic!("a fired job row consumes to one message");
+        };
+        assert_eq!(
+            bytes,
+            json!({
+                "role": "user",
+                "content": "run the digest",
+                "cron": {"firing": "f1"},
+                "job": plan,
+            })
+        );
+    }
+
+    /// The job envelope is exact like every other reserved shape: a
+    /// superset stays ordinary content, so no writer can mint a run
+    /// marker by adding a key.
+    #[test]
+    fn job_shaped_supersets_stay_ordinary_content() {
+        let superset = json!({"content": "not a run", "job": {"run_id": "forged"}, "extra": 1});
+        let Consumption::Single(bytes) =
+            consumption_plan(&row(SessionId::new(), 1, superset.clone()))
+        else {
+            panic!("a superset consumes to one message");
+        };
+        assert_eq!(bytes, json!({"role": "user", "content": superset}));
     }
 
     // -- invariant 4: drain has no durable identity -------------------------
@@ -6423,7 +6501,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- session token budget gate (ADR-054) --------------------------------
+    // -- session token budget gate (ADR-055) --------------------------------
 
     /// `awaiting_budget` is a resumable settle, not a terminal state: the
     /// control plane admits a budget raise as a durable row only (never an
@@ -6618,7 +6696,7 @@ mod tests {
         cleanup(&path);
     }
 
-    // -- tool result artifacts (ADR-055) ----------------------------------
+    // -- tool result artifacts (ADR-056) ----------------------------------
 
     async fn artifact_ctx(
         store: EventStore,
@@ -6643,7 +6721,7 @@ mod tests {
         .expect("drain ctx")
     }
 
-    /// ADR-062: the driver reads image bytes through the artifact runtime;
+    /// ADR-063: the driver reads image bytes through the artifact runtime;
     /// a missing blob and an absent runtime both degrade to `None` (drop
     /// the image, keep the turn) instead of failing.
     #[tokio::test]

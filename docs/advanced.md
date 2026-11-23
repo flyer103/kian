@@ -32,6 +32,11 @@
 - **Scheduled turns** — declarative `superagent.cron` schedules execute as ordinary durable turns
   (resident, or a detached per-firing git worktree), with a durable slot cursor, DST-correct
   next-fire math, misfire coalescing, disk guards and a `kian cron list|run-now|logs|rm` surface.
+- **Declarative jobs** — `superagent.jobs` declares a plan of capability-addressed steps:
+  a trigger starts a run (an ordinary durable session), one child session runs each step, text
+  artifacts move by reference, each step is proven by the evidence gate, delivery is the channel
+  adapter's receipt, and a failed run raises an alert run — with `kian job list|status|run|cancel`
+  ([JOB-MODEL](../design/JOB-MODEL.md)).
 - **Durable worker binding** — each delegated worker session is bound 1:1 to one `kiand`
   worker (Router-chosen from the worker catalog, recorded as additive event bytes,
   re-derived from the stream): worker restarts, migrations and server reboots keep the
@@ -55,7 +60,7 @@
 - **Audited web tools** — DeepSeek Search and Fetch mount as ordinary `web_search`/`web_fetch` tool
   calls on your own key: every request and response is an event on the durable stream, large pages
   spill through the artifact path, and failures are honest classified results
-  ([ADR-056](../design/decisions/ADR-056-client-side-web-tools.md)).
+  ([ADR-057](../design/decisions/ADR-057-client-side-web-tools.md)).
 - **Agent memory (notes + dreaming + creation-time injection)** — the memory session's drain reads
   a bounded transcript range and appends `memory/note` events (claims with provenance and
   verification state); `kian memory create/dream/list/show/verify` plus the read-only
@@ -141,7 +146,7 @@ superagent:
     github:
       type: github
       github:
-        topics: { "flyer103/kian": "kian-repo" }   # owner/repo → topic; also the allowlist
+        topics: { "flyer103/kian-runtime": "kian-repo" }   # owner/repo → topic; also the allowlist
         send: true                                  # reply half; requires KIAN_GITHUB_TOKEN
         webhook: { max_body_bytes: 1048576 }        # mounts POST /webhooks/github
     lark-im:
@@ -702,6 +707,79 @@ target/debug/kian cron rm     night-audit --config kian.yaml    # drop the store
 Semantics: [design/CRON-MODEL.md](../design/CRON-MODEL.md); decision:
 [ADR-034](../design/decisions/ADR-034-cron-scheduler.md).
 
+## Declarative jobs (`superagent.jobs`)
+
+A job is a *plan* of steps, not one prompt: each step declares the capabilities it needs (`requires`) —
+never a hostname — what it produces, and how it is proven done. A trigger starts a run; the run is
+an ordinary session whose driver dispatches one child session per step and parks between ticks.
+Delivery is its own conductor action, so the words that land are the ones the channel's receipt
+names.
+
+```yaml
+superagent:
+  jobs:
+    jobs:
+      - id: digest
+        limits: {deadline_ms: 900000}
+        plan:
+          - id: gather
+            requires: [net.unrestricted]        # a hostname is never a selector
+            prompt: "Collect today's sources; at most 40 lines."
+            produces: {name: sources, media: text, max_bytes: 24576}
+            timeout_ms: 120000
+            retries: 1
+            verify:
+              - {check: final_message_present}
+              - {check: min_tool_results, n: 1}
+          - id: compose
+            depends_on: [gather]
+            inputs: [{step: gather, name: sources}]
+            prompt: "You are the editor. Use the supplied sources; do not fetch."
+            produces: {name: digest, media: text, max_bytes: 24576}
+            verify: [{check: final_message_present}]
+          - id: send
+            action: deliver
+            depends_on: [compose]
+            channel: imessage
+            target: {handle: "+8613800000000"}
+            content: {from_artifact: {step: compose, name: digest}}
+            verify:
+              - {check: delivery_receipt, channel: imessage, target: {handle: "+8613800000000"}}
+    triggers:
+      - id: digest-morning                      # the schedule id; defaults to the job id
+        job: digest
+        expr: "0 9 * * *"
+        tz: Asia/Shanghai
+        catch_up: latest                        # skip | latest
+    alerts:
+      - id: digest-failed
+        on_failure_of: digest
+        channel: lark                           # must differ from every deliver channel
+        target: {topic: ops}
+```
+
+The alert channel must differ from every deliver channel of the job (a failure of the delivery path
+cannot be reported through itself): a single-channel deployment needs a second channel before it can
+alert on that channel's own failures.`
+
+Inspect and drive runs from the CLI:
+
+```bash
+target/debug/kian job list   --config kian.yaml             # jobs, plan digests, triggers, alerts
+target/debug/kian job status digest@2026-11-23T01:00:00Z    # one run: steps, attempts, workers, outcomes
+target/debug/kian job status digest                         # one job: header + recent firings
+target/debug/kian job run    digest --config kian.yaml      # a manual slot (never deduped with a cron slot)
+target/debug/kian job cancel digest@manual:01JBQ4Z7Q9K3YV6N8M2X0T5R4E
+```
+
+What the contract guarantees: a run's plan is frozen at admit, so editing `jobs:` never changes a
+run in flight; a retry is a new attempt on a fresh child (never a rebind); an unwritable effect is
+refused rather than repeated; a step that is not proven done makes the run `unverified`, never
+`succeeded`; and a run's outcome is written before the run ends, so the settlement sweep, the alert
+and `kian job status` all read the same fact.
+
+Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
+[ADR-052](../design/decisions/ADR-052-job-model.md).
 ## Model profiles
 
 `model_profiles:` declares what a provider/model pair can do. A slot with no profile keeps the
@@ -724,7 +802,7 @@ model_profiles:
 
 The profile is part of the session's slot binding: changing it for a live session requires a
 `slot/migration`, never a silent request-shape change. Semantics:
-[ADR-053](../design/decisions/ADR-053-request-plans-and-model-profiles.md).
+[ADR-054](../design/decisions/ADR-054-request-plans-and-model-profiles.md).
 
 ## Session budgets
 
@@ -756,7 +834,7 @@ curl -s localhost:7433/rpc -H 'content-type: application/json' -d \
 Outcomes: `accepted` (durable row, the drain resumes), `deduplicated` (identical raise already
 admitted), `terminal` (session completed/cancelled/rotated — nothing admitted). Both amounts absent
 or zero is refused. `wall_clock_ms` is recorded and projected but not enforced while a drain is
-idle. Semantics: [ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
+idle. Semantics: [ADR-055](../design/decisions/ADR-055-session-budget-gate.md).
 
 ## Off-peak deferral
 
@@ -811,7 +889,7 @@ drain may still be busy. When the next off peak is farther than `defer.max_wait_
 instant is already off peak, the admission runs immediately and records the reason
 (`deferred: false`). Without a `defer:` section, a request carrying `defer` is refused with
 `-32602` rather than silently running now. Semantics:
-[ADR-059](../design/decisions/ADR-059-off-peak-deferral.md).
+[ADR-060](../design/decisions/ADR-060-off-peak-deferral.md).
 
 ## Context compaction
 
@@ -843,7 +921,7 @@ maintenance requests, so a session can always pay for the compaction that preven
 Both operator views follow the purpose: `kian cache-stats` pairs only ordinary requests (a
 maintenance body is never reported as an unexpected prefix change), and `kian cost` prints
 maintenance requests and their subtotal apart from turns. Semantics:
-[ADR-057](../design/decisions/ADR-057-production-compaction-and-maintenance-reserve.md).
+[ADR-058](../design/decisions/ADR-058-production-compaction-and-maintenance-reserve.md).
 
 ## Tool result artifacts
 
@@ -892,8 +970,8 @@ target/debug/kian session export <session-id> --out audit.jsonl --with-artifacts
 
 An already-reclaimed blob is reported as missing in the command summary and does not fail the
 export. The same flag works when exporting an archived package. Semantics:
-[ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md) and
-[ADR-058](../design/decisions/ADR-058-maintenance-artifact-gc-and-export-pinning.md).
+[ADR-056](../design/decisions/ADR-056-artifacts-and-tool-result-spill.md) and
+[ADR-059](../design/decisions/ADR-059-maintenance-artifact-gc-and-export-pinning.md).
 
 ## Client-side web tools
 
@@ -917,7 +995,7 @@ takes `{"url"}` and returns `{"url","title","content"}`. Failures are honest err
 the HTTP status and a bounded body; 408/429/5xx are marked `retryable` but are never retried
 automatically. Search/Fetch bill per successful request — the token cost projection does not price
 them yet. Treat returned pages as untrusted data, never instructions. Semantics:
-[ADR-056](../design/decisions/ADR-056-client-side-web-tools.md).
+[ADR-057](../design/decisions/ADR-057-client-side-web-tools.md).
 
 ## Media tools and file ingest
 
@@ -955,7 +1033,7 @@ kian artifacts put ./invoice.png
 ```
 
 `--media-type` overrides the extension guess and `--json` emits the reference as JSON. Semantics:
-[ADR-060](../design/decisions/ADR-060-client-side-media-tools.md).
+[ADR-061](../design/decisions/ADR-061-client-side-media-tools.md).
 
 ### Channel media (inbound transcription)
 
@@ -976,7 +1054,7 @@ message is still admitted; a payload without `media` passes through untouched. N
 this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge is text-only, so this is
 the contract those channel phases implement (a mock channel can carry it today). Outbound audio is not
 wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
-Semantics: [ADR-061](../design/decisions/ADR-061-channel-edge-media.md).
+Semantics: [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
 
 ## Vision inputs
 
@@ -1012,7 +1090,7 @@ images per message, 8 MiB each, user messages only, and no image pricing — the
 what `kian cost` prices. A blob missing at send time drops that image (a warning, and the text
 still goes) rather than failing the turn; `kian session replay` reports such requests as vision
 requests because offline replay cannot rebuild base64. Semantics:
-[ADR-062](../design/decisions/ADR-062-vision-content-parts.md).
+[ADR-063](../design/decisions/ADR-063-vision-content-parts.md).
 
 ## Cost projection
 
@@ -1035,8 +1113,7 @@ target/debug/kian cost --config kian.yaml --json
 ```
 
 Unpriced models are counted, never priced at zero; an absent `pricing:` section reports no cost.
-Semantics: [ADR-052](../design/decisions/ADR-052-economics-cost-projection.md).
-
+Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 ## Operator surfaces
 
 | Surface | What it does |

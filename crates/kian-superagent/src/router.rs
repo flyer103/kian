@@ -1895,6 +1895,7 @@ impl RouterTools {
         // lineage-before-admit. An emit failure admits nothing; an
         // admit failure leaves a reservation the lease rule releases.
         let request = SpawnRequest {
+            parent: None,
             task,
             correlation,
             speculative,

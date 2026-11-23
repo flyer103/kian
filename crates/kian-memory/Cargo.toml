@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # DESIGN §7: a bundle layer, not core (MEMORY-MODEL §8 constraint 10):
 # the dreamer prompt/parser/driver live here, beside the loop, with NO

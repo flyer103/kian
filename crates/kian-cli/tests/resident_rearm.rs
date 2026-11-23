@@ -225,6 +225,13 @@ fn count_kind(events: &[Event], kind: EventKind) -> usize {
     events.iter().filter(|e| e.kind == kind).count()
 }
 
+fn step_request_carries(event: &Event, event_id: &str) -> bool {
+    event.kind == EventKind::StepRequest
+        && serde_json::to_string(&event.bytes["body"])
+            .map(|body| body.contains(event_id))
+            .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // 1. Terminal pinned session → the successor arms and carries the watch
 // ---------------------------------------------------------------------------
@@ -296,21 +303,22 @@ async fn terminal_pinned_router_re_arms_onto_the_successor_on_boot() {
     let events = wait_for_session(
         &read_only,
         successor,
-        "tick judged on the successor",
+        "the judge request carries the watch event",
         |ev| {
             count_kind(ev, EventKind::TurnStart) >= 2
                 && ev.iter().any(|e| {
                     e.kind == EventKind::InputAdmitted
                         && e.bytes.pointer("/content/kian/event_id") == Some(&json!(event_id))
                 })
+                && ev.iter().any(|e| step_request_carries(e, &event_id))
         },
     )
     .await;
     let request = events
         .iter()
         .rev()
-        .find(|e| e.kind == EventKind::StepRequest)
-        .expect("judge request");
+        .find(|e| step_request_carries(e, &event_id))
+        .expect("judge request carrying the watch event");
     let body = serde_json::to_string(&request.bytes["body"]).unwrap();
     assert!(body.contains(&event_id), "judge saw the event: {body}");
 

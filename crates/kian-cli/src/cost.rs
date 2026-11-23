@@ -1,5 +1,5 @@
 //! Cost projection — a pure read over the event stream and the config
-//! price book (ADR-052, phase 0).
+//! price book (ADR-053, phase 0).
 //!
 //! Nothing here is stored: a session's cost is derived on read from each
 //! usage-bearing turn/end, the step/request (or slot/fallback) that names
@@ -46,7 +46,7 @@ pub struct SessionCostReport {
     pub unpriced_models: Vec<String>,
     pub peak_requests: u64,
     pub off_peak_requests: u64,
-    /// Usage-bearing maintenance turns (ADR-057: the turn's purpose is
+    /// Usage-bearing maintenance turns (ADR-058: the turn's purpose is
     /// compact) — priced with the same book, reported apart from turns.
     pub maintenance_requests_with_usage: u64,
     /// Priced subtotal of maintenance turns, in micro-units.
@@ -176,7 +176,7 @@ pub fn session_cost_report(
                     report.unknown_usage_requests += 1;
                     continue;
                 }
-                // ADR-057: maintenance turns are usage-bearing turns of
+                // ADR-058: maintenance turns are usage-bearing turns of
                 // their own; totals include them, the report also names them.
                 let maintenance =
                     ev.bytes.get("purpose").and_then(|v| v.as_str()) == Some("compact");

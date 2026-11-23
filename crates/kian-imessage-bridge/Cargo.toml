@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # CHANNEL-IMESSAGE §3: this binary is the only component that touches
 # macOS (chat.db under Full Disk Access, Messages.app under Automation).

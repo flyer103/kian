@@ -156,7 +156,7 @@ Schedules live in a new `superagent.cron:` section, beside `channels:`, `watchdo
 | `max_concurrent` | u32 | no | `1` | Ceiling for one schedule's worktree firings (§5.4); the resident arm is serialized by its session. |
 | `timeout_ms` | u64 | no | `1800000` (30 min) | Per-firing ceiling, **worktree arm only** (§5.5). An explicit value on a resident schedule refuses load. |
 | `worktree` | `true`\|table | no | absent (resident arm) | Worktree policy (§6). |
-| `defer` | `immediate`\|`off_peak` | no | `immediate` (absent) | ADR-059: an `off_peak` firing is admitted with a future `eligible_at` planned against `pricing.peak_windows`, bounded by `defer.max_wait_ms`; absent keeps the immediate admit bytes unchanged. Resident arm only: a `worktree:` schedule refuses `off_peak` (an isolated external job has no inbox row to defer). |
+| `defer` | `immediate`\|`off_peak` | no | `immediate` (absent) | ADR-060: an `off_peak` firing is admitted with a future `eligible_at` planned against `pricing.peak_windows`, bounded by `defer.max_wait_ms`; absent keeps the immediate admit bytes unchanged. Resident arm only: a `worktree:` schedule refuses `off_peak` (an isolated external job has no inbox row to defer). |
 
 ### 3.2 Target
 
@@ -207,7 +207,7 @@ arm or a coarser cadence when that matters (§9.4).
 10. A schedule declaring `defer: off_peak` requires a top-level `defer:` section
     (`sweep_interval_ms`, `max_wait_ms`); without one it refuses load, naming the schedule. A
     `worktree:` schedule may not declare `off_peak` — an isolated external job has no inbox
-    row to defer (ADR-059).
+    row to defer (ADR-060).
 
 ### 3.4 Example
 
@@ -303,7 +303,7 @@ admitting the row — an overlapping slot used to wait behind the session's sing
 which duplicated unattended runs. `queue` and `kill-previous` are
 **not** accepted in v1: they refuse load (§3.3 rule 8) rather than silently behaving as `skip`.
 
-A row deferred under ADR-059 is not open work until its `eligible_at` passes: the resident arm's
+A row deferred under ADR-060 is not open work until its `eligible_at` passes: the resident arm's
 open-work probe counts only eligible rows, so an `off_peak` firing parking the next slot never
 records a false `skipped_overlap`. The serve due-wake sweep (DESIGN §2.3) wakes the session when
 the gate opens; correctness never depends on the sweep's cadence.
@@ -393,7 +393,7 @@ session, with the firing proof as an additive, non-context payload key
 `cron:<firing_id>`; the model request carries the prompt alone. A schedule that declared
 `defer: off_peak` adds the planner's decision as the additive, non-context key
 `defer: {policy, deferred, eligible_at_ms, reason}` beside the proof and admits the row with a
-future `eligible_at` (ADR-059, DESIGN §2.3) — the model request is still the prompt alone. The
+future `eligible_at` (ADR-060, DESIGN §2.3) — the model request is still the prompt alone. The
 session's harness is whatever
 `superagent.harness.dsh` configures ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)); the
 engine runs the turn and the firing settles from the session's end (§9.1).

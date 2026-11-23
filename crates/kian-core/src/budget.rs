@@ -1,4 +1,4 @@
-//! The session token budget projection (ADR-054).
+//! The session token budget projection (ADR-055).
 //!
 //! Budgets are never authoritative state: the base is pinned on
 //! `session/created`, raises are `budget/raised` events, and spend is the
@@ -11,7 +11,7 @@ use crate::events::{Event, EventKind};
 use crate::model::Budgets;
 
 /// Fraction of the token allowance withheld from ordinary turns so
-/// maintenance work (compaction, ADR-057) stays affordable near the limit.
+/// maintenance work (compaction, ADR-058) stays affordable near the limit.
 /// Without it the runtime can end up short of budget for the one call that
 /// would have prevented a context overflow.
 pub const DEFAULT_MAINTENANCE_RESERVE_PERCENT: u64 = 10;
@@ -66,7 +66,7 @@ pub struct BudgetProjection {
     /// Tokens reported spent by `turn/end` usage.
     pub tokens_spent: u64,
     /// The base wall-clock allowance; recorded and raised, never enforced
-    /// (ADR-054: idle waiting for a human must not consume a turn budget).
+    /// (ADR-055: idle waiting for a human must not consume a turn budget).
     pub wall_clock_limit_ms: Option<u64>,
     /// Wall-clock milliseconds added by raises.
     pub wall_clock_raised_ms: u64,

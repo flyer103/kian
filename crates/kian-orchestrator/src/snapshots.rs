@@ -132,7 +132,7 @@ enum EndReasonSerde {
     Failed,
     #[serde(rename = "awaiting_input")]
     AwaitingInput,
-    /// ADR-054: the token budget gate stopped the drain (resumable idle).
+    /// ADR-055: the token budget gate stopped the drain (resumable idle).
     #[serde(rename = "awaiting_budget")]
     AwaitingBudget,
     /// ADR-040: the resident session was retired by rotation.

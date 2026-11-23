@@ -819,7 +819,7 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
     cleanup_db(&h.db_path);
 }
 
-// -- session token budget gate (ADR-054) ------------------------------------
+// -- session token budget gate (ADR-055) ------------------------------------
 
 /// A pinned session token budget refuses the next request BEFORE the
 /// `step/request` is persisted: the drain ends the resumable
@@ -1933,7 +1933,7 @@ async fn coincident_declared_and_hook_deny_name_one_denier() {
     cleanup_db(&h.db_path);
 }
 
-// -- acceptance: production compaction (ADR-057) ---------------------------
+// -- acceptance: production compaction (ADR-058) ---------------------------
 
 /// Builds an agent definition with an explicit slot profile and budgets.
 fn profiled_agent_def(
@@ -2225,7 +2225,7 @@ async fn reactive_overflow_compacts_then_retries_the_smaller_request() {
     cleanup_db(&h.db_path);
 }
 
-/// The ordinary-turn gate reserves the maintenance share (ADR-057) and a
+/// The ordinary-turn gate reserves the maintenance share (ADR-058) and a
 /// raise releases the resulting awaiting_budget settle; a session without a
 /// declared window never compacts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2310,7 +2310,7 @@ async fn maintenance_reserve_parks_the_turn_and_a_budget_raise_resumes_it() {
     cleanup_db(&h.db_path);
 }
 
-// -- acceptance: vision content parts (ADR-062) -----------------------------
+// -- acceptance: vision content parts (ADR-063) -----------------------------
 
 fn vision_profile() -> kian_core::model::ModelProfile {
     kian_core::model::ModelProfile {
@@ -2327,7 +2327,7 @@ fn vision_profile() -> kian_core::model::ModelProfile {
 }
 
 /// Engine harness with an explicit artifact runtime so the loop can read
-/// referenced image blobs (ADR-062) through `DrainCtx::artifact_bytes`.
+/// referenced image blobs (ADR-063) through `DrainCtx::artifact_bytes`.
 async fn harness_with_artifacts(
     agent: AgentDef,
     turns: Vec<ScriptedChunksArgs>,
@@ -2364,7 +2364,7 @@ async fn harness_with_artifacts(
 
 /// What a client submits: the payload IS the model content. The engine's
 /// admission wraps it as `{"role":"user","content": payload}`, so this
-/// object becomes one user message whose content is the ADR-062 envelope.
+/// object becomes one user message whose content is the ADR-063 envelope.
 fn image_envelope(artifact: &str) -> Value {
     json!({
         "text": "what is on this invoice?",
@@ -2372,7 +2372,7 @@ fn image_envelope(artifact: &str) -> Value {
     })
 }
 
-/// ADR-062 L2: a user message referencing an artifact image is rendered as
+/// ADR-063 L2: a user message referencing an artifact image is rendered as
 /// dialect content parts (text + image_url data URL) for a vision profile;
 /// the bytes come from the artifact runtime, and the internal carrier field
 /// never reaches the wire.
@@ -2428,7 +2428,7 @@ async fn vision_profile_sends_artifact_images_as_content_parts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ADR-062 honesty: neither a missing blob nor a non-vision profile changes
+/// ADR-063 honesty: neither a missing blob nor a non-vision profile changes
 /// the wire shape into content parts — the envelope's text still flies, and
 /// a non-vision target keeps the legacy compact-JSON conversion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

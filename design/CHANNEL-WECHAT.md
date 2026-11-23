@@ -399,7 +399,7 @@ Explicitly out of scope for round 10, recorded so they are not silently half-bui
 multi-account (more than one `type: wechat`), proactive push (any send without an inbound
 `context_token`), message recall/edit handling, and any prompt-level tuning specific to WeChat.
 
-The typed side of inbound media is designed even though the adapter side is not built: ADR-061 defines
+The typed side of inbound media is designed even though the adapter side is not built: ADR-062 defines
 the additive `media` payload envelope (`{"kind","media_type","base64"[,"language"]}` items) and the
 assembly-side media edge that stores each item as an artifact, transcribes it and appends the
 transcript to the admitted text. A future WeChat media phase downloads from the media CDN and hands the

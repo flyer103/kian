@@ -1,6 +1,6 @@
 [package]
 name = "kian-media"
-description = "Client-side media tools (OCR, speech-to-text, text-to-speech) as an audited bundle tool provider (ADR-060)"
+description = "Client-side media tools (OCR, speech-to-text, text-to-speech) as an audited bundle tool provider (ADR-061)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

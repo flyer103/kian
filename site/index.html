@@ -3,27 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kian — the durable execution runtime for agents</title>
-  <meta name="description" content="Kian is an open-source, model-neutral, self-hostable durable execution runtime for agents. A session survives the process, compute stays on machines you own, and the agent loop stays yours.">
+  <title>Kian Runtime — the durable execution runtime for agents</title>
+  <meta name="description" content="Kian Runtime is an open-source, model-neutral, self-hostable durable execution runtime for agents. A session survives the process, compute stays on machines you own, and the agent loop stays yours.">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#08090a">
   <link rel="canonical" href="https://kian-site.pages.dev/">
   <meta property="og:type" content="website">
-  <meta property="og:site_name" content="Kian">
-  <meta property="og:title" content="Kian — the durable execution runtime for agents">
+  <meta property="og:site_name" content="Kian Runtime">
+  <meta property="og:title" content="Kian Runtime — the durable execution runtime for agents">
   <meta property="og:description" content="A crash, a deploy or a machine move costs a restart, not the work.">
   <meta property="og:url" content="https://kian-site.pages.dev/">
   <meta property="og:image" content="https://kian-site.pages.dev/assets/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="Kian — the durable execution runtime for agents">
+  <meta property="og:image:alt" content="Kian Runtime — the durable execution runtime for agents">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Kian — the durable execution runtime for agents">
+  <meta name="twitter:title" content="Kian Runtime — the durable execution runtime for agents">
   <meta name="twitter:description" content="A crash, a deploy or a machine move costs a restart, not the work.">
   <meta name="twitter:image" content="https://kian-site.pages.dev/assets/og.png">
   <link rel="icon" href="favicon.ico" sizes="32x32">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Kian Runtime",
+    "alternateName": "kian",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Linux",
+    "description": "An open-source, model-neutral, self-hostable durable execution runtime for agents. A session survives the process; the append-only event stream is the only source of truth.",
+    "url": "https://kian-site.pages.dev/",
+    "downloadUrl": "https://crates.io/crates/kian-cli",
+    "softwareVersion": "0.1.1",
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "codeRepository": "https://github.com/flyer103/kian-runtime",
+    "programmingLanguage": "Rust",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+  }
+  </script>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -44,11 +62,11 @@
       <a href="#how">How it works</a>
       <a href="#stream">Audit</a>
       <a href="#quickstart">Quickstart</a>
-      <a href="https://github.com/flyer103/kian/blob/main/docs/overview.md">Docs</a>
+      <a href="https://github.com/flyer103/kian-runtime/blob/main/docs/overview.md">Docs</a>
     </nav>
 
     <div class="topbar-actions">
-      <a class="btn btn-ghost" href="https://github.com/flyer103/kian">GitHub</a>
+      <a class="btn btn-ghost" href="https://github.com/flyer103/kian-runtime">GitHub</a>
       <a class="btn btn-primary" href="#quickstart">Get started</a>
     </div>
 
@@ -62,8 +80,8 @@
         <a href="#how">How it works</a>
         <a href="#stream">Audit</a>
         <a href="#quickstart">Quickstart</a>
-        <a href="https://github.com/flyer103/kian/blob/main/docs/overview.md">Docs</a>
-        <a href="https://github.com/flyer103/kian">GitHub</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/docs/overview.md">Docs</a>
+        <a href="https://github.com/flyer103/kian-runtime">GitHub</a>
       </nav>
     </details>
   </header>
@@ -78,7 +96,7 @@
       <p class="lede">Kian is a durable execution runtime for agents. It makes the session the durable entity and the event stream the only truth &mdash; so a crash, a deploy or a machine move costs a restart, not the work.</p>
       <div class="cta-row">
         <a class="btn btn-primary btn-lg" href="#quickstart">Get started</a>
-        <a class="btn btn-ghost btn-lg" href="https://github.com/flyer103/kian">View on GitHub</a>
+        <a class="btn btn-ghost btn-lg" href="https://github.com/flyer103/kian-runtime">View on GitHub</a>
       </div>
       <ul class="chips">
         <li>Model-neutral</li>
@@ -293,14 +311,18 @@ drain claims        2</code></pre>
     <p class="eyebrow">Quickstart</p>
     <div class="section-head">
       <h2>One binary. One sqlite file. No external queue.</h2>
-      <p class="section-lede">No toolchain needed: a prebuilt archive or the container image. sqlite is embedded and a single <code>kian serve</code> process is the whole system, and the provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
+      <p class="section-lede">One <code>cargo install</code>, a prebuilt archive, or the container image. sqlite is embedded and a single <code>kian serve</code> process is the whole system, and the provider contract is <code>base_url</code> + OpenAI chat-completions + SSE, so any compatible endpoint works unchanged.</p>
     </div>
 
     <ol class="steps">
       <li>
         <h3><span class="step-no">1</span>Install</h3>
-        <pre tabindex="0"><code>mkdir -p ~/.local/bin
-curl -fsSL https://github.com/flyer103/kian/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
+        <pre tabindex="0"><code># with Rust (stable 1.85+)
+cargo install kian-cli kiand
+
+# or a prebuilt archive, no toolchain needed
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/flyer103/kian-runtime/releases/latest/download/kian-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin kian kiand</code></pre>
       </li>
       <li>
@@ -344,7 +366,7 @@ curl -sN localhost:7433/sessions/$SID/events   # live SSE, ends after session/en
 
     <div class="quickstart-foot">
       <p>Full walkthrough, including the <code>kill -9</code> proof, projection read-back and test suites.</p>
-      <a class="btn btn-primary" href="https://github.com/flyer103/kian#quickstart">Read the README</a>
+      <a class="btn btn-primary" href="https://github.com/flyer103/kian-runtime#quickstart">Read the README</a>
     </div>
   </section>
 
@@ -366,22 +388,22 @@ curl -sN localhost:7433/sessions/$SID/events   # live SSE, ends after session/en
     <div class="footer-cols">
       <div>
         <h4>Project</h4>
-        <a href="https://github.com/flyer103/kian">GitHub</a>
-        <a href="https://github.com/flyer103/kian/blob/main/docs/overview.md">Overview</a>
-        <a href="https://github.com/flyer103/kian/blob/main/docs/SPEC.md">Spec</a>
-        <a href="https://github.com/flyer103/kian/blob/main/design/DESIGN.md">Design</a>
+        <a href="https://github.com/flyer103/kian-runtime">GitHub</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/docs/overview.md">Overview</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/docs/SPEC.md">Spec</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/design/DESIGN.md">Design</a>
       </div>
       <div>
         <h4>Docs</h4>
-        <a href="https://github.com/flyer103/kian/blob/main/docs/advanced.md">Capabilities</a>
-        <a href="https://github.com/flyer103/kian/blob/main/design/EVENT-MODEL.md">Event model</a>
-        <a href="https://github.com/flyer103/kian/blob/main/design/API-CONTRACT.md">API contract</a>
-        <a href="https://github.com/flyer103/kian/tree/main/design/decisions">Decisions</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/docs/advanced.md">Capabilities</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/design/EVENT-MODEL.md">Event model</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/design/API-CONTRACT.md">API contract</a>
+        <a href="https://github.com/flyer103/kian-runtime/tree/main/design/decisions">Decisions</a>
       </div>
       <div>
         <h4>License</h4>
-        <a href="https://github.com/flyer103/kian/blob/main/LICENSE">Apache-2.0</a>
-        <a href="https://github.com/flyer103/kian/blob/main/CHANGELOG.md">Changelog</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/LICENSE">Apache-2.0</a>
+        <a href="https://github.com/flyer103/kian-runtime/blob/main/CHANGELOG.md">Changelog</a>
       </div>
     </div>
 

@@ -1,11 +1,11 @@
 //! Client-side media tools for OCR, speech-to-text and text-to-speech
-//! (ADR-060, P5a).
+//! (ADR-061, P5a).
 //!
 //! image_ocr, audio_transcribe and speech_synthesize are ordinary
 //! ToolProvider tools: every call is an audited kian tool/call and
 //! tool/result pair, input bytes are read from the artifact store and
 //! synthesized audio is written back into it, so large payloads never
-//! ride the event stream inline (ADR-055). The crate is a bundle edge:
+//! ride the event stream inline (ADR-056). The crate is a bundle edge:
 //! no core crate names the provider, the endpoints or the response
 //! shape, and no provider SDK is pulled in.
 
@@ -777,7 +777,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Decodes standard padded base64; `None` on malformed or non-canonical input.
 ///
-/// Public because the channel-edge media processor (ADR-061, `kian-cli`)
+/// Public because the channel-edge media processor (ADR-062, `kian-cli`)
 /// decodes adapter bytes before writing them to the artifact store.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();

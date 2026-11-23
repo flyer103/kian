@@ -1,4 +1,4 @@
-//! Off-peak deferral (ADR-059, P4): the pure planning half of
+//! Off-peak deferral (ADR-060, P4): the pure planning half of
 //! deferred admissions.
 //!
 //! Deferral is not a scheduler. The planner here answers one question -
@@ -7,7 +7,7 @@
 //! eligible_at gate does the rest (the store refuses to hand out a row
 //! before that instant; the due-wake sweep wakes sessions when their rows
 //! become due). The price book is the same one the cost projection reads
-//! (ADR-052), so peak windows and holidays have exactly one definition.
+//! (ADR-053), so peak windows and holidays have exactly one definition.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::pricing::PriceBook;
 
-/// The wall-clock deferral policy one admission can request (ADR-059).
+/// The wall-clock deferral policy one admission can request (ADR-060).
 ///
 /// Interactive inputs (CLI runs, channel messages, steer) are always
 /// Immediate; only explicit opt-ins - the API defer parameter and a cron
@@ -83,7 +83,7 @@ impl DeferPlan {
 }
 
 /// The off-peak planner: the price book's peak calendar plus the
-/// operator's wait cap (ADR-059). A plan is pure - no clock read, no
+/// operator's wait cap (ADR-060). A plan is pure - no clock read, no
 /// store access.
 #[derive(Debug, Clone)]
 pub struct DeferCalendar {

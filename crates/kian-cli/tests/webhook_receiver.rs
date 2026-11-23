@@ -88,7 +88,7 @@ superagent:
       type: github
       github:
         topics:
-          flyer103/kian: ci
+          flyer103/kian-runtime: ci
 providers:
   mock:
     base_url: "{provider_base}"
@@ -141,7 +141,7 @@ fn delivery_body() -> Value {
         "action": "created",
         "issue": {"number": 9, "title": "build broken on main", "body": "the CI log shows a panic"},
         "comment": {"id": 99, "body": "please take a look"},
-        "repository": {"id": 1, "full_name": "flyer103/kian", "name": "kian"},
+        "repository": {"id": 1, "full_name": "flyer103/kian-runtime", "name": "kian"},
         "sender": {"login": "reporter", "type": "User", "id": 7}
     })
 }

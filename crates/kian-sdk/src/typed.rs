@@ -42,7 +42,7 @@ pub struct ConfirmResult {
     pub outcome: String,
 }
 
-/// `raise_budget` → `{"outcome": "accepted" | "deduplicated" | "terminal"}` (ADR-054).
+/// `raise_budget` → `{"outcome": "accepted" | "deduplicated" | "terminal"}` (ADR-055).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RaiseBudgetResult {
     pub outcome: String,
@@ -230,7 +230,7 @@ impl KianClient {
         Self::parse(result)
     }
 
-    /// Control plane: raise a session's lifetime budget (ADR-054). It
+    /// Control plane: raise a session's lifetime budget (ADR-055). It
     /// admits ONE durable reserved control row (idempotent) that the
     /// owning drain consumes into `budget/raised`; the outcome is the
     /// server's honest receipt (`accepted` / `deduplicated` /

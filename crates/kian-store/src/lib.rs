@@ -27,7 +27,7 @@
 //!   the archived marker, the terminal-only eligibility scan and the
 //!   single-transaction marker-CAS + online-row delete behind a
 //!   verified archive package
-//! - [`artifact`] — the content-addressed tool-result blob tree (ADR-055:
+//! - [`artifact`] — the content-addressed tool-result blob tree (ADR-056:
 //!   disposable payload cache, retention GC, never truth)
 //! - [`wake`] — the postgres LISTEN/NOTIFY wake transport (advisory;
 //!   /ADR-009)

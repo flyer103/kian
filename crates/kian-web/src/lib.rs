@@ -1,9 +1,9 @@
-//! Client-side web tools for the DeepSeek Search/Fetch APIs (ADR-056, P2b).
+//! Client-side web tools for the DeepSeek Search/Fetch APIs (ADR-057, P2b).
 //!
 //! web_search and web_fetch are ordinary ToolProvider tools: every call is an
 //! audited kian tool/call / tool/result pair, the request and result JSON ride
 //! the event stream, and oversized pages spill through the artifact path
-//! (ADR-055). The crate is a bundle edge — no core crate names the provider,
+//! (ADR-056). The crate is a bundle edge — no core crate names the provider,
 //! the endpoints or the response shape, and no provider-encrypted page
 //! signature is ever stored.
 

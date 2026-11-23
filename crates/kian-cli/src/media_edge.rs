@@ -1,9 +1,9 @@
-//! Channel-edge media processing (ADR-061, P5b).
+//! Channel-edge media processing (ADR-062, P5b).
 //!
 //! The assembly channel pump runs one optional edge before
 //! `SubscriptionService::handle_event`. An adapter event whose payload
 //! carries the additive `media` envelope has each item written into the
-//! content-addressed artifact store, transcribed by the ADR-060 tools and
+//! content-addressed artifact store, transcribed by the ADR-061 tools and
 //! rewritten to an artifact reference plus transcript; the payload text
 //! gains the transcript under a fixed marker. Base64 never re-enters the
 //! payload and no message is dropped on a media failure.
@@ -15,7 +15,7 @@ use kian_media::{DEFAULT_AUDIO_MEDIA_TYPE, DEFAULT_IMAGE_MEDIA_TYPE, MediaTools,
 use kian_store::ArtifactStore;
 use serde_json::{Map, Value, json};
 
-/// The additive payload key that marks a media event (ADR-061).
+/// The additive payload key that marks a media event (ADR-062).
 pub const MEDIA_ENVELOPE_KEY: &str = "media";
 /// Marker prefixed to an image transcript in the payload text.
 pub const IMAGE_TRANSCRIPT_MARKER: &str = "[image transcript]";

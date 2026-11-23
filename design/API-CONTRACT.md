@@ -138,7 +138,7 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   at the next provider-turn safe boundary and never inside an in-flight provider turn.
 - `queue` uses the same admit path; the input is promoted at the next safe boundary and never
   interrupts the current turn.
-- `defer` (ADR-059) is opt-in and additive. The closed value `off_peak` plans the admission
+- `defer` (ADR-060) is opt-in and additive. The closed value `off_peak` plans the admission
   against the configured `pricing.peak_windows`/`pricing.holidays` calendar and admits the
   durable row with a future `eligible_at`, so no drain consumes it before an off-peak instant.
   The result reports the planned instant and whether the row was actually deferred: a next off
@@ -162,7 +162,7 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   `expired` = the ask lapsed under `confirmation.ttl_ms` and a durable reject-with-`expired` row was
   admitted so the session resumes (the caller's decision was **not** applied). An archived session
   is `-32007`. A malformed `call_id`/`decision` is `-32602`.
-- `raise_budget` adds to one session's lifetime token/wall-clock budget (ADR-054). It admits ONE
+- `raise_budget` adds to one session's lifetime token/wall-clock budget (ADR-055). It admits ONE
   reserved budget row under `idempotency_key` (caller-supplied wins, else
   `budget:<session>:<tokens>:<wall_clock_ms>:<requested_at_ms>`) and wakes; the owning drain
   consumes it into a `budget/raised` event. It writes nothing else and never touches execution, so
@@ -170,7 +170,7 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   row is durable; `deduplicated` = an identical row already exists; `terminal` = the session is
   completed/cancelled/rotated, so nothing was admitted (no event is minted for a dead session).
   Both amounts absent or zero is `-32602`; unknown session `-32001`; archived `-32007`. Wall-clock
-  raises are recorded and projected but not enforced (ADR-054 §Limits).
+  raises are recorded and projected but not enforced (ADR-055 §Limits).
 - `pending` is a pure read of one session's stream: the unanswered asks in call order with the TTL
   overlay computed at read time (`expired` is a liveness overlay, never persisted). Unknown session
   `-32001`, archived `-32007`.
@@ -651,7 +651,7 @@ Window consequences:
 
 ### 9.3 Version numbers
 
-This file is **v0** (the version marker in the title). `kian-sdk` is `0.1.0`; its golden fixtures
+This file is **v0** (the version marker in the title). `kian-sdk` is `0.1.1`; its golden fixtures
 pin the current bytes. KiandProto carries its own `PROTOCOL_VERSION`. There is no JSON-RPC
 `version` field and no URL versioning — additions are called out here.
 

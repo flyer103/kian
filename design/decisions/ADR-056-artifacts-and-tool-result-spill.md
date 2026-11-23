@@ -1,4 +1,4 @@
-# ADR-055: Tool results ride the event stream by reference, and the blob store is disposable
+# ADR-056: Tool results ride the event stream by reference, and the blob store is disposable
 
 - **Status**: accepted (owner direction 2026-11-22; phase 2 slice).
 - **Context**: the event stream is the sole truth and every model-visible byte is persisted before it

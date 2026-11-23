@@ -203,7 +203,7 @@ pub fn transition(
         // CONFIRMATION-MODEL / ADR-033: a drain that stopped on a pending
         // ask is resumable — the answer's arrival re-opens the turn.
         (Some(S::Running), T::Ended(R::AwaitingInput)) => Ok(S::Idle),
-        // ADR-054: a drain that stopped on budget exhaustion is resumable —
+        // ADR-055: a drain that stopped on budget exhaustion is resumable —
         // a `budget/raised` row plus its wake re-opens the turn.
         (Some(S::Running), T::Ended(R::AwaitingBudget)) => Ok(S::Idle),
         (Some(S::Running), T::LeaseExpired) => Ok(S::Recoverable),

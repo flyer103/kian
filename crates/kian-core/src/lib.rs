@@ -16,7 +16,7 @@
 //! - [`state`] — session state machine and pure projection (DESIGN §2.2)
 //! - [`context`] — model-context projection `derive_model_context` (DESIGN §3.2, constraints 2/3)
 //! - [`control`] — reserved control-envelope convention (ADR-014, durable interrupt intent)
-//! - [`budget`] — the session token budget projection (ADR-054)
+//! - [`budget`] — the session token budget projection (ADR-055)
 //! - [`memory`] — the `memory/note` fold: fail-closed payload parsing, the
 //!   latest-per-subject projection and range verification (MEMORY-MODEL §3)
 //! - [`invariants`] — the six semantic invariants + NoHalfTerminated as assertion predicates

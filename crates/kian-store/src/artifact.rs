@@ -1,8 +1,8 @@
-//! Content-addressed artifact blobs (ADR-055).
+//! Content-addressed artifact blobs (ADR-056).
 //!
 //! Large tool results do not belong in the event log: the event carries a
 //! reference plus a bounded preview, and this store keeps the full bytes.
-//! It is deliberately **not** truth — see ADR-055. A blob may age out at any
+//! It is deliberately **not** truth — see ADR-056. A blob may age out at any
 //! time and replay stays correct (the preview is in the event), so the store
 //! is an operator cache with retention GC, never reference-counted.
 //!
@@ -118,7 +118,7 @@ impl ArtifactStore {
     }
 
     /// Read one blob. Ok(None) means it is gone (aged out or never stored) —
-    /// a normal outcome, not an error (ADR-055).
+    /// a normal outcome, not an error (ADR-056).
     pub fn get(&self, id: &str) -> Result<Option<Vec<u8>>, ArtifactError> {
         let path = self.path_for(id)?;
         match fs::read(&path) {
@@ -166,7 +166,7 @@ impl ArtifactStore {
 
     /// Retention-based GC: delete blobs older than retention_ms (when
     /// non-zero), then oldest-first until total bytes <= max_bytes (when
-    /// non-zero). Never reference-counted; see ADR-055.
+    /// non-zero). Never reference-counted; see ADR-056.
     pub fn gc(
         &self,
         now_ms: u64,

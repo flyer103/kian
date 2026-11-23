@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # HARNESS-BRIDGE / ADR-037: a protocol adapter + spawn recipe on top of
 # `kian-harness`. Depends on `kian-core` only through the skeleton (the
@@ -12,7 +16,7 @@ repository.workspace = true
 
 [dependencies]
 kian-core.workspace = true
-kian-harness = { path = "../kian-harness" }
+kian-harness = { path = "../kian-harness", version = "0.1.0" }
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

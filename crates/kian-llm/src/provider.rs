@@ -120,7 +120,7 @@ pub struct ChatMessage {
     /// (ADR-022, DESIGN §3.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    /// Images attached to this user message (ADR-062).
+    /// Images attached to this user message (ADR-063).
     ///
     /// Never serialized: the frozen body may not grow a field, so the plan
     /// builder renders the bytes as content parts only for a profile that
@@ -129,7 +129,7 @@ pub struct ChatMessage {
     pub images: Vec<ChatImage>,
 }
 
-/// One image attached to a user message (ADR-062).
+/// One image attached to a user message (ADR-063).
 ///
 /// The bytes ride the in-memory chat message only. The plan builder renders
 /// them into the persisted `step/request` body as OpenAI content parts under

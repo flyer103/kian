@@ -7,8 +7,8 @@ body:
       value: |
         Before filing: this project is pre-1.0 and several behaviours are deliberate boundaries —
         at-least-once command delivery, projection-only harnesses without byte-level replay, and
-        the "no cross-worker failover" rule. Check [docs/SPEC.md](https://github.com/flyer103/kian/blob/main/docs/SPEC.md)
-        and the [capability matrix](https://github.com/flyer103/kian/blob/main/design/HARNESS-BRIDGE.md)
+        the "no cross-worker failover" rule. Check [docs/SPEC.md](https://github.com/flyer103/kian-runtime/blob/main/docs/SPEC.md)
+        and the [capability matrix](https://github.com/flyer103/kian-runtime/blob/main/design/HARNESS-BRIDGE.md)
         first.
 
         **Do not paste provider keys, tokens, chat ids, personal paths or full `session export`

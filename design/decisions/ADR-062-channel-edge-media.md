@@ -1,12 +1,12 @@
-# ADR-061: Channel-edge media ingestion (phase 5b)
+# ADR-062: Channel-edge media ingestion (phase 5b)
 
 - Status: accepted (2026-11-23, P5b slice)
 - Supersedes: none
-- Related: ADR-055 (tool result artifacts), ADR-056 (client-side web tools), ADR-060 (client-side media tools), ADR-018 (WeChat, best-effort), ADR-042 (iMessage, best-effort)
+- Related: ADR-056 (tool result artifacts), ADR-057 (client-side web tools), ADR-061 (client-side media tools), ADR-018 (WeChat, best-effort), ADR-042 (iMessage, best-effort)
 
 ## Context
 
-ADR-060 gave the runtime OCR, speech-to-text and text-to-speech as ordinary tools, plus an
+ADR-061 gave the runtime OCR, speech-to-text and text-to-speech as ordinary tools, plus an
 operator ingest path (`kian artifacts put`). What is still missing is the inbound channel half:
 a voice message or a photo arriving on a channel cannot become context, because both real
 adapters map text items only and drop media (CHANNEL-WECHAT §7, CHANNEL-IMESSAGE §8).
@@ -28,7 +28,7 @@ be megabytes in the prompt wrapper, in every replay and in every prefix (constra
 1. **The media edge sits in the channel pump.** The assembly-owned consumer loop
    (`spawn_subscription_consumers` in `kian-cli`) is the one place every adapter event passes
    through before `SubscriptionService::handle_event`. The edge is a `kian-cli` component holding
-   the ADR-060 media tools and the artifact store; `kian-superagent` and every adapter stay
+   the ADR-061 media tools and the artifact store; `kian-superagent` and every adapter stay
    provider-blind and their code is unchanged. It is not a new seam, not a new core primitive and
    not a second scheduler.
 
@@ -45,7 +45,7 @@ be megabytes in the prompt wrapper, in every replay and in every prefix (constra
    media type. The rewritten item carries `{"kind","media_type","artifact","size"}` plus a
    `transcript` (or an `error`); the base64 is never re-emitted, so an admitted media message holds
    a reference and a transcript, never raw bytes. The blob is then retained, collected and
-   export-pinned exactly like any other artifact (ADR-055, ADR-058).
+   export-pinned exactly like any other artifact (ADR-056, ADR-059).
 
 4. **The transcript joins the admitted text.** A successful transcript is appended to the payload's
    `text` under a fixed English marker (`[image transcript]` / `[voice message transcript]`) in item
@@ -60,12 +60,12 @@ be megabytes in the prompt wrapper, in every replay and in every prefix (constra
    says so in the payload; no media item silently disappears, no admission is blocked and no pump
    failure is invented. The edge does not retry.
 
-6. **Only a configured `media:` section mounts the edge.** `media:` (ADR-060) already requires
+6. **Only a configured `media:` section mounts the edge.** `media:` (ADR-061) already requires
    `artifacts:`. Without the section there are no media tools and no edge, and the channel pumps
    behave exactly as before. Inbound media therefore requires both sections; a media envelope from
    an adapter without them is a configuration error, not a supported degradation.
 
-7. **Tool output stays untrusted data.** OCR/ASR text enters the payload exactly as the ADR-060
+7. **Tool output stays untrusted data.** OCR/ASR text enters the payload exactly as the ADR-061
    tool result and passes through the same channel-provenance shaping as any other channel text.
    Untrusted channels stay untrusted; the transcript is never treated as an instruction in runtime
    code.
@@ -85,7 +85,7 @@ be megabytes in the prompt wrapper, in every replay and in every prefix (constra
   channel events; real ingestion is each channel's phase 2 and reuses this contract unchanged.
 - The edge is sequential per event: one OCR/ASR call per media item, no queueing and no batching. A
   slow provider delays that channel's consumer, never the admission of other channels' events.
-- Media requests are not priced (ADR-060 limit), and the transcription request is not a
+- Media requests are not priced (ADR-061 limit), and the transcription request is not a
   `step/request` event — it is a client-side tool call made by the edge, before the turn exists.
 - No per-item policy beyond `media.max_input_bytes`; an adapter is responsible for not handing the
   edge an unbounded base64 string.
@@ -100,7 +100,7 @@ be megabytes in the prompt wrapper, in every replay and in every prefix (constra
 - **Let the model call `audio_transcribe` itself.** Rejected: the adapter's bytes never reach the
   event stream, so the model would have no artifact to name; and the transcript would not be in the
   admitted bytes, which breaks replay and audit.
-- **Admit base64 and let the ADR-055 spill path handle it.** Rejected: the payload rides the
+- **Admit base64 and let the ADR-056 spill path handle it.** Rejected: the payload rides the
   provenance wrapper into model context at full size, breaking cache stability and inflating every
   later request (and possibly the event-size bound).
 

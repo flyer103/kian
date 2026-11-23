@@ -9,7 +9,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 ## Unreleased
 
 - **Vision inputs: a vision-profile target sees artifact-backed images as dialect content parts
-  (DESIGN §3.2, ADR-062, P5c).** A user input content may carry `{"text", "images": [{"artifact",
+  (DESIGN §3.2, ADR-063, P5c).** A user input content may carry `{"text", "images": [{"artifact",
   "media_type"}]}`; the loop resolves the blobs through the artifact store and the V2 request plan
   rewrites exactly those messages into OpenAI `image_url` content parts under a `model_profiles`
   `vision: true` target. V1 and every image-free V2 body stay byte-identical (the field is
@@ -17,22 +17,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   rather than the turn, and `session replay` counts such requests as vision requests instead of
   byte-identity mismatches.
 
-- **Channel-edge media: voice notes and photos become durable text context (DESIGN §4.2, ADR-061,
+- **Channel-edge media: voice notes and photos become durable text context (DESIGN §4.2, ADR-062,
   P5b).** The assembly's channel pump runs an optional media edge before admission: an adapter event
   carrying the additive `media` envelope has each item's bytes written to the artifact store,
-  transcribed by the ADR-060 tools, and rewritten to an artifact reference plus transcript, with the
+  transcribed by the ADR-061 tools, and rewritten to an artifact reference plus transcript, with the
   transcript appended to the admitted text under fixed markers. Base64 never re-enters the payload, no
   message is dropped on a media failure (an honest per-item `error`), and a payload without `media`
   keeps its exact bytes. No shipped adapter emits the envelope yet — WeChat and iMessage record it as
   their phase-2 contract; outbound audio remains `speech_synthesize` plus a text reply.
-- **Client-side media tools and file ingest (ADR-060, P5a).** `media:` mounts
+- **Client-side media tools and file ingest (ADR-061, P5a).** `media:` mounts
   `image_ocr`, `audio_transcribe` and `speech_synthesize` as ordinary audited tools over
   DeepSeek's media HTTP APIs; input bytes are read from and synthesized audio is written into the
-  content-addressed artifact store (ADR-055), so no media rides the prompt inline. `kian artifacts
+  content-addressed artifact store (ADR-056), so no media rides the prompt inline. `kian artifacts
   put <path>` turns a local file into an artifact. `media:` requires `artifacts:`; an absent section
   keeps the tool set byte-identical. Semantics in [SPEC](docs/SPEC.md), placement in
   [DESIGN](design/DESIGN.md) §2.2.
-- **Batch and scheduled admissions can wait for an off-peak pricing window (DESIGN §2.3, CRON-MODEL §6.1, API-CONTRACT §3.2, ADR-059)**.
+- **Batch and scheduled admissions can wait for an off-peak pricing window (DESIGN §2.3, CRON-MODEL §6.1, API-CONTRACT §3.2, ADR-060)**.
   A pure planner beside the price book returns the next off-peak instant, bounded by
   `defer.max_wait_ms`; the ordinary inbox row is persisted with that `eligible_at` and the
   store's existing eligibility predicate is the hard gate — no second scheduler and no timer per
@@ -44,7 +44,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   admit instant already off peak, runs now and records why. No new event kind: the stream still
   carries ordinary admitted rows.
 
-- **Artifact retention runs inside `serve`, and exports can pin the blobs they reference (DESIGN §2.2, ADR-058)**.
+- **Artifact retention runs inside `serve`, and exports can pin the blobs they reference (DESIGN §2.2, ADR-059)**.
   With an `artifacts:` block configured, serve now arms a retention GC ticker beside the snapshot
   and view tickers (`artifacts.gc.interval_ms`, default one hour, outside every drain, a failed
   round only logs a warning) — the manual `kian artifacts gc` keeps the same policy. `kian session
@@ -53,7 +53,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   already reclaimed is reported as missing in the summary and never fails the export. No event,
   projection or replay rule changes: the stream still carries references plus previews.
 
-- **Long sessions fold old turns under measured context pressure, as audited maintenance turns (DESIGN §3.2, ADR-057)**.
+- **Long sessions fold old turns under measured context pressure, as audited maintenance turns (DESIGN §3.2, ADR-058)**.
   A new pure planner (`kian-orchestrator::compaction`) keeps the most recent turns verbatim,
   starts after the previous compact, requires a minimum reclaim and returns a strictly-past
   disjoint range; the loop folds only when a declared `model_profiles.*.context_window` is 90%
@@ -66,19 +66,19 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   itself into being unable to compact; cache metrics pair only ordinary requests and `kian cost`
   reports maintenance requests and their subtotal apart from turns.
 
-- **Web search and URL reading are audited tool calls on the operator's own key (DESIGN §2.2, ADR-056)**.
+- **Web search and URL reading are audited tool calls on the operator's own key (DESIGN §2.2, ADR-057)**.
   A new top-level `web:` block (`base_url` default `https://api.deepseek.com`, `api_key_env` default
   `DEEPSEEK_API_KEY`, `timeout_ms`, `search.max_results`/`need_content`) mounts `web_search` and
   `web_fetch` from the new `kian-web` bundle crate — no core crate names the provider, the endpoint
   or the response shape, and no server-side capability is hidden in a model response. Every call is
   an ordinary `tool/call` + `tool/result` with the documented request persisted before it flies; a
-  large page spills by reference through ADR-055 instead of being truncated, and `artifact_read`
+  large page spills by reference through ADR-056 instead of being truncated, and `artifact_read`
   pages it back. Failures are honest `is_error` results carrying the HTTP status (408/429/5xx marked
   retryable, nothing retried automatically); out-of-contract arguments are refused without a request.
   An absent block leaves the tool set and every request byte-identical; present, the key is read once
   at assembly and a missing value refuses boot. Returned pages are untrusted data, and Search/Fetch
   per-request fees are not yet in the token cost projection.
-- **Tool results ride the event stream by reference, and the blob store is disposable (DESIGN §2.2, ADR-055)**.
+- **Tool results ride the event stream by reference, and the blob store is disposable (DESIGN §2.2, ADR-056)**.
   With a new top-level `artifacts:` block configured, the engine rewrites a successful `tool/result`
   whose output exceeds `inline_max_bytes` (default 16 KiB) into a content-addressed
   `{artifact:{id,size,media_type},preview,truncated}` **before** the event is appended, so the
@@ -89,7 +89,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   the local tools; no `tools:` entry needed) serves the full payload back in bounded windows and
   reports an aged-out blob as an honest error. Error results never spill, and an absent block keeps
   every legacy payload byte-identical.
-- **A session-lifetime token budget gates before the request flies (DESIGN §15, ADR-054)**.
+- **A session-lifetime token budget gates before the request flies (DESIGN §15, ADR-055)**.
   `agents.<name>.budgets.tokens` is a real ceiling now: the loop projects
   `base + Σbudget/raised − Σturn/end.usage`, admits the request plan's worst case
   (`estimate.high + max_output`) and refuses the turn **before** any `step/request` is persisted, so
@@ -100,7 +100,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `accepted`/`deduplicated`/`terminal`) that the owning drain consumes into the new `budget/raised`
   kind and wakes; the control plane never touches execution. Wall-clock raises are projected but not
   enforced while a drain is idle, and usage-less turns spend nothing (unknown, never assumed).
-- **Request plans make the sent bytes one auditable value (DESIGN §3.2, ADR-053)**. Every provider
+- **Request plans make the sent bytes one auditable value (DESIGN §3.2, ADR-054)**. Every provider
   attempt is now built by a pure planner that returns the body plus its dialect, profile digest,
   body digest and a coarse token band; the sender, the persistence sink, the cache checker and the
   upcoming budget gate consume that one value. `model_profiles:` declares thinking, effort and
@@ -108,7 +108,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   profile-less slot still emits the frozen V1 body, and reasoning_content is replayed only when
   the profile permits reasoning. A fallback attempt builds its plan before the slot/fallback
   append and persists the exact body there, so replay reconstructs the retry bytes.
-- **A price book turns usage into money without touching the event stream (DESIGN §7, ADR-052)**.
+- **A price book turns usage into money without touching the event stream (DESIGN §7, ADR-053)**.
   The new top-level `pricing:` config section declares per-million-token cache-hit, cache-miss and
   output prices plus peak windows (IANA timezone) and holidays; prices are normalized once to
   integer micro-USD so cost is exact integer arithmetic. `kian cost [--config] [--session] [--json]`
@@ -116,22 +116,45 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `slot/fallback` target, quotes at the attempt timestamp, and reports priced/unpriced requests,
   unknown-usage requests and the peak/off-peak split. An unpriced model is counted, never priced at
   zero; no event or wire shape changes, and editing the book re-renders history.
-- **Usage projections learn the cache-miss side of the bill (ADR-052)**. `kian usage-stats`,
+- **Usage projections learn the cache-miss side of the bill (ADR-053)**. `kian usage-stats`,
   `GET /metrics` and `session inspect` now report `cache_miss_input_tokens` alongside the hit and
   creation counters, recognize DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
   spellings (deriving a miss count when only hits are reported), and render a cache hit rate. The
   materialized usage view gains the field as a required column, so an old row falls back to an
   honest full scan.
-- **A rejected DeepSeek request is no longer retried on a fallback (ADR-052)**. HTTP 422 — and an
+- **A rejected DeepSeek request is no longer retried on a fallback (ADR-053)**. HTTP 422 — and an
   in-band 400/422 error payload — now classifies as `InvalidResponse` instead of `Unavailable`;
   only genuine transport/provider-down errors fail over. This stops a schema-rejected request from
   burning a fallback slot, and context-window 422s still map to `ContextOverflow`.
-- **Model capability facts are config-first (ADR-052)**. The new top-level `model_profiles:`
+- **Model capability facts are config-first (ADR-053)**. The new top-level `model_profiles:`
   section declares a model's dialect, context window, maximum output, and reasoning/vision/strict/
   cache support. It is parsed and validated at boot now (unknown keys, bad keys or `max_output >
   context_window` refuse to start) and consumed by the request planner from phase 1; no request
   byte changes in this phase.
+- **Registry metadata only (v0.1.1, no code change)**: every crate carries the repository README,
+  the homepage, keywords and categories, so the crates.io page documents the project instead of
+  presenting an empty shell. No behavior, wire or event change.
 
+- **Distribution: the workspace publishes to crates.io**. Every crate ships as `kian-*`/`kiand`
+  under the `Kian Runtime` name, so `cargo install kian-cli kiand` is the shortest install path
+  (README § Install, the site quickstart). Internal path dependencies carry a `version` so the
+  registry can resolve them.
+
+- **Declarative jobs: a run is a plan of steps, not one prompt (JOB-MODEL, ADR-052)**. A new
+  `superagent.jobs` section declares jobs (a plan of capability-addressed steps with `depends_on`,
+  `inputs`/`produces`, per-step `verify`, `timeout_ms`, `retries`, the effect gate and an optional
+  step), `triggers` that lower into the existing cron runtime vector as a job-targeted schedule
+  (one scheduler, one cursor, one claim table) and `alerts` that fire as deliver-only runs. A run is
+  an ordinary durable session whose new `JobLoopDriver` conductor parks between ticks, dispatches one
+  child session per step attempt through the existing spawner with derived ids (`kian:job:step:…`),
+  freezes the plan and its digest into the admitted row, records placement before the child exists,
+  and writes exactly one run verdict (`evidence/verdict` gate `run`) before its final outcome — so a
+  step's success is the declared check set over the child's own events and a delivery is the
+  channel's receipt, never an exit code. New surface: `kian job list|status|run|cancel`, the additive
+  `job` key on `input/admitted`, `thread/started` and `evidence/verdict`, the runtime-only
+  `CronTarget::Job`, `SpawnRequest.parent` with the `kian.parent` wrapper key for a non-resident
+  parent, and job metrics. No new event kind, table, route or config-file scheduler; the settlement
+  sweep settles a job firing from its run verdict (unverified settles failed, honestly named).
 - **A dispatch that never left the process no longer spends the re-drive bound (WORKER-MODEL,
   ADR-033)**. `RegisteredTransport::dispatch_frame` and the connection manager now fail a frame
   whose writer is already closed as `ConnectionError::NotWritten` and flip the transport offline
@@ -1566,7 +1589,7 @@ outbox park rebuilt at boot and surfaced on the stage board; exec
   `deepseek-chat` appended the full mapped chain (turn/start, input/admitted, step/request,
   assistant/message, turn/end) with an honest `Settled` outcome — see `docs/runbook-dsh.md` for the run.
 - **Dogfood example** (`examples/issue-watch/`): a real long-running workload on
-  `flyer103/kian` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
+  `flyer103/kian-runtime` — TimerChannel ticks → `gh issue list` → Router delegates triage → worker drafts a
   reply (dry-run by default) → everything in the durable audit stream. `demo-restart.sh` resumes the
   same session from the event
   stream after `kill -9` + reboot; `RUNLOG.md` records the run.

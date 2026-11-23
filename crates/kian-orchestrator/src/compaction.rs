@@ -1,4 +1,4 @@
-//! Compaction planner (ADR-057).
+//! Compaction planner (ADR-058).
 //!
 //! Compression is the one deliberate prefix-invalidation point (constraint
 //! 3): everything else in the model context is immutable history. This
@@ -158,7 +158,7 @@ pub struct CompactionPlan {
 
 /// Chooses the oldest safe fold for this stream.
 ///
-/// Rules (all derived from the stream, ADR-057):
+/// Rules (all derived from the stream, ADR-058):
 /// - keep the last keep_recent_turns turns verbatim;
 /// - never overlap an existing compact range and start after the last one,
 ///   so repeated planning advances monotonically;

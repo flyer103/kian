@@ -241,6 +241,7 @@ pub fn declaration_digest(schedule: &CronRuntimeSchedule) -> String {
         crate::config::CronTarget::Channel { channel, topic } => {
             format!("channel:{channel}/{topic}")
         }
+        crate::config::CronTarget::Job { job } => format!("job:{job}"),
     };
     let mut hasher = Sha256::new();
     for part in [schedule.expr.to_string(), schedule.tz_name.clone(), target] {
@@ -390,8 +391,12 @@ impl CronTickStore for DurableCronTickStore {
         if schedule.worktree.is_some() {
             return Ok(());
         }
-        let target = match target_session(schedule) {
-            Ok(session) => session,
+        // The fallback for a firing row that recorded no session. A job target
+        // has none: its run session is derived from the firing's own slot, so
+        // such a row is left to the stranded grace path below.
+        let fallback: Option<SessionId> = match target_session(schedule, None) {
+            Ok(session) => Some(session),
+            Err(_) if matches!(schedule.target, crate::config::CronTarget::Job { .. }) => None,
             // A target that cannot resolve was rejected at load; a
             // later regression settles nothing rather than mis-settling.
             Err(_) => return Ok(()),
@@ -442,7 +447,10 @@ impl CronTickStore for DurableCronTickStore {
                         continue;
                     }
                 },
-                None => target,
+                None => match fallback {
+                    Some(session) => session,
+                    None => continue,
+                },
             };
             if let std::collections::btree_map::Entry::Vacant(slot) = streams.entry(session) {
                 match self.block(self.store.rebuild(session)) {
@@ -537,7 +545,7 @@ impl CronTickStore for DurableCronTickStore {
             // forward across it. It must stop at the first *settling* end —
             // a later episode (a retry's new input) is not this firing's
             // outcome, and reading the last end would mis-attribute it.
-            let Some(end) = streams[&session].iter().find(|ev| {
+            let Some(end_at) = streams[&session].iter().position(|ev| {
                 ev.seq > admitted.seq
                     && matches!(
                         ev.kind,
@@ -548,37 +556,81 @@ impl CronTickStore for DurableCronTickStore {
             }) else {
                 continue;
             };
-            let EventKind::SessionEnded { reason } = end.kind else {
+            let EventKind::SessionEnded { reason } = streams[&session][end_at].kind else {
                 continue;
             };
-            let (state, error) = match reason {
-                EndReason::Completed => (kian_store::FiringState::Succeeded, None),
-                EndReason::Failed => (
+            // (JOB-MODEL §5.5, §11.1, §18.2 amendment 1) A job run's end
+            // reason is not its outcome: an `unverified` run ends `completed`
+            // by construction (the work happened, the evidence did not), and a
+            // failed step ends `failed` with the step named. The engine owns
+            // the end write, so the conductor records the outcome as ONE
+            // `evidence/verdict` with gate `run` before it yields its final
+            // outcome — that verdict, at or before the settling end, is
+            // authoritative for a job schedule. A non-job firing keeps the
+            // bare-end mapping unchanged.
+            let job_verdict = matches!(schedule.target, crate::config::CronTarget::Job { .. })
+                .then(|| kian_superagent::job::status::run_verdict(&streams[&session][..=end_at]))
+                .flatten();
+            let (state, error) = if let Some(verdict) = job_verdict {
+                match verdict.outcome {
+                    kian_superagent::job::outcome::RunOutcome::Succeeded => {
+                        (kian_store::FiringState::Succeeded, None)
+                    }
+                    kian_superagent::job::outcome::RunOutcome::Unverified => (
+                        kian_store::FiringState::Failed,
+                        Some(
+                            "the run ended unverified: at least one step produced no evidence \
+                             of success"
+                                .to_string(),
+                        ),
+                    ),
+                    kian_superagent::job::outcome::RunOutcome::Cancelled => (
+                        kian_store::FiringState::Failed,
+                        Some("cancelled".to_string()),
+                    ),
+                    kian_superagent::job::outcome::RunOutcome::Failed => (
+                        kian_store::FiringState::Failed,
+                        Some(job_failure_text(&verdict.payload["job"])),
+                    ),
+                }
+            } else if matches!(schedule.target, crate::config::CronTarget::Job { .. }) {
+                (
                     kian_store::FiringState::Failed,
-                    Some("the scheduled turn failed".to_string()),
-                ),
-                EndReason::Interrupted => (
-                    kian_store::FiringState::Failed,
-                    Some("the scheduled turn was interrupted".to_string()),
-                ),
-                EndReason::Cancelled => (
-                    kian_store::FiringState::Failed,
-                    Some("cancelled".to_string()),
-                ),
-                // Excluded by the scan above; kept exhaustive.
-                EndReason::AwaitingInput | EndReason::AwaitingBudget => continue,
-                // A rotated resident firing never happens (rotation is a
-                // boot-time Router action, not a cron target); record an
-                // honest failure if it ever does.
-                EndReason::Rotated => (
-                    kian_store::FiringState::Failed,
-                    Some("the target session was rotated".to_string()),
-                ),
+                    Some(
+                        "the run ended without an outcome (the conductor never wrote one)"
+                            .to_string(),
+                    ),
+                )
+            } else {
+                match reason {
+                    EndReason::Completed => (kian_store::FiringState::Succeeded, None),
+                    EndReason::Failed => (
+                        kian_store::FiringState::Failed,
+                        Some("the scheduled turn failed".to_string()),
+                    ),
+                    EndReason::Interrupted => (
+                        kian_store::FiringState::Failed,
+                        Some("the scheduled turn was interrupted".to_string()),
+                    ),
+                    EndReason::Cancelled => (
+                        kian_store::FiringState::Failed,
+                        Some("cancelled".to_string()),
+                    ),
+                    // Excluded by the scan above; kept exhaustive.
+                    EndReason::AwaitingInput | EndReason::AwaitingBudget => continue,
+                    // A rotated resident firing never happens (rotation is a
+                    // boot-time Router action, not a cron target); record an
+                    // honest failure if it ever does.
+                    EndReason::Rotated => (
+                        kian_store::FiringState::Failed,
+                        Some("the target session was rotated".to_string()),
+                    ),
+                }
             };
             if let Err(settle_error) = self.block(self.store.finish_firing(
                 &firing.firing_id,
                 state,
-                Some(end.ts),
+                Some(streams[&session][end_at].ts),
                 None,
                 None,
                 error.as_deref(),
@@ -606,7 +658,7 @@ pub trait ResidentTurn: Send + Sync {
         idempotency_key: Option<String>,
     ) -> Result<(), String>;
 
-    /// Plans this firing's deferral (ADR-059). The default is immediate: a
+    /// Plans this firing's deferral (ADR-060). The default is immediate: a
     /// fake sink or a worktree-only dispatcher never defers.
     fn plan_deferral(
         &self,
@@ -619,7 +671,7 @@ pub trait ResidentTurn: Send + Sync {
         ))
     }
 
-    /// Delivers the firing at an explicit eligibility instant (ADR-059). The
+    /// Delivers the firing at an explicit eligibility instant (ADR-060). The
     /// default ignores the instant and delivers now, so a fake sink keeps its
     /// old behavior and a plain deliver call site is unchanged.
     fn deliver_at(
@@ -675,7 +727,7 @@ where
     /// ADR-038: the session bootstrap runs before the firing row, so a
     /// fresh cron target's first context event is the memory index.
     bootstrap: Option<Arc<dyn SessionBootstrap>>,
-    /// ADR-059: the off-peak planner, armed only when the serve config
+    /// ADR-060: the off-peak planner, armed only when the serve config
     /// declares a defer: section. None keeps every firing immediate.
     deferral: Option<crate::defer::DeferCalendar>,
 }
@@ -698,7 +750,7 @@ where
         }
     }
 
-    /// Arms the off-peak planner (ADR-059). Without it every firing is
+    /// Arms the off-peak planner (ADR-060). Without it every firing is
     /// immediate, and config validation refused any schedule that declared
     /// defer: off_peak without a defer: section.
     #[must_use]
@@ -709,7 +761,7 @@ where
 
     /// The one admit path shared by deliver (immediate) and deliver_at
     /// (deferred): the terminal/overlap/bootstrap checks run identically and
-    /// only the eligibility instant of the durable row differs (ADR-059).
+    /// only the eligibility instant of the durable row differs (ADR-060).
     fn admit(
         &self,
         session: SessionId,
@@ -851,14 +903,59 @@ fn channel_session(channel: &str, topic: &str) -> SessionId {
     SessionId(uuid::Uuid::from_bytes(bytes))
 }
 
+/// The slot token of a firing id `{schedule_id}@{slot}` (CRON-MODEL §4.1).
+///
+/// The slot is what a job run is addressed by (`design/JOB-MODEL.md` §6): one
+/// firing, one slot, one run session — a re-derivation never moves it.
+pub fn slot_of_firing(firing_id: &str) -> Result<&str, String> {
+    let (_, slot) = firing_id
+        .split_once('@')
+        .ok_or_else(|| format!("firing id `{firing_id}` carries no slot suffix"))?;
+    if slot.is_empty() {
+        return Err(format!("firing id `{firing_id}` carries an empty slot"));
+    }
+    Ok(slot)
+}
+
+/// The operator-facing reason a job run failed (JOB-MODEL §5.5).
+///
+/// The conductor records the failing step and the verdict's own words under
+/// the additive `job` key, so the firing row names the step instead of saying
+/// only "the scheduled turn failed". Absent keys degrade to what is known —
+/// never to a fabricated detail.
+fn job_failure_text(job: &serde_json::Value) -> String {
+    let step = job.get("failed_step").and_then(|value| value.as_str());
+    let detail = job.get("reason").and_then(|value| value.as_str());
+    match (step, detail) {
+        (Some(step), Some(detail)) => format!("step `{step}` failed: {detail}"),
+        (Some(step), None) => format!("step `{step}` failed"),
+        (None, Some(detail)) => detail.to_string(),
+        (None, None) => "the run failed".to_string(),
+    }
+}
+
 /// The session a schedule's firing belongs to (CRON-MODEL §3.2).
-pub fn target_session(schedule: &CronRuntimeSchedule) -> Result<SessionId, String> {
+///
+/// A job target's session is derived from the job id and the firing's slot
+/// (`design/JOB-MODEL.md` §6), so it needs the firing id; the other two shapes
+/// do not.
+pub fn target_session(
+    schedule: &CronRuntimeSchedule,
+    firing_id: Option<&str>,
+) -> Result<SessionId, String> {
     match &schedule.target {
         crate::config::CronTarget::Session { session } => uuid::Uuid::parse_str(session)
             .map(SessionId)
             .map_err(|e| format!("target.session `{session}` is not a uuid: {e}")),
         crate::config::CronTarget::Channel { channel, topic } => {
             Ok(channel_session(channel, topic))
+        }
+        crate::config::CronTarget::Job { job } => {
+            let firing_id = firing_id.ok_or_else(|| {
+                format!("job target `{job}` needs a firing id to derive its slot")
+            })?;
+            let slot = slot_of_firing(firing_id)?;
+            Ok(kian_superagent::job::plan::run_session(job, slot))
         }
     }
 }
@@ -869,12 +966,22 @@ pub fn target_session(schedule: &CronRuntimeSchedule) -> Result<SessionId, Strin
 /// already-resident engine drains.
 pub struct ResidentDispatcher {
     turn: Arc<dyn ResidentTurn>,
+    /// The declared jobs a `CronTarget::Job` firing admits from
+    /// (`design/JOB-MODEL.md` §7.1a). Absent = no job target can fire.
+    jobs: Option<Arc<crate::job_config::JobCatalog>>,
 }
 
 impl ResidentDispatcher {
     /// A dispatcher over the injected resident turn sink.
     pub fn new(turn: Arc<dyn ResidentTurn>) -> Self {
-        Self { turn }
+        Self { turn, jobs: None }
+    }
+
+    /// Mounts the job catalog (`design/JOB-MODEL.md` §7.1a).
+    #[must_use]
+    pub fn with_jobs(mut self, catalog: Arc<crate::job_config::JobCatalog>) -> Self {
+        self.jobs = Some(catalog);
+        self
     }
 }
 
@@ -884,9 +991,15 @@ impl CronDispatcher for ResidentDispatcher {
         schedule: &CronRuntimeSchedule,
         firing_id: &str,
     ) -> Result<Option<SessionId>, String> {
+        let target = target_session(schedule, Some(firing_id))?;
         // Resolve first (§3.2): a live/empty target is delivered to as before;
-        // a frozen one becomes this slot's deterministic firing session.
-        let session = self.turn.resolve(target_session(schedule)?, firing_id)?;
+        // a frozen one becomes this slot's deterministic firing session. A job
+        // run is already slot-addressed (`design/JOB-MODEL.md` §6): a terminal
+        // run is a settled slot, so there is nothing to fall back to.
+        let session = match &schedule.target {
+            crate::config::CronTarget::Job { .. } => target,
+            _ => self.turn.resolve(target, firing_id)?,
+        };
         // CRON-MODEL §5.1's default `skip`: an overlapping firing is a
         // recorded skip, never a queued duplicate. The judgement is a pure
         // projection of the **resolved** session (`Engine::has_open_work`); it
@@ -915,8 +1028,28 @@ impl CronDispatcher for ResidentDispatcher {
         // content is the turn's user message; cron carries the routing proof
         // (schedule_id / firing_id / fire_time / target) as an additive
         // non-context key, so the model request is the prompt alone.
+        if let crate::config::CronTarget::Job { job } = &schedule.target {
+            // A job firing admits a **run**: the same input row, plus the
+            // frozen plan under the additive `job` key and the run-scoped
+            // idempotency key (`design/JOB-MODEL.md` §5.2). The conductor
+            // derives everything from that key, never from the content line.
+            let slot = slot_of_firing(firing_id)?;
+            let catalog = self
+                .jobs
+                .as_ref()
+                .ok_or_else(|| format!("job target `{job}` fired without a mounted job catalog"))?;
+            let admission = catalog
+                .admission(job, slot, crate::job_config::TRIGGER_CRON)
+                .ok_or_else(|| format!("job `{job}` is not declared in the mounted catalog"))?;
+            let content = serde_json::json!({
+                "content": admission.content,
+                "cron": cron,
+                "job": admission.marker,
+            });
+            return self.turn.deliver(session, content, Some(admission.key));
+        }
         let mut content = serde_json::json!({ "content": schedule.prompt, "cron": cron });
-        // ADR-059: a schedule that declared defer: off_peak admits its durable
+        // ADR-060: a schedule that declared defer: off_peak admits its durable
         // row with a future eligibility instant instead of dropping it or
         // delaying outside the event log. The decision rides on the row payload
         // as an additive non-context key (derive_model_context keeps only
@@ -1719,7 +1852,7 @@ mod tests {
         }
     }
 
-    /// A resident sink that records the deferred admission path (ADR-059).
+    /// A resident sink that records the deferred admission path (ADR-060).
     #[derive(Default)]
     struct DeferResident {
         plans: AtomicUsize,
@@ -2396,6 +2529,240 @@ mod tests {
             .expect("load firing")
             .expect("row");
         assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
+    }
+
+    /// One `jobs:` declaration resolved exactly the way the loader resolves
+    /// it (JOB-MODEL §7.1(a)): the lowered schedule plus the frozen plan the
+    /// conductor would carry.
+    fn job_declaration(
+        id: &str,
+        job: &str,
+    ) -> (
+        crate::config::CronRuntimeSchedule,
+        kian_superagent::job::plan::JobPlan,
+    ) {
+        let yaml = format!(
+            "jobs:\n  - id: {job}\n    plan:\n      - id: fetch\n        prompt: fetch the news\n        produces: {{ name: raw, max_bytes: 1024 }}\n        verify: [{{ check: final_message_present }}]\ntriggers:\n  - id: {id}\n    job: {job}\n    expr: \"* * * * *\"\n"
+        );
+        let section: crate::job_config::JobsSection =
+            serde_yaml::from_str(&yaml).expect("the job fixture parses");
+        let mut resolved = section
+            .resolve(&channels(), &std::collections::BTreeSet::new(), Utc::now())
+            .expect("the job fixture resolves");
+        let plan = resolved
+            .catalog
+            .job(job)
+            .expect("the declared job")
+            .plan
+            .clone();
+        (resolved.schedules.remove(0), plan)
+    }
+
+    /// Seed a job run stream through its settling end: created, claimed, the
+    /// marker-carrying firing input, optionally one run verdict, then
+    /// `completed` (the end reason a job run always has when it finishes).
+    async fn seed_job_run(
+        store: &EventStore,
+        session: SessionId,
+        schedule_id: &str,
+        firing_id: &str,
+        plan: &kian_superagent::job::plan::JobPlan,
+        outcome: Option<kian_superagent::job::outcome::RunOutcome>,
+    ) {
+        append_created(store, session).await;
+        append_claim(store, session, 2, Epoch(1)).await;
+        let slot = slot_of_firing(firing_id).expect("the firing names its slot");
+        let marker = kian_superagent::job::status::marker_payload(&plan.id, slot, "cron", plan);
+        store
+            .append(
+                session,
+                cron_event(
+                    session,
+                    3,
+                    Epoch(1),
+                    EventKind::InputAdmitted,
+                    serde_json::json!({"role": "user", "content": "run the job",
+                                       "cron": {"firing_id": firing_id,
+                                                "schedule_id": schedule_id},
+                                       "job": marker}),
+                ),
+                AppendGuard {
+                    epoch: Epoch(1),
+                    expected_seq: 3,
+                },
+            )
+            .await
+            .expect("input/admitted");
+        let mut seq = 4;
+        if let Some(outcome) = outcome {
+            let payload = kian_superagent::job::status::run_verdict_payload(
+                outcome,
+                &plan.digest(),
+                &[],
+                None,
+                None,
+            );
+            store
+                .append(
+                    session,
+                    cron_event(session, seq, Epoch(1), EventKind::EvidenceVerdict, payload),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("evidence/verdict");
+            seq += 1;
+        }
+        append_end(store, session, seq, Epoch(1), EndReason::Completed).await;
+    }
+
+    /// (JOB-MODEL §5.5, §18.2 amendment 1) A job run ends `completed` whether
+    /// it succeeded or merely went unverified, so the sweep must settle from
+    /// the run verdict; the bare end reason would call both a success.
+    #[test]
+    fn a_job_firing_sets_succeeded_from_its_run_verdict() {
+        use kian_superagent::job::outcome::RunOutcome;
+
+        let rt = runtime();
+        let dir = TempDir::new("job-succeeded");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let (schedule, plan) = job_declaration("digest-morning", "digest");
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("{}@{fire_time}", schedule.id);
+        let slot = slot_of_firing(&firing_id).expect("slot");
+        let session = kian_superagent::job::plan::run_session("digest", slot);
+        rt.block_on(async {
+            seed_job_run(
+                &store,
+                session,
+                &schedule.id,
+                &firing_id,
+                &plan,
+                Some(RunOutcome::Succeeded),
+            )
+            .await;
+            claim_firing_row(&store, &schedule.id, fire_time).await;
+            assert!(
+                store
+                    .set_firing_session(&firing_id, session)
+                    .await
+                    .expect("record session")
+            );
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep settles");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
+        assert_eq!(row.error, None, "{row:?}");
+    }
+
+    /// The honest pair: an unverified run is NOT a success even though its
+    /// end reason is `completed`.
+    #[test]
+    fn an_unverified_job_firing_settles_failed() {
+        use kian_superagent::job::outcome::RunOutcome;
+
+        let rt = runtime();
+        let dir = TempDir::new("job-unverified");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let (schedule, plan) = job_declaration("digest-morning", "digest");
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("{}@{fire_time}", schedule.id);
+        let slot = slot_of_firing(&firing_id).expect("slot");
+        let session = kian_superagent::job::plan::run_session("digest", slot);
+        rt.block_on(async {
+            seed_job_run(
+                &store,
+                session,
+                &schedule.id,
+                &firing_id,
+                &plan,
+                Some(RunOutcome::Unverified),
+            )
+            .await;
+            claim_firing_row(&store, &schedule.id, fire_time).await;
+            assert!(
+                store
+                    .set_firing_session(&firing_id, session)
+                    .await
+                    .expect("record session")
+            );
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep settles");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "failed", "{row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unverified"),
+            "{row:?}"
+        );
+    }
+
+    /// A run stream that ends without a run verdict can never be read as a
+    /// success: the conductor's silence is not evidence (J7).
+    #[test]
+    fn a_job_firing_without_a_run_verdict_settles_failed() {
+        let rt = runtime();
+        let dir = TempDir::new("job-no-verdict");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let (schedule, plan) = job_declaration("digest-morning", "digest");
+        let fire_time = "2027-01-15T08:05:00Z";
+        let firing_id = format!("{}@{fire_time}", schedule.id);
+        let slot = slot_of_firing(&firing_id).expect("slot");
+        let session = kian_superagent::job::plan::run_session("digest", slot);
+        rt.block_on(async {
+            seed_job_run(&store, session, &schedule.id, &firing_id, &plan, None).await;
+            claim_firing_row(&store, &schedule.id, fire_time).await;
+            assert!(
+                store
+                    .set_firing_session(&firing_id, session)
+                    .await
+                    .expect("record session")
+            );
+        });
+
+        let durable =
+            DurableCronTickStore::new(store.clone(), rt.handle().clone(), vec![schedule.clone()]);
+        durable
+            .settle_from_target(&schedule)
+            .expect("the sweep settles");
+
+        let row = rt
+            .block_on(store.load_firing(&firing_id))
+            .expect("load firing")
+            .expect("row");
+        assert_eq!(row.state.as_str(), "failed", "{row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("without an outcome"),
+            "{row:?}"
+        );
     }
 
     /// CRON-MODEL §9.1: a pre-v8 row (no recorded session) stranded on a frozen

@@ -1,6 +1,6 @@
 [package]
 name = "kian-web"
-description = "Client-side web tools (DeepSeek Search/Fetch) as an audited bundle tool provider (ADR-056)"
+description = "Client-side web tools (DeepSeek Search/Fetch) as an audited bundle tool provider (ADR-057)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-# ADR-053: Request plans are values — declared model profiles, one planner, persisted fallback bytes
+# ADR-054: Request plans are values — declared model profiles, one planner, persisted fallback bytes
 
 - **Status**: accepted (owner direction 2026-11-22; phase 1a slice).
 - **Context**: kian already declared slot capabilities as config (`model_profiles:`), but the loop still

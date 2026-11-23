@@ -92,6 +92,7 @@ fn base_request(identity: Option<SpawnIdentity>) -> SpawnRequest {
         exec_worker: None,
         identity,
         output_schema: None,
+        parent: None,
     }
 }
 
@@ -164,6 +165,7 @@ fn legacy_spawn_wrapper_bytes_are_unchanged_without_an_identity() {
         exec_worker: Some("mac-mini".to_string()),
         identity: None,
         output_schema: None,
+        parent: None,
     });
     let mut expected = mandate_delegation_content(composed.thread.id, correlation, task, &mandate);
     expected[SPECULATIVE_MARKER] = Value::Bool(true);

@@ -1,8 +1,8 @@
-# ADR-058: Artifact GC runs as a serve-side ticker, and export pins blobs beside the package
+# ADR-059: Artifact GC runs as a serve-side ticker, and export pins blobs beside the package
 
 - **Status**: accepted (owner direction 2026-11-22, approved semantics 3; P3b slice).
 - **Context**: phase 2 landed the content-addressed artifact store, the append-path spill and the
-  manual `kian artifacts gc` command (ADR-055). Two operator gaps remained and were written down
+  manual `kian artifacts gc` command (ADR-056). Two operator gaps remained and were written down
   as non-goals at the time: serve never armed a garbage collector, so a long-running server grew
   the blob tree until an operator remembered the CLI; and `session export` copied the events (which
   carry only the reference and the preview), so an exported audit package silently lost fidelity
@@ -45,7 +45,7 @@
 - **Alternatives considered**:
   - A GC ticker inside `drain` (the episode loop): rejected. GC is not a session activity and must
     not consume a session's drain, budget or lease; a slow filesystem scan would stretch turns.
-  - Reference counting, or a pin set in the event log: rejected for the reasons ADR-055 already
+  - Reference counting, or a pin set in the event log: rejected for the reasons ADR-056 already
     records (no session enumeration authority, compaction rewrites ranges, constraint 1).
   - Exporting blobs inline into a single archive by default: rejected. It changes the export format
     and grows every package by payload size; opt-in pinning keeps the default package events-only.

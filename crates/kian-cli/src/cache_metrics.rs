@@ -156,7 +156,7 @@ pub fn session_cache_report(session: SessionId, events: &[Event]) -> SessionCach
             }
             EventKind::StepRequest => {
                 report.requests += 1;
-                // ADR-057 maintenance requests deliberately carry a
+                // ADR-058 maintenance requests deliberately carry a
                 // different body: they neither pair with nor invalidate the
                 // turn prefix chain, so the chain spans them untouched.
                 if ev.bytes.get("purpose").and_then(|v| v.as_str()) == Some("compact") {

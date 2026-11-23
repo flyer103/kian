@@ -26,7 +26,7 @@ edit, lock or delete contributions that violate it, and may block accounts for r
 violations. Enforcement is at the maintainer's discretion and is not up for public debate.
 
 Report a conduct problem privately to [@flyer103](https://github.com/flyer103) (or via the
-[security advisory flow](https://github.com/flyer103/kian/security/advisories/new) if the two are
+[security advisory flow](https://github.com/flyer103/kian-runtime/security/advisories/new) if the two are
 hard to separate). Reports are read by the maintainer only.
 
 For security vulnerabilities, use [SECURITY.md](SECURITY.md) instead — do not open a public issue.

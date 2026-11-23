@@ -1,4 +1,4 @@
-//! Tool-result artifacts at the assembly edge (ADR-055, phase 2).
+//! Tool-result artifacts at the assembly edge (ADR-056, phase 2).
 //!
 //! The engine spills oversized successful `tool/result` outputs into a
 //! content-addressed [`ArtifactStore`] before the event is written; the
@@ -170,7 +170,7 @@ impl ToolProvider for ArtifactReadTool {
 }
 
 /// The artifact ids a JSONL export references, sorted and de-duplicated
-/// (P3b, ADR-058). A spill-shaped `tool/result` carries its reference at
+/// (P3b, ADR-059). A spill-shaped `tool/result` carries its reference at
 /// `content.output.artifact.id`; inline results and errors carry none,
 /// so an export from a spill-off assembly pins nothing.
 pub fn referenced_artifact_ids<'a>(
@@ -217,7 +217,7 @@ impl ArtifactPinReport {
 }
 
 /// Copies every referenced blob into `<out>.artifacts/<id>`, a sibling
-/// directory of the exported JSONL (P3b, ADR-058). Content-addressed by
+/// directory of the exported JSONL (P3b, ADR-059). Content-addressed by
 /// construction: the id is the file name, so a re-export is idempotent
 /// and the pinned tree is verifiable byte-for-byte.
 pub fn pin_artifacts(
@@ -254,7 +254,7 @@ pub fn pin_artifacts(
 }
 
 /// `kian artifacts gc` — one retention pass over a content-addressed blob tree,
-/// oldest mtime first, until both configured bounds hold (ADR-055).
+/// oldest mtime first, until both configured bounds hold (ADR-056).
 ///
 /// Bounds come from the `artifacts:` section; an explicit `dir` lets an
 /// operator collect a standalone tree without a loadable config file.
@@ -328,7 +328,7 @@ pub fn run_artifacts_gc(
 }
 
 /// `kian artifacts put` — ingest a local file into the content-addressed
-/// blob tree and print its reference (ADR-060).
+/// blob tree and print its reference (ADR-061).
 ///
 /// Bounds and the default directory come from the artifacts: section; an
 /// explicit dir lets an operator ingest into a standalone tree.

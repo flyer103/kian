@@ -119,7 +119,9 @@ unknown and turn an honest park into a refusal — the reason the TTL question i
   live-session based, not connection based: `completed`/`cancelled` release the worker,
   `failed`/`interrupted` hold it until a **release** (the next bullet), and a never-started
   reservation holds it only until its lease timeout. An **offline** worker with a live bound
-  session is still busy.
+  session is still busy. The binding set is derivable store-wide from every non-terminal session's
+  `thread/started` with a live child; the spawn point remains the refusal, and the derived view
+  (`WorkerBindingView`) is an optimisation and an observability surface, never an authority.
 - **Release is a terminal close, never a reinterpretation.** A thread whose last event is
   `session/ended{interrupted|failed}` keeps holding the worker — it is resumable — until a release
   closes it with one atomic `drain/claimed` + `session/ended{cancelled}` batch under a fresh claim
@@ -361,9 +363,11 @@ seam.
 - **No worker pools**: 1:1 stays.
 - **Capabilities are declarations, not authority.** The worker declares them in `register` (v3);
   the server sanitizes (lowercase `[a-z0-9._-]`, ≤16, unique) and caches the accepted list. A
-  wrong or stale entry misleads selection; it grants nothing. Capability-based spawn validation and
-  enforcement are out of scope. Static pins have no declaration in this phase (`hello` unchanged);
-  their catalog row omits the field.
+  wrong or stale entry misleads selection; it grants nothing. When something selects a worker
+  (job step placement, `design/JOB-MODEL.md` §9) a capability is an eligibility input; eligibility
+  grants nothing, and enforcement stays with the worker's own tool grants and sandbox.
+  Capability-based spawn validation and enforcement are out of scope. Static pins have no
+  declaration in this phase (`hello` unchanged); their catalog row omits the field.
 - **No per-id queue timeout, rebind or failover.** The dynamic bound (`workers.queue_timeout_ms`)
   is one backend-level value; the ADR-020 deferred machinery is unchanged.
 - **The worker fs surface is the three text tools** (`fs_list`/`fs_read`/`fs_write`, 1 MiB bounds,

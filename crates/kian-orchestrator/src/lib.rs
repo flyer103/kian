@@ -15,7 +15,7 @@
 //! Modules:
 //! - [`engine`] — Admit → Wake → Drain → Promote (DESIGN §2.3)
 //! - [`wake`] — the foldable/losable pendingWake registry
-//! - [`compaction`] — compaction planner: the pure fold-range decision (ADR-057)
+//! - [`compaction`] — compaction planner: the pure fold-range decision (ADR-058)
 //! - [`metrics`] — orchestrator counters: state transitions, drain
 //!   depth/duration, pendingWake traffic
 //! - [`recovery`] — three-layer recovery (DESIGN §2.4)

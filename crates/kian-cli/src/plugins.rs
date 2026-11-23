@@ -143,8 +143,8 @@ pub struct LocalToolsPlugin {
     /// on; built at assembly from every secret name kian.yaml names).
     pub redactor: kian_core::secrets::SecretRedactor,
     /// Bundle-edge tool providers mounted beside the local tools:
-    /// `artifact_read` when `artifacts:` is on (ADR-055), the web tools
-    /// when `web:` is on (ADR-056). Empty keeps the provider set
+    /// `artifact_read` when `artifacts:` is on (ADR-056), the web tools
+    /// when `web:` is on (ADR-057). Empty keeps the provider set
     /// byte-identical (local tools only).
     pub extras: Vec<Arc<dyn ToolProvider>>,
 }
@@ -719,7 +719,7 @@ pub struct SuperAgentPlugin {
     /// projections and resolves invoking sessions from committed
     /// `tool/call` events). Only used when `async_tools` is on.
     pub event_store: kian_store::EventStore,
-    /// ADR-061: the channel-edge media processor, mounted only when
+    /// ADR-062: the channel-edge media processor, mounted only when
     /// `media:` is configured. `None` = every channel pump keeps its
     /// exact bytes and no media envelope is ever preprocessed.
     pub media_edge: Option<Arc<crate::media_edge::MediaEdge>>,
@@ -1800,6 +1800,34 @@ impl Plugin for SuperAgentPlugin {
                     .expect("the watchdog side is built exactly when the profile is present"),
             );
         }
+        // (JOB-MODEL §5.3, §9.2, §13.1, §13.3) the job conductor: it spawns
+        // its own run's steps through the one spawner, places them against
+        // this process's worker catalog, delivers through the mounted channel
+        // registry and admits alerts through the mounted inbox. The catalogue
+        // it alerts against is resolved after this assembly, so the port
+        // starts unmounted and is installed at boot.
+        let job_alerts = crate::job_runtime::JobAlertPort::new(
+            Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>
+        );
+        let job_directory: Arc<dyn kian_superagent::WorkerDirectoryPort> =
+            match directory_for_sides.clone() {
+                Some(directory) => directory,
+                None => Arc::new(crate::job_runtime::EmptyDirectory),
+            };
+        let job_deps = Arc::new(kian_superagent::job::conduct::JobDeps::new(
+            crate::superagent::StoreWorkerStreams::new(self.event_store.clone()),
+            Arc::clone(&spawner),
+            job_directory,
+            crate::job_runtime::deliver_port(&channels),
+            Arc::clone(&job_alerts) as Arc<dyn kian_superagent::job::conduct::AlertPort>,
+            Arc::new(crate::job_runtime::JobClock::new(Arc::new(
+                kian_orchestrator::SystemClock,
+            ))),
+        ));
+        driver = driver.with_job_runs(kian_superagent::job::conduct::JobLoopDriver::new(
+            crate::job_runtime::run_port_for_ctx(),
+            job_deps,
+        ));
         // (R12, S1/S2): the lazy side factory + static order + the
         // refusing factory + the directory port ride the driver —
         // with none installed (zero endpoints and no workers:) the
@@ -1893,6 +1921,7 @@ impl Plugin for SuperAgentPlugin {
             recall: recall_port,
             timers: self.timer_channels,
             watchdog: self.watchdog.clone(),
+            job_alerts,
         });
         ctx.provide::<crate::superagent::SuperAgentServices>(services)
     }

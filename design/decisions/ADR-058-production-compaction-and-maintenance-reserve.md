@@ -1,4 +1,4 @@
-# ADR-057: Production context compaction is a pure planner plus a maintenance turn, with a reserved budget share
+# ADR-058: Production context compaction is a pure planner plus a maintenance turn, with a reserved budget share
 
 - **Status**: accepted (owner direction 2026-11-22, approved semantics 7; P3 slice).
 - **Context**: the event model has carried a compact kind and a frozen context-projection rule
@@ -88,7 +88,7 @@
     produced_by pointer is provenance.
   - A hard trigger on the raw token count of the last request: not universally available and
     defeated by a large output cap; the planner uses the same chars estimator family as the plan
-    (ADR-053) and the declared cap so every dialect behaves the same.
+    (ADR-054) and the declared cap so every dialect behaves the same.
 - **Consequences**:
   - A long session now survives the declared window: the raw history stays intact in the stream
     (history is immutable), while the projection folds old turns behind one truthful summary.

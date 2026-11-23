@@ -86,7 +86,7 @@ fn github_issue_event(event_id: &str, number: u64, updated_at: &str) -> ChannelE
         event_id: event_id.into(),
         topic: Some("ci".into()),
         sender: Some(json!({"login": "reporter", "type": "User"})),
-        group: Some("flyer103/kian".into()),
+        group: Some("flyer103/kian-runtime".into()),
         payload: json!({
             "action": "created",
             "issue": {
@@ -95,7 +95,7 @@ fn github_issue_event(event_id: &str, number: u64, updated_at: &str) -> ChannelE
                 "updated_at": updated_at,
             },
             "comment": {"id": 99, "body": "please take a look"},
-            "repository": {"id": 1, "full_name": "flyer103/kian", "name": "kian"},
+            "repository": {"id": 1, "full_name": "flyer103/kian-runtime", "name": "kian"},
         }),
         ts_ms: 1_762_000_000_500,
     }
@@ -189,7 +189,7 @@ fn thread_key_derivation_golden_per_configured_source_shape() {
             }))
             .unwrap(),
             event: github_issue_event("d-1", 7, "2026-11-03T10:00:00Z"),
-            expected: "github:flyer103/kian#7",
+            expected: "github:flyer103/kian-runtime#7",
         },
         Case {
             name: "groupless config omits the group slot",
@@ -207,7 +207,7 @@ fn thread_key_derivation_golden_per_configured_source_shape() {
             }))
             .unwrap(),
             event: github_issue_event("d-1", 7, "2026-11-03T10:00:00Z"),
-            expected: "github:flyer103/kian#7.created",
+            expected: "github:flyer103/kian-runtime#7.created",
         },
     ];
     for case in cases {
@@ -281,15 +281,15 @@ fn keys_are_config_owned_two_configs_two_keys() {
 
     let key_before = before.derive(&ev).expect("before config derives");
     let key_after = after.derive(&ev).expect("after config derives");
-    assert_eq!(key_before.topic(), "github:flyer103/kian#7");
-    assert_eq!(key_after.topic(), "github:flyer103/kian#created");
+    assert_eq!(key_before.topic(), "github:flyer103/kian-runtime#7");
+    assert_eq!(key_after.topic(), "github:flyer103/kian-runtime#created");
     assert_ne!(key_before.topic(), key_after.topic());
 
     // The old config still derives the old key byte-identically: no
     // rewrite of already-admitted streams ever happens.
     assert_eq!(
         before.derive(&ev).expect("re-derive").topic(),
-        "github:flyer103/kian#7"
+        "github:flyer103/kian-runtime#7"
     );
 }
 

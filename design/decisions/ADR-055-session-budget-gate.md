@@ -1,8 +1,8 @@
-# ADR-054: A session-lifetime token budget that gates before the request, not after the bill
+# ADR-055: A session-lifetime token budget that gates before the request, not after the bill
 
 - **Status**: accepted (owner direction 2026-11-22; phase 1b slice).
 - **Context**: `AgentDef.budgets` has existed since the first config surface — `{tokens,
-  wall_clock_ms}` — but nothing consumed it. Cost was measurable (ADR-052 price book, `kian cost`,
+  wall_clock_ms}` — but nothing consumed it. Cost was measurable (ADR-053 price book, `kian cost`,
   usage projections) and compression was possible, yet a session could still run a 20-step tool loop
   through its ceiling and report the overspend afterwards. Three properties were missing.
   (1) **Binding**: a ceiling that only appears in a report is not a ceiling; the decision must be
@@ -14,7 +14,7 @@
   control-plane action (ADR-014/ADR-036), without touching execution and without a second
   scheduler. A fourth constraint shaped the design: the gate must not itself be a cost. A strict
   pre-send price estimate would need a second tokenizer and an exact price promise kian cannot keep
-  (ADR-052 rejected a priced event for the same reason), so the gate uses the label-honest
+  (ADR-053 rejected a priced event for the same reason), so the gate uses the label-honest
   `chars_v1` estimate it already has.
 - **Decision**:
   1. **The budget is session-lifetime and session-pinned.** `agents.<name>.budgets.tokens` is the
@@ -28,10 +28,10 @@
      every `budget/raised` and every `turn/end.usage`. Usage parsing recognizes the
      `prompt_tokens`/`input_tokens` and `completion_tokens`/`output_tokens` spellings; a turn
      whose usage object carries neither spends nothing (unknown is never assumed to be free or
-     expensive — ADR-052's honesty rule, applied to the gate). The projection is derived on read:
+     expensive — ADR-053's honesty rule, applied to the gate). The projection is derived on read:
      no budget counter is stored outside the event log.
   3. **The gate runs after the plan, before `step/request`.** Each provider turn builds its
-     `RequestPlan` (ADR-053), projects the budget from the committed stream, and admits the
+     `RequestPlan` (ADR-054), projects the budget from the committed stream, and admits the
      attempt only when `spent + estimate.high + max_output_tokens` fits the remaining ceiling. A
      refusal writes no `step/request` and dials nothing: persist-what-you-send only covers bytes
      that were actually sent. The coarse high bound is deliberately conservative — a false park is
@@ -64,7 +64,7 @@
      that a durable wait is an end + a resumable row, not a held lease; the same argument applies to
      budgets.
   3. **Priced gate (exact micro-USD before send)** — rejected: pricing is a projection and a price
-     promise before a byte is sent is not one kian can keep (ADR-052); the token estimate is
+     promise before a byte is sent is not one kian can keep (ADR-053); the token estimate is
      label-honest and sufficient for a conservative gate.
   4. **A direct `budget/raised` event written by the control plane** — rejected by the layered iron
      rule: the control plane writes inbox rows, execution appends events.

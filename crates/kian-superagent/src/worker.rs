@@ -274,6 +274,14 @@ pub fn spawn_identity_of(wrapper: &Value) -> Option<SpawnIdentity> {
 /// here so the two spellings cannot drift.
 pub const EXEC_WORKER_KEY: &str = kian_plugin::hooks::EXEC_WORKER_KEY;
 
+/// The lineage-parent wrapper key (JOB-MODEL §8.3, A5): the additive
+/// wrapper key a non-resident parent (a job run's conductor) writes so
+/// the child derives the *same* parent on both sides. Absent = the
+/// ambient resident (today's bytes), so legacy wrappers are unchanged
+/// and a child stream written before this key existed still routes to
+/// the Router exactly as before.
+pub const PARENT_KEY: &str = "kian.parent";
+
 /// The binding state of one surface (D2): the key is absent (legacy
 /// unbound, byte-identical), present with a non-empty string value
 /// (bound to that worker id), or present with anything else
@@ -759,6 +767,14 @@ impl WorkerSpawner {
         &self.worker_template_id
     }
 
+    /// The pinned worker version: every child this spawner creates is bound to
+    /// it (session-immutable slots, constraint 11). A job dispatch records it in
+    /// the child's identity so a re-drive derives the same thread.
+    #[must_use]
+    pub fn pinned_version(&self) -> u64 {
+        self.pinned_version
+    }
+
     /// Spawns one worker for `task` (the actual user content).
     /// The row is durable before the wake fires (invariant 1); the
     /// admit is idempotent per thread id, so a retried dispatch never
@@ -856,9 +872,12 @@ impl WorkerSpawner {
             Some(identity) => (identity.thread_id, child_session_id(identity.thread_id)),
             None => (Uuid::new_v4(), SessionId::new()),
         };
+        // (JOB-MODEL §8.3, A4) a conductor names its own run session as
+        // the parent; absent the override the resident stays the
+        // parent, so every Router spawn keeps today's bytes.
         let thread = Thread {
             id: thread_id,
-            parent_session: self.router.load(),
+            parent_session: request.parent.unwrap_or_else(|| self.router.load()),
             pinned_version: self.pinned_version,
         };
         // The wrapper composes the public builders: the mandate
@@ -885,6 +904,14 @@ impl WorkerSpawner {
         // spawns stay byte-identical (absent, never null).
         if let Some(exec_worker) = &request.exec_worker {
             wrapper[EXEC_WORKER_KEY] = Value::String(exec_worker.clone());
+        }
+        // (JOB-MODEL §8.3, A5) the parent key rides last-added, only
+        // when a non-resident parent was named: the child's own
+        // lineage derivation reads it back so both sides agree on the
+        // parent (a mismatch would route the completion report to the
+        // Router instead of the run).
+        if let Some(parent) = &request.parent {
+            wrapper[PARENT_KEY] = Value::String(parent.0.to_string());
         }
         // (R15 plan §4 C2, pin P6 class-B): on the multiagent path the
         // derived task identity rides as four more additive keys,
@@ -971,6 +998,7 @@ impl WorkerSpawner {
             exec_worker: None,
             identity: None,
             output_schema: None,
+            parent: None,
         })
         .await
     }
@@ -1010,6 +1038,16 @@ pub struct SpawnRequest {
     /// 2). `None` (the `Default`) writes no key — absent, never
     /// `null` — and the legacy path never sets it.
     pub output_schema: Option<Value>,
+    /// The lineage parent override (JOB-MODEL §8.3, A4): a job run is
+    /// an ordinary session that is **not** the resident Router, so a
+    /// conductor's spawn names itself here. `Some` makes the minted
+    /// `Thread` and the wrapper's `kian.parent` key name that
+    /// session, so the child's own lineage derivation and its
+    /// completion report route to the run — not to the ambient
+    /// resident (which would deliver every step report to the Router).
+    /// `None` (the `Default`) keeps today's bytes exactly: the
+    /// resident parent, no wrapper key.
+    pub parent: Option<SessionId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,9 +1111,15 @@ pub fn lineage_plan(
     let Some(delegation) = parse_delegation(content) else {
         return LineagePlan::PassThrough;
     };
+    // (JOB-MODEL §8.3, A5) a wrapper written by a non-resident parent
+    // carries `kian.parent`; reading it back makes the child's own
+    // `thread/started.parent` name the run, which is what the
+    // completion path joins on. Absent the key the ambient resident
+    // stays the parent — legacy bytes, unchanged.
+    let parent_session = delegation_parent(content).unwrap_or(router);
     let thread = Thread {
         id: delegation.thread_id,
-        parent_session: router,
+        parent_session,
         pinned_version: worker_version,
     };
     // (ADR-020, D4): the worker side derives its binding from the
@@ -1117,6 +1161,15 @@ pub fn lineage_plan(
 /// `bytes.worker` as a session id, if present and well-formed.
 fn event_worker(ev: &Event) -> Option<SessionId> {
     let raw = ev.bytes.get("worker").and_then(Value::as_str)?;
+    Some(SessionId(Uuid::parse_str(raw).ok()?))
+}
+
+/// The wrapper's `kian.parent` as a session id, if present and
+/// well-formed (JOB-MODEL §8.3, A5). A malformed value is *not* a
+/// parent: the ambient resident stays the parent rather than routing
+/// a report to an id nobody owns.
+fn delegation_parent(content: &Value) -> Option<SessionId> {
+    let raw = content.get(PARENT_KEY)?.as_str()?;
     Some(SessionId(Uuid::parse_str(raw).ok()?))
 }
 
@@ -3387,6 +3440,7 @@ mod tests {
             exec_worker: None,
             identity: None,
             output_schema: None,
+            parent: None,
         });
         let bound = spawner.prepare(&super::SpawnRequest {
             task: json!("do the thing"),
@@ -3396,6 +3450,7 @@ mod tests {
             exec_worker: Some("mac-mini".into()),
             identity: None,
             output_schema: None,
+            parent: None,
         });
         // The same frozen fields over the BOUND spawn's own thread id
         // (two prepares mint two threads — the id is the only
@@ -4056,6 +4111,7 @@ mod tests {
             exec_worker: Some("mac-mini".into()),
             identity: Some(identity.clone()),
             output_schema: None,
+            parent: None,
         });
         let wrapper = &spawned.task_message["content"];
         // The composed legacy form over the SAME (derived) thread id.

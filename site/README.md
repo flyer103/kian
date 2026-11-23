@@ -36,7 +36,7 @@ Cloudflare project is the only deployment, and no workflow publishes this direct
 - Replace `https://kian-site.pages.dev` in `index.html` (canonical plus Open Graph/Twitter URLs)
   with the production origin once a custom domain is bound. The current value matches the default
   `wrangler` project name.
-- Replace `flyer103/kian` if the repository moves.
+- Replace `flyer103/kian-runtime` if the repository moves.
 - Regenerate `assets/og.png` when the headline or one-liner changes.
 - Cloudflare Web Analytics is enabled on the Pages project, so the platform injects its beacon into
   the deployed HTML; `_headers` allows exactly that host (`static.cloudflareinsights.com` for the

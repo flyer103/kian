@@ -89,7 +89,7 @@ pub struct InputRow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct SlotName(pub String);
 
-/// The wire dialect a model speaks (ADR-053). Only the openai-compatible
+/// The wire dialect a model speaks (ADR-054). Only the openai-compatible
 /// chat-completions dialect exists today; the enum is the extension point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,7 +98,7 @@ pub enum ModelDialect {
     OpenAiChat,
 }
 
-/// Declared reasoning effort (ADR-053). The vocabulary is the closed set the
+/// Declared reasoning effort (ADR-054). The vocabulary is the closed set the
 /// providers accept; an unknown value refuses boot at config parse time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,7 +109,7 @@ pub enum ReasoningEffort {
 }
 
 /// Declarative capability profile for one (provider, model) target
-/// (ADR-053). Resolved from `model_profiles:` at agent assembly and carried
+/// (ADR-054). Resolved from `model_profiles:` at agent assembly and carried
 /// on the slot binding, so replay knows which plan produced a request.
 /// Absence on a target means the legacy V1 request shape, byte-identical.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +144,7 @@ fn default_cache() -> bool {
 pub struct SlotTarget {
     pub provider: String,
     pub model: String,
-    /// Capability profile in force for this target (ADR-053); absent means
+    /// Capability profile in force for this target (ADR-054); absent means
     /// the legacy V1 request shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ModelProfile>,
@@ -159,7 +159,7 @@ pub struct SlotSpec {
     /// Fallback chain, tried in order; each switch emits a durable
     /// `slot/fallback` event.
     pub fallback: Vec<SlotTarget>,
-    /// Capability profile of the primary target (ADR-053); absent means the
+    /// Capability profile of the primary target (ADR-054); absent means the
     /// legacy V1 request shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ModelProfile>,

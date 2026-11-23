@@ -1,4 +1,4 @@
-# ADR-056: Client-side web tools are an audited bundle provider, not a server-side model capability
+# ADR-057: Client-side web tools are an audited bundle provider, not a server-side model capability
 
 - **Status**: accepted (owner direction 2026-11-22; P2b slice).
 - **Context**: DeepSeek ships two ways to give an agent web access. The *server-side* form (the
@@ -11,7 +11,7 @@
   result bytes, no price line, and the signature is an un-auditable payload that kian would have to
   store and replay byte-for-byte while never being able to inspect it. They also bind the loop to a
   provider dialect. Client-side tools are ordinary HTTP calls with documented JSON, a per-request
-  price, and results kian already knows how to persist, spill (ADR-055), replay and budget (P0-P1).
+  price, and results kian already knows how to persist, spill (ADR-056), replay and budget (P0-P1).
   The constraint that decides this is the narrow waist (AGENTS.md #10): a web capability must not
   put provider names, provider signatures or a second effect channel into the core.
 - **Decision**:
@@ -30,7 +30,7 @@
   3. **Every call is an ordinary audited tool call.** A search or fetch is a `tool/call` followed by
      a `tool/result`; the request parameters and the result JSON are persisted by the same
      persist-what-you-send path as every other tool, count against the session tool budget, replay
-     identically after a crash, and spill by reference when the body is oversized (ADR-055). The
+     identically after a crash, and spill by reference when the body is oversized (ADR-056). The
      output shape is the provider's results verbatim under `results` (search) or `title`/`content`
      (fetch), wrapped with the request echo (`query`/`count`/`url`) so a replay can tell what was
      asked even if the provider-side ranking data changes meaning later.
@@ -53,7 +53,7 @@
      them, are the model's own rendering of `url`/`title`/`snippet` fields, not a stored provider
      artifact.
   7. **Billing is per request, and the phase-0 cost projection says so.** Search and Fetch are
-     priced per successful request, not per token. The token-based `kian cost` projection (ADR-052)
+     priced per successful request, not per token. The token-based `kian cost` projection (ADR-053)
      does not yet model request-count fees: web tool calls are visible in the event stream and
      counted as tool calls, but their fee is not added to `cost_micros`, and the limitation is
      recorded in SPEC and the ADR. A request-count price shape is a later economics slice.

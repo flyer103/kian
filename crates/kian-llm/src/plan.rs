@@ -1,5 +1,5 @@
 //! Request planning: one value that the sender, the persistence sink, the
-//! cache checker and the budget gate all consume (ADR-053).
+//! cache checker and the budget gate all consume (ADR-054).
 //!
 //! A plan is built by a pure function of the slot profile, the model, the
 //! exact message list and the tool schemas. It never reads process state, so
@@ -116,7 +116,7 @@ pub fn build_request_plan(
     if let Some(max_output) = profile.max_output {
         body["max_tokens"] = json!(max_output);
     }
-    // ADR-062: an image-bearing message becomes OpenAI content parts, and
+    // ADR-063: an image-bearing message becomes OpenAI content parts, and
     // only under a profile that declares the capability. Every other body
     // keeps the exact bytes `build_chat_body` produced.
     if profile.vision && messages.iter().any(|m| !m.images.is_empty()) {
@@ -136,7 +136,7 @@ pub fn build_request_plan(
     )
 }
 
-/// Renders the image-bearing messages as OpenAI content parts (ADR-062).
+/// Renders the image-bearing messages as OpenAI content parts (ADR-063).
 ///
 /// Only a message that actually carries an image changes shape: its string
 /// content becomes a `text` part followed by one `image_url` part per image
@@ -178,7 +178,7 @@ fn vision_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError
     Ok(out)
 }
 
-/// Standard padded base64 (RFC 4648) of an image payload (ADR-062).
+/// Standard padded base64 (RFC 4648) of an image payload (ADR-063).
 ///
 /// The workspace carries no base64 dependency; this encoder is the inverse
 /// of the decoder the channel media edge uses and is covered by vectors.

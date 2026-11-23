@@ -237,7 +237,7 @@ would have produced, followed immediately by `input/spilled` carrying the opaque
 while rows without the envelope consume byte-identically to before. The scheduler's firing
 rows keep the prompt as the message and carry the firing proof as an additive non-context key
 (`{content, cron}`) — plus, for an `off_peak` schedule, the deferral decision
-(`{content, cron, defer}`, ADR-059) — so every firing sends the same prompt bytes.
+(`{content, cron, defer}`, ADR-060) — so every firing sends the same prompt bytes.
 Promote-boundary enforcement lives in the drain-context
 surface handed to the `LoopDriver` seam (`LoopDriver::Ctx`): input-taking is refused while a
 provider turn is in flight, and every drain write carries the claim's epoch under expectedSeq
@@ -265,7 +265,7 @@ previous drain died inside is closed with one honest-error result per unpaired c
 marker, no fabricated permission) — EVENT-MODEL §4.2. Logged `ask` calls are never repaired;
 their approval path owns them (CONFIRMATION-MODEL R4/§15.6).
 
-**Deferral (ADR-059, P4).** Off-peak deferral is a planning decision plus a gate, never a second
+**Deferral (ADR-060, P4).** Off-peak deferral is a planning decision plus a gate, never a second
 scheduler. A pure planner in `kian-cli::defer` reads the same `pricing:` book the cost projection
 uses and returns the next off-peak instant bounded by `defer.max_wait_ms` (a next instant beyond
 the bound, or an admit instant already off peak, runs immediately and records the reason). The
@@ -503,7 +503,7 @@ so `FROZEN_CHAT_BODY_SHA256` is unchanged), and a non-thinking provider never em
 of replaying reasoning is input tokens and is observable through the existing usage events; no
 trimming or synthesis is performed (constraint 2/3).
 
-**Production compaction (ADR-057, P3 — landed):** the projection rule above is now driven by a
+**Production compaction (ADR-058, P3 — landed):** the projection rule above is now driven by a
 pure planner, `kian-orchestrator::compaction`. `plan_compaction(events, settings, trigger)` reads
 only the stream: it keeps the most recent `keep_recent_turns` turn/start boundaries verbatim,
 starts after the last `compact` event, requires a minimum reclaim (`min_reclaim_tokens`) and
@@ -526,7 +526,7 @@ reads as an unexpected prefix change) and `kian cost` reports maintenance reques
 priced subtotal apart from turns. Limits: no price-aware planner, no `compact_slot`, no
 maintenance fallback; wall-clock budgets remain ungated.
 
-**Vision inputs (ADR-062, P5c — landed):** the one capability that changes the request dialect
+**Vision inputs (ADR-063, P5c — landed):** the one capability that changes the request dialect
 rather than adding a surface beside it. A user input payload may carry its content object as
 {text, images: [{artifact, media_type}]}; the loop resolves each referenced blob through the
 same artifact store the spill path uses (a new DrainCtx::artifact_bytes accessor) and attaches
@@ -544,7 +544,7 @@ but offline replay cannot rebuild base64 from the stream alone, so kian session 
 request whose recorded messages carry content parts as a vision request instead of a byte-identity
 mismatch. Limits: no real vision provider is wired in the tree (the L2 evidence is a scripted
 provider), no per-image pricing, no replay re-derivation from the artifact store, and the channel
-media edge (ADR-061) still transcribes to text rather than attaching vision.
+media edge (ADR-062) still transcribes to text rather than attaching vision.
 
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and
@@ -597,7 +597,7 @@ timeout and reports `timed_out` as an honest error result. Wiring: kian-loop dep
 kian-orchestrator (for `LoopDriver::Ctx = DrainCtx`) and on kian-llm (slot resolution +
 `complete_turn`), matching the §7 crate map edge `KLD → KO`.
 
-**Request plans (ADR-053, phase 1a)**: every provider attempt is produced by the pure function
+**Request plans (ADR-054, phase 1a)**: every provider attempt is produced by the pure function
 `build_request_plan` (`kian-llm::plan`) and travels as one value — body, body version, dialect,
 profile digest, body digest and a coarse token band. The sender sends `plan.body`, the loop
 persists it, the cache checker compares its prefix, and the budget gate reads its estimate, so the
@@ -610,7 +610,7 @@ its plan before the `slot/fallback` append, and that event carries the exact bod
 metadata, so replay reconstructs the retry bytes. The event payload is additive: a profile-less session keeps
 the frozen V1 body, and the plan metadata is recorded next to it.
 
-**Tool result artifacts (ADR-055, phase 2)**: a tool result is the payload class that does not belong
+**Tool result artifacts (ADR-056, phase 2)**: a tool result is the payload class that does not belong
 in the log in full. When the operator configures `artifacts:`, the engine's single append path
 (`DrainCtxCore::append_event`) rewrites a successful `tool/result` whose output exceeds
 `inline_max_bytes` into `{artifact:{id,size,media_type},preview,truncated}` **before** the write, so
@@ -626,7 +626,7 @@ An aged-out blob is a normal, documented outcome that `artifact_read` reports as
 to the mounted tool list; core names neither the tool nor the store policy. Errors never spill, and
 an absent `artifacts:` block keeps every payload byte-identical to legacy.
 
-**Retention and pinning (ADR-058, phase 3b)**: with the block configured, `serve` also runs one GC
+**Retention and pinning (ADR-059, phase 3b)**: with the block configured, `serve` also runs one GC
 loop beside the snapshot and view tickers — the same `ArtifactStore::gc`, every
 `artifacts.gc.interval_ms` (default one hour), outside every drain, logging a warning when a round
 fails rather than failing a request; `kian artifacts gc` stays the manual path and the two share one
@@ -637,12 +637,12 @@ the CLI summary and never fails the export. Neither surface adds an event kind o
 the stream still carries references and previews, and replay is identical with or without pinned
 blobs.
 
-**Client-side web tools (ADR-056, phase 2b)**: the DeepSeek Search and Fetch HTTP APIs are mounted
+**Client-side web tools (ADR-057, phase 2b)**: the DeepSeek Search and Fetch HTTP APIs are mounted
 as two ordinary `ToolProvider` tools, `web_search` and `web_fetch`, from the bundle crate
 `kian-web` — never from a core crate, and never as a server-side model capability. Every call is a
 normal `tool/call` with the documented request JSON plus a `tool/result` carrying the provider's
 response verbatim, so it rides the same persistence, replay, budget and artifact-spill path as any
-local tool; a large page spills by reference through the ADR-055 path rather than being silently
+local tool; a large page spills by reference through the ADR-056 path rather than being silently
 truncated. Assembly is presence-locked: a `web:` block mounts the two schemas (fixed order,
 appended to every compiled agent's mounted list) and reads the key from `api_key_env` once — a
 missing value refuses boot; an absent block leaves the tool set and every request byte-identical.
@@ -651,13 +651,13 @@ exceptions or zero-result success; 408/429/5xx are marked retryable but nothing 
 automatically. The tool descriptions state that returned pages are untrusted data, never
 instructions, and no provider-encrypted page signature is stored — a client re-reads a page instead.
 Search/Fetch bill per successful request, which the phase-0 token cost projection does not price
-(ADR-056 limit).
+(ADR-057 limit).
 
-**Client-side media tools (ADR-060, phase 5a)**: OCR, speech-to-text and text-to-speech are
+**Client-side media tools (ADR-061, phase 5a)**: OCR, speech-to-text and text-to-speech are
 mounted as three ordinary `ToolProvider` tools — `image_ocr`, `audio_transcribe` and
 `speech_synthesize` — from the bundle crate `kian-media`, never from a core crate and never as a
 server-side capability. The seam stays byte-shaped: a reading tool takes an artifact id, loads the
-bytes through the ADR-055 store and returns `{"text"}`; the speech tool writes its audio into the same
+bytes through the ADR-056 store and returns `{"text"}`; the speech tool writes its audio into the same
 content-addressed store and returns `{"artifact":{id,size,media_type}}`, so every medium rides the
 existing tool/call, tool/result, retention, GC and export-pin paths and the prompt never carries
 base64. `media:` requires `artifacts:` and is presence-locked like `web:`: the block mounts the three schemas
@@ -667,7 +667,7 @@ a missing value refuses boot; an absent block leaves the tool set and every requ
 missing or oversize artifact is refused before any request; otherwise the HTTP status plus a bounded
 body); 408/429/5xx are marked retryable but nothing retries automatically. The tool descriptions state
 that OCR/ASR output is untrusted data, never instructions. Channel delivery of media is phase 5b
-(ADR-061); vision content parts are phase 5c.
+(ADR-062); vision content parts are phase 5c.
 
 **The audit enrichment (additive, additions-only)**: `turn/end` payloads may carry two further
 keys — both drain-activity, never context-bearing, both omitted when not applicable so legacy
@@ -687,7 +687,7 @@ parser learns every provider spelling of the same facts (DeepSeek's `prompt_cach
 `prompt_cache_miss_tokens`, OpenAI's `prompt_tokens_details.cached_tokens`, Anthropic's
 `cache_read_input_tokens`), derives a miss count when the provider only reports a hit count, and
 the CLI derives a cache hit rate at render time. `kian cost` additionally quotes the deployment's
-config `pricing:` book ([ADR-052](decisions/ADR-052-economics-cost-projection.md)) and reports
+config `pricing:` book ([ADR-053](decisions/ADR-053-economics-cost-projection.md)) and reports
 priced/unpriced requests, the peak/off-peak split and an exact integer micro-currency total. Cost
 is likewise a pure projection: no event carries a price or a cost, usage is never normalized or
 priced in core (§15), and editing the book re-renders history rather than rewriting the stream.
@@ -981,12 +981,12 @@ argument (a cached tool schema cannot flip it); a pinned resident prompt therefo
 correctly. The derivation is a pure function over events, so the boot outbox re-drive derives the
 same answer at the intent's `tool/call` seq and re-sends the intent's exact bytes.
 
-**Inbound channel media (P5b, ADR-061).** Media arrives before a turn exists, so it is processed at the
+**Inbound channel media (P5b, ADR-062).** Media arrives before a turn exists, so it is processed at the
 assembly's channel pump (`kian-cli` `spawn_subscription_consumers`), not by a tool the model calls and
 not inside `kian-superagent`: an adapter event whose payload carries the additive `media` array
 (`{kind, media_type, base64[, language]}` items; absent from every text event, so old payload bytes are
 unchanged) is rewritten before `SubscriptionService::handle_event` — each item's bytes go into the
-content-addressed artifact store (ADR-055, ADR-060), the matching `image_ocr` / `audio_transcribe` tool
+content-addressed artifact store (ADR-056, ADR-061), the matching `image_ocr` / `audio_transcribe` tool
 produces the transcript, and the item becomes `{kind, media_type, artifact, size, transcript|error}`
 while the payload's text gains a fixed `[image transcript]` / `[voice message transcript]` line in item
 order. Base64 never re-enters the payload, no message is ever dropped (a failed item is an honest
@@ -1535,7 +1535,7 @@ gap fixes recorded in the closing bullets.
  show — and `flaky-proxy.py` gained the path-scoped delivery-leg fault mode
  (`FAIL_N`/`FAIL_PATH`) so the retry/park arms reproduce with shipped tooling.
 - **Live validation** — the eight-step validation protocol executed
- live against the real `flyer103/kian` repo (2026-11-04, four scratch stores, real
+ live against the real `flyer103/kian-runtime` repo (2026-11-04, four scratch stores, real
  DeepSeek work trips, real GitHub REST traffic, `DRY_RUN=1` throughout; every claim cited
  by session id + seq or a captured log line — the issue-watch run log §7):
  scenarios 1 (Eval accept → Ticket + Mandate), 4 (speak-rules: deliver-once, one
@@ -1589,6 +1589,15 @@ capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-int
  not evaluate a table — one on their agents refuses boot (never silently ignored). The
  `AgentDef.tools` schema filter (what the model *sees*) is untouched; permissions decide what
  *runs*.
+
+- **Declarative job plans** — `superagent.jobs` declares a job as ordered steps with
+  capability requirements, declared artifacts and declared checks; a trigger starts a *run*,
+  an ordinary session whose driver is a stateless conductor that parks between episodes.
+  Each step attempt is a child session placed per attempt by capability, text artifacts move
+  by reference into the producer's immutable bytes, and a step settles only on its declared
+  checks — delivery is the channel adapter's receipt, and a failed run admits an alert run.
+  `kian job list|status|run|cancel`; no new event kind, table or route
+  ([JOB-MODEL](JOB-MODEL.md), [ADR-052](decisions/ADR-052-job-model.md)).
 
 ### 4.8 Multiagent bundle (R14, designed)
 
@@ -1646,7 +1655,7 @@ Unified semantics (portable across harnesses/channels):
 | `queue(msg)` | Queue an input without interrupting the current drain |
 | `confirm(call_id, decision)` | Resolve a pending ask (approve/reject); fail-closed (P8). The answer is a durable control row; the drain applies it in call order. Contract: [CONFIRMATION-MODEL](CONFIRMATION-MODEL.md) ([ADR-036](decisions/ADR-036-durable-confirmation-plane.md)) |
 | `pending(session)` | The session's unanswered asks with the TTL overlay — a pure read, no writes |
-| `raise_budget(tokens?, wall_clock_ms?, reason?)` | Add to a session's lifetime budget; ONE durable control row consumed into `budget/raised`, idempotent, never touches execution. Contract: [ADR-054](decisions/ADR-054-session-budget-gate.md) |
+| `raise_budget(tokens?, wall_clock_ms?, reason?)` | Add to a session's lifetime budget; ONE durable control row consumed into `budget/raised`, idempotent, never touches execution. Contract: [ADR-055](decisions/ADR-055-session-budget-gate.md) |
 
 Implementation: JSON-RPC over HTTP (axum) + SSE event stream. All control-plane operations **only
 write the inbox / read projections** (the layered iron rule), never touching execution directly.
@@ -1813,6 +1822,11 @@ A new capability is attempted in order of core footprint, smallest first:
 4. **Core primitive** (last resort): entering kian-core requires proof it cannot be expressed at
  the edge.
 
+A declarative plan (`design/JOB-MODEL.md`) is rungs 1–2: `superagent.jobs` is configuration, the
+conductor and the placement selector live in the bundle, and the run rides the existing session
+carrier. The only seam touch is an additive optional field (`SpawnRequest.parent`), not a new trait;
+no crate in the core waist changes.
+
 ### 6.4 Hook plugins (lifecycle hooks and the stdio sidecar tier)
 
 `kian-plugin` also carries a hook bus — a small, closed vocabulary of execution-lifecycle points
@@ -1880,7 +1894,7 @@ graph TB
 | crate | Responsibility | Key interfaces |
 |-------|----------------|----------------|
 | kian-core | Concept model, session state machine, six-invariant assertions | `SessionId`, `EventKind`, `Projection`, `seams::*` |
-| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project`; `ArtifactStore` (content-addressed `tool/result` blobs + retention GC, ADR-055) |
+| kian-store | EventStore (sqlite v0 → postgres), Inbox, expectedSeq CAS, epoch fencing, projection rebuild.: dual-backend — the public `EventStore` is a dispatching enum (`Sqlite(..) \| Postgres(..)`) with identical method names/signatures on both; per-backend SQL lives in private `sqlite`/`postgres` modules (dialect notes in §3.3); `open(path)` stays sqlite construction, `open_postgres(url)` is the pg entry | `append(carrying epoch, expected_seq)`, `scan`, `project`; `ArtifactStore` (content-addressed `tool/result` blobs + retention GC, ADR-056) |
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032; v6 bounds the re-drive count, ADR-033), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
@@ -1890,8 +1904,8 @@ graph TB
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |
 | kian-superagent | super-agent bundle: Router/Worker templates, subscription rules, channel output policies, and the real channel adapters (lark, github, wechat) plus the mock channel | profile assembly |
 | kian-cli | CLI and serve assembly: serve/run/inspect/replay/export; re-exports the SDK client so `commands` speak the same wire | `commands`, `client` (re-export of `KianClient`) |
-| kian-web | Client-side web tools bundle (ADR-056): `web_search` / `web_fetch` over the DeepSeek Search/Fetch HTTP APIs as an ordinary `ToolProvider` — no core crate names the provider, the endpoint or the response shape; oversized pages spill through ADR-055 | `WebTools`, `WebToolsConfig` |
-| kian-media | Client-side media tools bundle (ADR-060): `image_ocr` / `audio_transcribe` / `speech_synthesize` over the DeepSeek media HTTP APIs as an ordinary `ToolProvider` — input and output bytes flow through the ADR-055 artifact store, and no core crate names the provider, the endpoint or the response shape | `MediaTools`, `MediaToolsConfig` |
+| kian-web | Client-side web tools bundle (ADR-057): `web_search` / `web_fetch` over the DeepSeek Search/Fetch HTTP APIs as an ordinary `ToolProvider` — no core crate names the provider, the endpoint or the response shape; oversized pages spill through ADR-056 | `WebTools`, `WebToolsConfig` |
+| kian-media | Client-side media tools bundle (ADR-061): `image_ocr` / `audio_transcribe` / `speech_synthesize` over the DeepSeek media HTTP APIs as an ordinary `ToolProvider` — input and output bytes flow through the ADR-056 artifact store, and no core crate names the provider, the endpoint or the response shape | `MediaTools`, `MediaToolsConfig` |
 | kian-sdk | Wire-only embedded SDK: the frozen client surface over HTTP — JSON-RPC transport, typed methods (`create_session`, `submit`, `steer`, `queue`, `interrupt`, `projection`), the `events` SSE helper, ops wrappers (`wake_now`, `recovery_budget_reset`, `mock_channel_send`) and matchable typed errors. Depends on no kian crate (reqwest/serde/serde_json/futures/thiserror only) — embeddable anywhere | `KianClient`, `ClientError`, `SseFrame` |
 | kian-dsh | The dsh bridge (ADR-010 / §16): `DshDriver` implements the `LoopDriver` seam by driving a `dsh --profile sdk` child process over stdio JSON-lines — dsh keeps its interaction model, kian owns durability (every mapped event rides the ordinary fenced append path; the mapping is the only translation; steers arrive as promoted inbox rows). Narrow waist: depends on `kian-core` only (seam types + event vocabulary); the drain surface is the crate-local `DshCtx` port, implemented over the real `DrainCtx` by assembly (`kian-cli`, config-gated `superagent.harness.dsh`, default off) | `DshDriver`, `DshCtx`, `DshDriverConfig` |
 | kian-harness (planned, phase 1) | The shared bridge skeleton ([HARNESS-BRIDGE](HARNESS-BRIDGE.md), [ADR-043](decisions/ADR-043-multi-harness-bridge.md)): the session trait, the driver state machine (episode spawn/park, safe boundaries, takeover dedup, step budget, honesty outcomes), the declarative approval policy, the `tool/post` port shape and the capability declarations. Narrow waist: depends on `kian-core` only; the drain surface is a crate-local ctx port implemented by assembly | `HarnessSession`, `BridgeDriver`, `Capabilities`, `ApprovalPolicy` |
@@ -1909,7 +1923,7 @@ cursor advances only after the claim, so a crash between the two re-claims nothi
 two arms: the resident arm admits one durable inbox row for the target session (`{content, cron}`
 payload — the firing proof is additive and non-context — idempotency key `cron:<firing_id>`; a
 schedule that declares `defer: off_peak` instead admits with a future `eligible_at` and adds the
-non-context `defer` decision beside the proof, ADR-059), and
+non-context `defer` decision beside the proof, ADR-060), and
 the worktree arm cuts a detached git tree under the resolved `worktree.root`, runs the configured
 harness under `timeout_ms`, then captures and cleans up (or keeps, `keep_on_failure`) the tree;
 the disk guards and the per-schedule slot ceiling live in `cron_worktree`. The ticker is not a
@@ -1945,7 +1959,7 @@ list are fixed by [CHANNEL-WECHAT.md](CHANNEL-WECHAT.md); the rationale is
 **SDK freeze and versioning.** The `kian-sdk` public surface *is* the frozen wire
 contract: after it is **additive-only** — removing or reshaping a method, param, response
 field, or error code is a breaking change and requires a new design decision (the event-kinds rule
-applied to the API). The crate carries its own version (`0.1.0`), decoupled from the workspace
+applied to the API). The crate carries its own version (`0.1.1`), decoupled from the workspace
 bump cadence; publishing to crates.io happens only when the owner asks. Golden wire fixtures in
 `crates/kian-sdk/tests/fixtures/` pin the request/response bytes of every method (the 
 serialization-freeze discipline applied to the client).
@@ -2126,9 +2140,9 @@ wake transport is an advisory accelerator — availability never depends on it.
  (drain-activity, never context-bearing) and `kian usage-stats` / `GET /metrics` project token
  totals from them. Pricing/cost conversion is deliberately a projection-layer decision outside
  core — the event stream carries the provider's own numbers, unnormalized. `kian cost` prices each
-  attempt at its own timestamp against the config `pricing:` book (ADR-052); an unpriced model is
+  attempt at its own timestamp against the config `pricing:` book (ADR-053); an unpriced model is
   counted, never priced at zero.
-- **Session token budget (ADR-054).** A session-lifetime token ceiling, declared per agent
+- **Session token budget (ADR-055).** A session-lifetime token ceiling, declared per agent
   (`agents.<name>.budgets.tokens`) and pinned on `session/created.budgets` when configured, gates
   *before* a provider request is sent: the loop builds the request plan, projects
   `base + Σbudget/raised − Σturn/end.usage`, and refuses the turn when `spent + estimate.high +

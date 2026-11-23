@@ -108,7 +108,7 @@ model_profiles: # capability facts, config-first (enforced by the request planne
     strict: true
     cache: true
 
-pricing: # read-only cost projection (kian cost, ADR-052); absent = cost unavailable
+pricing: # read-only cost projection (kian cost, ADR-053); absent = cost unavailable
   currency: USD
   peak_multiplier: 2.0 # applied inside a peak window
   peak_windows:
@@ -312,7 +312,7 @@ status recorded here.
 | Item | Contents | Status |
 |------|---------|--------|
 | live leg — contract-v0 peer | `contrib/dsh-v0-peer/dsh-v0-peer.mjs` (zero-dep Node) adapting stock dsh JSON-RPC onto the frozen [ADR-010](../design/decisions/ADR-010-dsh-session-mapping.md) v0 contract; live run green (real `deepseek-chat`, full mapped chain, honest `Settled`) — supersedes the 2026-11-01 honest negative | landed |
-| Dogfood workload | an out-of-tree issue-watch harness: TimerChannel → `gh issue list` → Router triage → worker draft (dry-run) on the real `flyer103/kian` repo; its restart demo proves a kill -9 reboot resumes the same session; the run log records real data | landed |
+| Dogfood workload | an out-of-tree issue-watch harness: TimerChannel → `gh issue list` → Router triage → worker draft (dry-run) on the real `flyer103/kian-runtime` repo; its restart demo proves a kill -9 reboot resumes the same session; the run log records real data | landed |
 | Wire dialect v2 (breaking) | Strict OpenAI-compatible serialization: dotless built-in tool names (`fs_list`/`fs_read`/`fs_write`, dotted forms replayable), wire-level `tool_calls`/`tool_call_id`, `AgentDef.tools` fail-closed. Found live via DeepSeek HTTP 400/422; constraint-3 event in DESIGN (golden hash same commit) | landed |
 | Router re-arm | Boot-time deterministic successor walk (uuid5 chain) revives a frozen resident Router with an observable `[re-arm]` cause input; soft-failed sessions re-open the same pinned session. Zero new kinds; DESIGN §4.6 | landed |
 
@@ -336,7 +336,7 @@ artifact.** Semantics: DESIGN §4.7; operator surface: [advanced.md](advanced.md
 | Outbox+receipts bounded retry | Reuse audit verdict: the outbox is a disposable projection over `tool/call` intent + `channel/delivered` receipt plus a bounded driver — no new durable state; 2s→60s backoff, `max_attempts` 6 then parked honestly (`delivery-retry` stage, named on `kian tickets`); per-(ticket, conversation) ordering; additive `attempt`/`first_attempt_ms` on new receipts; park survives reboot ( +, plan) | landed |
 | Policy/prompt versioning + drift marking | `[policy <label>]` header added at render (template text untouched, persisted prompts replay byte-identically); boot-time drift marking (audit + counter, live sessions never rewritten); config-gated one-shot policy-changed marker input | landed |
 | Issue-watch multi-Ticket dogfood | GitHub poll-receive mode beside the webhook (`since` cursors, bounded backfill); the issue-watch v2 harness composes the whole stack — one Ticket per live issue, thread-keyed topics, mandate-bounded triagers, speak-rule deliveries through the outbox; v1 kept as the timer config | landed |
-| live validation | The eight-step validation protocol executed live against `flyer103/kian` (real DeepSeek + GitHub REST, `DRY_RUN=1`): steps 1, 4, 5, 6, 7, 8 PASS with captured evidence; steps 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; the gap report filed the gaps (the issue-watch run log §7) | executed (with honest negatives) |
+| live validation | The eight-step validation protocol executed live against `flyer103/kian-runtime` (real DeepSeek + GitHub REST, `DRY_RUN=1`): steps 1, 4, 5, 6, 7, 8 PASS with captured evidence; steps 2–3 honest negatives (structural `spawn_topic` gap — no live topic binding), every claim cited by session id + seq; the gap report filed the gaps (the issue-watch run log §7) | executed (with honest negatives) |
 | gap fixes | The four gaps, all landed: the `User-Agent` stamp on every github/lark HTTP client + `flaky-proxy.py` delivery-leg fault mode; `spawn_topic` accepts the live spawn spellings — live topic binding, mandate strength and outbox ticket aliasing work live; outbox park rebuilt at boot and surfaced per-ticket on the stage board; exec secret hygiene — shared core redactor + env policy, `env` dumps never persist secrets (the one cross-bundle-fence commit, filed separately) | landed |
 | Multiagent delegation (session-internal + roster) | The multiagent contract: delegation = a **child session** via `Thread` (one mechanism, no lighter tier) with a derived spawn identity (`spawn_uid`) so a replay cannot mint a duplicate child, and a completion delivered as a **pair of writes** with a reconciliation rule; cross-session composition = existing Thread/Mandate/subscription/`agent.id` + a config agent roster over `AgentDef` (`superagent.roster`, selected only through a read-only `list_agents`); the board ruling — a disposable `task_board` view plus a control path recomputed from the primary, **never** a board entity and never a control read on the view; a closed nine-value task-outcome vocabulary (an empty answer is never a success) plus a separate two-value spawn outcome; config-only caps (`max_children` 4, `max_depth` 1). **Zero new event kinds, no new table/route/ops method/metrics key, no core change**; **no event-payload key set changes before P4** — P1 adds message content inside new delegation wrappers and new reports, P2 adds three `spawn_worker` arguments (one constraint-3 change), and the two additive `thread/*` audit key groups are a P4 owner gate — [MULTIAGENT-MODEL](../design/MULTIAGENT-MODEL.md), [ADR-029](../design/decisions/ADR-029-multiagent-delegation-and-board.md) | implemented P1–P4 (R15–R17; tests only — no live-run evidence) |
 
@@ -373,7 +373,7 @@ compatibility, and cross-replica interrupt latency beyond "next safe boundary" (
 
 Cost conversion is no longer out of scope at the projection layer: usage still persists verbatim
 and no event carries a price, but `kian cost` prices a stream from the deployment's config
-`pricing:` book and reports exact integer micro-currency totals ([ADR-052](../design/decisions/ADR-052-economics-cost-projection.md)).
+`pricing:` book and reports exact integer micro-currency totals ([ADR-053](../design/decisions/ADR-053-economics-cost-projection.md)).
 The core never normalizes or stores cost, and the book is a deployment fact rather than event
 state, so editing a price re-renders history instead of corrupting it.
 
@@ -544,7 +544,7 @@ pin them together.
 | P3b | kian-plugin, bundle | Hook `ask` verdict (`tool/pre` defers) and its ordering with the declarative gate (a PLUGIN-SPEC widening) | not started |
 | P4 | orchestrator, read model | Automatic expiry without a control-plane touch; a read-model snapshot carrying the pending set | not started |
 
-### Session token budget (ADR-054, P1b landed)
+### Session token budget (ADR-055, P1b landed)
 
 Scope: a **session-lifetime token ceiling** an operator can declare per agent and raise while a
 session is parked. It closes the gap the original `Budgets` type recorded but never enforced (A5:
@@ -565,18 +565,18 @@ raises are projected but not enforced while a drain is idle; a usage-less turn s
 
 The normative contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §2.3/§3/§4.4; the
 wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; the decision record is
-[ADR-054](../design/decisions/ADR-054-session-budget-gate.md).
+[ADR-055](../design/decisions/ADR-055-session-budget-gate.md).
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P1b | kian-core, kian-loop, kian-orchestrator | `kian-core::budget` projection (`base + Σraised − Σspent`, DeepSeek/OpenAI usage spellings); the seventh end reason `awaiting_budget` (`running → idle`); the `budget/raised` kind + reserved budget row envelope; the pre-send gate (`estimate.high + max_output`, no `step/request` on refusal); `session/created.budgets` pin | landed |
 | P1b-wire | kian-cli, kian-sdk | `raise_budget` RPC + `ControlPlane` method + CLI (`kian raise-budget`); no new error code (reuses `-32602`/`-32001`/`-32007`; outcomes `accepted`/`deduplicated`/`terminal`) | landed |
 
-Non-goals recorded with the phase: no per-step monetary gate (pricing stays a projection, ADR-052),
+Non-goals recorded with the phase: no per-step monetary gate (pricing stays a projection, ADR-053),
 no enforcement of wall-clock budgets while idle, no budget on harness-owned (projection-only) loops,
 no automatic compaction or model downgrade as a budget response.
 
-### Tool result artifacts (ADR-055, P2 landed)
+### Tool result artifacts (ADR-056, P2 landed)
 
 Scope: keep a large tool result **out of the log and out of the model's context** while keeping both
 replayable and auditable. A result is the payload class that otherwise grows the event stream, the
@@ -594,9 +594,9 @@ Error results never spill; an absent block keeps every legacy payload byte-ident
 
 The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §3/§4.1; the
 placement is [design/DESIGN.md](../design/DESIGN.md) §2.2; the decision record is
-[ADR-055](../design/decisions/ADR-055-artifacts-and-tool-result-spill.md).
+[ADR-056](../design/decisions/ADR-056-artifacts-and-tool-result-spill.md).
 
-P3b ([ADR-058](../design/decisions/ADR-058-maintenance-artifact-gc-and-export-pinning.md)) adds two
+P3b ([ADR-059](../design/decisions/ADR-059-maintenance-artifact-gc-and-export-pinning.md)) adds two
 operational surfaces without changing this contract: `serve` runs a retention GC ticker when the
 `artifacts:` block exists (interval from `artifacts.gc.interval_ms`, default one hour, outside
 drains, non-fatal), and `kian session export --with-artifacts` copies referenced blobs beside the
@@ -610,9 +610,9 @@ already reclaimed is an honest, documented outcome.
 
 Non-goals recorded with the phase: no per-session quota, no reference counting (kian has no
 session enumeration API and compaction rewrites ranges), no server-side fetch in core. Export blob
-pinning and the serve GC ticker were deferred here and landed in P3b under ADR-058.
+pinning and the serve GC ticker were deferred here and landed in P3b under ADR-059.
 
-### Client-side web tools (ADR-056, P2b landed)
+### Client-side web tools (ADR-057, P2b landed)
 
 Scope: give the loop web search and URL reading as ordinary audited tool calls on the operator's own
 provider key — without adding a provider capability to core and without a second truth for page
@@ -623,14 +623,14 @@ Semantics: a `web:` block (protocol-only: `base_url`, `api_key_env`, `timeout_ms
 `web_fetch`, assembled from the `kian-web` crate. Every call is a normal `tool/call` +
 `tool/result`: the documented Search/Fetch request JSON is persisted before the request flies, the
 provider's response object is the result content, and a large page spills by reference through the
-ADR-055 path instead of being truncated. Failures are honest `is_error` results carrying the HTTP
+ADR-056 path instead of being truncated. Failures are honest `is_error` results carrying the HTTP
 status and a bounded body (408/429/5xx marked retryable, nothing retried automatically);
 out-of-contract arguments are refused without a request. An absent `web:` block leaves the tool set
 and every request byte-identical; present, the key is read once at serve assembly and a missing
 value refuses boot. Returned pages are untrusted data and no provider-encrypted signature is
 retained.
 
-The normative decision record is [ADR-056](../design/decisions/ADR-056-client-side-web-tools.md);
+The normative decision record is [ADR-057](../design/decisions/ADR-057-client-side-web-tools.md);
 placement is [design/DESIGN.md](../design/DESIGN.md) §2.2/§7. Search/Fetch bill per successful
 request; the phase-0 cost projection prices model tokens only (request-count pricing is a later
 slice).
@@ -642,7 +642,7 @@ slice).
 Non-goals recorded with the phase: no server-side web tools in core, no citation/signature
 retention, no automatic retry loop, no request-count cost in the phase-0 projection.
 
-### Context compaction (ADR-057, P3 landed)
+### Context compaction (ADR-058, P3 landed)
 
 Scope: keep a long session inside its declared context window without rewriting history, and keep
 compaction economically honest and observable. Folding is the only deliberate prefix-invalidation
@@ -667,7 +667,7 @@ reports maintenance requests apart from turns.
 
 The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md)
 §3/§4.2/§4.3; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2; the decision record is
-[ADR-057](../design/decisions/ADR-057-production-compaction-and-maintenance-reserve.md).
+[ADR-058](../design/decisions/ADR-058-production-compaction-and-maintenance-reserve.md).
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
@@ -677,7 +677,7 @@ Non-goals recorded with the phase: no price-aware break-even planner, no separat
 scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
 enforcement of the reserve.
 
-### Off-peak deferral (ADR-059, P4 landed)
+### Off-peak deferral (ADR-060, P4 landed)
 
 Scope: let a deliberately submitted batch admission or a scheduled firing wait for an off-peak
 pricing window, without introducing a second scheduler and without ever delaying interactive work.
@@ -701,7 +701,7 @@ The normative wire is [design/API-CONTRACT.md](../design/API-CONTRACT.md) §3; t
 semantics are [design/CRON-MODEL.md](../design/CRON-MODEL.md) §3.1/§3.3/§6.1; the event contract is
 [design/EVENT-MODEL.md](../design/EVENT-MODEL.md) §4.2; the placement is
 [design/DESIGN.md](../design/DESIGN.md) §2.3; the decision record is
-[ADR-059](../design/decisions/ADR-059-off-peak-deferral.md).
+[ADR-060](../design/decisions/ADR-060-off-peak-deferral.md).
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
@@ -711,7 +711,7 @@ Non-goals recorded with the phase: no second scheduler or per-row timer, no defe
 interactive inputs or steering, no job deferral (the job runtime is not in this tree), no
 `overlap`/queue policy change, no cost guarantee from deferring.
 
-### Client-side media tools (ADR-060, P5a landed)
+### Client-side media tools (ADR-061, P5a landed)
 
 Scope: OCR, speech-to-text and text-to-speech as client-side bundle tools over documented HTTP
 shapes, with every input and output byte flowing through the content-addressed artifact store. This
@@ -731,7 +731,7 @@ file into the same store and prints the reference. Tool descriptions and result 
 output as untrusted data, never instructions.
 
 The provider protocol is the client-side HTTP adapter described in
-[ADR-060](../design/decisions/ADR-060-client-side-media-tools.md); the blob contract is ADR-055; the
+[ADR-061](../design/decisions/ADR-061-client-side-media-tools.md); the blob contract is ADR-056; the
 placement is [design/DESIGN.md](../design/DESIGN.md) §2.2.
 
 | Phase | Module | Contents | Status |
@@ -742,7 +742,7 @@ Non-goals recorded with the phase: no channel media delivery (P5b), no vision co
 (P5c), no media pricing in the cost projection, no media persisted as an event, no server-side
 media tool in the core.
 
-### Channel-edge media (ADR-061, P5b landed)
+### Channel-edge media (ADR-062, P5b landed)
 
 Scope: inbound images and voice messages become durable text context at the channel edge, before the
 turn exists, while their bytes live in the artifact store. This is the second half of the P5 media
@@ -752,7 +752,7 @@ Semantics: the assembly's channel pump (`kian-cli`) runs one optional edge befor
 `SubscriptionService::handle_event`. An adapter event whose payload carries the additive `media`
 array — items `{"kind":"image"|"audio","media_type","base64"[,"language"]}`, absent from every
 text event so existing payload bytes are unchanged — is processed item by item: the bytes are written
-to the artifact store (ADR-055), `image_ocr` / `audio_transcribe` (ADR-060) produce the transcript, and
+to the artifact store (ADR-056), `image_ocr` / `audio_transcribe` (ADR-061) produce the transcript, and
 the item is rewritten to `{"kind","media_type","artifact","size","transcript"}` or
 `{"kind","media_type","error"}`. Transcripts are appended to the payload's `text` under
 `[image transcript]` / `[voice message transcript]` markers, in item order. Base64 never re-enters the
@@ -761,8 +761,8 @@ honest per-item `error` that does not block admission. A payload without `media`
 byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is not a channel
 capability yet: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
 
-The edge contract is [ADR-061](../design/decisions/ADR-061-channel-edge-media.md); the tool protocol is
-ADR-060; the blobs are ADR-055; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
+The edge contract is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md); the tool protocol is
+ADR-061; the blobs are ADR-056; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
@@ -772,7 +772,7 @@ Non-goals recorded with the phase: no real-adapter media ingestion (WeChat CDN d
 attachments remain those channels' phase 2), no outbound audio send, no TTS call behind the model's
 back, no media pricing, no new event kind and no queue or batching at the edge.
 
-### Vision inputs (ADR-062, P5c landed)
+### Vision inputs (ADR-063, P5c landed)
 
 Scope: let a vision-capable model see an image without leaving the event log. A user input payload
 may carry its content as `{"text": <string>, "images": [{"artifact": <content id>,
@@ -790,8 +790,8 @@ the answer, never fails the turn). The exact base64 bytes are persisted on `step
 persist-what-you-send; an offline replay cannot re-derive them from the stream alone, so
 `kian session replay` counts such requests as vision requests instead of byte-identity mismatches.
 
-The contract is [ADR-062](../design/decisions/ADR-062-vision-content-parts.md); the artifacts are
-ADR-055; the profile knob is ADR-053; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2.
+The contract is [ADR-063](../design/decisions/ADR-063-vision-content-parts.md); the artifacts are
+ADR-056; the profile knob is ADR-054; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2.
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
@@ -849,6 +849,29 @@ usage/recall (CRON-MODEL §6.1). The tick loop and the durable adapter are exerc
 (L1: real store + the real decision table); the grammar, DST, misfire, store, settlement and
 worktree paths carry unit coverage, and the confirmation plane's crash repair is exercised by the
 `kill -9` chaos suite (L2).
+
+### Declarative jobs (P0–P1 landed)
+
+Scope: a unit of work that is a *plan* of steps — fetch on one machine, summarise, then deliver —
+carried as ordinary durable machinery, with honest per-step evidence. No workflow engine, no job
+table, no second scheduler, no new event kinds. The normative contract is
+[design/JOB-MODEL.md](../design/JOB-MODEL.md); the decision record is
+[ADR-052](../design/decisions/ADR-052-job-model.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| P0 | kian-superagent, kian-cli | The four axes (trigger / plan / placement / evidence); a run is an ordinary session whose stateless conductor parks (so a run may wait hours without ending); the plan frozen into the admitted row with its digest; capability-only step declarations with placement computed once per attempt; a step attempt is an ordinary child thread; delivery as a conductor action over the channel adapter; one run verdict as the outcome record; alerts as deliver-only runs; `kian job list\|status\|run\|cancel` | landed |
+| P1 | kian-superagent | The kernel: dependency-ordered readiness, per-attempt retries with a bounded backoff, the effect gate (`needs_operator` for an unknown write), text artifacts by reference with a cap breach as a failure, the run deadline, the outcome lattice | landed |
+| P2 | kian-cli | The worker binding view, HTTP/JSON-RPC/SSE status, sweep-side alerting, `resume --assume-no-effect`, schema checks on step output, channel-side dedupe | designed |
+| P3–P4 | — | Binary artifacts (needs a worker upload seam), enforced cancellation (needs a core interrupt that cancels an in-flight tool future), per-step cost, event triggers, `max_parallel > 1` | designed |
+
+A run's trigger is a cron schedule whose runtime target is the job (§7.1 of the contract), so the
+durable cursor, misfire policy and settlement sweep are the ones already tested — a job firing adds
+no scheduler and no table. A step's success is never an exit code: it is the declared check set
+(§11.2) evaluated over the child's own committed facts, and a delivery is the channel's receipt.
+The run's outcome rides one additive `evidence/verdict` with gate `run`, because the engine — not a
+driver — owns the session end.
+
 
 ### Deferred (unchanged)
 | Item | Reason |

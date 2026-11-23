@@ -4,7 +4,7 @@
 //! the runtime normalizes them once to integer micro-USD per million
 //! tokens, so every cost is exact integer arithmetic. The book is a
 //! deployment fact, not event state: only the projection reads it, and a
-//! price edit re-renders history (ADR-052).
+//! price edit re-renders history (ADR-053).
 //!
 //! Peak windows are wall-clock intervals in an IANA timezone; a timestamp
 //! is peak when it falls in any window on a listed weekday and the local
@@ -18,9 +18,9 @@ use kian_core::model::{ModelDialect, ModelProfile, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 
 /// Milliseconds in one wall-clock minute (off-peak planning granularity,
-/// ADR-059).
+/// ADR-060).
 const MINUTE_MS: u64 = 60_000;
-/// The off-peak search horizon (ADR-059): eight days covers one whole week
+/// The off-peak search horizon (ADR-060): eight days covers one whole week
 /// plus a day of timezone/DST slack.
 const OFF_PEAK_SCAN_HORIZON_MS: u64 = 8 * 24 * 60 * MINUTE_MS;
 /// A reference Monday 00:00 UTC used by the boot-time off-peak existence
@@ -353,7 +353,7 @@ impl ModelProfileConfig {
         Ok(())
     }
 
-    /// Resolves the wire form carried on the slot binding (ADR-053).
+    /// Resolves the wire form carried on the slot binding (ADR-054).
     #[must_use]
     pub fn model_profile(&self) -> ModelProfile {
         ModelProfile {
@@ -503,7 +503,7 @@ impl PriceBook {
     }
 
     /// The next instant at or after `from_ms` outside every peak window
-    /// (ADR-059): `Some(from_ms)` when already off peak, else the first
+    /// (ADR-060): `Some(from_ms)` when already off peak, else the first
     /// off-peak minute boundary inside the scan horizon. `None` means the
     /// configured windows leave no off-peak minute in the horizon - the
     /// `defer:` section refuses boot in that case rather than defer
@@ -528,7 +528,7 @@ impl PriceBook {
     }
 
     /// True when at least one minute of a reference week is outside every
-    /// peak window, ignoring the holiday table (ADR-059 boot validation:
+    /// peak window, ignoring the holiday table (ADR-060 boot validation:
     /// holidays can only add off-peak minutes, never remove one).
     #[must_use]
     pub fn has_off_peak_minute(&self) -> bool {

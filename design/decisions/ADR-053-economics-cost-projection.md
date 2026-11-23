@@ -1,4 +1,4 @@
-# ADR-052: Economics as a projection — a config price book, not a priced event
+# ADR-053: Economics as a projection — a config price book, not a priced event
 
 - **Status**: accepted (owner direction 2026-11-22; phase 0 slice).
 - **Context**: the provider bill is dominated by two facts the event stream already observes but the

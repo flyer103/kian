@@ -1,13 +1,13 @@
-# ADR-062: Vision inputs as dialect-level content parts
+# ADR-063: Vision inputs as dialect-level content parts
 
 - Status: accepted (2026-11-23, P5c slice)
-- Related: ADR-053 (request plan, model profiles), ADR-055 (tool result
-  artifacts), ADR-060 (client-side media tools), ADR-061 (channel-edge
+- Related: ADR-054 (request plan, model profiles), ADR-056 (tool result
+  artifacts), ADR-061 (client-side media tools), ADR-062 (channel-edge
   media), DESIGN §3.2, SPEC §P5c
 
 ## Context
 
-`ModelProfile` has carried a `vision` flag since ADR-053, and the
+`ModelProfile` has carried a `vision` flag since ADR-054, and the
 `model_profiles:` section can declare it, but nothing consumes it: every
 user message becomes a plain `{role, content: <string>}` chat message, so
 a model that accepts images has never seen one. The P5 phase list ends
@@ -15,7 +15,7 @@ with vision for a reason: it is the only capability that changes the
 request dialect rather than adding a surface beside it.
 
 The pieces are already in place: the content-addressed artifact store
-(ADR-055) can hand bytes to a drain, the request plan (ADR-053) is the
+(ADR-056) can hand bytes to a drain, the request plan (ADR-054) is the
 single place that turns messages into the bytes both persisted and sent,
 and the loop is the single place that derives the model context from the
 event stream. What is missing is the wire shape and the gate.
@@ -59,7 +59,7 @@ event stream. What is missing is the wire shape and the gate.
    like any other request.
 7. **No new event kind, crate or provider code.** The shape lives in
    `kian-llm` (plan builder) and `kian-loop` (assembly); `kian-core` gains
-   one read accessor. The channel-edge media processor (ADR-061) keeps
+   one read accessor. The channel-edge media processor (ADR-062) keeps
    transcribing to text; vision is an explicit API/file path
    (`kian artifacts put` + `submit` with the content envelope).
 

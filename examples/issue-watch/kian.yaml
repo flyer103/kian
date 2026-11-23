@@ -58,11 +58,11 @@ superagent:
       type: github
       github:
         topics:
-          flyer103/kian: issues
+          flyer103/kian-runtime: issues
         webhook_receive: false
         send: true
         poll:
-          repo: flyer103/kian
+          repo: flyer103/kian-runtime
           interval_ms: 30000
           kinds: [issues, issue_comments]
           since_field: updated_at
