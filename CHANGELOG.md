@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Cron worktrees: nested `git` runs scrub the inherited repository environment.** A `kian`
+  started under a hook (or any wrapper exporting `GIT_DIR`/`GIT_WORK_TREE`) no longer points
+  worktree inspection, creation or cleanup at that checkout instead of the configured repo
+  (`cron_worktree::git_command`); the same scrub keeps the test suite from writing to the
+  repository it is pushing.
+
 - **iMessage attachment bytes: an authenticated bridge route serves image/audio items to the media edge
   (CHANNEL-IMESSAGE §3.2, ADR-064, P5b slice 2a).** `attachments: bytes` (default `metadata`, refused
   without a `media:` section) makes the adapter fetch each image/audio item with the page's

@@ -3313,7 +3313,7 @@ mod tests {
 
     fn init_repo(dir: &Path) {
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::cron_worktree::git_command()
                 .arg("-C")
                 .arg(dir)
                 .args(args)
