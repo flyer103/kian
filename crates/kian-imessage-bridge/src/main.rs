@@ -139,6 +139,7 @@ async fn run(config_path: &std::path::Path) -> Result<(), String> {
         config.poll_interval,
         config.catchup_rows,
         config.page_limit,
+        config.attachments,
     ));
     let listener = TcpListener::bind(config.listen)
         .await
@@ -170,7 +171,7 @@ async fn bootstrap_tail(backend: &ImsgRpc, cursor: &CursorStore) -> Result<u64, 
     let mut start = 1u64;
     for _ in 0..MAX_BOOTSTRAP_PAGES {
         let page = backend
-            .after(start, 500)
+            .after(start, 500, false)
             .await
             .map_err(|e| format!("cannot read the Messages history: {e}"))?;
         cursor.observe(page.next_rowid);

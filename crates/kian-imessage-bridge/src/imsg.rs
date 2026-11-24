@@ -131,6 +131,7 @@ pub trait Backend: Send + Sync + 'static {
         &self,
         since_rowid: u64,
         limit: u32,
+        with_attachments: bool,
     ) -> impl std::future::Future<Output = Result<AfterPage, RpcError>> + Send;
     fn send(
         &self,
@@ -369,14 +370,19 @@ impl Backend for ImsgRpc {
         })
     }
 
-    async fn after(&self, since_rowid: u64, limit: u32) -> Result<AfterPage, RpcError> {
+    async fn after(
+        &self,
+        since_rowid: u64,
+        limit: u32,
+        with_attachments: bool,
+    ) -> Result<AfterPage, RpcError> {
         let result = self
             .request(
                 "messages.after",
                 json!({
                     "since_rowid": since_rowid,
                     "limit": limit,
-                    "attachments": false,
+                    "attachments": with_attachments,
                     "include_reactions": false,
                 }),
             )

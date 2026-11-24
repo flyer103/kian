@@ -72,6 +72,11 @@ pub struct WatchConfig {
     /// Maximum rows a single `/v1/updates` response may carry.
     #[serde(default = "default_page_limit")]
     pub page_limit: u32,
+    /// Ask `imsg messages.after` for attachment metadata (`attachments:
+    /// true`). On by default; `"attachments": false` restores the
+    /// phase-1 text-only read without a rebuild.
+    #[serde(default = "default_watch_attachments")]
+    pub attachments: bool,
 }
 
 impl Default for WatchConfig {
@@ -81,6 +86,7 @@ impl Default for WatchConfig {
             poll_interval_ms: default_poll_interval_ms(),
             catchup_rows: default_catchup_rows(),
             page_limit: default_page_limit(),
+            attachments: default_watch_attachments(),
         }
     }
 }
@@ -93,6 +99,9 @@ fn default_catchup_rows() -> u32 {
 }
 fn default_page_limit() -> u32 {
     200
+}
+fn default_watch_attachments() -> bool {
+    true
 }
 
 /// A validated bridge config (paths expanded, token loaded, loopback
@@ -108,6 +117,8 @@ pub struct BridgeConfig {
     pub poll_interval: std::time::Duration,
     pub catchup_rows: u32,
     pub page_limit: u32,
+    /// `watch.attachments`: request attachment metadata per row.
+    pub attachments: bool,
 }
 
 #[derive(Debug, Error)]
@@ -186,6 +197,7 @@ impl BridgeConfig {
             poll_interval: std::time::Duration::from_millis(file.watch.poll_interval_ms),
             catchup_rows: file.watch.catchup_rows,
             page_limit: file.watch.page_limit,
+            attachments: file.watch.attachments,
         })
     }
 }

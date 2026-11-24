@@ -117,6 +117,8 @@ pub struct App<B: Backend> {
     poll_interval: Duration,
     catchup_rows: u32,
     page_limit: u32,
+    /// `watch.attachments`: ask `imsg` for attachment metadata.
+    attachments: bool,
     cache: Mutex<SendCache>,
     /// Sends are serialized (one at a time, §3.2): order is preserved and
     /// a duplicate `client_id` arriving mid-flight joins the first.
@@ -130,6 +132,7 @@ pub struct App<B: Backend> {
 
 impl<B: Backend> App<B> {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend: B,
         token: impl Into<String>,
@@ -138,6 +141,7 @@ impl<B: Backend> App<B> {
         poll_interval: Duration,
         catchup_rows: u32,
         page_limit: u32,
+        attachments: bool,
     ) -> Self {
         Self {
             backend: Arc::new(backend),
@@ -148,6 +152,7 @@ impl<B: Backend> App<B> {
             poll_interval,
             catchup_rows,
             page_limit,
+            attachments,
             cache: Mutex::new(SendCache::new()),
             send_lock: tokio::sync::Mutex::new(()),
             automation: Mutex::new("unknown".to_string()),
@@ -336,7 +341,7 @@ async fn updates<B: Backend>(
     let mut next_rowid = start;
     let mut has_more = false;
     for _ in 0..100 {
-        let page = match app.backend.after(start, limit).await {
+        let page = match app.backend.after(start, limit, app.attachments).await {
             Ok(page) => page,
             Err(error) => return rpc_error_response(&error),
         };
@@ -409,6 +414,8 @@ fn reduce_message(raw: &Value, participants: &[String]) -> Option<Value> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let created_at_ms = created_at.as_deref().and_then(parse_rfc3339_ms);
+    let attachments = project_attachments(rowid, raw.get("attachments"));
+    let text = text_with_attachment_markers(raw.get("text").and_then(Value::as_str), &attachments);
     Some(json!({
         "rowid": rowid,
         "guid": raw.get("guid").and_then(Value::as_str).unwrap_or(""),
@@ -416,7 +423,8 @@ fn reduce_message(raw: &Value, participants: &[String]) -> Option<Value> {
         "chat_guid": raw.get("chat_guid").cloned().unwrap_or(Value::Null),
         "chat_identifier": raw.get("chat_identifier").cloned().unwrap_or(Value::Null),
         "sender": raw.get("sender").cloned().unwrap_or(Value::Null),
-        "text": raw.get("text").cloned().unwrap_or(Value::Null),
+        "text": text.map(Value::String).unwrap_or(Value::Null),
+        "attachments": attachments,
         "created_at": created_at,
         "created_at_ms": created_at_ms,
         "service": raw.get("service").cloned().unwrap_or(Value::Null),
@@ -424,6 +432,82 @@ fn reduce_message(raw: &Value, participants: &[String]) -> Option<Value> {
         "is_group": raw.get("is_group").and_then(Value::as_bool).unwrap_or(false),
         "is_reaction": raw.get("is_reaction").and_then(Value::as_bool).unwrap_or(false),
     }))
+}
+
+/// What Messages writes into `text` for one item it could not put in
+/// words (an attachment, a sticker, a poll).
+const OBJECT_REPLACEMENT: char = '\u{FFFC}';
+
+/// The attachment fields the bridge lets off the Mac, and nothing else
+/// — `imsg` attachment objects also carry absolute paths and internal
+/// bookkeeping (CHANNEL-IMESSAGE §3.2: the bridge reduces, the adapter
+/// decides). `filename` is reduced to its basename for that reason; the
+/// reading side resolves bytes by `attachment_id` (`{rowid}:{index}`),
+/// never by a path the Mac exported.
+fn project_attachments(rowid: u64, raw: Option<&Value>) -> Vec<Value> {
+    let Some(items) = raw.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            json!({
+                "attachment_id": format!("{rowid}:{index}"),
+                "filename": item
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(basename)
+                    .map(Value::from)
+                    .unwrap_or(Value::Null),
+                "mime_type": item.get("mime_type").cloned().unwrap_or(Value::Null),
+                "transfer_name": item.get("transfer_name").cloned().unwrap_or(Value::Null),
+                "total_bytes": item.get("total_bytes").cloned().unwrap_or(Value::Null),
+                "is_sticker": item.get("is_sticker").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `/a/b/IMG_0001.heic` -> `IMG_0001.heic` (no directory layout leaves
+/// the Mac).
+fn basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Replaces every U+FFFC with `[image]`/`[attachment]` so a photo is not
+/// silently dropped downstream as "no text", and gives an
+/// attachment-only row (no `text` at all) the same honest marker.
+fn text_with_attachment_markers(text: Option<&str>, attachments: &[Value]) -> Option<String> {
+    match text {
+        Some(text) if text.contains(OBJECT_REPLACEMENT) => {
+            let mut index = 0usize;
+            let mut out = String::with_capacity(text.len() + 8);
+            for character in text.chars() {
+                if character == OBJECT_REPLACEMENT {
+                    out.push_str(attachment_marker(attachments.get(index)));
+                    index += 1;
+                } else {
+                    out.push(character);
+                }
+            }
+            Some(out)
+        }
+        Some(text) if text.trim().is_empty() && !attachments.is_empty() => {
+            Some(attachment_marker(attachments.first()).to_string())
+        }
+        Some(text) => Some(text.to_string()),
+        None if !attachments.is_empty() => Some(attachment_marker(attachments.first()).to_string()),
+        None => None,
+    }
+}
+
+fn attachment_marker(attachment: Option<&Value>) -> &'static str {
+    let is_image = attachment
+        .and_then(|item| item.get("mime_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.to_ascii_lowercase().starts_with("image/"));
+    if is_image { "[image]" } else { "[attachment]" }
 }
 
 fn parse_rfc3339_ms(text: &str) -> Option<u64> {
@@ -672,7 +756,12 @@ mod tests {
         async fn status(&self) -> Result<Status, RpcError> {
             self.status.lock().unwrap().clone()
         }
-        async fn after(&self, since_rowid: u64, _limit: u32) -> Result<AfterPage, RpcError> {
+        async fn after(
+            &self,
+            since_rowid: u64,
+            _limit: u32,
+            _with_attachments: bool,
+        ) -> Result<AfterPage, RpcError> {
             self.pages
                 .lock()
                 .unwrap()
@@ -714,6 +803,7 @@ mod tests {
             Duration::from_millis(1),
             10,
             100,
+            true,
         ))
     }
 
@@ -742,6 +832,75 @@ mod tests {
     async fn body(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn photo_message(rowid: u64, sender: &str) -> Value {
+        json!({
+            "id": rowid,
+            "guid": format!("G-{rowid}"),
+            "chat_id": 3,
+            "chat_guid": format!("iMessage;-;{sender}"),
+            "chat_identifier": sender,
+            "sender": sender,
+            "text": "\u{FFFC}",
+            "created_at": "2026-11-19T15:31:55Z",
+            "service": "iMessage",
+            "is_from_me": false,
+            "is_group": false,
+            "attachments": [{
+                "id": 7,
+                "filename": "/Users/someone/Library/Messages/Attachments/aa/bb/IMG_0001.heic",
+                "transfer_name": "IMG_0001.heic",
+                "mime_type": "image/heic",
+                "total_bytes": 2_345_678_u64,
+                "is_sticker": false,
+                "internal_hint": "must not leave the Mac",
+            }],
+        })
+    }
+
+    #[test]
+    fn attachments_are_projected_to_a_whitelist_without_paths() {
+        let reduced = reduce_message(&photo_message(41, "+8618521321872"), &[])
+            .expect("an attachment row is reduced, not dropped");
+        let attachments = reduced["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["attachment_id"], json!("41:0"));
+        assert_eq!(attachments[0]["filename"], json!("IMG_0001.heic"));
+        assert_eq!(attachments[0]["mime_type"], json!("image/heic"));
+        assert_eq!(attachments[0]["transfer_name"], json!("IMG_0001.heic"));
+        assert_eq!(attachments[0]["total_bytes"], json!(2_345_678_u64));
+        assert_eq!(attachments[0]["is_sticker"], json!(false));
+        let wire = reduced.to_string();
+        assert!(
+            !wire.contains("/Users/"),
+            "an absolute path left the Mac: {wire}"
+        );
+        assert!(
+            !wire.contains("internal_hint"),
+            "an unknown field left the Mac: {wire}"
+        );
+    }
+
+    #[test]
+    fn the_object_replacement_character_becomes_a_marker() {
+        let reduced = reduce_message(&photo_message(42, "+8618521321872"), &[]).unwrap();
+        assert_eq!(reduced["text"], json!("[image]"));
+        let mut raw = photo_message(43, "+8618521321872");
+        raw["text"] = json!("look \u{FFFC} at this \u{FFFC}");
+        raw["attachments"] = json!([
+            {"mime_type": "image/jpeg"},
+            {"mime_type": "application/pdf", "transfer_name": "a.pdf"},
+        ]);
+        let reduced = reduce_message(&raw, &[]).unwrap();
+        assert_eq!(reduced["text"], json!("look [image] at this [attachment]"));
+    }
+
+    #[test]
+    fn a_text_only_row_keeps_its_text_and_has_no_attachments() {
+        let reduced = reduce_message(&message(44, "+8618521321872"), &[]).unwrap();
+        assert_eq!(reduced["text"], json!("hi 44"));
+        assert_eq!(reduced["attachments"], json!([]));
     }
 
     #[tokio::test]
