@@ -127,6 +127,38 @@ impl ImessageService {
     }
 }
 
+/// `attachments: metadata | bytes` (ADR-064). `metadata` (the default)
+/// never calls `/v1/attachment`, so a payload is exactly the metadata
+/// projection; `bytes` fetches the row's image/audio items and hands the
+/// media edge the ADR-062 envelope, whose transcripts the edge appends to
+/// the admitted text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImessageAttachments {
+    #[default]
+    Metadata,
+    Bytes,
+}
+
+impl ImessageAttachments {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImessageAttachments::Metadata => "metadata",
+            ImessageAttachments::Bytes => "bytes",
+        }
+    }
+}
+
+/// How many attachments of one row the adapter hands the media edge.
+pub const MAX_MEDIA_ITEMS_PER_ROW: usize = 4;
+
+/// The largest single attachment the adapter fetches (the bridge's own
+/// default cap; a bigger item is skipped before the request).
+pub const MAX_MEDIA_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// One `/v1/attachment` deadline.
+pub const ATTACHMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Honest construction/config failures (fail-closed: a bad imessage
 /// config refuses to start, never silently degrades).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -187,6 +219,8 @@ pub struct ImessageConfig {
     pub send_timeout: Duration,
     /// Defensive split point for outbound text.
     pub max_send_chars: usize,
+    /// `attachments: metadata | bytes` (ADR-064).
+    pub attachments: ImessageAttachments,
 }
 
 impl ImessageConfig {
@@ -206,6 +240,7 @@ impl ImessageConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             send_timeout: DEFAULT_SEND_TIMEOUT,
             max_send_chars: SEND_SPLIT_CHARS,
+            attachments: ImessageAttachments::Metadata,
         }
     }
 
@@ -456,7 +491,11 @@ impl ImessageChannel {
                             continue;
                         }
                         match map_message(&inner.name, &inner.config.topics, message, received_at) {
-                            Mapping::Event(event) => {
+                            Mapping::Event(mut event) => {
+                                if inner.config.attachments == ImessageAttachments::Bytes {
+                                    attach_media(&inner, message, &batch.generation, &mut event)
+                                        .await;
+                                }
                                 cache_chat_guid(&inner, message);
                                 if seen.insert(event.event_id.clone()) {
                                     fan_out(&inner, event);
@@ -899,6 +938,9 @@ fn disposition_error(inner: &Inner, error: BridgeError) -> ChannelError {
         BridgeError::Unreachable(detail) => {
             ChannelError::Unavailable(format!("imessage bridge unreachable: {detail}"))
         }
+        BridgeError::AttachmentUnavailable(detail) => {
+            ChannelError::Unavailable(format!("imessage attachment unavailable ({detail})"))
+        }
         BridgeError::Timeout => ChannelError::Timeout,
         BridgeError::Malformed(detail) => {
             // The response could not be read after dispatch: the
@@ -984,6 +1026,89 @@ pub fn split_text(text: &str, limit_chars: usize) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Shared plumbing (the wechat pattern)
 // ---------------------------------------------------------------------------
+
+/// ADR-064: hand the media edge the ADR-062 `media` envelope for the
+/// row's image/audio items. Every failure is one audit line for one
+/// item — the row is still admitted with its metadata, never dropped and
+/// never given a fabricated transcript.
+async fn attach_media(
+    inner: &Inner,
+    message: &BridgeMessage,
+    generation: &str,
+    event: &mut ChannelEvent,
+) {
+    let mut items = Vec::new();
+    for attachment in message
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.media_kind().is_some())
+        .take(MAX_MEDIA_ITEMS_PER_ROW)
+    {
+        let Some(id) = attachment.attachment_id.as_deref() else {
+            continue;
+        };
+        let kind = attachment.media_kind().unwrap_or("image");
+        if attachment.total_bytes.unwrap_or(0) > MAX_MEDIA_ATTACHMENT_BYTES {
+            warn!(
+                target: "kian::imessage_channel",
+                channel = %inner.name,
+                attachment_id = %id,
+                total_bytes = attachment.total_bytes.unwrap_or(0),
+                "imessage audit: attachment skipped before the fetch (over the adapter's bound)"
+            );
+            continue;
+        }
+        match inner
+            .client
+            .attachment(id, generation, ATTACHMENT_FETCH_TIMEOUT)
+            .await
+        {
+            Ok(bytes) => items.push(json!({
+                "kind": kind,
+                "media_type": bytes.media_type,
+                "base64": base64_encode(&bytes.bytes),
+            })),
+            Err(error) => warn!(
+                target: "kian::imessage_channel",
+                channel = %inner.name,
+                attachment_id = %id,
+                kind = kind,
+                error = %error,
+                "imessage audit: attachment fetch failed; the row keeps its metadata"
+            ),
+        }
+    }
+    if !items.is_empty()
+        && let Some(payload) = event.payload.as_object_mut()
+    {
+        payload.insert("media".into(), Value::Array(items));
+    }
+}
+
+/// Base64 for the ADR-062 envelope (`kian-media`'s `base64_decode` reads
+/// it on the edge; the adapter never touches bytes otherwise).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
 
 /// Fans one event out to every live subscriber (bounded `try_send`; a
 /// full queue drops that subscriber's copy with an audit line — a slow
@@ -1345,6 +1470,16 @@ mod tests {
             ImessageService::parse("x"),
             Err(ImessageError::BadService(_))
         ));
+    }
+
+    #[test]
+    fn base64_encodes_the_edge_envelope_bytes() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"heic-bytes"), "aGVpYy1ieXRlcw==");
+        assert_eq!(base64_encode(&[0xff, 0x00, 0x7f]), "/wB/");
     }
 
     #[test]

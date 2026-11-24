@@ -235,6 +235,30 @@ pub struct SendErr {
     pub retry_safe: bool,
 }
 
+impl BridgeAttachment {
+    /// The ADR-062 kind this item can produce base64 for, or `None` when
+    /// the media edge has no tool for it (a sticker, a PDF, a video).
+    #[must_use]
+    pub fn media_kind(&self) -> Option<&'static str> {
+        if self.is_sticker {
+            return None;
+        }
+        match self.mime_type.as_deref() {
+            Some(mime) if mime.starts_with("image/") => Some("image"),
+            Some(mime) if mime.starts_with("audio/") => Some("audio"),
+            _ => None,
+        }
+    }
+}
+
+/// One `/v1/attachment` success: the item's bytes and the media type the
+/// bridge read from `imsg`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentBytes {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Why a bridge call failed — pre-aligned with the seam's closed
 /// vocabulary so classification never parses strings.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -256,6 +280,11 @@ pub enum BridgeError {
         detail: String,
         retry_safe: bool,
     },
+    /// `/v1/attachment` refused this item for a permanent reason: the id
+    /// is unknown (`404`), the page's generation is stale (`409`) or the
+    /// file exceeds `watch.max_attachment_bytes` (`413`).
+    #[error("imessage bridge cannot serve that attachment: {0}")]
+    AttachmentUnavailable(String),
     #[error("imessage bridge response malformed: {0}")]
     Malformed(String),
 }
@@ -329,6 +358,69 @@ impl BridgeClient {
             )));
         }
         Ok(batch)
+    }
+
+    /// `GET /v1/attachment` — the bytes of one item a page named
+    /// (CHANNEL-IMESSAGE §3.2, ADR-064). Always called with the
+    /// generation the id came from: a replaced `chat.db` must be a
+    /// `409`, never a plausible wrong file.
+    pub async fn attachment(
+        &self,
+        attachment_id: &str,
+        generation: &str,
+        timeout: Duration,
+    ) -> Result<AttachmentBytes, BridgeError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/attachment", self.base))
+            .query(&[("attachment_id", attachment_id), ("generation", generation)])
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(map_reqwest)?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(BridgeError::Unauthorized);
+        }
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Err(BridgeError::DatabaseUnreadable(
+                error_detail(response).await,
+            ));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(BridgeError::AttachmentUnavailable(
+                "unknown attachment id or outside watch.participants".into(),
+            ));
+        }
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(BridgeError::AttachmentUnavailable(
+                "stale chat.db generation (re-read /v1/updates)".into(),
+            ));
+        }
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(BridgeError::AttachmentUnavailable(
+                "over watch.max_attachment_bytes".into(),
+            ));
+        }
+        if !status.is_success() {
+            return Err(BridgeError::Unreachable(format!(
+                "bridge answered HTTP {status}"
+            )));
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| BridgeError::Malformed(e.to_string()))?
+            .to_vec();
+        Ok(AttachmentBytes { media_type, bytes })
     }
 
     /// `POST /v1/send` — one text message.
@@ -500,6 +592,28 @@ mod tests {
         assert_eq!(attachment.transfer_name.as_deref(), Some("IMG_0001.heic"));
         assert_eq!(attachment.total_bytes, Some(2_345_678));
         assert!(!attachment.is_sticker);
+    }
+
+    #[test]
+    fn only_image_and_audio_items_are_eligible_for_the_envelope() {
+        let item = |mime: Option<&str>, is_sticker: bool| BridgeAttachment {
+            attachment_id: Some("1:0".into()),
+            filename: None,
+            mime_type: mime.map(str::to_string),
+            transfer_name: None,
+            total_bytes: None,
+            is_sticker,
+        };
+        assert_eq!(item(Some("image/heic"), false).media_kind(), Some("image"));
+        assert_eq!(item(Some("audio/x-caf"), false).media_kind(), Some("audio"));
+        assert_eq!(item(Some("video/mp4"), false).media_kind(), None);
+        assert_eq!(item(Some("application/pdf"), false).media_kind(), None);
+        assert_eq!(
+            item(Some("image/png"), true).media_kind(),
+            None,
+            "a sticker is decorative: it never costs a provider call"
+        );
+        assert_eq!(item(None, false).media_kind(), None);
     }
 
     #[test]

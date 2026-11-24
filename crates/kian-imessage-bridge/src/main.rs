@@ -140,6 +140,7 @@ async fn run(config_path: &std::path::Path) -> Result<(), String> {
         config.catchup_rows,
         config.page_limit,
         config.attachments,
+        config.max_attachment_bytes,
     ));
     let listener = TcpListener::bind(config.listen)
         .await

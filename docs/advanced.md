@@ -164,6 +164,7 @@ superagent:
       imessage:
         bridge_url: "http://127.0.0.1:7420"          # the Mac bridge, over an SSH -R / mesh VPN
         topics: { "+14155551212": "imessage" }       # handle → topic; both allowlists
+        attachments: metadata                         # metadata (default) | bytes (needs media:)
 ```
 
 `type: wechat` is **best-effort by contract**: one long-poll loop per channel over Tencent's
@@ -176,8 +177,10 @@ changes ([design/CHANNEL-WECHAT.md](../design/CHANNEL-WECHAT.md)).
 `kian-imessage-bridge` (Full Disk Access + Automation → Messages, `imsg` ≥ 0.14), because iMessage
 has no API — the message must land on that Mac's `chat.db`. The adapter long-polls the bridge's loopback ABI;
 the bridge's `participants` list keeps non-allowlisted conversations from leaving the Mac. An inbound
-attachment arrives as `[image]`/`[attachment]` marker text plus its name, MIME type and size in the payload;
-its bytes stay on the Mac.
+attachment arrives as `[image]`/`[attachment]` marker text plus its name, MIME type and size in the payload.
+With `attachments: bytes` (which needs a `media:` section) the adapter also fetches image and audio items
+through the bridge and hands them to the media edge, so their transcripts join the text; the bytes
+never enter the event log ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)).
 `kian imessage check` is the read-only preflight
 ([design/CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md),
 [docs/runbook-imessage.md](../docs/runbook-imessage.md)).
@@ -1052,10 +1055,12 @@ envelope an adapter sends is:
 After the edge the admitted payload holds no base64 — the item becomes an artifact reference plus its
 transcript, and the text gains a marker line (`[image transcript] ...`, `[voice message transcript]
 ...`). An item that fails (bad base64, provider error, oversize input) carries an `error` string and the
-message is still admitted; a payload without `media` passes through untouched. No shipped adapter emits
-this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge exports no
-attachment bytes, so this is
-the contract those channel phases implement (a mock channel can carry it today). Outbound audio is not
+message is still admitted; a payload without `media` passes through untouched. The iMessage channel
+emits this envelope when `attachments: bytes` and a `media:` section are configured, fetching each
+image/audio item through the bridge
+([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)); WeChat media lives on a separate
+CDN and stays that channel's phase 2, so for it this remains only the contract (a mock channel can
+carry it today). Outbound audio is not
 wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
 Semantics: [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
 

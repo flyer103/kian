@@ -158,8 +158,8 @@ pub use github::{
 pub use imessage::{
     BRIDGE_TOKEN_ENV as IMESSAGE_BRIDGE_TOKEN_ENV,
     DEFAULT_POLL_TIMEOUT as IMESSAGE_DEFAULT_POLL_TIMEOUT, ECHO_RING_CAPACITY,
-    IMESSAGE_CHANNEL_TYPE, ImessageChannel, ImessageConfig, ImessageDrop, ImessageError,
-    ImessageService, SEND_SPLIT_CHARS as IMESSAGE_SEND_SPLIT_CHARS,
+    IMESSAGE_CHANNEL_TYPE, ImessageAttachments, ImessageChannel, ImessageConfig, ImessageDrop,
+    ImessageError, ImessageService, SEND_SPLIT_CHARS as IMESSAGE_SEND_SPLIT_CHARS,
     SUBSCRIBER_CAPACITY as IMESSAGE_SUBSCRIBER_CAPACITY, delivery_client_id, is_http_base,
     map_message as imessage_map_message, message_to_event as imessage_message_to_event,
     split_text as imessage_split_text,

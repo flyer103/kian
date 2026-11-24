@@ -111,7 +111,8 @@ openssl rand -hex 32 > ~/.config/kian/imessage-bridge.token
     "poll_interval_ms": 250,
     "catchup_rows": 200,
     "page_limit": 200,
-    "attachments": true
+    "attachments": true,
+    "max_attachment_bytes": 16777216
   }
 }
 ```
@@ -126,6 +127,15 @@ whitelist of it — basename, MIME type, size, sticker flag — never a path and
 adapter then carries that whitelist in the channel payload, so the model sees what arrived even though
 it cannot open it. `false` stops the bridge from reading attachment rows at all; text-only conversations
 are unaffected either way.
+
+To let the model read an attachment's content as text, set `attachments: bytes` on the kian channel and
+configure a `media:` section (ADR-064). The adapter then calls the bridge's `GET /v1/attachment` for each
+image and audio item; the bridge reads the file itself (the path never leaves the Mac), refuses a fetch
+whose `generation` no longer matches (`409`) and one over `watch.max_attachment_bytes` (default 16 MiB,
+`413`), and the media edge turns the bytes into an OCR/ASR transcript appended to the message text. The
+base64 exists only between the two processes — it is never admitted, so it never enters the event log or
+a prompt. A failed fetch keeps the attachment's metadata and admits the row unchanged. `attachments:
+metadata` (the default) never calls the route.
 
 LaunchAgent `~/Library/LaunchAgents/com.kian.imessage-bridge.plist`:
 

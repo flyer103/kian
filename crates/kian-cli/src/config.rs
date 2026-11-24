@@ -2937,6 +2937,22 @@ pub struct ImessageChannelSection {
     /// Defensive split point for outbound text.
     #[serde(default = "default_imessage_max_send_chars")]
     pub max_send_chars: usize,
+    /// Attachment handling: `metadata` (the default) projects
+    /// name/type/size only and never calls the bridge's bytes route;
+    /// `bytes` also fetches image/audio items so the media edge can
+    /// turn them into transcripts, and requires a `media:` section
+    /// (ADR-064).
+    #[serde(default)]
+    pub attachments: AttachmentMode,
+}
+
+/// `attachments: metadata | bytes` (ADR-064).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentMode {
+    #[default]
+    Metadata,
+    Bytes,
 }
 
 fn default_imessage_service() -> String {
@@ -2988,6 +3004,10 @@ impl ImessageChannelSection {
         config.wait = std::time::Duration::from_millis(self.wait_ms);
         config.send_timeout = std::time::Duration::from_millis(self.send_timeout_ms);
         config.max_send_chars = self.max_send_chars;
+        config.attachments = match self.attachments {
+            AttachmentMode::Metadata => kian_superagent::ImessageAttachments::Metadata,
+            AttachmentMode::Bytes => kian_superagent::ImessageAttachments::Bytes,
+        };
         config
             .validate()
             .map_err(|e| invalid(format!("superagent.channels `{name}` (type imessage): {e}")))
@@ -4855,6 +4875,14 @@ impl ServeConfig {
                             return Err(invalid(format!(
                                 "superagent.channels `{name}`.imessage.max_send_chars must be \
                                  at least 100"
+                            )));
+                        }
+                        if section.attachments == AttachmentMode::Bytes && self.media.is_none() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.attachments is `bytes` \
+                                 but the config has no `media:` section: the fetched bytes have \
+                                 no edge to consume them and would reach the model as text — \
+                                 add `media:` (with `artifacts:`) or use `attachments: metadata`"
                             )));
                         }
                     }
@@ -8644,6 +8672,42 @@ recovery:
             .expect("converts");
         assert_eq!(runtime.service, kian_superagent::ImessageService::Imessage);
         assert_eq!(runtime.max_send_chars, 500);
+    }
+
+    #[test]
+    fn imessage_attachment_bytes_refuse_without_a_media_section() {
+        let section = IMESSAGE_SECTION.replace(
+            "        topics:\n",
+            "        attachments: bytes\n        topics:\n",
+        );
+        let err = ServeConfig::parse(&imessage_yaml(&section))
+            .expect_err("bytes without a media: section refuses startup")
+            .to_string();
+        assert!(err.contains("attachments is `bytes`"), "{err}");
+        assert!(err.contains("`media:`"), "{err}");
+    }
+
+    #[test]
+    fn imessage_attachment_bytes_convert_when_media_is_configured() {
+        let section = IMESSAGE_SECTION.replace(
+            "        topics:\n",
+            "        attachments: bytes\n        topics:\n",
+        );
+        let yaml = format!(
+            "artifacts:\n  dir: /tmp/kian-test-artifacts\nmedia:\n  base_url: http://127.0.0.1:9\n{}",
+            imessage_yaml(&section)
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("bytes with media: parse");
+        let runtime = cfg.superagent.as_ref().unwrap().channels["imessage"]
+            .imessage
+            .as_ref()
+            .unwrap()
+            .to_runtime("imessage", Some("fake-bridge-token-0123456789".to_string()))
+            .expect("converts");
+        assert_eq!(
+            runtime.attachments,
+            kian_superagent::ImessageAttachments::Bytes
+        );
     }
 
     #[test]
