@@ -1167,6 +1167,34 @@ fn truncate(mut text: String, max: usize) -> String {
     text
 }
 
+/// The environment variables git reads the target repository from. Git takes
+/// them over `-C`, so a `kian` started under a hook — which exports `GIT_DIR`
+/// and friends — would otherwise inspect, create and clean up worktrees in
+/// that checkout instead of the repository it was asked about.
+const GIT_REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+];
+
+/// One `git` command with the inherited repository environment scrubbed. Every
+/// spawn in this crate goes through here.
+pub(crate) fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for key in GIT_REPOSITORY_ENV {
+        command.env_remove(key);
+    }
+    command
+}
+
 /// A `git` invocation against `repo`, `-C`-rooted so it works for the primary
 /// checkout and for a worktree alike. stderr is returned verbatim on failure —
 /// §6.5 wants it captured on the firing.
@@ -1174,7 +1202,7 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     if args.is_empty() {
         return Err("empty git invocation".to_owned());
     }
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -1256,6 +1284,21 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn git_spawns_scrub_the_inherited_repository_environment() {
+        let scrubbed: Vec<String> = git_command()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in GIT_REPOSITORY_ENV {
+            assert!(
+                scrubbed.iter().any(|scrubbed| scrubbed == key),
+                "{key} is not scrubbed: {scrubbed:?}"
+            );
+        }
+    }
 
     struct TempDir(PathBuf);
 

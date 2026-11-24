@@ -63,6 +63,11 @@ the WHAT, `design/DESIGN.md` the HOW, `design/decisions/ADR-NNN-*.md` the WHY (a
   it. Do not reintroduce an archive directory for third-party pages or internal docs.
 - **macOS system proxy intercepts localhost** (inherited vadis lesson): any local end-to-end test
   involving `kian serve` + a client needs `NO_PROXY=127.0.0.1,localhost`.
+- **A nested `git` inherits the caller's repository.** Git runs the pre-push hook with `GIT_DIR`
+  exported, and git takes that over `-C`: a test or helper spawning `git` in a temp dir then writes
+  to the real checkout (it once re-initialized the repo as bare and committed over the pushed
+  branch). Every spawn in `kian-cli` goes through `cron_worktree::git_command()`, which scrubs
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` and the object/store overrides.
 - **Tool schemas are part of the prompt prefix.** Changing tool-schema ordering/format in
   serialization invalidates provider prefix cache across a whole session — treat serialization
   format as stable content, gated like constraint 3.
