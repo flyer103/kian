@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/flyer103/kian-runtime"
@@ -72,33 +72,33 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 
 # Internal crates (DESIGN §7 as landed).
-kian-core = { version = "0.2.0", path = "crates/kian-core" }
-kian-store = { version = "0.2.0", path = "crates/kian-store" }
-kian-orchestrator = { version = "0.2.0", path = "crates/kian-orchestrator" }
-kian-llm = { version = "0.2.0", path = "crates/kian-llm" }
-kian-loop = { version = "0.2.0", path = "crates/kian-loop" }
+kian-core = { version = "0.3.0", path = "crates/kian-core" }
+kian-store = { version = "0.3.0", path = "crates/kian-store" }
+kian-orchestrator = { version = "0.3.0", path = "crates/kian-orchestrator" }
+kian-llm = { version = "0.3.0", path = "crates/kian-llm" }
+kian-loop = { version = "0.3.0", path = "crates/kian-loop" }
 # the memory bundle (MEMORY-MODEL Phase 1): kian-core + orchestrator + loop only.
-kian-memory = { version = "0.2.0", path = "crates/kian-memory" }
-kian-endpoint = { version = "0.2.0", path = "crates/kian-endpoint" }
-kian-exec = { version = "0.2.0", path = "crates/kian-exec" }
-kian-plugin = { version = "0.2.0", path = "crates/kian-plugin" }
-kian-superagent = { version = "0.2.0", path = "crates/kian-superagent" }
+kian-memory = { version = "0.3.0", path = "crates/kian-memory" }
+kian-endpoint = { version = "0.3.0", path = "crates/kian-endpoint" }
+kian-exec = { version = "0.3.0", path = "crates/kian-exec" }
+kian-plugin = { version = "0.3.0", path = "crates/kian-plugin" }
+kian-superagent = { version = "0.3.0", path = "crates/kian-superagent" }
 # Wire-only SDK: its own pinned version, never a kian dependency inside.
-kian-sdk = { version = "0.2.0", path = "crates/kian-sdk" }
+kian-sdk = { version = "0.3.0", path = "crates/kian-sdk" }
 # the dsh bridge — depends on kian-core only (narrow waist).
-kian-dsh = { version = "0.2.0", path = "crates/kian-dsh" }
-kian-harness = { version = "0.2.0", path = "crates/kian-harness" }
-kian-claude = { version = "0.2.0", path = "crates/kian-claude" }
-kian-codex = { version = "0.2.0", path = "crates/kian-codex" }
+kian-dsh = { version = "0.3.0", path = "crates/kian-dsh" }
+kian-harness = { version = "0.3.0", path = "crates/kian-harness" }
+kian-claude = { version = "0.3.0", path = "crates/kian-claude" }
+kian-codex = { version = "0.3.0", path = "crates/kian-codex" }
 # the cron scheduling core (CRON-MODEL §2, §5) — pure: no I/O, no clock.
-kian-cron = { version = "0.2.0", path = "crates/kian-cron" }
+kian-cron = { version = "0.3.0", path = "crates/kian-cron" }
 # the client-side web tools bundle (ADR-057): DeepSeek Search/Fetch as
 # audited ToolProvider tools, never a core capability.
-kian-web = { version = "0.2.0", path = "crates/kian-web" }
+kian-web = { version = "0.3.0", path = "crates/kian-web" }
 # the client-side media tools bundle (ADR-061): OCR / ASR / TTS as
 # audited ToolProvider tools over the artifact store, never a core capability.
-kian-media = { version = "0.2.0", path = "crates/kian-media" }
-kian-cli = { version = "0.2.0", path = "crates/kian-cli" }
-kiand = { version = "0.2.0", path = "crates/kiand" }
+kian-media = { version = "0.3.0", path = "crates/kian-media" }
+kian-cli = { version = "0.3.0", path = "crates/kian-cli" }
+kiand = { version = "0.3.0", path = "crates/kiand" }
 [profile.release]
 lto = "thin"
