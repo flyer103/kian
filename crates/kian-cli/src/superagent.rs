@@ -1873,7 +1873,7 @@ pub fn spawn_subscription_consumers(
                     // admitted. Absent = the event is untouched.
                     let event = match edge.as_ref() {
                         Some(edge) => edge.prepare(event).await,
-                        None => event,
+                        None => strip_unconsumed_media(event),
                     };
                     match service.handle_event(event).await {
                         Ok(outcome) => {
@@ -1890,6 +1890,36 @@ pub fn spawn_subscription_consumers(
             })
         })
         .collect()
+}
+
+/// Defense in depth for ADR-062/ADR-064: an adapter can emit a `media`
+/// envelope this assembly cannot consume (no `media:` section, so no
+/// edge is mounted). The bytes must never ride into a prompt as text, so
+/// the pump strips the key and records the omission in the text instead
+/// of admitting base64 it could never read.
+fn strip_unconsumed_media(
+    mut event: kian_core::seams::ChannelEvent,
+) -> kian_core::seams::ChannelEvent {
+    let Some(payload) = event.payload.as_object_mut() else {
+        return event;
+    };
+    let Some(items) = payload.remove("media") else {
+        return event;
+    };
+    let dropped = items.as_array().map_or(0, Vec::len);
+    let note = format!("[media not processed: {dropped} attachment(s) omitted]");
+    let text = payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let text = if text.is_empty() {
+        note
+    } else {
+        format!("{text}\n{note}")
+    };
+    payload.insert("text".into(), serde_json::Value::String(text));
+    event
 }
 
 // ---------------------------------------------------------------------------
@@ -2838,6 +2868,31 @@ pub fn clone_gate(gate: &EvidenceGateConfig) -> EvidenceGateConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconsumable_media_envelope_is_stripped_before_admission() {
+        let event = |payload: serde_json::Value| kian_core::seams::ChannelEvent {
+            channel: "imessage".into(),
+            event_id: "G-1".into(),
+            topic: Some("imessage".into()),
+            sender: None,
+            group: None,
+            payload,
+            ts_ms: 1,
+        };
+        let stripped = strip_unconsumed_media(event(serde_json::json!({
+            "text": "look at this [image]",
+            "media": [{"kind": "image", "media_type": "image/heic", "base64": "aGVpYw=="}],
+        })));
+        assert!(stripped.payload.get("media").is_none());
+        assert_eq!(
+            stripped.payload["text"],
+            "look at this [image]\n[media not processed: 1 attachment(s) omitted]"
+        );
+
+        let untouched = strip_unconsumed_media(event(serde_json::json!({"text": "hi"})));
+        assert_eq!(untouched.payload, serde_json::json!({"text": "hi"}));
+    }
 
     #[tokio::test]
     async fn combined_tools_dedupe_first_wins_and_route_by_name() {

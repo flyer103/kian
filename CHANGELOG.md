@@ -8,12 +8,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage attachment bytes: an authenticated bridge route serves image/audio items to the media edge
+  (CHANNEL-IMESSAGE §3.2, ADR-064, P5b slice 2a).** `attachments: bytes` (default `metadata`, refused
+  without a `media:` section) makes the adapter fetch each image/audio item with the page's
+  `generation` and hand the ADR-062 envelope to the edge, so the model reads an OCR/ASR transcript
+  instead of a bare `[image]` marker. A generation mismatch is `409` (the id embeds a rebasing rowid,
+  so serving the current occupant would be plausibly wrong), `watch.max_attachment_bytes` (default
+  16 MiB) bounds one file, and a failed fetch keeps the metadata and admits the row. Base64 never
+  persists; vision of pixels stays out (ADR-063).
+
 - **iMessage attachments: inbound metadata reaches the model instead of being silently dropped
   (CHANNEL-IMESSAGE §2.5, §3.2, §4).** The adapter now models the bridge's `attachments` whitelist and
   maps it into the channel payload as `filename`, `mime_type`, `total_bytes` and `is_sticker` (the key
   is absent on a row without attachments, so a text-only payload keeps its exact bytes); a photo, voice
   note or file therefore arrives as `[image]`/`[attachment]` marker text plus what arrived, not as a
-  bare marker. The bytes are still phase 2, and `watch.attachments` (default on) documents the knob.
+  bare marker. `watch.attachments` (default on) documents the knob; the bytes themselves are the
+  next entry.
   One checked-in ABI row is asserted by both the bridge's emitter and the adapter's parser, so a field
   renamed on one side fails a test rather than vanishing from the model's view.
 

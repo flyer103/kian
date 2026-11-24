@@ -49,6 +49,9 @@ async fn wait_until<F: FnMut() -> bool>(mut cond: F, ms: u64) {
 // The scripted bridge mock.
 // ---------------------------------------------------------------------------
 
+/// Scripted `/v1/attachment` body per id: status, content type, bytes.
+type AttachmentReplies = Arc<Mutex<BTreeMap<String, (StatusCode, String, Vec<u8>)>>>;
+
 #[derive(Clone)]
 struct BridgeMock {
     /// Scripted `/v1/updates` bodies (200), served in order; the default
@@ -71,6 +74,11 @@ struct BridgeMock {
     /// Health body override (the CLI preflight leg is unit-tested in
     /// kian-cli; the mock keeps a minimal one for completeness).
     health: Arc<Mutex<Value>>,
+    /// Scripted `/v1/attachment` entries by attachment id: the status,
+    /// content type and body the route answers (ADR-064).
+    attachments: AttachmentReplies,
+    /// Every captured `/v1/attachment` query string.
+    attachment_queries: Arc<Mutex<Vec<String>>>,
 }
 
 impl BridgeMock {
@@ -93,6 +101,8 @@ impl BridgeMock {
                 "watch": {"active": true, "last_rowid": 0, "buffered": 0, "participants": []},
                 "counters": {}
             }))),
+            attachments: Arc::new(Mutex::new(BTreeMap::new())),
+            attachment_queries: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -120,11 +130,30 @@ impl BridgeMock {
         self.update_queries.lock().unwrap().clone()
     }
 
+    fn push_attachment(&self, id: &str, content_type: &str, bytes: &[u8]) {
+        self.attachments.lock().unwrap().insert(
+            id.into(),
+            (StatusCode::OK, content_type.into(), bytes.to_vec()),
+        );
+    }
+
+    fn push_attachment_status(&self, id: &str, status: StatusCode) {
+        self.attachments
+            .lock()
+            .unwrap()
+            .insert(id.into(), (status, "application/json".into(), Vec::new()));
+    }
+
+    fn attachment_queries(&self) -> Vec<String> {
+        self.attachment_queries.lock().unwrap().clone()
+    }
+
     async fn serve(self: &Arc<Self>) -> String {
         let app = axum::Router::new()
             .route("/v1/updates", axum::routing::get(updates_endpoint))
             .route("/v1/send", axum::routing::post(send_endpoint))
             .route("/v1/health", axum::routing::get(health_endpoint))
+            .route("/v1/attachment", axum::routing::get(attachment_endpoint))
             .with_state(Arc::clone(self));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -196,6 +225,45 @@ async fn send_endpoint(
                "rowid": 900, "service": "iMessage", "verified": true, "deduplicated": false}),
     ));
     (scripted.0, Json(scripted.1)).into_response()
+}
+
+async fn attachment_endpoint(
+    State(state): State<Arc<BridgeMock>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    if !check_auth(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"ok": false}))).into_response();
+    }
+    let encoded = query
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    state.attachment_queries.lock().unwrap().push(encoded);
+    let id = query.get("attachment_id").cloned().unwrap_or_default();
+    let entry = state.attachments.lock().unwrap().get(&id).cloned();
+    match entry {
+        Some((StatusCode::OK, content_type, bytes)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            bytes,
+        )
+            .into_response(),
+        Some((status, _, _)) => {
+            let kind = match status {
+                StatusCode::CONFLICT => "stale_generation",
+                StatusCode::PAYLOAD_TOO_LARGE => "too_large",
+                _ => "bridge_unavailable",
+            };
+            (status, Json(json!({"ok": false, "kind": kind}))).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "kind": "not_found"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn health_endpoint(
@@ -347,6 +415,99 @@ async fn the_shared_abi_row_arrives_with_its_attachment_metadata() {
     assert_eq!(event.topic.as_deref(), Some("imessage"));
     assert_eq!(event.ts_ms, 1_795_102_315_000);
     assert_eq!(event.payload["text"], "look at this [image]");
+    assert_eq!(
+        event.payload["attachments"],
+        json!([{
+            "filename": "IMG_0001.heic",
+            "mime_type": "image/heic",
+            "total_bytes": 2_345_678u64,
+            "is_sticker": false,
+        }])
+    );
+    adapter.shutdown();
+}
+
+fn attachment_config(
+    bridge_url: String,
+    attachments: kian_superagent::ImessageAttachments,
+) -> ImessageConfig {
+    let mut config = config(bridge_url);
+    config.attachments = attachments;
+    config
+}
+
+#[tokio::test]
+async fn bytes_mode_hands_the_media_edge_an_envelope() {
+    let row: Value = serde_json::from_str(
+        &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),
+    )
+    .expect("the fixture is JSON");
+    let rowid = row["rowid"].as_u64().expect("a row carries its rowid");
+    let mock = BridgeMock::new();
+    mock.push_attachment("48211:0", "image/heic", b"heic-bytes");
+    mock.push_updates(updates_page(vec![row], rowid));
+    let url = mock.serve().await;
+    let adapter = ImessageChannel::new(
+        "imessage",
+        attachment_config(url, kian_superagent::ImessageAttachments::Bytes),
+    )
+    .expect("channel builds");
+    let mut stream = adapter.subscribe().boxed();
+    let event = next_event(&mut stream).await;
+    assert_eq!(
+        event.payload["media"],
+        json!([{
+            "kind": "image",
+            "media_type": "image/heic",
+            "base64": "aGVpYy1ieXRlcw==",
+        }])
+    );
+    assert!(event.payload["attachments"].is_array());
+    let queries = mock.attachment_queries();
+    assert_eq!(queries.len(), 1, "{queries:?}");
+    assert!(queries[0].contains("attachment_id=48211:0"), "{queries:?}");
+    assert!(queries[0].contains("generation=g-1"), "{queries:?}");
+    adapter.shutdown();
+}
+
+#[tokio::test]
+async fn metadata_mode_never_asks_for_bytes() {
+    let row: Value = serde_json::from_str(
+        &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),
+    )
+    .expect("the fixture is JSON");
+    let rowid = row["rowid"].as_u64().expect("a row carries its rowid");
+    let mock = BridgeMock::new();
+    mock.push_attachment("48211:0", "image/heic", b"heic-bytes");
+    mock.push_updates(updates_page(vec![row], rowid));
+    let adapter = channel(&mock).await;
+    let mut stream = adapter.subscribe().boxed();
+    let event = next_event(&mut stream).await;
+    assert!(event.payload.get("media").is_none());
+    assert!(event.payload["attachments"].is_array());
+    assert!(mock.attachment_queries().is_empty());
+    adapter.shutdown();
+}
+
+#[tokio::test]
+async fn a_refused_attachment_keeps_the_row_and_its_metadata() {
+    let row: Value = serde_json::from_str(
+        &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),
+    )
+    .expect("the fixture is JSON");
+    let rowid = row["rowid"].as_u64().expect("a row carries its rowid");
+    let mock = BridgeMock::new();
+    mock.push_attachment_status("48211:0", StatusCode::CONFLICT);
+    mock.push_updates(updates_page(vec![row], rowid));
+    let url = mock.serve().await;
+    let adapter = ImessageChannel::new(
+        "imessage",
+        attachment_config(url, kian_superagent::ImessageAttachments::Bytes),
+    )
+    .expect("channel builds");
+    let mut stream = adapter.subscribe().boxed();
+    let event = next_event(&mut stream).await;
+    assert!(event.payload.get("media").is_none());
     assert_eq!(
         event.payload["attachments"],
         json!([{

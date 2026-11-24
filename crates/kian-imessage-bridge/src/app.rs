@@ -1,11 +1,13 @@
 //! The bridge's HTTP ABI (CHANNEL-IMESSAGE §3.2, `protocol: 1`).
 //!
-//! Three routes on a loopback listener, all bearer-authenticated:
+//! Four routes on a loopback listener, all bearer-authenticated:
 //! `GET /v1/health`, `GET /v1/updates` (bounded long poll over an
-//! exclusive `rowid` cursor), `POST /v1/send` (with the caller's
-//! `client_id` as the delivery idempotency key). No route reads
-//! arbitrary chats, lists chats, or sends to a target the caller did not
-//! name: the surface is exactly the contract.
+//! exclusive `rowid` cursor), `GET /v1/attachment` (the bytes of one
+//! item an already-filtered page named, guarded by the database
+//! generation), and `POST /v1/send` (with the caller's `client_id` as
+//! the delivery idempotency key). No route reads arbitrary chats, lists
+//! chats, or sends to a target the caller did not name: the surface is
+//! exactly the contract.
 //!
 //! The bridge applies the **privacy filter** (`watch.participants`) to
 //! every page before it leaves the Mac, and nothing else: the sender
@@ -19,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -37,6 +40,10 @@ pub const MAX_WAIT_MS: u64 = 25_000;
 
 /// Body cap for every route.
 pub const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// `watch.max_attachment_bytes` default: the largest file
+/// `/v1/attachment` returns.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How long a `client_id`'s observed result is served instead of a
 /// resend (the delivery idempotency window, §3.2).
@@ -119,6 +126,9 @@ pub struct App<B: Backend> {
     page_limit: u32,
     /// `watch.attachments`: ask `imsg` for attachment metadata.
     attachments: bool,
+    /// `watch.max_attachment_bytes`: the largest file
+    /// `/v1/attachment` returns.
+    max_attachment_bytes: u64,
     cache: Mutex<SendCache>,
     /// Sends are serialized (one at a time, §3.2): order is preserved and
     /// a duplicate `client_id` arriving mid-flight joins the first.
@@ -142,6 +152,7 @@ impl<B: Backend> App<B> {
         catchup_rows: u32,
         page_limit: u32,
         attachments: bool,
+        max_attachment_bytes: u64,
     ) -> Self {
         Self {
             backend: Arc::new(backend),
@@ -153,6 +164,7 @@ impl<B: Backend> App<B> {
             catchup_rows,
             page_limit,
             attachments,
+            max_attachment_bytes,
             cache: Mutex::new(SendCache::new()),
             send_lock: tokio::sync::Mutex::new(()),
             automation: Mutex::new("unknown".to_string()),
@@ -165,6 +177,7 @@ impl<B: Backend> App<B> {
         Router::new()
             .route("/v1/health", get(health::<B>))
             .route("/v1/updates", get(updates::<B>))
+            .route("/v1/attachment", get(attachment::<B>))
             .route("/v1/send", post(send::<B>))
             .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT_BYTES))
             .with_state(Arc::clone(self))
@@ -387,6 +400,23 @@ async fn updates<B: Backend>(
     .into_response()
 }
 
+/// The bridge's **privacy** filter (`watch.participants`): a row is
+/// visible when it has no sender filter to fail, or when its sender is
+/// one of the configured handles. `/v1/updates` and `/v1/attachment`
+/// both answer `404` for a row this hides.
+fn visible_to(raw: &Value, participants: &[String]) -> bool {
+    if participants.is_empty() {
+        return true;
+    }
+    let sender = raw.get("sender").and_then(Value::as_str).unwrap_or("");
+    let normalized_sender = normalize_handle(sender);
+    participants.iter().any(|participant| {
+        normalize_handle(participant)
+            .zip(normalized_sender.clone())
+            .is_some_and(|(a, b)| a == b)
+    })
+}
+
 /// Reduces one raw `imsg` message to the ABI's documented shape and
 /// applies the bridge's **privacy** filter. Mutation notifications
 /// (`type: edited|unsent`), rows outside the participant filter and
@@ -397,17 +427,8 @@ fn reduce_message(raw: &Value, participants: &[String]) -> Option<Value> {
         return None; // an edit/unsend update, not a new row
     }
     let rowid = raw.get("id").and_then(Value::as_u64)?;
-    if !participants.is_empty() {
-        let sender = raw.get("sender").and_then(Value::as_str).unwrap_or("");
-        let normalized_sender = normalize_handle(sender);
-        let allowed = participants.iter().any(|participant| {
-            normalize_handle(participant)
-                .zip(normalized_sender.clone())
-                .is_some_and(|(a, b)| a == b)
-        });
-        if !allowed {
-            return None;
-        }
+    if !visible_to(raw, participants) {
+        return None;
     }
     let created_at = raw
         .get("created_at")
@@ -538,6 +559,116 @@ pub fn normalize_handle(raw: &str) -> Option<String> {
         return Some(trimmed.to_ascii_lowercase());
     }
     Some(trimmed.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// /v1/attachment
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct AttachmentQuery {
+    attachment_id: String,
+    #[serde(default)]
+    generation: Option<String>,
+}
+
+/// `{rowid}:{index}`, exactly the id `/v1/updates` publishes.
+fn parse_attachment_id(raw: &str) -> Option<(u64, usize)> {
+    let (rowid, index) = raw.split_once(':')?;
+    Some((rowid.trim().parse().ok()?, index.trim().parse().ok()?))
+}
+
+fn not_found() -> Response {
+    error_response(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "no such attachment in this database generation",
+        true,
+    )
+}
+
+/// `GET /v1/attachment` (CHANNEL-IMESSAGE §3.2): the bytes of one item,
+/// resolved by the bridge from the row the id names. The file path never
+/// crosses the wire in either direction.
+async fn attachment<B: Backend>(
+    State(app): State<Arc<App<B>>>,
+    headers: HeaderMap,
+    Query(query): Query<AttachmentQuery>,
+) -> Response {
+    if !authorized(&headers, &app.token) {
+        return unauthorized();
+    }
+    if !app.attachments {
+        return not_found();
+    }
+    let Some((rowid, index)) = parse_attachment_id(&query.attachment_id) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "attachment_id must be `<rowid>:<index>`",
+            true,
+        );
+    };
+    let Some(generation) = query.generation.as_deref() else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "generation is required: an attachment id belongs to one chat.db generation",
+            true,
+        );
+    };
+    if generation != app.cursor.generation() {
+        return error_response(
+            StatusCode::CONFLICT,
+            "stale_generation",
+            "the chat.db generation changed; re-read /v1/updates",
+            true,
+        );
+    }
+    let page = match app.backend.after(rowid.saturating_sub(1), 32, true).await {
+        Ok(page) => page,
+        Err(error) => return rpc_error_response(&error),
+    };
+    let Some(raw) = page.messages.iter().find(|raw| {
+        raw.get("id").and_then(Value::as_u64) == Some(rowid) && visible_to(raw, &app.participants)
+    }) else {
+        return not_found();
+    };
+    let Some(item) = raw
+        .get("attachments")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(index))
+    else {
+        return not_found();
+    };
+    let Some(path) = item.get("filename").and_then(Value::as_str) else {
+        return not_found();
+    };
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return not_found();
+    };
+    if !metadata.is_file() {
+        return not_found();
+    }
+    if metadata.len() > app.max_attachment_bytes {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "the attachment exceeds watch.max_attachment_bytes",
+            false,
+        );
+    }
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return not_found();
+    };
+    let media_type = item
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream");
+    let content_type = HeaderValue::from_str(media_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    (StatusCode::OK, [(CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -788,9 +919,19 @@ mod tests {
         }
     }
 
-    fn app(fake: Arc<Fake>, participants: Vec<String>) -> Arc<App<Arc<Fake>>> {
+    fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kian-bridge-app-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_in(
+        dir: PathBuf,
+        fake: Arc<Fake>,
+        participants: Vec<String>,
+        attachments: bool,
+        max_attachment_bytes: u64,
+    ) -> Arc<App<Arc<Fake>>> {
         let db = PathBuf::from(&dir).join("chat.db");
         std::fs::write(&db, b"x").unwrap();
         let cursor = CursorStore::load(&dir, &db);
@@ -803,8 +944,32 @@ mod tests {
             Duration::from_millis(1),
             10,
             100,
-            true,
+            attachments,
+            max_attachment_bytes,
         ))
+    }
+
+    fn app(fake: Arc<Fake>, participants: Vec<String>) -> Arc<App<Arc<Fake>>> {
+        app_in(
+            temp_dir(),
+            fake,
+            participants,
+            true,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        )
+    }
+
+    fn photo_row_at(rowid: u64, sender: &str, path: &str) -> Value {
+        let mut row = photo_message(rowid, sender);
+        row["attachments"][0]["filename"] = json!(path);
+        row
+    }
+
+    fn attachment_request(app: &Arc<App<Arc<Fake>>>, id: &str) -> Query<AttachmentQuery> {
+        Query(AttachmentQuery {
+            attachment_id: id.to_string(),
+            generation: Some(app.cursor.generation()),
+        })
     }
 
     fn bearer() -> HeaderMap {
@@ -880,6 +1045,170 @@ mod tests {
             !wire.contains("internal_hint"),
             "an unknown field left the Mac: {wire}"
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_requires_the_bearer_token() {
+        let app = app(Fake::new(), Vec::new());
+        let response = attachment(
+            State(app),
+            HeaderMap::new(),
+            Query(AttachmentQuery {
+                attachment_id: "41:0".into(),
+                generation: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn attachment_serves_the_file_the_row_named() {
+        let dir = temp_dir();
+        let path = dir.join("IMG_0001.heic");
+        std::fs::write(&path, b"heic-bytes").unwrap();
+        let fake = Fake::new();
+        fake.push_page(AfterPage {
+            messages: vec![photo_row_at(
+                41,
+                "+14155551212",
+                path.to_str().expect("utf-8 path"),
+            )],
+            next_rowid: 41,
+            has_more: false,
+        });
+        let app = app_in(
+            dir,
+            fake,
+            vec!["+14155551212".into()],
+            true,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        );
+        let response = attachment(
+            State(app.clone()),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/heic");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"heic-bytes");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("/Users/"),
+            "the path must never cross the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_refuses_a_stale_generation() {
+        let app = app(Fake::new(), Vec::new());
+        let response = attachment(
+            State(app),
+            bearer(),
+            Query(AttachmentQuery {
+                attachment_id: "41:0".into(),
+                generation: Some("a-previous-chat-db".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "stale_generation");
+    }
+
+    #[tokio::test]
+    async fn attachment_refuses_an_oversize_file() {
+        let dir = temp_dir();
+        let path = dir.join("IMG_0001.heic");
+        std::fs::write(&path, b"ten-bytes!").unwrap();
+        let fake = Fake::new();
+        fake.push_page(AfterPage {
+            messages: vec![photo_row_at(
+                41,
+                "+14155551212",
+                path.to_str().expect("utf-8 path"),
+            )],
+            next_rowid: 41,
+            has_more: false,
+        });
+        let app = app_in(dir, fake, vec!["+14155551212".into()], true, 4);
+        let response = attachment(
+            State(app.clone()),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "too_large");
+    }
+
+    #[tokio::test]
+    async fn attachment_of_an_unknown_id_is_not_found() {
+        let fake = Fake::new();
+        fake.push_page(AfterPage {
+            messages: vec![message(101, "+14155551212")],
+            next_rowid: 101,
+            has_more: false,
+        });
+        let app = app(fake, vec!["+14155551212".into()]);
+        let response = attachment(
+            State(app.clone()),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attachment_outside_the_privacy_filter_is_not_found() {
+        let dir = temp_dir();
+        let path = dir.join("IMG_0001.heic");
+        std::fs::write(&path, b"heic-bytes").unwrap();
+        let fake = Fake::new();
+        fake.push_page(AfterPage {
+            messages: vec![photo_row_at(
+                41,
+                "+14155551212",
+                path.to_str().expect("utf-8 path"),
+            )],
+            next_rowid: 41,
+            has_more: false,
+        });
+        let app = app_in(
+            dir,
+            fake,
+            vec!["+19995550000".into()],
+            true,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        );
+        let response = attachment(
+            State(app.clone()),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attachment_is_not_found_when_metadata_is_off() {
+        let app = app_in(
+            temp_dir(),
+            Fake::new(),
+            Vec::new(),
+            false,
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+        );
+        let response = attachment(
+            State(app.clone()),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

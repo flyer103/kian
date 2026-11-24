@@ -77,6 +77,11 @@ pub struct WatchConfig {
     /// phase-1 text-only read without a rebuild.
     #[serde(default = "default_watch_attachments")]
     pub attachments: bool,
+    /// Largest file `/v1/attachment` returns; a bigger one answers
+    /// `413` so one enormous video cannot be pulled onto the server
+    /// just because a row named it.
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
 }
 
 impl Default for WatchConfig {
@@ -87,6 +92,7 @@ impl Default for WatchConfig {
             catchup_rows: default_catchup_rows(),
             page_limit: default_page_limit(),
             attachments: default_watch_attachments(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         }
     }
 }
@@ -102,6 +108,9 @@ fn default_page_limit() -> u32 {
 }
 fn default_watch_attachments() -> bool {
     true
+}
+fn default_max_attachment_bytes() -> u64 {
+    16 * 1024 * 1024
 }
 
 /// A validated bridge config (paths expanded, token loaded, loopback
@@ -119,6 +128,8 @@ pub struct BridgeConfig {
     pub page_limit: u32,
     /// `watch.attachments`: request attachment metadata per row.
     pub attachments: bool,
+    /// `watch.max_attachment_bytes`: the `/v1/attachment` size cap.
+    pub max_attachment_bytes: u64,
 }
 
 #[derive(Debug, Error)]
@@ -187,6 +198,11 @@ impl BridgeConfig {
                 "watch.page_limit must be between 1 and 500".into(),
             ));
         }
+        if file.watch.max_attachment_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "watch.max_attachment_bytes must be greater than zero".into(),
+            ));
+        }
         Ok(Self {
             listen,
             token,
@@ -198,6 +214,7 @@ impl BridgeConfig {
             catchup_rows: file.watch.catchup_rows,
             page_limit: file.watch.page_limit,
             attachments: file.watch.attachments,
+            max_attachment_bytes: file.watch.max_attachment_bytes,
         })
     }
 }
