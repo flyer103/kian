@@ -315,6 +315,47 @@ async fn one_inbound_text_maps_to_one_event() {
     assert_eq!(event.payload["chat_guid"], "iMessage;-;+1 (415) 555-1212");
     assert_eq!(event.payload["service"], "iMessage");
     assert_eq!(event.payload["is_group"], false);
+    assert!(
+        event.payload.get("attachments").is_none(),
+        "a text-only row's payload keeps its exact keys"
+    );
+    adapter.shutdown();
+}
+
+/// The §3.2 sample, checked in once: the bridge crate asserts its emitter
+/// produces this row and this test asserts the adapter carries it into the
+/// payload, so a field renamed on either side fails here instead of
+/// disappearing from a model's view.
+const ABI_ROW: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../kian-imessage-bridge/tests/fixtures/row-with-attachment.json"
+);
+
+#[tokio::test]
+async fn the_shared_abi_row_arrives_with_its_attachment_metadata() {
+    let row: Value = serde_json::from_str(
+        &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),
+    )
+    .expect("the fixture is JSON");
+    let rowid = row["rowid"].as_u64().expect("a row carries its rowid");
+    let mock = BridgeMock::new();
+    mock.push_updates(updates_page(vec![row], rowid));
+    let adapter = channel(&mock).await;
+    let mut stream = adapter.subscribe().boxed();
+    let event = next_event(&mut stream).await;
+    assert_eq!(event.event_id, "8DF1C0A2-4B7E-4F01-9D1C-2E5A6B7C8D90");
+    assert_eq!(event.topic.as_deref(), Some("imessage"));
+    assert_eq!(event.ts_ms, 1_795_102_315_000);
+    assert_eq!(event.payload["text"], "look at this [image]");
+    assert_eq!(
+        event.payload["attachments"],
+        json!([{
+            "filename": "IMG_0001.heic",
+            "mime_type": "image/heic",
+            "total_bytes": 2_345_678u64,
+            "is_sticker": false,
+        }])
+    );
     adapter.shutdown();
 }
 

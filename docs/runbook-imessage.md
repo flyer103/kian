@@ -110,7 +110,8 @@ openssl rand -hex 32 > ~/.config/kian/imessage-bridge.token
     "participants": ["+14155551212"],
     "poll_interval_ms": 250,
     "catchup_rows": 200,
-    "page_limit": 200
+    "page_limit": 200,
+    "attachments": true
   }
 }
 ```
@@ -119,6 +120,12 @@ openssl rand -hex 32 > ~/.config/kian/imessage-bridge.token
 `chat.db`. It must equal (or be a superset of) the kian `topics` keys; `kian imessage check` diffs
 them. Leaving it empty means *every conversation on the Mac* transits the bridge — do not do that
 on a personal account.
+
+`watch.attachments` (default `true`) makes the bridge read each row's attachment metadata and export a
+whitelist of it — basename, MIME type, size, sticker flag — never a path and never the bytes; the
+adapter then carries that whitelist in the channel payload, so the model sees what arrived even though
+it cannot open it. `false` stops the bridge from reading attachment rows at all; text-only conversations
+are unaffected either way.
 
 LaunchAgent `~/Library/LaunchAgents/com.kian.imessage-bridge.plist`:
 
