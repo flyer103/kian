@@ -903,6 +903,45 @@ mod tests {
         assert_eq!(reduced["attachments"], json!([]));
     }
 
+    /// The raw row `photo_message` models, at the published sample's ids:
+    /// the same JSON the adapter parses in its own test.
+    fn golden_raw_row() -> Value {
+        json!({
+            "id": 48211,
+            "guid": "8DF1C0A2-4B7E-4F01-9D1C-2E5A6B7C8D90",
+            "chat_id": 7,
+            "chat_guid": "iMessage;-;+14155551212",
+            "chat_identifier": "+14155551212",
+            "sender": "+14155551212",
+            "text": "look at this \u{FFFC}",
+            "attachments": [{
+                "id": 9,
+                "filename": "/Users/someone/Library/Messages/Attachments/aa/bb/IMG_0001.heic",
+                "transfer_name": "IMG_0001.heic",
+                "mime_type": "image/heic",
+                "total_bytes": 2_345_678_u64,
+                "is_sticker": false,
+                "internal_hint": "must not leave the Mac",
+            }],
+            "created_at": "2026-11-19T15:31:55Z",
+            "service": "iMessage",
+            "is_from_me": false,
+            "is_group": false,
+        })
+    }
+
+    #[test]
+    fn the_emitter_matches_the_published_abi_row() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/row-with-attachment.json"))
+                .expect("the shared ABI fixture parses");
+        let reduced = reduce_message(&golden_raw_row(), &[]).expect("a photo row reduces");
+        assert_eq!(
+            reduced, fixture,
+            "the bridge's reduced row drifted from the published ABI sample"
+        );
+    }
+
     #[tokio::test]
     async fn every_route_requires_the_bearer_token() {
         let app = app(Fake::new(), vec![]);

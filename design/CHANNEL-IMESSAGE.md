@@ -172,7 +172,7 @@ section first.
 | Step | Method | Request (the fields used) | Result (fields used) |
 |---|---|---|---|
 | readiness | `status` | `{}` | `version`, `protocol_version`, `database.ready`, `database.error`, `database.features`, `bridge.ready`, `methods`, `supported_methods` |
-| read | `messages.after` | `{since_rowid, limit ≤ 500, attachments:false, include_reactions:false}` | `{messages[], next_rowid, has_more}` — ordered by ROWID asc; `next_rowid` is the authoritative physical cursor |
+| read | `messages.after` | `{since_rowid, limit ≤ 500, attachments:<watch.attachments>, include_reactions:false}` | `{messages[], next_rowid, has_more}` — ordered by ROWID asc; `next_rowid` is the authoritative physical cursor |
 | send | `send` | `{to or chat_guid, text, service, allow_sms_fallback}` | `{ok:true, id, guid}`; failures carry a delivery **disposition** (`not_started` / `may_have_completed` / `still_in_flight`) and `retry_safe` |
 | (unused) | `watch.subscribe` | — | available in `imsg` but **not used by phase 1**: the reference bridge polls `messages.after` at `poll_interval_ms` (250 ms), which keeps it a plain request/response client. A future low-latency bridge may subscribe instead; the ABI does not change |
 
@@ -209,6 +209,10 @@ Frozen semantics the bridge relies on:
     `chat_guid: "any;-;…"` on inbound rows while the round trip worked; the channel never keys
     admission or routing on `service` (it admits on text/sender/`is_from_me`/`guid` and sets the
     service explicitly on send), so a missing field is harmless.
+11. **`messages.after` with `attachments:true`** adds a per-row `attachments[]` whose useful fields
+    are `filename` (the original full path), `transfer_name`, `mime_type`, `total_bytes` and
+    `is_sticker`; `imsg` attachment objects also carry absolute paths and internal ids that must not
+    leave the Mac. The bridge projects a whitelist and basenames the path (§3.2).
 
 ## 3. The bridge
 
@@ -231,10 +235,17 @@ Frozen semantics the bridge relies on:
     "participants": ["+14155551212", "me@example.com"],
     "poll_interval_ms": 250,
     "catchup_rows": 200,
-    "page_limit": 200
+    "page_limit": 200,
+    "attachments": true
   }
 }
 ```
+
+- **`watch.attachments`** (default `true`) asks `imsg` for each row's attachment metadata, so an
+  inbound photo, voice note or file reaches the adapter as a name, a MIME type and a byte count next
+  to the `[image]`/`[attachment]` marker. The bridge applies the same whitelist here (basename, MIME
+  type, size, sticker flag, `attachment_id`) — never a path, never the bytes (§3.2). `false` restores
+  a text-only scan for a Mac that must not read attachment rows at all.
 
 - **Token**: read from `token_file` (mode `0600`, one line). Required; a missing/blank/short token
   refuses startup. The bridge checks the file's permission bits and refuses a group/world-readable
@@ -309,12 +320,32 @@ long-poll until at least one row arrives or `wait_ms` elapses:
 - `messages[]` is the bridge-owned **reduced** message shape — not the raw `imsg` object:
 
 ```json
-{"rowid": 48211, "guid": "8DF1C0A2-...", "chat_id": 7,
+{"rowid": 48211, "guid": "8DF1C0A2-4B7E-4F01-9D1C-2E5A6B7C8D90", "chat_id": 7,
  "chat_guid": "iMessage;-;+14155551212", "chat_identifier": "+14155551212",
- "sender": "+14155551212", "text": "hi",
- "created_at": "2026-11-19T15:31:55Z", "created_at_ms": 1794718315000,
+ "sender": "+14155551212", "text": "look at this [image]",
+ "attachments": [{"attachment_id": "48211:0", "filename": "IMG_0001.heic",
+                  "mime_type": "image/heic", "transfer_name": "IMG_0001.heic",
+                  "total_bytes": 2345678, "is_sticker": false}],
+ "created_at": "2026-11-19T15:31:55Z", "created_at_ms": 1795102315000,
  "service": "iMessage", "is_from_me": false, "is_group": false, "is_reaction": false}
 ```
+
+The sample row is checked in as
+`crates/kian-imessage-bridge/tests/fixtures/row-with-attachment.json`; the bridge's emitter and the
+adapter's parser each assert against that one file, so a field renamed on either side fails a test
+instead of disappearing from a model's view.
+
+- `attachments[]` is the row's projection (`[]` when there are none): `attachment_id`
+  (`{rowid}:{index}`), `filename` (the basename of the original path), `mime_type`,
+  `transfer_name`, `total_bytes`, `is_sticker`. Absolute paths and `imsg`'s internal ids are dropped
+  at the bridge, and the content itself is not exported in phase 1 (§11). `attachment_id` names the
+  item inside the database generation that produced `rowid` (§2.5 rule 6): a byte-read handle for the
+  media phase, never a kian identity.
+- `text` replaces every U+FFFC (an item Messages could not put in words: an attachment, a sticker, a
+  poll) with `[image]` when that attachment's MIME type is `image/*` and `[attachment]` otherwise,
+  and an attachment-only row gets the first attachment's marker as its text. Row text is therefore
+  never empty for such a row, so the adapter's text admission (§4 rule 4) does not have to know
+  about attachments.
 
 - The bridge does **not** apply the sender allowlist and does **not** drop on `is_from_me`,
   `is_group`, reactions or attachments. All policy lives in the adapter (§4) so the contract has one
@@ -391,8 +422,15 @@ bridge message plus the channel config (normalized allowlist), so it is unit-tes
 | `topic` | `topics[normalize(sender)]` | the same table is the receive allowlist |
 | `sender` | `{"handle": "<raw handle>"}` | minimal stable provenance object; admission-class entries compare it by exact JSON equality |
 | `group` | `None` | direct chats only in phase 1 |
-| `payload` | `{"text", "created_at_ms", "sender_handle", "chat_guid", "chat_identifier", "service", "is_group": false}` | text-bearing, media-free; `sender_handle` is the reply target the model echoes |
+| `payload` | `{"text", "created_at_ms", "sender_handle", "chat_guid", "chat_identifier", "service", "is_group": false}`, plus `attachments` when the row carried any | text-bearing; `attachments` is the projected metadata (§3.2 items), never the bytes; `sender_handle` is the reply target the model echoes |
 | `ts_ms` | `created_at_ms` | falls back to the adapter's receive time when absent |
+
+The `attachments` items carry `filename`, `mime_type`, `total_bytes` and `is_sticker` — the fields a
+model can reason about ("a 2.3 MB HEIC named `IMG_0001.heic`") — and omit `attachment_id`, which
+encodes a per-generation ROWID that must not become durable data. The bytes and that byte-read handle
+reach the media edge in the ephemeral `media` envelope (ADR-062), never the durable payload. A row
+without attachments keeps its payload bytes exactly as before, so a text-only conversation is
+unaffected by the field's existence.
 
 Drop rules — each produces `None` plus one audit line and a counter, never a synthesized event:
 
@@ -402,8 +440,9 @@ Drop rules — each produces `None` plus one audit line and a counter, never a s
 2. `is_group == true` → drop (phase 1 direct chats only; groups are §11).
 3. `is_reaction == true` → drop (tapbacks are not input; the watcher is also subscribed without
    reactions).
-4. `text` missing, empty after trimming, or the row is a non-text item (attachment-only, poll,
-   sticker) → drop (media is phase 2).
+4. `text` missing or empty after trimming → drop. An attachment-only row is not this case while the
+   bridge runs with `watch.attachments` (§3.2 synthesizes the marker); with the knob off it has no
+   text and is dropped here. What the attachment *contains* is still phase 2 (§11).
 5. `sender` empty/absent → drop (no identity, no allowlist decision).
 6. `normalize(sender)` is not a key of `topics` → drop. Unknown sender is an **honest drop with an
    audit line**, never a fallback topic. (The bridge's `watch.participants` filter is a second,
@@ -614,8 +653,8 @@ plus an honest error at the seam.
 
 ## 11. Non-goals (phase 2)
 
-Explicitly out of scope, recorded so they are not silently half-built: inbound media (attachments,
-voice notes, stickers), outbound media, SMS/Text Message Forwarding, group chats, tapbacks/reactions,
+Explicitly out of scope, recorded so they are not silently half-built: inbound media **bytes** (the
+bridge maps an attachment's metadata but never reads its content), outbound media, SMS/Text Message Forwarding, group chats, tapbacks/reactions,
 message edits and unsends as *input corrections*, read receipts and typing indicators (private API,
 SIP off), rich sends/effects/polls, multi-account (more than one bridge/Apple ID), a bridge that is
 not `imsg`-based, kian-side cursor persistence, and any iMessage-specific prompt tuning beyond the
@@ -624,8 +663,9 @@ channel-target sentence.
 The typed side of inbound media is designed even though the adapter side is not built: ADR-062 defines
 the additive `media` payload envelope (`{"kind","media_type","base64"[,"language"]}` items) and the
 assembly-side media edge that stores each item as an artifact, transcribes it and appends the
-transcript to the admitted text. A future iMessage media phase (the bridge grows attachment reads) hands
-the adapter's `ChannelEvent` payload in that shape; nothing else on this channel changes.
+transcript to the admitted text. A future iMessage media phase (the bridge grows attachment reads)
+hands the adapter's `ChannelEvent` payload in that shape; the metadata array already tells the model
+what arrived (§4), so only the bytes are missing; nothing else on this channel changes.
 
 ## 12. Acceptance
 
@@ -633,7 +673,9 @@ the adapter's `ChannelEvent` payload in that shape; nothing else on this channel
 the bridge crate's unit tests, and the config unit tests in `crates/kian-cli/src/config.rs`): a
 scripted in-process bridge mock (axum, the `wechat_channel.rs` shape).
 
-- Adapter: the §4 mapping table row by row; every drop rule (§4 rules 1–7) with its audit reason;
+- Adapter: the §4 mapping table row by row; the payload's attachment metadata and its absence on a
+  text-only row (a checked-in golden bridge row is the shared ABI fixture); every drop rule (§4
+  rules 1–7) with its audit reason;
   `guid` → `event_id`; `topics` allowlist both ways; ring dedupe; `client_id` stability across two
   `send` calls with identical shaped content (dedupe proof); long-text split at 2000 chars; receipt
   from `guid`/`rowid`/`kian/<client_id>`; all three dispositions → the honest `ChannelError`;
@@ -643,7 +685,8 @@ scripted in-process bridge mock (axum, the `wechat_channel.rs` shape).
 - Config: section presence both ways, empty/blank `bridge_url`, non-http URL, `wait_ms` bounds,
   `poll_timeout_ms` relation, `max_send_chars` guard, two `imessage` channels refused, missing
   `KIAN_IMESSAGE_BRIDGE_TOKEN` refused at assembly.
-- Bridge crate: its ABI JSON (health/updates/send error kinds) against a fake `imsg rpc` child;
+- Bridge crate: its ABI JSON (health/updates/send error kinds) against a fake `imsg rpc` child; the
+  attachment projection against that same golden row (whitelist, basename, no path, byte length);
   cursor persistence + generation reset; `client_id` cache (hit, miss, uncertain cached, failure not
   cached); body cap; auth required on every route; loopback-only bind refusal.
 
@@ -744,6 +787,10 @@ question — they stay in §13.
     (model turn included), so the cadence is not the dominant term. Not measured under sustained
     load; `imsg`'s `watch.subscribe` would remove the cadence and stays deliberately unused in
     phase 1.
+12. **Attachment metadata on a real photo** — the projection and the mapping are covered at L1 (a
+    checked-in golden row, the bridge's `imsg` fake) and L2 (a scripted bridge), but the 2026-11-20
+    L3 run predates `watch.attachments`. A real HEIC or voice-note row on the Mac, its basename
+    projection and the model seeing that metadata inside a turn were not part of that run.
 
 ## 14. Delivery slices
 
@@ -752,11 +799,12 @@ question — they stay in §13.
 cursor file, `client_id` cache, loopback + token, LaunchAgent packaging); the `imessage` adapter
 (§4 receive, §5 send, §6 normalization); config + validation + assembly + `kian imessage check`;
 the router-target sentence; L1 + L2 suites; this document, ADR-042, the runbook, the SPEC row, the
-README entries and one CHANGELOG bullet. Text-only direct chats, iMessage service only, one channel.
+README entries and one CHANGELOG bullet. Text-only direct chats, iMessage service only, one channel;
+an attachment row carries its marker text plus metadata (§3.2, §4), never its bytes.
 Estimated write set ≈ adapter 700 lines, bridge 800 lines, config/CLI 250 lines, tests ~1200 lines,
 docs ~900 lines.
 
-**1b (follow-ups, each its own change).** SMS; attachments; reactions/tapbacks; group chats;
+**1b (follow-ups, each its own change).** SMS; attachment bytes; reactions/tapbacks; group chats;
 typing/read receipts (private API, SIP off); multi-account; a seam-level delivery idempotency key
 (a `ChannelDelivery` change — core seam, needs its own ADR) replacing the `client_id` derivation;
 bridge-side metric/health surfacing on `/metrics`.
@@ -772,6 +820,6 @@ error code — changes **here first**, and the bridge, the adapter, the mock and
 reconciled in the same change (the EVENT-MODEL discipline applied to a channel). The ABI of §3.2,
 the allowlist/privacy semantics (§3.3, §8), the dedupe and cursor discipline (§9) and the config/CLI
 shapes (§7) also start here. A change that would add a kian-side position table, a new event kind,
-a new server surface, a public bridge bind, multi-account or media support needs an ADR, not an
+a new server surface, a public bridge bind, multi-account or channel media bytes needs an ADR, not an
 edit to this file. An `imsg`/macOS break is recorded as a dated note in this section plus a
 CHANGELOG entry, and parks the channel honestly rather than guessing.

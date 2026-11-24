@@ -51,7 +51,7 @@ use tracing::warn;
 pub mod bridge;
 pub mod handle;
 
-use bridge::{BridgeClient, BridgeError, BridgeMessage, SendRequest};
+use bridge::{BridgeAttachment, BridgeClient, BridgeError, BridgeMessage, SendRequest};
 
 /// The channel `type` spelling that builds an [`ImessageChannel`]
 /// (kian-cli cross-references this constant).
@@ -557,7 +557,9 @@ pub enum ImessageDrop {
     GroupChat,
     /// `is_reaction` — a tapback is not input.
     Reaction,
-    /// No text item — attachment/poll/sticker only (media is phase 2).
+    /// No text item — an attachment-only row reaches this only when the
+    /// bridge runs with `watch.attachments` off (it synthesizes a marker
+    /// otherwise); the bytes of what arrived are phase 2.
     NotText,
     /// `sender` empty/absent — no identity, no allowlist decision.
     NoSender,
@@ -592,7 +594,9 @@ pub enum Mapping {
 /// Maps one bridge message per CHANNEL-IMESSAGE §4. Pure: a function of
 /// the message plus the config's normalized topic table and the
 /// receive-time fallback. Only a new, text-bearing, direct inbound row
-/// from an allowlisted handle maps; everything else is an honest drop.
+/// from an allowlisted handle maps; everything else is an honest drop. A
+/// row that carries attachments also contributes their metadata to the
+/// payload, so the model sees what arrived even though it cannot open it.
 #[must_use]
 pub fn map_message(
     channel: &str,
@@ -635,23 +639,46 @@ pub fn map_message(
         return Mapping::Drop(ImessageDrop::NoGuid);
     }
     let created_at_ms = message.created_at_ms.unwrap_or(received_at_ms);
+    let mut payload = json!({
+        "text": text,
+        "created_at_ms": created_at_ms,
+        "sender_handle": sender,
+        "chat_guid": message.chat_guid,
+        "chat_identifier": message.chat_identifier,
+        "service": message.service,
+        "is_group": false,
+    });
+    if !message.attachments.is_empty() {
+        payload["attachments"] = attachment_metadata(&message.attachments);
+    }
     Mapping::Event(ChannelEvent {
         channel: channel.to_string(),
         event_id: message.guid.clone(),
         topic: Some(topic.clone()),
         sender: Some(json!({"handle": sender})),
         group: None, // direct chats only in phase 1
-        payload: json!({
-            "text": text,
-            "created_at_ms": created_at_ms,
-            "sender_handle": sender,
-            "chat_guid": message.chat_guid,
-            "chat_identifier": message.chat_identifier,
-            "service": message.service,
-            "is_group": false,
-        }),
+        payload,
         ts_ms: created_at_ms,
     })
+}
+
+/// The `attachments` items the payload carries: what the model can reason
+/// about, and nothing that encodes a physical scan position — a durable
+/// payload must not name an item by `rowid` (CHANNEL-IMESSAGE §4).
+fn attachment_metadata(attachments: &[BridgeAttachment]) -> serde_json::Value {
+    serde_json::Value::Array(
+        attachments
+            .iter()
+            .map(|attachment| {
+                json!({
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "total_bytes": attachment.total_bytes,
+                    "is_sticker": attachment.is_sticker,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The thin wrapper: `Some(event)` or `None`.
@@ -1087,6 +1114,7 @@ mod tests {
             is_from_me: false,
             is_group: false,
             is_reaction: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -1106,6 +1134,45 @@ mod tests {
         assert_eq!(event.payload["chat_guid"], "iMessage;-;+14155551212");
         assert_eq!(event.payload["service"], "iMessage");
         assert_eq!(event.payload["is_group"], false);
+        assert!(
+            event.payload.get("attachments").is_none(),
+            "a text-only row's payload keeps its exact keys"
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_reaches_the_payload_without_the_row_position() {
+        let mut photo = message("g-photo");
+        photo.text = Some("look at this [image]".into());
+        photo.attachments = vec![BridgeAttachment {
+            attachment_id: Some("42:0".into()),
+            filename: Some("IMG_0001.heic".into()),
+            mime_type: Some("image/heic".into()),
+            transfer_name: Some("IMG_0001.heic".into()),
+            total_bytes: Some(2_345_678),
+            is_sticker: false,
+        }];
+        let Mapping::Event(event) = map_message("imessage", &topics(), &photo, 9) else {
+            panic!("expected an event");
+        };
+        assert_eq!(
+            event.payload,
+            json!({
+                "text": "look at this [image]",
+                "created_at_ms": 1_794_718_315_000u64,
+                "sender_handle": "+1 (415) 555-1212",
+                "chat_guid": "iMessage;-;+14155551212",
+                "chat_identifier": "+14155551212",
+                "service": "iMessage",
+                "is_group": false,
+                "attachments": [{
+                    "filename": "IMG_0001.heic",
+                    "mime_type": "image/heic",
+                    "total_bytes": 2_345_678u64,
+                    "is_sticker": false,
+                }],
+            })
+        );
     }
 
     #[test]

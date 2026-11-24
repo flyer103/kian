@@ -175,7 +175,9 @@ changes ([design/CHANNEL-WECHAT.md](../design/CHANNEL-WECHAT.md)).
 `type: imessage` needs a Mac signed into a dedicated Apple ID running
 `kian-imessage-bridge` (Full Disk Access + Automation → Messages, `imsg` ≥ 0.14), because iMessage
 has no API — the message must land on that Mac's `chat.db`. The adapter long-polls the bridge's loopback ABI;
-the bridge's `participants` list keeps non-allowlisted conversations from leaving the Mac.
+the bridge's `participants` list keeps non-allowlisted conversations from leaving the Mac. An inbound
+attachment arrives as `[image]`/`[attachment]` marker text plus its name, MIME type and size in the payload;
+its bytes stay on the Mac.
 `kian imessage check` is the read-only preflight
 ([design/CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md),
 [docs/runbook-imessage.md](../docs/runbook-imessage.md)).
@@ -1051,7 +1053,8 @@ After the edge the admitted payload holds no base64 — the item becomes an arti
 transcript, and the text gains a marker line (`[image transcript] ...`, `[voice message transcript]
 ...`). An item that fails (bad base64, provider error, oversize input) carries an `error` string and the
 message is still admitted; a payload without `media` passes through untouched. No shipped adapter emits
-this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge is text-only, so this is
+this envelope yet — WeChat media lives on a separate CDN and the iMessage bridge exports no
+attachment bytes, so this is
 the contract those channel phases implement (a mock channel can carry it today). Outbound audio is not
 wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
 Semantics: [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).

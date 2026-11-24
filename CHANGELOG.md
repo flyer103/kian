@@ -8,6 +8,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage attachments: inbound metadata reaches the model instead of being silently dropped
+  (CHANNEL-IMESSAGE §2.5, §3.2, §4).** The adapter now models the bridge's `attachments` whitelist and
+  maps it into the channel payload as `filename`, `mime_type`, `total_bytes` and `is_sticker` (the key
+  is absent on a row without attachments, so a text-only payload keeps its exact bytes); a photo, voice
+  note or file therefore arrives as `[image]`/`[attachment]` marker text plus what arrived, not as a
+  bare marker. The bytes are still phase 2, and `watch.attachments` (default on) documents the knob.
+  One checked-in ABI row is asserted by both the bridge's emitter and the adapter's parser, so a field
+  renamed on one side fails a test rather than vanishing from the model's view.
+
 - **Vision inputs: a vision-profile target sees artifact-backed images as dialect content parts
   (DESIGN §3.2, ADR-063, P5c).** A user input content may carry `{"text", "images": [{"artifact",
   "media_type"}]}`; the loop resolves the blobs through the artifact store and the V2 request plan

@@ -26,7 +26,10 @@ pub const MAX_WAIT_MS: u64 = 25_000;
 /// One message as the bridge reduces it (CHANNEL-IMESSAGE §3.2): the
 /// bridge-owned shape, not the raw `imsg` object. Fields the phase-1
 /// contract does not name are deliberately absent so the bridge's
-/// third-party schema never becomes durable session data.
+/// third-party schema never becomes durable session data; a field the
+/// contract does name (`attachments`) is modeled rather than left to
+/// serde's silent unknown-key ignore, and the adapter projects a subset
+/// of it into the payload (§4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BridgeMessage {
     /// `message.ROWID` — the physical scan position (per database
@@ -44,6 +47,11 @@ pub struct BridgeMessage {
     pub sender: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    /// The row's attachment metadata (the bridge sends the array, empty
+    /// when the row has none).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<BridgeAttachment>,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -56,6 +64,27 @@ pub struct BridgeMessage {
     pub is_group: bool,
     #[serde(default)]
     pub is_reaction: bool,
+}
+
+/// One attachment as the bridge reduces it: exactly the six fields the
+/// ABI names, so nothing on the wire is unmodeled. `attachment_id` and
+/// `transfer_name` stay here — the durable payload carries only what a
+/// model can reason about (CHANNEL-IMESSAGE §4), never a physical row
+/// position.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BridgeAttachment {
+    #[serde(default)]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub transfer_name: Option<String>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub is_sticker: bool,
 }
 
 /// One `/v1/updates` page.
@@ -439,6 +468,38 @@ mod tests {
         assert_eq!(batch.messages.len(), 1);
         assert_eq!(batch.messages[0].guid, "8DF1");
         assert_eq!(batch.next_rowid, 48211);
+        assert!(
+            batch.messages[0].attachments.is_empty(),
+            "a text-only row carries no attachments"
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_is_kept_instead_of_being_silently_dropped() {
+        let raw = serde_json::json!({
+            "protocol": 1,
+            "messages": [{
+                "rowid": 48211,
+                "guid": "8DF1",
+                "text": "[image]",
+                "attachments": [{
+                    "attachment_id": "48211:0",
+                    "filename": "IMG_0001.heic",
+                    "mime_type": "image/heic",
+                    "transfer_name": "IMG_0001.heic",
+                    "total_bytes": 2_345_678u64,
+                    "is_sticker": false
+                }]
+            }]
+        });
+        let batch: UpdatesBatch = serde_json::from_value(raw).expect("parse");
+        let attachment = &batch.messages[0].attachments[0];
+        assert_eq!(attachment.attachment_id.as_deref(), Some("48211:0"));
+        assert_eq!(attachment.filename.as_deref(), Some("IMG_0001.heic"));
+        assert_eq!(attachment.mime_type.as_deref(), Some("image/heic"));
+        assert_eq!(attachment.transfer_name.as_deref(), Some("IMG_0001.heic"));
+        assert_eq!(attachment.total_bytes, Some(2_345_678));
+        assert!(!attachment.is_sticker);
     }
 
     #[test]
