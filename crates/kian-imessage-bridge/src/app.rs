@@ -699,8 +699,8 @@ fn parse_attachment_position(rowid: &str, index: &str) -> Option<(u64, usize)> {
     Some((rowid, index))
 }
 
-fn visible_attachment(sender: Option<&str>, participants: &[String]) -> bool {
-    if participants.is_empty() {
+fn visible_attachment(sender: Option<&str>, is_from_me: bool, participants: &[String]) -> bool {
+    if participants.is_empty() || is_from_me {
         return true;
     }
     sender.and_then(normalize_handle).is_some_and(|sender| {
@@ -759,7 +759,7 @@ async fn attachment_by_position<B: Backend>(
         Ok(None) => return not_found(),
         Err(_) => return attachment_unavailable(),
     };
-    if !visible_attachment(located.sender.as_deref(), &app.participants) {
+    if !visible_attachment(located.sender.as_deref(), located.is_from_me, &app.participants) {
         return not_found();
     }
     let attachment = match attachment_source
@@ -767,13 +767,22 @@ async fn attachment_by_position<B: Backend>(
         .await
     {
         Ok(attachment) => attachment,
-        Err(AttachmentError::Gone) => {
-            return error_response(
-                StatusCode::GONE,
-                "gone",
-                "the attachment file no longer exists",
-                false,
+        Err(AttachmentError::Gone {
+            basename,
+            shape,
+            redacted,
+        }) => {
+            tracing::warn!(
+                rowid,
+                index,
+                shape,
+                prefix = %redacted,
+                "attachment file is missing on disk"
             );
+            let detail = format!(
+                "the attachment file no longer exists (basename={basename}, shape={shape})"
+            );
+            return error_response(StatusCode::GONE, "gone", &detail, false);
         }
         Err(AttachmentError::TooLarge) => {
             return error_response(
@@ -1152,7 +1161,8 @@ mod tests {
                 );
                 CREATE TABLE IF NOT EXISTS message (
                     ROWID INTEGER PRIMARY KEY,
-                    handle_id INTEGER
+                    handle_id INTEGER,
+                    is_from_me INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS attachment (
                     ROWID INTEGER PRIMARY KEY,
@@ -1714,6 +1724,40 @@ mod tests {
         assert_eq!(
             position_response(&app, "48", "0", None).await.status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_of_a_self_sent_photo_is_visible() {
+        let dir = temp_dir();
+        let photo = dir.join("IMG_0040.heic");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            46,
+            12,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let connection = rusqlite::Connection::open(dir.join("chat.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE message SET handle_id = NULL, is_from_me = 1 WHERE ROWID = 46",
+                [],
+            )
+            .unwrap();
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/nonexistent/sips"),
+        );
+        assert_eq!(
+            position_response(&app, "46", "0", None).await.status(),
+            StatusCode::OK
         );
     }
 

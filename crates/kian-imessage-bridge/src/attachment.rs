@@ -23,6 +23,12 @@ pub struct LocatedAttachment {
     pub total_bytes: Option<u64>,
     pub is_sticker: bool,
     pub sender: Option<String>,
+    /// `is_from_me` for the owning row: a self-sent photo has no `handle`.
+    pub is_from_me: bool,
+    /// `"~"`, `"relative"` or `"absolute"`: the shape of `attachment.filename`.
+    pub path_shape: &'static str,
+    /// First 30 characters of the resolved path, `$HOME` collapsed to `~`.
+    pub redacted_path: String,
 }
 
 #[derive(Debug)]
@@ -36,7 +42,11 @@ pub struct AttachmentBytes {
 #[derive(Debug, Error)]
 pub enum AttachmentError {
     #[error("attachment file is no longer available")]
-    Gone,
+    Gone {
+        basename: String,
+        shape: &'static str,
+        redacted: String,
+    },
     #[error("attachment exceeds the configured limit")]
     TooLarge,
     #[error("attachment type `{0}` is not an image")]
@@ -99,13 +109,13 @@ impl AttachmentSource {
             .await
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    AttachmentError::Gone
+                    gone(&located)
                 } else {
                     AttachmentError::Unavailable
                 }
             })?;
         if !metadata.is_file() {
-            return Err(AttachmentError::Gone);
+            return Err(gone(&located));
         }
         if metadata.len() > max_bytes {
             return Err(AttachmentError::TooLarge);
@@ -123,7 +133,7 @@ impl AttachmentSource {
             None => {
                 let bytes = tokio::fs::read(&located.filename).await.map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
-                        AttachmentError::Gone
+                        gone(&located)
                     } else {
                         AttachmentError::Unavailable
                     }
@@ -244,7 +254,7 @@ fn locate_in_db(
         .map_err(|_| AttachmentError::Unavailable)?;
     let row = connection
         .query_row(
-            "SELECT a.filename, a.mime_type, a.total_bytes, a.is_sticker, h.id
+            "SELECT a.filename, a.mime_type, a.total_bytes, a.is_sticker, h.id, m.is_from_me
              FROM message_attachment_join AS j
              JOIN attachment AS a ON a.ROWID = j.attachment_id
              JOIN message AS m ON m.ROWID = j.message_id
@@ -259,21 +269,138 @@ fn locate_in_db(
                 let total_bytes: Option<i64> = row.get(2)?;
                 let is_sticker: Option<bool> = row.get(3)?;
                 let sender: Option<String> = row.get(4)?;
-                Ok((filename, mime_type, total_bytes, is_sticker, sender))
+                let is_from_me: Option<bool> = row.get(5)?;
+                Ok((
+                    filename,
+                    mime_type,
+                    total_bytes,
+                    is_sticker,
+                    sender,
+                    is_from_me,
+                ))
             },
         )
         .optional()
         .map_err(|_| AttachmentError::Unavailable)?;
-    Ok(
-        row.and_then(|(filename, mime_type, total_bytes, is_sticker, sender)| {
-            let filename = filename.filter(|value| !value.trim().is_empty())?;
-            Some(LocatedAttachment {
-                filename: PathBuf::from(filename),
-                mime_type,
-                total_bytes: total_bytes.and_then(|value| u64::try_from(value).ok()),
-                is_sticker: is_sticker.unwrap_or(false),
-                sender,
-            })
-        }),
-    )
+    let Some((filename, mime_type, total_bytes, is_sticker, sender, is_from_me)) = row else {
+        return Ok(None);
+    };
+    let Some(raw) = filename.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .ok_or(AttachmentError::Unavailable)?;
+    let filename = resolve_attachment_path(raw, &home);
+    Ok(Some(LocatedAttachment {
+        redacted_path: redacted_prefix(&filename, &home),
+        filename,
+        mime_type,
+        total_bytes: total_bytes.and_then(|value| u64::try_from(value).ok()),
+        is_sticker: is_sticker.unwrap_or(false),
+        sender,
+        is_from_me: is_from_me.unwrap_or(false),
+        path_shape: path_shape(raw),
+    }))
 }
+
+/// Builds the 410 error for a located attachment, keeping only the
+/// basename, the stored path shape and a `$HOME`-redacted prefix.
+fn gone(located: &LocatedAttachment) -> AttachmentError {
+    AttachmentError::Gone {
+        basename: located.filename.file_name().map_or_else(
+            || "attachment".to_string(),
+            |name| name.to_string_lossy().to_string(),
+        ),
+        shape: located.path_shape,
+        redacted: located.redacted_path.clone(),
+    }
+}
+
+/// Expands a Messages `attachment.filename` into a filesystem path.
+///
+/// `chat.db` stores three shapes: a `~/`-prefixed path, a bare relative
+/// path such as `Attachments/ab/cd/IMG_0035.heic`, and an absolute path.
+/// Treating the relative form as absolute is why every attachment used to
+/// resolve to a missing file.
+#[must_use]
+pub fn resolve_attachment_path(raw: &str, home: &Path) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else if raw.starts_with('/') {
+        PathBuf::from(raw)
+    } else {
+        home.join("Library/Messages").join(raw)
+    }
+}
+
+/// Classifies a stored `attachment.filename` without revealing the path.
+#[must_use]
+pub fn path_shape(raw: &str) -> &'static str {
+    if raw.starts_with("~/") {
+        "~"
+    } else if raw.starts_with('/') {
+        "absolute"
+    } else {
+        "relative"
+    }
+}
+
+/// First 30 characters of `path` with `home` collapsed to `~`.
+fn redacted_prefix(path: &Path, home: &Path) -> String {
+    let text = path.to_string_lossy();
+    let home = home.to_string_lossy();
+    let redacted = match text.strip_prefix(home.as_ref()) {
+        Some(rest) => format!("~{rest}"),
+        None => text.to_string(),
+    };
+    redacted.chars().take(30).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{path_shape, redacted_prefix, resolve_attachment_path};
+    use std::path::{Path, PathBuf};
+
+    const HOME: &str = "/Users/tester";
+
+    #[test]
+    fn attachment_filenames_are_normalized_from_the_three_stored_shapes() {
+        let home = Path::new(HOME);
+        assert_eq!(
+            resolve_attachment_path("~/Library/Messages/Attachments/a/b/IMG_0035.heic", home),
+            PathBuf::from("/Users/tester/Library/Messages/Attachments/a/b/IMG_0035.heic")
+        );
+        assert_eq!(
+            resolve_attachment_path("Attachments/c/d/IMG_0036.heic", home),
+            PathBuf::from("/Users/tester/Library/Messages/Attachments/c/d/IMG_0036.heic")
+        );
+        assert_eq!(
+            resolve_attachment_path("/var/folders/xy/T/IMG_0037.jpg", home),
+            PathBuf::from("/var/folders/xy/T/IMG_0037.jpg")
+        );
+    }
+
+    #[test]
+    fn path_shapes_are_reported_without_the_path_itself() {
+        assert_eq!(path_shape("~/Library/Messages/Attachments/a/IMG.heic"), "~");
+        assert_eq!(path_shape("Attachments/a/IMG.heic"), "relative");
+        assert_eq!(
+            path_shape("/Users/tester/Library/Messages/Attachments/a/IMG.heic"),
+            "absolute"
+        );
+    }
+
+    #[test]
+    fn the_logged_prefix_is_redacted_to_home_and_truncated() {
+        let path =
+            Path::new("/Users/tester/Library/Messages/Attachments/aaaa/bbbb/very-long-name.heic");
+        let prefix = redacted_prefix(path, Path::new(HOME));
+        assert!(prefix.starts_with("~/Library/Messages"));
+        assert_eq!(prefix.chars().count(), 30);
+        assert!(!prefix.contains(HOME));
+    }
+}
+
