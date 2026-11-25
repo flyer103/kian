@@ -383,6 +383,9 @@ instead of disappearing from a model's view.
 - The legacy `GET /v1/attachment?attachment_id=<rowid>:<index>&generation=<g>` form remains for
   protocol-1 compatibility. Its `generation` must equal `database.generation`; a mismatch answers
   `409 stale_generation`, because its id is meaningful only inside that database instance.
+  It accepts the same `?as=jpeg` selector with the same variants, `400` and `503` semantics
+  as the positioned route, so a caller that must keep the generation guard can still ask for
+  readable bytes instead of trading one guarantee for the other.
 
 **`POST /v1/send`** — one text message:
 
@@ -467,7 +470,8 @@ payload bytes exactly as before, so a text-only conversation is unaffected by th
 
 With `attachments: bytes` and a `media:` section, the adapter additionally fetches the row's
 `image/*` and `audio/*` items — at most four, never a sticker — through `/v1/attachment` (carrying
-the page's `generation`) and hands
+the page's `generation`; an `image/*` item asks for `as=jpeg` because the provider rejects
+`image/heic` deterministically) and hands
 the edge the ADR-062 envelope `{"media": [{"kind", "media_type", "base64"}]}`; the edge stores each
 item as an artifact, transcribes it, rewrites the item to an artifact reference plus transcript and
 appends the `[image transcript]`/`[voice message transcript]` line to the admitted text (ADR-062,

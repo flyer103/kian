@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage images: the adapter asks the bridge for the JPEG variant, so a photo reaches the model
+  as a transcript instead of a bare `[image]` marker (CHANNEL-IMESSAGE §3.2/§4, ADR-064 amendment).**
+  The provider rejects `image/heic` deterministically, so an iPhone photo's original bytes failed OCR
+  on every row. `GET /v1/attachment` now accepts the same `?as=jpeg` selector as the positioned route
+  (sips-backed `image/jpeg`, `400` on any other value, `503` on a failed conversion), and the adapter
+  requests it for each `image/*` item while the envelope's `media_type` keeps following the response
+  header. The generation guard is untouched: a stale id is still `409`.
 - **Cron worktrees: nested `git` runs scrub the inherited repository environment.** A `kian`
   started under a hook (or any wrapper exporting `GIT_DIR`/`GIT_WORK_TREE`) no longer points
   worktree inspection, creation or cleanup at that checkout instead of the configured repo

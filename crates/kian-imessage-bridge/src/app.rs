@@ -583,6 +583,20 @@ struct AttachmentQuery {
     attachment_id: String,
     #[serde(default)]
     generation: Option<String>,
+    #[serde(rename = "as")]
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// `?as=jpeg` asks for the sips-backed `image/jpeg` variant of an
+/// `image/heic` attachment; any other value is a client error so a typo
+/// never silently serves bytes the caller cannot read.
+fn requested_jpeg(raw: Option<&str>) -> Result<bool, &'static str> {
+    match raw {
+        None => Ok(false),
+        Some("jpeg") => Ok(true),
+        Some(_) => Err("`as` must be `jpeg` when present"),
+    }
 }
 
 /// `{rowid}:{index}`, exactly the id `/v1/updates` publishes.
@@ -602,7 +616,9 @@ fn not_found() -> Response {
 
 /// `GET /v1/attachment` (CHANNEL-IMESSAGE §3.2): the bytes of one item,
 /// resolved by the bridge from the row the id names. The file path never
-/// crosses the wire in either direction.
+/// crosses the wire in either direction. `?as=jpeg` answers the same
+/// `image/jpeg` variant the positioned route serves, so a caller that
+/// must keep the generation guard still gets model-readable bytes.
 async fn attachment<B: Backend>(
     State(app): State<Arc<App<B>>>,
     headers: HeaderMap,
@@ -638,7 +654,13 @@ async fn attachment<B: Backend>(
             true,
         );
     }
-    serve_attachment_at(&app, rowid, index, false).await
+    let as_jpeg = match requested_jpeg(query.variant.as_deref()) {
+        Ok(as_jpeg) => as_jpeg,
+        Err(detail) => {
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", detail, true);
+        }
+    };
+    serve_attachment_at(&app, rowid, index, as_jpeg).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -696,16 +718,10 @@ async fn attachment_by_position<B: Backend>(
             true,
         );
     };
-    let as_jpeg = match query.variant.as_deref() {
-        None => false,
-        Some("jpeg") => true,
-        Some(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "`as` must be `jpeg` when present",
-                true,
-            );
+    let as_jpeg = match requested_jpeg(query.variant.as_deref()) {
+        Ok(as_jpeg) => as_jpeg,
+        Err(detail) => {
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", detail, true);
         }
     };
     serve_attachment_at(&app, rowid, index, as_jpeg).await
@@ -1212,16 +1228,19 @@ mod tests {
         path
     }
 
-    fn photo_row_at(rowid: u64, sender: &str, path: &str) -> Value {
-        let mut row = photo_message(rowid, sender);
-        row["attachments"][0]["filename"] = json!(path);
-        row
+    fn attachment_request(app: &Arc<App<Arc<Fake>>>, id: &str) -> Query<AttachmentQuery> {
+        attachment_request_variant(app, id, None)
     }
 
-    fn attachment_request(app: &Arc<App<Arc<Fake>>>, id: &str) -> Query<AttachmentQuery> {
+    fn attachment_request_variant(
+        app: &Arc<App<Arc<Fake>>>,
+        id: &str,
+        variant: Option<&str>,
+    ) -> Query<AttachmentQuery> {
         Query(AttachmentQuery {
             attachment_id: id.to_string(),
             generation: Some(app.cursor.generation()),
+            variant: variant.map(str::to_string),
         })
     }
 
@@ -1309,6 +1328,7 @@ mod tests {
             Query(AttachmentQuery {
                 attachment_id: "41:0".into(),
                 generation: None,
+                variant: None,
             }),
         )
         .await;
@@ -1353,6 +1373,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_query_route_serves_the_jpeg_variant_when_asked() {
+        let dir = temp_dir();
+        let original = dir.join("photo.heic");
+        let original_bytes = b"heic-original";
+        std::fs::write(&original, original_bytes).unwrap();
+        seed_attachment(
+            &dir,
+            42,
+            8,
+            Some(&original),
+            Some("image/heic"),
+            Some(original_bytes.len() as i64),
+            false,
+            "+14155551212",
+        );
+        let sips = fake_sips(&dir, 0, None);
+        let app = app_with_attachment_db(
+            dir.clone(),
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            sips,
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request_variant(&app, "42:0", Some("jpeg")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()["x-kian-variant"], "jpeg");
+        assert_eq!(
+            response.headers()["x-kian-total-bytes"],
+            original_bytes.len().to_string()
+        );
+        let served = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&served[..], b"\xff\xd8\xff\xe0fake-jpeg");
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+    }
+
+    #[tokio::test]
+    async fn attachment_query_route_rejects_an_unknown_variant() {
+        let dir = temp_dir();
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request_variant(&app, "42:0", Some("png")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "bad_request");
+    }
+
+    #[tokio::test]
     async fn attachment_refuses_a_stale_generation() {
         let app = app(Fake::new(), Vec::new());
         let response = attachment(
@@ -1361,6 +1442,7 @@ mod tests {
             Query(AttachmentQuery {
                 attachment_id: "41:0".into(),
                 generation: Some("a-previous-chat-db".into()),
+                variant: None,
             }),
         )
         .await;
