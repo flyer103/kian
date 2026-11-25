@@ -1,12 +1,26 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
 pub const SIPS: &str = "/usr/bin/sips";
+
+/// Extra `locate` attempts made when the attachment row is not committed yet.
+///
+/// kian fetches the bytes of an attachment as soon as `/v1/updates` mentions it,
+/// but Messages commits the `attachment` and `message_attachment_join` rows a
+/// moment after the `message` row itself. Inside that window `locate` returns
+/// `Ok(None)` and used to answer 404, while the very same request is a 200 a few
+/// hundred milliseconds later -- and kian does not retry. Six attempts spaced
+/// `LOCATE_RETRY_DELAY` apart ride out that window (~1.5s) while keeping a truly
+/// missing attachment a fast 404.
+pub const LOCATE_RETRIES: usize = 6;
+
+/// Spacing between two `locate` attempts while waiting for that commit.
+pub const LOCATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct AttachmentSource {
@@ -81,6 +95,20 @@ impl AttachmentSource {
         tokio::task::spawn_blocking(move || locate_in_db(&db, rowid, index))
             .await
             .map_err(|_| AttachmentError::Unavailable)?
+    }
+
+    /// [`Self::locate`], retried while the row is not committed yet.
+    ///
+    /// See [`LOCATE_RETRIES`] for why the first miss is not final.
+    pub async fn locate_settled(
+        &self,
+        rowid: u64,
+        index: usize,
+    ) -> Result<Option<LocatedAttachment>, AttachmentError> {
+        locate_when_committed(LOCATE_RETRIES, LOCATE_RETRY_DELAY, || {
+            self.locate(rowid, index)
+        })
+        .await
     }
 
     pub async fn read(
@@ -237,6 +265,33 @@ impl AttachmentSource {
     }
 }
 
+/// Retries `locate` while it reports `Ok(None)`.
+///
+/// Only a "row not committed yet" miss is retried. A database failure or any
+/// other error surfaces on the first attempt, so the 410/413/415/503 semantics
+/// of the caller are unchanged.
+pub async fn locate_when_committed<F, Fut>(
+    retries: usize,
+    delay: Duration,
+    mut locate: F,
+) -> Result<Option<LocatedAttachment>, AttachmentError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<LocatedAttachment>, AttachmentError>>,
+{
+    let mut attempts = 0;
+    loop {
+        if let Some(located) = locate().await? {
+            return Ok(Some(located));
+        }
+        if attempts >= retries {
+            return Ok(None);
+        }
+        attempts += 1;
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn locate_in_db(
     db: &Path,
     rowid: u64,
@@ -361,8 +416,13 @@ fn redacted_prefix(path: &Path, home: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{path_shape, redacted_prefix, resolve_attachment_path};
+    use super::{
+        AttachmentError, LocatedAttachment, locate_when_committed, path_shape, redacted_prefix,
+        resolve_attachment_path,
+    };
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     const HOME: &str = "/Users/tester";
 
@@ -402,5 +462,66 @@ mod tests {
         assert_eq!(prefix.chars().count(), 30);
         assert!(!prefix.contains(HOME));
     }
-}
 
+    fn sample_attachment() -> LocatedAttachment {
+        LocatedAttachment {
+            filename: PathBuf::from("/Users/tester/Library/Messages/Attachments/a/IMG_0035.heic"),
+            mime_type: Some("image/heic".into()),
+            total_bytes: Some(42),
+            is_sticker: false,
+            sender: Some("+15551234567".into()),
+            is_from_me: false,
+            path_shape: "~",
+            redacted_path: "~/Library/Messages/Attachm".into(),
+        }
+    }
+
+    /// The commit race: two misses (kian arrived before `chat.db` had the
+    /// join/attachment rows) followed by a hit must be served, not 404'd.
+    #[tokio::test]
+    async fn a_row_committed_after_two_misses_is_found() {
+        let calls = Cell::new(0_usize);
+        let located = locate_when_committed(6, Duration::ZERO, || {
+            let attempt = calls.get() + 1;
+            calls.set(attempt);
+            async move {
+                if attempt < 3 {
+                    Ok(None)
+                } else {
+                    Ok(Some(sample_attachment()))
+                }
+            }
+        })
+        .await
+        .expect("a committed row must not be an error");
+        assert_eq!(calls.get(), 3);
+        let located = located.expect("the third attempt finds the row");
+        assert_eq!(located.mime_type.as_deref(), Some("image/heic"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_row_stays_not_found_after_the_whole_budget() {
+        let calls = Cell::new(0_usize);
+        let located = locate_when_committed(6, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Ok(None) }
+        })
+        .await
+        .expect("an absent row is not an error");
+        assert_eq!(calls.get(), 7, "one try plus six retries");
+        assert!(located.is_none());
+    }
+
+    #[tokio::test]
+    async fn database_failures_are_never_retried() {
+        let calls = Cell::new(0_usize);
+        let error = locate_when_committed(6, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            async { Err::<Option<LocatedAttachment>, _>(AttachmentError::Unavailable) }
+        })
+        .await
+        .expect_err("a failing database must surface immediately");
+        assert!(matches!(error, AttachmentError::Unavailable));
+        assert_eq!(calls.get(), 1, "503 must not be delayed or swallowed");
+    }
+}

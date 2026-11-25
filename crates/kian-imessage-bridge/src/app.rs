@@ -754,12 +754,16 @@ async fn attachment_by_position<B: Backend>(
     let Some(attachment_source) = app.attachment_source.as_ref() else {
         return attachment_unavailable();
     };
-    let located = match attachment_source.locate(rowid, index).await {
+    let located = match attachment_source.locate_settled(rowid, index).await {
         Ok(Some(located)) => located,
         Ok(None) => return not_found(),
         Err(_) => return attachment_unavailable(),
     };
-    if !visible_attachment(located.sender.as_deref(), located.is_from_me, &app.participants) {
+    if !visible_attachment(
+        located.sender.as_deref(),
+        located.is_from_me,
+        &app.participants,
+    ) {
         return not_found();
     }
     let attachment = match attachment_source
