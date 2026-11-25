@@ -2,12 +2,12 @@
 //!
 //! Four routes on a loopback listener, all bearer-authenticated:
 //! `GET /v1/health`, `GET /v1/updates` (bounded long poll over an
-//! exclusive `rowid` cursor), `GET /v1/attachment` (the bytes of one
-//! item an already-filtered page named, guarded by the database
-//! generation), and `POST /v1/send` (with the caller's `client_id` as
-//! the delivery idempotency key). No route reads arbitrary chats, lists
-//! chats, or sends to a target the caller did not name: the surface is
-//! exactly the contract.
+//! exclusive `rowid` cursor), `GET /v1/attachment/{rowid}/{index}` (the
+//! bytes of one item an already-filtered page named, plus its legacy
+//! generation-guarded form), and `POST /v1/send` (with the caller's
+//! `client_id` as the delivery idempotency key). No route reads
+//! arbitrary chats, lists chats, or sends to a target the caller did
+//! not name: the surface is exactly the contract.
 //!
 //! The bridge applies the **privacy filter** (`watch.participants`) to
 //! every page before it leaves the Mac, and nothing else: the sender
@@ -20,8 +20,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -29,6 +29,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::attachment::{AttachmentError, AttachmentSource};
 use crate::imsg::{Backend, RpcError};
 use crate::state::CursorStore;
 
@@ -129,6 +130,7 @@ pub struct App<B: Backend> {
     /// `watch.max_attachment_bytes`: the largest file
     /// `/v1/attachment` returns.
     max_attachment_bytes: u64,
+    attachment_source: Option<AttachmentSource>,
     cache: Mutex<SendCache>,
     /// Sends are serialized (one at a time, §3.2): order is preserved and
     /// a duplicate `client_id` arriving mid-flight joins the first.
@@ -165,11 +167,18 @@ impl<B: Backend> App<B> {
             page_limit,
             attachments,
             max_attachment_bytes,
+            attachment_source: None,
             cache: Mutex::new(SendCache::new()),
             send_lock: tokio::sync::Mutex::new(()),
             automation: Mutex::new("unknown".to_string()),
             counters: Counters::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_attachment_source(mut self, source: AttachmentSource) -> Self {
+        self.attachment_source = Some(source);
+        self
     }
 
     /// The axum router over this state.
@@ -178,6 +187,10 @@ impl<B: Backend> App<B> {
             .route("/v1/health", get(health::<B>))
             .route("/v1/updates", get(updates::<B>))
             .route("/v1/attachment", get(attachment::<B>))
+            .route(
+                "/v1/attachment/{rowid}/{index}",
+                get(attachment_by_position::<B>),
+            )
             .route("/v1/send", post(send::<B>))
             .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT_BYTES))
             .with_state(Arc::clone(self))
@@ -582,7 +595,7 @@ fn not_found() -> Response {
     error_response(
         StatusCode::NOT_FOUND,
         "not_found",
-        "no such attachment in this database generation",
+        "no such attachment",
         true,
     )
 }
@@ -669,6 +682,144 @@ async fn attachment<B: Backend>(
     let content_type = HeaderValue::from_str(media_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     (StatusCode::OK, [(CONTENT_TYPE, content_type)], bytes).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachmentVariantQuery {
+    #[serde(rename = "as")]
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+fn parse_attachment_position(rowid: &str, index: &str) -> Option<(u64, usize)> {
+    let rowid = rowid.parse::<u64>().ok()?;
+    let index = index.parse::<usize>().ok()?;
+    i64::try_from(rowid).ok()?;
+    i64::try_from(index).ok()?;
+    Some((rowid, index))
+}
+
+fn visible_attachment(sender: Option<&str>, is_from_me: bool, participants: &[String]) -> bool {
+    if participants.is_empty() || is_from_me {
+        return true;
+    }
+    sender.and_then(normalize_handle).is_some_and(|sender| {
+        participants.iter().any(|participant| {
+            normalize_handle(participant).is_some_and(|participant| participant == sender)
+        })
+    })
+}
+
+fn attachment_unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "attachment_unavailable",
+        "cannot read the Messages database or attachment file; check Full Disk Access",
+        true,
+    )
+}
+
+async fn attachment_by_position<B: Backend>(
+    State(app): State<Arc<App<B>>>,
+    headers: HeaderMap,
+    AxumPath((raw_rowid, raw_index)): AxumPath<(String, String)>,
+    Query(query): Query<AttachmentVariantQuery>,
+) -> Response {
+    if !authorized(&headers, &app.token) {
+        return unauthorized();
+    }
+    if !app.attachments {
+        return not_found();
+    }
+    let Some((rowid, index)) = parse_attachment_position(&raw_rowid, &raw_index) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "rowid and index must be non-negative integers",
+            true,
+        );
+    };
+    let as_jpeg = match query.variant.as_deref() {
+        None => false,
+        Some("jpeg") => true,
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`as` must be `jpeg` when present",
+                true,
+            );
+        }
+    };
+    let Some(attachment_source) = app.attachment_source.as_ref() else {
+        return attachment_unavailable();
+    };
+    let located = match attachment_source.locate(rowid, index).await {
+        Ok(Some(located)) => located,
+        Ok(None) => return not_found(),
+        Err(_) => return attachment_unavailable(),
+    };
+    if !visible_attachment(located.sender.as_deref(), located.is_from_me, &app.participants) {
+        return not_found();
+    }
+    let attachment = match attachment_source
+        .read(rowid, index, located, app.max_attachment_bytes, as_jpeg)
+        .await
+    {
+        Ok(attachment) => attachment,
+        Err(AttachmentError::Gone {
+            basename,
+            shape,
+            redacted,
+        }) => {
+            tracing::warn!(
+                rowid,
+                index,
+                shape,
+                prefix = %redacted,
+                "attachment file is missing on disk"
+            );
+            let detail = format!(
+                "the attachment file no longer exists (basename={basename}, shape={shape})"
+            );
+            return error_response(StatusCode::GONE, "gone", &detail, false);
+        }
+        Err(AttachmentError::TooLarge) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                "the attachment exceeds watch.max_attachment_bytes",
+                false,
+            );
+        }
+        Err(AttachmentError::Unsupported(_)) => {
+            return error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_type",
+                "the attachment is not a supported image",
+                false,
+            );
+        }
+        Err(AttachmentError::Unavailable) => return attachment_unavailable(),
+    };
+    let Ok(content_type) = HeaderValue::from_str(&attachment.media_type) else {
+        return attachment_unavailable();
+    };
+    let Ok(content_length) = HeaderValue::from_str(&attachment.bytes.len().to_string()) else {
+        return attachment_unavailable();
+    };
+    let Ok(total_bytes) = HeaderValue::from_str(&attachment.total_bytes.to_string()) else {
+        return attachment_unavailable();
+    };
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(CONTENT_TYPE, content_type);
+    response_headers.insert(CONTENT_LENGTH, content_length);
+    response_headers.insert("x-kian-total-bytes", total_bytes);
+    response_headers.insert(
+        "x-kian-variant",
+        HeaderValue::from_static(attachment.variant),
+    );
+    (StatusCode::OK, response_headers, attachment.bytes).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -841,10 +992,14 @@ async fn send<B: Backend>(
 mod tests {
     use super::*;
     use crate::imsg::{AfterPage, Status};
+    use axum::body::Body;
     use axum::body::to_bytes;
+    use axum::http::Request;
     use axum::http::header::AUTHORIZATION;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
+    use tower::ServiceExt;
 
     /// (to, chat_guid, text, service) of every backend send.
     type SendArgs = (Option<String>, Option<String>, String, String);
@@ -959,6 +1114,128 @@ mod tests {
         )
     }
 
+    fn app_with_attachment_db(
+        dir: PathBuf,
+        participants: Vec<String>,
+        max_attachment_bytes: u64,
+        sips: PathBuf,
+    ) -> Arc<App<Arc<Fake>>> {
+        let db = dir.join("chat.db");
+        let cursor = CursorStore::load(&dir, &db);
+        cursor.observe(100);
+        Arc::new(
+            App::new(
+                Fake::new(),
+                "token-0123456789",
+                cursor,
+                participants,
+                Duration::from_millis(1),
+                10,
+                100,
+                true,
+                max_attachment_bytes,
+            )
+            .with_attachment_source(
+                AttachmentSource::new(db, dir.join("attachment-cache")).with_sips(sips),
+            ),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_attachment(
+        dir: &Path,
+        rowid: i64,
+        attachment_id: i64,
+        filename: Option<&Path>,
+        mime_type: Option<&str>,
+        total_bytes: Option<i64>,
+        is_sticker: bool,
+        sender: &str,
+    ) {
+        let connection = rusqlite::Connection::open(dir.join("chat.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS handle (
+                    ROWID INTEGER PRIMARY KEY,
+                    id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS message (
+                    ROWID INTEGER PRIMARY KEY,
+                    handle_id INTEGER,
+                    is_from_me INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS attachment (
+                    ROWID INTEGER PRIMARY KEY,
+                    filename TEXT,
+                    transfer_name TEXT,
+                    mime_type TEXT,
+                    total_bytes INTEGER,
+                    is_sticker INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS message_attachment_join (
+                    message_id INTEGER,
+                    attachment_id INTEGER
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO handle (ROWID, id) VALUES (1, ?1)",
+                [sender],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO message (ROWID, handle_id) VALUES (?1, 1)",
+                [rowid],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO attachment
+                 (ROWID, filename, transfer_name, mime_type, total_bytes, is_sticker)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    attachment_id,
+                    filename.map(|path| path.to_string_lossy().to_string()),
+                    filename.map(|path| basename(&path.to_string_lossy())),
+                    mime_type,
+                    total_bytes,
+                    is_sticker,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_attachment_join (message_id, attachment_id)
+                 VALUES (?1, ?2)",
+                [rowid, attachment_id],
+            )
+            .unwrap();
+    }
+
+    fn fake_sips(dir: &Path, exit_code: i32, invocation_log: Option<&Path>) -> PathBuf {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-sips");
+        let log = invocation_log
+            .map(|path| {
+                format!(
+                    "printf x >> '{}'\n",
+                    path.to_string_lossy().replace('\'', "'\\''")
+                )
+            })
+            .unwrap_or_default();
+        let script = format!(
+            "#!/bin/sh\n{log}out=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--out' ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\nif [ {exit_code} -ne 0 ]; then exit {exit_code}; fi\nprintf '\\377\\330\\377\\340fake-jpeg' > \"$out\"\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     fn photo_row_at(rowid: u64, sender: &str, path: &str) -> Value {
         let mut row = photo_message(rowid, sender);
         row["attachments"][0]["filename"] = json!(path);
@@ -1051,7 +1328,7 @@ mod tests {
     async fn attachment_requires_the_bearer_token() {
         let app = app(Fake::new(), Vec::new());
         let response = attachment(
-            State(app),
+            State(Arc::clone(&app)),
             HeaderMap::new(),
             Query(AttachmentQuery {
                 attachment_id: "41:0".into(),
@@ -1209,6 +1486,390 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn position_response(
+        app: &Arc<App<Arc<Fake>>>,
+        rowid: &str,
+        index: &str,
+        variant: Option<&str>,
+    ) -> Response {
+        attachment_by_position(
+            State(Arc::clone(app)),
+            bearer(),
+            AxumPath((rowid.to_string(), index.to_string())),
+            Query(AttachmentVariantQuery {
+                variant: variant.map(str::to_string),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_requires_a_bearer_token() {
+        let dir = temp_dir();
+        let app = app_with_attachment_db(
+            dir,
+            Vec::new(),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = attachment_by_position(
+            State(Arc::clone(&app)),
+            HeaderMap::new(),
+            AxumPath(("41".into(), "0".into())),
+            Query(AttachmentVariantQuery { variant: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "unauthorized");
+        assert!(!body.to_string().contains("token-0123456789"));
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let response = attachment_by_position(
+            State(Arc::clone(&app)),
+            wrong,
+            AxumPath(("41".into(), "0".into())),
+            Query(AttachmentVariantQuery { variant: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_route_is_bearer_guarded() {
+        let app = app_with_attachment_db(
+            temp_dir(),
+            Vec::new(),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let request = Request::builder()
+            .uri("/v1/attachment/41/0?as=jpeg")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_rejects_invalid_positions_and_variants() {
+        let dir = temp_dir();
+        let app = app_with_attachment_db(
+            dir,
+            Vec::new(),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        for (rowid, index) in [("-1", "0"), ("one", "0"), ("1", "-2")] {
+            let response = position_response(&app, rowid, index, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = position_response(&app, "1", "0", Some("png")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_serves_the_original_with_contract_headers() {
+        let dir = temp_dir();
+        let original = dir.join("photo.png");
+        let bytes = b"\x89PNG\r\noriginal";
+        std::fs::write(&original, bytes).unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&original),
+            Some("image/png"),
+            Some(1234),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = position_response(&app, "41", "0", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()[CONTENT_LENGTH], bytes.len().to_string());
+        assert_eq!(response.headers()["x-kian-total-bytes"], "1234");
+        assert_eq!(response.headers()["x-kian-variant"], "original");
+        let served = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&served[..], bytes);
+    }
+
+    #[tokio::test]
+    async fn heic_jpeg_variant_uses_sips_and_never_modifies_the_original() {
+        let dir = temp_dir();
+        let original = dir.join("photo.heic");
+        let original_bytes = b"heic-original";
+        std::fs::write(&original, original_bytes).unwrap();
+        seed_attachment(
+            &dir,
+            42,
+            8,
+            Some(&original),
+            Some("image/heic"),
+            Some(original_bytes.len() as i64),
+            false,
+            "+14155551212",
+        );
+        let invocation_log = dir.join("sips.log");
+        let sips = fake_sips(&dir, 0, Some(&invocation_log));
+        let app = app_with_attachment_db(
+            dir.clone(),
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            sips,
+        );
+
+        let first = position_response(&app, "42", "0", Some("jpeg")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            first.headers()["x-kian-total-bytes"],
+            original_bytes.len().to_string()
+        );
+        assert_eq!(first.headers()["x-kian-variant"], "jpeg");
+        let served = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&served[..], b"\xff\xd8\xff\xe0fake-jpeg");
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+
+        let second = position_response(&app, "42", "0", Some("jpeg")).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(std::fs::read(invocation_log).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn heic_jpeg_generation_failure_is_a_redacted_503() {
+        let dir = temp_dir();
+        let original = dir.join("photo.heic");
+        std::fs::write(&original, b"heic-original").unwrap();
+        seed_attachment(
+            &dir,
+            43,
+            9,
+            Some(&original),
+            Some("image/heic"),
+            Some(13),
+            false,
+            "+14155551212",
+        );
+        let sips = fake_sips(&dir, 7, None);
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            sips,
+        );
+        let response = position_response(&app, "43", "0", Some("jpeg")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body(response).await;
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Full Disk Access")
+        );
+        assert!(!body.to_string().contains("/Users/"));
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_distinguishes_missing_rows_indexes_and_files() {
+        let dir = temp_dir();
+        let missing_file = dir.join("gone.jpg");
+        seed_attachment(
+            &dir,
+            44,
+            10,
+            Some(&missing_file),
+            Some("image/jpeg"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        seed_attachment(
+            &dir,
+            48,
+            14,
+            None,
+            Some("image/jpeg"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        assert_eq!(
+            position_response(&app, "999", "0", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            position_response(&app, "44", "1", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            position_response(&app, "44", "0", None).await.status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            position_response(&app, "48", "0", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_of_a_self_sent_photo_is_visible() {
+        let dir = temp_dir();
+        let photo = dir.join("IMG_0040.heic");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            46,
+            12,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let connection = rusqlite::Connection::open(dir.join("chat.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE message SET handle_id = NULL, is_from_me = 1 WHERE ROWID = 46",
+                [],
+            )
+            .unwrap();
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/nonexistent/sips"),
+        );
+        assert_eq!(
+            position_response(&app, "46", "0", None).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_rejects_unsupported_and_oversize_files() {
+        let dir = temp_dir();
+        let video = dir.join("clip.mp4");
+        std::fs::write(&video, b"not-a-real-video").unwrap();
+        seed_attachment(
+            &dir,
+            45,
+            11,
+            Some(&video),
+            Some("video/mp4"),
+            Some(17),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir.clone(),
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        assert_eq!(
+            position_response(&app, "45", "0", None).await.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let sticker = dir.join("sticker.gif");
+        std::fs::write(&sticker, b"gif").unwrap();
+        seed_attachment(
+            &dir,
+            49,
+            15,
+            Some(&sticker),
+            Some("image/gif"),
+            Some(3),
+            true,
+            "+14155551212",
+        );
+        assert_eq!(
+            position_response(&app, "49", "0", None).await.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let large = dir.join("large.jpg");
+        std::fs::write(&large, b"too-large").unwrap();
+        seed_attachment(
+            &dir,
+            46,
+            12,
+            Some(&large),
+            Some("image/jpeg"),
+            Some(9),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            4,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = position_response(&app, "46", "0", None).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body(response).await["kind"], "too_large");
+    }
+
+    #[tokio::test]
+    async fn positioned_attachment_hides_filtered_rows_and_redacts_database_failures() {
+        let dir = temp_dir();
+        let image = dir.join("photo.jpg");
+        std::fs::write(&image, b"jpeg").unwrap();
+        seed_attachment(
+            &dir,
+            47,
+            13,
+            Some(&image),
+            Some("image/jpeg"),
+            Some(4),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+19995550000".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        assert_eq!(
+            position_response(&app, "47", "0", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let broken = temp_dir();
+        let app = app_with_attachment_db(
+            broken,
+            Vec::new(),
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = position_response(&app, "47", "0", None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body(response).await;
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Full Disk Access")
+        );
+        assert!(!body.to_string().contains("/Users/"));
     }
 
     #[test]

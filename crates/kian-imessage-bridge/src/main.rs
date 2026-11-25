@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kian_imessage_bridge::app::App;
+use kian_imessage_bridge::attachment::AttachmentSource;
 use kian_imessage_bridge::config::{BridgeConfig, expand};
 use kian_imessage_bridge::imsg::{Backend, ImsgRpc};
 use kian_imessage_bridge::state::CursorStore;
@@ -20,6 +21,13 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CONFIG: &str = "~/.config/kian/imessage-bridge.json";
+
+fn attachment_cache_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library/Caches/kian-attachments")
+}
 
 /// How many `messages.after` pages the first-boot tail bootstrap may
 /// walk (a safety bound; 500 rows per page, so 10k pages ≈ 5M rows).
@@ -131,17 +139,23 @@ async fn run(config_path: &std::path::Path) -> Result<(), String> {
         );
     }
 
-    let app = Arc::new(App::new(
-        backend,
-        config.token.clone(),
-        cursor,
-        config.participants.clone(),
-        config.poll_interval,
-        config.catchup_rows,
-        config.page_limit,
-        config.attachments,
-        config.max_attachment_bytes,
-    ));
+    let app = Arc::new(
+        App::new(
+            backend,
+            config.token.clone(),
+            cursor,
+            config.participants.clone(),
+            config.poll_interval,
+            config.catchup_rows,
+            config.page_limit,
+            config.attachments,
+            config.max_attachment_bytes,
+        )
+        .with_attachment_source(AttachmentSource::new(
+            config.db.clone(),
+            attachment_cache_dir(),
+        )),
+    );
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("cannot bind {}: {e}", config.listen))?;
