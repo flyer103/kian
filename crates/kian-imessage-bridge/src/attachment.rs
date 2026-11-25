@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
@@ -14,10 +14,10 @@ pub const SIPS: &str = "/usr/bin/sips";
 /// but Messages commits the `attachment` and `message_attachment_join` rows a
 /// moment after the `message` row itself. Inside that window `locate` returns
 /// `Ok(None)` and used to answer 404, while the very same request is a 200 a few
-/// hundred milliseconds later -- and kian does not retry. Six attempts spaced
-/// `LOCATE_RETRY_DELAY` apart ride out that window (~1.5s) while keeping a truly
-/// missing attachment a fast 404.
-pub const LOCATE_RETRIES: usize = 6;
+/// hundred milliseconds later -- and kian does not retry. Thirty-two attempts
+/// spaced `LOCATE_RETRY_DELAY` apart ride out that window (~8s) while keeping a
+/// truly missing attachment a 404 once the budget is spent.
+pub const LOCATE_RETRIES: usize = 32;
 
 /// Spacing between two `locate` attempts while waiting for that commit.
 pub const LOCATE_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -105,10 +105,23 @@ impl AttachmentSource {
         rowid: u64,
         index: usize,
     ) -> Result<Option<LocatedAttachment>, AttachmentError> {
-        locate_when_committed(LOCATE_RETRIES, LOCATE_RETRY_DELAY, || {
+        let started = Instant::now();
+        let mut attempts = 0usize;
+        let located = locate_when_committed(LOCATE_RETRIES, LOCATE_RETRY_DELAY, || {
+            attempts += 1;
             self.locate(rowid, index)
         })
-        .await
+        .await?;
+        if attempts > 1 && located.is_some() {
+            tracing::warn!(
+                rowid,
+                index,
+                attempts,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "attachment row was not committed when kian asked; served after retrying"
+            );
+        }
+        Ok(located)
     }
 
     pub async fn read(
