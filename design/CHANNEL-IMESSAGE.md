@@ -360,23 +360,29 @@ instead of disappearing from a model's view.
   `"unsent"` rows reuse an existing `guid` and are **not** emitted in phase 1, because a correction
   is not a new input (§9, §11).
 
-**`GET /v1/attachment?attachment_id=<rowid>:<index>&generation=<g>`** — the bytes of one attachment:
+**`GET /v1/attachment/{rowid}/{index}[?as=jpeg]`** — the bytes of one attachment:
 
-- The id is resolved by the bridge, never by the caller: it re-reads the row through `imsg` and
-  takes `attachments[<index>].filename`. No path is accepted from the client, so the metadata
-  whitelist's "never a path" property holds (§3.2 above): the client only names an item an
-  already-filtered `/v1/updates` row published.
-- `generation` must equal the bridge's current `database.generation`; a mismatch answers
-  `409 stale_generation`, because `attachment_id` embeds a ROWID that rebases when `chat.db` is
-  replaced or restored (§2.5 rule 6, §9). Serving whatever file now occupies that position would be
-  a plausible, wrong answer — worse than no bytes.
-- `200` returns the raw bytes with `content-type` from the attachment's `mime_type`
-  (`application/octet-stream` when absent). `413 too_large` when the file exceeds
-  `watch.max_attachment_bytes`. `404 not_found` for an unknown row or index, an unreadable file, or
-  a row the `watch.participants` filter hides (§3.3) — a hidden row and a missing one are
-  deliberately indistinguishable.
-- `401 unauthorized` and `503 database_unreadable` behave exactly like every other route; failures
-  use the same `{"protocol":1,"ok":false,"kind","detail","retry_safe"}` envelope as `/v1/send`.
+- The bridge resolves the position through `chat.db`'s `message_attachment_join` and `attachment`
+  tables, ordered by attachment ROWID. No path is accepted from the client, so the metadata
+  whitelist's "never a path" property holds (§3.2 above).
+- Without `as`, `200` returns the original bytes with the attachment's `mime_type` as
+  `content-type`. `?as=jpeg` returns an `image/jpeg` variant for `image/heic`: the bridge runs
+  `/usr/bin/sips -s format jpeg -Z 2048` against a temporary file, atomically renames the result
+  into its disposable cache, and never modifies the original. JPEG generation is serialized in the
+  bridge process; a failed conversion answers `503 attachment_unavailable` and never falls back to
+  HEIC bytes.
+- `200` includes `content-length`, `x-kian-total-bytes` from the attachment row and
+  `x-kian-variant: original|jpeg`.
+- `400 bad_request` covers a non-integer or negative position, or an unsupported `as` value.
+  `404 not_found` covers an unknown message or index, a missing filename, or a row outside
+  `watch.participants`. `410 gone` means the stored file has disappeared; `413 too_large`,
+  `415 unsupported_type` and `503 attachment_unavailable` cover the remaining byte-read failures.
+- `401 unauthorized` and `503` failures use the same
+  `{"protocol":1,"ok":false,"kind","detail","retry_safe"}` envelope as `/v1/send`; errors never
+  contain a local path, filename or token.
+- The legacy `GET /v1/attachment?attachment_id=<rowid>:<index>&generation=<g>` form remains for
+  protocol-1 compatibility. Its `generation` must equal `database.generation`; a mismatch answers
+  `409 stale_generation`, because its id is meaningful only inside that database instance.
 
 **`POST /v1/send`** — one text message:
 
@@ -435,8 +441,9 @@ instead of disappearing from a model's view.
 - The adapter refuses a bridge whose `protocol != 1` (honest `Unavailable` naming the version).
 - `instance_id` change = bridge restart; `generation` change = different `chat.db`. Either resets
   the adapter's rowid cursor (§9) with one audit line; admission idempotency makes the replay safe.
-- A bytes fetch carries the `generation` of the page that named it; a mismatch is the `409` of
-  §3.2, never a silent re-read of a possibly different file.
+- The legacy query-form bytes fetch carries the `generation` of the page that named it; a mismatch
+  is the `409` of §3.2, never a silent re-read of a possibly different file. The path form resolves
+  the current database position directly.
 
 ## 4. Receive: `ChannelEvent` mapping
 
@@ -734,8 +741,9 @@ scripted in-process bridge mock (axum, the `wechat_channel.rs` shape).
   attachment projection against that same golden row (whitelist, basename, no path, byte length);
   cursor persistence + generation reset; `client_id` cache (hit, miss, uncertain cached, failure not
   cached); body cap; auth required on every route; loopback-only bind refusal; `/v1/attachment`
-  (bearer, bytes plus `content-type`, `409` stale generation, `413` oversize, `404` unknown id and a
-  row outside the participant filter).
+  (bearer, raw bytes plus headers, HEIC-to-JPEG conversion and cache reuse, `409` stale generation
+  on the legacy form, `410` missing file, `413` oversize, `415` non-image, `404` unknown id/
+  filename and a row outside the participant filter, and redacted `503` failures).
 
 **L2 — real `Server` + sqlite + mock bridge over loopback** (landed:
 `crates/kian-cli/tests/imessage_cli.rs`): one inbound message → exactly one
