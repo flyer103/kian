@@ -332,6 +332,7 @@ mod tests {
             chat_completions_path: chat_path.into(),
             connect_timeout_ms: DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
             idle_timeout_ms: DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+            max_request_bytes: None,
         }
     }
 

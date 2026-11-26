@@ -809,6 +809,24 @@ The profile is part of the session's slot binding: changing it for a live sessio
 `slot/migration`, never a silent request-shape change. Semantics:
 [ADR-054](../design/decisions/ADR-054-request-plans-and-model-profiles.md).
 
+An endpoint also takes an optional size bound, so a request the carrier would drop fails honestly
+before any byte flies:
+
+```yaml
+providers:
+  vadis:
+    base_url: http://127.0.0.1:8290/v1
+    api_key_env: VADIS_API_KEY
+    max_request_bytes: 33554432   # match the carrier's inbound bound
+```
+
+`providers.<name>.max_request_bytes` (bytes, floor 1024, absent = off) is checked against the
+serialized body; over it the turn fails `request_too_large` naming both sizes with nothing sent, and
+an HTTP 413 from the upstream classifies the same way. The class is non-retryable by default — the
+same bytes cannot succeed; a deployment that wants compaction to shrink the history first adds
+`request_too_large: compress_then_retry` to its `recovery:` table. Semantics:
+[ADR-067](../design/decisions/ADR-067-oversized-request-classification.md).
+
 ## Session budgets
 
 `agents.<name>.budgets.tokens` is a real ceiling: the loop builds the request plan, projects

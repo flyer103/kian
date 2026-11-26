@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Provider failures: an oversized request is a classified, non-retryable error
+  (`providers.<name>.max_request_bytes`, the `request_too_large` policy class, ADR-067).** The
+  openai-compatible seam compares the serialized body against the optional bound before the POST
+  and fails `request_too_large` with both sizes and nothing sent; an HTTP 413 answer classifies the
+  same way with the status and a bounded snippet. The class joins the closed policy vocabulary and
+  defaults to `fail`, because resending identical bytes cannot succeed.
 - **Channel images: an opt-in admission shape sends the media edge's image artifacts to a vision
   target (`superagent.shaping.vision`, CHANNEL-IMESSAGE §4/§11, ADR-065).** The shaper keeps the
   `{"kian": …}` wrapper byte-identical and adds a sibling `images` array of `{artifact,

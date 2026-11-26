@@ -311,7 +311,8 @@ graph TB
  Refinement (the implementation contract, `kian-orchestrator::recovery`):
 - The class vocabulary is closed and string-keyed for the policy table: `provider_down`,
  `rate_limited`, `context_overflow`, `tool_failed`, `store_failure`, `budget_exhausted`,
- `validation_failed`, `empty_response` (the constraint-7 soft failure), `unknown`. Wrapping the
+ `validation_failed`, `request_too_large` (a body the upstream refused or would refuse by size;
+ non-retryable by default, ADR-067), `empty_response` (the constraint-7 soft failure), `unknown`. Wrapping the
  typed seam/store errors (`ProviderError`, `ToolError`, `StoreError`, `InboxError`) means
  classification never parses error strings.
 - Policy resolution is **first-match-wins** in declaration order (deterministic); a class no rule
@@ -362,7 +363,10 @@ crash loop terminates instead of re-driving forever (constraint 8). The same ref
 last unbounded wait: the model call itself is bounded by `providers.<name>.connect_timeout_ms` and
 `providers.<name>.idle_timeout_ms` (a per-gap idle bound, never a total-request cap), so a provider
 that stops sending becomes an honest `failed` end that the ADR-035 reclaim can free, instead of a
-permanently `running` drain that no timer can detect.
+permanently `running` drain that no timer can detect. The same seam refuses an oversized body before
+the POST when `providers.<name>.max_request_bytes` is declared, so a request the upstream would drop
+becomes a `request_too_large` failure naming both sizes instead of a transport error that looks like
+an outage (ADR-067).
 
  Refinement (multi-replica claim admission, ADR-009): claiming is *conditional* — the claim lands only when no
 claims row exists, the row's lease is expired, or the claiming holder already owns the row; a fresh lease held by a
@@ -2060,7 +2064,8 @@ idempotent. No maintenance write ever changes event bytes.
 ## 10. Error-handling strategy
 
 - Pure classification function `classify(error, ctx) -> ErrorClass`: provider_down / rate_limited /
- context_overflow / tool_failed / store_failure / budget_exhausted / validation_failed …
+ context_overflow / request_too_large / tool_failed / store_failure / budget_exhausted /
+ validation_failed …
 - Policy table (declarative): `match → action`, action ∈ {backoff_retry, compress_then_retry,
  failover, interrupt_ask, fail}; disposition owned by the caller (A4).
 - Every recovery has a one-shot guard; budget refund semantics (A5).
