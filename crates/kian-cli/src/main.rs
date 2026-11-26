@@ -81,6 +81,9 @@ const USAGE: &str = "usage:
                                          ingest a local file into the artifact tree (ADR-061)
   kian lease inspect [--db <sqlite>] [--config <path>] [--json]
                                          epoch/TTL/holder of every lease
+  kian self inspect [--db <sqlite>] [--config <path>] [--window <dur>] [--session <uuid>] [--json]
+                                         one window of the durable stream (default 1h):
+                                         what the runtime did and where it is failing
   kian tickets [--db <sqlite>] [--config <path>] [--json]
                                          Ticket stage board: every worker session's
                                          'what is it waiting for' stage
@@ -171,6 +174,7 @@ fn main() -> ExitCode {
         Some("raise-budget") => raise_budget(&args[2..]),
         Some("artifacts") => artifacts(&args[2..]),
         Some("lease") => lease(&args[2..]),
+        Some("self") => self_cmd(&args[2..]),
         Some("tickets") => tickets(&args[2..]),
         Some("cron") => cron(&args[2..]),
         Some("job") => job(&args[2..]),
@@ -1654,6 +1658,116 @@ fn lease(args: &[String]) -> ExitCode {
         kian_cli::commands::run_lease_inspect(&parsed.config, parsed.db.as_deref(), parsed.json),
         "lease inspect",
     )
+}
+
+/// `kian self inspect [--db <sqlite>] [--config <path>] [--window <dur>]
+/// [--session <uuid>] [--json]` — one window of the durable stream
+/// (read-only embedded; SPEC §3.1). `--window` takes a unit
+/// (`30m`, `24h`); a bare number is refused rather than guessed.
+fn self_cmd(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first() else {
+        eprintln!(
+            "kian: `kian self` needs a subcommand (`inspect`)
+{USAGE}"
+        );
+        return ExitCode::from(2);
+    };
+    if sub != "inspect" {
+        eprintln!(
+            "kian: unknown self subcommand `{sub}`
+{USAGE}"
+        );
+        return ExitCode::from(2);
+    }
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut window = kian_cli::self_inspect::DEFAULT_WINDOW_MS;
+    let mut session = None;
+    let mut json = false;
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!(
+                        "kian: --config requires a path
+{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!(
+                        "kian: --db requires a path
+{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            "--window" => match iter.next() {
+                Some(raw) => match kian_cli::self_inspect::parse_window(raw) {
+                    Ok(ms) => window = ms,
+                    Err(e) => {
+                        eprintln!(
+                            "kian: {e}
+{USAGE}"
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "kian: --window requires a duration (e.g. 30m)
+{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match iter.next() {
+                Some(raw) => match kian_cli::commands::parse_session(raw) {
+                    Ok(id) => session = Some(id),
+                    Err(e) => {
+                        eprintln!(
+                            "kian: {e}
+{USAGE}"
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "kian: --session requires a uuid
+{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!(
+                    "kian: unknown self inspect option `{other}`
+{USAGE}"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let until_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let since_ms = until_ms.saturating_sub(window);
+    let opts = kian_cli::self_inspect::Options {
+        config_path: &config,
+        db: db.as_deref(),
+        since_ms,
+        until_ms,
+        session,
+    };
+    run_command(kian_cli::self_inspect::run(opts, json), "self inspect")
 }
 
 /// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the
