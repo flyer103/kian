@@ -178,7 +178,7 @@ pub fn parse_session(raw: &str) -> CmdResult<SessionId> {
         .map_err(|_| format!("`{raw}` is not a uuid"))
 }
 
-async fn open_reader(db: &Path) -> CmdResult<EventStore> {
+pub(crate) async fn open_reader(db: &Path) -> CmdResult<EventStore> {
     EventStore::open_read_only(db)
         .await
         .map_err(|e| format!("cannot open `{}` read-only: {e}", db.display()))

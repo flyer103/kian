@@ -84,6 +84,7 @@ pub mod ops;
 pub mod plugins;
 pub mod pricing;
 pub mod rotation;
+pub mod self_inspect;
 pub mod server;
 pub mod sidecars;
 pub mod superagent;

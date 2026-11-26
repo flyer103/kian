@@ -869,6 +869,66 @@ pub(crate) async fn events_where_kinds(
     Ok(events)
 }
 
+/// Every event of the given kinds whose recorded `ts` falls in
+/// `[since_ms, until_ms]`, ordered by `(ts, session, seq)` — the
+/// `kian self inspect` window read: one bounded slice of the stream,
+/// never the full history. The kind list is the report's compile-time
+/// set, never user input.
+pub(crate) async fn events_in_window(
+    pool: &SqlitePool,
+    kinds: &[&str],
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<Vec<Event>, StoreError> {
+    let placeholders = vec!["?"; kinds.len()].join(", ");
+    let sql = format!(
+        "SELECT session, version, envelope FROM events WHERE kind IN ({placeholders}) AND ts >= ? AND ts <= ? ORDER BY ts ASC, session ASC, seq ASC"
+    );
+    let mut query = sqlx::query_as::<_, (String, i64, String)>(&sql);
+    for kind in kinds {
+        query = query.bind(kind);
+    }
+    let rows = query
+        .bind(se_i64(since_ms, "self inspect since_ms")?)
+        .bind(se_i64(until_ms, "self inspect until_ms")?)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (session_col, version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session.0.to_string() != session_col {
+            return Err(StoreError::CorruptRow {
+                session: event.session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Event counts per kind whose recorded `ts` falls in
+/// `[since_ms, until_ms]`, kind-ascending — the report's volume
+/// section without decoding a single envelope (the `(kind, ts)` index
+/// serves it).
+pub(crate) async fn event_kind_counts(
+    pool: &SqlitePool,
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<Vec<(String, u64)>, StoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, COUNT(*) FROM events WHERE ts >= ? AND ts <= ? GROUP BY kind ORDER BY kind ASC",
+    )
+    .bind(se_i64(since_ms, "self inspect since_ms")?)
+    .bind(se_i64(until_ms, "self inspect until_ms")?)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, count)| (kind, count.max(0) as u64))
+        .collect())
+}
+
 /// The incremental publication (R9-10): ONE transaction that deletes
 /// the gone sessions' rows, upserts the changed sessions' rows and
 /// flips `view_state` to the new digest + pinned key. Same atomic

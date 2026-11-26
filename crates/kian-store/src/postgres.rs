@@ -820,6 +820,57 @@ pub(crate) async fn events_where_kinds(
     Ok(events)
 }
 
+/// Every event of the given kinds whose recorded `ts` falls in
+/// `[since_ms, until_ms]`, ordered by `(ts, session, seq)` (the
+/// sqlite twin's contract).
+pub(crate) async fn events_in_window(
+    pool: &PgPool,
+    kinds: &[&str],
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<Vec<Event>, StoreError> {
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT session, version, envelope FROM events WHERE kind = ANY($1::text[]) AND ts >= $2 AND ts <= $3 ORDER BY ts ASC, session ASC, seq ASC",
+    )
+    .bind(kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>())
+    .bind(se_i64(since_ms, "self inspect since_ms")?)
+    .bind(se_i64(until_ms, "self inspect until_ms")?)
+    .fetch_all(pool)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (session_col, version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session.0.to_string() != session_col {
+            return Err(StoreError::CorruptRow {
+                session: event.session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+/// Event counts per kind whose recorded `ts` falls in
+/// `[since_ms, until_ms]`, kind-ascending (the sqlite twin's contract).
+pub(crate) async fn event_kind_counts(
+    pool: &PgPool,
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<Vec<(String, u64)>, StoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, COUNT(*) FROM events WHERE ts >= $1 AND ts <= $2 GROUP BY kind ORDER BY kind ASC",
+    )
+    .bind(se_i64(since_ms, "self inspect since_ms")?)
+    .bind(se_i64(until_ms, "self inspect until_ms")?)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, count)| (kind, count.max(0) as u64))
+        .collect())
+}
+
 /// The incremental publication (R9-10): ONE transaction — delete the
 /// gone sessions' rows, upsert the changed rows, flip `view_state`.
 /// Same atomic version-flip shape as [`view_publish`], writes
