@@ -1060,7 +1060,7 @@ async fn attach_media(
         }
         match inner
             .client
-            .attachment(id, generation, ATTACHMENT_FETCH_TIMEOUT)
+            .attachment(id, generation, kind == "image", ATTACHMENT_FETCH_TIMEOUT)
             .await
         {
             Ok(bytes) => items.push(json!({

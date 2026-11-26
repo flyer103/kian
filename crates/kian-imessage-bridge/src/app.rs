@@ -583,6 +583,20 @@ struct AttachmentQuery {
     attachment_id: String,
     #[serde(default)]
     generation: Option<String>,
+    #[serde(rename = "as")]
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// `?as=jpeg` asks for the sips-backed `image/jpeg` variant of an
+/// `image/heic` attachment; any other value is a client error so a typo
+/// never silently serves bytes the caller cannot read.
+fn requested_jpeg(raw: Option<&str>) -> Result<bool, &'static str> {
+    match raw {
+        None => Ok(false),
+        Some("jpeg") => Ok(true),
+        Some(_) => Err("`as` must be `jpeg` when present"),
+    }
 }
 
 /// `{rowid}:{index}`, exactly the id `/v1/updates` publishes.
@@ -602,7 +616,9 @@ fn not_found() -> Response {
 
 /// `GET /v1/attachment` (CHANNEL-IMESSAGE §3.2): the bytes of one item,
 /// resolved by the bridge from the row the id names. The file path never
-/// crosses the wire in either direction.
+/// crosses the wire in either direction. `?as=jpeg` answers the same
+/// `image/jpeg` variant the positioned route serves, so a caller that
+/// must keep the generation guard still gets model-readable bytes.
 async fn attachment<B: Backend>(
     State(app): State<Arc<App<B>>>,
     headers: HeaderMap,
@@ -638,50 +654,13 @@ async fn attachment<B: Backend>(
             true,
         );
     }
-    let page = match app.backend.after(rowid.saturating_sub(1), 32, true).await {
-        Ok(page) => page,
-        Err(error) => return rpc_error_response(&error),
+    let as_jpeg = match requested_jpeg(query.variant.as_deref()) {
+        Ok(as_jpeg) => as_jpeg,
+        Err(detail) => {
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", detail, true);
+        }
     };
-    let Some(raw) = page.messages.iter().find(|raw| {
-        raw.get("id").and_then(Value::as_u64) == Some(rowid) && visible_to(raw, &app.participants)
-    }) else {
-        return not_found();
-    };
-    let Some(item) = raw
-        .get("attachments")
-        .and_then(Value::as_array)
-        .and_then(|items| items.get(index))
-    else {
-        return not_found();
-    };
-    let Some(path) = item.get("filename").and_then(Value::as_str) else {
-        return not_found();
-    };
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return not_found();
-    };
-    if !metadata.is_file() {
-        return not_found();
-    }
-    if metadata.len() > app.max_attachment_bytes {
-        return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too_large",
-            "the attachment exceeds watch.max_attachment_bytes",
-            false,
-        );
-    }
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return not_found();
-    };
-    let media_type = item
-        .get("mime_type")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("application/octet-stream");
-    let content_type = HeaderValue::from_str(media_type)
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    (StatusCode::OK, [(CONTENT_TYPE, content_type)], bytes).into_response()
+    serve_attachment_at(&app, rowid, index, as_jpeg).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,27 +718,40 @@ async fn attachment_by_position<B: Backend>(
             true,
         );
     };
-    let as_jpeg = match query.variant.as_deref() {
-        None => false,
-        Some("jpeg") => true,
-        Some(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "`as` must be `jpeg` when present",
-                true,
-            );
+    let as_jpeg = match requested_jpeg(query.variant.as_deref()) {
+        Ok(as_jpeg) => as_jpeg,
+        Err(detail) => {
+            return error_response(StatusCode::BAD_REQUEST, "bad_request", detail, true);
         }
     };
+    serve_attachment_at(&app, rowid, index, as_jpeg).await
+}
+
+/// Resolves a `{rowid}:{index}` attachment id to bytes.
+///
+/// Both `/v1/attachment` (the query form kian learned first) and
+/// `/v1/attachment/{rowid}/{index}` land here, so one id means one thing on
+/// either route: the same wait for a not-yet-committed attachment row, the
+/// same participant filter, and the same 404/410/413/415/503 semantics.
+async fn serve_attachment_at<B: Backend>(
+    app: &App<B>,
+    rowid: u64,
+    index: usize,
+    as_jpeg: bool,
+) -> Response {
     let Some(attachment_source) = app.attachment_source.as_ref() else {
         return attachment_unavailable();
     };
-    let located = match attachment_source.locate(rowid, index).await {
+    let located = match attachment_source.locate_settled(rowid, index).await {
         Ok(Some(located)) => located,
         Ok(None) => return not_found(),
         Err(_) => return attachment_unavailable(),
     };
-    if !visible_attachment(located.sender.as_deref(), located.is_from_me, &app.participants) {
+    if !visible_attachment(
+        located.sender.as_deref(),
+        located.is_from_me,
+        &app.participants,
+    ) {
         return not_found();
     }
     let attachment = match attachment_source
@@ -1236,16 +1228,19 @@ mod tests {
         path
     }
 
-    fn photo_row_at(rowid: u64, sender: &str, path: &str) -> Value {
-        let mut row = photo_message(rowid, sender);
-        row["attachments"][0]["filename"] = json!(path);
-        row
+    fn attachment_request(app: &Arc<App<Arc<Fake>>>, id: &str) -> Query<AttachmentQuery> {
+        attachment_request_variant(app, id, None)
     }
 
-    fn attachment_request(app: &Arc<App<Arc<Fake>>>, id: &str) -> Query<AttachmentQuery> {
+    fn attachment_request_variant(
+        app: &Arc<App<Arc<Fake>>>,
+        id: &str,
+        variant: Option<&str>,
+    ) -> Query<AttachmentQuery> {
         Query(AttachmentQuery {
             attachment_id: id.to_string(),
             generation: Some(app.cursor.generation()),
+            variant: variant.map(str::to_string),
         })
     }
 
@@ -1333,6 +1328,7 @@ mod tests {
             Query(AttachmentQuery {
                 attachment_id: "41:0".into(),
                 generation: None,
+                variant: None,
             }),
         )
         .await;
@@ -1342,27 +1338,26 @@ mod tests {
     #[tokio::test]
     async fn attachment_serves_the_file_the_row_named() {
         let dir = temp_dir();
-        let path = dir.join("IMG_0001.heic");
-        std::fs::write(&path, b"heic-bytes").unwrap();
-        let fake = Fake::new();
-        fake.push_page(AfterPage {
-            messages: vec![photo_row_at(
-                41,
-                "+14155551212",
-                path.to_str().expect("utf-8 path"),
-            )],
-            next_rowid: 41,
-            has_more: false,
-        });
-        let app = app_in(
+        let photo = dir.join("IMG_0001.heic");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
             dir,
-            fake,
             vec!["+14155551212".into()],
-            true,
             DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
         );
         let response = attachment(
-            State(app.clone()),
+            State(Arc::clone(&app)),
             bearer(),
             attachment_request(&app, "41:0"),
         )
@@ -1378,6 +1373,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attachment_query_route_serves_the_jpeg_variant_when_asked() {
+        let dir = temp_dir();
+        let original = dir.join("photo.heic");
+        let original_bytes = b"heic-original";
+        std::fs::write(&original, original_bytes).unwrap();
+        seed_attachment(
+            &dir,
+            42,
+            8,
+            Some(&original),
+            Some("image/heic"),
+            Some(original_bytes.len() as i64),
+            false,
+            "+14155551212",
+        );
+        let sips = fake_sips(&dir, 0, None);
+        let app = app_with_attachment_db(
+            dir.clone(),
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            sips,
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request_variant(&app, "42:0", Some("jpeg")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()["x-kian-variant"], "jpeg");
+        assert_eq!(
+            response.headers()["x-kian-total-bytes"],
+            original_bytes.len().to_string()
+        );
+        let served = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&served[..], b"\xff\xd8\xff\xe0fake-jpeg");
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+    }
+
+    #[tokio::test]
+    async fn attachment_query_route_rejects_an_unknown_variant() {
+        let dir = temp_dir();
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request_variant(&app, "42:0", Some("png")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "bad_request");
+    }
+
+    #[tokio::test]
     async fn attachment_refuses_a_stale_generation() {
         let app = app(Fake::new(), Vec::new());
         let response = attachment(
@@ -1386,6 +1442,7 @@ mod tests {
             Query(AttachmentQuery {
                 attachment_id: "41:0".into(),
                 generation: Some("a-previous-chat-db".into()),
+                variant: None,
             }),
         )
         .await;
@@ -1397,21 +1454,26 @@ mod tests {
     #[tokio::test]
     async fn attachment_refuses_an_oversize_file() {
         let dir = temp_dir();
-        let path = dir.join("IMG_0001.heic");
-        std::fs::write(&path, b"ten-bytes!").unwrap();
-        let fake = Fake::new();
-        fake.push_page(AfterPage {
-            messages: vec![photo_row_at(
-                41,
-                "+14155551212",
-                path.to_str().expect("utf-8 path"),
-            )],
-            next_rowid: 41,
-            has_more: false,
-        });
-        let app = app_in(dir, fake, vec!["+14155551212".into()], true, 4);
+        let photo = dir.join("IMG_0001.heic");
+        std::fs::write(&photo, b"ten-bytes!").unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            4,
+            PathBuf::from("/usr/bin/sips"),
+        );
         let response = attachment(
-            State(app.clone()),
+            State(Arc::clone(&app)),
             bearer(),
             attachment_request(&app, "41:0"),
         )
@@ -1423,15 +1485,27 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_of_an_unknown_id_is_not_found() {
-        let fake = Fake::new();
-        fake.push_page(AfterPage {
-            messages: vec![message(101, "+14155551212")],
-            next_rowid: 101,
-            has_more: false,
-        });
-        let app = app(fake, vec!["+14155551212".into()]);
+        let dir = temp_dir();
+        let photo = dir.join("IMG_0001.heic");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            47,
+            9,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
         let response = attachment(
-            State(app.clone()),
+            State(Arc::clone(&app)),
             bearer(),
             attachment_request(&app, "41:0"),
         )
@@ -1442,32 +1516,70 @@ mod tests {
     #[tokio::test]
     async fn attachment_outside_the_privacy_filter_is_not_found() {
         let dir = temp_dir();
-        let path = dir.join("IMG_0001.heic");
-        std::fs::write(&path, b"heic-bytes").unwrap();
-        let fake = Fake::new();
-        fake.push_page(AfterPage {
-            messages: vec![photo_row_at(
-                41,
-                "+14155551212",
-                path.to_str().expect("utf-8 path"),
-            )],
-            next_rowid: 41,
-            has_more: false,
-        });
-        let app = app_in(
+        let photo = dir.join("IMG_0001.heic");
+        std::fs::write(&photo, b"heic-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&photo),
+            Some("image/heic"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
             dir,
-            fake,
             vec!["+19995550000".into()],
-            true,
             DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
         );
         let response = attachment(
-            State(app.clone()),
+            State(Arc::clone(&app)),
             bearer(),
             attachment_request(&app, "41:0"),
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The legacy query route reads the same positions as the path route:
+    /// an index past the row's last attachment is a 404, and a located row
+    /// whose file is gone is still a 410.
+    #[tokio::test]
+    async fn attachment_of_an_out_of_range_index_is_not_found() {
+        let dir = temp_dir();
+        let missing = dir.join("gone.jpg");
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&missing),
+            Some("image/jpeg"),
+            Some(10),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let beyond = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request(&app, "41:1"),
+        )
+        .await;
+        assert_eq!(beyond.status(), StatusCode::NOT_FOUND);
+        let gone = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::GONE);
     }
 
     #[tokio::test]

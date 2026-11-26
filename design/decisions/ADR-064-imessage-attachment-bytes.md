@@ -143,3 +143,29 @@ image bytes.
   artifact reference plus transcript (existing edge tests, same shape).
 - **L3 (owner):** a real photo on a real Mac yields an
   `[image transcript]` line in the admitted text.
+
+## Amendment (2026-11-25): `as=jpeg` on the bytes route
+
+Trigger: an iPhone photo arrives as `image/heic`, and the media
+provider rejects HEIC deterministically (`format_error`, not
+retried), so decision 6's per-item failure applied to every photo: the
+row was admitted with its metadata and the model saw `[image]`, never a
+transcript. The bridge already rendered a JPEG variant for
+the positioned route (§3.2); the bytes route this ADR introduced could not
+ask for it, and switching the adapter to the positioned route would drop
+the generation guard decision 2 exists to keep.
+
+- **Both forms grow the same selector.** `GET /v1/attachment` answers
+  `?as=jpeg` with the same `image/jpeg` variant, the same
+  `x-kian-variant` header, the same `503` on a failed conversion and the
+  same `400` on any other value as `GET /v1/attachment/{rowid}/{index}`.
+  One helper validates the selector for both routes, so they cannot drift.
+- **The adapter asks for it per item.** An `image/*` item requests
+  `as=jpeg`; an `audio/*` item never does. The envelope's
+  `media_type` follows the response header, so it describes the bytes
+  actually carried rather than the variant requested.
+- **Decision 2 is unchanged.** The fetch still carries the page's
+  generation, and a stale generation is still `409`.
+- **Cost and failure shape are unchanged.** One extra sips render per
+  HEIC item (cached on the Mac), and decision 6 still governs a failed
+  conversion: that item is absent, the row is admitted with metadata.

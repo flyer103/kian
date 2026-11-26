@@ -364,16 +364,27 @@ impl BridgeClient {
     /// (CHANNEL-IMESSAGE §3.2, ADR-064). Always called with the
     /// generation the id came from: a replaced `chat.db` must be a
     /// `409`, never a plausible wrong file.
+    ///
+    /// `as_jpeg` asks the bridge for the `image/jpeg` variant it can
+    /// render from `image/heic`; the model provider rejects HEIC
+    /// deterministically, so an image item that is not asked for the
+    /// variant arrives unreadable. `media_type` still follows the
+    /// response header, never the request.
     pub async fn attachment(
         &self,
         attachment_id: &str,
         generation: &str,
+        as_jpeg: bool,
         timeout: Duration,
     ) -> Result<AttachmentBytes, BridgeError> {
+        let mut query = vec![("attachment_id", attachment_id), ("generation", generation)];
+        if as_jpeg {
+            query.push(("as", "jpeg"));
+        }
         let response = self
             .http
             .get(format!("{}/v1/attachment", self.base))
-            .query(&[("attachment_id", attachment_id), ("generation", generation)])
+            .query(&query)
             .bearer_auth(&self.token)
             .timeout(timeout)
             .send()
