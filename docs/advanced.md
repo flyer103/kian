@@ -1222,10 +1222,28 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
 | `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids, `--with-artifacts` pins referenced blobs beside the file |
 | `kian cache-stats [--json]` | Prefix-cache stability report from the durable stream |
+| `kian self inspect [--window <dur>] [--session <uuid>] [--json]` | Windowed read-only diagnostic report (default `1h`): event volume by kind, session ends by reason, turn outcomes and provider error classes, tool failures by tool, media items with and without a transcript (counts, never content), evidence verdicts, store/artifact footprint, plus `findings` that name the session and seq evidencing each one |
 | `kian wake-now`, `kian lease inspect`, `kian recovery budget reset` | Operational actions |
 | `GET /metrics` | Engine, cache, usage and super-agent counters |
 
 Interrupt is durable: it admits a control-envelope inbox row (idempotent per epoch), so the intent
 survives a drain crash and the takeover settles `interrupted`
 ([ADR-014](../design/decisions/ADR-014-durable-interrupt-intent.md)).
+
+`kian self inspect` answers "what did the runtime do, and where is it failing?" for one window of
+the durable stream — offline, against the same sqlite file:
+
+```bash
+target/debug/kian self inspect --config kian.yaml --window 24h
+target/debug/kian self inspect --config kian.yaml --session <uuid> --json
+```
+
+The `lifetime` section carries the existing usage and cache projections: they are lifetime totals
+(session-filtered with `--session`), never windowed, so they stay readable next to a narrow window.
+
+`--window` takes a unit (`30m`, `24h`); a bare number is refused. The report never prints a
+payload string or a transcript — content is counted, not shown — and every finding names the
+session and seq that evidence it. Finding codes: `media_error`, `turn_error`, `tool_error`,
+`session_failed`, `evidence_failed`. A uuid this store never saw is refused, not reported as
+zeros; an empty window is reported as zeros.
 

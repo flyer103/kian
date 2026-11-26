@@ -198,12 +198,21 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 - Trace: every event carries drain_id + epoch (fencing); cross-session delegation (Thread lineage)
   chains into a causal trace.
 - Audit: event-stream interval export + replay (A1/A2).
+- Self-inspection: `kian self inspect` reads one window of the durable stream and answers what the
+  runtime did and where it is failing — event volume by kind, session ends by reason, turn outcomes
+  and provider error classes, tool failures by tool, media items with or without a transcript,
+  evidence-gate verdicts, and the store/artifact footprint; the usage and cache projections appear
+  under `lifetime`, since they are lifetime totals (session-filtered with `--session`), never
+  windowed. It is a pure projection over the log with a stable top-level key set (consumers ignore
+  unknown keys); it runs offline against `--db` without a server, and it never writes, starts or
+  stops execution. Content-bearing payloads are counted, never printed; every finding names the
+  session and seq that evidence it.
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, recovery budget reset, cache-stats, usage-stats, cost, raise-budget, tickets,
-  channel credentials (`kian wechat login` — the QR flow writes the WeChat channel's credential
-  file; no other channel needs an interactive login).
+  wake-now, lease inspect, self inspect, recovery budget reset, cache-stats, usage-stats, cost,
+  raise-budget, tickets, channel credentials (`kian wechat login` — the QR flow writes the WeChat
+  channel's credential file; no other channel needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
 
 ### 3.3 Operational flows
