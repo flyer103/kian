@@ -5,7 +5,9 @@
 //! proves the env-only bridge token is present, calls the bridge's
 //! `GET /v1/health`, and reports the gates the operator must fix —
 //! Full Disk Access (`database.ready`), `imsg rpc`, the protocol
-//! version, and the `watch.participants` ↔ `topics` allowlist diff.
+//! version, the `watch.participants` ↔ `topics` allowlist diff, and —
+//! when the channel enables `voice` — whether the host can send a
+//! native voice message or only an audio attachment.
 //!
 //! It never sends a message, never writes the bridge state, and never
 //! prints the token — on stdout or stderr, in text or `--json` mode.
@@ -183,6 +185,12 @@ pub async fn run_check(args: &ImessageCheckArgs) -> Result<String, String> {
                 topics_only.join(", ")
             ));
         }
+        if section.voice && !health.voice.native {
+            warnings.push(format!(
+                "voice replies are enabled but will arrive as audio attachments: {}",
+                health.voice.detail
+            ));
+        }
         if !participants_only.is_empty() {
             warnings.push(format!(
                 "bridge participants not in topics will be read then dropped: {}",
@@ -203,6 +211,11 @@ pub async fn run_check(args: &ImessageCheckArgs) -> Result<String, String> {
         "database_ready": health.database.ready,
         "database_path": health.database.path,
         "automation": health.automation,
+        "voice": {
+            "configured": section.voice,
+            "native": health.voice.native,
+            "detail": health.voice.detail,
+        },
         "participants": participants,
         "topics": topics,
         "topics_only": topics_only,
@@ -234,6 +247,10 @@ pub async fn run_check(args: &ImessageCheckArgs) -> Result<String, String> {
             health.database.ready, health.database.path
         ));
         out.push_str(&format!("  automation: {}\n", health.automation));
+        out.push_str(&format!(
+            "  voice: configured={} (native: {} — {})\n",
+            section.voice, health.voice.native, health.voice.detail
+        ));
         out.push_str(&format!("  topics: {}\n", topics.join(", ")));
         out.push_str(&format!("  participants: {}\n", participants.join(", ")));
         for warning in &warnings {

@@ -15,9 +15,10 @@
 //!   and a `generation` that changes when `chat.db` is replaced.
 //! - `GET  /v1/attachment/{rowid}/{index}` — one image by position,
 //!   with an optional `as=jpeg` HEIC variant.
-//! - `POST /v1/send`    — one text message, with the caller's
-//!   `client_id` as the delivery idempotency key (a repeated id is
-//!   answered from the observed-result cache, never sent twice).
+//! - `POST /v1/send`    — one text message or one voice message, with
+//!   the caller's `client_id` as the delivery idempotency key (a
+//!   repeated id is answered from the observed-result cache, never sent
+//!   twice).
 //!
 //! Everything here is deliberately kian-agnostic: no kian crate is a
 //! dependency, so a different bridge implementation can replace this one
@@ -28,3 +29,4 @@ pub mod attachment;
 pub mod config;
 pub mod imsg;
 pub mod state;
+pub mod voice;

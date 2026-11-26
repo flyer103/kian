@@ -90,6 +90,7 @@ pub mod sidecars;
 pub mod superagent;
 pub mod usage_metrics;
 pub mod views;
+pub mod voice_edge;
 pub mod webhook;
 pub mod wechat_login;
 pub mod worker_release;

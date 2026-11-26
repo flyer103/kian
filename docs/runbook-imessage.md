@@ -209,8 +209,34 @@ On the server: `curl -s -H "Authorization: Bearer $KIAN_IMESSAGE_BRIDGE_TOKEN" \
 http://127.0.0.1:7420/v1/health` must answer the same JSON. A remote forward binds the **server's**
 loopback only (no public exposure); keep it that way.
 
-## 4. Set up `kian serve`
+### 3.5 Enable voice messages (optional)
 
+**Inbound** needs nothing on the Mac: a voice note is a `.caf` attachment in `chat.db`, and
+`imsg` already reads it. kian transcribes it when the channel runs `attachments: bytes` next to
+a `media:` section (contract §4); the admission carries `[voice message transcript]` plus an
+artifact reference instead of the audio.
+
+**Outbound** has two transports, and the Mac decides which one you get:
+
+- *Audio attachment — always available.* The bridge stages the file and `imsg send` attaches it
+  through AppleScript; the recipient sees a playable audio file in the conversation.
+- *Native voice message — needs the IMCore helper.* `imsg launch` keeps a helper process alive
+  that can post a real voice memo (converted to mono 24 kHz Opus CAF). It is a private-API
+  feature, so macOS only loads it with SIP disabled: `csrutil disable` from Recovery, reboot,
+  then `imsg launch`. Keep it running under a LaunchAgent with `KeepAlive` — `send.attachment`
+  answers `-32003` the moment the helper is gone.
+
+```bash
+imsg status --json | jq .bridge     # {"ready": true} once the helper is up
+kian imessage check --config kian.yaml | grep voice
+```
+
+kian never guesses: when the native call is unavailable it falls back to the attachment path and
+the bridge response reports `voice_mode: "attachment"`. Disabling SIP on a machine you do not
+control is not worth a blue bubble — the attachment path is a complete feature, not a degraded
+one.
+
+## 4. Set up `kian serve`
 ```yaml
 superagent:
   channels:
@@ -221,6 +247,8 @@ superagent:
         topics:
           "+14155551212": imessage         # the owner's iPhone handle (allowlist both ways)
         service: imessage                   # dedicated Apple ID: SMS is unavailable; auto is safe too
+        attachments: bytes                  # inbound voice notes become transcripts (needs media:)
+        voice: true                         # outbound voice replies (needs media: + artifacts:)
     # ...
   subscriptions:
     - channel: imessage
@@ -237,7 +265,13 @@ kian serve --config kian.yaml
 `kian imessage check` (contract §7/§8) should print, and fail closed on: the resolved channel, the
 token presence, the bridge `protocol` (must be 1), `imsg.version`, `database.ready`,
 `watch.participants` vs `topics` diff, and the automation state. It never prints the token.
+With `voice: true` it also prints `configured`/`native`: `native: false` is a capability note,
+not a failure — replies still arrive, as audio attachments (§3.5).
 
+`attachments: bytes` and `voice: true` both need the same `media:` section (plus
+`artifacts:`); configuring one without them refuses startup instead of silently sending text.
+`attachments: metadata` is the default and keeps every blob on the Mac — try that first if the
+media provider is not set up yet.
 ## 5. Verify end to end
 
 1. From the iPhone, text the bot's address: `hi`.
@@ -256,7 +290,12 @@ token presence, the bridge `protocol` (must be 1), `imsg.version`, `database.rea
    (`target: {"handle": …}`) **6.4 s** later.
 3. The iPhone receives the reply **in the same conversation** (the adapter passes the inbound
    `chat_guid`), as plain text (no markdown).
-4. Failure probes worth running once: revoke Full Disk Access (receive stops, sends still work and
+4. **Voice** (only with `attachments: bytes` + `voice: true`): send the bot a voice note —
+   the admission carries `[voice message transcript]`, and `channel/delivered` records
+   `voice: true` with the spoken word count. On the phone the reply is a voice memo when
+   `imsg status --json | jq .bridge.ready` is `true`, an audio attachment otherwise. The
+   receipt in the bridge log names `voice_mode` — that is the honest answer for which path ran.
+5. Failure probes worth running once: revoke Full Disk Access (receive stops, sends still work and
    report `verified: false`); deny Automation (sends `Unavailable` naming System Settings, receive
    keeps working); stop the bridge (adapter backs off, sends `Unavailable`, resumes when it
    returns); sleep the Mac and send a message (it should arrive on wake — record whether it does).
@@ -274,6 +313,10 @@ token presence, the bridge `protocol` (must be 1), `imsg.version`, `database.rea
 | Bridge refuses startup: `-32603 … authorization denied` | Full Disk Access is not granted to **this binary path**. TCC attributes to the responsible process; grant `~/bin/kian-imessage-bridge` (its `imsg` child inherits it), then `launchctl kickstart -k`. |
 | 401 from the bridge | `KIAN_IMESSAGE_BRIDGE_TOKEN` ≠ the Mac `token_file` (rotated one side only). |
 | Bridge unreachable from the server | The `ssh -R` is down; check the tunnel process, then `/v1/health` on the Mac. |
+| Voice reply arrives as a file, not a voice bubble | `imsg launch` is not running (or SIP is enabled): check `bridge.ready` in `imsg status --json`, then `voice_mode` in the bridge log. The attachment path is the designed fallback (§3.5). |
+| `reply_voice` is not in the tool list | `voice: true` is missing on the channel, or the assembly has no media edge (`voice: true` without an assembled `media:` logs `reply_voice is not mounted` and keeps text). `kian imessage check` prints `voice.configured`. |
+| Startup refuses: `imessage.voice` is `true` but the config has no `media:` section | Add `media:` (with `artifacts:`) or set `voice: false`: a spoken reply needs a synthesizer and a store before the adapter can send bytes. |
+| `speech_synthesize` fails during a voice reply | The media provider answered an error; the delivery fails honestly (no empty send) and the outbox retries per policy. Check `media.base_url`/`api_key_env`, then the provider status. |
 | Duplicate replies after a timeout | The outbox retried an uncertain send across a bridge restart (contract §13.6). The bridge's `client_id` cache prevents the common case; a duplicate means the cache was lost. |
 | Strange `is_from_me` behaviour / the bot ignoring the owner | The Mac is signed into the **same** Apple ID the owner texts from (self-chat). Use a dedicated bot Apple ID. |
 | Messages stop arriving after a macOS update | Re-verify both grants; `imsg --version` against the **0.14.0 floor**; TCC entries go stale per path after updates. |

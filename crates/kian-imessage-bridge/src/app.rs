@@ -289,6 +289,12 @@ async fn health<B: Backend>(State(app): State<Arc<App<B>>>, headers: HeaderMap) 
             .iter()
             .any(|method| method == "send");
     let automation = app.automation.lock().expect("automation lock").clone();
+    let native_voice = status.private_api;
+    let native_detail = if native_voice {
+        "IMCore bridge ready: voice sends as a native voice message"
+    } else {
+        "IMCore bridge not running (SIP enabled or `imsg launch` not running): voice sends as an audio attachment"
+    };
     Json(json!({
         "protocol": PROTOCOL,
         "bridge_version": env!("CARGO_PKG_VERSION"),
@@ -302,6 +308,10 @@ async fn health<B: Backend>(State(app): State<Arc<App<B>>>, headers: HeaderMap) 
             "ready": status.db_ready,
             "path": status.db_path,
             "generation": app.cursor.generation(),
+        },
+        "voice": {
+            "native": native_voice,
+            "detail": native_detail,
         },
         "automation": automation,
         "watch": {
@@ -827,9 +837,44 @@ struct SendBody {
     to: Option<String>,
     #[serde(default)]
     chat_guid: Option<String>,
+    #[serde(default)]
     text: String,
+    #[serde(default)]
+    voice: Option<VoiceBody>,
     #[serde(default = "default_service")]
     service: String,
+}
+
+/// One audio message: standard padded base64 plus the media type the
+/// transport keys its file extension off (CHANNEL-IMESSAGE §3.2).
+#[derive(Debug, Deserialize)]
+struct VoiceBody {
+    base64: String,
+    media_type: String,
+    #[serde(default)]
+    audio: bool,
+}
+
+impl VoiceBody {
+    fn decode(&self) -> Result<Vec<u8>, (StatusCode, &'static str, String)> {
+        let bytes = crate::voice::decode_base64(&self.base64).ok_or((
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "voice.base64 must be standard padded base64".to_string(),
+        ))?;
+        if bytes.len() > crate::voice::MAX_VOICE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!(
+                    "voice payload is {} bytes, the cap is {} bytes",
+                    bytes.len(),
+                    crate::voice::MAX_VOICE_BYTES
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
 }
 
 fn default_service() -> String {
@@ -860,11 +905,31 @@ async fn send<B: Backend>(
             true,
         );
     }
-    if body.text.is_empty() {
+    if body.text.is_empty() && body.voice.is_none() {
         return error_response(
             StatusCode::BAD_REQUEST,
             "bad_request",
             "text must not be empty",
+            true,
+        );
+    }
+    if !body.text.is_empty() && body.voice.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "text and voice are mutually exclusive",
+            true,
+        );
+    }
+    if body
+        .voice
+        .as_ref()
+        .is_some_and(|voice| voice.media_type.trim().is_empty())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "voice.media_type is required",
             true,
         );
     }
@@ -904,16 +969,53 @@ async fn send<B: Backend>(
             }
         };
     }
+    let voice_audio = body.voice.as_ref().is_some_and(|voice| voice.audio);
+    let staged = match body.voice.as_ref() {
+        Some(voice) => {
+            let bytes = match voice.decode() {
+                Ok(bytes) => bytes,
+                Err((status, kind, detail)) => {
+                    return error_response(status, kind, &detail, true);
+                }
+            };
+            match crate::voice::stage(&bytes, &voice.media_type) {
+                Ok(staged) => Some(staged),
+                Err(error) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "bridge_unavailable",
+                        &format!("staging the voice payload failed: {error}"),
+                        true,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
     app.counters.sends.fetch_add(1, Ordering::Relaxed);
-    let outcome = app
-        .backend
-        .send(
-            body.to.clone(),
-            body.chat_guid.clone(),
-            body.text.clone(),
-            body.service.clone(),
-        )
-        .await;
+    let outcome = match staged.as_ref() {
+        Some(staged) => {
+            app.backend
+                .send_voice(
+                    body.to.clone(),
+                    body.chat_guid.clone(),
+                    staged.path().to_path_buf(),
+                    voice_audio,
+                    body.service.clone(),
+                )
+                .await
+        }
+        None => {
+            app.backend
+                .send(
+                    body.to.clone(),
+                    body.chat_guid.clone(),
+                    body.text.clone(),
+                    body.service.clone(),
+                )
+                .await
+        }
+    };
     match outcome {
         Ok(result) => {
             *app.automation.lock().expect("automation lock") = "granted".to_string();
@@ -932,7 +1034,7 @@ async fn send<B: Backend>(
                 .clone()
                 .or_else(|| rowid.map(|rowid| format!("imessage:{rowid}")))
                 .unwrap_or_else(|| format!("kian/{}", body.client_id));
-            let ok = json!({
+            let mut ok = json!({
                 "protocol": PROTOCOL,
                 "ok": true,
                 "message_id": message_id,
@@ -942,6 +1044,15 @@ async fn send<B: Backend>(
                 "verified": verified,
                 "deduplicated": false,
             });
+            if let Some(staged) = staged.as_ref() {
+                // The transport is an observation, not an intent: report
+                // the path that actually carried the audio (ADR-067).
+                ok["voice_mode"] = result
+                    .get("voice_mode")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("attachment".into()));
+                ok["voice_bytes"] = Value::from(staged.bytes());
+            }
             app.cache.lock().expect("send cache lock").insert(
                 body.client_id.clone(),
                 Cached::Ok(ok.clone()),
@@ -996,12 +1107,17 @@ mod tests {
     /// (to, chat_guid, text, service) of every backend send.
     type SendArgs = (Option<String>, Option<String>, String, String);
 
+    /// (to, chat_guid, staged path, audio, service) of every voice send.
+    type VoiceArgs = (Option<String>, Option<String>, PathBuf, bool, String);
+
     struct Fake {
         status: Mutex<Result<Status, RpcError>>,
         pages: Mutex<VecDeque<Result<AfterPage, RpcError>>>,
         sends: AtomicU64,
         send_result: Mutex<Result<Value, RpcError>>,
         send_args: Mutex<Vec<SendArgs>>,
+        send_voice_result: Mutex<Result<Value, RpcError>>,
+        voice_sends: Mutex<Vec<VoiceArgs>>,
     }
 
     impl Fake {
@@ -1023,6 +1139,10 @@ mod tests {
                 sends: AtomicU64::new(0),
                 send_result: Mutex::new(Ok(json!({"ok": true, "id": 9, "guid": "G-9"}))),
                 send_args: Mutex::new(Vec::new()),
+                send_voice_result: Mutex::new(Ok(
+                    json!({"ok": true, "id": 11, "guid": "G-11", "voice_mode": "native"}),
+                )),
+                voice_sends: Mutex::new(Vec::new()),
             })
         }
         fn push_page(&self, page: AfterPage) {
@@ -1063,6 +1183,20 @@ mod tests {
                 .unwrap()
                 .push((to, chat_guid, text, service));
             self.send_result.lock().unwrap().clone()
+        }
+        async fn send_voice(
+            &self,
+            to: Option<String>,
+            chat_guid: Option<String>,
+            path: PathBuf,
+            audio: bool,
+            service: String,
+        ) -> Result<Value, RpcError> {
+            self.voice_sends
+                .lock()
+                .unwrap()
+                .push((to, chat_guid, path, audio, service));
+            self.send_voice_result.lock().unwrap().clone()
         }
     }
 
@@ -2077,6 +2211,7 @@ mod tests {
         assert_eq!(body["imsg"]["rpc"], true);
         assert_eq!(body["database"]["ready"], true);
         assert_eq!(body["automation"], "unknown");
+        assert_eq!(body["voice"]["native"], false);
         assert_eq!(body["watch"]["participants"][0], "+14155551212");
         assert!(
             body["instance_id"]
@@ -2172,6 +2307,7 @@ mod tests {
             to: Some("+14155551212".into()),
             chat_guid: None,
             text: "hello".into(),
+            voice: None,
             service: "imessage".into(),
         };
         let first = send(State(app.clone()), bearer(), Json(body_json("cid-1"))).await;
@@ -2214,6 +2350,7 @@ mod tests {
             to: Some("+14155551212".into()),
             chat_guid: None,
             text: "hello".into(),
+            voice: None,
             service: "auto".into(),
         };
         let response = send(State(app.clone()), bearer(), Json(request)).await;
@@ -2234,6 +2371,7 @@ mod tests {
                 to: Some("+14155551212".into()),
                 chat_guid: None,
                 text: "hello".into(),
+                voice: None,
                 service: "auto".into(),
             }),
         )
@@ -2258,6 +2396,7 @@ mod tests {
             to: Some("+14155551212".into()),
             chat_guid: None,
             text: "hello".into(),
+            voice: None,
             service: "auto".into(),
         };
         let first = send(State(app.clone()), bearer(), Json(request())).await;
@@ -2278,6 +2417,7 @@ mod tests {
             to: None,
             chat_guid: None,
             text: "hi".into(),
+            voice: None,
             service: "auto".into(),
         };
         assert_eq!(
@@ -2292,12 +2432,141 @@ mod tests {
             to: Some("+1".into()),
             chat_guid: None,
             text: "hi".into(),
+            voice: None,
             service: "sms".into(),
         };
         assert_eq!(
             send(State(app), bearer(), Json(bad_service)).await.status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn voice_request(client_id: &str, base64: &str) -> SendBody {
+        SendBody {
+            protocol: Some(1),
+            client_id: client_id.into(),
+            to: Some("+14155551212".into()),
+            chat_guid: Some("iMessage;-;+14155551212".into()),
+            text: String::new(),
+            voice: Some(VoiceBody {
+                base64: base64.into(),
+                media_type: "audio/mpeg".into(),
+                audio: true,
+            }),
+            service: "auto".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_voice_send_reports_the_transport_and_stages_privately() {
+        let fake = Fake::new();
+        let app = app(fake.clone(), vec![]);
+        let response = send(
+            State(app.clone()),
+            bearer(),
+            Json(voice_request("cid-v", "aGVsbG8=")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body(response).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["message_id"], "G-11");
+        assert_eq!(body["voice_mode"], "native");
+        assert_eq!(body["voice_bytes"], 5);
+        let sends = fake.voice_sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 1, "one voice request reaches the transport");
+        assert_eq!(sends[0].0.as_deref(), Some("+14155551212"));
+        assert!(sends[0].3);
+        assert_eq!(
+            sends[0].2.extension().and_then(|ext| ext.to_str()),
+            Some("mp3")
+        );
+        assert!(
+            !sends[0].2.exists(),
+            "the staged file is gone after the send"
+        );
+        assert!(fake.send_args.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_voice_client_id_is_answered_without_staging() {
+        let fake = Fake::new();
+        let app = app(fake.clone(), vec![]);
+        let first = send(
+            State(app.clone()),
+            bearer(),
+            Json(voice_request("cid-v", "aGVsbG8=")),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let again = send(
+            State(app.clone()),
+            bearer(),
+            Json(voice_request("cid-v", "aGVsbG8=")),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(body(again).await["deduplicated"], true);
+        assert_eq!(fake.voice_sends.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_and_text_are_mutually_exclusive() {
+        let app = app(Fake::new(), vec![]);
+        let mut request = voice_request("cid-x", "aGVsbG8=");
+        request.text = "hello".into();
+        let response = send(State(app.clone()), bearer(), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await["detail"],
+            "text and voice are mutually exclusive"
+        );
+
+        let mut empty = voice_request("cid-y", "aGVsbG8=");
+        empty.voice = None;
+        let response = send(State(app.clone()), bearer(), Json(empty)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await["detail"], "text must not be empty");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_voice_payload_is_refused_before_the_transport() {
+        let fake = Fake::new();
+        let app = app(fake.clone(), vec![]);
+        let response = send(
+            State(app.clone()),
+            bearer(),
+            Json(voice_request("cid-1", "not base64")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await["detail"],
+            "voice.base64 must be standard padded base64"
+        );
+
+        let mut untyped = voice_request("cid-2", "aGVsbG8=");
+        if let Some(voice) = untyped.voice.as_mut() {
+            voice.media_type = "  ".into();
+        }
+        let response = send(State(app.clone()), bearer(), Json(untyped)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await["detail"],
+            "voice.media_type is required"
+        );
+
+        // One byte over the 1 MiB cap (3 bytes of payload per 4 chars).
+        let over = format!("{}AAA=", "A".repeat((1024 * 1024 / 3) * 4));
+        let response = send(
+            State(app.clone()),
+            bearer(),
+            Json(voice_request("cid-3", &over)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body(response).await["kind"], "too_large");
+        assert!(fake.voice_sends.lock().unwrap().is_empty());
     }
 
     #[test]

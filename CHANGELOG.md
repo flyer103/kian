@@ -8,6 +8,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage voice: a spoken reply arrives as a voice message, and inbound voice notes are
+  config-complete (CHANNEL-IMESSAGE §2.5, §3.2, §5, §7, ADR-067, P5b slice 2b).** `imessage.voice:
+  true` (refused without `media:` and `artifacts:`) mounts one extra Router tool,
+  `reply_voice`, whose arguments mirror `reply` — the `reply` schema is prompt-prefix
+  content, so no voice argument was added to it. The Router emits the intent
+  `{"voice": {"text": …}}`; a CLI voice edge on the channel edge synthesizes it through
+  `speech_synthesize`, reads the artifact, and rewrites the delivery into bytes the bridge
+  accepts, so `kian-superagent` stays store- and provider-blind and no audio enters the event
+  log (`channel/delivered` gains an additive `voice: true`). `POST /v1/send` grows an
+  optional `voice: {base64, media_type, audio}` (text XOR voice, 1 MiB cap, protocol stays 1)
+  and answers `voice_mode`; the bridge picks native `send.attachment` when the IMCore helper
+  is running and falls back to an audio attachment, reporting which path ran. The delivery key
+  covers the spoken text, never the synthesized bytes, so a re-drive after a restart converges on
+  one message; a refused synthesis or a missing artifact is an honest delivery failure, never an
+  empty send.
+
 - **Self inspection: `kian self inspect` answers one window of the durable stream (SPEC §3.1,
   §3.2).** A read-only, offline projection over `--db` with a default one-hour `--window`
   (`s`/`m`/`h`/`d` units; a bare number is refused) or one `--session`: event volume by kind,

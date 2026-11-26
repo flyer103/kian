@@ -277,7 +277,7 @@ only status is recorded here.
 | Untrusted-input marking | `"untrusted": true` in the provenance wrapper for configured channels (real channels default untrusted); judge-prompt and recall-hop hygiene | landed |
 | Real lark channel adapter | Feishu IM receive/send over the open APIs; env-only credentials (`KIAN_LARK_*`), fail-closed startup; default-untrusted | landed |
 | WeChat iLink channel | `type: wechat`, **best-effort by contract** ([CHANNEL-WECHAT.md](../design/CHANNEL-WECHAT.md), [ADR-018](../design/decisions/ADR-018-wechat-ilink-channel.md)): one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink API (`getupdates` ~35 s hold), `message_id` → `event_id`, the config `topics` table as the receive allowlist, reply-only sends echoing the latest inbound `context_token`, QR-issued bot token in a `0600` credential file written by `kian wechat login` (no env var), `errcode -14` → pause + resume on file change, empty cursor with no position table, text-only/single-account phase 1, forced untrusted; reply tokens additionally persist **best-effort** in a TTL-bounded `0600` state file beside the credential file ([ADR-026](../design/decisions/ADR-026-wechat-context-token-state.md)) so a restart can still reply; no new surface, no new event kind | landed |
-| iMessage channel (macOS bridge) | `type: imessage`, **best-effort by construction** ([CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md), [ADR-042](../design/decisions/ADR-042-imessage-channel.md)): iMessage has no API, so the channel long-polls a Mac-side `kian-imessage-bridge` (`imsg rpc` under Full Disk Access + Automation) over a loopback HTTP ABI; `guid` → `event_id`, `topics` is both allowlists, the bridge's `participants` is a privacy filter, text-bearing direct chats (attachment metadata is mapped into the payload; with `attachments: bytes` plus a `media:` section, image and audio bytes become OCR/ASR transcripts — [ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)), one channel per config, forced untrusted; sends are **not** reply-only (any allowlisted handle) with a deterministic `client_id` that makes the outbox retry effectively once; revoked Full Disk Access pauses receive but sends continue, `-1743` denies sends but receive continues; no new surface, no new event kind, no kian-side position table. L1/L2 landed; a first live L3 round trip (real Mac + iPhone) is recorded 2026-11-20; the attachment-bytes path is L1/L2 ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)) | landed (L1/L2/L3) |
+| iMessage channel (macOS bridge) | `type: imessage`, **best-effort by construction** ([CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md), [ADR-042](../design/decisions/ADR-042-imessage-channel.md)): iMessage has no API, so the channel long-polls a Mac-side `kian-imessage-bridge` (`imsg rpc` under Full Disk Access + Automation) over a loopback HTTP ABI; `guid` → `event_id`, `topics` is both allowlists, the bridge's `participants` is a privacy filter, text-bearing direct chats (attachment metadata is mapped into the payload; with `attachments: bytes` plus a `media:` section, image and audio bytes become OCR/ASR transcripts — [ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md); `voice: true` adds a spoken reply path — [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)), one channel per config, forced untrusted; sends are **not** reply-only (any allowlisted handle) with a deterministic `client_id` that makes the outbox retry effectively once; revoked Full Disk Access pauses receive but sends continue, `-1743` denies sends but receive continues; no new surface, no new event kind, no kian-side position table. L1/L2 landed; a first live L3 round trip (real Mac + iPhone) is recorded 2026-11-20; the attachment-bytes path is L1/L2 ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)) | landed (L1/L2/L3) |
 | Plugin SDK + Footprint Ladder | Static plugin system + Footprint Ladder landed across the capability sets; SDK extraction → the hosted set (below) | partial |
 | Audit export/replay tooling | `session export`/re-import (byte-identical) + delegation-audit replay assertions — demonstrated by earlier work, recorded here; no new work | **Demonstrated** |
 
@@ -767,8 +767,10 @@ the item is rewritten to `{"kind","media_type","artifact","size","transcript"}` 
 `[image transcript]` / `[voice message transcript]` markers, in item order. Base64 never re-enters the
 payload, no message is dropped, and every failure (decode, provider, oversize, missing blob) is an
 honest per-item `error` that does not block admission. A payload without `media` is passed through
-byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is not a channel
-capability yet: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is the iMessage
+channel's voice path ([ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)): `imessage.voice: true`
+mounts a `reply_voice` tool, the voice decorator on the channel edge synthesizes the utterance and
+rewrites the delivery into bytes, and every other channel still answers in text.
 
 The edge contract is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md); the tool protocol is
 ADR-061; the blobs are ADR-056; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
@@ -776,11 +778,13 @@ ADR-061; the blobs are ADR-056; the placement is [design/DESIGN.md](../design/DE
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P5b | kian-cli | the channel-pump media edge: the typed inbound media envelope, artifact-backed OCR/ASR transcripts appended to the admitted text, honest per-item failures | landed |
+| P5b | kian-cli, kian-imessage-bridge | the outbound voice path: `imessage.voice` mounts `reply_voice`, the channel-edge voice decorator synthesizes and rewrites the delivery, and the bridge sends it as a native voice message or an audio attachment ([ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)) | landed (L1/L2) |
 
 Non-goals recorded with the phase: no real-adapter media ingestion in phase 5b itself (WeChat CDN
 download remains that channel's phase 2; the iMessage attachment-bytes path landed separately as
-[ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)), no outbound audio send, no TTS call
-behind the model's back, no media pricing, no new event kind and no queue or batching at the edge.
+[ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)), no outbound media other than the
+iMessage voice path, no voice answer the model did not ask for (a reply is spoken only when it calls
+`reply_voice`), no media pricing, no new event kind and no queue or batching at the edge.
 
 ### Vision inputs (ADR-063, P5c landed)
 
