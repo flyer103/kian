@@ -1177,6 +1177,15 @@ vadis defaults `server.max_body_bytes` to 2 MiB, which a single large photo can 
 (for example `33554432`) before turning `shaping.vision` on. A request the carrier rejects at that
 bound arrives as a transport error, not a model reply, and the turn soft-fails.
 
+The turn itself is budgeted. `superagent.shaping.max_images_per_turn` (default `4`, range 1–32) and
+`superagent.shaping.max_image_bytes_per_turn` (default `4194304`, range 64 KiB–64 MiB) bound only
+the **unsent tail** — the messages after the last assistant message — admitting the newest
+references first; a reference past either limit keeps its transcript in the text and is not
+rendered, and the turn logs one warning naming both limits. Once a request flies, its pixels are
+pinned: a retry re-sends identical bytes and a later turn keeps the pixels it already sent. Both
+keys refuse boot unless `shaping.vision: true`. Semantics:
+[ADR-066](../design/decisions/ADR-066-per-turn-image-budget.md).
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`

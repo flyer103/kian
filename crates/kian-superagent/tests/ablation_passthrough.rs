@@ -528,6 +528,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             slot: SlotName("router".into()),
             max_iterations: 10_000,
             budget_scope: kian_loop::BudgetScope::Lifetime,
+            vision: kian_loop::VisionBudget::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));
@@ -543,6 +544,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             // (32) and far below the defensive cap.
             max_iterations: 20_000,
             budget_scope: kian_loop::BudgetScope::Lifetime,
+            vision: kian_loop::VisionBudget::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));

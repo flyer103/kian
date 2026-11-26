@@ -650,6 +650,10 @@ pub struct SuperAgentPlugin {
     pub thread_keys: kian_superagent::ThreadKeySet,
     /// admission-time shaping (infinite cap = legacy behavior).
     pub shaping: kian_superagent::ShapingConfig,
+    /// (ADR-066) the per-turn image budget every loop built from this
+    /// plugin carries: newest-first over the unsent tail, default 4
+    /// references / 4 MiB when the section configures neither key.
+    pub vision_budget: kian_loop::VisionBudget,
     /// untrusted-channel set (prompt-injection hygiene): events
     /// from these channels admit with the untrusted bit inside the
     /// provenance wrapper. Empty = every channel trusted.
@@ -1145,6 +1149,7 @@ impl Plugin for SuperAgentPlugin {
                 slot: kian_core::model::SlotName(self.router_slot.clone()),
                 max_iterations: self.max_iterations,
                 budget_scope: kian_loop::BudgetScope::PerEpisode,
+                vision: self.vision_budget,
                 permissions: BTreeMap::new(),
             },
         ));
@@ -1227,6 +1232,7 @@ impl Plugin for SuperAgentPlugin {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
                     budget_scope: kian_loop::BudgetScope::Lifetime,
+                    vision: self.vision_budget,
                     permissions: self.worker_permissions.clone(),
                 },
                 EvidenceGateConfig::default(),
@@ -1241,6 +1247,7 @@ impl Plugin for SuperAgentPlugin {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
                     budget_scope: kian_loop::BudgetScope::Lifetime,
+                    vision: self.vision_budget,
                     permissions: self.worker_permissions.clone(),
                 },
             )),
@@ -1280,6 +1287,7 @@ impl Plugin for SuperAgentPlugin {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
                 budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
                 permissions: self.default_permissions.clone(),
             },
             self.default_gate,
@@ -1325,6 +1333,7 @@ impl Plugin for SuperAgentPlugin {
                     slot: kian_core::model::SlotName("main".into()),
                     max_iterations: self.max_iterations,
                     budget_scope: kian_loop::BudgetScope::PerEpisode,
+                    vision: self.vision_budget,
                     permissions: BTreeMap::new(),
                 },
             ));
@@ -1414,6 +1423,7 @@ impl Plugin for SuperAgentPlugin {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
                 budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
                 permissions: self.worker_permissions.clone(),
             };
             let side_backend = Arc::clone(&remote.backend);
@@ -1648,6 +1658,7 @@ impl Plugin for SuperAgentPlugin {
                 slot: kian_core::model::SlotName("main".into()),
                 max_iterations: self.max_iterations,
                 budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
                 permissions: self.worker_permissions.clone(),
             };
             let assignee_recall = self.recall.worker;

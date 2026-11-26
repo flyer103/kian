@@ -835,6 +835,32 @@ transcript path is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
 Non-goals recorded with this slice: no vision on the spill path, no outbound media, no per-image
 pricing or dedupe, no automatic slot migration, no automatic session rotation.
 
+### Per-turn image budget (ADR-066)
+
+Scope: bound what a burst may cost in one request without rewriting a turn that already flew.
+
+Semantics: the loop budgets only the unsent tail of the model context — the messages after the last
+assistant message. References are admitted newest-first and the admitted set is a contiguous prefix
+of that order: `superagent.shaping.max_images_per_turn` (default `4`, range 1–32) counts references
+and `superagent.shaping.max_image_bytes_per_turn` (default `4194304`, range 64 KiB–64 MiB) sums the
+artifact bytes before base64. A reference that does not fit is not rendered — its wrapper and
+transcript stay byte-identical — and the turn logs one warning naming both limits. Both keys refuse
+boot unless `shaping.vision: true`. Once a request flies its images sit at or before the last
+assistant message and are never re-budgeted, so a retry sends identical bytes and a later turn keeps
+the pixels it already sent; the persisted `step/request` remains the exact bytes sent. The
+per-message ceiling (4 images, 8 MiB each, ADR-063) still applies inside a message.
+
+The contract is
+[ADR-066](../design/decisions/ADR-066-per-turn-image-budget.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| Channel | kian-loop, kian-cli | unsent-tail image budget, per-message ceiling, two config keys with boot refusal | landed |
+
+Non-goals recorded with this slice: no retroactive eviction of history pixels, no downscale, no
+dedupe, no per-image cache. Growth across turns is stopped by the provider's `max_request_bytes`
+(ADR-067), not here.
+
 ### Resident rotation (ADR-040)
 
 Scope: bound the resident Router's context and refresh its memory index (MEMORY-MODEL I2 freezes it
