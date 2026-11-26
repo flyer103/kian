@@ -1,4 +1,4 @@
-//! L2 for ADR-067: an oversized request is classified as
+//! L2 for ADR-068: an oversized request is classified as
 //! `request_too_large` against a REAL `kian serve` process.
 //!
 //! Two shapes, both driven over HTTP against a real child process and

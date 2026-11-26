@@ -83,7 +83,7 @@ pub enum ProviderError {
     /// A soft failure (constraint 7): never mappable onto `completed`.
     #[error("empty response")]
     EmptyResponse,
-    /// The request itself is too large (ADR-067): an operator
+    /// The request itself is too large (ADR-068): an operator
     /// `max_request_bytes` bound refused it before sending, or the
     /// provider answered HTTP 413. Re-sending the same bytes cannot
     /// succeed, so this is its own class — never `provider_down`.

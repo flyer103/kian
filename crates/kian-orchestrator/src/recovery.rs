@@ -43,7 +43,7 @@ pub enum ErrorClass {
     ProviderDown,
     RateLimited,
     ContextOverflow,
-    /// The request itself is too large (ADR-067): refused locally by
+    /// The request itself is too large (ADR-068): refused locally by
     /// `providers.<name>.max_request_bytes` or by the provider's 413.
     /// Never retried implicitly — the same bytes cannot succeed.
     RequestTooLarge,
@@ -1197,7 +1197,7 @@ rules:
             table.resolve(ErrorClass::StoreFailure),
             Some(&RecoveryAction::Fail)
         );
-        // ADR-067: the same bytes cannot succeed on a retry, and a failover
+        // ADR-068: the same bytes cannot succeed on a retry, and a failover
         // would resend them — the default is an honest fail.
         assert_eq!(
             table.resolve(ErrorClass::RequestTooLarge),

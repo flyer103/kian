@@ -38,6 +38,19 @@ impl MediaEdge {
         Self { tools, store }
     }
 
+    /// ADR-067: the outbound voice edge shares this assembly's tools and
+    /// store, so a channel gains `reply_voice` only where inbound media
+    /// already has an edge.
+    pub fn tools(&self) -> &Arc<MediaTools> {
+        &self.tools
+    }
+
+    /// ADR-067: the artifact store the voice edge reads a synthesized
+    /// artifact back from.
+    pub fn store(&self) -> &Arc<ArtifactStore> {
+        &self.store
+    }
+
     /// Processes one inbound event. A payload without a `media` key is
     /// returned byte-identically; every media failure is an honest
     /// per-item `error` and never blocks the event.

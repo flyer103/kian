@@ -219,7 +219,7 @@ pub struct ConfigTuning {
     pub heartbeat_interval_ms: u64,
     pub tools: Vec<String>,
     pub exec_timeout_ms: u64,
-    /// ADR-067: the provider's own request-size bound (None = the
+    /// ADR-068: the provider's own request-size bound (None = the
     /// provider config carries no key, the default today).
     pub max_request_bytes: Option<u64>,
 }

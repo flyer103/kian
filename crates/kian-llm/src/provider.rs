@@ -261,7 +261,7 @@ pub struct OpenAiCompatConfig {
     /// body chunks, never the total request (ADR-041). `0` = disabled.
     pub idle_timeout_ms: u64,
     /// Largest serialized request body this provider accepts, in bytes
-    /// (ADR-067). `None` = no local bound: an oversized request is then
+    /// (ADR-068). `None` = no local bound: an oversized request is then
     /// discovered only from the provider's HTTP status. A configured bound
     /// refuses before the first byte leaves the process.
     pub max_request_bytes: Option<u64>,
@@ -278,7 +278,7 @@ struct Inner {
 impl Inner {
     async fn post(&self, body: Vec<u8>) -> Result<reqwest::Response, ProviderError> {
         let cfg = &self.config;
-        // ADR-067: a configured outbound bound refuses here, before the
+        // ADR-068: a configured outbound bound refuses here, before the
         // client is even asked to write — the error names both numbers and
         // states that no byte left the process.
         if let Some(limit) = cfg.max_request_bytes
@@ -288,7 +288,7 @@ impl Inner {
                 size: body.len(),
                 limit: Some(limit),
                 detail: format!(
-                    "the serialized request is {} bytes, over providers.{}.max_request_bytes {limit}; nothing was sent (no request byte left this process, ADR-067)",
+                    "the serialized request is {} bytes, over providers.{}.max_request_bytes {limit}; nothing was sent (no request byte left this process, ADR-068)",
                     body.len(),
                     cfg.name
                 ),
@@ -367,7 +367,7 @@ impl ModelProvider for OpenAiCompatProvider {
                 body: body.clone(),
             };
             // The exact byte count that will cross the wire: the 413
-            // detail reports it (ADR-067).
+            // detail reports it (ADR-068).
             let sent_bytes = body.len();
             // A2: persist-what-you-send. The persist hook completes before
             // the request is issued; on failure the request is never sent.
@@ -598,14 +598,14 @@ fn map_error_status(
     match code {
         429 => ProviderError::RateLimited,
         408 => ProviderError::Transport(format!("HTTP {code}: {snippet}")),
-        // ADR-067: 413 is the provider saying "these bytes are too many".
+        // ADR-068: 413 is the provider saying "these bytes are too many".
         // Its own class (never provider_down): a failover would resend the
         // same bytes, and a raw transport retry would re-upload them.
         413 => ProviderError::RequestTooLarge {
             size: sent_bytes,
             limit: max_request_bytes,
             detail: format!(
-                "the provider answered HTTP 413 for a {sent_bytes}-byte request{bound};                  the same context cannot succeed on a retry (ADR-067): {snippet}",
+                "the provider answered HTTP 413 for a {sent_bytes}-byte request{bound};                  the same context cannot succeed on a retry (ADR-068): {snippet}",
                 bound = max_request_bytes
                     .map(|limit| format!(" (local bound {limit})"))
                     .unwrap_or_default(),
@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
     }
 
-    /// ADR-067: a configured outbound bound refuses before the client is
+    /// ADR-068: a configured outbound bound refuses before the client is
     /// handed the bytes — zero requests reach the server, and the error
     /// says so.
     #[tokio::test]
@@ -1191,7 +1191,7 @@ mod tests {
         );
     }
 
-    /// ADR-067: HTTP 413 is its own class, carrying the sent size — never
+    /// ADR-068: HTTP 413 is its own class, carrying the sent size — never
     /// `provider_down` (which the old transport path produced) and never
     /// the 400/422 request-shape verdict.
     #[tokio::test]

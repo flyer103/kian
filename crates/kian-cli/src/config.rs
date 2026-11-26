@@ -324,7 +324,7 @@ pub struct ProviderConfig {
     #[serde(default = "default_provider_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
     /// Largest serialized request body this provider accepts, in bytes
-    /// (ADR-067). Absent = no local bound; an HTTP 413 is still its own
+    /// (ADR-068). Absent = no local bound; an HTTP 413 is still its own
     /// class either way. A configured bound refuses before the first byte
     /// leaves the process; floor 1024.
     #[serde(default)]
@@ -2976,6 +2976,13 @@ pub struct ImessageChannelSection {
     /// (ADR-064).
     #[serde(default)]
     pub attachments: AttachmentMode,
+    /// Outbound voice (ADR-067): `true` mounts the `reply_voice` tool
+    /// on the channel and synthesizes each reply through the media edge
+    /// before the adapter sends it — requires a `media:` section (with
+    /// `artifacts:`), because the edge is what turns text into audio.
+    /// `false` (the default) keeps the tool surface byte-identical.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 /// `attachments: metadata | bytes` (ADR-064).
@@ -4153,14 +4160,14 @@ impl ServeConfig {
         if self.providers.is_empty() {
             return Err(invalid("providers must list at least one endpoint"));
         }
-        // providers.<name>.max_request_bytes (ADR-067): a bound below the
+        // providers.<name>.max_request_bytes (ADR-068): a bound below the
         // floor bounds nothing a real request could ever hit.
         for (name, p) in &self.providers {
             if let Some(limit) = p.max_request_bytes
                 && limit < 1024
             {
                 return Err(invalid(format!(
-                    "providers.{name}.max_request_bytes {limit} is below the 1024-byte floor (ADR-067)",
+                    "providers.{name}.max_request_bytes {limit} is below the 1024-byte floor (ADR-068)",
                 )));
             }
         }
@@ -4926,6 +4933,15 @@ impl ServeConfig {
                                  but the config has no `media:` section: the fetched bytes have \
                                  no edge to consume them and would reach the model as text — \
                                  add `media:` (with `artifacts:`) or use `attachments: metadata`"
+                            )));
+                        }
+                        if section.voice && self.media.is_none() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.voice is `true` but the \
+                                 config has no `media:` section: a voice reply is synthesized by \
+                                 the media edge and stored in the artifact store before the \
+                                 adapter can send it — add `media:` (with `artifacts:`) or use \
+                                 `voice: false`"
                             )));
                         }
                     }
@@ -6731,7 +6747,7 @@ recovery:
         );
     }
 
-    /// ADR-067: `providers.<name>.max_request_bytes` is optional (absent =
+    /// ADR-068: `providers.<name>.max_request_bytes` is optional (absent =
     /// no local bound), parses, and refuses below the 1024-byte floor.
     #[test]
     fn provider_max_request_bytes_is_optional_and_bounded() {

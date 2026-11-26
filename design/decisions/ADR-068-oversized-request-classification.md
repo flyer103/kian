@@ -1,4 +1,4 @@
-# ADR-067 — An oversized request is a classified, non-retryable failure
+# ADR-068 — An oversized request is a classified, non-retryable failure
 
 - Status: accepted (2026-11-26, provider-failure classification slice)
 

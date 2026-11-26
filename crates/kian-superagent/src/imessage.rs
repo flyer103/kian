@@ -51,7 +51,9 @@ use tracing::warn;
 pub mod bridge;
 pub mod handle;
 
-use bridge::{BridgeAttachment, BridgeClient, BridgeError, BridgeMessage, SendRequest};
+use bridge::{
+    BridgeAttachment, BridgeClient, BridgeError, BridgeMessage, SendRequest, VoicePayload,
+};
 
 /// The channel `type` spelling that builds an [`ImessageChannel`]
 /// (kian-cli cross-references this constant).
@@ -820,6 +822,15 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
              (a handle key of superagent.channels.<name>.imessage.topics) — refused"
         )));
     }
+    let chat_guid = inner
+        .chat_guids
+        .lock()
+        .expect("imessage channel lock")
+        .get(&handle)
+        .cloned();
+    if let Some(voice) = voice_payload(&out.content)? {
+        return send_voice(inner, &handle, chat_guid, voice).await;
+    }
     let text = match &out.content {
         Value::String(s) => s.clone(),
         Value::Object(object) => match object.get("text") {
@@ -838,12 +849,6 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
             )));
         }
     };
-    let chat_guid = inner
-        .chat_guids
-        .lock()
-        .expect("imessage channel lock")
-        .get(&handle)
-        .cloned();
     let parts = split_text(&text, inner.config.max_send_chars);
     let total = parts.len();
     let mut last_receipt = None;
@@ -891,6 +896,119 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
     }
     last_receipt
         .ok_or_else(|| ChannelError::DeliveryFailed("imessage send produced no parts".into()))
+}
+
+/// The voice half of a delivery: the router's intent
+/// (`{"voice": {"text": …}}`) materialized into bytes by the CLI voice
+/// edge before it reaches this adapter (ADR-067).
+#[derive(Debug)]
+struct VoiceRequest {
+    text: String,
+    payload: VoicePayload,
+}
+
+/// Reads `content["voice"]`; `Ok(None)` for a text delivery.
+fn voice_payload(content: &Value) -> Result<Option<VoiceRequest>, ChannelError> {
+    let Some(voice) = content.get("voice") else {
+        return Ok(None);
+    };
+    let Some(object) = voice.as_object() else {
+        return Err(ChannelError::DeliveryFailed(format!(
+            "imessage voice content must be {{\"voice\": {{\"text\": …, \"base64\": …, \"media_type\": …}}}}, got `{content}`"
+        )));
+    };
+    let Some(base64) = object
+        .get("base64")
+        .and_then(Value::as_str)
+        .filter(|encoded| !encoded.is_empty())
+    else {
+        return Err(ChannelError::DeliveryFailed(
+            "imessage voice delivery carries no audio bytes (voice is enabled on a channel only \
+             when `voice: true`, `media:` and `artifacts:` are configured together)"
+                .to_string(),
+        ));
+    };
+    let Some(media_type) = object
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|media_type| !media_type.trim().is_empty())
+    else {
+        return Err(ChannelError::DeliveryFailed(
+            "imessage voice delivery is missing `media_type`".to_string(),
+        ));
+    };
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let audio = object.get("audio").and_then(Value::as_bool).unwrap_or(true);
+    Ok(Some(VoiceRequest {
+        text,
+        payload: VoicePayload {
+            base64: base64.to_string(),
+            media_type: media_type.to_string(),
+            audio,
+        },
+    }))
+}
+
+/// The delivery key of one voice message. It covers what was spoken,
+/// never the synthesized bytes: a re-drive re-runs synthesis (the TTS
+/// bytes are not stable), and the bridge's dedupe cache must still
+/// converge on one delivered message (ADR-067).
+fn voice_client_id(channel: &str, handle: &str, media_type: &str, text: &str) -> String {
+    let seed = format!("voice\u{1f}{media_type}\u{1f}{text}");
+    delivery_client_id(channel, handle, 0, 1, &seed)
+}
+
+/// Sends exactly one voice message (never split: splitting audio would
+/// produce several unintelligible parts).
+async fn send_voice(
+    inner: &Inner,
+    handle: &str,
+    chat_guid: Option<String>,
+    voice: VoiceRequest,
+) -> Result<SendReceipt, ChannelError> {
+    let client_id = voice_client_id(&inner.name, handle, &voice.payload.media_type, &voice.text);
+    let request = SendRequest::new(
+        client_id.clone(),
+        handle,
+        chat_guid,
+        "",
+        inner.config.service.as_str(),
+    )
+    .with_voice(voice.payload);
+    let ok = inner
+        .client
+        .send(&request, inner.config.send_timeout)
+        .await
+        .map_err(|error| disposition_error(inner, error))?;
+    let message_id = if !ok.message_id.trim().is_empty() {
+        ok.message_id
+    } else if let Some(guid) = ok.guid.clone() {
+        guid
+    } else if let Some(rowid) = ok.rowid {
+        format!("imessage:{rowid}")
+    } else {
+        client_id
+    };
+    if let Some(guid) = ok.guid.as_deref().or(Some(message_id.as_str())) {
+        remember_own_echo(inner, guid);
+    }
+    tracing::debug!(
+        target: "kian::imessage_channel",
+        channel = %inner.name,
+        handle = %handle,
+        mode = ok.voice_mode.as_deref().unwrap_or("unreported"),
+        bytes = ok.voice_bytes,
+        deduplicated = ok.deduplicated,
+        "imessage: voice delivered"
+    );
+    Ok(SendReceipt {
+        message_id,
+        ts_ms: now_ms(),
+    })
 }
 
 /// Maps the bridge's delivery disposition onto the seam vocabulary
@@ -1399,6 +1517,65 @@ mod tests {
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn voice_client_id_covers_the_spoken_text_not_the_audio_bytes() {
+        let a = voice_client_id("imessage", "+14155551212", "audio/mpeg", "hello");
+        let b = voice_client_id("imessage", "+14155551212", "audio/mpeg", "hello");
+        let c = voice_client_id("imessage", "+14155551212", "audio/mpeg", "hell0");
+        let d = voice_client_id("imessage", "+14155551212", "audio/wav", "hello");
+        let e = voice_client_id("imessage", "+14155559999", "audio/mpeg", "hello");
+        assert_eq!(a, b, "the same intent derives the same key");
+        assert_ne!(a, c, "the spoken text scopes the key");
+        assert_ne!(a, d, "the media type scopes the key");
+        assert_ne!(a, e, "the handle scopes the key");
+        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn voice_payload_rejects_unusable_envelopes() {
+        assert!(
+            voice_payload(&json!({"text": "hi"}))
+                .expect("a text delivery is not a voice delivery")
+                .is_none(),
+            "no voice key means the text path, untouched"
+        );
+        let missing_bytes = voice_payload(&json!({"voice": {"text": "hi"}}))
+            .expect_err("no bytes is a refusal, never silence");
+        assert!(
+            matches!(&missing_bytes, ChannelError::DeliveryFailed(m) if m.contains("no audio bytes")),
+            "{missing_bytes:?}"
+        );
+        let missing_type =
+            voice_payload(&json!({"voice": {"base64": "aGk="}})).expect_err("no media type");
+        assert!(
+            matches!(&missing_type, ChannelError::DeliveryFailed(m) if m.contains("media_type")),
+            "{missing_type:?}"
+        );
+        let not_an_object =
+            voice_payload(&json!({"voice": "hi"})).expect_err("a voice envelope is an object");
+        assert!(!not_an_object.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_voice_request_defaults_to_audio_and_keeps_its_text() {
+        let request = voice_payload(&json!({
+            "voice": {"text": "hi", "base64": "aGk=", "media_type": "audio/mpeg"}
+        }))
+        .expect("valid")
+        .expect("a voice request");
+        assert_eq!(request.text, "hi");
+        assert_eq!(request.payload.base64, "aGk=");
+        assert_eq!(request.payload.media_type, "audio/mpeg");
+        assert!(request.payload.audio, "the default is a voice message");
+        let plain_attachment = voice_payload(&json!({
+            "voice": {"base64": "aGk=", "media_type": "audio/mpeg", "audio": false}
+        }))
+        .expect("valid")
+        .expect("a voice request");
+        assert!(!plain_attachment.payload.audio, "audio: false is honored");
+        assert_eq!(plain_attachment.text, "");
     }
 
     #[test]

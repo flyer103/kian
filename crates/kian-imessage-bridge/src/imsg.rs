@@ -75,6 +75,17 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    /// True when the child does not have the method at all (an `imsg` too
+    /// old for it, or no running IMCore bridge): a capability gap the
+    /// caller degrades around, not a delivery failure.
+    #[must_use]
+    pub fn is_capability_absent(&self) -> bool {
+        matches!(
+            self,
+            RpcError::Rejected { code, .. } if *code == -32003 || *code == -32601
+        )
+    }
+
     /// The ABI error kind (`not_started`, `may_have_completed`,
     /// `still_in_flight`, `database_unreadable`, `bridge_unavailable`,
     /// `bridge_busy`, `bad_request`, `unauthorized`) and whether a retry
@@ -138,6 +149,17 @@ pub trait Backend: Send + Sync + 'static {
         to: Option<String>,
         chat_guid: Option<String>,
         text: String,
+        service: String,
+    ) -> impl std::future::Future<Output = Result<Value, RpcError>> + Send;
+    /// Sends one staged audio file, preferring a native voice message and
+    /// falling back to an ordinary attachment; `voice_mode` on the result
+    /// names the path that ran.
+    fn send_voice(
+        &self,
+        to: Option<String>,
+        chat_guid: Option<String>,
+        path: PathBuf,
+        audio: bool,
         service: String,
     ) -> impl std::future::Future<Output = Result<Value, RpcError>> + Send;
 }
@@ -432,6 +454,62 @@ impl Backend for ImsgRpc {
             });
         }
         self.request("send", Value::Object(params)).await
+    }
+
+    async fn send_voice(
+        &self,
+        to: Option<String>,
+        chat_guid: Option<String>,
+        path: PathBuf,
+        audio: bool,
+        service: String,
+    ) -> Result<Value, RpcError> {
+        let file = path.display().to_string();
+        let chat_guid = chat_guid.filter(|guid| !guid.trim().is_empty());
+        // The native path needs all three: an audio request, a chat guid
+        // (only a chat renders a voice memo) and the IMCore bridge.
+        let native_ready = audio && self.status().await.is_ok_and(|status| status.private_api);
+        if native_ready && let Some(guid) = chat_guid.clone() {
+            let mut params = serde_json::Map::new();
+            params.insert("chat_guid".into(), Value::String(guid));
+            params.insert("file".into(), Value::String(file.clone()));
+            params.insert("audio".into(), Value::Bool(true));
+            match self.request("send.attachment", Value::Object(params)).await {
+                Ok(mut result) => {
+                    insert_voice_mode(&mut result, "native");
+                    return Ok(result);
+                }
+                // The capability is absent, not the message: the
+                // ordinary attachment path still carries the audio.
+                Err(error) if error.is_capability_absent() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("file".into(), Value::String(file));
+        params.insert("service".into(), Value::String(service));
+        if let Some(guid) = chat_guid {
+            params.insert("chat_guid".into(), Value::String(guid));
+        } else if let Some(to) = to.filter(|handle| !handle.trim().is_empty()) {
+            params.insert("to".into(), Value::String(to));
+        } else {
+            return Err(RpcError::Rejected {
+                code: -32602,
+                message: "send requires `to` or `chat_guid`".into(),
+                disposition: Some("bad_request".into()),
+                retry_safe: Some(true),
+            });
+        }
+        let mut result = self.request("send", Value::Object(params)).await?;
+        insert_voice_mode(&mut result, "attachment");
+        Ok(result)
+    }
+}
+
+/// Records which transport actually carried the audio.
+fn insert_voice_mode(result: &mut Value, mode: &str) {
+    if let Some(object) = result.as_object_mut() {
+        object.insert("voice_mode".into(), Value::String(mode.to_string()));
     }
 }
 
