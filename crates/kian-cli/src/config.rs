@@ -2758,6 +2758,11 @@ pub struct ChannelShapingConfig {
     pub first_chars: usize,
     #[serde(default)]
     pub neighbor_fields: Vec<String>,
+    /// ADR-065: beside the unchanged wrapper, admit the artifact
+    /// references of stored images so a vision target can read the
+    /// pixels. Requires the media edge and a vision-capable Router slot.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 fn default_shaping_first_chars() -> usize {
@@ -2770,6 +2775,7 @@ impl ChannelShapingConfig {
             inline_cap_bytes: self.inline_cap_bytes,
             first_chars: self.first_chars,
             neighbor_fields: self.neighbor_fields.clone(),
+            vision: self.vision,
         }
     }
 }
@@ -5015,6 +5021,38 @@ impl ServeConfig {
                      worker/default agent",
                     sa.router.agent
                 )));
+            }
+            // (ADR-065) The channel-image flag is inert without its two
+            // prerequisites — a media edge to store the pixels and a
+            // vision-capable Router slot to read them — so it refuses
+            // boot rather than silently admitting text only.
+            if sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
+                if self.media.is_none() {
+                    return Err(invalid(
+                        "superagent.shaping.vision requires a `media:` section: the image \
+                         references it admits point at artifacts only the media edge stores \
+                         (ADR-065)",
+                    ));
+                }
+                let slot = router_agent
+                    .model_slots
+                    .get(&sa.router.slot)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
+                            sa.router.slot, sa.router.agent
+                        ))
+                    })?;
+                let vision = profile_for(&self.model_profiles, &slot.provider, &slot.model)
+                    .is_some_and(|profile| profile.vision);
+                if !vision {
+                    return Err(invalid(format!(
+                        "superagent.shaping.vision requires agents.{}.model_slots.{} to resolve a \
+                         model_profiles entry with `vision: true` (provider `{}`, model `{}`): a \
+                         text-only slot would drop every image reference (ADR-065)",
+                        sa.router.agent, sa.router.slot, slot.provider, slot.model
+                    )));
+                }
             }
             // The speculation section must convert cleanly (
             // fail-closed — a zero cap or empty label refuses to start).
@@ -8707,6 +8745,79 @@ recovery:
         assert_eq!(
             runtime.attachments,
             kian_superagent::ImessageAttachments::Bytes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // channel images as vision references (ADR-065)
+    // -----------------------------------------------------------------------
+
+    /// The golden superagent config plus `shaping.vision: true` and a
+    /// `model_profiles` entry for the Router slot's target.
+    fn vision_yaml(slot_vision: bool) -> String {
+        let yaml = superagent_yaml().replacen(
+            "  router:\n    session_id:",
+            "  shaping:\n    vision: true\n  router:\n    session_id:",
+            1,
+        );
+        format!("{yaml}model_profiles:\n  openai/gpt-router:\n    vision: {slot_vision}\n")
+    }
+
+    fn vision_prerequisites() -> &'static str {
+        "artifacts:\n  dir: /tmp/kian-test-artifacts\nmedia:\n  base_url: http://127.0.0.1:9\n"
+    }
+
+    #[test]
+    fn shaping_vision_refuses_without_a_media_section() {
+        let err = ServeConfig::parse(&vision_yaml(true))
+            .expect_err("vision without a media: section refuses startup")
+            .to_string();
+        assert!(
+            err.contains("shaping.vision requires a `media:` section"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn shaping_vision_refuses_on_a_text_only_router_slot() {
+        let yaml = format!("{}{}", vision_prerequisites(), vision_yaml(false));
+        let err = ServeConfig::parse(&yaml)
+            .expect_err("a text-only Router slot refuses the flag")
+            .to_string();
+        assert!(err.contains("agents.router.model_slots.router"), "{err}");
+        assert!(err.contains("vision: true"), "{err}");
+    }
+
+    #[test]
+    fn shaping_vision_parses_with_its_prerequisites() {
+        let yaml = format!("{}{}", vision_prerequisites(), vision_yaml(true));
+        let cfg = ServeConfig::parse(&yaml).expect("vision flag with its prerequisites parses");
+        let shaping = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .shaping
+            .as_ref()
+            .unwrap()
+            .to_runtime();
+        assert!(shaping.vision);
+
+        // Omitted means off, and the runtime config keeps the legacy shape.
+        let off = ServeConfig::parse(&superagent_yaml()).expect("golden config");
+        assert!(
+            !off.superagent
+                .as_ref()
+                .unwrap()
+                .shaping
+                .as_ref()
+                .is_some_and(|shaping| shaping.to_runtime().vision)
+        );
+        let text_only = format!("{}{}", vision_prerequisites(), vision_yaml(false));
+        let err = ServeConfig::parse(&text_only).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("text-only slot would drop every image reference"),
+            "{err}"
         );
     }
 

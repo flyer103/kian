@@ -1100,6 +1100,33 @@ still goes) rather than failing the turn; `kian session replay` reports such req
 requests because offline replay cannot rebuild base64. Semantics:
 [ADR-063](../design/decisions/ADR-063-vision-content-parts.md).
 
+### Channel images
+
+An image that arrives over a channel can reach a vision target as pixels instead of a transcript.
+Turn it on once per deployment:
+
+```yaml
+superagent:
+  shaping:
+    vision: true
+```
+
+`shaping.vision` (default `false`) keeps the `{"kian": …}` channel wrapper byte-identical and adds a
+sibling `images` array of the media edge's artifact references; the request then carries the picture
+as a content part whenever the binding declares `vision: true`. `kian serve` refuses the flag
+without a `media:` section or without a vision Router profile, and logs one warning when the
+resident Router session was bound before the change — slot bindings are session-immutable, so
+`superagent.router.rotate_after_events` retires it. The transcript line stays in the text (blind
+targets, replay, compaction), inputs above `inline_cap_bytes` keep the Inline view without images,
+and a media item whose transcription failed still keeps its artifact reference. Semantics:
+[ADR-065](../design/decisions/ADR-065-channel-images-as-vision-references.md).
+
+Each image is base64-inlined (roughly 1.33× its bytes) and the history is re-sent with every later
+turn, so one turn is as large as the images it carries. The carrier's inbound bound must allow it:
+vadis defaults `server.max_body_bytes` to 2 MiB, which a single large photo can exceed — raise it
+(for example `33554432`) before turning `shaping.vision` on. A request the carrier rejects at that
+bound arrives as a transport error, not a model reply, and the turn soft-fails.
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`

@@ -449,6 +449,7 @@ fn spill_shaping() -> ShapingConfig {
         inline_cap_bytes: Some(32),
         first_chars: 24,
         neighbor_fields: vec!["reply_to".into()],
+        vision: false,
     }
 }
 
