@@ -411,7 +411,7 @@ instead of disappearing from a model's view.
  "guid": "8DF1C0A2-...", "service": "iMessage", "verified": true, "deduplicated": false}
 ```
 
-A voice delivery replaces `text` with `voice` (ADR-065):
+A voice delivery replaces `text` with `voice` (ADR-066):
 
 ```json
 {"protocol": 1, "client_id": "<stable delivery id>", "to": "+14155551212",
@@ -444,7 +444,7 @@ A voice delivery replaces `text` with `voice` (ADR-065):
 - `client_id` semantics are unchanged, including the cache. The adapter derives a **voice** id
   from the spoken text rather than from the audio bytes, because speech synthesis is not
   byte-stable across calls; a re-drive therefore converges on the same id even though its bytes
-  differ (ADR-065).
+  differ (ADR-066).
 
 - `to` and `chat_guid` are both optional but at least one is required; when both are present
   `chat_guid` wins (thread/service continuity) and `to` is the allowlist key the adapter validated.
@@ -577,7 +577,7 @@ change (§15).
   adapter derives its `client_id` from `(channel, handle, spoken text, voice)` rather than from the
   audio bytes, posts `voice: {base64, media_type, audio: true}` with an empty `text`, and maps the
   bridge's answer like any other send; `channel/delivered` gains `"voice": true`. The bytes are
-  produced by the channel-edge voice decorator (ADR-065) — the adapter never synthesizes.
+  produced by the channel-edge voice decorator (ADR-066) — the adapter never synthesizes.
 - **Long text** splits into ordered deliveries at ~2000 characters (never mid-codepoint, never
   dropping characters); each part is its own send, its own `client_id`, and therefore its own
   `channel/delivered` receipt. A failure after part *k* is a `DeliveryFailed` naming how many parts
@@ -645,7 +645,7 @@ refuses startup (fail-closed), exactly like `KIAN_GITHUB_TOKEN`.
 | `send_timeout_ms` | > 0 |
 | `max_send_chars` | ≥ 100 (below 100 the split becomes absurd) |
 | `attachments` | `metadata` (default) or `bytes`; `bytes` refuses startup without a `media:` section (the edge is the only consumer of base64) and fetches only `image/*`/`audio/*` items, at most four and never a sticker (ADR-064) |
-| `voice` | `false` (default) or `true`; `true` refuses startup without a `media:` section **and** an `artifacts:` root (the edge synthesizes the utterance and the store serves the bytes) and mounts the `reply_voice` tool on this channel's assembly (ADR-065) |
+| `voice` | `false` (default) or `true`; `true` refuses startup without a `media:` section **and** an `artifacts:` root (the edge synthesizes the utterance and the store serves the bytes) and mounts the `reply_voice` tool on this channel's assembly (ADR-066) |
 | token env | `KIAN_IMESSAGE_BRIDGE_TOKEN` required at assembly; absent/blank refuses serve startup |
 | cross-references | every `subscriptions[].channel`, `speak_rules[].channel`, `untrusted_channels[]` and `intake.thread_keys[].channel` naming this channel keeps validating |
 | trust | the channel is **forced** untrusted; the config cannot turn the marker off (§8) |
@@ -760,7 +760,7 @@ plus an honest error at the seam.
 
 Explicitly out of scope, recorded so they are not silently half-built: inbound media **vision** (a
 model reads an OCR/ASR transcript, never pixels; ADR-063's decision stands — ADR-064 serves bytes to
-the edge, not to the model), outbound media other than voice — a voice message is ADR-065, while
+the edge, not to the model), outbound media other than voice — a voice message is ADR-066, while
 photos, files and stickers stay inbound-only — SMS/Text Message Forwarding, group chats, tapbacks/reactions,
 message edits and unsends as *input corrections*, read receipts and typing indicators (private API,
 SIP off), rich sends/effects/polls, multi-account (more than one bridge/Apple ID), a bridge that is
@@ -915,7 +915,7 @@ question — they stay in §13.
    fake `imsg` child and a fake media provider. A real voice message on a real Mac was not part of
    any L3 run, and the **native** path additionally needs SIP disabled plus a running `imsg launch`
    — the reference Mac reports `sip: enabled`, so only the attachment path has a reachable host.
-   The first owner voice reply is the acceptance (§12, ADR-065).
+   The first owner voice reply is the acceptance (§12, ADR-066).
 
 ## 14. Delivery slices
 
@@ -941,13 +941,13 @@ refuses `bytes` without a `media:` section plus the pump strip that keeps an unc
 key out of the prompt; L1 suites on both sides; §3.2/§3.4/§4/§7 increments, ADR-064, the runbook and
 one CHANGELOG bullet. No event kind, no store schema and no core seam change.
 
-**2b (outbound voice, ADR-065).** The bridge's additive `voice` field on `/v1/send` with the
+**2b (outbound voice, ADR-066).** The bridge's additive `voice` field on `/v1/send` with the
 native/attachment choice, its `0600` staging file and the `voice_mode`/health report; the
 adapter's single-part voice send with a text-derived `client_id`; the `kian-cli` voice edge that
 synthesizes an utterance, reads its artifact and rewrites the delivery; the router's `reply_voice`
 tool, mounted only when a voice-capable channel is assembled; the config coupling that refuses
 `voice: true` without `media:`/`artifacts:`; the `"voice": true` key on `channel/delivered`;
-L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-065, the runbook and one CHANGELOG
+L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-066, the runbook and one CHANGELOG
 bullet. No new event kind, no store schema, no core seam change. Estimated write set ≈ bridge 250
 lines, adapter 120 lines, edge + router 350 lines, config/CLI 120 lines, tests ~600 lines, docs
 ~500 lines.
@@ -964,5 +964,5 @@ reconciled in the same change (the EVENT-MODEL discipline applied to a channel).
 the allowlist/privacy semantics (§3.3, §8), the dedupe and cursor discipline (§9) and the config/CLI
 shapes (§7) also start here. A change that would add a kian-side position table, a new event kind,
 a new server surface, a public bridge bind, multi-account or channel media bytes needs an ADR, not an
-edit to this file (inbound channel media bytes: ADR-064; outbound voice: ADR-065). An `imsg`/macOS break is recorded as a dated note in this section plus a
+edit to this file (inbound channel media bytes: ADR-064; outbound voice: ADR-066). An `imsg`/macOS break is recorded as a dated note in this section plus a
 CHANGELOG entry, and parks the channel honestly rather than guessing.

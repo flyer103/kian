@@ -900,7 +900,7 @@ async fn send_delivery(inner: &Inner, out: &ChannelDelivery) -> Result<SendRecei
 
 /// The voice half of a delivery: the router's intent
 /// (`{"voice": {"text": …}}`) materialized into bytes by the CLI voice
-/// edge before it reaches this adapter (ADR-065).
+/// edge before it reaches this adapter (ADR-066).
 #[derive(Debug)]
 struct VoiceRequest {
     text: String,
@@ -956,7 +956,7 @@ fn voice_payload(content: &Value) -> Result<Option<VoiceRequest>, ChannelError> 
 /// The delivery key of one voice message. It covers what was spoken,
 /// never the synthesized bytes: a re-drive re-runs synthesis (the TTS
 /// bytes are not stable), and the bridge's dedupe cache must still
-/// converge on one delivered message (ADR-065).
+/// converge on one delivered message (ADR-066).
 fn voice_client_id(channel: &str, handle: &str, media_type: &str, text: &str) -> String {
     let seed = format!("voice\u{1f}{media_type}\u{1f}{text}");
     delivery_client_id(channel, handle, 0, 1, &seed)

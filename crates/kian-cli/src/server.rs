@@ -784,7 +784,7 @@ impl Server {
             // KIAN_IMESSAGE_BRIDGE_TOKEN refuses startup (the token
             // never lives in kian.yaml — CHANNEL-IMESSAGE §7).
             let mut imessage_channels = std::collections::BTreeMap::new();
-            // the channels that opted into outbound voice (ADR-065): each
+            // the channels that opted into outbound voice (ADR-066): each
             // is registered behind the voice edge and mounts `reply_voice`
             // — the set stays empty unless a channel says `voice: true`.
             let mut voice_channels = std::collections::BTreeSet::new();

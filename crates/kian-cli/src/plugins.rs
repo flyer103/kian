@@ -723,7 +723,7 @@ pub struct SuperAgentPlugin {
     /// `media:` is configured. `None` = every channel pump keeps its
     /// exact bytes and no media envelope is ever preprocessed.
     pub media_edge: Option<Arc<crate::media_edge::MediaEdge>>,
-    /// ADR-065: the channels whose config says `voice: true`. Each is
+    /// ADR-066: the channels whose config says `voice: true`. Each is
     /// registered behind the voice edge (so a voice intent arrives at the
     /// adapter as bytes) and the set is what mounts `reply_voice` on the
     /// Router — empty (the default) keeps the tool surface byte-identical.

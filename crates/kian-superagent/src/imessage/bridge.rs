@@ -129,7 +129,7 @@ pub struct Health {
     #[serde(default)]
     pub watch: WatchInfo,
     /// Whether a voice message can go out as a native voice bubble on
-    /// this host (ADR-065); absent from an older bridge.
+    /// this host (ADR-066); absent from an older bridge.
     #[serde(default)]
     pub voice: VoiceInfo,
     #[serde(default)]
@@ -192,7 +192,7 @@ pub struct SendRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_guid: Option<String>,
     /// Empty exactly when `voice` is present (the two are mutually
-    /// exclusive, ADR-065).
+    /// exclusive, ADR-066).
     #[serde(default)]
     pub text: String,
     /// One audio message; `None` for a text send.

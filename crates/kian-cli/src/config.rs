@@ -2944,7 +2944,7 @@ pub struct ImessageChannelSection {
     /// (ADR-064).
     #[serde(default)]
     pub attachments: AttachmentMode,
-    /// Outbound voice (ADR-065): `true` mounts the `reply_voice` tool
+    /// Outbound voice (ADR-066): `true` mounts the `reply_voice` tool
     /// on the channel and synthesizes each reply through the media edge
     /// before the adapter sends it — requires a `media:` section (with
     /// `artifacts:`), because the edge is what turns text into audio.
