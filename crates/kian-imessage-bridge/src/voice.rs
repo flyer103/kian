@@ -1,5 +1,5 @@
 //! Voice payloads: one caller-supplied audio blob, decoded, capped and
-//! staged for `imsg` (CHANNEL-IMESSAGE §3.2, ADR-066).
+//! staged for `imsg` (CHANNEL-IMESSAGE §3.2, ADR-067).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

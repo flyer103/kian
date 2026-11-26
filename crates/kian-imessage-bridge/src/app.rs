@@ -1046,7 +1046,7 @@ async fn send<B: Backend>(
             });
             if let Some(staged) = staged.as_ref() {
                 // The transport is an observation, not an intent: report
-                // the path that actually carried the audio (ADR-066).
+                // the path that actually carried the audio (ADR-067).
                 ok["voice_mode"] = result
                     .get("voice_mode")
                     .cloned()

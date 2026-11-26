@@ -1,4 +1,4 @@
-# ADR-066: Outbound voice on the iMessage channel edge
+# ADR-067: Outbound voice on the iMessage channel edge
 
 - Status: accepted (2026-11-26, P5b extension slice)
 - Related: ADR-042 (iMessage channel), ADR-056 (artifacts), ADR-061

@@ -184,7 +184,7 @@ through the bridge and hands them to the media edge, so their transcripts join t
 never enter the event log ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)).
 With `voice: true` the channel also *speaks*: the Router gains a `reply_voice` tool and a spoken
 reply arrives as a native voice message where the Mac allows it, an audio attachment otherwise
-([voice replies](#voice-replies-outbound), [ADR-066](../design/decisions/ADR-066-imessage-voice-io.md)).
+([voice replies](#voice-replies-outbound), [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)).
 `kian imessage check` is the read-only preflight
 ([design/CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md),
 [docs/runbook-imessage.md](../docs/runbook-imessage.md)).
@@ -1112,7 +1112,7 @@ which one this Mac will produce.
 Limits, recorded rather than promised: one voice message per call (never split — split audio is
 unintelligible), at most 1 MiB of audio, no caption-plus-voice delivery, and no automatic voice
 answer — a reply is spoken only when the model calls `reply_voice`. Semantics:
-[ADR-066](../design/decisions/ADR-066-imessage-voice-io.md).
+[ADR-067](../design/decisions/ADR-067-imessage-voice-io.md).
 
 ## Vision inputs
 

@@ -94,7 +94,7 @@ use crate::worker::{
 pub const REPLY_TOOL: &str = "reply";
 
 /// The `reply_voice` tool name (Router-only, mounted only when a
-/// voice-capable channel is assembled — ADR-066).
+/// voice-capable channel is assembled — ADR-067).
 pub const REPLY_VOICE_TOOL: &str = "reply_voice";
 
 /// The `deliver_structured` tool name (Router-only).
@@ -884,7 +884,7 @@ pub struct RouterTools {
     /// `SpawnRequest::default()` prepare is a pure mint (no IO, no
     /// side effect), so the probe is an honest read, not a workaround.
     worker_pinned_version: u64,
-    /// (ADR-066): the channels whose assembly carries a voice edge.
+    /// (ADR-067): the channels whose assembly carries a voice edge.
     /// Empty (the default) keeps the tool surface byte-identical —
     /// `reply_voice` is simply absent; the set itself never reaches a
     /// prompt.
@@ -990,7 +990,7 @@ impl RouterTools {
         self
     }
 
-    /// (ADR-066): installs the channels that carry a voice edge. A
+    /// (ADR-067): installs the channels that carry a voice edge. A
     /// non-empty set mounts `reply_voice`; an absent call (the default)
     /// leaves the tool surface byte-identical, because a tool schema is
     /// prompt prefix.
@@ -2462,7 +2462,7 @@ impl RouterTools {
         })
     }
 
-    /// (ADR-066): replies with one spoken message. The tool exists only
+    /// (ADR-067): replies with one spoken message. The tool exists only
     /// on a surface whose assembly carries a voice edge, so the delivery
     /// it emits is an intent (`{"voice": {"text": …}}`): the edge
     /// synthesizes the bytes and the adapter sends them, which keeps
@@ -2692,7 +2692,7 @@ changes, verification)."
                 }),
             },
         ];
-        // (ADR-066): the voice reply rides the surface only when a
+        // (ADR-067): the voice reply rides the surface only when a
         // voice-capable channel is assembled — without one the tool set
         // stays byte-identical (a tool schema is prompt prefix).
         if !self.voice_channels.is_empty() {

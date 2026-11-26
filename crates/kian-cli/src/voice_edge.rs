@@ -1,4 +1,4 @@
-//! The outbound voice edge (ADR-066).
+//! The outbound voice edge (ADR-067).
 //!
 //! A channel whose config says `voice: true` is registered behind this
 //! decorator. The Router's `reply_voice` emits an *intent* — a

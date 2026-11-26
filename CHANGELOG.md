@@ -9,7 +9,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 ## Unreleased
 
 - **iMessage voice: a spoken reply arrives as a voice message, and inbound voice notes are
-  config-complete (CHANNEL-IMESSAGE §2.5, §3.2, §5, §7, ADR-066, P5b slice 2b).** `imessage.voice:
+  config-complete (CHANNEL-IMESSAGE §2.5, §3.2, §5, §7, ADR-067, P5b slice 2b).** `imessage.voice:
   true` (refused without `media:` and `artifacts:`) mounts one extra Router tool,
   `reply_voice`, whose arguments mirror `reply` — the `reply` schema is prompt-prefix
   content, so no voice argument was added to it. The Router emits the intent

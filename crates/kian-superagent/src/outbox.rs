@@ -977,7 +977,7 @@ fn shape_reply(im: &ImPolicy, entry: &OutboxEntry, detail: bool) -> EnforcedRepl
 
 /// The `reply_voice` shaping an intent takes: always the summary
 /// budget — a voice message is the delivery, so a details request never
-/// promotes it to a full one (ADR-066).
+/// promotes it to a full one (ADR-067).
 fn shape_voice(im: &ImPolicy, entry: &OutboxEntry) -> EnforcedReply {
     im.enforce(&arguments_text(&entry.arguments))
 }
@@ -1516,7 +1516,7 @@ mod tests {
 
     /// A voice intent reconstructs as the voice intent it was: the
     /// summary shaping always, and never promoted by a details request
-    /// (ADR-066) — a re-drive must not resend spoken text as text.
+    /// (ADR-067) — a re-drive must not resend spoken text as text.
     #[test]
     fn voice_intents_reconstruct_as_voice_intents() {
         let im = ImPolicy::default();

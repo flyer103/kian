@@ -38,14 +38,14 @@ impl MediaEdge {
         Self { tools, store }
     }
 
-    /// ADR-066: the outbound voice edge shares this assembly's tools and
+    /// ADR-067: the outbound voice edge shares this assembly's tools and
     /// store, so a channel gains `reply_voice` only where inbound media
     /// already has an edge.
     pub fn tools(&self) -> &Arc<MediaTools> {
         &self.tools
     }
 
-    /// ADR-066: the artifact store the voice edge reads a synthesized
+    /// ADR-067: the artifact store the voice edge reads a synthesized
     /// artifact back from.
     pub fn store(&self) -> &Arc<ArtifactStore> {
         &self.store
