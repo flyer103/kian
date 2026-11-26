@@ -2496,3 +2496,71 @@ async fn a_missing_blob_or_a_non_vision_profile_keeps_the_text_only_shape() {
     );
     cleanup_db(&h.db_path);
 }
+
+/// ADR-065 L2: a channel row carrying image references beside its wrapper
+/// reaches a vision target as content parts, and the text part is exactly
+/// the bytes the same row sends without the flag — the wrapper is not
+/// reformatted by gaining references.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_wrapper_with_image_references_fills_the_vision_parts() {
+    let dir = std::env::temp_dir().join(format!("kian-loop-vision-channel-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let reference = blobs.put(b"hi", "image/jpeg").expect("put blob");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(
+        agent,
+        vec![vec![text_chunk("a night sky")]],
+        Some(artifacts),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let wrapper = json!({
+        "kian": {
+            "type": "channel_event",
+            "channel": "imessage",
+            "topic": "imessage",
+            "event_id": "evt-9",
+            "raw": {"text": "[image]"}
+        }
+    });
+    let mut content = wrapper.clone();
+    content["images"] = json!([{"artifact": reference.id, "media_type": "image/jpeg"}]);
+    assert_eq!(
+        submit_and_wait(&h, sid, content).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    assert_eq!(
+        last["content"],
+        json!([
+            {"type": "text", "text": serde_json::to_string(&wrapper).unwrap()},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,aGk="}}
+        ]),
+        "the wrapper keeps its bytes and the pixels ride as a content part"
+    );
+    assert_eq!(
+        last.get("images"),
+        None,
+        "the carrier never reaches the wire"
+    );
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}

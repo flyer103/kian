@@ -56,6 +56,10 @@ pub struct ShapingConfig {
     pub inline_cap_bytes: Option<usize>,
     pub first_chars: usize,
     pub neighbor_fields: Vec<String>,
+    /// ADR-065: beside the unchanged wrapper, admit the artifact
+    /// references the media edge stored for image items, so a vision
+    /// target can read the pixels instead of only the transcript.
+    pub vision: bool,
 }
 
 impl Default for ShapingConfig {
@@ -64,6 +68,7 @@ impl Default for ShapingConfig {
             inline_cap_bytes: None,
             first_chars: 50,
             neighbor_fields: Vec::new(),
+            vision: false,
         }
     }
 }
@@ -96,7 +101,13 @@ pub fn shape_channel_input_marked(
         .inline_cap_bytes
         .is_none_or(|cap| serialized.len() <= cap)
     {
-        return wrap_channel_event_marked(event, untrusted);
+        let mut content = wrap_channel_event_marked(event, untrusted);
+        if config.vision
+            && let Some(images) = vision_references(&event.payload)
+        {
+            content["images"] = images;
+        }
+        return content;
     }
 
     // An excerpt is strictly shorter than the serialized raw, even for a
@@ -156,6 +167,37 @@ pub fn shape_channel_input_marked(
 /// The wrapper itself: `{"kian":{"type":"channel_event",…}}`.
 pub fn wrap_channel_event(event: &ChannelEvent) -> Value {
     wrap_channel_event_marked(event, false)
+}
+
+/// The artifact references an admitted image may hand a vision target
+/// (ADR-065): one entry per post-edge "media" item of kind "image" that
+/// names both its artifact and its media type. Audio is
+/// transcript-only, and an item without a reference stays text-only —
+/// None when nothing qualifies, so the inline content keeps the
+/// legacy bytes exactly.
+fn vision_references(payload: &Value) -> Option<Value> {
+    let mut images = Vec::new();
+    for item in payload.get("media").and_then(Value::as_array)? {
+        if item.get("kind").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let Some(artifact) = item
+            .get("artifact")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(media_type) = item
+            .get("media_type")
+            .and_then(Value::as_str)
+            .filter(|media_type| !media_type.is_empty())
+        else {
+            continue;
+        };
+        images.push(json!({"artifact": artifact, "media_type": media_type}));
+    }
+    (!images.is_empty()).then_some(Value::Array(images))
 }
 
 /// [`wrap_channel_event`] plus the untrusted bit. `false` omits
@@ -495,6 +537,7 @@ mod tests {
                 inline_cap_bytes: Some(4_096),
                 first_chars: 1,
                 neighbor_fields: vec!["text".into()],
+                vision: false,
             },
         );
         assert_eq!(shaped, legacy);
@@ -534,6 +577,7 @@ mod tests {
                 inline_cap_bytes: Some(16),
                 first_chars: 12,
                 neighbor_fields: vec!["reply_to".into(), "large_nested_field".into()],
+                vision: false,
             },
         );
 
@@ -572,6 +616,118 @@ mod tests {
                 .unwrap(),
             serialized,
             "an excerpt never re-inlines the complete over-cap raw"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // channel images as vision references (ADR-065)
+    // -----------------------------------------------------------------
+
+    fn media_event() -> ChannelEvent {
+        let mut ev = event();
+        ev.payload = json!({
+            "text": "[image]",
+            "media": [
+                {
+                    "kind": "image",
+                    "media_type": "image/jpeg",
+                    "artifact": "aa11",
+                    "size": 3,
+                    "transcript": "logo"
+                },
+                {
+                    "kind": "audio",
+                    "media_type": "audio/ogg",
+                    "artifact": "bb22",
+                    "transcript": "hello"
+                },
+                {"kind": "image", "media_type": "image/jpeg", "error": "refused"},
+                {"kind": "image", "media_type": "image/png"}
+            ]
+        });
+        ev
+    }
+
+    #[test]
+    fn vision_off_keeps_the_wrapper_bytes_untouched() {
+        let ev = media_event();
+        let shaped = shape_channel_input(&ev, &ShapingConfig::default());
+        assert_eq!(
+            serde_json::to_vec(&shaped).unwrap(),
+            serde_json::to_vec(&channel_input_payload(&ev)).unwrap()
+        );
+        assert!(shaped.get("images").is_none(), "{shaped}");
+    }
+
+    #[test]
+    fn vision_on_admits_only_stored_images_beside_the_unchanged_wrapper() {
+        let ev = media_event();
+        let shaped = shape_channel_input(
+            &ev,
+            &ShapingConfig {
+                vision: true,
+                ..ShapingConfig::default()
+            },
+        );
+        // The wrapper keeps the legacy bytes: the references ride beside
+        // it, never inside it (the marker parser reads that object).
+        assert_eq!(
+            serde_json::to_vec(&shaped["kian"]).unwrap(),
+            serde_json::to_vec(&channel_input_payload(&ev)["kian"]).unwrap()
+        );
+        assert_eq!(
+            shaped["images"],
+            json!([{"artifact": "aa11", "media_type": "image/jpeg"}])
+        );
+    }
+
+    #[test]
+    fn vision_on_without_references_stays_byte_identical() {
+        let shaped = shape_channel_input(
+            &event(),
+            &ShapingConfig {
+                vision: true,
+                ..ShapingConfig::default()
+            },
+        );
+        assert_eq!(
+            serde_json::to_vec(&shaped).unwrap(),
+            serde_json::to_vec(&channel_input_payload(&event())).unwrap()
+        );
+    }
+
+    #[test]
+    fn over_cap_shaping_never_carries_references() {
+        let mut ev = media_event();
+        ev.payload["text"] = json!("x".repeat(4_096));
+        let shaped = shape_channel_input(
+            &ev,
+            &ShapingConfig {
+                inline_cap_bytes: Some(16),
+                first_chars: 12,
+                neighbor_fields: vec![],
+                vision: true,
+            },
+        );
+        assert!(shaped.get("images").is_none(), "{shaped}");
+        assert!(shaped["content"].get("images").is_none(), "{shaped}");
+    }
+
+    #[test]
+    fn vision_references_ride_beside_an_untrusted_wrapper() {
+        let ev = media_event();
+        let shaped = shape_channel_input_marked(
+            &ev,
+            &ShapingConfig {
+                vision: true,
+                ..ShapingConfig::default()
+            },
+            true,
+        );
+        assert_eq!(shaped["kian"]["untrusted"], json!(true));
+        assert_eq!(
+            shaped["images"],
+            json!([{"artifact": "aa11", "media_type": "image/jpeg"}])
         );
     }
 
@@ -671,6 +827,7 @@ mod tests {
                 inline_cap_bytes: Some(16),
                 first_chars: 12,
                 neighbor_fields: vec![],
+                vision: false,
             },
             true,
         );
@@ -690,6 +847,7 @@ mod tests {
                 inline_cap_bytes: Some(16),
                 first_chars: 12,
                 neighbor_fields: vec![],
+                vision: false,
             },
             false,
         );
@@ -713,6 +871,7 @@ mod tests {
                 inline_cap_bytes: Some(8),
                 first_chars: 4,
                 neighbor_fields: vec![],
+                vision: false,
             },
             true,
         );

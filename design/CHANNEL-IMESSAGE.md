@@ -524,7 +524,10 @@ item as an artifact, transcribes it, rewrites the item to an artifact reference 
 appends the `[image transcript]`/`[voice message transcript]` line to the admitted text (ADR-062,
 ADR-064). The base64 is consumed before admission, so the durable payload never contains bytes; a
 fetch that fails without bytes leaves the metadata-only payload above and still admits the row. In
-`metadata` mode (default) the route is never called.
+`metadata` mode (default) the route is never called. With `superagent.shaping.vision: true`
+(ADR-065) the admitted content also carries a sibling `images` array of these artifact references,
+so a vision target reads the picture itself while the wrapper and this transcript line stay
+unchanged.
 
 Drop rules — each produces `None` plus one audit line and a counter, never a synthesized event:
 
@@ -536,9 +539,10 @@ Drop rules — each produces `None` plus one audit line and a counter, never a s
    reactions).
 4. `text` missing or empty after trimming → drop. An attachment-only row is not this case while the
    bridge runs with `watch.attachments` (§3.2 synthesizes the marker); with the knob off it has no
-   text and is dropped here. What the attachment *contains* reaches the model as a transcript only
-   when `attachments: bytes` and a `media:` section are configured (ADR-064); otherwise it stays on
-   the Mac (§11).
+   text and is dropped here. What the attachment *contains* reaches the model as a transcript when
+   `attachments: bytes` and a `media:` section are configured (ADR-064), and as pixels when
+   `superagent.shaping.vision` is on and the binding declares `vision: true` (ADR-065); otherwise it
+   stays on the Mac (§11).
 5. `sender` empty/absent → drop (no identity, no allowlist decision).
 6. `normalize(sender)` is not a key of `topics` → drop. Unknown sender is an **honest drop with an
    audit line**, never a fallback topic. (The bridge's `watch.participants` filter is a second,
@@ -758,11 +762,10 @@ plus an honest error at the seam.
 
 ## 11. Non-goals (phase 2)
 
-Explicitly out of scope, recorded so they are not silently half-built: inbound media **vision** (a
-model reads an OCR/ASR transcript, never pixels; ADR-063's decision stands — ADR-064 serves bytes to
-the edge, not to the model), outbound media other than voice — a voice message is ADR-066, while
-photos, files and stickers stay inbound-only — SMS/Text Message Forwarding, group chats, tapbacks/reactions,
-message edits and unsends as *input corrections*, read receipts and typing indicators (private API,
+Explicitly out of scope, recorded so they are not silently half-built: outbound media other than
+voice — a voice message is ADR-066, while photos, files and stickers stay inbound-only — SMS/Text
+Message Forwarding, group chats, tapbacks/reactions, message edits and unsends as *input
+corrections*, read receipts and typing indicators (private API,
 SIP off), rich sends/effects/polls, multi-account (more than one bridge/Apple ID), a bridge that is
 not `imsg`-based, kian-side cursor persistence, and any iMessage-specific prompt tuning beyond the
 channel-target sentence.
@@ -773,7 +776,9 @@ ADR-062 `media` envelope (`{"kind","media_type","base64"[,"language"]}` items), 
 assembly-side media edge stores each item as an artifact, transcribes it and appends the transcript
 to the admitted text. In the default `metadata` mode nothing is fetched and the metadata array alone
 tells the model what arrived (§4). Nothing else on this channel changes: no event kind, no store
-schema, no core seam.
+schema, no core seam. Inbound media vision is no longer a non-goal: `superagent.shaping.vision:
+true` (ADR-065) admits the edge's image references beside the unchanged wrapper, so a vision target
+reads the pixels while a blind target keeps reading the transcript.
 
 ## 12. Acceptance
 
@@ -910,6 +915,9 @@ question — they stay in §13.
    `attachments: bytes` mode and the resulting `[image transcript]` line have been exercised
    against fakes and the media edge's own suite, not against a real photo on a real Mac. The
    `2026-11-20` L3 run predates the route; the first owner photo is the acceptance for L3 (§12).
+   The channel-image opt-in (ADR-065) is likewise L1/L2-only until a real photo arrives at a vision
+   target on the live host.
+
 14. **Outbound voice is L1/L2 only.** The bridge's `voice` field, its native/attachment choice and
    `voice_mode`, the edge's synthesis path and a `reply_voice` delivery are exercised against a
    fake `imsg` child and a fake media provider. A real voice message on a real Mac was not part of

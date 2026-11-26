@@ -804,7 +804,36 @@ ADR-056; the profile knob is ADR-054; the placement is [design/DESIGN.md](../des
 
 Non-goals recorded with the phase: no real vision provider wired in the tree (scripted-provider L2
 evidence), no image pricing, no images outside `role: user`, no replay re-derivation from the
-artifact store, no automatic vision from channel media (that edge transcribes to text).
+artifact store. Channel media reaches the model as pixels only through the explicit opt-in below;
+without it the edge still transcribes every item and no channel attaches an image.
+
+### Channel images on a vision target (ADR-065, opt-in)
+
+Scope: let an image that arrived over a channel reach a vision-capable model as pixels, without
+changing what every other reader of the admitted content sees.
+
+Semantics: with `superagent.shaping.vision: true` (default `false`), the admission shaper keeps the
+`{"kian": …}` channel wrapper byte-identical and adds a sibling `"images": [{"artifact": <content
+id>, "media_type": <IANA type>}]` built from the items the media edge already stored (`kind:
+"image"` with a non-empty artifact and media type). Inputs above `inline_cap_bytes` keep the Inline
+view and carry no images. The loop recognizes the sibling and derives the same model-visible text as
+before; the ADR-063 capability gate is unchanged, so only a `vision: true` target attaches bytes and
+a blind target drops the references with one warning and sends the text. Config refuses
+`shaping.vision: true` without a `media:` section or without a Router slot that resolves to a vision
+profile, and `kian serve` logs one warning when the resident session's projected binding predates
+the change (slot bindings are session-immutable; `superagent.router.rotate_after_events` retires the
+session, ADR-040). A media item whose transcription failed keeps its artifact reference, so a picture
+still reaches a vision target when the text tool could not describe it.
+
+The contract is [ADR-065](../design/decisions/ADR-065-channel-images-as-vision-references.md); the
+transcript path is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| Channel | kian-superagent, kian-loop, kian-cli | opt-in sibling image references on channel admission, capability-gated bytes, boot validation and the stale-binding diagnostic | landed (default off) |
+
+Non-goals recorded with this slice: no vision on the spill path, no outbound media, no per-image
+pricing or dedupe, no automatic slot migration, no automatic session rotation.
 
 ### Resident rotation (ADR-040)
 

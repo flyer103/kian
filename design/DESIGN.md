@@ -543,8 +543,10 @@ fails the turn). Replay honesty: the persisted step/request body is still the ex
 but offline replay cannot rebuild base64 from the stream alone, so kian session replay counts a
 request whose recorded messages carry content parts as a vision request instead of a byte-identity
 mismatch. Limits: no real vision provider is wired in the tree (the L2 evidence is a scripted
-provider), no per-image pricing, no replay re-derivation from the artifact store, and the channel
-media edge (ADR-062) still transcribes to text rather than attaching vision.
+provider), no per-image pricing, no replay re-derivation from the artifact store. Channel media
+reaches a vision target through the admission opt-in (ADR-065): `superagent.shaping.vision` adds a
+sibling `images` array of artifact references beside the unchanged channel wrapper, so no marker
+parser moves and a blind target still reads the transcript.
 
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and
@@ -858,8 +860,10 @@ graph TB
  top-level scalar association ids), `"spill": true`, and `continuation: {event_id}`; the row
  envelope carries the verbatim raw as its sidecar, producing the atomic admitted/spilled pair at
  the ordinary consumption write. Idempotent `(session, event_id)` admission still dedupes the
- whole pair. There is no retroactive re-shaper: committed context remains immutable and
- `derive_model_context` stays verbatim. Neighbor inlining v1 reads only fields on this payload;
+ whole pair. An optional `vision` flag (default false) additionally emits a sibling `images` array of
+ `{artifact, media_type}` beside the unchanged wrapper for post-edge image items, which is how a
+ vision target reads pixels (ADR-065); over-cap inputs carry no images. There is no retroactive
+ re-shaper: committed context remains immutable and `derive_model_context` stays verbatim. Neighbor inlining v1 reads only fields on this payload;
  it never fetches cross-event IM history (that is a recall hop).
 - **Batching**: the Router drain batches naturally (a drain has "drain the queue" semantics —
  eligible inputs are consumed in one sweep) — matching the article §7.2 batch-merge experimental

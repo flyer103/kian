@@ -672,6 +672,7 @@ mod tests {
             inline_cap_bytes: None,
             first_chars: 8,
             neighbor_fields: vec![],
+            vision: false,
         };
         let small = json!({"text": "tiny"});
         assert_eq!(

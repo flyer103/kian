@@ -23,6 +23,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   covers the spoken text, never the synthesized bytes, so a re-drive after a restart converges on
   one message; a refused synthesis or a missing artifact is an honest delivery failure, never an
   empty send.
+
+- **Channel images: an opt-in admission shape sends the media edge's image artifacts to a vision
+  target (`superagent.shaping.vision`, CHANNEL-IMESSAGE §4/§11, ADR-065).** The shaper keeps the
+  `{"kian": …}` wrapper byte-identical and adds a sibling `images` array of `{artifact,
+  media_type}` for post-edge image items, so reply routing and channel reads are untouched while
+  the loop attaches pixels under a `vision: true` profile. Over-cap inputs and blind targets keep
+  today's text-only behavior, config refuses the flag without a `media:` section and a vision
+  Router profile, a stale resident binding gets one boot warning instead of a silent text-only
+  answer, and a media item whose transcription failed now keeps its artifact reference.
 - **iMessage images: the adapter asks the bridge for the JPEG variant, so a photo reaches the model
   as a transcript instead of a bare `[image]` marker (CHANNEL-IMESSAGE §3.2/§4, ADR-064 amendment).**
   The provider rejects `image/heic` deterministically, so an iPhone photo's original bytes failed OCR

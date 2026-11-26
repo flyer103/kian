@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use kian_core::seams::{ChannelEvent, ToolCall, ToolProvider};
 use kian_media::{DEFAULT_AUDIO_MEDIA_TYPE, DEFAULT_IMAGE_MEDIA_TYPE, MediaTools, base64_decode};
-use kian_store::ArtifactStore;
+use kian_store::{ArtifactRef, ArtifactStore};
 use serde_json::{Map, Value, json};
 
 /// The additive payload key that marks a media event (ADR-062).
@@ -131,19 +131,19 @@ impl MediaEdge {
             .filter(|value| !value.is_empty());
         let Some(encoded) = object.get("base64").and_then(Value::as_str) else {
             return (
-                error_item(kind, media_type, "media item is missing base64 bytes"),
+                error_item(kind, media_type, None, "media item is missing base64 bytes"),
                 None,
             );
         };
         let Some(bytes) = base64_decode(encoded) else {
             return (
-                error_item(kind, media_type, "media item base64 is malformed"),
+                error_item(kind, media_type, None, "media item base64 is malformed"),
                 None,
             );
         };
         if bytes.is_empty() {
             return (
-                error_item(kind, media_type, "media item carries no bytes"),
+                error_item(kind, media_type, None, "media item carries no bytes"),
                 None,
             );
         }
@@ -157,6 +157,7 @@ impl MediaEdge {
                     error_item(
                         kind,
                         media_type,
+                        None,
                         &format!("could not store the media artifact: {error}"),
                     ),
                     None,
@@ -188,6 +189,7 @@ impl MediaEdge {
                     error_item(
                         kind,
                         media_type,
+                        Some(&reference),
                         &format!("{tool} refused the item: {error}"),
                     ),
                     None,
@@ -200,11 +202,19 @@ impl MediaEdge {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("media tool failed");
-            return (error_item(kind, media_type, message), None);
+            return (
+                error_item(kind, media_type, Some(&reference), message),
+                None,
+            );
         }
         let Some(transcript) = result.output.get("text").and_then(Value::as_str) else {
             return (
-                error_item(kind, media_type, &format!("{tool} returned no transcript")),
+                error_item(
+                    kind,
+                    media_type,
+                    Some(&reference),
+                    &format!("{tool} returned no transcript"),
+                ),
                 None,
             );
         };
@@ -221,10 +231,28 @@ impl MediaEdge {
     }
 }
 
-fn error_item(kind: &str, media_type: Option<&str>, message: &str) -> Value {
+/// The failed-item view. An item whose bytes were already stored keeps
+/// its reference (ADR-065): a picture a vision target can read is worth
+/// admitting even when the text tool could not describe it. A failure
+/// before the store has no reference to give.
+fn error_item(
+    kind: &str,
+    media_type: Option<&str>,
+    stored: Option<&ArtifactRef>,
+    message: &str,
+) -> Value {
     let mut item = json!({"kind": kind, "error": message});
-    if let Some(media_type) = media_type {
-        item["media_type"] = json!(media_type);
+    match stored {
+        Some(reference) => {
+            item["artifact"] = json!(reference.id);
+            item["media_type"] = json!(reference.media_type);
+            item["size"] = json!(reference.size);
+        }
+        None => {
+            if let Some(media_type) = media_type {
+                item["media_type"] = json!(media_type);
+            }
+        }
     }
     item
 }
@@ -387,9 +415,39 @@ mod tests {
         let item = &payload["media"][0];
         let error = item["error"].as_str().expect("error item");
         assert!(error.contains("HTTP 500"), "unexpected error: {error}");
-        assert!(item.get("artifact").is_none());
+        // ADR-065: the bytes were stored before the tool ran, so the
+        // reference survives a failed transcription — a vision target can
+        // still read the picture, and only the text is missing.
+        let id = item["artifact"]
+            .as_str()
+            .expect("the stored reference survives");
+        assert_eq!(item["media_type"], json!("image/png"));
+        assert_eq!(item["size"], json!(2));
+        assert_eq!(store.get(id).expect("store get").expect("blob"), b"hi");
         assert!(!prepared.payload.to_string().contains("aGk="));
-        assert!(store.get(&"0".repeat(64)).expect("store get").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_has_no_reference_to_offer() {
+        let server = MockServer::start().await;
+        let dir = temp_dir();
+        let store = Arc::new(ArtifactStore::open(dir.clone()).expect("store"));
+        let edge = MediaEdge::new(tools(&server, &store), Arc::clone(&store));
+        // A store that can no longer write: the root is now a file.
+        std::fs::remove_dir_all(&dir).expect("remove the root");
+        std::fs::write(&dir, b"in the way").expect("file in the way");
+        let prepared = edge
+            .prepare(event(json!({
+                "media": [{"kind": "image", "base64": "aGk="}],
+            })))
+            .await;
+        let payload = prepared.payload.as_object().expect("payload object");
+        let item = &payload["media"][0];
+        let error = item["error"].as_str().expect("error item");
+        assert!(error.contains("could not store"), "{error}");
+        assert!(item.get("artifact").is_none(), "{item}");
+        assert!(item.get("size").is_none(), "{item}");
+        std::fs::remove_file(&dir).ok();
     }
 
     #[tokio::test]
