@@ -677,6 +677,37 @@ impl Server {
                 }
             }
             let router_session = router_re_arm.live;
+            // (ADR-065) The flag is configuration, but the live Router's
+            // target is session state: a session created before the flag
+            // (or before the profile declared `vision`) keeps its
+            // text-only binding — ADR-006 forbids a runtime swap, so the
+            // only honest recovery is rotation (ADR-040).
+            if sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
+                let missing = match store.rebuild(router_session).await {
+                    Ok(events) => kian_llm::slots::SessionSlots::replay(router_session, &events)
+                        .ok()
+                        .and_then(|slots| {
+                            slots
+                                .binding(&kian_core::model::SlotName(sa.router.slot.clone()))
+                                .ok()
+                                .map(|binding| {
+                                    !binding
+                                        .target
+                                        .profile
+                                        .as_ref()
+                                        .is_some_and(|profile| profile.vision)
+                                })
+                        }),
+                    Err(_) => None,
+                };
+                if missing == Some(true) {
+                    tracing::warn!(
+                        session = %router_session.0,
+                        slot = %sa.router.slot,
+                        "superagent: shaping.vision is on but the resident Router's live slot binding carries no vision profile — image references are dropped until the Router rotates (superagent.router.rotate_after_events, ADR-040/ADR-065)"
+                    );
+                }
+            }
             // ADR-040 phase 1: one binding shared by every router-facing
             // surface (driver routing, the mounted inbox, the spawner's
             // parent, completion reports, the router route, the tools,

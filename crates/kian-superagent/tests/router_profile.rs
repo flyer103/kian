@@ -880,6 +880,7 @@ async fn over_cap_admission_commits_one_pair_and_router_sees_only_the_excerpt() 
         inline_cap_bytes: Some(32),
         first_chars: 24,
         neighbor_fields: vec!["reply_to".into()],
+        vision: false,
     });
 
     let full_text = "FULL_OVER_CAP_RAW_abcdefghijklmnopqrstuvwxyz_MUST_NOT_REACH_THE_ROUTER";

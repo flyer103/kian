@@ -1668,6 +1668,7 @@ mod tests {
             inline_cap_bytes: Some(4),
             first_chars: 2,
             neighbor_fields: vec![],
+            vision: false,
         });
         service
             .handle_event(event("mock-im", "evt-spill", None))

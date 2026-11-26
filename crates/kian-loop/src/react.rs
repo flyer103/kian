@@ -2090,13 +2090,19 @@ type ImageReference = (String, String);
 /// The text to send plus the image references parsed out of a vision envelope.
 type VisionEnvelope = (Option<String>, Vec<ImageReference>);
 
-/// The ADR-063 vision envelope: a user message content object
-/// `{"text": <string>, "images": [{"artifact": <id>, "media_type": <type>}]}`.
+/// The vision envelope: a user message content object carrying
+/// `images: [{"artifact": <id>, "media_type": <type>}]` beside its text.
+/// ADR-063's shape is `{"text": <string>, "images": […]}`; ADR-065 adds
+/// the channel wrapper form `{"kian": {…}, "images": […]}`.
 ///
 /// Returns the text to send and the referenced blobs, or `None` when the
-/// payload is not an envelope with at least one usable reference (both keys
-/// are required on an item). A malformed descriptor therefore never changes
-/// the bytes: the legacy compact-JSON conversion still applies.
+/// payload carries no usable reference (both keys are required on an item).
+/// A malformed descriptor therefore never changes the bytes: the legacy
+/// compact-JSON conversion still applies. The text is exactly what the
+/// content would render as without the references: the sole `text` string
+/// when that is the only other key, nothing when the references are all
+/// there is, and the compact serialization of the object minus `images`
+/// otherwise — for a channel wrapper, today's bytes.
 fn vision_envelope(content: &Value) -> Option<VisionEnvelope> {
     let object = content.as_object()?;
     let references = object.get("images")?.as_array()?;
@@ -2124,10 +2130,18 @@ fn vision_envelope(content: &Value) -> Option<VisionEnvelope> {
     if usable.is_empty() {
         return None;
     }
-    let text = object
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let mut remainder = object.clone();
+    remainder.remove("images");
+    let text = if remainder.is_empty() {
+        None
+    } else if remainder.len() == 1 && remainder.get("text").is_some_and(Value::is_string) {
+        remainder
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        Some(serde_json::to_string(&Value::Object(remainder)).unwrap_or_default())
+    };
     Some((text, usable))
 }
 
