@@ -174,6 +174,7 @@ section first.
 | readiness | `status` | `{}` | `version`, `protocol_version`, `database.ready`, `database.error`, `database.features`, `bridge.ready`, `methods`, `supported_methods` |
 | read | `messages.after` | `{since_rowid, limit ≤ 500, attachments:<watch.attachments>, include_reactions:false}` | `{messages[], next_rowid, has_more}` — ordered by ROWID asc; `next_rowid` is the authoritative physical cursor |
 | send | `send` | `{to or chat_guid, text, service, allow_sms_fallback}` | `{ok:true, id, guid}`; failures carry a delivery **disposition** (`not_started` / `may_have_completed` / `still_in_flight`) and `retry_safe` |
+| send (voice) | `send.attachment` | `{chat_guid, file, audio:true}` | `{ok:true, id, guid}`; converts the file to a native voice message. A private-API method: it needs the IMCore bridge (`status.bridge.ready`), which is unavailable with SIP enabled. Used by `/v1/send`'s `voice` path when the bridge is ready, with `send` + `file` as the fallback (rule 12) |
 | (unused) | `watch.subscribe` | — | available in `imsg` but **not used by phase 1**: the reference bridge polls `messages.after` at `poll_interval_ms` (250 ms), which keeps it a plain request/response client. A future low-latency bridge may subscribe instead; the ABI does not change |
 
 Frozen semantics the bridge relies on:
@@ -214,6 +215,13 @@ Frozen semantics the bridge relies on:
     `is_sticker`; `imsg` attachment objects also carry absolute paths and internal ids that must not
     leave the Mac. The bridge projects a whitelist and basenames the path (§3.2); it reads the file itself for
     `/v1/attachment`, so the path never leaves the Mac.
+12. **A native voice message is a private-API feature.** `send.attachment` with `audio` has `imsg`
+    convert the file to a mono 24 kHz Opus CAF voice message and dispatch it through the IMCore
+    bridge, so the method is reachable only while that bridge is ready (`status.bridge.ready`;
+    SIP disabled and `imsg launch` running — rule 7). An audio file is still sendable with SIP
+    enabled: `send`'s `file` parameter stages it under `~/Library/Messages/Attachments/imsg/` and
+    it arrives as an ordinary attachment. The bridge uses the native method when it can and the
+    ordinary one when it cannot, and reports which (§3.2 `voice_mode`).
 
 ## 3. The bridge
 
@@ -281,6 +289,7 @@ All requests carry `Authorization: Bearer <token>`. Bodies are JSON; every respo
   "imsg": {"version": "0.11.1", "rpc": true, "private_api": false},
   "database": {"ready": true, "path": "/Users/me/Library/Messages/chat.db", "generation": "9f1e..."},
   "automation": "unknown",
+  "voice": {"native": false, "detail": "IMCore bridge not running (SIP enabled)"},
   "watch": {"active": true, "last_rowid": 48211, "buffered": 12, "participants": ["+14155551212"]},
   "counters": {"updates_served": 812, "sends": 33, "uncertain_sends": 0, "watch_restarts": 1}
 }
@@ -293,6 +302,9 @@ All requests carry `Authorization: Bearer <token>`. Bodies are JSON; every respo
 - `automation` is the **last observed** Automation state: `unknown` until a send proves it,
   `granted` after a successful send, `denied` after `-1743`. It is never probed proactively
   (a probe would itself raise a TCC prompt).
+- `voice.native` mirrors `imsg.private_api`: the IMCore bridge that `send.attachment` needs
+  (§2.5 rule 12). It is a capability, not a failure — with `native: false` a voice delivery still
+  goes out as an audio attachment, and `voice.detail` says why (SIP enabled, bridge not running).
 - `instance_id` = random UUID per bridge process boot; `database.generation` = a UUID rotated when
   the bridge observes a different `chat.db` (inode change, or a rowid regression past the cursor).
 - `watch.participants` = the effective read filter; `kian imessage check` diffs it against the
@@ -387,7 +399,7 @@ instead of disappearing from a model's view.
   as the positioned route, so a caller that must keep the generation guard can still ask for
   readable bytes instead of trading one guarantee for the other.
 
-**`POST /v1/send`** — one text message:
+**`POST /v1/send`** — one text message, or one voice message:
 
 ```json
 {"protocol": 1, "client_id": "<stable delivery id>", "to": "+14155551212",
@@ -398,6 +410,41 @@ instead of disappearing from a model's view.
 {"protocol": 1, "ok": true, "message_id": "8DF1C0A2-...", "rowid": 48220,
  "guid": "8DF1C0A2-...", "service": "iMessage", "verified": true, "deduplicated": false}
 ```
+
+A voice delivery replaces `text` with `voice` (ADR-065):
+
+```json
+{"protocol": 1, "client_id": "<stable delivery id>", "to": "+14155551212",
+ "chat_guid": "iMessage;-;+14155551212", "text": "", "service": "auto",
+ "voice": {"base64": "<audio bytes>", "media_type": "audio/mpeg", "audio": true}}
+```
+
+```json
+{"protocol": 1, "ok": true, "message_id": "8DF1C0A2-...", "rowid": 48220,
+ "guid": "8DF1C0A2-...", "service": "iMessage", "verified": true,
+ "deduplicated": false, "voice_mode": "attachment", "voice_bytes": 41234}
+```
+
+- `voice` is additive: on a text send it is absent and both the request and the response are
+  byte-identical to the pre-voice contract. A request carries **either** `text` **or** `voice`:
+  both is `400 bad_request` (`text and voice are mutually exclusive`), neither is `400`
+  (`text must not be empty`). One delivery is one modality, never a caption plus audio.
+- `voice.audio: true` asks for a **native** voice message; `false` sends the file as an ordinary
+  audio attachment on every transport. The decoded audio is bounded at **1 MiB**
+  (`413 too_large`), the base64 must decode (`400 bad_request`), and the bound keeps a voice
+  request well under the 2 MiB body cap.
+- `voice_mode` reports the path that **actually** ran: `native` (the IMCore bridge accepted
+  `send.attachment`) or `attachment` (the file went out through `send`, §2.5 rule 12). A
+  `bridge_unavailable` from the native attempt degrades to the attachment path instead of failing
+  the send, so `voice_mode` is an observation and never an intent. `voice_bytes` is the decoded
+  byte count.
+- The bridge stages the decoded bytes in a fresh `0600` file in the system temp directory (the
+  extension follows `media_type`) and removes it on every path: success, failure and fallback. A
+  `client_id` cache hit answers before any file is staged.
+- `client_id` semantics are unchanged, including the cache. The adapter derives a **voice** id
+  from the spoken text rather than from the audio bytes, because speech synthesis is not
+  byte-stable across calls; a re-drive therefore converges on the same id even though its bytes
+  differ (ADR-065).
 
 - `to` and `chat_guid` are both optional but at least one is required; when both are present
   `chat_guid` wins (thread/service continuity) and `to` is the allowlist key the adapter validated.
@@ -526,6 +573,11 @@ change (§15).
 - **Receipt.** Resolve on bridge `ok`. `message_id` = the observed Apple `guid`, else
   `imessage:<rowid>`, else the honest fallback `kian/<client_id>` when `verified: false`. Never an
   invented server id.
+- **Voice** is exactly one part, never split: a split audio stream is not a message. The
+  adapter derives its `client_id` from `(channel, handle, spoken text, voice)` rather than from the
+  audio bytes, posts `voice: {base64, media_type, audio: true}` with an empty `text`, and maps the
+  bridge's answer like any other send; `channel/delivered` gains `"voice": true`. The bytes are
+  produced by the channel-edge voice decorator (ADR-065) — the adapter never synthesizes.
 - **Long text** splits into ordered deliveries at ~2000 characters (never mid-codepoint, never
   dropping characters); each part is its own send, its own `client_id`, and therefore its own
   `channel/delivered` receipt. A failure after part *k* is a `DeliveryFailed` naming how many parts
@@ -574,6 +626,7 @@ superagent:
         send_timeout_ms: 30000                 # one-shot send deadline (> imsg's 8 s verify)
         max_send_chars: 2000                   # defensive split point
         attachments: metadata                  # metadata (default) | bytes — bytes needs a media: section
+        voice: false                           # true mounts reply_voice; needs media: and artifacts:
 ```
 
 The same secret as the bridge's `token_file` is read from **`KIAN_IMESSAGE_BRIDGE_TOKEN`** by
@@ -592,6 +645,7 @@ refuses startup (fail-closed), exactly like `KIAN_GITHUB_TOKEN`.
 | `send_timeout_ms` | > 0 |
 | `max_send_chars` | ≥ 100 (below 100 the split becomes absurd) |
 | `attachments` | `metadata` (default) or `bytes`; `bytes` refuses startup without a `media:` section (the edge is the only consumer of base64) and fetches only `image/*`/`audio/*` items, at most four and never a sticker (ADR-064) |
+| `voice` | `false` (default) or `true`; `true` refuses startup without a `media:` section **and** an `artifacts:` root (the edge synthesizes the utterance and the store serves the bytes) and mounts the `reply_voice` tool on this channel's assembly (ADR-065) |
 | token env | `KIAN_IMESSAGE_BRIDGE_TOKEN` required at assembly; absent/blank refuses serve startup |
 | cross-references | every `subscriptions[].channel`, `speak_rules[].channel`, `untrusted_channels[]` and `intake.thread_keys[].channel` naming this channel keeps validating |
 | trust | the channel is **forced** untrusted; the config cannot turn the marker off (§8) |
@@ -706,7 +760,8 @@ plus an honest error at the seam.
 
 Explicitly out of scope, recorded so they are not silently half-built: inbound media **vision** (a
 model reads an OCR/ASR transcript, never pixels; ADR-063's decision stands — ADR-064 serves bytes to
-the edge, not to the model), outbound media, SMS/Text Message Forwarding, group chats, tapbacks/reactions,
+the edge, not to the model), outbound media other than voice — a voice message is ADR-065, while
+photos, files and stickers stay inbound-only — SMS/Text Message Forwarding, group chats, tapbacks/reactions,
 message edits and unsends as *input corrections*, read receipts and typing indicators (private API,
 SIP off), rich sends/effects/polls, multi-account (more than one bridge/Apple ID), a bridge that is
 not `imsg`-based, kian-side cursor persistence, and any iMessage-specific prompt tuning beyond the
@@ -855,6 +910,12 @@ question — they stay in §13.
    `attachments: bytes` mode and the resulting `[image transcript]` line have been exercised
    against fakes and the media edge's own suite, not against a real photo on a real Mac. The
    `2026-11-20` L3 run predates the route; the first owner photo is the acceptance for L3 (§12).
+14. **Outbound voice is L1/L2 only.** The bridge's `voice` field, its native/attachment choice and
+   `voice_mode`, the edge's synthesis path and a `reply_voice` delivery are exercised against a
+   fake `imsg` child and a fake media provider. A real voice message on a real Mac was not part of
+   any L3 run, and the **native** path additionally needs SIP disabled plus a running `imsg launch`
+   — the reference Mac reports `sip: enabled`, so only the attachment path has a reachable host.
+   The first owner voice reply is the acceptance (§12, ADR-065).
 
 ## 14. Delivery slices
 
@@ -880,6 +941,17 @@ refuses `bytes` without a `media:` section plus the pump strip that keeps an unc
 key out of the prompt; L1 suites on both sides; §3.2/§3.4/§4/§7 increments, ADR-064, the runbook and
 one CHANGELOG bullet. No event kind, no store schema and no core seam change.
 
+**2b (outbound voice, ADR-065).** The bridge's additive `voice` field on `/v1/send` with the
+native/attachment choice, its `0600` staging file and the `voice_mode`/health report; the
+adapter's single-part voice send with a text-derived `client_id`; the `kian-cli` voice edge that
+synthesizes an utterance, reads its artifact and rewrites the delivery; the router's `reply_voice`
+tool, mounted only when a voice-capable channel is assembled; the config coupling that refuses
+`voice: true` without `media:`/`artifacts:`; the `"voice": true` key on `channel/delivered`;
+L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-065, the runbook and one CHANGELOG
+bullet. No new event kind, no store schema, no core seam change. Estimated write set ≈ bridge 250
+lines, adapter 120 lines, edge + router 350 lines, config/CLI 120 lines, tests ~600 lines, docs
+~500 lines.
+
 **Rollback.** Purely config: remove the `type: imessage` channel (or stop the bridge); no event
 kind, no store schema, no wire frame and no core seam changes, so a rollback loses no session data
 and requires no migration. The channel's events remain readable forever as ordinary admitted inputs.
@@ -892,5 +964,5 @@ reconciled in the same change (the EVENT-MODEL discipline applied to a channel).
 the allowlist/privacy semantics (§3.3, §8), the dedupe and cursor discipline (§9) and the config/CLI
 shapes (§7) also start here. A change that would add a kian-side position table, a new event kind,
 a new server surface, a public bridge bind, multi-account or channel media bytes needs an ADR, not an
-edit to this file (channel media bytes: ADR-064). An `imsg`/macOS break is recorded as a dated note in this section plus a
+edit to this file (inbound channel media bytes: ADR-064; outbound voice: ADR-065). An `imsg`/macOS break is recorded as a dated note in this section plus a
 CHANGELOG entry, and parks the channel honestly rather than guessing.

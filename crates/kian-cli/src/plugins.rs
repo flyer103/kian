@@ -723,6 +723,11 @@ pub struct SuperAgentPlugin {
     /// `media:` is configured. `None` = every channel pump keeps its
     /// exact bytes and no media envelope is ever preprocessed.
     pub media_edge: Option<Arc<crate::media_edge::MediaEdge>>,
+    /// ADR-065: the channels whose config says `voice: true`. Each is
+    /// registered behind the voice edge (so a voice intent arrives at the
+    /// adapter as bytes) and the set is what mounts `reply_voice` on the
+    /// Router — empty (the default) keeps the tool surface byte-identical.
+    pub voice_channels: std::collections::BTreeSet<String>,
 }
 
 impl Plugin for SuperAgentPlugin {
@@ -935,13 +940,36 @@ impl Plugin for SuperAgentPlugin {
         }
         // the imessage adapter rides the same registry + consumer
         // spawn; its receive half is its own bridge long-poll (started
-        // by `subscribe` inside the consumer spawn).
+        // by `subscribe` inside the consumer spawn). A channel with
+        // `voice: true` is registered behind the voice edge, so a voice
+        // intent becomes audio before the adapter sees it — including on
+        // an outbox re-drive, which resolves the adapter from this same
+        // registry.
+        let mut voice_channels = std::collections::BTreeSet::new();
         for (name, imessage) in &self.imessage_channels {
-            channels.register(
-                name.clone(),
-                Arc::clone(imessage) as Arc<dyn ChannelAdapter>,
-            );
-            adapters.push(Arc::clone(imessage) as Arc<dyn ChannelAdapter>);
+            let mut adapter = Arc::clone(imessage) as Arc<dyn ChannelAdapter>;
+            if self.voice_channels.contains(name) {
+                // The server refuses `voice: true` without a `media:`
+                // section; a missing edge here still must not mount the
+                // tool, so the channel keeps its exact bytes and stays
+                // out of the voice set.
+                if let Some(edge) = self.media_edge.as_ref() {
+                    adapter = crate::voice_edge::VoiceEdge::wrap(
+                        adapter,
+                        Arc::clone(edge.tools()),
+                        Arc::clone(edge.store()),
+                    );
+                    voice_channels.insert(name.clone());
+                } else {
+                    tracing::warn!(
+                        target: "kian::channels",
+                        channel = %name,
+                        "voice: true without an assembled media edge — reply_voice is not mounted"
+                    );
+                }
+            }
+            channels.register(name.clone(), Arc::clone(&adapter));
+            adapters.push(adapter);
         }
         // the timers ride the same registry + consumer spawn (a
         // timer is a channel — nothing here knows a watchdog exists).
@@ -980,7 +1008,8 @@ impl Plugin for SuperAgentPlugin {
         // (R17-C6, pin P4-1): the class-A emission switch rides
         // the tool surface — the parent-side `thread/started`
         // keys are written only when it is on.
-        .with_board_gating(self.board_gating);
+        .with_board_gating(self.board_gating)
+        .with_voice_channels(voice_channels);
         if let Some(driver) = &outbox_driver {
             router_tools = router_tools.with_outbox_driver(Arc::clone(driver));
         }

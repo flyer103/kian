@@ -2944,6 +2944,13 @@ pub struct ImessageChannelSection {
     /// (ADR-064).
     #[serde(default)]
     pub attachments: AttachmentMode,
+    /// Outbound voice (ADR-065): `true` mounts the `reply_voice` tool
+    /// on the channel and synthesizes each reply through the media edge
+    /// before the adapter sends it — requires a `media:` section (with
+    /// `artifacts:`), because the edge is what turns text into audio.
+    /// `false` (the default) keeps the tool surface byte-identical.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 /// `attachments: metadata | bytes` (ADR-064).
@@ -4883,6 +4890,15 @@ impl ServeConfig {
                                  but the config has no `media:` section: the fetched bytes have \
                                  no edge to consume them and would reach the model as text — \
                                  add `media:` (with `artifacts:`) or use `attachments: metadata`"
+                            )));
+                        }
+                        if section.voice && self.media.is_none() {
+                            return Err(invalid(format!(
+                                "superagent.channels `{name}`.imessage.voice is `true` but the \
+                                 config has no `media:` section: a voice reply is synthesized by \
+                                 the media edge and stored in the artifact store before the \
+                                 adapter can send it — add `media:` (with `artifacts:`) or use \
+                                 `voice: false`"
                             )));
                         }
                     }

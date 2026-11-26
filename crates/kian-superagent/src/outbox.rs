@@ -24,7 +24,7 @@
 //!    exactly what this module supplies.
 //!
 //! **Verdict (the expected one): the stream already carries intent
-//! and receipt.** `tool/call` for `reply`/`deliver_structured` is
+//! and receipt.** `tool/call` for `reply`/`reply_voice`/`deliver_structured` is
 //! persisted *before* execution (log-before-execute, the loop's
 //! invariant 1) with `content.{id, name, arguments}` verbatim;
 //! `channel/delivered` lands only after a successful send; and
@@ -87,7 +87,7 @@ use crate::policy::{
     EnforcedReply, ImPolicy, StructuredPolicy, im_delivered_payload, im_delivered_payload_full,
     speak_key, structured_delivered_payload,
 };
-use crate::router::{DELIVER_STRUCTURED_TOOL, REPLY_TOOL};
+use crate::router::{DELIVER_STRUCTURED_TOOL, REPLY_TOOL, REPLY_VOICE_TOOL};
 use crate::stage::OutboxView;
 
 /// Default attempt bound (the first attempt plus 5 retries).
@@ -315,7 +315,7 @@ pub enum OutboxState {
 
 /// Whether `content.name` names a delivery intent.
 fn is_delivery_tool(name: &str) -> bool {
-    name == REPLY_TOOL || name == DELIVER_STRUCTURED_TOOL
+    name == REPLY_TOOL || name == DELIVER_STRUCTURED_TOOL || name == REPLY_VOICE_TOOL
 }
 
 /// The rebuild: every `reply`/`deliver_structured` intent on a Router
@@ -890,7 +890,12 @@ impl OutboxDriver {
             };
             let channel = delivery.channel.clone();
             let target = delivery.target.clone();
-            let base_payload = if entry.tool == REPLY_TOOL {
+            let base_payload = if entry.tool == REPLY_VOICE_TOOL {
+                let enforced = shape_voice(im, entry);
+                let mut payload = im_delivered_payload(&channel, &target, &enforced);
+                payload["voice"] = Value::Bool(true);
+                payload
+            } else if entry.tool == REPLY_TOOL {
                 let enforced = shape_reply(im, entry, detail);
                 if detail {
                     im_delivered_payload_full(&channel, &target, &enforced)
@@ -970,10 +975,18 @@ fn shape_reply(im: &ImPolicy, entry: &OutboxEntry, detail: bool) -> EnforcedRepl
     }
 }
 
+/// The `reply_voice` shaping an intent takes: always the summary
+/// budget — a voice message is the delivery, so a details request never
+/// promotes it to a full one (ADR-065).
+fn shape_voice(im: &ImPolicy, entry: &OutboxEntry) -> EnforcedReply {
+    im.enforce(&arguments_text(&entry.arguments))
+}
+
 /// Rebuilds the `ChannelDelivery` an intent's arguments describe: the
 /// same pure shaping the tool path applied (`reply` → ImPolicy word
-/// cap, or the full delivery for a details request; `deliver_structured`
-/// → the payload verbatim, re-validated). `None` when the intent cannot
+/// cap, or the full delivery for a details request; `reply_voice` →
+/// the word cap always, as a voice intent the edge turns into bytes;
+/// `deliver_structured` → the payload verbatim, re-validated). `None` when the intent cannot
 /// be reconstructed (unknown tool, missing payload, failed validation) —
 /// the re-drive says so, never guesses.
 #[must_use]
@@ -989,7 +1002,9 @@ pub fn reconstruct_delivery(
         .get("target")
         .cloned()
         .unwrap_or(Value::Null);
-    let content = if entry.tool == REPLY_TOOL {
+    let content = if entry.tool == REPLY_VOICE_TOOL {
+        serde_json::json!({"voice": {"text": shape_voice(im, entry).text}})
+    } else if entry.tool == REPLY_TOOL {
         serde_json::json!({"text": shape_reply(im, entry, detail).text})
     } else {
         let payload = entry.arguments.get("payload")?.clone();
@@ -1497,6 +1512,42 @@ mod tests {
         );
         let full = reconstruct_delivery(&entry, &im, &structured, true).expect("full");
         assert_eq!(full.content, json!({"text": long}));
+    }
+
+    /// A voice intent reconstructs as the voice intent it was: the
+    /// summary shaping always, and never promoted by a details request
+    /// (ADR-065) — a re-drive must not resend spoken text as text.
+    #[test]
+    fn voice_intents_reconstruct_as_voice_intents() {
+        let im = ImPolicy::default();
+        let structured = StructuredPolicy::default();
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long: String = (1..=over)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let entry = OutboxEntry {
+            ticket: "t".into(),
+            conversation: "mock-im:x".into(),
+            tool: REPLY_VOICE_TOOL.into(),
+            call_id: "c1".into(),
+            arguments: json!({"channel": "mock-im", "target": {"chat_id": 1},
+                              "text": long.clone()}),
+            seq: 4,
+            state: OutboxState::Pending,
+        };
+        let summary = reconstruct_delivery(&entry, &im, &structured, false).expect("summary");
+        let capped = summary.content["voice"]["text"].as_str().unwrap();
+        assert_eq!(capped, im.enforce(&long).text);
+        assert!(
+            summary.content.get("text").is_none(),
+            "a voice intent carries no top-level text"
+        );
+        let full = reconstruct_delivery(&entry, &im, &structured, true).expect("full");
+        assert_eq!(
+            full.content, summary.content,
+            "voice is a summary channel: a details request never promotes it"
+        );
     }
 
     /// The mode is derived at the intent's own seq and channel — the

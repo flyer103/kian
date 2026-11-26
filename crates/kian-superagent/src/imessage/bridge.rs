@@ -128,8 +128,20 @@ pub struct Health {
     pub automation: String,
     #[serde(default)]
     pub watch: WatchInfo,
+    /// Whether a voice message can go out as a native voice bubble on
+    /// this host (ADR-065); absent from an older bridge.
+    #[serde(default)]
+    pub voice: VoiceInfo,
     #[serde(default)]
     pub counters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct VoiceInfo {
+    #[serde(default)]
+    pub native: bool,
+    #[serde(default)]
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -179,8 +191,23 @@ pub struct SendRequest {
     /// continuity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_guid: Option<String>,
+    /// Empty exactly when `voice` is present (the two are mutually
+    /// exclusive, ADR-065).
+    #[serde(default)]
     pub text: String,
+    /// One audio message; `None` for a text send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoicePayload>,
     pub service: String,
+}
+
+/// The audio half of a `/v1/send`: standard padded base64 and the media
+/// type the transport keys its file extension off.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VoicePayload {
+    pub base64: String,
+    pub media_type: String,
+    pub audio: bool,
 }
 
 impl SendRequest {
@@ -198,8 +225,17 @@ impl SendRequest {
             to: to.into(),
             chat_guid,
             text: text.into(),
+            voice: None,
             service: service.into(),
         }
+    }
+
+    /// Turns the request into one voice message.
+    #[must_use]
+    pub fn with_voice(mut self, voice: VoicePayload) -> Self {
+        self.text.clear();
+        self.voice = Some(voice);
+        self
     }
 }
 
@@ -222,6 +258,13 @@ pub struct SendOk {
     /// cache (the retry dedupe, CHANNEL-IMESSAGE §3.2).
     #[serde(default)]
     pub deduplicated: bool,
+    /// `native` (a voice bubble) or `attachment` (audio sent as a file):
+    /// the path the transport actually took, `None` for a text send.
+    #[serde(default)]
+    pub voice_mode: Option<String>,
+    /// The decoded audio length the bridge accepted.
+    #[serde(default)]
+    pub voice_bytes: Option<u64>,
 }
 
 /// A `/v1/send` refusal body (`ok: false`).

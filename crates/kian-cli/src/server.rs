@@ -784,6 +784,10 @@ impl Server {
             // KIAN_IMESSAGE_BRIDGE_TOKEN refuses startup (the token
             // never lives in kian.yaml — CHANNEL-IMESSAGE §7).
             let mut imessage_channels = std::collections::BTreeMap::new();
+            // the channels that opted into outbound voice (ADR-065): each
+            // is registered behind the voice edge and mounts `reply_voice`
+            // — the set stays empty unless a channel says `voice: true`.
+            let mut voice_channels = std::collections::BTreeSet::new();
             // the timer input sources (a channel like any other —
             // the system clock times the cadence).
             let mut timer_channels: Vec<Arc<kian_superagent::TimerChannel>> = Vec::new();
@@ -883,6 +887,9 @@ impl Server {
                             .map_err(|e| {
                                 ServeError::Assembly(format!("imessage channel `{name}`: {e}"))
                             })?;
+                        if section.voice {
+                            voice_channels.insert(name.clone());
+                        }
                         imessage_channels.insert(name.clone(), Arc::new(adapter));
                     }
                     // Unknown types were rejected at parse time.
@@ -1026,6 +1033,7 @@ impl Server {
                 harness_mounts,
                 event_store: store.clone(),
                 media_edge,
+                voice_channels,
             });
             None // services resolve from the Ctx after activation
         } else {

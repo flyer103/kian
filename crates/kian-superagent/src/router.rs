@@ -93,6 +93,10 @@ use crate::worker::{
 /// The `reply` tool name (Router-only).
 pub const REPLY_TOOL: &str = "reply";
 
+/// The `reply_voice` tool name (Router-only, mounted only when a
+/// voice-capable channel is assembled — ADR-065).
+pub const REPLY_VOICE_TOOL: &str = "reply_voice";
+
 /// The `deliver_structured` tool name (Router-only).
 pub const DELIVER_STRUCTURED_TOOL: &str = "deliver_structured";
 
@@ -880,6 +884,11 @@ pub struct RouterTools {
     /// `SpawnRequest::default()` prepare is a pure mint (no IO, no
     /// side effect), so the probe is an honest read, not a workaround.
     worker_pinned_version: u64,
+    /// (ADR-065): the channels whose assembly carries a voice edge.
+    /// Empty (the default) keeps the tool surface byte-identical —
+    /// `reply_voice` is simply absent; the set itself never reaches a
+    /// prompt.
+    voice_channels: BTreeSet<String>,
     hold: Arc<RouterHold>,
 }
 
@@ -936,6 +945,7 @@ impl RouterTools {
             board_gating: BoardGating::default(),
             roster: None,
             worker_pinned_version,
+            voice_channels: BTreeSet::new(),
             hold,
         }
     }
@@ -977,6 +987,16 @@ impl RouterTools {
     #[must_use]
     pub fn with_board_gating(mut self, gating: BoardGating) -> Self {
         self.board_gating = gating;
+        self
+    }
+
+    /// (ADR-065): installs the channels that carry a voice edge. A
+    /// non-empty set mounts `reply_voice`; an absent call (the default)
+    /// leaves the tool surface byte-identical, because a tool schema is
+    /// prompt prefix.
+    #[must_use]
+    pub fn with_voice_channels(mut self, channels: BTreeSet<String>) -> Self {
+        self.voice_channels = channels;
         self
     }
 
@@ -2442,6 +2462,64 @@ impl RouterTools {
         })
     }
 
+    /// (ADR-065): replies with one spoken message. The tool exists only
+    /// on a surface whose assembly carries a voice edge, so the delivery
+    /// it emits is an intent (`{"voice": {"text": …}}`): the edge
+    /// synthesizes the bytes and the adapter sends them, which keeps
+    /// providers and the artifact store out of the bundle.
+    async fn reply_voice(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
+        let port = self.port()?;
+        let args = &call.arguments;
+        let channel = str_arg(args, "channel", "reply_voice")?;
+        let text = str_arg(args, "text", "reply_voice")?;
+        let target = args.get("target").cloned().unwrap_or(Value::Null);
+        if !self.voice_channels.contains(channel) {
+            return Err(ToolError::InvalidCall(format!(
+                "channel `{channel}` has no voice capability (a channel grows one only with                  `voice: true` next to a configured `media:` section)"
+            )));
+        }
+        let adapter = self
+            .channels
+            .get(channel)
+            .ok_or_else(|| ToolError::InvalidCall(format!("unknown channel `{channel}`")))?;
+        self.speak_gate(&port, channel, SpeakKind::Decision, &target)
+            .await?;
+        // Voice is a summary channel: the audio itself is the delivery,
+        // so the §4.2 shaping always applies and a details request never
+        // promotes it to a full delivery.
+        let enforced = self.im.enforce(text);
+        let delivery = ChannelDelivery {
+            channel: channel.to_string(),
+            target: target.clone(),
+            content: json!({"voice": {"text": enforced.text}}),
+        };
+        let delivered = self
+            .send_with_outbox(args, channel, &target, &adapter, delivery)
+            .await?;
+        let mut payload = im_delivered_payload(channel, &target, &enforced);
+        payload["voice"] = Value::Bool(true);
+        let payload = if self.outbox.is_some() {
+            with_attempt_keys(payload, &delivered)
+        } else {
+            payload
+        };
+        port.emit(EventKind::ChannelDelivered, payload)
+            .await
+            .map_err(|e| ToolError::Execution(format!("channel/delivered write failed: {e}")))?;
+        self.speak_record(channel, &target);
+        Ok(ToolResult {
+            call_id: call.id,
+            output: json!({
+                "message_id": delivered.receipt.message_id,
+                "words": enforced.words,
+                "truncated": enforced.truncated,
+                "voice": true,
+            }),
+            is_error: false,
+            redactions: Vec::new(),
+        })
+    }
+
     async fn deliver_structured(&self, call: ToolCall) -> Result<ToolResult, ToolError> {
         let port = self.port()?;
         let args = &call.arguments;
@@ -2614,6 +2692,29 @@ changes, verification)."
                 }),
             },
         ];
+        // (ADR-065): the voice reply rides the surface only when a
+        // voice-capable channel is assembled — without one the tool set
+        // stays byte-identical (a tool schema is prompt prefix).
+        if !self.voice_channels.is_empty() {
+            schemas.push(ToolSchema {
+                name: REPLY_VOICE_TOOL.to_string(),
+                description: "Reply with a spoken voice message on a channel (word-limit shaped \
+                    by policy)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string"},
+                        "text": {"type": "string", "description": "What the voice message says"},
+                        "target": {"description": "Channel-defined delivery target"},
+                        "correlation": {"type": "string", "description": "Optional ticket correlation \
+                         (thread id or topic) — the outbox orders and reports deliveries per \
+                         (correlation, target conversation)"}
+                    },
+                    "required": ["channel", "text"],
+                }),
+            });
+        }
         // (R12, R4): the read-only catalog tool rides the surface only
         // when membership is on — membership off keeps the pre-R12
         // tool set byte-identical (the tool is simply absent).
@@ -2656,6 +2757,7 @@ changes, verification)."
             match call.name.as_str() {
                 s if s == SPAWN_WORKER_TOOL => this.spawn_worker(call).await,
                 s if s == REPLY_TOOL => this.reply(call).await,
+                s if s == REPLY_VOICE_TOOL => this.reply_voice(call).await,
                 s if s == DELIVER_STRUCTURED_TOOL => this.deliver_structured(call).await,
                 s if s == LIST_WORKERS_TOOL => this.list_workers(call).await,
                 s if s == LIST_AGENTS_TOOL => this.list_agents(call).await,
@@ -2697,6 +2799,7 @@ impl Clone for RouterTools {
             board_gating: self.board_gating,
             roster: self.roster.clone(),
             worker_pinned_version: self.worker_pinned_version,
+            voice_channels: self.voice_channels.clone(),
             hold: Arc::clone(&self.hold),
         }
     }
@@ -3377,6 +3480,7 @@ async fn finish_turn<D: LoopDriver>(core: &DriverCore<D>, turn: Option<TurnTimin
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -3388,7 +3492,7 @@ mod tests {
 
     use super::{
         ChannelRegistry, DELIVER_STRUCTURED_TOOL, JUDGE_PROMPT_TEMPLATE, JudgePrompt,
-        LIST_WORKERS_DESCRIPTION, LIST_WORKERS_TOOL, MandatePolicy, REPLY_TOOL,
+        LIST_WORKERS_DESCRIPTION, LIST_WORKERS_TOOL, MandatePolicy, REPLY_TOOL, REPLY_VOICE_TOOL,
         ROUTER_BOOTSTRAP_KEY, RouterHold, RouterInbox, RouterProfile, RouterTools,
         SILENT_REPRO_TEMPLATE, SpeculationPolicy, WORKER_MEMBERSHIP_PROMPT_BLOCK, build_mandate,
         enforce_speculation_cap, outstanding_threads,
@@ -3838,6 +3942,102 @@ mod tests {
         assert_eq!(emitted[0].1["words"], json!(DEFAULT_MAX_WORDS));
         assert_eq!(emitted[0].1["truncated"], json!(true));
         assert_eq!(emitted[0].1["channel"], json!("mock-im"));
+    }
+
+    #[test]
+    fn reply_voice_is_absent_until_a_channel_carries_it() {
+        let (tools, _hold, _mock, _inbox) = tools_for_test();
+        let plain = tools.schemas();
+        let names: Vec<&str> = plain.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&REPLY_VOICE_TOOL),
+            "no voice channel, no tool"
+        );
+        assert!(names.contains(&REPLY_TOOL), "the text reply stays");
+
+        let (voiced, _hold, _mock, _inbox) = tools_for_test();
+        let voiced = (*voiced)
+            .clone()
+            .with_voice_channels(BTreeSet::from(["mock-im".to_string()]));
+        let mounted = voiced.schemas();
+        let names: Vec<&str> = mounted.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&REPLY_VOICE_TOOL),
+            "a voice channel mounts it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_voice_delivers_an_intent_and_a_voice_receipt() {
+        let (tools, hold, mock, _inbox) = tools_for_test();
+        let tools = Arc::new(
+            (*tools)
+                .clone()
+                .with_voice_channels(BTreeSet::from(["mock-im".to_string()])),
+        );
+        let (rec, dyn_port) = RecordingPort::shared(sid(10));
+        hold.install(dyn_port);
+
+        let over = DEFAULT_MAX_WORDS as usize + 20;
+        let long_text: String = (1..=over)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = tools
+            .invoke(call(
+                REPLY_VOICE_TOOL,
+                json!({"channel": "mock-im", "text": long_text, "target": {"chat_id": 7}}),
+            ))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.output["voice"], json!(true));
+        assert_eq!(result.output["words"], json!(DEFAULT_MAX_WORDS));
+        assert_eq!(result.output["truncated"], json!(true));
+
+        // The delivery is an intent (text only) — the edge owns the
+        // bytes, so nothing here synthesizes anything.
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let content = &deliveries[0].delivery.content;
+        assert_eq!(content.as_object().unwrap().len(), 1);
+        let spoken = content["voice"]["text"].as_str().unwrap();
+        assert_eq!(spoken.split_whitespace().count() as u64, DEFAULT_MAX_WORDS);
+        assert!(spoken.ends_with('…'));
+        assert!(
+            content["voice"].get("base64").is_none(),
+            "the intent carries no bytes"
+        );
+        assert_eq!(deliveries[0].delivery.target, json!({"chat_id": 7}));
+
+        let emitted = rec.emitted.lock().unwrap().clone();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, EventKind::ChannelDelivered);
+        assert_eq!(emitted[0].1["voice"], json!(true));
+        assert_eq!(emitted[0].1["channel"], json!("mock-im"));
+        assert_eq!(emitted[0].1["words"], json!(DEFAULT_MAX_WORDS));
+    }
+
+    #[tokio::test]
+    async fn reply_voice_refuses_a_channel_without_a_voice_edge() {
+        let (tools, hold, mock, _inbox) = tools_for_test();
+        let tools = Arc::new(
+            (*tools)
+                .clone()
+                .with_voice_channels(BTreeSet::from(["elsewhere".to_string()])),
+        );
+        let (rec, dyn_port) = RecordingPort::shared(sid(10));
+        hold.install(dyn_port);
+        let error = tools
+            .invoke(call(
+                REPLY_VOICE_TOOL,
+                json!({"channel": "mock-im", "text": "hi"}),
+            ))
+            .await
+            .expect_err("a channel without voice must refuse");
+        assert!(error.to_string().contains("no voice capability"), "{error}");
+        assert!(mock.deliveries().is_empty(), "nothing is sent");
+        assert!(rec.emitted.lock().unwrap().is_empty(), "nothing is claimed");
     }
 
     /// A `详情` reply is derived from the committed stream (the latest

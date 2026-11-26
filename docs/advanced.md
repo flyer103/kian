@@ -165,6 +165,7 @@ superagent:
         bridge_url: "http://127.0.0.1:7420"          # the Mac bridge, over an SSH -R / mesh VPN
         topics: { "+14155551212": "imessage" }       # handle → topic; both allowlists
         attachments: metadata                         # metadata (default) | bytes (needs media:)
+        voice: false                                  # true = outbound voice replies (needs media: + artifacts:)
 ```
 
 `type: wechat` is **best-effort by contract**: one long-poll loop per channel over Tencent's
@@ -181,6 +182,9 @@ attachment arrives as `[image]`/`[attachment]` marker text plus its name, MIME t
 With `attachments: bytes` (which needs a `media:` section) the adapter also fetches image and audio items
 through the bridge and hands them to the media edge, so their transcripts join the text; the bytes
 never enter the event log ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)).
+With `voice: true` the channel also *speaks*: the Router gains a `reply_voice` tool and a spoken
+reply arrives as a native voice message where the Mac allows it, an audio attachment otherwise
+([voice replies](#voice-replies-outbound), [ADR-065](../design/decisions/ADR-065-imessage-voice-io.md)).
 `kian imessage check` is the read-only preflight
 ([design/CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md),
 [docs/runbook-imessage.md](../docs/runbook-imessage.md)).
@@ -1060,9 +1064,55 @@ emits this envelope when `attachments: bytes` and a `media:` section are configu
 image/audio item through the bridge
 ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)); WeChat media lives on a separate
 CDN and stays that channel's phase 2, so for it this remains only the contract (a mock channel can
-carry it today). Outbound audio is not
-wired into any channel: a voice reply is `speech_synthesize` plus a text reply naming the artifact.
+carry it today). Outbound audio is wired for the iMessage channel only — see
+[voice replies](#voice-replies-outbound); no other channel sends media.
 Semantics: [ADR-062](../design/decisions/ADR-062-channel-edge-media.md).
+
+### Voice replies (outbound)
+
+A channel that says `voice: true` — today only `imessage` — speaks. It needs `media:` **and**
+`artifacts:`, since a reply is synthesized, stored, then sent as bytes; either one missing refuses
+startup rather than degrading quietly.
+
+```yaml
+artifacts:
+  dir: .kian/artifacts
+media:
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  default_format: mp3
+  default_voice: alloy
+superagent:
+  channels:
+    imessage:
+      type: imessage
+      imessage:
+        bridge_url: "http://127.0.0.1:7420"
+        topics: { "+14155551212": "imessage" }
+        attachments: bytes      # inbound voice notes arrive as transcripts
+        voice: true             # outbound: mounts reply_voice on the Router
+```
+
+Enabled, the Router gains one extra tool — `reply_voice` taking the same arguments as `reply`
+(`channel`, `text`, optional `target`) — and nothing else about the tool surface changes: the
+`reply` schema is prompt-prefix content, so a voice argument was never added to it. Voice is a
+*summary* channel: the speak-rules word cap always applies and a details request never promotes a
+spoken reply to the full text.
+
+The Router only emits the intent `{"voice": {"text": …}}`. The CLI voice edge synthesizes it with
+`speech_synthesize` (the `media:` defaults apply), stores the blob, and rewrites the delivery
+into base64 bytes for the adapter — so nothing spoken and no audio ever enters the event log; the
+`channel/delivered` event records `voice: true`, the word count and whether it was truncated.
+
+The bridge picks the transport and reports it. With the IMCore helper running (`imsg launch`, which
+needs SIP disabled) and a known chat guid, the message lands as a native voice memo; otherwise
+`imsg` stages the file and it arrives as an ordinary audio attachment. `kian imessage check` prints
+which one this Mac will produce.
+
+Limits, recorded rather than promised: one voice message per call (never split — split audio is
+unintelligible), at most 1 MiB of audio, no caption-plus-voice delivery, and no automatic voice
+answer — a reply is spoken only when the model calls `reply_voice`. Semantics:
+[ADR-065](../design/decisions/ADR-065-imessage-voice-io.md).
 
 ## Vision inputs
 
