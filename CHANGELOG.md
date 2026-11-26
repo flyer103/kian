@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Vision: a per-turn image budget caps what one drain's burst renders
+  (`superagent.shaping.max_images_per_turn`, `superagent.shaping.max_image_bytes_per_turn`,
+  ADR-066).** The loop admits only the newest references of the unsent tail — the messages after
+  the last assistant message — by count and by raw artifact bytes; a reference past either limit
+  keeps its wrapper and transcript byte-identical and is simply not rendered, and the turn logs
+  one warning. Both keys refuse boot without `shaping.vision: true`; pixels that already flew are
+  pinned, so a retry is byte-identical and no later turn rewrites earlier context.
 - **Channel images: an opt-in admission shape sends the media edge's image artifacts to a vision
   target (`superagent.shaping.vision`, CHANNEL-IMESSAGE §4/§11, ADR-065).** The shaper keeps the
   `{"kian": …}` wrapper byte-identical and adds a sibling `images` array of `{artifact,

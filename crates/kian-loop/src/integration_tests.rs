@@ -802,6 +802,7 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
             slot: SlotName("main".into()),
             max_iterations: 2,
             budget_scope: crate::react::BudgetScope::Lifetime,
+            vision: crate::react::VisionBudget::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     )
@@ -1222,6 +1223,7 @@ async fn allow_path_invokes_tool_and_records_provenance_default_vs_configured() 
     ];
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
+        vision: crate::react::VisionBudget::default(),
         permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
         ..ReActConfig::default()
     };
@@ -1276,6 +1278,7 @@ async fn deny_path_does_not_invoke_and_emits_honest_error_result() {
     ];
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
+        vision: crate::react::VisionBudget::default(),
         permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
         ..ReActConfig::default()
     };
@@ -1669,6 +1672,7 @@ async fn request_bytes_identical_with_hook_mounted_observing_vs_absent() {
         }
         let (tools, _seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
         let config = ReActConfig {
+            vision: crate::react::VisionBudget::default(),
             permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
             ..ReActConfig::default()
         };
@@ -1759,6 +1763,7 @@ async fn tool_pre_and_post_cover_executed_and_declared_denied_arms() {
     ];
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
+        vision: crate::react::VisionBudget::default(),
         permissions: BTreeMap::from([
             ("fs_read".to_string(), Permission::Allow),
             ("fs_write".to_string(), Permission::Deny),
@@ -1858,6 +1863,7 @@ async fn coincident_declared_and_hook_deny_name_one_denier() {
     ];
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
+        vision: crate::react::VisionBudget::default(),
         permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
         ..ReActConfig::default()
     };
@@ -2495,6 +2501,94 @@ async fn a_missing_blob_or_a_non_vision_profile_keeps_the_text_only_shape() {
         "the legacy fallback carries the envelope verbatim: {content}"
     );
     cleanup_db(&h.db_path);
+}
+
+/// ADR-066 L1: six references in one tail message under the default
+/// budget render the newest four as content parts; the text part is still
+/// exactly the wrapper bytes and the two dropped references cost pixels,
+/// never text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_per_turn_image_budget_renders_only_the_newest_references() {
+    let dir = std::env::temp_dir().join(format!("kian-loop-vision-budget-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let ids: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+        .iter()
+        .map(|byte| {
+            blobs
+                .put(byte.as_bytes(), "image/jpeg")
+                .expect("put blob")
+                .id
+        })
+        .collect();
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(
+        agent,
+        vec![vec![text_chunk("a night sky")]],
+        Some(artifacts),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let wrapper = json!({
+        "kian": {
+            "type": "channel_event",
+            "channel": "imessage",
+            "topic": "imessage",
+            "event_id": "evt-10",
+            "raw": {"text": "[image]"}
+        }
+    });
+    let mut content = wrapper.clone();
+    content["images"] = json!(
+        ids.iter()
+            .map(|id| json!({"artifact": id, "media_type": "image/jpeg"}))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        submit_and_wait(&h, sid, content).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    let last = requests[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .last()
+        .expect("user message")
+        .clone();
+    let parts = last["content"].as_array().expect("vision content parts");
+    assert_eq!(
+        parts.len(),
+        5,
+        "one text part plus the newest four references"
+    );
+    assert_eq!(
+        parts[0],
+        json!({"type": "text", "text": serde_json::to_string(&wrapper).unwrap()}),
+        "the dropped references change no text byte"
+    );
+    assert_eq!(
+        parts[1..],
+        [
+            json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Yw=="}}),
+            json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,ZA=="}}),
+            json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,ZQ=="}}),
+            json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Zg=="}}),
+        ],
+        "the newest four win; the two older references stay text-only"
+    );
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// ADR-065 L2: a channel row carrying image references beside its wrapper

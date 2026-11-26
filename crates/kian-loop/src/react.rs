@@ -98,6 +98,12 @@ const MAX_IMAGES_PER_MESSAGE: usize = 4;
 /// Upper bound on one attached image byte payload (ADR-063).
 const MAX_VISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Default per-turn image count budget (ADR-066).
+pub const DEFAULT_MAX_IMAGES_PER_TURN: usize = 4;
+
+/// Default per-turn image byte budget, in raw artifact bytes (ADR-066).
+pub const DEFAULT_MAX_VISION_BYTES_PER_TURN: u64 = 4 * 1024 * 1024;
+
 /// Upper bound on the transcript handed to the summarizer, in characters.
 /// The model already cost the context; the transcript only has to carry
 /// the decisions and facts forward, not every byte.
@@ -136,6 +142,28 @@ impl BudgetScope {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// The per-turn vision budget (ADR-066). Only the unsent tail of the
+/// model context — the messages after the last assistant message — is
+/// budgeted, newest references first, and the admitted set is a contiguous
+/// prefix of that order. Pixels at or before the last assistant message
+/// already flew and are never re-budgeted (constraint 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionBudget {
+    /// How many image references one turn may render.
+    pub max_images_per_turn: usize,
+    /// How many artifact bytes (before base64) one turn may render.
+    pub max_image_bytes_per_turn: u64,
+}
+
+impl Default for VisionBudget {
+    fn default() -> Self {
+        Self {
+            max_images_per_turn: DEFAULT_MAX_IMAGES_PER_TURN,
+            max_image_bytes_per_turn: DEFAULT_MAX_VISION_BYTES_PER_TURN,
+        }
+    }
+}
+
 /// Tuning for the built-in ReAct loop.
 #[derive(Debug, Clone)]
 pub struct ReActConfig {
@@ -155,6 +183,9 @@ pub struct ReActConfig {
     /// shape (no provenance key at all). A non-empty table decides every
     /// call — provenance rides the payload on allow, not only on deny.
     pub permissions: BTreeMap<String, Permission>,
+    /// The per-turn image budget (ADR-066). Applies only to the unsent
+    /// tail; the default (4 references, 4 MiB) needs no configuration.
+    pub vision: VisionBudget,
 }
 
 impl Default for ReActConfig {
@@ -164,6 +195,7 @@ impl Default for ReActConfig {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             budget_scope: BudgetScope::Lifetime,
             permissions: BTreeMap::new(),
+            vision: VisionBudget::default(),
         }
     }
 }
@@ -1050,20 +1082,102 @@ impl Inner {
     ) -> Vec<ChatMessage> {
         let vision = profile.is_some_and(|p| p.vision);
         let mut chat = Vec::with_capacity(messages.len());
+        let mut pending: Vec<Option<Vec<ImageReference>>> = Vec::with_capacity(messages.len());
+        let mut tail_start = 0;
         for message in messages {
             let Some(mut chat_message) = to_chat_message(message) else {
                 continue;
             };
+            if message.role == "assistant" {
+                tail_start = chat.len() + 1;
+            }
+            let mut references = None;
             if vision
                 && message.role == "user"
-                && let Some((text, references)) = vision_envelope(&message.content)
+                && let Some((text, envelope)) = vision_envelope(&message.content)
             {
                 chat_message.content = text;
-                chat_message.images = self.load_images(ctx, &references).await;
+                references = Some(envelope);
             }
             chat.push(chat_message);
+            pending.push(references);
         }
+        for (index, references) in pending.iter_mut().enumerate().take(tail_start) {
+            if let Some(references) = references.take() {
+                chat[index].images = self.load_images(ctx, &references).await;
+            }
+        }
+        self.attach_tail_images(ctx, &mut chat, &mut pending, tail_start)
+            .await;
         chat
+    }
+
+    /// Attaches the unsent tail's references under the per-turn budget
+    /// (ADR-066): newest first, contiguous while both limits hold, and the
+    /// first reference that would exceed either limit ends the selection.
+    /// Only the pixels change; every message still renders its text.
+    async fn attach_tail_images(
+        &self,
+        ctx: &DrainCtx,
+        chat: &mut [ChatMessage],
+        pending: &mut [Option<Vec<ImageReference>>],
+        tail_start: usize,
+    ) {
+        let budget = self.config.vision;
+        let mut loaded: Vec<Option<Vec<ChatImage>>> = (0..chat.len()).map(|_| None).collect();
+        for index in tail_start..chat.len() {
+            let Some(references) = pending[index].take() else {
+                continue;
+            };
+            let mut images = Vec::with_capacity(references.len());
+            for (artifact, media_type) in references.iter() {
+                let Some(bytes) = ctx.artifact_bytes(artifact).await else {
+                    continue;
+                };
+                if bytes.len() > MAX_VISION_IMAGE_BYTES {
+                    tracing::warn!(
+                        artifact = %artifact,
+                        bytes = bytes.len(),
+                        limit = MAX_VISION_IMAGE_BYTES,
+                        "vision image is over the byte bound; the image is skipped (ADR-063)"
+                    );
+                    continue;
+                }
+                images.push(ChatImage {
+                    media_type: media_type.clone(),
+                    bytes,
+                });
+            }
+            loaded[index] = Some(images);
+        }
+        let tail: Vec<Vec<usize>> = loaded
+            .iter()
+            .skip(tail_start)
+            .map(|images| {
+                images
+                    .as_ref()
+                    .map(|images| images.iter().map(|image| image.bytes.len()).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let (per_message, admitted, dropped) = select_tail_images(budget, &tail);
+        for (offset, count) in per_message.into_iter().enumerate() {
+            let index = tail_start + offset;
+            let Some(mut images) = loaded[index].take() else {
+                continue;
+            };
+            let keep_from = images.len().saturating_sub(count);
+            chat[index].images = images.split_off(keep_from);
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                admitted,
+                dropped,
+                max_images_per_turn = budget.max_images_per_turn,
+                max_image_bytes_per_turn = budget.max_image_bytes_per_turn,
+                "per-turn image budget: the newest references in the tail are rendered; older ones stay text-only (ADR-066)"
+            );
+        }
     }
 
     /// Loads the referenced image blobs for one user message (ADR-063).
@@ -2473,6 +2587,37 @@ fn error_class(e: &ProviderError) -> &'static str {
 /// Consults the declarative policy table for `class`. The loop never
 /// *execs* the action (disposition is owned by the caller, A4); the match
 /// is reported in the soft-failure reason for observability.
+/// The pure core of the per-turn budget (ADR-066): `tail` lists each
+/// unsent message's loaded image sizes in arrival order, newest message
+/// last. Walks newest message first and newest reference first, admitting
+/// while both limits hold; the first reference that would exceed either
+/// limit ends the selection. Returns how many images each message keeps
+/// (always a suffix of its own list), the admitted count and the dropped
+/// count. A pure function of the projected order, so a retry of the same
+/// stream selects the same images.
+fn select_tail_images(budget: VisionBudget, tail: &[Vec<usize>]) -> (Vec<usize>, usize, usize) {
+    let total: usize = tail.iter().map(|sizes| sizes.len()).sum();
+    let mut per_message = vec![0usize; tail.len()];
+    let mut admitted = 0usize;
+    let mut admitted_bytes = 0u64;
+    'selection: for (index, sizes) in tail.iter().enumerate().rev() {
+        for size in sizes.iter().rev() {
+            if per_message[index] >= MAX_IMAGES_PER_MESSAGE {
+                break 'selection;
+            }
+            if admitted >= budget.max_images_per_turn
+                || admitted_bytes + *size as u64 > budget.max_image_bytes_per_turn
+            {
+                break 'selection;
+            }
+            admitted += 1;
+            admitted_bytes += *size as u64;
+            per_message[index] += 1;
+        }
+    }
+    (per_message, admitted, total - admitted)
+}
+
 fn consult_policy(policy: &dyn RecoveryPolicySource, class: &str) -> Option<RecoveryAction> {
     policy
         .table()
@@ -3156,6 +3301,61 @@ mod tests {
             )),
             ErrorClass::Unknown
         );
+    }
+
+    #[test]
+    fn the_default_budget_admits_the_newest_references_in_the_tail() {
+        let budget = super::VisionBudget::default();
+        let tail = vec![vec![10], vec![10], vec![10], vec![10], vec![10], vec![10]];
+        let (per_message, admitted, dropped) = super::select_tail_images(budget, &tail);
+        assert_eq!(per_message, vec![0, 0, 1, 1, 1, 1], "newest four win");
+        assert_eq!(admitted, 4);
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            super::select_tail_images(budget, &tail),
+            (vec![0, 0, 1, 1, 1, 1], 4, 2),
+            "a retry of the same stream selects the same images"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_stops_at_the_first_reference_that_would_exceed_it() {
+        let budget = super::VisionBudget {
+            max_images_per_turn: 8,
+            max_image_bytes_per_turn: 4,
+        };
+        let tail = vec![vec![3], vec![3]];
+        let (per_message, admitted, dropped) = super::select_tail_images(budget, &tail);
+        assert_eq!(
+            per_message,
+            vec![0, 1],
+            "the newest 3 bytes fit, the next 3 do not"
+        );
+        assert_eq!(admitted, 1);
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn a_message_still_keeps_at_most_four_references() {
+        let budget = super::VisionBudget {
+            max_images_per_turn: 32,
+            max_image_bytes_per_turn: u64::MAX,
+        };
+        let tail = vec![vec![1, 1, 1, 1, 1, 1]];
+        let (per_message, admitted, dropped) = super::select_tail_images(budget, &tail);
+        assert_eq!(per_message, vec![4], "the ceiling admits a suffix of four");
+        assert_eq!(admitted, 4);
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn a_tail_within_both_limits_keeps_every_reference() {
+        let budget = super::VisionBudget::default();
+        let tail = vec![vec![1, 1], vec![1]];
+        let (per_message, admitted, dropped) = super::select_tail_images(budget, &tail);
+        assert_eq!(per_message, vec![2, 1]);
+        assert_eq!(admitted, 3);
+        assert_eq!(dropped, 0);
     }
 
     #[test]
