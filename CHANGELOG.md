@@ -14,6 +14,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   and fails `request_too_large` with both sizes and nothing sent; an HTTP 413 answer classifies the
   same way with the status and a bounded snippet. The class joins the closed policy vocabulary and
   defaults to `fail`, because resending identical bytes cannot succeed.
+- **Self inspection: `kian self inspect` answers one window of the durable stream (SPEC §3.1,
+  §3.2).** A read-only, offline projection over `--db` with a default one-hour `--window`
+  (`s`/`m`/`h`/`d` units; a bare number is refused) or one `--session`: event volume by kind,
+  session ends by reason, turn outcomes and provider error classes, tool failures resolved through
+  `tool/call` ids, media items split transcribed/failed, evidence verdicts, delivery receipts, the
+  existing usage and cache projections under `lifetime` (lifetime totals, never windowed), and the
+  store/artifact footprint. Findings are a closed set (`media_error`, `turn_error`, `tool_error`,
+  `session_failed`, `evidence_failed`) that name the evidencing session and seq; payload content is
+  counted, never printed.
 - **Vision: a per-turn image budget caps what one drain's burst renders
   (`superagent.shaping.max_images_per_turn`, `superagent.shaping.max_image_bytes_per_turn`,
   ADR-066).** The loop admits only the newest references of the unsent tail — the messages after

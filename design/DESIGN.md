@@ -1714,6 +1714,19 @@ constraint-3 violation. The same report is exposed by `kian cache-stats [--confi
 from CI, so it is recorded in the run log of whichever run performed it, never in the
 changelog.
 
+ Refinement (self-inspection, as implemented by `kian-cli`): `kian self inspect [--window <dur>]
+[--session <uuid>] [--json]` is the windowed diagnostic over the same stream.
+`kian-cli::self_inspect` reads one `ts` window through `EventStore::events_in_window` /
+`event_kind_counts` (or a session rebuild filtered by `ts`) and folds it into one report: event
+volume by kind, session ends by reason, turn outcomes and provider error classes, tool failures
+resolved through `tool/call` ids, media items split transcribed/failed by walking the ADR-062
+envelope, evidence verdicts, delivery receipts, the existing usage/cache projections under
+`lifetime` (lifetime totals, never windowed), and a `findings` list. The v0 codes are a closed set
+— `media_error`, `turn_error`, `tool_error`, `session_failed`, `evidence_failed` — and every
+finding names the session and seq that evidence it. It is read-only in-process (no migrations, no server) and never prints a payload string or a
+transcript (content is counted, never shown). The report is a diagnostic slice, not a snapshot:
+several queries, with the slice's observed `ts` bounds reported so clock skew stays visible.
+
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session
 replay <id>`, `kian session export <id> [--since/--until]`, `kian lease inspect`) open the sqlite

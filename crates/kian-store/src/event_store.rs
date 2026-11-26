@@ -436,6 +436,46 @@ impl EventStore {
         }
     }
 
+    /// Every event of the given kinds whose recorded `ts` falls in
+    /// `[since_ms, until_ms]`, `(ts, session, seq)`-ascending — the
+    /// bounded window read behind `kian self inspect` (SPEC §3.1). One
+    /// diagnostic slice, not a consistent snapshot: the window is a
+    /// diagnostic bound, and the report says so by exposing the observed
+    /// first/last `ts`.
+    pub async fn events_in_window(
+        &self,
+        kinds: &[&str],
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<Vec<Event>, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::events_in_window(pool, kinds, since_ms, until_ms).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::events_in_window(pool, kinds, since_ms, until_ms).await
+            }
+        }
+    }
+
+    /// Event counts per kind whose recorded `ts` falls in
+    /// `[since_ms, until_ms]`, kind-ascending — the window's volume
+    /// without decoding any payload.
+    pub async fn event_kind_counts(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::event_kind_counts(pool, since_ms, until_ms).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::event_kind_counts(pool, since_ms, until_ms).await
+            }
+        }
+    }
+
     /// The session's read version (READ-MODEL §3, P0):
     /// `head.next_seq - 1`, `0` for a session with no events. This is
     /// the unchanged-read fast path's only query — the seq axis alone
