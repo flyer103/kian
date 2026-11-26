@@ -147,6 +147,12 @@ Three constraints decide where the shape may live:
   compaction honest.
 - No automatic slot migration: an already-bound session needs the
   configured rotation (ADR-040), and this slice adds no CLI verb for it.
+- No per-turn image budget: a batch of admitted inputs inlines every image
+  it carries, so one request can reach tens of megabytes and a carrier with
+  a smaller inbound bound (vadis `server.max_body_bytes`, 2 MiB by default)
+  rejects it at the transport layer instead of answering the picture.
+- No downscale of its own: the channel's media edge decides the bytes, and
+  this slice forwards whatever artifact the reference names.
 
 ## Acceptance
 

@@ -1121,6 +1121,12 @@ targets, replay, compaction), inputs above `inline_cap_bytes` keep the Inline vi
 and a media item whose transcription failed still keeps its artifact reference. Semantics:
 [ADR-065](../design/decisions/ADR-065-channel-images-as-vision-references.md).
 
+Each image is base64-inlined (roughly 1.33× its bytes) and the history is re-sent with every later
+turn, so one turn is as large as the images it carries. The carrier's inbound bound must allow it:
+vadis defaults `server.max_body_bytes` to 2 MiB, which a single large photo can exceed — raise it
+(for example `33554432`) before turning `shaping.vision` on. A request the carrier rejects at that
+bound arrives as a transport error, not a model reply, and the turn soft-fails.
+
 ## Cost projection
 
 `pricing:` turns token usage into money without storing a price in the event stream; `kian cost`
