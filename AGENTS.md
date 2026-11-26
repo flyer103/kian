@@ -239,6 +239,10 @@ runnable snippet per capability; the document map is this file's §Docs map and
 `CHANGELOG.md` records **what changed, when, and in which capability** — nothing else.
 
 - **Newest first.** The newest entry is at the top; the file reads as a reverse-chronological log.
+- **Concurrent branches merge without conflict.** `.gitattributes` gives this file the built-in
+  `union` driver, so two branches adding bullets under `## Unreleased` both survive. The driver
+  concatenates the two sides in file order, so the resulting order is not chronological: reorder
+  the bullets newest-first when the entry is published.
 - **One bullet per functional change** — capability, contract, behavior — naming the owning
   doc/ADR. A change with no functional delta (a verification-only round, a log edit) gets no entry.
 - **No acceptance results**: no gates, test counts, "verified / unverified / live-run / L2-L3
