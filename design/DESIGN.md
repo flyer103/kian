@@ -550,7 +550,11 @@ mismatch. Limits: no real vision provider is wired in the tree (the L2 evidence 
 provider), no per-image pricing, no replay re-derivation from the artifact store. Channel media
 reaches a vision target through the admission opt-in (ADR-065): `superagent.shaping.vision` adds a
 sibling `images` array of artifact references beside the unchanged channel wrapper, so no marker
-parser moves and a blind target still reads the transcript.
+parser moves and a blind target still reads the transcript. A per-turn budget (ADR-066) governs only
+the unsent tail — the messages after the last assistant message — newest first, by count and by raw
+artifact bytes: a reference past either limit is not rendered and keeps its text, while pixels at or
+before the last assistant message are already pinned, so a retry is byte-identical and no later turn
+rewrites earlier context (constraint 3).
 
 **Memory injection (MEMORY-MODEL §6, P2 — landed):** the only sanctioned extension of this
 section. At session creation (the server's create handler, after `engine.create_session` and

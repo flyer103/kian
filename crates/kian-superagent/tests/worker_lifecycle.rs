@@ -496,6 +496,7 @@ fn build_harness(
             slot: kian_core::model::SlotName("router".into()),
             max_iterations: 16,
             budget_scope: kian_loop::BudgetScope::Lifetime,
+            vision: kian_loop::VisionBudget::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));

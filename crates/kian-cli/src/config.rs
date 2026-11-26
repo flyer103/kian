@@ -2769,6 +2769,14 @@ pub struct ChannelShapingConfig {
     /// pixels. Requires the media edge and a vision-capable Router slot.
     #[serde(default)]
     pub vision: bool,
+    /// ADR-066: how many image references one turn may render, newest
+    /// first over the unsent tail. Absent = 4; range 1–32.
+    #[serde(default)]
+    pub max_images_per_turn: Option<usize>,
+    /// ADR-066: how many artifact bytes (before base64) one turn may
+    /// render. Absent = 4 MiB; range 64 KiB–64 MiB.
+    #[serde(default)]
+    pub max_image_bytes_per_turn: Option<u64>,
 }
 
 fn default_shaping_first_chars() -> usize {
@@ -2776,6 +2784,18 @@ fn default_shaping_first_chars() -> usize {
 }
 
 impl ChannelShapingConfig {
+    /// ADR-066: the per-turn vision budget this section configures.
+    pub fn vision_budget(&self) -> kian_loop::VisionBudget {
+        kian_loop::VisionBudget {
+            max_images_per_turn: self
+                .max_images_per_turn
+                .unwrap_or(kian_loop::DEFAULT_MAX_IMAGES_PER_TURN),
+            max_image_bytes_per_turn: self
+                .max_image_bytes_per_turn
+                .unwrap_or(kian_loop::DEFAULT_MAX_VISION_BYTES_PER_TURN),
+        }
+    }
+
     pub fn to_runtime(&self) -> kian_superagent::ShapingConfig {
         kian_superagent::ShapingConfig {
             inline_cap_bytes: self.inline_cap_bytes,
@@ -5068,6 +5088,38 @@ impl ServeConfig {
                          model_profiles entry with `vision: true` (provider `{}`, model `{}`): a \
                          text-only slot would drop every image reference (ADR-065)",
                         sa.router.agent, sa.router.slot, slot.provider, slot.model
+                    )));
+                }
+            }
+            // (ADR-066) The per-turn image budget is only meaningful beside
+            // the channel-image flag, and both keys are bounded: a budget
+            // with no pixels to budget is a configuration mistake, and an
+            // out-of-range bound is a typo, not a policy.
+            if let Some(shaping) = sa.shaping.as_ref() {
+                if !shaping.vision
+                    && (shaping.max_images_per_turn.is_some()
+                        || shaping.max_image_bytes_per_turn.is_some())
+                {
+                    return Err(invalid(
+                        "superagent.shaping.max_images_per_turn and \
+                         max_image_bytes_per_turn require superagent.shaping.vision: true — a \
+                         budget with no pixels to budget is a configuration mistake (ADR-066)",
+                    ));
+                }
+                if let Some(images) = shaping.max_images_per_turn
+                    && !(1..=32).contains(&images)
+                {
+                    return Err(invalid(format!(
+                        "superagent.shaping.max_images_per_turn {images} is outside 1..=32 \
+                         (ADR-066)"
+                    )));
+                }
+                if let Some(bytes) = shaping.max_image_bytes_per_turn
+                    && !(65_536..=67_108_864).contains(&bytes)
+                {
+                    return Err(invalid(format!(
+                        "superagent.shaping.max_image_bytes_per_turn {bytes} is outside \
+                         65536..=67108864 (ADR-066)"
                     )));
                 }
             }
@@ -8878,6 +8930,94 @@ recovery:
                 .contains("text-only slot would drop every image reference"),
             "{err}"
         );
+    }
+
+    /// ADR-066: `vision_yaml` with extra shaping keys after `vision`.
+    fn budget_yaml(extra: &str) -> String {
+        let yaml = superagent_yaml().replacen(
+            "  router:\n    session_id:",
+            &format!("  shaping:\n    vision: true\n{extra}  router:\n    session_id:"),
+            1,
+        );
+        format!("{yaml}model_profiles:\n  openai/gpt-router:\n    vision: true\n")
+    }
+
+    #[test]
+    fn the_per_turn_budget_refuses_without_the_vision_flag() {
+        let yaml = format!(
+            "{}{}",
+            vision_prerequisites(),
+            superagent_yaml().replacen(
+                "  router:\n    session_id:",
+                "  shaping:\n    max_images_per_turn: 2\n  router:\n    session_id:",
+                1,
+            )
+        );
+        let err = ServeConfig::parse(&yaml)
+            .expect_err("a budget with no pixels to budget refuses startup")
+            .to_string();
+        assert!(
+            err.contains("require superagent.shaping.vision: true"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_per_turn_budget_bounds_refuse_out_of_range() {
+        let too_many = format!(
+            "{}{}",
+            vision_prerequisites(),
+            budget_yaml("    max_images_per_turn: 33\n")
+        );
+        let err = ServeConfig::parse(&too_many).unwrap_err().to_string();
+        assert!(err.contains("outside 1..=32"), "{err}");
+
+        let too_small = format!(
+            "{}{}",
+            vision_prerequisites(),
+            budget_yaml("    max_image_bytes_per_turn: 1024\n")
+        );
+        let err = ServeConfig::parse(&too_small).unwrap_err().to_string();
+        assert!(err.contains("outside 65536..=67108864"), "{err}");
+    }
+
+    #[test]
+    fn the_per_turn_budget_defaults_when_omitted_and_parses_when_given() {
+        let cfg = ServeConfig::parse(&format!("{}{}", vision_prerequisites(), vision_yaml(true)))
+            .expect("vision flag with its prerequisites parses");
+        let budget = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .shaping
+            .as_ref()
+            .unwrap()
+            .vision_budget();
+        assert_eq!(
+            budget.max_images_per_turn,
+            kian_loop::DEFAULT_MAX_IMAGES_PER_TURN
+        );
+        assert_eq!(
+            budget.max_image_bytes_per_turn,
+            kian_loop::DEFAULT_MAX_VISION_BYTES_PER_TURN
+        );
+
+        let yaml = format!(
+            "{}{}",
+            vision_prerequisites(),
+            budget_yaml("    max_images_per_turn: 6\n    max_image_bytes_per_turn: 1048576\n")
+        );
+        let cfg = ServeConfig::parse(&yaml).expect("explicit budget keys parse");
+        let budget = cfg
+            .superagent
+            .as_ref()
+            .unwrap()
+            .shaping
+            .as_ref()
+            .unwrap()
+            .vision_budget();
+        assert_eq!(budget.max_images_per_turn, 6);
+        assert_eq!(budget.max_image_bytes_per_turn, 1_048_576);
     }
 
     #[test]

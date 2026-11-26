@@ -734,6 +734,7 @@ async fn budget_stop_with_passing_gate_completes_with_verdict_before_end_write()
             slot: kian_core::model::SlotName("main".into()),
             max_iterations: 2,
             budget_scope: crate::react::BudgetScope::Lifetime,
+            vision: crate::react::VisionBudget::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     )

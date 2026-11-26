@@ -967,6 +967,11 @@ impl Server {
                 router_rotate_after_events: sa.router.rotate_after_events,
                 router_agent,
                 worker_agent,
+                vision_budget: sa
+                    .shaping
+                    .as_ref()
+                    .map(|shaping| shaping.vision_budget())
+                    .unwrap_or_default(),
                 default_agent: config.agent_def(),
                 // (ADR-015): the worker template's and the default
                 // agent's permission tables ride their loops; the judge
@@ -1069,6 +1074,7 @@ impl Server {
                     slot: kian_core::model::SlotName(config.drain.slot.clone()),
                     max_iterations: config.drain.max_iterations,
                     budget_scope: kian_loop::BudgetScope::Lifetime,
+                    vision: kian_loop::VisionBudget::default(),
                     permissions: config.agent.permissions.clone(),
                 },
                 gate: config.agent.evidence_gate.clone(),
@@ -2932,6 +2938,7 @@ fn build_dream_driver(
             slot: kian_core::model::SlotName("main".into()),
             max_iterations: config.drain.max_iterations,
             budget_scope: kian_loop::BudgetScope::Lifetime,
+            vision: kian_loop::VisionBudget::default(),
             permissions: agent_cfg.permissions.clone(),
         },
         agent_cfg.evidence_gate.clone(),
