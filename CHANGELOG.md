@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Compaction answers byte pressure, not only token pressure (ADR-072).** With
+  `providers.<name>.max_request_bytes` declared, the loop measures the rendered request (artifact
+  bytes inlined, tool schemas sorted, plan body serialized) before the turn exists, and folds old
+  turns instead of persisting and sending a body over the bound. A byte-triggered fold skips the
+  minimum-reclaim rule, which counts projected text and cannot see the pixels it removes, and
+  records both byte readings as the fold's reason. The refusal of ADR-068 stays the last defense;
+  this is what makes the next turn sendable instead of wedging the session.
 - **Publishing is a conductor action, not a command surface (`design/JOB-MODEL.md` §7.2, §13.5,
   `design/SELF-EVOLUTION-MODEL.md` §9.4–§9.5, ADR-071).** S2 of the self-evolution ladder adds a
   `publish` step the conductor runs itself: re-verify the patch artifact's digest out of the

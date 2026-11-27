@@ -111,6 +111,15 @@ pub enum CompactionTrigger {
     Pressure(CompactionPressure),
     /// The provider already rejected a request as context overflow.
     Overflow,
+    /// The rendered request would exceed the provider's declared byte bound
+    /// (ADR-072). Both numbers are the ones the pre-flight compares, so the
+    /// fold answers a bound the send would otherwise be refused for.
+    Bytes {
+        /// Serialized length of the body this turn would send.
+        request_bytes: u64,
+        /// `providers.<name>.max_request_bytes`.
+        limit_bytes: u64,
+    },
 }
 
 impl CompactionTrigger {
@@ -120,6 +129,10 @@ impl CompactionTrigger {
         match self {
             Self::Pressure(pressure) => pressure.triggers(settings),
             Self::Overflow => true,
+            Self::Bytes {
+                request_bytes,
+                limit_bytes,
+            } => request_bytes > limit_bytes,
         }
     }
 
@@ -132,6 +145,12 @@ impl CompactionTrigger {
                 pressure.context_window_tokens
             ),
             Self::Overflow => "provider reported context overflow".to_string(),
+            Self::Bytes {
+                request_bytes,
+                limit_bytes,
+            } => format!(
+                "request byte pressure: {request_bytes} bytes > provider bound {limit_bytes} bytes"
+            ),
         }
     }
 }
@@ -227,7 +246,13 @@ pub fn plan_compaction(
     }
 
     let reclaimed_tokens = folded_bytes / BYTES_PER_TOKEN;
-    if reclaimed_tokens < settings.min_reclaim_tokens {
+    // ADR-072: a byte-pressure fold exists to remove payload the token
+    // arithmetic cannot see (inlined artifact bytes), so the minimum-reclaim
+    // rule — which counts projected text — would refuse the only fold that can
+    // make the request sendable.
+    if !matches!(trigger, CompactionTrigger::Bytes { .. })
+        && reclaimed_tokens < settings.min_reclaim_tokens
+    {
         return Ok(None);
     }
     let summary_bytes = (folded_bytes / SUMMARY_DIVISOR).min(folded_bytes);
@@ -473,6 +498,107 @@ mod tests {
         .expect("overflow authorizes a fold");
         assert_eq!(plan.reason, "provider reported context overflow");
         assert_eq!(plan.folded_messages, 10);
+    }
+
+    #[test]
+    fn a_byte_trigger_authorizes_only_over_the_bound() {
+        let mut stream = Stream::new();
+        for i in 0..8 {
+            stream.turn(&format!("turn {i}"));
+        }
+        let settings = CompactionSettings {
+            keep_recent_turns: 2,
+            min_reclaim_tokens: 1,
+            trigger_percent: 50,
+        };
+        let at_bound = CompactionTrigger::Bytes {
+            request_bytes: 33_554_432,
+            limit_bytes: 33_554_432,
+        };
+        assert!(
+            plan_compaction(&stream.events, &settings, Some(&at_bound))
+                .unwrap()
+                .is_none(),
+            "the bound is inclusive: exactly at it the request is sendable"
+        );
+        let over = CompactionTrigger::Bytes {
+            request_bytes: 35_372_873,
+            limit_bytes: 33_554_432,
+        };
+        let plan = plan_compaction(&stream.events, &settings, Some(&over))
+            .unwrap()
+            .expect("over the bound authorizes a fold");
+        assert_eq!(
+            plan.reason,
+            "request byte pressure: 35372873 bytes > provider bound 33554432 bytes"
+        );
+    }
+
+    #[test]
+    fn a_byte_fold_is_not_refused_by_the_minimum_reclaim() {
+        let mut stream = Stream::new();
+        for i in 0..8 {
+            stream.turn(&format!("turn {i}"));
+        }
+        let settings = CompactionSettings {
+            keep_recent_turns: 2,
+            min_reclaim_tokens: u64::MAX,
+            trigger_percent: 50,
+        };
+        assert_eq!(
+            plan_compaction(&stream.events, &settings, Some(&pressure(9_000, 10_000))).unwrap(),
+            None,
+            "token pressure still answers the minimum-reclaim rule"
+        );
+        let plan = plan_compaction(
+            &stream.events,
+            &settings,
+            Some(&CompactionTrigger::Bytes {
+                request_bytes: 2_000,
+                limit_bytes: 1_024,
+            }),
+        )
+        .unwrap()
+        .expect("byte pressure skips the text-based reclaim rule");
+        assert!(plan.folded_messages > 0);
+    }
+
+    #[test]
+    fn a_byte_fold_still_respects_the_keep_recent_window_and_the_frontier() {
+        let mut stream = Stream::new();
+        let mut starts = Vec::new();
+        for i in 0..10 {
+            starts.push(stream.turn(&format!("turn {i}")).0);
+        }
+        let settings = CompactionSettings {
+            keep_recent_turns: 4,
+            min_reclaim_tokens: u64::MAX,
+            trigger_percent: 50,
+        };
+        let trigger = CompactionTrigger::Bytes {
+            request_bytes: 9_000,
+            limit_bytes: 1_024,
+        };
+        let first = plan_compaction(&stream.events, &settings, Some(&trigger))
+            .unwrap()
+            .expect("first byte fold");
+        assert_eq!(first.to_seq, starts[6], "four most-recent turns kept");
+        stream.push(
+            EventKind::Compact,
+            json!({
+                "from_seq": first.from_seq,
+                "to_seq": first.to_seq,
+                "summary": {"role": "assistant", "content": {"text": "summary"}},
+            }),
+        );
+        for i in 10..14 {
+            starts.push(stream.turn(&format!("turn {i}")).0);
+        }
+        let second = plan_compaction(&stream.events, &settings, Some(&trigger))
+            .unwrap()
+            .expect("second byte fold");
+        assert_eq!(second.from_seq, first.to_seq, "no overlap, no re-fold");
+        assert_eq!(second.to_seq, starts[10]);
     }
 
     #[test]

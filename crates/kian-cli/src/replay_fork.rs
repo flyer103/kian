@@ -589,6 +589,7 @@ async fn drive(
             budget_scope: kian_loop::BudgetScope::Lifetime,
             permissions: cfg.agent.permissions.clone(),
             vision: kian_loop::VisionBudget::default(),
+            max_request_bytes: Default::default(),
         },
         cfg.agent.evidence_gate.clone(),
     );

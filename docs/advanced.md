@@ -899,6 +899,13 @@ same bytes cannot succeed; a deployment that wants compaction to shrink the hist
 `request_too_large: compress_then_retry` to its `recovery:` table. Semantics:
 [ADR-068](../design/decisions/ADR-068-oversized-request-classification.md).
 
+With the bound declared, it also decides *when* the loop folds: the rendered request (artifact bytes
+inlined, tool schemas sorted, plan body serialized) is measured before the turn exists, and a body
+over the bound makes the loop fold old turns instead of persisting and sending an oversized one.
+Read the bound as a retention knob — history older than `keep_recent_turns` is summarized earlier
+than the context window alone would require. Semantics:
+[ADR-072](../design/decisions/ADR-072-request-byte-pressure-folds-history.md).
+
 ## Session budgets
 
 `agents.<name>.budgets.tokens` is a real ceiling: the loop builds the request plan, projects

@@ -60,10 +60,12 @@ use kian_core::events::{Event, EventKind};
 use kian_core::model::{AgentDef, ModelProfile, Permission, SlotName};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
-    ToolCall, ToolProvider, ToolResult,
+    ToolCall, ToolProvider, ToolResult, ToolSchema,
 };
-use kian_llm::plan::build_request_plan;
-use kian_llm::provider::{ChatImage, ChatMessage, WireFunctionCall, WireToolCall};
+use kian_llm::plan::{RequestPlan, build_request_plan};
+use kian_llm::provider::{
+    ChatImage, ChatMessage, WireFunctionCall, WireToolCall, serialize_request_body,
+};
 use kian_llm::slots::{SessionSlots, SlotBinding, SlotError, SlotResolver};
 use kian_llm::turn::{ProviderRegistry, SlotEventSink, complete_turn};
 use kian_orchestrator::compaction::{
@@ -186,6 +188,13 @@ pub struct ReActConfig {
     /// The per-turn image budget (ADR-066). Applies only to the unsent
     /// tail; the default (4 references, 4 MiB) needs no configuration.
     pub vision: VisionBudget,
+    /// Declared byte bounds per provider name (ADR-072): the loop renders
+    /// the request the send would use and folds old turns when it would
+    /// exceed the bound, instead of persisting and sending a body the
+    /// provider seam (ADR-068) would refuse. **Absent = no byte gate**, so a
+    /// deployment that declares no `providers.<name>.max_request_bytes`
+    /// behaves exactly as before.
+    pub max_request_bytes: BTreeMap<String, u64>,
 }
 
 impl Default for ReActConfig {
@@ -196,6 +205,7 @@ impl Default for ReActConfig {
             budget_scope: BudgetScope::Lifetime,
             permissions: BTreeMap::new(),
             vision: VisionBudget::default(),
+            max_request_bytes: BTreeMap::new(),
         }
     }
 }
@@ -224,6 +234,17 @@ struct Inner {
     /// ADR-058 compaction tuning. The default folds old turns only under
     /// context pressure; it never spends a provider call to save money.
     compaction: CompactionSettings,
+}
+
+/// The primary request rendered exactly as a send would build it: sorted tool
+/// schemas, the chat messages (artifact bytes inlined for a vision target) and
+/// the plan that carries the persisted body. Rendering it before `turn/start`
+/// lets the byte-pressure gate (ADR-072) measure the bytes the wire would
+/// carry, and the provider turn reuses the same value instead of rebuilding it.
+struct PreparedRequest {
+    schemas: Vec<ToolSchema>,
+    chat: Vec<ChatMessage>,
+    plan: Result<RequestPlan, ProviderError>,
 }
 
 /// The built-in async ReAct [`LoopDriver`] (DESIGN §6.2). Cheap to clone.
@@ -897,11 +918,54 @@ impl Inner {
             return Ok(flow);
         }
 
+        // 4b. Request byte pressure (ADR-072): render the request the send
+        //     would use and fold old turns when it would exceed a declared
+        //     provider bound. The gate runs before the turn exists, so an
+        //     over-bound body is never persisted and never sent; ADR-068
+        //     stays the last defense when no fold can relieve the request.
+        let prepared = self.prepare_request(ctx, &binding, &messages).await;
+        if let Some(limit) = self
+            .config
+            .max_request_bytes
+            .get(&binding.target.provider)
+            .copied()
+            && let Ok(plan) = &prepared.plan
+            && let Ok(body) = serialize_request_body(&plan.body)
+        {
+            let request_bytes = body.len() as u64;
+            if request_bytes > limit {
+                if let Some(flow) = self
+                    .compact_now(
+                        ctx,
+                        &binding,
+                        iteration,
+                        CompactionTrigger::Bytes {
+                            request_bytes,
+                            limit_bytes: limit,
+                        },
+                        compactions,
+                    )
+                    .await?
+                {
+                    return Ok(flow);
+                }
+                tracing::warn!(
+                    session = %ctx.session().0,
+                    provider = %binding.target.provider,
+                    request_bytes,
+                    limit_bytes = limit,
+                    compactions = *compactions,
+                    keep_recent_turns = self.compaction.keep_recent_turns,
+                    "request byte pressure: no fold relieved the request; sending it for the provider bound to refuse (ADR-072)"
+                );
+            }
+        }
+
         // 5. The provider turn. begin/end bracket every outcome (including
         //    soft failures) so turn events stay balanced in the stream.
         ctx.begin_turn_with(json!({"iteration": iteration})).await?;
         let turn = self
-            .provider_turn(ctx, &binding, &messages, iteration)
+            .provider_turn(ctx, &binding, &prepared, iteration)
             .await;
         let usage = turn.usage.as_ref();
         let flow = match turn.result {
@@ -1208,6 +1272,34 @@ impl Inner {
         images
     }
 
+    /// Renders the primary request exactly as a send would (ADR-054):
+    /// deterministic tool order, the chat messages with artifact bytes
+    /// inlined for a vision target, and the plan that carries the persisted
+    /// body. The request is built before `turn/start` so the byte-pressure
+    /// gate (ADR-072) can measure the bytes the wire would carry without
+    /// starting a turn it may not send.
+    async fn prepare_request(
+        &self,
+        ctx: &DrainCtx,
+        binding: &SlotBinding,
+        messages: &[Message],
+    ) -> PreparedRequest {
+        let target = &binding.target;
+        // Deterministic tool order (the request body freezes the tools
+        // array order — serialization contract).
+        let mut schemas = self.tools.schemas();
+        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        let chat = self
+            .chat_messages(ctx, target.profile.as_ref(), messages)
+            .await;
+        let plan = build_request_plan(target.profile.as_ref(), &target.model, &chat, &schemas);
+        PreparedRequest {
+            schemas,
+            chat,
+            plan,
+        }
+    }
+
     /// Runs one provider turn: persist the A2 audit copy, call the slot
     /// (with fallback traversal), assemble the streamed response, then
     /// either dispatch tool calls (log-before-execute) or return a final
@@ -1217,30 +1309,25 @@ impl Inner {
         &self,
         ctx: &DrainCtx,
         binding: &SlotBinding,
-        messages: &[Message],
+        prepared: &PreparedRequest,
         iteration: usize,
     ) -> TurnResult {
         let target = binding.target.clone();
 
         // Deterministic tool order (the request body freezes the tools
         // array order — serialization contract).
-        let mut schemas = self.tools.schemas();
-        schemas.sort_by(|a, b| a.name.cmp(&b.name));
-        let chat = self
-            .chat_messages(ctx, target.profile.as_ref(), messages)
-            .await;
+        let schemas = prepared.schemas.clone();
 
         // A2: the audit copy of the exact request is durable BEFORE the
         // provider is called. The plan is the single source of the bytes
         // and of the metadata recorded next to them (ADR-054).
-        let plan = match build_request_plan(target.profile.as_ref(), &target.model, &chat, &schemas)
-        {
+        let plan = match &prepared.plan {
             Ok(plan) => plan,
             Err(e) => {
                 return TurnResult {
                     result: Err(TurnError::Soft {
                         reason: format!("request plan: {e}"),
-                        audit: recovery_audit(self.policy.as_ref(), provider_error_class(&e)),
+                        audit: recovery_audit(self.policy.as_ref(), provider_error_class(e)),
                     }),
                     usage: None,
                 };
@@ -1293,8 +1380,8 @@ impl Inner {
             "body": body,
             "body_version": plan.body_version,
             "dialect": plan.dialect,
-            "body_sha256": plan.body_sha256,
-            "estimate": plan.estimate,
+            "body_sha256": plan.body_sha256.clone(),
+            "estimate": plan.estimate.clone(),
         });
         if let Some(digest) = &plan.profile_digest {
             step_payload["profile_digest"] = json!(digest);
@@ -1322,7 +1409,7 @@ impl Inner {
         self.observe_request(
             ctx,
             binding,
-            chat.len(),
+            prepared.chat.len(),
             &schemas,
             iteration,
             &body,
@@ -1332,7 +1419,7 @@ impl Inner {
 
         // complete_turn rebuilds the body per (fallback) target so the
         // model name always matches the provider actually called.
-        let build_chat = chat.clone();
+        let build_chat = prepared.chat.clone();
         let build_schemas = schemas.clone();
         let build = Arc::new(move |t: &kian_core::model::SlotTarget| {
             build_request_plan(t.profile.as_ref(), &t.model, &build_chat, &build_schemas)

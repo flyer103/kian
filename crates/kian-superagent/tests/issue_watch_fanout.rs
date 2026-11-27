@@ -660,6 +660,7 @@ async fn multi_ticket_fanout_end_to_end_over_fixture_pages() {
             max_iterations: 10_000,
             budget_scope: kian_loop::BudgetScope::Lifetime,
             vision: kian_loop::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));
