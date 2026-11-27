@@ -2273,7 +2273,7 @@ async fn reactive_overflow_compacts_then_retries_the_smaller_request() {
     cleanup_db(&h.db_path);
 }
 
-/// ADR-070: a byte refusal folds under the policy opt-in — the fold is keyed
+/// ADR-071: a byte refusal folds under the policy opt-in — the fold is keyed
 /// on the resolved action, the retry carries the summary, and the refusal
 /// itself stays evidenced as a soft failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2355,7 +2355,7 @@ async fn reactive_request_too_large_folds_under_the_policy_opt_in() {
     cleanup_db(&h.db_path);
 }
 
-/// ADR-070: without the opt-in the byte refusal stays terminal — nothing
+/// ADR-071: without the opt-in the byte refusal stays terminal — nothing
 /// folds and the turn settles failed, exactly as ADR-068's default table says.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_too_large_without_the_opt_in_fails_without_a_fold() {
@@ -2413,7 +2413,7 @@ async fn request_too_large_without_the_opt_in_fails_without_a_fold() {
     cleanup_db(&h.db_path);
 }
 
-/// ADR-070: the reactive arm honors the table for the window overflow too — an
+/// ADR-071: the reactive arm honors the table for the window overflow too — an
 /// explicit table that maps `context_overflow` to `fail` folds nothing, which
 /// is the delta the action gate introduces over the old class-only check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

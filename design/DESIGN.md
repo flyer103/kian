@@ -516,7 +516,7 @@ all are evidence: a declared `profile.context_window` whose worst-case next requ
 context plus the declared output cap) reaches `trigger_percent`; the provider's own
 `ContextOverflow` answer; or its `request_too_large` refusal (ADR-068) against the declared
 `max_request_bytes` bound. The last two are reactive, and both fold only when the deployment's
-recovery policy table resolves the class to `compress_then_retry` (ADR-070) — the loop reads the
+recovery policy table resolves the class to `compress_then_retry` (ADR-071) — the loop reads the
 action it already persisted in the audit, so an operator who maps the class to `fail` still gets a
 failed turn, and the class only selects the trigger whose name the `compact` reason reports. The
 loop never compacts for cost — folding is the only deliberate prefix invalidation (constraint 3),
@@ -535,7 +535,7 @@ ordinary requests (a maintenance body never reads as an unexpected prefix change
 reports maintenance requests and their priced subtotal apart from turns. Limits: no price-aware
 planner, no `compact_slot`, no maintenance fallback, no byte-aware preventive estimate — pixels can
 grow the serialized request faster than the token estimate grows, so such a session folds only
-after the refusal and then oscillates near the declared bound (ADR-070); wall-clock budgets
+after the refusal and then oscillates near the declared bound (ADR-071); wall-clock budgets
 remain ungated.
 
 **Vision inputs (ADR-063, P5c — landed):** the one capability that changes the request dialect

@@ -8,7 +8,7 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
-- **An oversized request folds when the recovery policy says so (ADR-070).** A
+- **An oversized request folds when the recovery policy says so (ADR-071).** A
   `request_too_large` refusal — the serialized request crossed
   `providers.<name>.max_request_bytes` — now runs the same maintenance fold as a
   `context_overflow` answer when the recovery table resolves the class to `compress_then_retry`:

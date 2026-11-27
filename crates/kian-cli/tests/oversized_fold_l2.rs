@@ -1,4 +1,4 @@
-//! L2 for ADR-070: an oversized request folds the old turns under the
+//! L2 for ADR-071: an oversized request folds the old turns under the
 //! recovery policy's `compress_then_retry`, against a real assembled
 //! server.
 //!

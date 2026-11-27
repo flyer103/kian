@@ -686,7 +686,7 @@ with an explicit reason. The loop folds under three triggers: a declared
 `profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90);
 the provider's authoritative `ContextOverflow` answer; or its `request_too_large` refusal
 against the declared byte bound (ADR-068). The two reactive triggers fold only when the
-deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-070), so
+deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-071), so
 the default table — which maps `request_too_large` to `fail` — keeps a byte refusal terminal,
 and the class selects the trigger whose name the `compact` reason reports. The summary is
 produced by an ordinary persisted maintenance turn - `turn/start`, `step/request` with
@@ -937,7 +937,7 @@ process. An HTTP 413 answer is classified `request_too_large` as well, carrying 
 size that was sent and a bounded snippet. `request_too_large` is a closed policy-table class: the
 default table maps it to `fail` because re-sending identical bytes cannot succeed, and a deployment
 that wants compaction to shrink the history opts into `compress_then_retry` explicitly — the loop
-then folds the old turns under the byte trigger and retries the smaller request (ADR-070), bounded
+then folds the old turns under the byte trigger and retries the smaller request (ADR-071), bounded
 by the per-episode fold cap; when no fold can reclaim anything the turn settles failed as before.
 Without a declared bound a mid-upload connection close stays `provider_down` — no transport
 heuristics. The persisted `step/request` remains the audit record of the bytes that were not sent.

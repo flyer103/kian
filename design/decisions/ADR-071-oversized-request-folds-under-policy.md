@@ -1,4 +1,4 @@
-# ADR-070 — An oversized request folds when the policy resolves `compress_then_retry`
+# ADR-071 — An oversized request folds when the policy resolves `compress_then_retry`
 
 - Status: accepted (2026-11-27, compaction slice)
 - Related: ADR-058 (production compaction and maintenance reserve), ADR-066 (per-turn image

@@ -941,7 +941,7 @@ impl Inner {
                     payload["usage"] = u.clone();
                 }
                 let _ = ctx.end_turn_with(payload).await;
-                // ADR-058/ADR-070 reactive arm: when the recovery policy
+                // ADR-058/ADR-071 reactive arm: when the recovery policy
                 // resolved this failure to `compress_then_retry`, fold the old
                 // turns and let the next iteration retry the (now smaller)
                 // request. Keying on the resolved action rather than on the
@@ -2086,7 +2086,7 @@ fn action_name(action: Option<&RecoveryAction>) -> &'static str {
 }
 
 /// The fold a soft failure authorizes: only when the declarative policy
-/// resolved the class to `compress_then_retry` (ADR-070), and then the class
+/// resolved the class to `compress_then_retry` (ADR-071), and then the class
 /// picks the trigger so the `compact` event's reason names the verdict that
 /// actually arrived.
 fn fold_trigger(audit: &Value) -> Option<CompactionTrigger> {
