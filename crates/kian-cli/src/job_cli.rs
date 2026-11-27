@@ -707,7 +707,17 @@ async fn run_job(
     // V24: a plan that declares the surface cannot be admitted without a
     // symptom, and a plan that declares nothing takes no pack (14).
     let verified = match (job.plan.declares_surface(), pack) {
-        (true, Some(dir)) => Some(admission_selfdev(dir, base)?),
+        (true, Some(dir)) => {
+            // V30: a base commit is a full commit, never an abbreviation.
+            if let Some(base) = base
+                && !is_full_commit(base)
+            {
+                return Err(usage(format!(
+                    "invalid base commit: {base:?} is not a full 40-hex commit"
+                )));
+            }
+            Some(admission_selfdev(dir, base)?)
+        }
         (true, None) => {
             return Err(usage(format!(
                 "selfdev job requires an evidence pack: job {job_id} declares patch_paths_allowed (kian job run {job_id} --pack <dir>)"
@@ -838,6 +848,10 @@ fn admission_selfdev(dir: &Path, base: Option<&str>) -> Result<Value, JobCliErro
         )));
     }
     Ok(value)
+}
+
+fn is_full_commit(text: &str) -> bool {
+    text.len() == 40 && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// V26's refusal shape: an unverified pack is the whole message.
@@ -1237,6 +1251,15 @@ superagent:
         .expect_err("a base commit is a claim about a pack");
         assert!(matches!(error, JobCliError::Usage(_)), "{error:?}");
         assert!(error.message().contains("--base needs --pack"), "{error:?}");
+    }
+
+    #[test]
+    fn a_base_commit_is_a_full_commit() {
+        assert!(is_full_commit(&"a".repeat(40)));
+        assert!(is_full_commit("9F3C000000000000000000000000000000000000"));
+        assert!(!is_full_commit("9f3c"));
+        assert!(!is_full_commit(&"a".repeat(39)));
+        assert!(!is_full_commit(&"g".repeat(40)));
     }
 
     #[test]

@@ -8,6 +8,15 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Self-evolution S2a: the publish step lands (`design/SELF-EVOLUTION-MODEL.md` §9.4–§9.5,
+  `design/JOB-MODEL.md` §7.2, §13.5, ADR-071).** A plan's `publish` step now derives
+  `selfdev/<run_session>` and its worktree from the frozen `job.selfdev.base_commit`, re-reads
+  the patch artifact out of the producer's stream and re-verifies its digest, creates the worktree,
+  applies the patch, commits it with the audit trailers and runs the operator's
+  `selfdev.publish.gate` inside the worktree before recording one
+  `job:publish:<step>:<attempt>` receipt. No credential is read and nothing is pushed; an occupied
+  worktree or an unclosed intent settles `needs_operator`, and `kian job status <run>` renders
+  the receipt's branch, commit and gate.
 - **An oversized request folds when the recovery policy says so (ADR-074).** A
   `request_too_large` refusal the byte gate could not predict — the carrier's own limit sits below
   `providers.<name>.max_request_bytes`, no bound is declared, or a fallback target built the body —
@@ -40,8 +49,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   `job:publish:<step>:<attempt>` receipt — so a plan never names a program. The authority splits
   where the credential appears: S2a publish-local holds none, S2b adds one non-forced push and one
   pull request with the token read from `selfdev.publish.token_env` at push time. Specification
-  only in this change: the action, the `publish_ok` check, the receipt and the gate configuration
-  land with S2a.
+  only in that change: the action, the `publish_ok` check, the receipt and the gate configuration
+  land with S2a below; S2b remains specified.
 - **Job artifacts: a step's artifact is its child's final message
   (`design/JOB-MODEL.md` §12.1).** The conductor derives the ref, `bytes` and `sha256` from the
   producer's last `assistant/message` that carries text and no tool calls, then records the

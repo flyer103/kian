@@ -86,6 +86,10 @@ pub const DEFAULT_CONSECUTIVE_FAILURES: u32 = 3;
 /// (SELF-EVOLUTION-MODEL §14 V25).
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 10;
 
+/// The branch a `publish` step's pull request targets when it declares none
+/// (SELF-EVOLUTION-MODEL §14 V31, A15).
+pub const DEFAULT_PUBLISH_BASE: &str = "main";
+
 /// A job's plan, frozen: every default filled in, every id validated
 /// (§7.3). Serialising this struct *is* the canonical frozen form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -227,6 +231,11 @@ pub struct StepPlan {
     /// `deliver` only: what to send (§13.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<DeliverContent>,
+    /// `publish` only: the frozen publish shape (SELF-EVOLUTION-MODEL §9.4,
+    /// A15). The field serializes only when present, so a plan written before
+    /// the action existed keeps its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishSpec>,
 }
 
 impl StepPlan {
@@ -235,6 +244,23 @@ impl StepPlan {
     #[must_use]
     pub fn is_deliver(&self) -> bool {
         matches!(self.action, StepAction::Deliver)
+    }
+
+    /// Whether this step publishes an artifact as a conductor action
+    /// (SELF-EVOLUTION-MODEL §9.4).
+    #[must_use]
+    pub fn is_publish(&self) -> bool {
+        matches!(self.action, StepAction::Publish)
+    }
+
+    /// The publish facts, present exactly when the step is a well-formed
+    /// `publish` step (V27 validated them at load).
+    #[must_use]
+    pub fn publish(&self) -> Option<&PublishSpec> {
+        if !self.is_publish() {
+            return None;
+        }
+        self.publish.as_ref()
     }
 
     /// The deliver facts, present exactly when the step is a well-formed
@@ -323,6 +349,9 @@ pub enum StepAction {
     Agent,
     /// A conductor-executed send through the channel adapter (§13.1).
     Deliver,
+    /// A conductor-executed publish of one artifact (SELF-EVOLUTION-MODEL
+    /// §9.4): a derived worktree, a commit, a gate and a receipt.
+    Publish,
 }
 
 /// A step's retry class (§10).
@@ -397,6 +426,37 @@ pub struct DeliverContent {
     pub from_artifact: Option<ArtifactInput>,
 }
 
+/// The frozen shape of a `publish` step (SELF-EVOLUTION-MODEL §9.4, A15).
+///
+/// The plan chooses *what* is published — its single input — and the branch a
+/// pull request would target. It cannot choose the repository, the gate or the
+/// credential: those are the operator's configuration (§9.5), so a run cannot
+/// pick a trivial gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishSpec {
+    /// The branch a pull request targets (S2b); validated by V31.
+    #[serde(default = "default_publish_base")]
+    pub base: String,
+    /// Whether the configured gate runs before the receipt (§9.4 step 8).
+    #[serde(default = "default_publish_gates")]
+    pub gates: bool,
+    /// S2b: push the branch to the configured remote. S2a leaves it false.
+    #[serde(default)]
+    pub push: bool,
+    /// S2b: open the pull request. Requires `push` (V31).
+    #[serde(default)]
+    pub pull_request: bool,
+}
+
+fn default_publish_base() -> String {
+    DEFAULT_PUBLISH_BASE.to_string()
+}
+
+const fn default_publish_gates() -> bool {
+    true
+}
+
 /// One declarative evidence check (§11.2).
 ///
 /// The first four reuse `kian_loop::evidence::CheckSpec` semantics
@@ -433,6 +493,8 @@ pub enum JobCheck {
         #[serde(default)]
         target: Value,
     },
+    /// The publish receipt on this attempt satisfies §9.4 (A17).
+    PublishOk,
     /// The patch artifact changes only paths inside the declared surface
     /// (SELF-EVOLUTION-MODEL §5.3, A13).
     PatchPathsAllowed {
@@ -460,6 +522,7 @@ impl JobCheck {
             Self::MinToolResults { .. } => "min_tool_results",
             Self::ArtifactWithinCap { .. } => "artifact_within_cap",
             Self::DeliveryReceipt { .. } => "delivery_receipt",
+            Self::PublishOk => "publish_ok",
             Self::PatchPathsAllowed { .. } => "patch_paths_allowed",
         }
     }
@@ -481,6 +544,7 @@ impl JobCheck {
             }
             Self::ArtifactWithinCap { .. }
             | Self::DeliveryReceipt { .. }
+            | Self::PublishOk
             | Self::PatchPathsAllowed { .. } => None,
         }
     }
@@ -718,6 +782,22 @@ pub fn validate_plan(plan: &JobPlan) -> Vec<PlanViolation> {
         validate_step(plan, index, step, &mut out);
     }
 
+    let publish_steps = plan.steps.iter().filter(|step| step.is_publish()).count();
+    if publish_steps > 1 {
+        out.push(violation(
+            "V28",
+            "steps",
+            "invalid publish step: a plan declares at most one publish step",
+        ));
+    }
+    if publish_steps > 0 && !plan.declares_surface() {
+        out.push(violation(
+            "V29",
+            "steps",
+            "publish requires a declared surface: no step declares patch_paths_allowed",
+        ));
+    }
+
     validate_limits(plan, &mut out);
     validate_graph(plan, &mut out);
 
@@ -805,6 +885,15 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
             }
         }
         StepAction::Deliver => validate_deliver(&path, plan, step, out),
+        StepAction::Publish => validate_publish(&path, step, out),
+    }
+
+    if step.action != StepAction::Publish && step.publish.is_some() {
+        out.push(violation(
+            "V27",
+            format!("{path}.publish"),
+            "invalid publish step: the publish field belongs to a publish step",
+        ));
     }
 
     if step.requires.len() > MAX_CAPABILITIES {
@@ -1027,6 +1116,93 @@ fn valid_surface_glob(entry: &str) -> bool {
     entry
         .split('/')
         .all(|segment| !segment.is_empty() && segment != ".." && segment != ".")
+}
+
+fn validate_publish(path: &str, step: &StepPlan, out: &mut Vec<PlanViolation>) {
+    if step.publish.is_none() {
+        out.push(violation(
+            "V27",
+            format!("{path}.publish"),
+            "invalid publish step: a publish step declares its publish block",
+        ));
+    }
+    if step.inputs.len() != 1 {
+        out.push(violation(
+            "V27",
+            format!("{path}.inputs"),
+            "invalid publish step: exactly one input names the artifact to publish",
+        ));
+    }
+    if step.retries != 0 {
+        out.push(violation(
+            "V27",
+            format!("{path}.retries"),
+            "invalid publish step: a publish is never retried, so retries is 0",
+        ));
+    }
+    if !matches!(step.effect, Effect::Write) {
+        out.push(violation(
+            "V27",
+            format!("{path}.effect"),
+            "invalid publish step: a publish writes, so effect is write",
+        ));
+    }
+    if step.idempotent {
+        out.push(violation(
+            "V27",
+            format!("{path}.idempotent"),
+            "invalid publish step: a publish is not idempotent",
+        ));
+    }
+    let forbidden = |field: &str, present: bool, out: &mut Vec<PlanViolation>| {
+        if present {
+            out.push(violation(
+                "V27",
+                format!("{path}.{field}"),
+                format!("invalid publish step: a publish step declares no {field}"),
+            ));
+        }
+    };
+    forbidden("prompt", step.prompt.is_some(), out);
+    forbidden("requires", !step.requires.is_empty(), out);
+    forbidden("pin", step.pin.is_some(), out);
+    forbidden("prefer", !step.prefer.is_empty(), out);
+    forbidden("allow_offline", step.allow_offline, out);
+    forbidden("produces", step.produces.is_some(), out);
+    forbidden("channel", step.channel.is_some(), out);
+    forbidden("target", step.target.is_some(), out);
+    forbidden("content", step.content.is_some(), out);
+
+    if let Some(input) = step.inputs.first()
+        && !step.depends_on.iter().any(|dep| dep == &input.step)
+    {
+        out.push(violation(
+            "V27",
+            format!("{path}.depends_on"),
+            format!(
+                "invalid publish step: depends_on names the producer {:?}",
+                input.step
+            ),
+        ));
+    }
+
+    let Some(publish) = &step.publish else {
+        return;
+    };
+    if publish.pull_request && !publish.push {
+        out.push(violation(
+            "V31",
+            format!("{path}.publish.pull_request"),
+            "invalid publish target: pull_request needs push",
+        ));
+    }
+    if publish.base.trim().is_empty() || publish.base.chars().any(char::is_whitespace) {
+        out.push(violation(
+            "V31",
+            format!("{path}.publish.base"),
+            "invalid publish target: a branch name without whitespace",
+        ));
+    }
 }
 
 fn validate_deliver(path: &str, plan: &JobPlan, step: &StepPlan, out: &mut Vec<PlanViolation>) {
@@ -1943,5 +2119,185 @@ mod tests {
             "sha256:b130bbb784b4c7ea2ec46146d6d1d1b0c34eba03303e9192765758b3bb504b78"
         );
         assert_eq!(canonical_json(&plan.frozen_json()), GOLDEN_CANONICAL);
+    }
+
+    /// A well-formed self-dev plan: one patch producer, one publish step.
+    fn proposal() -> JobPlan {
+        plan(json!({
+            "id": "self-dev",
+            "limits": {"deadline_ms": 3_600_000},
+            "steps": [{
+                "id": "patch",
+                "action": "agent",
+                "prompt": "propose a patch",
+                "produces": {"name": "patch", "max_bytes": 262_144},
+                "verify": [
+                    {"check": "artifact_within_cap", "name": "patch"},
+                    {"check": "patch_paths_allowed", "artifact": "patch",
+                     "allow": ["crates/**"], "deny": ["AGENTS.md"]}
+                ]
+            }, {
+                "id": "publish",
+                "action": "publish",
+                "depends_on": ["patch"],
+                "inputs": [{"step": "patch", "name": "patch"}],
+                "publish": {"base": "main", "gates": true},
+                "effect": "write",
+                "verify": [{"check": "publish_ok"}]
+            }]
+        }))
+    }
+
+    fn rules_of(mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<&'static str> {
+        let mut value = proposal().frozen_json();
+        mutate(&mut value);
+        rules(&plan(value))
+    }
+
+    fn publish_step(value: &mut serde_json::Value) -> &mut serde_json::Value {
+        &mut value["steps"][1]
+    }
+
+    #[test]
+    fn a_well_formed_publish_plan_validates() {
+        assert_eq!(validate_plan(&proposal()), Vec::new());
+    }
+
+    #[test]
+    fn publish_defaults_are_frozen_into_the_step() {
+        let held = proposal();
+        let step = held.step("publish").expect("declared");
+        assert!(step.is_publish());
+        assert!(!step.is_deliver());
+        let publish = step.publish().expect("the publish block");
+        assert_eq!(publish.base, DEFAULT_PUBLISH_BASE);
+        assert!(publish.gates);
+        assert!(!publish.push);
+        assert!(!publish.pull_request);
+
+        let frozen = held.frozen_json();
+        assert_eq!(frozen["steps"][1]["publish"]["base"], json!("main"));
+        assert_eq!(frozen["steps"][1]["publish"]["gates"], json!(true));
+        assert_eq!(
+            frozen["steps"][1]["action"],
+            json!("publish"),
+            "the action is part of the frozen bytes"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_publish_field_freezes_the_same_bytes() {
+        let plain = minimal();
+        assert!(plain.frozen_json()["steps"][0].get("publish").is_none());
+        let explicit_null = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "action": "agent",
+                "prompt": "fetch the news",
+                "publish": null,
+                "verify": [{"check": "final_message_present"}]
+            }]
+        }));
+        assert_eq!(plain.digest(), explicit_null.digest());
+    }
+
+    #[test]
+    fn publish_ok_names_itself_and_is_owned_by_the_conductor() {
+        assert_eq!(JobCheck::PublishOk.name(), "publish_ok");
+        assert!(JobCheck::PublishOk.to_check_spec().is_none());
+    }
+
+    #[test]
+    fn v27_rejects_a_publish_step_that_breaks_the_fixed_shape() {
+        assert!(
+            rules_of(|value| {
+                publish_step(value)
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("publish");
+            })
+            .contains(&"V27")
+        );
+        assert!(
+            rules_of(|value| {
+                publish_step(value)["inputs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"step": "patch", "name": "patch"}));
+            })
+            .contains(&"V27")
+        );
+        assert!(rules_of(|value| publish_step(value)["retries"] = json!(1)).contains(&"V27"));
+        assert!(rules_of(|value| publish_step(value)["effect"] = json!("read")).contains(&"V27"));
+        assert!(rules_of(|value| publish_step(value)["idempotent"] = json!(true)).contains(&"V27"));
+        assert!(rules_of(|value| publish_step(value)["prompt"] = json!("do it")).contains(&"V27"));
+        assert!(
+            rules_of(|value| publish_step(value)["produces"] = json!({"name": "again"}))
+                .contains(&"V27")
+        );
+        assert!(rules_of(|value| publish_step(value)["depends_on"] = json!([])).contains(&"V27"));
+        assert!(
+            rules_of(|value| publish_step(value)["channel"] = json!("mock-im")).contains(&"V27")
+        );
+        assert!(
+            rules_of(|value| publish_step(value)["requires"] = json!(["repo"])).contains(&"V27")
+        );
+    }
+
+    #[test]
+    fn v27_rejects_the_publish_field_on_another_action() {
+        let rules = rules_of(|value| value["steps"][0]["publish"] = json!({"gates": true}));
+        assert!(rules.contains(&"V27"), "{rules:?}");
+    }
+
+    #[test]
+    fn v28_allows_at_most_one_publish_step() {
+        let rules = rules_of(|value| {
+            let copy = value["steps"][1].clone();
+            value["steps"].as_array_mut().unwrap()[1]["id"] = json!("publish-again");
+            value["steps"].as_array_mut().unwrap().push(copy);
+        });
+        assert!(rules.contains(&"V28"), "{rules:?}");
+    }
+
+    #[test]
+    fn v29_requires_a_declared_surface() {
+        let rules = rules_of(|value| {
+            value["steps"][0]["verify"] =
+                json!([{"check": "artifact_within_cap", "name": "patch"}]);
+        });
+        assert!(rules.contains(&"V29"), "{rules:?}");
+    }
+
+    #[test]
+    fn v31_rejects_a_pull_request_without_a_push_and_a_blank_base() {
+        let rules = rules_of(|value| {
+            publish_step(value)["publish"]["pull_request"] = json!(true);
+        });
+        assert!(rules.contains(&"V31"), "{rules:?}");
+        let rules = rules_of(|value| {
+            publish_step(value)["publish"]["base"] = json!("release 1");
+        });
+        assert!(rules.contains(&"V31"), "{rules:?}");
+        let rules = rules_of(|value| {
+            publish_step(value)["publish"]["base"] = json!("");
+        });
+        assert!(rules.contains(&"V31"), "{rules:?}");
+        assert!(
+            !rules_of(|value| {
+                publish_step(value)["publish"]["push"] = json!(true);
+                publish_step(value)["publish"]["pull_request"] = json!(true);
+            })
+            .contains(&"V31")
+        );
+    }
+
+    #[test]
+    fn a_publish_step_freezes_into_the_plan_digest() {
+        let without = proposal();
+        let mut value = without.frozen_json();
+        publish_step(&mut value)["publish"]["gates"] = json!(false);
+        assert_ne!(plan(value).digest(), without.digest());
     }
 }
