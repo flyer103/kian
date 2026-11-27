@@ -37,6 +37,7 @@ struct BridgeMock {
     updates: Mutex<VecDeque<Value>>,
     sends: Mutex<VecDeque<Value>>,
     update_requests: Mutex<u64>,
+    since_rowids: Mutex<Vec<u64>>,
 }
 
 impl BridgeMock {
@@ -45,6 +46,7 @@ impl BridgeMock {
             updates: Mutex::new(VecDeque::new()),
             sends: Mutex::new(VecDeque::new()),
             update_requests: Mutex::new(0),
+            since_rowids: Mutex::new(Vec::new()),
         })
     }
 
@@ -54,6 +56,10 @@ impl BridgeMock {
 
     fn update_requests(&self) -> u64 {
         *self.update_requests.lock().unwrap()
+    }
+
+    fn since_rowids(&self) -> Vec<u64> {
+        self.since_rowids.lock().unwrap().clone()
     }
 
     async fn serve(self: &Arc<Self>) -> String {
@@ -91,6 +97,7 @@ async fn updates_endpoint(
         .get("since_rowid")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    state.since_rowids.lock().unwrap().push(since);
     let scripted = state.updates.lock().unwrap().pop_front();
     let body = scripted.unwrap_or_else(|| {
         json!({
@@ -159,6 +166,28 @@ fn bridge_message(guid: &str) -> Value {
         "is_group": false,
         "is_reaction": false
     })
+}
+
+/// A row whose text renders one marker per attachment placeholder while
+/// only some of the attachments have landed (chat.db commits the joins one
+/// at a time; ADR-070).
+fn multi_attachment_message(guid: &str, text: &str, attachments: usize) -> Value {
+    let items: Vec<Value> = (0..attachments)
+        .map(|index| {
+            json!({
+                "attachment_id": format!("101:{index}"),
+                "filename": format!("IMG_000{index}.heic"),
+                "mime_type": "image/heic",
+                "transfer_name": format!("IMG_000{index}.heic"),
+                "total_bytes": 272_218u64,
+                "is_sticker": false
+            })
+        })
+        .collect();
+    let mut message = bridge_message(guid);
+    message["text"] = json!(text);
+    message["attachments"] = json!(items);
+    message
 }
 
 fn updates_with(message: &Value) -> Value {
@@ -434,6 +463,101 @@ async fn e2e_one_inbound_admits_exactly_once_across_replay_and_restart() {
         1,
         "a guid replayed after a real restart admits nothing new"
     );
+    child.kill().expect("kill serve");
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// L2: a row settles before it is admitted
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_multi_attachment_row_waits_for_its_late_attachments() {
+    force_no_proxy();
+    let dir = temp_dir("imessage-e2e-settle");
+    let mock = BridgeMock::new();
+    let bridge_url = mock.clone().serve().await;
+    let (router_base, _router) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            ScriptedResponse::Text("batch noted".into()),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+    let port = free_port().await;
+    let config = write_imessage_config(&dir, &router_base, &worker_base, &bridge_url, port);
+
+    // The first page renders three placeholders but carries one
+    // attachment; the second page (read after the cursor parked before
+    // the row) carries all three.
+    mock.push_updates(updates_with(&multi_attachment_message(
+        "G-MULTI-1",
+        "[image][attachment][attachment]",
+        1,
+    )));
+    mock.push_updates(updates_with(&multi_attachment_message(
+        "G-MULTI-1",
+        "[image][image][image]",
+        3,
+    )));
+
+    let mut child = spawn_kian_serve(&config, Some(TOKEN));
+    let read_only = open_read_only_when_ready(&dir).await;
+
+    // The unsettled row must not be admitted: the read position parks
+    // just before it, so the next page re-reads row 101.
+    within_fut(30, || {
+        let mock = mock.clone();
+        async move { mock.since_rowids().contains(&100).then_some(()) }
+    })
+    .await
+    .expect("the adapter parks its cursor before the settling row");
+
+    let events = within_fut(30, || {
+        let store = read_only.clone();
+        async move {
+            let events = match store.rebuild(router_session()).await {
+                Ok(events) => events,
+                Err(_) => return None,
+            };
+            (imessage_admits(&events).len() == 1).then_some(events)
+        }
+    })
+    .await
+    .expect("one imessage admission for the settled row");
+    let admitted = imessage_admits(&events)[0];
+    assert_eq!(
+        admitted.bytes.pointer("/content/kian/event_id"),
+        Some(&json!("G-MULTI-1")),
+    );
+    let attachments = admitted
+        .bytes
+        .pointer("/content/kian/raw/attachments")
+        .and_then(Value::as_array)
+        .expect("the admitted payload carries its attachments");
+    assert_eq!(
+        attachments.len(),
+        3,
+        "the row is admitted once, with every attachment chat.db committed"
+    );
+    assert_eq!(
+        admitted
+            .bytes
+            .pointer("/content/kian/raw/attachments/2/filename"),
+        Some(&json!("IMG_0002.heic")),
+    );
+
+    // After the admission the cursor moves past the row: no third read.
+    within_fut(30, || {
+        let mock = mock.clone();
+        async move { mock.since_rowids().contains(&101).then_some(()) }
+    })
+    .await
+    .expect("the cursor advances past the settled row");
     child.kill().expect("kill serve");
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);

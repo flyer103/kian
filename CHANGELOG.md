@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage: a multi-attachment row settles before it is admitted (ADR-070).** `chat.db` appends
+  one attachment join row at a time, so a scan that lands mid-commit used to admit a prefix and let
+  `guid` dedupe swallow the rest; the adapter now holds its read position just before an unsettled
+  row for at most five seconds and admits it whole. The per-row media cap rises to eight, and both an
+  expired wait and a truncation over the cap write an audit line instead of dropping silently.
 - **Self-evolution contract: a proposal pipeline, not an autonomous engineer
   (`design/SELF-EVOLUTION-MODEL.md`, ADR-069).** A self-dev run is an ordinary job run whose subject
   is a verified evidence pack: the trigger verifies before admitting and records the pack digests,

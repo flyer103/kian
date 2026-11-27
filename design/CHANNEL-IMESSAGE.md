@@ -365,6 +365,12 @@ instead of disappearing from a model's view.
   never empty for such a row, so the adapter's text admission (§4 rule 4) does not have to know
   about attachments.
 
+- A page can therefore show a row **mid-commit**: `chat.db` appends one `message_attachment_join`
+  row per attachment after the message row, so a scan that lands between two appends renders more
+  markers than `attachments[]` carries. The bridge neither waits nor repairs such a row (a blocking
+  read would stall the whole scan); the surplus is the adapter's signal that the row is unsettled
+  (§4, ADR-070).
+
 - The bridge does **not** apply the sender allowlist and does **not** drop on `is_from_me`,
   `is_group`, reactions or attachments. All policy lives in the adapter (§4) so the contract has one
   home and the L1 tests cover it; the bridge's only filters are `watch.participants` (§3.3, a
@@ -516,7 +522,7 @@ encodes a per-generation ROWID that must not become durable data. A row without 
 payload bytes exactly as before, so a text-only conversation is unaffected by the field's existence.
 
 With `attachments: bytes` and a `media:` section, the adapter additionally fetches the row's
-`image/*` and `audio/*` items — at most four, never a sticker — through `/v1/attachment` (carrying
+`image/*` and `audio/*` items — at most eight, never a sticker — through `/v1/attachment` (carrying
 the page's `generation`; an `image/*` item asks for `as=jpeg` because the provider rejects
 `image/heic` deterministically) and hands
 the edge the ADR-062 envelope `{"media": [{"kind", "media_type", "base64"}]}`; the edge stores each
@@ -528,6 +534,15 @@ fetch that fails without bytes leaves the metadata-only payload above and still 
 (ADR-065) the admitted content also carries a sibling `images` array of these artifact references,
 so a vision target reads the picture itself while the wrapper and this transcript line stay
 unchanged.
+
+A row whose text renders more attachment placeholders than the page delivered is **unsettled** and
+is not admitted: the adapter parks its in-memory read position immediately before that `rowid` and
+re-reads the page, so the row it eventually admits carries every attachment `chat.db` committed
+meanwhile (ADR-070). The hold is bounded — `ROW_SETTLE_WINDOW`, five seconds of polls — and a row
+that never settles is admitted with what arrived plus one audit line naming the placeholder and
+attachment counts, because a best-effort channel fails per row, never globally. A row carrying more
+media items than the eight-item cap is admitted with the first eight and one audit line naming the
+count and the cap: the rest stay on the Mac, visible in the log instead of silent.
 
 Drop rules — each produces `None` plus one audit line and a counter, never a synthesized event:
 
@@ -648,7 +663,7 @@ refuses startup (fail-closed), exactly like `KIAN_GITHUB_TOKEN`.
 | `wait_ms` | ≤ 25000 (the bridge's cap); 0 = short poll |
 | `send_timeout_ms` | > 0 |
 | `max_send_chars` | ≥ 100 (below 100 the split becomes absurd) |
-| `attachments` | `metadata` (default) or `bytes`; `bytes` refuses startup without a `media:` section (the edge is the only consumer of base64) and fetches only `image/*`/`audio/*` items, at most four and never a sticker (ADR-064) |
+| `attachments` | `metadata` (default) or `bytes`; `bytes` refuses startup without a `media:` section (the edge is the only consumer of base64) and fetches only `image/*`/`audio/*` items, at most eight and never a sticker, with an audit line when a row exceeds the cap (ADR-064, ADR-070) |
 | `voice` | `false` (default) or `true`; `true` refuses startup without a `media:` section **and** an `artifacts:` root (the edge synthesizes the utterance and the store serves the bytes) and mounts the `reply_voice` tool on this channel's assembly (ADR-067) |
 | token env | `KIAN_IMESSAGE_BRIDGE_TOKEN` required at assembly; absent/blank refuses serve startup |
 | cross-references | every `subscriptions[].channel`, `speak_rules[].channel`, `untrusted_channels[]` and `intake.thread_keys[].channel` naming this channel keeps validating |
@@ -717,6 +732,10 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
   its current process. **Kian persists no position table** — a client-side read position is
   pre-event durable state (constraint 1); the honest v1 bound is "exactly one admission per `guid`
   (idempotent replay), never two rows", plus the bridge's bounded catch-up.
+- **A settling row parks the read position.** While a multi-attachment row is mid-commit (§4), the
+  adapter passes `rowid - 1` instead of `next_rowid` for its next page, for at most
+  `ROW_SETTLE_WINDOW` (five seconds). Nothing was admitted, so the re-read costs latency only, and
+  the `guid` guard makes any duplicate read a no-op (ADR-070).
 - **Downtime bounds (honest).**
   - Adapter restart, bridge alive: `since_rowid: 0` → the bridge's tail replay (last
     `watch.catchup_rows` rows); no gap inside the window, duplicates absorbed by `guid` dedupe; older
@@ -750,6 +769,8 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
 | Messages signed out / not running | send failure (no health field can prove sign-in) | sends `not_started` → `DeliveryFailed` (retry-safe); receive silent; runbook has the `launchctl kickstart` recovery | this channel only |
 | `watch.overflow` | terminal notification | re-subscribe at `resume_after_rowid`, counter + audit; a duplicate is absorbed by `guid` dedupe | this channel only |
 | `chat.db` replaced/restored | generation change | reset cursors, audit, replay bounded; no merge claimed | this channel only |
+| Row still settling after `ROW_SETTLE_WINDOW` (an attachment join never arrives) | more markers than delivered attachments for five seconds of polls | admit the row with what arrived, one audit line naming the placeholder and attachment counts (ADR-070) | that row |
+| Row carries more media items than the eight-item cap | attachment count over `MAX_MEDIA_ITEMS_PER_ROW` | admit the row with the first eight, one audit line naming the count and the cap; the rest stay on the Mac (ADR-070) | that row |
 | Mac asleep / logged out | bridge unreachable (the whole Mac is down) | inbound delayed until wake; messages cached by iCloud are read then (UNVERIFIED, §13.3); sends return `Unavailable` → retried by the outbox | this channel only |
 | Send outcome uncertain (`may_have_completed` / `still_in_flight`) | disposition | `DeliveryFailed` with the disposition in the text; the outbox's retry is deduped by `client_id` when the bridge is alive; a bridge restart inside the window can duplicate (§13.6) | that delivery |
 | Send queue full (8) | bridge answers `bridge_busy` | `DeliveryFailed` (retry-safe, no wire traffic); the outbox retries with backoff | that delivery |

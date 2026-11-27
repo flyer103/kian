@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -152,7 +152,13 @@ impl ImessageAttachments {
 }
 
 /// How many attachments of one row the adapter hands the media edge.
-pub const MAX_MEDIA_ITEMS_PER_ROW: usize = 4;
+pub const MAX_MEDIA_ITEMS_PER_ROW: usize = 8;
+
+/// How long one row may hold the read position while `chat.db` commits the
+/// rest of its attachment join rows (ADR-070). Long enough for a phone to
+/// finish copying a burst, short enough that a row whose attachment never
+/// arrives cannot stall the channel.
+pub const ROW_SETTLE_WINDOW: Duration = Duration::from_secs(5);
 
 /// The largest single attachment the adapter fetches (the bridge's own
 /// default cap; a bigger item is skipped before the request).
@@ -426,6 +432,7 @@ impl ImessageChannel {
         // 0 = the bridge's bounded tail replay on startup only (§9).
         let mut cursor: u64 = 0;
         let mut generation = String::new();
+        let mut settle = SettleHold::default();
         let mut backoff = Backoff::new(DEFAULT_BACKOFF_START, DEFAULT_BACKOFF_CAP);
         loop {
             if *shutdown.borrow() {
@@ -470,18 +477,15 @@ impl ImessageChannel {
                         );
                     }
                     generation = batch.generation.clone();
-                    // Advance the cursor before any early return: a page
-                    // the adapter will drop (or a generation reset) must
-                    // still move the read position forward, never re-read
-                    // the same rows forever.
-                    cursor = cursor.max(batch.next_rowid);
                     if batch.messages.is_empty() {
+                        cursor = cursor.max(batch.next_rowid);
                         if !sleep_or_shutdown(inner.config.poll_interval, &mut shutdown).await {
                             break;
                         }
                         continue;
                     }
                     let received_at = now_ms();
+                    let mut held: Option<u64> = None;
                     for message in &batch.messages {
                         if let Some(guid) = own_echo(&inner, &message.guid) {
                             warn!(
@@ -494,6 +498,39 @@ impl ImessageChannel {
                         }
                         match map_message(&inner.name, &inner.config.topics, message, received_at) {
                             Mapping::Event(mut event) => {
+                                let pending = pending_placeholders(message);
+                                if pending == 0 {
+                                    settle.clear();
+                                } else {
+                                    match settle.decide(message.rowid, Instant::now()) {
+                                        Settle::Hold { first } => {
+                                            if first {
+                                                warn!(
+                                                    target: "kian::imessage_channel",
+                                                    channel = %inner.name,
+                                                    rowid = message.rowid,
+                                                    guid = %message.guid,
+                                                    placeholders = pending + message.attachments.len(),
+                                                    attachments = message.attachments.len(),
+                                                    window_ms = ROW_SETTLE_WINDOW.as_millis() as u64,
+                                                    "imessage audit: inbound row is still settling; waiting for the rest of its attachments (ADR-070)"
+                                                );
+                                            }
+                                            held = Some(message.rowid);
+                                            break;
+                                        }
+                                        Settle::Admit => warn!(
+                                            target: "kian::imessage_channel",
+                                            channel = %inner.name,
+                                            rowid = message.rowid,
+                                            guid = %message.guid,
+                                            placeholders = pending + message.attachments.len(),
+                                            attachments = message.attachments.len(),
+                                            window_ms = ROW_SETTLE_WINDOW.as_millis() as u64,
+                                            "imessage audit: the settle window elapsed; admitting the row with the attachments that did arrive (ADR-070)"
+                                        ),
+                                    }
+                                }
                                 if inner.config.attachments == ImessageAttachments::Bytes {
                                     attach_media(&inner, message, &batch.generation, &mut event)
                                         .await;
@@ -516,7 +553,16 @@ impl ImessageChannel {
                             }
                         }
                     }
-                    if !batch.has_more
+                    // A row that is still settling parks the read position
+                    // just before itself (ADR-070): the next page re-reads it
+                    // together with whatever `chat.db` committed meanwhile.
+                    // Every other page advances to its exclusive cursor, so a
+                    // dropped row is never re-read forever.
+                    cursor = match held {
+                        Some(rowid) => cursor.max(rowid.saturating_sub(1)),
+                        None => cursor.max(batch.next_rowid),
+                    };
+                    if (held.is_some() || !batch.has_more)
                         && !sleep_or_shutdown(inner.config.poll_interval, &mut shutdown).await
                     {
                         break;
@@ -1145,6 +1191,59 @@ pub fn split_text(text: &str, limit_chars: usize) -> Vec<String> {
 // Shared plumbing (the wechat pattern)
 // ---------------------------------------------------------------------------
 
+/// How many of a row's attachment placeholders are still missing. The
+/// bridge renders one `[image]`/`[attachment]` marker per placeholder
+/// (CHANNEL-IMESSAGE §3.2), so more markers than delivered attachments
+/// means `chat.db` has not committed the whole row yet (ADR-070).
+fn pending_placeholders(message: &BridgeMessage) -> usize {
+    let Some(text) = message.text.as_deref() else {
+        return 0;
+    };
+    let markers = text.matches("[image]").count() + text.matches("[attachment]").count();
+    markers.saturating_sub(message.attachments.len())
+}
+
+/// Bounded head-of-line wait: one row may hold the read position until its
+/// attachments land, never longer than [`ROW_SETTLE_WINDOW`] (ADR-070).
+#[derive(Debug, Default)]
+struct SettleHold {
+    rowid: Option<u64>,
+    since: Option<Instant>,
+}
+
+enum Settle {
+    /// Wait is over: admit the row with what arrived.
+    Admit,
+    /// Park the read position before the row; `first` marks the entry into
+    /// the wait so the audit line is written once per row.
+    Hold { first: bool },
+}
+
+impl SettleHold {
+    fn clear(&mut self) {
+        self.rowid = None;
+        self.since = None;
+    }
+
+    fn decide(&mut self, rowid: u64, now: Instant) -> Settle {
+        match (self.rowid, self.since) {
+            (Some(held), Some(since)) if held == rowid => {
+                if now.duration_since(since) >= ROW_SETTLE_WINDOW {
+                    self.clear();
+                    Settle::Admit
+                } else {
+                    Settle::Hold { first: false }
+                }
+            }
+            _ => {
+                self.rowid = Some(rowid);
+                self.since = Some(now);
+                Settle::Hold { first: true }
+            }
+        }
+    }
+}
+
 /// ADR-064: hand the media edge the ADR-062 `media` envelope for the
 /// row's image/audio items. Every failure is one audit line for one
 /// item — the row is still admitted with its metadata, never dropped and
@@ -1156,12 +1255,23 @@ async fn attach_media(
     event: &mut ChannelEvent,
 ) {
     let mut items = Vec::new();
-    for attachment in message
+    let media: Vec<&BridgeAttachment> = message
         .attachments
         .iter()
         .filter(|attachment| attachment.media_kind().is_some())
-        .take(MAX_MEDIA_ITEMS_PER_ROW)
-    {
+        .collect();
+    if media.len() > MAX_MEDIA_ITEMS_PER_ROW {
+        warn!(
+            target: "kian::imessage_channel",
+            channel = %inner.name,
+            rowid = message.rowid,
+            guid = %message.guid,
+            media_items = media.len(),
+            limit = MAX_MEDIA_ITEMS_PER_ROW,
+            "imessage audit: the row carries more media items than the adapter fetches; the rest stay on the Mac"
+        );
+    }
+    for attachment in media.into_iter().take(MAX_MEDIA_ITEMS_PER_ROW) {
         let Some(id) = attachment.attachment_id.as_deref() else {
             continue;
         };
@@ -1657,6 +1767,90 @@ mod tests {
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"heic-bytes"), "aGVpYy1ieXRlcw==");
         assert_eq!(base64_encode(&[0xff, 0x00, 0x7f]), "/wB/");
+    }
+
+    fn media_attachment(name: &str, mime: &str) -> BridgeAttachment {
+        BridgeAttachment {
+            attachment_id: Some(format!("42:{name}")),
+            filename: Some(name.to_string()),
+            mime_type: Some(mime.to_string()),
+            transfer_name: Some(name.to_string()),
+            total_bytes: Some(2_345_678),
+            is_sticker: false,
+        }
+    }
+
+    #[test]
+    fn a_surplus_of_markers_means_the_row_is_not_settled_yet() {
+        let mut photo = message("g-photo");
+        photo.text = Some("[image][attachment][attachment]".into());
+        photo.attachments = vec![media_attachment("IMG_0001.heic", "image/heic")];
+        assert_eq!(pending_placeholders(&photo), 2);
+
+        photo
+            .attachments
+            .push(media_attachment("IMG_0002.heic", "image/heic"));
+        photo
+            .attachments
+            .push(media_attachment("IMG_0003.mov", "video/mp4"));
+        assert_eq!(
+            pending_placeholders(&photo),
+            0,
+            "a complete row renders as many markers as it delivered"
+        );
+
+        photo.text = None;
+        assert_eq!(pending_placeholders(&photo), 0);
+        photo.text = Some("no markers at all".into());
+        assert_eq!(pending_placeholders(&photo), 0);
+    }
+
+    #[test]
+    fn a_settling_row_holds_the_read_position_for_a_bounded_window() {
+        let mut hold = SettleHold::default();
+        let start = Instant::now();
+        assert!(matches!(
+            hold.decide(42, start),
+            Settle::Hold { first: true }
+        ));
+        assert!(matches!(
+            hold.decide(42, start + ROW_SETTLE_WINDOW / 2),
+            Settle::Hold { first: false }
+        ));
+        assert!(matches!(
+            hold.decide(42, start + ROW_SETTLE_WINDOW),
+            Settle::Admit
+        ));
+        assert!(
+            matches!(
+                hold.decide(42, start + ROW_SETTLE_WINDOW),
+                Settle::Hold { first: true }
+            ),
+            "the window restarts once the row was admitted"
+        );
+    }
+
+    #[test]
+    fn a_new_row_restarts_the_settle_window_and_clear_releases_it() {
+        let mut hold = SettleHold::default();
+        let start = Instant::now();
+        assert!(matches!(
+            hold.decide(42, start),
+            Settle::Hold { first: true }
+        ));
+        assert!(matches!(
+            hold.decide(43, start + Duration::from_secs(4)),
+            Settle::Hold { first: true }
+        ));
+        assert!(matches!(
+            hold.decide(43, start + Duration::from_secs(5)),
+            Settle::Hold { first: false }
+        ));
+        hold.clear();
+        assert!(matches!(
+            hold.decide(43, start + Duration::from_secs(9)),
+            Settle::Hold { first: true }
+        ));
     }
 
     #[test]
