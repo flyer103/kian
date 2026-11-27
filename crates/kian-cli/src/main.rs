@@ -151,8 +151,9 @@ const USAGE: &str = "usage:
                                          declared jobs: steps, plan digest, triggers, alerts
   kian job status <run|job> [--config <path>] [--json]
                                          a run's steps and attempts, or a job's recent firings
-  kian job run <job> [--slot <token>] [--config <path>] [--json]
-                                         admit one manual run (a fresh manual:<token> slot by default)
+  kian job run <job> [--pack <dir>] [--base <commit>] [--force] [--slot <token>] [--config <path>] [--json]
+                                         admit one manual run (a fresh manual:<token> slot by default);
+                                         --pack hands a self-dev job its verified pack, --force overrides the breaker
   kian job cancel <run> [--config <path>] [--json]
                                          ask the run's conductor to end the run cancelled
   kian --version                        print the version

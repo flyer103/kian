@@ -355,6 +355,17 @@ async fn tick(port: &Arc<dyn RunPort>, deps: &JobDeps) -> Tick {
     };
     let plan = &marker.plan;
 
+    if plan.declares_surface() && marker.selfdev.is_none() {
+        return finish_invalid_input(
+            port,
+            status::MarkerError::Malformed(
+                "selfdev job requires an evidence pack: the plan declares patch_paths_allowed and the marker carries no selfdev value"
+                    .to_string(),
+            ),
+        )
+        .await;
+    }
+
     if let Some(verdict) = status::run_verdict(&events) {
         let (failed_step, reason) = run_failure(&verdict.payload);
         admit_alerts(
@@ -830,12 +841,56 @@ fn extra_check(
                 detail: receipt.map(|event| format!("receipt at seq {}", event.seq)),
             }
         }
+        JobCheck::PatchPathsAllowed {
+            artifact,
+            allow,
+            deny,
+        } => {
+            let (passed, detail) = match produced_artifact(events, artifact) {
+                None => (
+                    false,
+                    format!("artifact {artifact} was not produced, so no paths can be read"),
+                ),
+                Some(value) => match artifact_text(events, artifact, value) {
+                    Err(reason) => (false, reason),
+                    Ok(diff) => {
+                        let verdict = crate::job::surface::check_surface(&diff, allow, deny);
+                        (verdict.passed, verdict.detail)
+                    }
+                },
+            };
+            CheckOutcome {
+                name: check.name().to_string(),
+                passed,
+                detail: Some(detail),
+            }
+        }
         _ => CheckOutcome {
             name: check.name().to_string(),
             passed: false,
             detail: Some("the check is not evaluable by the conductor".to_string()),
         },
     }
+}
+
+/// The text an artifact reference points at, read from the same child stream:
+/// the ref names a seq and that event carries the bytes the producer sent
+/// (§12.1). The gate runs before the harvest, so this reads the child stream,
+/// never the run stream's refs.
+fn artifact_text(events: &[Event], name: &str, artifact: &Value) -> Result<String, String> {
+    let seq = artifact
+        .get("ref")
+        .and_then(|reference| reference.get("seq"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("artifact {name} carries no ref, so its bytes cannot be read"))?;
+    let event = events
+        .iter()
+        .find(|event| event.seq == seq)
+        .ok_or_else(|| {
+            format!("artifact {name} points at seq {seq}, which is not on this stream")
+        })?;
+    message_text(event)
+        .ok_or_else(|| format!("artifact {name} points at seq {seq}, which is not a text message"))
 }
 
 /// The artifact a stream reports under the given name, if any (§12.1). A child
@@ -1444,6 +1499,11 @@ async fn child_task_text(
         marker.plan_digest,
         step.digest()
     );
+    if let Some(selfdev) = &marker.selfdev {
+        text.push_str("selfdev=");
+        text.push_str(&crate::job::plan::canonical_json(selfdev));
+        text.push('\n');
+    }
     if let Some(prompt) = &step.prompt {
         text.push('\n');
         text.push_str(prompt);
@@ -1882,6 +1942,96 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_check_reads_the_patch_artifact_text() {
+        let plan = plan();
+        let fetch = plan.step("fetch").expect("the fetch step");
+        let mut patched = fetch.clone();
+        patched.verify = vec![crate::job::plan::JobCheck::PatchPathsAllowed {
+            artifact: "raw".to_string(),
+            allow: vec!["crates/**".to_string()],
+            deny: vec!["design/decisions/**".to_string()],
+        }];
+        let stream = |diff: &str| {
+            vec![
+                event(3, EventKind::AssistantMessage, json!({"content": diff})),
+                event(
+                    4,
+                    EventKind::ToolCall,
+                    json!({
+                        "tool": status::ARTIFACT_TOOL,
+                        "call_id": "job:artifact:fetch:1",
+                        "args": {"artifact": {
+                            "step": "fetch",
+                            "name": "raw",
+                            "media": "text",
+                            "bytes": diff.len(),
+                            "sha256": "sha256:00",
+                            "ref": {"session": Uuid::from_u128(1).to_string(), "seq": 3},
+                        }},
+                    }),
+                ),
+            ]
+        };
+        let inside = "--- a/crates/kian-cli/src/lib.rs\n+++ b/crates/kian-cli/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let (specs, extra) = declared_checks(&patched, &stream(inside));
+        assert!(specs.is_empty(), "patch_paths_allowed is a job-owned check");
+        assert!(extra[0].passed, "{:?}", extra[0].detail);
+
+        let denied = "--- a/design/decisions/ADR-069-x.md\n+++ b/design/decisions/ADR-069-x.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let (_, extra) = declared_checks(&patched, &stream(denied));
+        assert!(!extra[0].passed);
+        assert!(
+            extra[0]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("denied: "),
+            "{:?}",
+            extra[0].detail
+        );
+
+        let (_, extra) = declared_checks(&patched, &[]);
+        assert!(!extra[0].passed);
+        assert!(
+            extra[0]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("was not produced"),
+            "{:?}",
+            extra[0].detail
+        );
+
+        let orphan = vec![event(
+            4,
+            EventKind::ToolCall,
+            json!({
+                "tool": status::ARTIFACT_TOOL,
+                "call_id": "job:artifact:fetch:1",
+                "args": {"artifact": {
+                    "step": "fetch",
+                    "name": "raw",
+                    "media": "text",
+                    "bytes": 10,
+                    "sha256": "sha256:00",
+                    "ref": {"session": Uuid::from_u128(1).to_string(), "seq": 3},
+                }},
+            }),
+        )];
+        let (_, extra) = declared_checks(&patched, &orphan);
+        assert!(!extra[0].passed);
+        assert!(
+            extra[0]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("not on this stream"),
+            "{:?}",
+            extra[0].detail
+        );
+    }
+
+    #[test]
     fn an_artifact_cap_check_reads_the_reported_size() {
         let plan = plan();
         let fetch = plan.step("fetch").expect("the fetch step");
@@ -1951,6 +2101,7 @@ mod tests {
             trigger: "cron".to_string(),
             plan_digest: plan.digest(),
             plan: plan.clone(),
+            selfdev: None,
         };
         let first = format!(
             "[kian-job] run={} job={} step={} attempt={}\nplan={}\nstep_digest={}\n",

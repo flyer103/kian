@@ -169,7 +169,7 @@ when the owner asks. Negative results commit documentation only — never broken
   starts here**; triggers stay in CRON-MODEL, binding in WORKER-MODEL, kinds in EVENT-MODEL, wire
   shapes in API-CONTRACT.
 - `design/SELF-EVOLUTION-MODEL.md` — the normative self-evolution contract (source of truth,
-  phase S1 specified, not implemented): a self-dev run as an ordinary job run over a verified
+  phase S1 landed, S2/S3 not): a self-dev run as an ordinary job run over a verified
   evidence pack, the proposal plan and its patch artifact, the `patch_paths_allowed` denial surface
   frozen in the plan, the S1 propose / S2 publish / S3 land authority ladder, write isolation by
   derivation, the `consecutive_failures` breaker, the digest audit chain and the additive surface

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use kian_core::model::InputRow;
 use kian_store::EventStore;
-use kian_superagent::job::{plan, status};
+use kian_superagent::job::{outcome::RunOutcome, plan, status};
 use serde_json::{Value, json};
 
 /// How many firings `status <job>` shows per trigger.
@@ -24,6 +24,14 @@ pub const DEFAULT_FIRINGS: u64 = 5;
 /// content is this word as a cancel request (§5.4); any other message is an
 /// operator note that mutates nothing.
 pub const CANCEL_CONTENT: &str = "cancel";
+
+/// The whole-job.selfdev bound (4.2): an over-long value is an admission
+/// refusal, never a truncation.
+pub const MAX_SELFDEV_BYTES: usize = 4096;
+
+/// The job.selfdev.pack.dir bound (4.2). The directory is a reference, so
+/// this is the only place its length is bounded.
+pub const MAX_SELFDEV_DIR_BYTES: usize = 1024;
 
 /// One `kian job` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,12 +52,19 @@ pub enum JobCommand {
         /// Machine-readable output.
         json: bool,
     },
-    /// `kian job run <job> [--slot <token>] [--config <path>] [--json]`
+    /// `kian job run <job> [--pack <dir>] [--base <commit>] [--slot <token>] [--force] [--config <path>] [--json]`
     Run {
         /// The declared job id.
         job: String,
         /// The slot token; defaults to a fresh `manual:<token>`.
         slot: Option<String>,
+        /// The evidence pack a self-dev job admits as its symptom (4.1).
+        pack: Option<PathBuf>,
+        /// The base commit, when the pack was taken outside a git checkout.
+        base: Option<String>,
+        /// Admit one run even when the consecutive-failure breaker is open
+        /// (10.2).
+        force: bool,
         /// The serve config.
         config: PathBuf,
         /// Machine-readable output.
@@ -109,9 +124,7 @@ pub fn run(args: &[String]) -> Result<String, JobCliError> {
         .enable_all()
         .build()
         .map_err(|error| refused(format!("tokio runtime: {error}")))?;
-    runtime
-        .block_on(execute(&command))
-        .map_err(JobCliError::Refused)
+    runtime.block_on(execute(&command))
 }
 
 /// `kian job <subcommand> ...` (the argv after the verb group).
@@ -159,12 +172,18 @@ fn list_args(rest: &[String]) -> Result<JobCommand, JobCliError> {
 fn run_args(rest: &[String]) -> Result<JobCommand, JobCliError> {
     let mut job: Option<String> = None;
     let mut slot: Option<String> = None;
+    let mut pack: Option<PathBuf> = None;
+    let mut base: Option<String> = None;
+    let mut force = false;
     let mut config = default_config();
     let mut json = false;
     let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--slot" => slot = Some(next_value(&mut iter, "--slot")?.to_string()),
+            "--pack" => pack = Some(PathBuf::from(next_value(&mut iter, "--pack")?)),
+            "--base" => base = Some(next_value(&mut iter, "--base")?.to_string()),
+            "--force" => force = true,
             "--config" => config = PathBuf::from(next_value(&mut iter, "--config")?),
             "--json" => json = true,
             other if other.starts_with("--") => {
@@ -183,6 +202,9 @@ fn run_args(rest: &[String]) -> Result<JobCommand, JobCliError> {
     Ok(JobCommand::Run {
         job,
         slot,
+        pack,
+        base,
+        force,
         config,
         json,
     })
@@ -229,22 +251,40 @@ fn positional_and_flags(
     Ok((positional, config, json))
 }
 
-/// Executes one command.
-pub async fn execute(command: &JobCommand) -> Result<String, String> {
+/// Executes one command. A usage error (exit 2) is distinct from a refusal
+/// (exit 1): the verbs that can refuse before writing anything - an
+/// unverified evidence pack, an open breaker - say so with the argv's code.
+pub async fn execute(command: &JobCommand) -> Result<String, JobCliError> {
     match command {
-        JobCommand::List { config, json } => list(config, *json).await,
+        JobCommand::List { config, json } => list(config, *json).await.map_err(refused),
         JobCommand::Status {
             target,
             config,
             json,
-        } => status_command(target, config, *json).await,
+        } => status_command(target, config, *json).await.map_err(refused),
         JobCommand::Run {
             job,
             slot,
+            pack,
+            base,
+            force,
             config,
             json,
-        } => run_job(job, slot.as_deref(), config, *json).await,
-        JobCommand::Cancel { run, config, json } => cancel(run, config, *json).await,
+        } => {
+            run_job(
+                job,
+                slot.as_deref(),
+                config,
+                *json,
+                pack.as_deref(),
+                base.as_deref(),
+                *force,
+            )
+            .await
+        }
+        JobCommand::Cancel { run, config, json } => {
+            cancel(run, config, *json).await.map_err(refused)
+        }
     }
 }
 
@@ -648,27 +688,86 @@ async fn run_job(
     slot: Option<&str>,
     path: &Path,
     json_output: bool,
-) -> Result<String, String> {
-    let config = load_config(path)?;
-    let (_schedules, catalog) = resolved(&config)?;
+    pack: Option<&Path>,
+    base: Option<&str>,
+    force: bool,
+) -> Result<String, JobCliError> {
+    let config = load_config(path).map_err(refused)?;
+    let (_schedules, catalog) = resolved(&config).map_err(refused)?;
     let Some(job) = catalog.job(job_id) else {
-        return Err(unknown_job(&catalog, job_id));
+        return Err(refused(unknown_job(&catalog, job_id)));
     };
     let slot = match slot {
         Some(slot) => slot.to_string(),
         None => manual_slot(),
     };
     if slot.trim().is_empty() {
-        return Err("--slot must be a non-empty token".to_string());
+        return Err(usage("--slot must be a non-empty token"));
     }
+    // V24: a plan that declares the surface cannot be admitted without a
+    // symptom, and a plan that declares nothing takes no pack (14).
+    let verified = match (job.plan.declares_surface(), pack) {
+        (true, Some(dir)) => Some(admission_selfdev(dir, base)?),
+        (true, None) => {
+            return Err(usage(format!(
+                "selfdev job requires an evidence pack: job {job_id} declares patch_paths_allowed (kian job run {job_id} --pack <dir>)"
+            )));
+        }
+        (false, Some(_)) => {
+            return Err(usage(format!(
+                "job {job_id} declares no patch_paths_allowed check, so it takes no --pack"
+            )));
+        }
+        (false, None) => {
+            if base.is_some() {
+                return Err(usage("--base needs --pack <dir>"));
+            }
+            None
+        }
+    };
     let session = plan::run_session(job_id, &slot);
     let run = plan::run_id(job_id, &slot);
     let content =
         crate::job_config::admission_content(job_id, &slot, crate::job_config::TRIGGER_MANUAL);
-    let marker =
-        status::marker_payload(job_id, &slot, crate::job_config::TRIGGER_MANUAL, &job.plan);
     let key = plan::run_input_key(&run);
-    let store = open_store(&config, false).await?;
+    let store = open_store(&config, false).await.map_err(refused)?;
+    // (10.2) the breaker is a trigger rule: it reads the last N settled runs
+    // of this job through the operator projection and refuses before any row
+    // exists, so an open circuit writes nothing.
+    let streak = job.plan.limits.consecutive_failures;
+    let circuit_open = if streak > 0 {
+        match recent_run_outcomes(&store, job_id, streak).await {
+            Ok(recent) => breaker_tripped(&recent, streak),
+            Err(error) => {
+                store.close().await;
+                return Err(refused(error));
+            }
+        }
+    } else {
+        false
+    };
+    if circuit_open && !force {
+        store.close().await;
+        return Err(usage(format!(
+            "selfdev_circuit_open: the last {streak} settled run(s) of {job_id} failed - no run was admitted (--force admits one run and records the override)"
+        )));
+    }
+    let selfdev = verified.map(|mut value| {
+        if force
+            && circuit_open
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("circuit_overridden".to_string(), json!(true));
+        }
+        value
+    });
+    let marker = status::marker_payload_with_selfdev(
+        job_id,
+        &slot,
+        crate::job_config::TRIGGER_MANUAL,
+        &job.plan,
+        selfdev,
+    );
     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     let admitted = store
         .admit(InputRow {
@@ -680,7 +779,7 @@ async fn run_job(
             idempotency_key: Some(key),
         })
         .await
-        .map_err(|error| format!("admit run {run}: {error}"))?;
+        .map_err(|error| refused(format!("admit run {run}: {error}")))?;
     store.close().await;
     if json_output {
         return serde_json::to_string_pretty(&json!({
@@ -693,13 +792,103 @@ async fn run_job(
             "deduplicated": admitted.deduplicated,
             "note": MANUAL_NOTE,
         }))
-        .map_err(|error| error.to_string());
+        .map_err(|error| refused(error.to_string()));
     }
     Ok(format!(
-        "run={run}\njob={}\nslot={slot}\nsession={}\nplan={}\nstate=admitted\n\
-         deduplicated={}\nnote={MANUAL_NOTE}\n",
+        "run={run}\njob={}\nslot={slot}\nsession={}\nplan={}\nstate=admitted\ndeduplicated={}\nnote={MANUAL_NOTE}\n",
         job.id, session.0, job.digest, admitted.deduplicated
     ))
+}
+
+/// The frozen selfdev value an admitted row carries (4.2), built from facts
+/// the trigger re-derived rather than from the command line.
+fn admission_selfdev(dir: &Path, base: Option<&str>) -> Result<Value, JobCliError> {
+    let dir_text = dir.to_string_lossy().to_string();
+    if dir_text.len() > MAX_SELFDEV_DIR_BYTES {
+        return Err(pack_refusal(format!(
+            "pack dir is {} bytes (the bound is {MAX_SELFDEV_DIR_BYTES})",
+            dir_text.len()
+        )));
+    }
+    let manifest = crate::self_evidence::verify_pack(dir).map_err(pack_refusal)?;
+    let manifest_bytes = std::fs::read(dir.join("manifest.json"))
+        .map_err(|error| pack_refusal(format!("read manifest.json: {error}")))?;
+    let manifest_sha256 = crate::archive::sha256_hex(&manifest_bytes);
+    let base_commit = base
+        .map(str::to_string)
+        .or_else(|| manifest.repo.commit.clone())
+        .ok_or_else(|| {
+            pack_refusal(
+                "repo.json carries no commit (the pack was taken outside a git checkout) and --base was not given",
+            )
+        })?;
+    let value = json!({
+        "pack": {
+            "dir": dir_text,
+            "manifest_sha256": format!("sha256:{manifest_sha256}"),
+            "files_sha256": format!("sha256:{}", manifest.files_sha256),
+        },
+        "base_commit": base_commit,
+        "kian_version": env!("CARGO_PKG_VERSION"),
+    });
+    let len = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
+    if len > MAX_SELFDEV_BYTES {
+        return Err(pack_refusal(format!(
+            "job.selfdev is {len} bytes (the bound is {MAX_SELFDEV_BYTES})"
+        )));
+    }
+    Ok(value)
+}
+
+/// V26's refusal shape: an unverified pack is the whole message.
+fn pack_refusal(reason: impl std::fmt::Display) -> JobCliError {
+    usage(format!("evidence pack does not verify: {reason}"))
+}
+
+/// The breaker predicate (10.2), newest first: a full streak of settled
+/// failed runs. Unverified and cancelled say something about a run, not
+/// about a broken job, so neither extends the streak.
+fn breaker_tripped(recent: &[RunOutcome], streak: u32) -> bool {
+    let streak = usize::try_from(streak).unwrap_or(usize::MAX);
+    streak > 0
+        && recent.len() >= streak
+        && recent[..streak]
+            .iter()
+            .all(|outcome| *outcome == RunOutcome::Failed)
+}
+
+/// The last N settled runs of one job, newest first, through the projection
+/// the operator surface reads: a run is a session, its job identity is the
+/// marked input row, and its outcome is the run verdict (11.1).
+async fn recent_run_outcomes(
+    store: &EventStore,
+    job_id: &str,
+    limit: u32,
+) -> Result<Vec<RunOutcome>, String> {
+    let sessions = crate::cache_metrics::sessions_with_events(store)
+        .await
+        .map_err(|error| format!("sessions: {error}"))?;
+    let mut settled: Vec<(u64, RunOutcome)> = Vec::new();
+    for session in sessions {
+        let events = store
+            .rebuild(session)
+            .await
+            .map_err(|error| format!("session {}: {error}", session.0))?;
+        let Some(Ok(found)) = status::marker(&events) else {
+            continue;
+        };
+        if found.job_id != job_id {
+            continue;
+        }
+        let Some(verdict) = status::run_verdict(&events) else {
+            continue;
+        };
+        settled.push((verdict.at_ms, verdict.outcome));
+    }
+    settled.sort_by_key(|settled| std::cmp::Reverse(settled.0));
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    settled.truncate(limit);
+    Ok(settled.into_iter().map(|(_, outcome)| outcome).collect())
 }
 
 async fn cancel(run: &str, path: &Path, json_output: bool) -> Result<String, String> {
@@ -954,6 +1143,9 @@ superagent:
             JobCommand::Run {
                 job: "digest".to_string(),
                 slot: Some("manual:ABC".to_string()),
+                pack: None,
+                base: None,
+                force: false,
                 config: PathBuf::from("kian.yaml"),
                 json: false,
             }
@@ -973,6 +1165,78 @@ superagent:
             ]),
             Err(JobCliError::Usage(_))
         ));
+    }
+
+    #[test]
+    fn parse_run_carries_the_evidence_pack_flags() {
+        assert_eq!(
+            parse_args(&[
+                "run".to_string(),
+                "self-dev".to_string(),
+                "--pack".to_string(),
+                "/tmp/pack".to_string(),
+                "--base".to_string(),
+                "9f3c".to_string(),
+                "--force".to_string(),
+            ])
+            .expect("run with a pack"),
+            JobCommand::Run {
+                job: "self-dev".to_string(),
+                slot: None,
+                pack: Some(PathBuf::from("/tmp/pack")),
+                base: Some("9f3c".to_string()),
+                force: true,
+                config: PathBuf::from("kian.yaml"),
+                json: false,
+            }
+        );
+        assert!(matches!(
+            parse_args(&[
+                "run".to_string(),
+                "digest".to_string(),
+                "--pack".to_string()
+            ]),
+            Err(JobCliError::Usage(_))
+        ));
+        assert!(matches!(
+            parse_args(&[
+                "run".to_string(),
+                "digest".to_string(),
+                "--base".to_string()
+            ]),
+            Err(JobCliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn the_breaker_needs_a_full_streak_of_failed_runs() {
+        use RunOutcome::{Cancelled, Failed, Succeeded, Unverified};
+        assert!(breaker_tripped(&[Failed, Failed, Failed], 3));
+        assert!(breaker_tripped(&[Failed, Failed, Failed, Succeeded], 3));
+        assert!(breaker_tripped(&[Failed], 1));
+        assert!(!breaker_tripped(&[Failed, Failed], 3));
+        assert!(!breaker_tripped(&[Failed, Succeeded, Failed], 3));
+        assert!(!breaker_tripped(&[Failed, Unverified, Failed], 3));
+        assert!(!breaker_tripped(&[Failed, Cancelled, Failed], 3));
+        assert!(!breaker_tripped(&[Failed, Failed, Failed], 0));
+    }
+
+    #[test]
+    fn a_base_commit_needs_a_pack() {
+        let temp = Temp::new("selfdev-base-without-pack");
+        let config = write_config(temp.path(), &temp.path().join("kian.sqlite"));
+        let error = block_on(run_job(
+            "digest",
+            Some("manual:ABC"),
+            &config,
+            false,
+            None,
+            Some("9f3c"),
+            false,
+        ))
+        .expect_err("a base commit is a claim about a pack");
+        assert!(matches!(error, JobCliError::Usage(_)), "{error:?}");
+        assert!(error.message().contains("--base needs --pack"), "{error:?}");
     }
 
     #[test]
