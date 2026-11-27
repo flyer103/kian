@@ -646,7 +646,7 @@ because no cursor belongs to a plan.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `id` | string | — | Step identity inside the plan; also the artifact namespace and the `gate` suffix. |
-| `action` | `agent` \| `deliver` | `agent` | `agent`: a child session bound to a worker. `deliver`: an in-conductor channel action (§13). P3 adds `exec` (a bare endpoint command, no model). |
+| `action` | `agent` \| `deliver` \| `publish` | `agent` | `agent`: a child session bound to a worker. `deliver`: an in-conductor channel action (§13.2). `publish`: an in-conductor publish action (§13.5, [SELF-EVOLUTION-MODEL.md](SELF-EVOLUTION-MODEL.md) §9.4). |
 | `prompt` | string | — | Required for `agent`. The task message, verbatim, plus the frozen inputs. |
 | `requires` | string[] | `[]` | Capability names the worker must declare (`crates/kian-core/src/worker.rs:13-33`: ≤16, ≤64 bytes, `[a-z0-9]` first then `[a-z0-9._-]`). `[]` = any worker. |
 | `pin` | string | absent | Exact worker id; when present, `requires` must be a subset of that worker's declared capabilities (V6). Named `pin` to match the existing `exec_worker` verb. |
@@ -668,6 +668,13 @@ because no cursor belongs to a plan.
 `CronTarget`/`ChannelDelivery` target shape), `content` (`{text}` or `{from_artifact: {step,
 name}}`, exactly one). They have no `requires`, no `pin`, no `retries` of their own (retry is the
 outbox's bounded retry, reused as §13.3 describes), and no `output_schema`.
+
+`publish` steps use instead: `publish` (`{base?, gates?, push?, pull_request?}`, all defaulted),
+exactly one `inputs` entry naming the artifact to publish, `effect: write`, `retries: 0`, and none of
+`prompt`, `requires`, `pin`, `prefer`, `allow_offline`, `produces`, `channel`, `target` or
+`content`. They run in the conductor's own drain (§13.5); the sequence and its receipt belong to
+[SELF-EVOLUTION-MODEL.md](SELF-EVOLUTION-MODEL.md) §9.4, and the validation rules to its §14
+(V27–V32).
 
 ### 7.3 Canonicalisation and the digest
 
@@ -705,7 +712,7 @@ stated. `deny_unknown_fields` on every struct, matching `CronSection`.
 | V13 | Every trigger's `job` exists; `catch_up` and `overlap` are the cron contract's values | `unknown job` |
 | V14 | Every step reachable from a root (no orphan subgraph) | `unreachable step` |
 | V15 | Every `id` has at most one trigger with `overlap: skip` and `max_concurrent == 1` (cron's defaults); explicit overrides allowed only where CRON-MODEL allows | `overlap policy unsupported` |
-| V16 | `deliver` steps: `channel`, `target` and `content` present, `content` exactly one of `{text}` / `{from_artifact}`; no `requires`/`pin`/`retries`/`output_schema`; `channel` known to the channel registry at load; `target` shape valid for that channel | `unknown channel` / `invalid target` |
+| V16 | `deliver` steps: `channel`, `target` and `content` present, `content` exactly one of `{text}` / `{from_artifact}`; no `requires`/`pin`/`retries`/`output_schema`; `channel` known to the channel registry at load; `target` shape valid for that channel. `publish` steps: `publish` present, exactly one `inputs` entry naming a produced artifact, `retries: 0`, `effect: write`, and none of `prompt`/`requires`/`pin`/`prefer`/`produces`/`channel`/`target`/`content` (SELF-EVOLUTION-MODEL §14, V27) | `unknown channel` / `invalid target` / `invalid publish step` |
 | V17 | `output_schema` is a JSON object, ≤16 KiB serialized | `invalid output_schema` |
 | V18 | Prompts and schema strings contain no literal that matches the secret redactor's patterns (checked with the existing redactor) | `prompt contains a secret-shaped literal` |
 | V19 | Job with no trigger is valid (manual-only) — recorded, not an error | — |
@@ -1114,6 +1121,7 @@ Two checks are job-owned (a small evaluator in the job bundle; `kian-loop` is no
 |---|---|
 | `artifact_within_cap{name}` | an artifact of that name was harvested in this attempt, `bytes <= produces.max_bytes`, and its `sha256` matches the recorded bytes |
 | `delivery_receipt{channel, target}` | a `channel/delivered` in this attempt whose `channel` matches and whose `target` equals the frozen target, **and** no later `tool/result` error for the same `call_id` |
+| `publish_ok` | a `job.publish` `tool/result` for this step and attempt with `ok: true`, a 40-hex `commit`, the derived branch, and — when the step sets `gates: true` — a gate with `exit_code: 0` (SELF-EVOLUTION-MODEL §9.4) |
 
 `report_matches_schema` (validating the child's report against `output_schema`) is P2: v1 uses the
 schema only as a tool the child may call, which is what today's `WorkerSpawner` does.
@@ -1315,6 +1323,20 @@ fired) or `kian cron rm`. Because a disabled trigger admits nothing, no run exis
 fire — the acceptance line "`KIAN_DIGEST_DISABLE=1` gives no delivery and no alert storm" is satisfied
 by construction, and the environment contract does not grow an env var that only one job honours.
 
+### 13.5 Why publishing is a conductor action too
+
+The publish step ([SELF-EVOLUTION-MODEL.md](SELF-EVOLUTION-MODEL.md) §9.4) has the same shape as
+delivery: a fixed, auditable sequence — worktree, apply, commit, gates, push, pull request — in which
+every step needs a receipt, run in the conductor's own drain with no worker candidate, no capability
+and no binding. The alternative, an `exec` action that runs an arbitrary endpoint command, would put
+a second unbounded command surface inside the runtime, with its own allowlist, credential
+distribution and idempotency story, for one workflow. A job may therefore ask for *a publish*, never
+for a command; ADR-071 records the trade.
+
+The action is versioned with the self-evolution contract, not with v1: the step shape is A15 and the
+check is A17 in [SELF-EVOLUTION-MODEL.md](SELF-EVOLUTION-MODEL.md) §13, a runtime that does not
+implement them refuses the plan (its §14, V27–V32), and the receipt is a `job.publish`
+`tool/call`/`tool/result` pair on the run stream, so the event vocabulary does not grow.
 
 ## 14. The additive surface
 

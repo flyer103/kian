@@ -735,6 +735,7 @@ async fn budget_stop_with_passing_gate_completes_with_verdict_before_end_write()
             max_iterations: 2,
             budget_scope: crate::react::BudgetScope::Lifetime,
             vision: crate::react::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     )

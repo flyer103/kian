@@ -916,12 +916,22 @@ recovery:
 
 The refusal then folds the old turns into a summary — one ordinary maintenance turn, the most
 recent turns kept verbatim, at most twice per drain episode — and the retry carries the smaller
-request. When no fold can reclaim anything the turn settles failed as before. The classes left out
+request. This arm answers a refusal the pre-flight cannot predict: a carrier limit below the
+declared bound, no declared bound at all, or a fallback target building its own body; with a bound
+declared the pre-flight usually folds first and this path is the backstop. When no fold can
+reclaim anything the turn settles failed as before. The classes left out
 above (`store_failure`, `budget_exhausted`, `validation_failed`, `unknown`) carry a `fail` rule in
 the default table; omitting them here matches it, because a class with no rule runs no recovery
 action and the turn settles failed. Semantics:
 [ADR-068](../design/decisions/ADR-068-oversized-request-classification.md) and
 [ADR-073](../design/decisions/ADR-073-oversized-request-folds-under-policy.md).
+
+With the bound declared, it also decides *when* the loop folds: the rendered request (artifact bytes
+inlined, tool schemas sorted, plan body serialized) is measured before the turn exists, and a body
+over the bound makes the loop fold old turns instead of persisting and sending an oversized one.
+Read the bound as a retention knob — history older than `keep_recent_turns` is summarized earlier
+than the context window alone would require. Semantics:
+[ADR-072](../design/decisions/ADR-072-request-byte-pressure-folds-history.md).
 
 ## Session budgets
 

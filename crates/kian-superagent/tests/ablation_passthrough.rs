@@ -529,6 +529,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             max_iterations: 10_000,
             budget_scope: kian_loop::BudgetScope::Lifetime,
             vision: kian_loop::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));
@@ -545,6 +546,7 @@ async fn run_configuration(passthrough: bool, train_len: usize, seed: u64) -> Ab
             max_iterations: 20_000,
             budget_scope: kian_loop::BudgetScope::Lifetime,
             vision: kian_loop::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     ));

@@ -979,6 +979,7 @@ impl Server {
                     .as_ref()
                     .map(|shaping| shaping.vision_budget())
                     .unwrap_or_default(),
+                max_request_bytes: config.request_byte_bounds(),
                 default_agent: config.agent_def(),
                 // (ADR-015): the worker template's and the default
                 // agent's permission tables ride their loops; the judge
@@ -1083,6 +1084,7 @@ impl Server {
                     max_iterations: config.drain.max_iterations,
                     budget_scope: kian_loop::BudgetScope::Lifetime,
                     vision: kian_loop::VisionBudget::default(),
+                    max_request_bytes: config.request_byte_bounds(),
                     permissions: config.agent.permissions.clone(),
                 },
                 gate: config.agent.evidence_gate.clone(),
@@ -2947,6 +2949,7 @@ fn build_dream_driver(
             max_iterations: config.drain.max_iterations,
             budget_scope: kian_loop::BudgetScope::Lifetime,
             vision: kian_loop::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: agent_cfg.permissions.clone(),
         },
         agent_cfg.evidence_gate.clone(),

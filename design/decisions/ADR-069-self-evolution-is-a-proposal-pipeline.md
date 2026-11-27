@@ -1,6 +1,8 @@
 # ADR-069 — Self-evolution is a proposal pipeline, not an autonomous engineer
 
 - Status: accepted (2026-11-27, self-evolution contract; specification only)
+- Amended by [ADR-071](ADR-071-publish-is-a-conductor-action.md): S2's enabling action is a
+  conductor-owned `publish` step, not the `exec` step action this record anticipated.
 
 ## Context
 

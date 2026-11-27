@@ -511,32 +511,36 @@ trimming or synthesis is performed (constraint 2/3).
 pure planner, `kian-orchestrator::compaction`. `plan_compaction(events, settings, trigger)` reads
 only the stream: it keeps the most recent `keep_recent_turns` turn/start boundaries verbatim,
 starts after the last `compact` event, requires a minimum reclaim (`min_reclaim_tokens`) and
-returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Three triggers exist and
-all are evidence: a declared `profile.context_window` whose worst-case next request (projected
-context plus the declared output cap) reaches `trigger_percent`; the provider's own
-`ContextOverflow` answer; or its `request_too_large` refusal (ADR-068) against the declared
-`max_request_bytes` bound. The last two are reactive, and both fold only when the deployment's
-recovery policy table resolves the class to `compress_then_retry` (ADR-073) — the loop reads the
-action it already persisted in the audit, so an operator who maps the class to `fail` still gets a
-failed turn, and the class only selects the trigger whose name the `compact` reason reports. The
-loop never compacts for cost — folding is the only deliberate prefix invalidation (constraint 3),
-so it must answer a measured pressure or a verdict the provider already delivered. The fold itself
-is an ordinary persisted maintenance turn: `turn/start`, `step/request` with
-`purpose: "compact"`, then the summary, then `compact` only on success; the summarizer uses the
-session's bound slot/provider, one request, no fallback traversal and no
-`turn/request`/`turn/response` hook ports (it is not a model turn). The compact payload keeps its
-frozen `{from_seq,to_seq,summary}` keys and adds audit-only `produced_by.step_seq`, `reason`,
-`folded_messages` and `reclaimed_tokens`; projection and `context_to_bytes` are untouched. At most
-two folds run per drain episode. The ordinary turn gate reserves ten percent of the budget
-allowance (`kian-core::budget`) for these maintenance requests, so a session cannot spend itself
-into being unable to compact; the reserve is what makes the `awaiting_budget` park recoverable
-instead of a deadlock. CLI observability follows the `purpose`: the cache checker pairs only
-ordinary requests (a maintenance body never reads as an unexpected prefix change) and `kian cost`
-reports maintenance requests and their priced subtotal apart from turns. Limits: no price-aware
-planner, no `compact_slot`, no maintenance fallback, no byte-aware preventive estimate — pixels can
-grow the serialized request faster than the token estimate grows, so such a session folds only
-after the refusal and then oscillates near the declared bound (ADR-073); wall-clock budgets
-remain ungated.
+returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Four triggers exist
+and all are evidence: a declared `profile.context_window` whose worst-case next request (projected
+context plus the declared output cap) reaches `trigger_percent`, the provider's own
+`ContextOverflow` answer, a declared `providers.<name>.max_request_bytes` that the rendered
+request would exceed (ADR-072), or the provider's `request_too_large` refusal (ADR-068) when the
+bound that refused is not the one the gate compared (ADR-073). The preventive byte reading is taken
+on the body the send would use — chat messages with the artifact bytes inlined, the sorted tool
+schemas and the plan body — before `turn/start`, so a body over the bound is neither persisted nor
+sent; the fold it authorizes skips `min_reclaim_tokens` (that rule counts projected text and is
+blind to the pixels the fold removes) and its two byte readings become the fold's reason. The two
+reactive triggers fold only when the deployment's recovery policy table resolves the class to
+`compress_then_retry` (ADR-073) — the loop reads the action it already persisted in the audit, so
+an operator who maps the class to `fail` still gets a failed turn, and the class only selects the
+trigger whose name the `compact` reason reports. The loop never compacts for cost — folding is the
+only deliberate prefix invalidation (constraint 3), so it must answer a measured pressure or a
+verdict the provider already delivered. The fold itself is an ordinary persisted maintenance turn:
+`turn/start`, `step/request` with `purpose: "compact"`, then the summary, then `compact` only
+on success; the summarizer uses the session's bound slot/provider, one request, no fallback
+traversal and no `turn/request`/`turn/response` hook ports (it is not a model turn). The compact
+payload keeps its frozen `{from_seq,to_seq,summary}` keys and adds audit-only
+`produced_by.step_seq`, `reason`, `folded_messages` and `reclaimed_tokens`; projection and
+`context_to_bytes` are untouched. At most two folds run per drain episode. The ordinary turn gate
+reserves ten percent of the budget allowance (`kian-core::budget`) for these maintenance requests,
+so a session cannot spend itself into being unable to compact; the reserve is what makes the
+`awaiting_budget` park recoverable instead of a deadlock. CLI observability follows the
+`purpose`: the cache checker pairs only ordinary requests (a maintenance body never reads as an
+unexpected prefix change) and `kian cost` reports maintenance requests and their priced subtotal
+apart from turns. Limits: no price-aware planner, no `compact_slot`, no maintenance fallback; a
+refusal the byte gate did not predict folds once under ADR-073, and a smaller body that still
+exceeds the carrier ends the turn failed; wall-clock budgets remain ungated.
 
 **Vision inputs (ADR-063, P5c — landed):** the one capability that changes the request dialect
 rather than adding a surface beside it. A user input payload may carry its content object as
@@ -1809,6 +1813,27 @@ The breaker is a trigger rule over the operator projection: the last
 nothing and exits 2, and `--force` admits one run and records `circuit_overridden: true` in the
 frozen value. `kian job run` returns exit 2 for every admission refusal and exit 1 only for a
 store failure.
+
+ Refinement (publish, specified for S2 — not implemented): the publish step is a conductor action
+(JOB-MODEL §13.5, ADR-071), so it costs no worker, no capability and no model turn, and the plan
+cannot name a program. The sequence is fixed: resolve `from` (the step's single artifact input)
+and the base commit (the run's frozen `job.selfdev.base_commit`; `publish.base` names the branch a
+pull request targets, not the commit); derive
+`branch = selfdev/<run_session>` and `worktree = <repo root>/.agents/worktrees/selfdev-<run_session>`;
+append the intent pair `job:publish:<step>:<attempt>` with `{step, attempt, from, base_commit,
+branch, worktree}`; read the producer's committed bytes through its `ref` and re-verify `bytes`
+and `sha256` at the moment of the write; refuse an occupied worktree or an existing branch;
+`git worktree add -b <branch> <worktree> <base_commit>` then `git apply --index` the patch from
+stdin; commit with `Kian-Run` / `Kian-Plan-Digest` / `Kian-Patch-Sha256` / `Kian-Pack` trailers;
+run the configured gate (`selfdev.publish.gate`, default `./scripts/selfcheck.sh`, bounded output,
+`CARGO_TARGET_DIR` honoured — the gate is configuration, so a proposal cannot choose the evidence
+that judges it); append the receipt pair `{branch, worktree, commit, gate}`. An interruption
+between the two pairs leaves an intent with no receipt, which settles the attempt `needs_operator`
+and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. S2b
+extends the same receipt with one `git push <remote> HEAD:refs/heads/<branch>` (never forced) and
+one `gh pr create --base <base> --head <branch>`, with the token read from the environment named
+by `selfdev.publish.token_env` and never written to an event. The action, the receipt and the gate
+configuration are specified in the contracts; S2a lands them.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session

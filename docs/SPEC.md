@@ -682,21 +682,27 @@ never a cost optimization.
 Semantics: `kian-orchestrator::compaction` exposes a pure planner
 (`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
 after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
-with an explicit reason. The loop folds under three triggers: a declared
-`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90);
-the provider's authoritative `ContextOverflow` answer; or its `request_too_large` refusal
-against the declared byte bound (ADR-068). The two reactive triggers fold only when the
-deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-073), so
-the default table — which maps `request_too_large` to `fail` — keeps a byte refusal terminal,
-and the class selects the trigger whose name the `compact` reason reports. The summary is
-produced by an ordinary persisted maintenance turn - `turn/start`, `step/request` with
-`purpose: "compact"`, the summary, then `compact` - using the session's bound slot/provider with
-one request and no fallback; the summarizer is not routed through `turn/request` /
-`turn/response` hook ports. The `compact` event is appended only after the summary exists; a
-failed summarizer leaves the projection untouched and its request is still persisted and priced.
-Ordinary turns reserve ten percent of the budget allowance for maintenance requests, so the
-session can always pay for the compaction that prevents the overflow deadlock. At most two folds
-run per drain episode.
+with an explicit reason. The loop folds under four triggers: a declared
+`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90), the
+provider's authoritative `ContextOverflow` answer, a declared request-byte bound that the rendered
+request itself would exceed (ADR-072), or the provider's `request_too_large` refusal against a
+bound the gate did not compare (ADR-068, ADR-073). The preventive byte trigger is measured on the
+exact body the send would use - artifact bytes inlined, tool schemas sorted, plan body serialized -
+and it is checked before `turn/start`: an oversized body is never persisted and never sent. It
+skips the minimum-reclaim rule, which counts projected text and cannot see the pixels the fold
+removes, and records both byte readings in the fold's reason. The two reactive triggers fold only
+when the deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-073),
+so the default table - which maps `request_too_large` to `fail` - keeps a byte refusal terminal,
+and the class selects the trigger whose name the `compact` reason reports; an `Oversized` fold
+skips the same minimum-reclaim rule, and its refused request stays in the stream as the record of
+what was not sent. The summary is produced by an ordinary persisted maintenance turn -
+`turn/start`, `step/request` with `purpose: "compact"`, the summary, then `compact` - using the
+session's bound slot/provider with one request and no fallback; the summarizer is not routed through
+`turn/request` / `turn/response` hook ports. The `compact` event is appended only after the
+summary exists; a failed summarizer leaves the projection untouched and its request is still
+persisted and priced. Ordinary turns reserve ten percent of the budget allowance for maintenance
+requests, so the session can always pay for the compaction that prevents the overflow deadlock. At
+most two folds run per drain episode.
 Observability follows the purpose: cache metrics pair only ordinary requests, and `kian cost`
 reports maintenance requests apart from turns.
 
@@ -707,10 +713,13 @@ The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P3 | kian-orchestrator, kian-loop, kian-core, kian-cli | the pure compaction planner (settings/pressure/trigger/plan, keep-recent-turns fold, minimum reclaim, strictly-past disjoint ranges); preventive and reactive folds in the ReAct loop as persisted maintenance turns (`purpose: "compact"`, summary request, `compact` on success only); per-episode fold bound; the maintenance budget reserve; purpose-aware cache metrics and cost reporting | landed |
+| P3b | kian-orchestrator, kian-loop, kian-cli | byte pressure as a fold trigger: `CompactionTrigger::Bytes` measured on the rendered request against `providers.<name>.max_request_bytes`, the pre-turn gate that folds instead of persisting an oversized body, the per-slot bound delivered into the loop ([ADR-072](../design/decisions/ADR-072-request-byte-pressure-folds-history.md)) | landed |
+| P3c | kian-orchestrator, kian-loop, kian-cli | the refusal-side fold: `CompactionTrigger::Oversized` for a `request_too_large` the byte gate did not predict, taken only when the recovery table resolves the class to `compress_then_retry`, skipping the text-based minimum reclaim and naming the refusal in the `compact` reason ([ADR-073](../design/decisions/ADR-073-oversized-request-folds-under-policy.md)) | landed |
 
 Non-goals recorded with the phase: no price-aware break-even planner, no separate compaction
 scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
-enforcement of the reserve.
+enforcement of the reserve. Byte pressure adds no downscale, no per-request image cap, no
+retroactive eviction outside a fold, and no automatic raising of the provider bound.
 
 ### Off-peak deferral (ADR-060, P4 landed)
 
@@ -907,7 +916,8 @@ The contract is
 
 Non-goals recorded with this slice: no retroactive eviction of history pixels, no downscale, no
 dedupe, no per-image cache. Growth across turns is stopped by the provider's `max_request_bytes`
-(ADR-067), not here.
+(ADR-068), the byte-pressure fold it authorizes (ADR-072) and the refusal-side fold (ADR-073), not
+here.
 
 ### Resident rotation (ADR-040)
 
@@ -1008,19 +1018,21 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed)
+### Self-evolution (S1 landed, S2 specified)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
 proposing. No new session state, event kind, table or daemon: the marking travels as one additive
 key on the admitted row. The normative contract is
-[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision record is
-[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md).
+[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision records are
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md) and
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
 
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
-| S2 publish | one derived worktree and branch, one push, one pull request whose body carries the audit chain; needs the `exec` step action | specified, not implemented |
+| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | specified, not implemented |
+| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | specified, not implemented |
 | S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
@@ -1032,6 +1044,12 @@ An agent step produces its artifact from the child's own stream: the final answe
 `patch_paths_allowed` read the bytes the producer committed
 ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §12.1). A child that never reaches a final answer
 produces no artifact, and the step fails its artifact check instead of passing it.
+
+Publishing is a conductor action, not a general command: the `publish` step's sequence is fixed
+(worktree, apply, commit, gates, and in S2b one non-forced push and one pull request), every step
+leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
+command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
+[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
 
 ### Deferred (unchanged)
 | Item | Reason |

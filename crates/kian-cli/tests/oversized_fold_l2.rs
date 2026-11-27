@@ -1,13 +1,13 @@
-//! L2 for ADR-073: an oversized request folds the old turns under the
-//! recovery policy's `compress_then_retry`, against a real assembled
-//! server.
+//! L2 for ADR-073: a request the carrier refuses as too large folds the old
+//! turns under the recovery policy's `compress_then_retry`, against a real
+//! assembled server.
 //!
-//! The shape is the production one: a resident Router session whose
-//! history crosses the provider's declared byte bound. The seam refuses
-//! the request locally (`request_too_large`), the recovery table resolves
-//! `compress_then_retry`, the loop folds the old turns into a summary and
-//! retries — so the input that would otherwise have failed is answered by
-//! a smaller request.
+//! ADR-072 prevents the refusal it can predict: when a declared bound is
+//! below the rendered body, the fold happens before the send. This shape is
+//! the one it cannot predict — the declaration sits above the carrier's real
+//! limit, so the body flies, the carrier answers HTTP 413, and the loop must
+//! fold and retry a smaller request instead of failing the turn on the same
+//! bytes.
 //!
 //! Batches arrive the way the Router receives them in production: one
 //! message on a mock channel, admitted by the subscription engine into the
@@ -17,9 +17,15 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::{ScriptedResponse, force_no_proxy, spawn_scripted_provider, temp_dir};
+use axum::Router;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::post;
+use common::{force_no_proxy, sse_completion_body, temp_dir};
 use kian_cli::server::Server;
 use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
@@ -27,15 +33,64 @@ use kian_store::EventStore;
 
 const ROUTER_SESSION: &str = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
 
-/// `providers.router-mock.max_request_bytes`: five judged batches fit,
-/// the sixth does not.
-const BOUND: usize = 5_767_168;
-/// One judged batch's content. Some five of them (plus the small
-/// bootstrap turn) stay under the bound; the next one crosses it.
-const TURN_BYTES: usize = 1024 * 1024;
+/// What the deployment declares. Above the carrier's real limit on purpose:
+/// the ADR-072 gate compares this number, the carrier enforces its own.
+const DECLARED_BOUND: u64 = 64 * 1024 * 1024;
+/// The carrier's real limit: four judged batches fit, the fifth does not.
+const CARRIER_LIMIT: usize = 2_800_000;
+/// One judged batch's content; four retained turns fit under the carrier
+/// limit, five do not.
+const TURN_BYTES: usize = 600_000;
 
 fn router_session() -> SessionId {
     SessionId(uuid::Uuid::parse_str(ROUTER_SESSION).expect("router uuid"))
+}
+
+/// A carrier that refuses bodies over its own limit with HTTP 413 — the
+/// upstream bound no local declaration can describe.
+struct Carrier {
+    requests: AtomicUsize,
+}
+
+async fn completions(
+    State(carrier): State<Arc<Carrier>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    carrier.requests.fetch_add(1, Ordering::SeqCst);
+    if body.len() > CARRIER_LIMIT {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the carrier refuses a {} byte request (limit {CARRIER_LIMIT})",
+                body.len()
+            ),
+        )
+            .into_response();
+    }
+    let mut response = (StatusCode::OK, sse_completion_body("batch noted")).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+async fn spawn_carrier() -> (String, Arc<Carrier>) {
+    let carrier = Arc::new(Carrier {
+        requests: AtomicUsize::new(0),
+    });
+    let app = Router::new()
+        .route("/chat/completions", post(completions))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .with_state(Arc::clone(&carrier));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind carrier");
+    let addr = listener.local_addr().expect("carrier addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("carrier serve");
+    });
+    (format!("http://{addr}"), carrier)
 }
 
 /// The recovery table from docs/advanced.md's oversized-request section,
@@ -89,7 +144,7 @@ providers:
   router-mock:
     base_url: "{provider}"
     api_key_env: KIAN_E2E_API_KEY
-    max_request_bytes: {BOUND}
+    max_request_bytes: {DECLARED_BOUND}
 plugins: ["openai-compat", "local-tools", "superagent"]
 drain:
   max_iterations: 16
@@ -202,6 +257,27 @@ async fn wait_turn_settled(store: &EventStore, prev_turns: usize) -> Vec<Event> 
     panic!("the router never settled after turn {prev_turns}");
 }
 
+/// The folded turn's retry is a turn of its own; wait for its final answer
+/// rather than sampling the instant the compact turn closed.
+async fn wait_final_answer(store: &EventStore, after: u64) -> Vec<Event> {
+    for _ in 0..2400 {
+        let events = store
+            .rebuild(router_session())
+            .await
+            .expect("rebuild router");
+        let answered = events.iter().any(|event| {
+            event.kind == EventKind::TurnEnd
+                && event.seq > after
+                && event.bytes["outcome"] == serde_json::json!("final_answer")
+        });
+        if answered {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the retried request never answered after seq {after}");
+}
+
 fn count_kind(events: &[Event], kind: EventKind) -> usize {
     events.iter().filter(|e| e.kind == kind).count()
 }
@@ -213,19 +289,10 @@ fn step_body_len(event: &Event) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_oversized_request_folds_old_turns_under_the_policy_and_answers_the_input() {
+async fn a_carrier_refusal_folds_old_turns_under_the_policy_and_answers_the_input() {
     force_no_proxy();
-    let dir = temp_dir("adr070-fold");
-    // The Router's script: the bootstrap ack, then one answer per judged
-    // batch (the last entry repeats).
-    let (provider_base, mock) = spawn_scripted_provider(
-        vec![
-            ScriptedResponse::Text("bootstrap acknowledged".into()),
-            ScriptedResponse::Text("batch noted".into()),
-        ],
-        0,
-    )
-    .await;
+    let dir = temp_dir("adr073-fold");
+    let (provider_base, carrier) = spawn_carrier().await;
     let config = write_fold_config(&dir, &provider_base);
     let (base, _server) = spawn_server(&config).await;
     let read_only = EventStore::open_read_only(&dir.join("kian.sqlite"))
@@ -236,7 +303,7 @@ async fn an_oversized_request_folds_old_turns_under_the_policy_and_answers_the_i
     // The resident Router's bootstrap turn.
     let mut events = wait_turn_settled(&read_only, 0).await;
 
-    // Grow the history one judged batch at a time until the bound refuses
+    // Grow the history one judged batch at a time until the carrier refuses
     // a request. Each message waits for the park, so no two messages share
     // a turn and every turn keeps its own context slice.
     let content = "x".repeat(TURN_BYTES);
@@ -311,23 +378,10 @@ async fn an_oversized_request_folds_old_turns_under_the_policy_and_answers_the_i
 
     // The batch that was refused is answered afterwards, by a smaller
     // request: the retried turn ends with a final answer.
-    let answered = events.iter().any(|e| {
-        e.kind == EventKind::TurnEnd
-            && e.seq > compact.seq
-            && e.bytes["outcome"] == serde_json::json!("final_answer")
-    });
-    assert!(
-        answered,
-        "the retried request completed the turn the refusal ended: {:?}",
-        events
-            .iter()
-            .filter(|e| e.kind == EventKind::TurnEnd)
-            .map(|e| (&e.seq, &e.bytes["outcome"]))
-            .collect::<Vec<_>>()
-    );
+    events = wait_final_answer(&read_only, compact.seq).await;
 
-    // The refused bytes are persisted (ADR-068 decision 5) and are over
-    // the bound; the retry is under it and smaller.
+    // The refused bytes are persisted (ADR-068 decision 5) and are over the
+    // carrier's limit; the retry is under it and smaller.
     let requests: Vec<&Event> = events
         .iter()
         .filter(|e| e.kind == EventKind::StepRequest)
@@ -335,26 +389,29 @@ async fn an_oversized_request_folds_old_turns_under_the_policy_and_answers_the_i
     let sizes: Vec<usize> = requests.iter().map(|e| step_body_len(e)).collect();
     let largest = *sizes.iter().max().expect("a request was persisted");
     assert!(
-        largest > BOUND,
-        "the refused request is persisted with its exact bytes ({largest} <= {BOUND})"
+        largest > CARRIER_LIMIT,
+        "the refused request is persisted with its exact bytes ({largest} <= {CARRIER_LIMIT})"
     );
     let retry = *sizes.last().expect("a retry was persisted");
     assert!(
-        retry < BOUND,
-        "the retried request fits under the bound ({retry} vs {BOUND})"
+        retry < CARRIER_LIMIT,
+        "the retried request fits under the carrier limit ({retry} vs {CARRIER_LIMIT})"
     );
     assert!(
         retry < largest,
         "the fold shrank the request ({retry} vs the refused {largest})"
     );
+    assert!(
+        largest < usize::try_from(DECLARED_BOUND).expect("declared bound fits a usize"),
+        "the declaration sat above the carrier limit, so ADR-072's gate never armed          ({largest} vs {DECLARED_BOUND})"
+    );
 
-    // Nothing over the bound ever reached the provider: every persisted
-    // under-bound request arrived, and the refused one did not.
-    let arrived = sizes.iter().filter(|size| **size <= BOUND).count();
+    // The declaration could not predict the refusal, so the oversized body did
+    // fly — exactly once, and it was the carrier's answer that folded it.
     assert_eq!(
-        mock.requests.load(std::sync::atomic::Ordering::SeqCst),
-        arrived,
-        "the refused body never left the process; sizes: {sizes:?}"
+        carrier.requests.load(Ordering::SeqCst),
+        sizes.len(),
+        "every persisted request was attempted once; sizes: {sizes:?}"
     );
 
     // A resident session outlives its turns: the fold never ended it.

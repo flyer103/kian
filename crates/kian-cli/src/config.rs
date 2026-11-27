@@ -3995,6 +3995,18 @@ impl ServeConfig {
             .collect()
     }
 
+    /// (ADR-072): the declared request-byte bound per provider, for the
+    /// loop's byte-pressure gate. Only providers that declare
+    /// `max_request_bytes` appear; an absent entry means no gate (the
+    /// provider's own bound, ADR-068, stays the last line of defense).
+    #[must_use]
+    pub fn request_byte_bounds(&self) -> std::collections::BTreeMap<String, u64> {
+        self.providers
+            .iter()
+            .filter_map(|(name, pcfg)| pcfg.max_request_bytes.map(|bound| (name.clone(), bound)))
+            .collect()
+    }
+
     /// (ADR-020, D5): per-worker-id queue timeouts — the exclusivity
     /// check's never-started release bound.
     #[must_use]

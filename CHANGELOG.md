@@ -9,15 +9,33 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 ## Unreleased
 
 - **An oversized request folds when the recovery policy says so (ADR-073).** A
-  `request_too_large` refusal — the serialized request crossed
-  `providers.<name>.max_request_bytes` — now runs the same maintenance fold as a
-  `context_overflow` answer when the recovery table resolves the class to `compress_then_retry`:
-  the older turns fold behind a summary under the byte trigger and the retry carries the smaller
-  request, bounded by the per-episode fold cap. The gate covers `context_overflow` as well, so the
-  table is authoritative for both reactive folds; both defaults are unchanged (`request_too_large`
-  still fails, a window overflow still folds), so a deployment opts in with
-  `recovery.rules: [{class: request_too_large, action: compress_then_retry}, …]` — an explicit
-  `rules:` table replaces the defaults, and `docs/advanced.md` carries the runnable table.
+  `request_too_large` refusal the byte gate could not predict — the carrier's own limit sits below
+  `providers.<name>.max_request_bytes`, no bound is declared, or a fallback target built the body —
+  now runs the same maintenance fold as a `context_overflow` answer when the recovery table
+  resolves the class to `compress_then_retry`: the older turns fold behind a summary under the
+  byte trigger and the retry carries the smaller request, bounded by the per-episode fold cap.
+  The gate covers `context_overflow` as well, so the table is authoritative for both reactive
+  folds; both defaults are unchanged (`request_too_large` still fails, a window overflow still
+  folds), so a deployment opts in with `recovery.rules: [{class: request_too_large, action:
+  compress_then_retry}, …]` — an explicit `rules:` table replaces the defaults, and
+  `docs/advanced.md` carries the runnable table.
+- **Compaction answers byte pressure, not only token pressure (ADR-072).** With
+  `providers.<name>.max_request_bytes` declared, the loop measures the rendered request (artifact
+  bytes inlined, tool schemas sorted, plan body serialized) before the turn exists, and folds old
+  turns instead of persisting and sending a body over the bound. A byte-triggered fold skips the
+  minimum-reclaim rule, which counts projected text and cannot see the pixels it removes, and
+  records both byte readings as the fold's reason. The refusal of ADR-068 stays the last defense;
+  this is what makes the next turn sendable instead of wedging the session.
+- **Publishing is a conductor action, not a command surface (`design/JOB-MODEL.md` §7.2, §13.5,
+  `design/SELF-EVOLUTION-MODEL.md` §9.4–§9.5, ADR-071).** S2 of the self-evolution ladder adds a
+  `publish` step the conductor runs itself: re-verify the patch artifact's digest out of the
+  producer's stream, create the derived worktree and branch (`selfdev/<run_session>`), apply and
+  commit with audit trailers, run the configured gate, and record one
+  `job:publish:<step>:<attempt>` receipt — so a plan never names a program. The authority splits
+  where the credential appears: S2a publish-local holds none, S2b adds one non-forced push and one
+  pull request with the token read from `selfdev.publish.token_env` at push time. Specification
+  only in this change: the action, the `publish_ok` check, the receipt and the gate configuration
+  land with S2a.
 - **Job artifacts: a step's artifact is its child's final message
   (`design/JOB-MODEL.md` §12.1).** The conductor derives the ref, `bytes` and `sha256` from the
   producer's last `assistant/message` that carries text and no tool calls, then records the
