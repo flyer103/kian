@@ -1020,10 +1020,11 @@ A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` 
 patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and
 the merge is the owner's decision on the pull request.
 
-An agent child does not yet turn its final message into a `job.artifact` intent (the record a
-step's artifact checks read), so a live self-dev run today stops at `artifact_within_cap` rather
-than passing it; the admission surface, the surface check and the breaker are landed and tested.
-Wiring the artifact producer is the next increment and changes no contract here.
+An agent step produces its artifact from the child's own stream: the final answer — the last
+`assistant/message` carrying text and no `tool_calls` — is the artifact, so `artifact_within_cap` and
+`patch_paths_allowed` read the bytes the producer committed
+([design/JOB-MODEL.md](../design/JOB-MODEL.md) §12.1). A child that never reaches a final answer
+produces no artifact, and the step fails its artifact check instead of passing it.
 
 ### Deferred (unchanged)
 | Item | Reason |

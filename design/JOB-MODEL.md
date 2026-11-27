@@ -1171,12 +1171,16 @@ the structured payload the child returned when `output_schema` is declared). Rea
 the stream — no store, no TTL, no copy, no GC. `sha256` is over the exact bytes, so a reader detects
 any divergence instead of trusting a copy.
 
+The conductor derives that ref from the child's own stream: the final answer is the last
+`assistant/message` that carries text and no `tool_calls`, so no tool inside the child has to announce an
+artifact, and the gate and the harvest read the same committed bytes.
+
 The ref is committed on the run stream as one `tool/call` + `tool/result` pair under the conductor's
 own tool name:
 
 ```text
-tool/call   {call_id: "job:artifact:compose:1", tool: "job.artifact", args: {step, attempt, name}}
-tool/result {call_id: "job:artifact:compose:1", ok: true, output: <the ref JSON above>}
+tool/call   {call_id: "job:artifact:compose:1", tool: "job.artifact", args: {artifact: <the ref JSON above>}}
+tool/result {call_id: "job:artifact:compose:1", ok: true, result: {artifact: <the ref JSON above>}}
 ```
 
 Why a tool pair rather than a new event kind: the conductor really is performing an action (harvest),
