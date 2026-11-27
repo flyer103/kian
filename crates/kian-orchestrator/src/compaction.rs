@@ -111,6 +111,10 @@ pub enum CompactionTrigger {
     Pressure(CompactionPressure),
     /// The provider already rejected a request as context overflow.
     Overflow,
+    /// The provider refused a request as too large for its byte bound
+    /// (ADR-068). Distinct from `Overflow` so the fold's reason names the
+    /// byte verdict instead of claiming a window overflow.
+    Oversized,
     /// The rendered request would exceed the provider's declared byte bound
     /// (ADR-072). Both numbers are the ones the pre-flight compares, so the
     /// fold answers a bound the send would otherwise be refused for.
@@ -128,7 +132,7 @@ impl CompactionTrigger {
     pub fn authorizes(&self, settings: &CompactionSettings) -> bool {
         match self {
             Self::Pressure(pressure) => pressure.triggers(settings),
-            Self::Overflow => true,
+            Self::Overflow | Self::Oversized => true,
             Self::Bytes {
                 request_bytes,
                 limit_bytes,
@@ -145,6 +149,7 @@ impl CompactionTrigger {
                 pressure.context_window_tokens
             ),
             Self::Overflow => "provider reported context overflow".to_string(),
+            Self::Oversized => "provider refused the request as too large (ADR-068)".to_string(),
             Self::Bytes {
                 request_bytes,
                 limit_bytes,
@@ -246,12 +251,15 @@ pub fn plan_compaction(
     }
 
     let reclaimed_tokens = folded_bytes / BYTES_PER_TOKEN;
-    // ADR-072: a byte-pressure fold exists to remove payload the token
-    // arithmetic cannot see (inlined artifact bytes), so the minimum-reclaim
-    // rule — which counts projected text — would refuse the only fold that can
-    // make the request sendable.
-    if !matches!(trigger, CompactionTrigger::Bytes { .. })
-        && reclaimed_tokens < settings.min_reclaim_tokens
+    // ADR-072/ADR-074: a byte-pressure fold — preventive, or the answer to a
+    // refusal — exists to remove payload the token arithmetic cannot see
+    // (inlined artifact bytes), so the minimum-reclaim rule, which counts
+    // projected text, would refuse the only fold that can make the request
+    // sendable.
+    if !matches!(
+        trigger,
+        CompactionTrigger::Bytes { .. } | CompactionTrigger::Oversized
+    ) && reclaimed_tokens < settings.min_reclaim_tokens
     {
         return Ok(None);
     }
@@ -501,6 +509,31 @@ mod tests {
     }
 
     #[test]
+    fn oversized_refusal_authorizes_a_fold_and_names_the_byte_verdict() {
+        let mut stream = Stream::new();
+        for i in 0..8 {
+            stream.turn(&format!("turn {i}"));
+        }
+        let settings = CompactionSettings {
+            keep_recent_turns: 3,
+            min_reclaim_tokens: 1,
+            trigger_percent: 50,
+        };
+        let plan = plan_compaction(
+            &stream.events,
+            &settings,
+            Some(&CompactionTrigger::Oversized),
+        )
+        .unwrap()
+        .expect("a byte refusal authorizes a fold");
+        assert_eq!(
+            plan.reason,
+            "provider refused the request as too large (ADR-068)"
+        );
+        assert_eq!(plan.folded_messages, 10);
+    }
+
+    #[test]
     fn a_byte_trigger_authorizes_only_over_the_bound() {
         let mut stream = Stream::new();
         for i in 0..8 {
@@ -561,6 +594,14 @@ mod tests {
         .unwrap()
         .expect("byte pressure skips the text-based reclaim rule");
         assert!(plan.folded_messages > 0);
+        let refusal = plan_compaction(
+            &stream.events,
+            &settings,
+            Some(&CompactionTrigger::Oversized),
+        )
+        .unwrap()
+        .expect("a refusal fold skips the text-based reclaim rule too");
+        assert!(refusal.folded_messages > 0);
     }
 
     #[test]

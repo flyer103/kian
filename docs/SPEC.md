@@ -133,13 +133,13 @@ sessions:
     recovery_budget: { tokens: 500k, wall_clock: 30m }
 
 recovery: # A4/A5: pure-function classification + declarative policy table
-  policies:
-    - match: { error_class: rate_limited }
-      action: backoff_retry { max: 5, base: 2s }
-    - match: { error_class: context_overflow }
-      policy: compress_then_retry
-    - match: { error_class: provider_down }
-      action: failover { slots: [main], to: fallback }
+  rules: # an explicit table replaces the defaults, so list every class this deployment governs
+    - class: rate_limited
+      action: { backoff_retry: { delay_ms: 500 } }
+    - class: context_overflow
+      action: compress_then_retry
+    - class: provider_down
+      action: failover
 
 control_plane: # P5 protocoled control plane
   steer: enabled
@@ -682,21 +682,27 @@ never a cost optimization.
 Semantics: `kian-orchestrator::compaction` exposes a pure planner
 (`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
 after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
-with an explicit reason. The loop folds under three triggers only: a declared
-`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90),
-the provider's authoritative `ContextOverflow` answer, or a declared request-byte bound that the
-rendered request itself would exceed (ADR-072). The byte trigger is measured on the exact body the
-send would use - artifact bytes inlined, tool schemas sorted, plan body serialized - and it is
-checked before `turn/start`: an oversized body is never persisted and never sent. It skips the
-minimum-reclaim rule, which counts projected text and cannot see the pixels the fold removes, and
-records both byte readings in the fold's reason. The summary is produced by an ordinary
-persisted maintenance turn - `turn/start`, `step/request` with `purpose: "compact"`, the
-summary, then `compact` - using the session's bound slot/provider with one request and no
-fallback; the summarizer is not routed through `turn/request` / `turn/response` hook ports. The
-`compact` event is appended only after the summary exists; a failed summarizer leaves the
-projection untouched and its request is still persisted and priced. Ordinary turns reserve ten
-percent of the budget allowance for maintenance requests, so the session can always pay for the
-compaction that prevents the overflow deadlock. At most two folds run per drain episode.
+with an explicit reason. The loop folds under four triggers: a declared
+`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90), the
+provider's authoritative `ContextOverflow` answer, a declared request-byte bound that the rendered
+request itself would exceed (ADR-072), or the provider's `request_too_large` refusal against a
+bound the gate did not compare (ADR-068, ADR-074). The preventive byte trigger is measured on the
+exact body the send would use - artifact bytes inlined, tool schemas sorted, plan body serialized -
+and it is checked before `turn/start`: an oversized body is never persisted and never sent. It
+skips the minimum-reclaim rule, which counts projected text and cannot see the pixels the fold
+removes, and records both byte readings in the fold's reason. The two reactive triggers fold only
+when the deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-074),
+so the default table - which maps `request_too_large` to `fail` - keeps a byte refusal terminal,
+and the class selects the trigger whose name the `compact` reason reports; an `Oversized` fold
+skips the same minimum-reclaim rule, and its refused request stays in the stream as the record of
+what was not sent. The summary is produced by an ordinary persisted maintenance turn -
+`turn/start`, `step/request` with `purpose: "compact"`, the summary, then `compact` - using the
+session's bound slot/provider with one request and no fallback; the summarizer is not routed through
+`turn/request` / `turn/response` hook ports. The `compact` event is appended only after the
+summary exists; a failed summarizer leaves the projection untouched and its request is still
+persisted and priced. Ordinary turns reserve ten percent of the budget allowance for maintenance
+requests, so the session can always pay for the compaction that prevents the overflow deadlock. At
+most two folds run per drain episode.
 Observability follows the purpose: cache metrics pair only ordinary requests, and `kian cost`
 reports maintenance requests apart from turns.
 
@@ -708,6 +714,7 @@ The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md
 |-------|--------|----------|--------|
 | P3 | kian-orchestrator, kian-loop, kian-core, kian-cli | the pure compaction planner (settings/pressure/trigger/plan, keep-recent-turns fold, minimum reclaim, strictly-past disjoint ranges); preventive and reactive folds in the ReAct loop as persisted maintenance turns (`purpose: "compact"`, summary request, `compact` on success only); per-episode fold bound; the maintenance budget reserve; purpose-aware cache metrics and cost reporting | landed |
 | P3b | kian-orchestrator, kian-loop, kian-cli | byte pressure as a fold trigger: `CompactionTrigger::Bytes` measured on the rendered request against `providers.<name>.max_request_bytes`, the pre-turn gate that folds instead of persisting an oversized body, the per-slot bound delivered into the loop ([ADR-072](../design/decisions/ADR-072-request-byte-pressure-folds-history.md)) | landed |
+| P3c | kian-orchestrator, kian-loop, kian-cli | the refusal-side fold: `CompactionTrigger::Oversized` for a `request_too_large` the byte gate did not predict, taken only when the recovery table resolves the class to `compress_then_retry`, skipping the text-based minimum reclaim and naming the refusal in the `compact` reason ([ADR-074](../design/decisions/ADR-074-oversized-request-folds-under-policy.md)) | landed |
 
 Non-goals recorded with the phase: no price-aware break-even planner, no separate compaction
 scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
@@ -911,7 +918,8 @@ The contract is
 
 Non-goals recorded with this slice: no retroactive eviction of history pixels, no downscale, no
 dedupe, no per-image cache. Growth across turns is stopped by the provider's `max_request_bytes`
-(ADR-068) and the byte-pressure fold it authorizes (ADR-072), not here.
+(ADR-068), the byte-pressure fold it authorizes (ADR-072) and the refusal-side fold (ADR-074), not
+here.
 
 ### Request audit bodies by reference (ADR-073)
 
@@ -984,9 +992,11 @@ Semantics: `providers.<name>.max_request_bytes` (optional, absent = no pre-fligh
 process. An HTTP 413 answer is classified `request_too_large` as well, carrying the status, the
 size that was sent and a bounded snippet. `request_too_large` is a closed policy-table class: the
 default table maps it to `fail` because re-sending identical bytes cannot succeed, and a deployment
-that wants compaction to shrink the history opts into `compress_then_retry` explicitly. Without a
-declared bound a mid-upload connection close stays `provider_down` — no transport heuristics. The
-persisted `step/request` remains the audit record of the bytes that were not sent.
+that wants compaction to shrink the history opts into `compress_then_retry` explicitly — the loop
+then folds the old turns under the byte trigger and retries the smaller request (ADR-074), bounded
+by the per-episode fold cap; when no fold can reclaim anything the turn settles failed as before.
+Without a declared bound a mid-upload connection close stays `provider_down` — no transport
+heuristics. The persisted `step/request` remains the audit record of the bytes that were not sent.
 
 The contract is
 [ADR-068](../design/decisions/ADR-068-oversized-request-classification.md).

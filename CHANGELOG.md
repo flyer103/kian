@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **An oversized request folds when the recovery policy says so (ADR-074).** A
+  `request_too_large` refusal the byte gate could not predict — the carrier's own limit sits below
+  `providers.<name>.max_request_bytes`, no bound is declared, or a fallback target built the body —
+  now runs the same maintenance fold as a `context_overflow` answer when the recovery table
+  resolves the class to `compress_then_retry`: the older turns fold behind a summary under the
+  byte trigger and the retry carries the smaller request, bounded by the per-episode fold cap.
+  The gate covers `context_overflow` as well, so the table is authoritative for both reactive
+  folds; both defaults are unchanged (`request_too_large` still fails, a window overflow still
+  folds), so a deployment opts in with `recovery.rules: [{class: request_too_large, action:
+  compress_then_retry}, …]` — an explicit `rules:` table replaces the defaults, and
+  `docs/advanced.md` carries the runnable table.
 - **Request audit bodies store image bytes by reference (ADR-073).** On a vision target the
   persisted `step/request` — and the `slot/fallback` attempt copy — records each image part as a
   content-addressed reference with `body_form: "artifact_refs"` and `body_bytes`, while the wire

@@ -1992,12 +1992,54 @@ fn fold_settings(keep_recent_turns: usize) -> kian_orchestrator::compaction::Com
     }
 }
 
-/// Harness with an explicit agent definition and compaction tuning.
+/// The policy table the compaction tests run under: each reactive class takes
+/// the disposition the test is about (the default table folds a window overflow
+/// and fails a byte refusal).
+fn compaction_policy(
+    context_overflow: kian_core::seams::RecoveryAction,
+    request_too_large: kian_core::seams::RecoveryAction,
+) -> Arc<dyn kian_core::seams::RecoveryPolicySource> {
+    Arc::new(crate::test_support::TablePolicy(vec![
+        kian_core::seams::PolicyRule {
+            class: "context_overflow".into(),
+            action: context_overflow,
+        },
+        kian_core::seams::PolicyRule {
+            class: "request_too_large".into(),
+            action: request_too_large,
+        },
+    ]))
+}
+
+/// Harness with an explicit agent definition and compaction tuning, under the
+/// policy table a deployed runtime ships by default (an overflow folds, a byte
+/// refusal fails).
 async fn harness_compacting(
     agent: AgentDef,
     turns: Vec<ScriptedChunksArgs>,
     tools: Arc<dyn kian_core::seams::ToolProvider>,
     compaction: kian_orchestrator::compaction::CompactionSettings,
+) -> (Harness, Arc<ScriptedProvider>) {
+    harness_compacting_under(
+        agent,
+        turns,
+        tools,
+        compaction,
+        compaction_policy(
+            kian_core::seams::RecoveryAction::CompressThenRetry,
+            kian_core::seams::RecoveryAction::Fail,
+        ),
+    )
+    .await
+}
+
+/// The same harness with an explicit recovery policy table.
+async fn harness_compacting_under(
+    agent: AgentDef,
+    turns: Vec<ScriptedChunksArgs>,
+    tools: Arc<dyn kian_core::seams::ToolProvider>,
+    compaction: kian_orchestrator::compaction::CompactionSettings,
+    policy: Arc<dyn kian_core::seams::RecoveryPolicySource>,
 ) -> (Harness, Arc<ScriptedProvider>) {
     let db_path = temp_db_path();
     let store = EventStore::open(&db_path).await.expect("open store");
@@ -2008,7 +2050,7 @@ async fn harness_compacting(
         agent,
         Arc::new(registry),
         tools,
-        Arc::new(crate::test_support::NoopPolicy),
+        policy,
         ReActConfig::default(),
     )
     .with_compaction(compaction);
@@ -2233,6 +2275,191 @@ async fn reactive_overflow_compacts_then_retries_the_smaller_request() {
             .to_string()
             .contains("folded summary"),
         "the retry carries the summary in its context"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// ADR-074: a byte refusal folds under the policy opt-in — the fold is keyed
+/// on the resolved action, the retry carries the summary, and the refusal
+/// itself stays evidenced as a soft failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reactive_request_too_large_folds_under_the_policy_opt_in() {
+    let agent = profiled_agent_def(
+        None,
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "missing_tool", json!({}))],
+        vec![Err(kian_core::seams::ProviderError::RequestTooLarge {
+            size: 35_350_711,
+            limit: Some(33_554_432),
+            detail: "the serialized request is 35350711 bytes, over providers.vadis.max_request_bytes 33554432".into(),
+        })],
+        vec![text_chunk("folded summary")],
+        vec![text_chunk("done")],
+    ];
+    let (h, provider) = harness_compacting_under(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(1),
+        compaction_policy(
+            kian_core::seams::RecoveryAction::CompressThenRetry,
+            kian_core::seams::RecoveryAction::CompressThenRetry,
+        ),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("do the thing")).await;
+    assert_eq!(
+        reason,
+        EndReason::Completed,
+        "a byte refusal the policy opts into recovering is recovered"
+    );
+
+    let events = events_of(&h.store, sid).await;
+    let compacts = compact_payloads(&events);
+    assert_eq!(compacts.len(), 1);
+    assert_eq!(
+        compacts[0]["reason"],
+        json!("provider refused the request as too large (ADR-068)"),
+        "the fold names the byte verdict, not a window overflow"
+    );
+    let soft_ends: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EventKind::TurnEnd)
+                && e.bytes["outcome"] == json!("soft_failure")
+                && e.bytes["error"]["class"] == json!("request_too_large")
+                && e.bytes["error"]["action"] == json!("compress_then_retry")
+        })
+        .collect();
+    assert_eq!(
+        soft_ends.len(),
+        1,
+        "the refused request is evidenced honestly"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2]["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("summarize conversation history")),
+        "the fold is an ordinary maintenance turn"
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("folded summary"),
+        "the retry carries the summary in its context"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// ADR-074: without the opt-in the byte refusal stays terminal — nothing
+/// folds and the turn settles failed, exactly as ADR-068's default table says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_too_large_without_the_opt_in_fails_without_a_fold() {
+    let agent = profiled_agent_def(
+        None,
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "missing_tool", json!({}))],
+        vec![Err(kian_core::seams::ProviderError::RequestTooLarge {
+            size: 35_350_711,
+            limit: Some(33_554_432),
+            detail: "the serialized request is 35350711 bytes".into(),
+        })],
+    ];
+    let (h, provider) = harness_compacting_under(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(1),
+        compaction_policy(
+            kian_core::seams::RecoveryAction::CompressThenRetry,
+            kian_core::seams::RecoveryAction::Fail,
+        ),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("do the thing")).await;
+    assert_eq!(reason, EndReason::Failed);
+
+    let events = events_of(&h.store, sid).await;
+    assert!(
+        compact_payloads(&events).is_empty(),
+        "the default disposition never folds"
+    );
+    let soft_ends: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, EventKind::TurnEnd)
+                && e.bytes["outcome"] == json!("soft_failure")
+                && e.bytes["error"]["class"] == json!("request_too_large")
+                && e.bytes["error"]["action"] == json!("fail")
+        })
+        .collect();
+    assert_eq!(soft_ends.len(), 1);
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "no summarizer request is issued"
+    );
+    cleanup_db(&h.db_path);
+}
+
+/// ADR-074: the reactive arm honors the table for the window overflow too — an
+/// explicit table that maps `context_overflow` to `fail` folds nothing, which
+/// is the delta the action gate introduces over the old class-only check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_overflow_without_the_policy_opt_in_fails_without_a_fold() {
+    let agent = profiled_agent_def(
+        None,
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let turns = vec![
+        vec![tool_call_chunk("call-1", "missing_tool", json!({}))],
+        vec![Err(kian_core::seams::ProviderError::ContextOverflow)],
+    ];
+    let (h, provider) = harness_compacting_under(
+        agent,
+        turns,
+        Arc::new(crate::test_support::NoopTools),
+        fold_settings(1),
+        compaction_policy(
+            kian_core::seams::RecoveryAction::Fail,
+            kian_core::seams::RecoveryAction::Fail,
+        ),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let reason = submit_and_wait(&h, sid, json!("do the thing")).await;
+    assert_eq!(reason, EndReason::Failed);
+
+    let events = events_of(&h.store, sid).await;
+    assert!(
+        compact_payloads(&events).is_empty(),
+        "a table that maps the class to fail is not overridden by the loop"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "no summarizer request is issued"
     );
     cleanup_db(&h.db_path);
 }
