@@ -67,7 +67,7 @@ pub struct ArchiveManifest {
     pub terminal_state: String,
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     let out = h.finalize();

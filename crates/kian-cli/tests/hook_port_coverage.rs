@@ -208,6 +208,16 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 1,
     },
     ProducerFile {
+        // Scripted replay re-admits a recorded episode's input rows into a
+        // throwaway fork store (`kian session replay --provider fake`). There is
+        // no hook bus and no live session on that store: re-entering the rows is
+        // the point (the engine's own admission path must produce the model
+        // context being compared), and the source store is only ever read. An
+        // offline operator command is an internal producer by the §3.4.3 matrix.
+        file: "kian-cli/src/replay_fork.rs",
+        admits: 1,
+    },
+    ProducerFile {
         // The conductor's admissions are a step's child task rows, and they go
         // through `WorkerSpawner::admit` (the row above), the same path the
         // Router uses — the conductor writes no inbox row itself. Both call

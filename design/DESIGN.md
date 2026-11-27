@@ -1727,6 +1727,53 @@ finding names the session and seq that evidence it. It is read-only in-process (
 transcript (content is counted, never shown). The report is a diagnostic slice, not a snapshot:
 several queries, with the slice's observed `ts` bounds reported so clock skew stays visible.
 
+ Refinement (evidence pack, as implemented by `kian-cli`): `kian self evidence --session <uuid>
+--seq <n> --out <dir> [--context <k>]` names one anchor row and writes a five-file directory —
+`events.ndjson` (the raw envelope slice through `kian-cli::archive::export_bytes`),
+`session.json` (state via `kian_core::state::project`, the end writes and the last end reason),
+`repo.json` (git commit/branch/dirty through the scrubbed `cron_worktree::git_command` plus the
+workspace crate map parsed from the root `Cargo.toml`), `inspect.json` (the `self_inspect`
+report over the session's whole stream, so the pack and the aggregate surface cannot drift) and
+`manifest.json` (kian version, anchor, slice span, store/config/repo identity, per-file bytes and
+sha256, and an aggregate digest over the per-file digests in manifest order). The slice is
+±`context` rows clamped to the stream — default 10, refused above 200 rather than narrowed. Content
+is the point here: unlike `self inspect`, the payload travels, but only inside the package —
+stdout gets the summary, `--json` the manifest. Writes follow the archive discipline: build in a
+`.tmp-` sibling, re-read and re-verify every digest and re-parse every payload
+(`verify_pack`, also exposed for operators), then rename; a refusal (unknown seq, non-empty
+`--out`, oversized context) leaves nothing behind.
+
+ Refinement (scripted replay, as implemented by `kian-cli`): `kian session replay <uuid>
+--provider fake --script <file> [--from-seq <n>] [--keep-fork]` re-drives one recorded drain
+episode instead of only re-projecting it. The anchor is an episode boundary — the seq of a
+`drain/claimed` row, the last one by default; a `--from-seq` off a boundary is refused with the
+nearest boundary named. Everything before the anchor is the prefix: it must project to a
+non-terminal state (a terminal session has no episode left to re-drive), it is exported through
+`archive::export_bytes` and imported into a fresh sqlite fork under the system temp dir, and the
+episode's `input/admitted` rows are inverted back into inbox rows (`invert_admitted` mirrors
+`orchestrator::consumption_plan` arm for arm and re-wraps every row to assert the round trip), so
+the engine's own admission path produces the model context. Admit and eligibility timestamps come
+from the recorded row; the idempotency key becomes `replay:<seq>`. The loop is the production
+assembly — `ReActLoop::with_evidence_gate` over the config's `agent_def()`, promoted to
+`Engine::new` with holder `kian-replay` — so every event the replay writes is written by the code
+under test. The prefix's `slot/binding` events still pin provider/model, and every provider named
+by the agent definition or the prefix is registered as a scripted provider, so a configured
+`mock` provider is shadowed rather than called. `ScriptedProvider` answers `complete()` from the
+script — `{"text": ..}`, `{"tool_calls": [..]}`, `{"error": ..}` or `{"empty": true}`, with an
+optional `usage` on any turn, one turn per provider call in order; a script that runs out ends
+the turn as an honest soft failure. `RecordedTools` replays recorded `tool/result` payloads by call id, falls back per tool name in
+FIFO order, and otherwise returns an execution error plus a note — the verdict then becomes
+`incomplete`, never a silent pass. Comparison walks both tails row by row on kind + bytes,
+ignoring `drain/claimed` (lease bookkeeping differs by construction) and nothing else; the first
+mismatch reports seq, kind, JSON-pointer path and bounded excerpts, and each of `reproduced`,
+`diverged` and `incomplete` exits 0 — a divergence is a finding, not a failed command. Refusals:
+a live lease on the session (the message points at `sqlite3 <db> ".backup <copy>"`), a steer
+admitted after the episode's first `turn/start`, an `input/spilled` pair (the blob tree is not in
+the fork), an un-invertible input shape, and `--from-seq` off a boundary. Non-targets: live
+providers, executing tools, vision re-materialization, compaction, postgres, hooks, plugins and
+cross-session fan-out; the replay runs with the current config's agent, permissions and gate, and
+the fork is deleted unless `--keep-fork` is passed.
+
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session
 replay <id>`, `kian session export <id> [--since/--until]`, `kian lease inspect`) open the sqlite
