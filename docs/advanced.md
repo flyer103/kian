@@ -1123,6 +1123,10 @@ Enabled, the Router gains one extra tool — `reply_voice` taking the same argum
 *summary* channel: the speak-rules word cap always applies and a details request never promotes a
 spoken reply to the full text.
 
+Text stays the default. The tool description tells the model to call `reply_voice` only when you
+asked for a spoken reply — in that message or as a standing instruction in the conversation — and
+to use `reply` otherwise; a voice note from you is answered in text unless you ask for voice.
+
 The Router only emits the intent `{"voice": {"text": …}}`. The CLI voice edge synthesizes it with
 `speech_synthesize` (the `media:` defaults apply), stores the blob, and rewrites the delivery
 into base64 bytes for the adapter — so nothing spoken and no audio ever enters the event log; the

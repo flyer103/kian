@@ -597,6 +597,10 @@ change (§15).
   audio bytes, posts `voice: {base64, media_type, audio: true}` with an empty `text`, and maps the
   bridge's answer like any other send; `channel/delivered` gains `"voice": true`. The bytes are
   produced by the channel-edge voice decorator (ADR-067) — the adapter never synthesizes.
+- **Whether a turn speaks is the Router's choice, and text is the default.** The `reply_voice`
+  description states the rule: speak only when the user asked for a spoken reply — in that message
+  or as a standing instruction in the conversation — and use `reply` otherwise. The channel never
+  mirrors the inbound modality: a voice note is answered in text unless the user asks for voice.
 - **Long text** splits into ordered deliveries at ~2000 characters (never mid-codepoint, never
   dropping characters); each part is its own send, its own `client_id`, and therefore its own
   `channel/delivered` receipt. A failure after part *k* is a `DeliveryFailed` naming how many parts

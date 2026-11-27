@@ -791,7 +791,9 @@ honest per-item `error` that does not block admission. A payload without `media`
 byte-identically; an unconfigured `media:` section mounts no edge. Outbound audio is the iMessage
 channel's voice path ([ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)): `imessage.voice: true`
 mounts a `reply_voice` tool, the voice decorator on the channel edge synthesizes the utterance and
-rewrites the delivery into bytes, and every other channel still answers in text.
+rewrites the delivery into bytes, and every other channel still answers in text. An enabled voice
+path does not change the default: the tool is used only when the user asks for a spoken reply, and
+every other turn is text.
 
 Admission is per row, not per attachment: on the iMessage channel a page that renders more attachment
 placeholders than the attachments it delivered is a row mid-commit, and the adapter parks its
