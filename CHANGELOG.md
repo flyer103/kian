@@ -8,6 +8,16 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Self-dev runs: a proposal is admitted from a verified evidence pack
+  (`design/SELF-EVOLUTION-MODEL.md` §4–§5, ADR-069).**
+  `kian job run <job> --pack <dir> [--base <commit>] [--force]` verifies the package before
+  anything is written, freezes `job.selfdev` (pack directory, manifest and per-file digests, base
+  commit, `kian_version`) into the admitted input, and exits 2 with no run row when the pack does
+  not verify. A job whose plan declares `patch_paths_allowed` fails `invalid_job_input` without
+  that key, and the check parses the produced diff against the plan's `allow`/`deny` globs, so the
+  denial surface is frozen with the plan digest. The `consecutive_failures` limit (default 3) is a
+  breaker over the job's last run verdicts; `--force` admits once and records
+  `circuit_overridden: true`.
 - **iMessage voice replies are opt-in per request (ADR-067).** `reply_voice`'s description now
   states the default: the Router speaks only when the user asked for a spoken reply — in that
   message or as a standing instruction in the conversation — and replies with text otherwise; the

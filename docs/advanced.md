@@ -789,6 +789,68 @@ and `kian job status` all read the same fact.
 
 Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
 [ADR-052](../design/decisions/ADR-052-job-model.md).
+
+## Self-dev proposals (S1 propose)
+
+A self-dev run turns one verified evidence pack into a reviewable patch proposal. It is an
+ordinary job run: the pack is frozen into the run's `job.selfdev` key at admit, the patch is a
+step artifact, and a successful run means only that a patch exists inside the declared surface —
+not that it was merged.
+
+Produce the pack, then trigger the run:
+
+```bash
+target/debug/kian self evidence --session <uuid> --seq <n> --out evidence/incident --config kian.yaml
+target/debug/kian job run self-dev --pack evidence/incident --config kian.yaml --json
+```
+
+`--pack` verifies the package before anything is written (each file's sha256, the per-file digest
+fold and the manifest), then admits one manual slot. A pack that does not verify exits 2 with
+`evidence pack does not verify: <reason>` and leaves no run row. `--base <commit>` overrides the
+base commit recorded in `repo.json`; `--force` overrides the breaker below.
+
+The plan declares the denial surface, and it is frozen with the plan digest, so a run cannot
+widen it:
+
+```yaml
+jobs:
+  jobs:
+    - id: self-dev
+      limits: { deadline_ms: 3600000, max_parallel: 1, consecutive_failures: 3 }
+      plan:
+        steps:
+          - id: patch
+            action: agent
+            requires: [repo.kian]
+            produces: { name: patch, media: text, max_bytes: 262144 }
+            verify:
+              - check: artifact_within_cap
+                name: patch
+              - check: patch_paths_allowed
+                artifact: patch
+                allow: ["crates/**", "docs/**"]
+                deny: ["design/decisions/**", "AGENTS.md", "scripts/**"]
+            prompt: |
+              Read the evidence pack and the repository, then reply with a unified diff.
+          # the canonical plan also declares a deliver step that posts the proposal summary
+```
+
+`patch_paths_allowed` parses the diff the step produced: every path must be repository-relative
+(`..` segments, absolute paths and escapes out of the root fail), match at least one `allow` glob,
+match no `deny` glob (deny wins), and at least one path must be a non-test path. An unparsable
+diff, a patch that only touches tests, or a path outside the declared surface fails the check with
+the offending paths named, and the artifact stays on the stream for a human to read.
+
+The breaker refuses a run when the last `consecutive_failures` run verdicts of the job are all
+`failed`: nothing is written and the command exits 2 with `selfdev_circuit_open`. `--force` admits
+once and records `circuit_overridden: true` inside `job.selfdev`.
+
+`succeeded` means a proposal exists. It does not mean the bug is fixed, that the patch applies to
+a newer `main`, or that anyone reviewed it — landing stays with the owner.
+
+Semantics: [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); decision:
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md).
+
 ## Model profiles
 
 `model_profiles:` declares what a provider/model pair can do. A slot with no profile keeps the

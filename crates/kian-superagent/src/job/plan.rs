@@ -77,6 +77,15 @@ pub const MIN_DEADLINE_MS: u64 = 60_000;
 /// `limits.max_parallel` in v1 (§7.4 V10).
 pub const MAX_PARALLEL_V1: u32 = 1;
 
+/// How many consecutive failed runs close the manual-trigger breaker when a
+/// job does not declare `limits.consecutive_failures`
+/// (SELF-EVOLUTION-MODEL §10.2).
+pub const DEFAULT_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// The breaker ceiling: a larger streak is a deployment problem, not a knob
+/// (SELF-EVOLUTION-MODEL §14 V25).
+pub const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
 /// A job's plan, frozen: every default filled in, every id validated
 /// (§7.3). Serialising this struct *is* the canonical frozen form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +126,20 @@ pub struct JobLimits {
     /// (§12.2).
     #[serde(default = "default_inline_max_bytes")]
     pub inline_max_bytes: u64,
+    /// How many consecutive settled runs of this job may fail before a manual
+    /// trigger is refused (SELF-EVOLUTION-MODEL §10.2). Zero disables the
+    /// breaker; the value is part of the frozen plan, so a run cannot raise
+    /// it.
+    ///
+    /// The default is omitted from the frozen bytes, which keeps every
+    /// plan_digest written before this key existed valid: the frozen form
+    /// still spells out what the plan means, and "absent" means exactly the
+    /// default.
+    #[serde(
+        default = "default_consecutive_failures",
+        skip_serializing_if = "is_default_consecutive_failures"
+    )]
+    pub consecutive_failures: u32,
 }
 
 impl Default for JobLimits {
@@ -128,6 +151,7 @@ impl Default for JobLimits {
             accept_unverified: Vec::new(),
             defer_budget_ms: DEFAULT_DEFER_BUDGET_MS,
             inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+            consecutive_failures: DEFAULT_CONSECUTIVE_FAILURES,
         }
     }
 }
@@ -276,6 +300,18 @@ impl JobPlan {
     pub fn digest(&self) -> String {
         digest_json(&self.frozen_json())
     }
+
+    /// Whether the plan declares a patch surface, which is what makes its runs
+    /// self-dev runs that require a verified evidence pack
+    /// (SELF-EVOLUTION-MODEL §14 V24).
+    #[must_use]
+    pub fn declares_surface(&self) -> bool {
+        self.steps.iter().any(|step| {
+            step.verify
+                .iter()
+                .any(|check| matches!(check, JobCheck::PatchPathsAllowed { .. }))
+        })
+    }
 }
 
 /// What a step does (§2.2).
@@ -397,6 +433,20 @@ pub enum JobCheck {
         #[serde(default)]
         target: Value,
     },
+    /// The patch artifact changes only paths inside the declared surface
+    /// (SELF-EVOLUTION-MODEL §5.3, A13).
+    PatchPathsAllowed {
+        /// The artifact holding the unified diff; it must be produced by the
+        /// step that declares the check.
+        artifact: String,
+        /// Repository-relative globs every changed path must match at least
+        /// one of.
+        #[serde(default)]
+        allow: Vec<String>,
+        /// Repository-relative globs no changed path may match.
+        #[serde(default)]
+        deny: Vec<String>,
+    },
 }
 
 impl JobCheck {
@@ -410,6 +460,7 @@ impl JobCheck {
             Self::MinToolResults { .. } => "min_tool_results",
             Self::ArtifactWithinCap { .. } => "artifact_within_cap",
             Self::DeliveryReceipt { .. } => "delivery_receipt",
+            Self::PatchPathsAllowed { .. } => "patch_paths_allowed",
         }
     }
 
@@ -428,7 +479,9 @@ impl JobCheck {
             Self::MinToolResults { n } => {
                 Some(kian_loop::evidence::CheckSpec::MinToolResults { n })
             }
-            Self::ArtifactWithinCap { .. } | Self::DeliveryReceipt { .. } => None,
+            Self::ArtifactWithinCap { .. }
+            | Self::DeliveryReceipt { .. }
+            | Self::PatchPathsAllowed { .. } => None,
         }
     }
 }
@@ -708,6 +761,16 @@ fn validate_limits(plan: &JobPlan, out: &mut Vec<PlanViolation>) {
             format!("must be in 1..={MAX_ARTIFACT_BYTES}"),
         ));
     }
+    if limits.consecutive_failures > MAX_CONSECUTIVE_FAILURES {
+        out.push(violation(
+            "V25",
+            "limits.consecutive_failures",
+            format!(
+                "a breaker streak is at most {MAX_CONSECUTIVE_FAILURES}, found {}",
+                limits.consecutive_failures
+            ),
+        ));
+    }
 }
 
 fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<PlanViolation>) {
@@ -856,6 +919,7 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
         }
     }
 
+    let mut patch_checks = 0_usize;
     for (at, check) in step.verify.iter().enumerate() {
         let at_path = format!("{path}.verify[{at}]");
         match check {
@@ -871,13 +935,88 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
                     "delivery_receipt names the channel that must have delivered",
                 ))
             }
+            JobCheck::PatchPathsAllowed {
+                artifact,
+                allow,
+                deny,
+            } => {
+                patch_checks += 1;
+                validate_surface(&at_path, artifact, allow, deny, step, out);
+            }
             _ => {}
         }
+    }
+
+    if patch_checks > 1 {
+        out.push(violation(
+            "V23",
+            format!("{path}.verify"),
+            "a step declares at most one patch_paths_allowed check",
+        ));
     }
 
     for (at, worker) in step.prefer.iter().enumerate() {
         validate_prefer_entry(&format!("{path}.prefer[{at}]"), worker, out);
     }
+}
+
+fn validate_surface(
+    path: &str,
+    artifact: &str,
+    allow: &[String],
+    deny: &[String],
+    step: &StepPlan,
+    out: &mut Vec<PlanViolation>,
+) {
+    let produced = step.produces.as_ref().map(|spec| spec.name.as_str());
+    if produced != Some(artifact) {
+        out.push(violation(
+            "V23",
+            format!("{path}.artifact"),
+            format!("patch_paths_allowed names {artifact:?}, which this step does not produce"),
+        ));
+    }
+    if allow.is_empty() {
+        out.push(violation(
+            "V23",
+            format!("{path}.allow"),
+            "the surface declares at least one allow glob",
+        ));
+    }
+    if deny.is_empty() {
+        out.push(violation(
+            "V23",
+            format!("{path}.deny"),
+            "the surface declares its deny globs, so the forbidden paths are frozen with the plan",
+        ));
+    }
+    for (at, entry) in allow.iter().enumerate() {
+        if !valid_surface_glob(entry) {
+            out.push(violation(
+                "V23",
+                format!("{path}.allow[{at}]"),
+                format!("not a repository-relative glob: {entry:?}"),
+            ));
+        }
+    }
+    for (at, entry) in deny.iter().enumerate() {
+        if !valid_surface_glob(entry) {
+            out.push(violation(
+                "V23",
+                format!("{path}.deny[{at}]"),
+                format!("not a repository-relative glob: {entry:?}"),
+            ));
+        }
+    }
+}
+
+fn valid_surface_glob(entry: &str) -> bool {
+    if entry.trim().is_empty() || entry.starts_with('/') || entry.contains('\\') {
+        return false;
+    }
+    entry
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != ".." && segment != ".")
 }
 
 fn validate_deliver(path: &str, plan: &JobPlan, step: &StepPlan, out: &mut Vec<PlanViolation>) {
@@ -1114,6 +1253,14 @@ const fn default_max_parallel() -> u32 {
 
 const fn default_defer_budget_ms() -> u64 {
     DEFAULT_DEFER_BUDGET_MS
+}
+
+const fn default_consecutive_failures() -> u32 {
+    DEFAULT_CONSECUTIVE_FAILURES
+}
+
+const fn is_default_consecutive_failures(value: &u32) -> bool {
+    *value == DEFAULT_CONSECUTIVE_FAILURES
 }
 
 const fn default_inline_max_bytes() -> u64 {
@@ -1635,6 +1782,130 @@ mod tests {
     /// The same plan's frozen bytes as they ship today: the fixture the
     /// digest is pinned against.
     const GOLDEN_CANONICAL: &str = r#"{"id":"digest","limits":{"accept_unverified":[],"deadline_ms":1800000,"defer_budget_ms":300000,"inline_max_bytes":65536,"max_parallel":1,"prefer":[]},"steps":[{"action":"agent","allow_offline":false,"depends_on":[],"effect":"read","id":"fetch","idempotent":false,"inputs":[],"on_failure":"halt","optional":false,"prefer":[],"prompt":"fetch the news","requires":[],"retries":0,"timeout_ms":300000,"verify":[{"check":"final_message_present"}]}]}"#;
+
+    fn patch_check(allow: serde_json::Value, deny: serde_json::Value) -> serde_json::Value {
+        json!({"check": "patch_paths_allowed", "artifact": "patch", "allow": allow, "deny": deny})
+    }
+
+    #[test]
+    fn v23_accepts_a_frozen_surface() {
+        let plan = plan(json!({
+            "id": "self-dev",
+            "steps": [{
+                "id": "patch",
+                "action": "agent",
+                "prompt": "write the patch",
+                "produces": {"name": "patch"},
+                "verify": [patch_check(
+                    json!(["crates/**", "docs/**"]),
+                    json!(["design/decisions/**", "**/*.pem"])
+                )]
+            }]
+        }));
+        assert!(
+            validate_plan(&plan).is_empty(),
+            "{:?}",
+            validate_plan(&plan)
+        );
+        assert_eq!(plan.steps[0].verify[0].name(), "patch_paths_allowed");
+        assert!(plan.steps[0].verify[0].to_check_spec().is_none());
+        assert!(plan.frozen_json()["steps"][0]["verify"][0]["allow"].is_array());
+    }
+
+    #[test]
+    fn v23_refuses_a_surface_that_names_an_unproduced_artifact() {
+        let plan = plan(json!({
+            "id": "self-dev",
+            "steps": [{
+                "id": "patch",
+                "action": "agent",
+                "prompt": "write the patch",
+                "produces": {"name": "diff"},
+                "verify": [patch_check(json!(["crates/**"]), json!(["**/*.pem"]))]
+            }]
+        }));
+        assert_eq!(rules(&plan), vec!["V23"]);
+        assert!(
+            validate_plan(&plan)[0]
+                .to_string()
+                .contains("does not produce")
+        );
+    }
+
+    #[test]
+    fn v23_requires_both_glob_lists_and_repository_relative_entries() {
+        for (allow, deny) in [
+            (json!([]), json!(["**/*.pem"])),
+            (json!(["crates/**"]), json!([])),
+            (json!(["/etc/**"]), json!(["**/*.pem"])),
+            (json!(["crates/../etc/**"]), json!(["**/*.pem"])),
+            (json!(["crates/**"]), json!(["../**"])),
+        ] {
+            let plan = plan(json!({
+                "id": "self-dev",
+                "steps": [{
+                    "id": "patch",
+                    "action": "agent",
+                    "prompt": "write the patch",
+                    "produces": {"name": "patch"},
+                    "verify": [patch_check(allow.clone(), deny.clone())]
+                }]
+            }));
+            assert_eq!(rules(&plan), vec!["V23"], "{allow} {deny}");
+        }
+    }
+
+    #[test]
+    fn v23_allows_one_surface_per_step() {
+        let plan = plan(json!({
+            "id": "self-dev",
+            "steps": [{
+                "id": "patch",
+                "action": "agent",
+                "prompt": "write the patch",
+                "produces": {"name": "patch"},
+                "verify": [
+                    patch_check(json!(["crates/**"]), json!(["**/*.pem"])),
+                    patch_check(json!(["docs/**"]), json!(["**/*.pem"]))
+                ]
+            }]
+        }));
+        assert_eq!(rules(&plan), vec!["V23"]);
+        assert!(validate_plan(&plan)[0].message.contains("at most one"));
+    }
+
+    #[test]
+    fn v25_bounds_the_breaker_streak() {
+        let with_breaker = |value: u32| {
+            plan(json!({
+                "id": "self-dev",
+                "limits": {"consecutive_failures": value},
+                "steps": [{
+                    "id": "patch",
+                    "action": "agent",
+                    "prompt": "p",
+                    "verify": [{"check": "final_message_present"}]
+                }]
+            }))
+        };
+        assert!(validate_plan(&with_breaker(0)).is_empty());
+        assert!(validate_plan(&with_breaker(10)).is_empty());
+        assert_eq!(rules(&with_breaker(11)), vec!["V25"]);
+
+        assert_eq!(
+            minimal().limits.consecutive_failures,
+            DEFAULT_CONSECUTIVE_FAILURES
+        );
+        assert!(
+            minimal().frozen_json()["limits"]
+                .get("consecutive_failures")
+                .is_none()
+        );
+        assert_eq!(
+            with_breaker(4).frozen_json()["limits"]["consecutive_failures"],
+            json!(4)
+        );
+    }
 
     /// JOB-MODEL §18.4: the golden fixture. Frozen bytes are a compatibility
     /// surface: a stored `plan_digest` must keep meaning the same plan, so an
