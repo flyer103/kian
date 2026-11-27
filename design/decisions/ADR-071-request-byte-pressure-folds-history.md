@@ -130,4 +130,7 @@ summary) and ADR-068 would refuse it honestly.
   measured 289,450-byte body over a 250,000-byte bound (six image parts before the fold, four
   after).
 - L3 (production): with the bound at the carrier's inbound limit, a photo burst folds instead of
-  wedging; the session keeps answering. Not run with this phase.
+  wedging and the session keeps answering. Verified on the resident Router with real channel
+  pictures: a rendered body of 34,186,459 bytes over the 33,554,432-byte bound folded 121 messages
+  (seq 1–192) and the next request carried 5.5 MB; turns and deliveries continued afterwards and the
+  retained tail still carried image parts.
