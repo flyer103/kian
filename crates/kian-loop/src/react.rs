@@ -1372,17 +1372,24 @@ impl Inner {
             };
         }
         let body = plan.body.clone();
+        // ADR-073: the persisted body renders images by reference; the wire
+        // body below is what flies and what `body_sha256` covers.
+        let (audit_body, body_form) = plan.audit();
         let mut step_payload = json!({
             "slot": self.config.slot.0,
             "provider": target.provider,
             "model": target.model,
             "iteration": iteration,
-            "body": body,
+            "body": audit_body,
             "body_version": plan.body_version,
             "dialect": plan.dialect,
             "body_sha256": plan.body_sha256.clone(),
+            "body_bytes": plan.body_bytes,
             "estimate": plan.estimate.clone(),
         });
+        if let Some(form) = body_form {
+            step_payload["body_form"] = json!(form);
+        }
         if let Some(digest) = &plan.profile_digest {
             step_payload["profile_digest"] = json!(digest);
         }
@@ -1873,18 +1880,23 @@ impl Inner {
 
         ctx.begin_turn_with(json!({"iteration": iteration, "purpose": "compact"}))
             .await?;
+        let (audit_body, body_form) = request.audit();
         let mut step_payload = json!({
             "slot": self.config.slot.0,
             "provider": target.provider,
             "model": target.model,
             "iteration": iteration,
             "purpose": "compact",
-            "body": request.body.clone(),
+            "body": audit_body,
             "body_version": request.body_version,
             "dialect": request.dialect,
             "body_sha256": request.body_sha256,
+            "body_bytes": request.body_bytes,
             "estimate": request.estimate,
         });
+        if let Some(form) = body_form {
+            step_payload["body_form"] = json!(form);
+        }
         if let Some(digest) = &request.profile_digest {
             step_payload["profile_digest"] = json!(digest);
         }

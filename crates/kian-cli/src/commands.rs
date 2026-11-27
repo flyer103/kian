@@ -1,6 +1,7 @@
-//! The operational session commands: `inspect` / `replay` /
-//! `export` / `wake-now` / `lease inspect` / `recovery budget reset`
-//! (SPEC §3.2), plus `tickets` — the Ticket stage board.
+//! The operational session commands: `inspect` / `request` /
+//! `replay` / `export` / `wake-now` / `lease inspect` /
+//! `recovery budget reset` (SPEC §3.2), plus `tickets` — the Ticket
+//! stage board.
 //!
 //! Two access modes, by card design:
 //!
@@ -36,6 +37,22 @@
 //!     "pending_eligible_inputs": 0, "pending_control_inputs": 0 }
 //! }
 //! ```
+//!
+//! **`session request <id> --seq <n> [--expand]`**
+//! ```json
+//! {
+//!   "session": "<uuid>", "seq": 227, "kind": "step/request|slot/fallback",
+//!   "slot": "<slot>", "provider": "<name>", "model": "<model>",
+//!   "iteration": 0, "body_form": "artifact_refs" | null,
+//!   "body_bytes": 18986123, "stored_bytes": 5123,
+//!   "body_sha256": "<hex>", "expanded": false, "references": 0,
+//!   "body": { "model": "…", "messages": [ … ] }
+//! }
+//! ```
+//! `body_bytes` is the wire size the digest covers; `stored_bytes` is the
+//! persisted form (smaller when images are held by reference, ADR-073).
+//! `--expand` rebuilds the wire body from the blob store and only succeeds
+//! when the rebuild reproduces `body_sha256`.
 //!
 //! **`session replay <id>`** (re-derives everything from events; with
 //! `--url` additionally diffs the derived state against the live
@@ -358,6 +375,133 @@ pub async fn run_inspect(
 }
 
 // ---------------------------------------------------------------------------
+// session request — one persisted model request, in its stored form
+// ---------------------------------------------------------------------------
+
+/// `kian session request <id> --seq <n> [--expand]`: one persisted model
+/// request exactly as the stream stores it (ADR-073). An image-bearing
+/// body is stored with `artifact:<sha256>` references instead of base64;
+/// `--expand` rebuilds the wire body from the blob store and verifies the
+/// rebuild against `body_sha256`, so a reconstruction is never silently
+/// partial or silently different. A reclaimed blob is reported by id, not
+/// guessed around.
+pub async fn run_session_request(
+    config_path: &Path,
+    db: Option<&Path>,
+    session: SessionId,
+    seq: u64,
+    expand: bool,
+    json: bool,
+) -> CmdResult<String> {
+    let db = resolve_db(db, config_path)?;
+    let store = open_reader(&db).await?;
+    let events = rebuild_session(&store, session).await?;
+    store.close().await;
+    let Some(event) = events.iter().find(|e| e.seq == seq) else {
+        let last = events.last().map_or(0, |e| e.seq);
+        return Err(format!(
+            "no event at seq {seq} for session {} (stream covers 1..={last})",
+            session.0
+        ));
+    };
+    if !matches!(event.kind, EventKind::StepRequest | EventKind::SlotFallback) {
+        return Err(format!(
+            "seq {seq} is a `{}` event, not a model request (`step/request` or `slot/fallback`)",
+            event.kind.as_str()
+        ));
+    }
+    let recorded = &event.bytes;
+    let body = recorded
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| recorded.clone());
+    let stored_bytes = kian_llm::provider::serialize_request_body(&body)
+        .map_err(|e| format!("request body: {e}"))?
+        .len() as u64;
+    let wire_bytes = recorded
+        .get("body_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(stored_bytes);
+    let body_sha256 = recorded.get("body_sha256").and_then(Value::as_str);
+    let body_form = recorded.get("body_form").and_then(Value::as_str);
+    let slot = recorded.get("slot").and_then(Value::as_str);
+    let provider = recorded.get("provider").and_then(Value::as_str);
+    let model = recorded.get("model").and_then(Value::as_str);
+    let iteration = recorded.get("iteration").and_then(Value::as_u64);
+    let (shown, references) = if expand {
+        let (expanded, references) = expand_request_body(config_path, &body, body_sha256)?;
+        (expanded, references)
+    } else {
+        (body, 0)
+    };
+    if !json {
+        let mut line = format!("kian: request seq {seq} ({})", event.kind.as_str());
+        if let Some(slot) = slot {
+            line.push_str(&format!(", slot {slot}"));
+        }
+        line.push_str(&format!(": stored {stored_bytes} B, wire {wire_bytes} B"));
+        if expand {
+            line.push_str(&format!(
+                ", {references} image part(s) reconstructed from the blob store, body_sha256 verified"
+            ));
+        } else if body_form.is_some() {
+            line.push_str(", images held by reference (--expand rebuilds them)");
+        } else {
+            line.push_str(", no image parts");
+        }
+        eprintln!("{line}");
+    }
+    if json {
+        let report = json!({
+            "session": session.0.to_string(),
+            "seq": seq,
+            "kind": event.kind.as_str(),
+            "slot": slot,
+            "provider": provider,
+            "model": model,
+            "iteration": iteration,
+            "body_form": body_form,
+            "body_bytes": wire_bytes,
+            "stored_bytes": stored_bytes,
+            "body_sha256": body_sha256,
+            "expanded": expand,
+            "references": references,
+            "body": shown,
+        });
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    let mut text = serde_json::to_string_pretty(&shown).map_err(|e| e.to_string())?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// Rebuilds a request body's wire form from the configured blob store
+/// (ADR-073). The artifacts section is required: a body that names blobs
+/// can only be expanded by the store that holds them, and an absent
+/// section means the operator pointed this at the wrong config.
+fn expand_request_body(
+    config_path: &Path,
+    body: &Value,
+    body_sha256: Option<&str>,
+) -> CmdResult<(Value, usize)> {
+    let config = crate::config::ServeConfig::load(config_path)
+        .map_err(|e| format!("--expand: config: {e}"))?;
+    let artifacts = config.artifacts.as_ref().ok_or_else(|| {
+        "--expand requires an `artifacts:` section — no blob store is configured".to_string()
+    })?;
+    let dir = artifacts
+        .resolve_dir(&config.storage)
+        .map_err(|e| format!("--expand: {e}"))?;
+    let store =
+        kian_store::ArtifactStore::open(dir).map_err(|e| format!("--expand: open store: {e}"))?;
+    let expansion = kian_llm::plan::expand_audit_body(body, body_sha256, |id| {
+        store.get(id).map_err(|e| e.to_string())
+    })
+    .map_err(|e| format!("--expand: {e}"))?;
+    Ok((expansion.body, expansion.references))
+}
+
+// ---------------------------------------------------------------------------
 // session replay — re-derive everything, diff against the live projection
 // ---------------------------------------------------------------------------
 
@@ -376,10 +520,10 @@ pub struct ModelContextCheck {
     pub byte_identical: u64,
     /// Requests whose recorded body carries dialect content parts
     /// (ADR-063 vision). Their per-message bytes are not re-derivable
-    /// offline — the image data URLs live only in the recorded body, and
-    /// the event stream deliberately holds artifact references, not
-    /// base64 — so they are counted here and left out of the byte diff
-    /// instead of being reported as mismatches.
+    /// offline — the pixels live in the artifact store, the persisted body
+    /// names them by reference (ADR-073), and the stream's input rows carry
+    /// the carrier references — so they are counted here and left out of
+    /// the byte diff instead of being reported as mismatches.
     pub vision_requests: u64,
     pub mismatches: Vec<ContextMismatch>,
 }

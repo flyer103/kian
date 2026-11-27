@@ -53,6 +53,8 @@ const USAGE: &str = "usage:
                                          priced usage from the config price book
   kian session inspect <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          projection + counters
+  kian session request <uuid> --seq <n> [--expand] [--db <sqlite>] [--config <path>] [--json]
+                                         one persisted model request (--expand rebuilds its image bodies)
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
                                          re-derive everything from events
   kian session replay <uuid> --provider fake --script <file> [--from-seq <n>] [--keep-fork]
@@ -649,6 +651,11 @@ struct SessionArgs {
     script: Option<std::path::PathBuf>,
     from_seq: Option<u64>,
     keep_fork: bool,
+    /// `session request --seq <n>` — which persisted request to render.
+    seq: Option<u64>,
+    /// `session request --expand` — rebuild the wire body from the blob
+    /// store and verify it against the recorded digest (ADR-073).
+    expand: bool,
 }
 
 impl Default for SessionArgs {
@@ -669,6 +676,8 @@ impl Default for SessionArgs {
             script: None,
             from_seq: None,
             keep_fork: false,
+            seq: None,
+            expand: false,
         }
     }
 }
@@ -730,7 +739,16 @@ fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, S
                 }
                 None => return Err(format!("--from-seq requires a seq number ({usage_for})")),
             },
+            "--seq" => match iter.next() {
+                Some(raw) => {
+                    out.seq = Some(raw.parse().map_err(|_| {
+                        format!("--seq requires an event seq, got `{raw}` ({usage_for})")
+                    })?)
+                }
+                None => return Err(format!("--seq requires a seq number ({usage_for})")),
+            },
             "--keep-fork" => out.keep_fork = true,
+            "--expand" => out.expand = true,
             "--json" => out.json = true,
             "--with-event-ids" => out.with_event_ids = true,
             "--with-artifacts" => out.with_artifacts = true,
@@ -776,7 +794,7 @@ fn run_command(
 fn session(args: &[String]) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
         eprintln!(
-            "kian: `session` requires a subcommand (inspect, replay, export, import)\n{USAGE}"
+            "kian: `session` requires a subcommand (inspect, request, replay, export, import)\n{USAGE}"
         );
         return ExitCode::from(2);
     };
@@ -843,6 +861,29 @@ fn session(args: &[String]) -> ExitCode {
             ),
             "session inspect",
         ),
+        "request" => {
+            let Some(seq) = parsed.seq else {
+                eprintln!("kian: session request requires --seq <n>\n{USAGE}");
+                return ExitCode::from(2);
+            };
+            if parsed.with_artifacts || parsed.with_event_ids {
+                eprintln!(
+                    "kian: --with-artifacts and --with-event-ids belong to `session export`\n{USAGE}"
+                );
+                return ExitCode::from(2);
+            }
+            run_command(
+                kian_cli::commands::run_session_request(
+                    &parsed.config,
+                    parsed.db.as_deref(),
+                    session,
+                    seq,
+                    parsed.expand,
+                    parsed.json,
+                ),
+                "session request",
+            )
+        }
         "replay" => match parsed.provider.as_deref() {
             None => {
                 if parsed.script.is_some() || parsed.from_seq.is_some() || parsed.keep_fork {

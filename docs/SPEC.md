@@ -841,9 +841,11 @@ exactly those messages to OpenAI content parts (`[{"type":"text","text":...},{"t
 every image-free V2 body keep their exact bytes, because the image field is `#[serde(skip)]`. At
 most 4 images per message and 8 MiB per image; a missing, oversized or malformed reference drops
 that image with a warning and the text envelope still reaches the model (a reclaimed blob degrades
-the answer, never fails the turn). The exact base64 bytes are persisted on `step/request` by
-persist-what-you-send; an offline replay cannot re-derive them from the stream alone, so
-`kian session replay` counts such requests as vision requests instead of byte-identity mismatches.
+the answer, never fails the turn). The persisted `step/request` proves the exact bytes without
+copying the pixels again: `body_sha256` covers the wire body and each image part is recorded as a
+content-addressed reference (ADR-073). An offline replay still cannot re-derive the base64 from the
+stream alone, so `kian session replay` counts such requests as vision requests instead of
+byte-identity mismatches.
 
 The contract is [ADR-063](../design/decisions/ADR-063-vision-content-parts.md); the artifacts are
 ADR-056; the profile knob is ADR-054; the placement is [design/DESIGN.md](../design/DESIGN.md) §3.2.
@@ -910,6 +912,39 @@ The contract is
 Non-goals recorded with this slice: no retroactive eviction of history pixels, no downscale, no
 dedupe, no per-image cache. Growth across turns is stopped by the provider's `max_request_bytes`
 (ADR-068) and the byte-pressure fold it authorizes (ADR-072), not here.
+
+### Request audit bodies by reference (ADR-073)
+
+Scope: bound what the audit record of a request costs while keeping the exact bytes identifiable
+and verifiable.
+
+Semantics: on a vision target the persisted `step/request` body — and the `slot/fallback` attempt
+copy — renders each image part as `{"type":"image_url","image_url":{"url":"artifact:<sha256-hex>",
+"media_type":<IANA type>,"size":<u64>}}` and carries `"body_form":"artifact_refs"` plus
+`"body_bytes":<u64>`, the length of the wire body. The wire body is unchanged: the provider still
+receives `data:` URL parts and `body_sha256` stays the digest of those exact bytes; a body with no
+image carries no `body_form` and keeps its bytes. The reference is the artifact store's own address
+(the lowercase sha256 hex of the image bytes), derived from bytes the loop already holds, so
+rendering it reads no store and stays deterministic across replay. `kian session request <uuid>
+--seq <n> [--expand]` prints the stored payload; `--expand` re-reads each blob, requires
+`sha256(blob) == id`, rebuilds the exact `data:` URL and verifies the result against
+`body_sha256`, failing by id when a blob is gone. The live blob store stays disposable (ADR-056):
+a durable copy is what `kian session export --with-artifacts` produces, pinning every blob a request
+body references beside the JSONL. A reclaimed blob leaves the identity, media type, size and digest
+in place, never fabricated bytes. Replay keeps counting content-part requests as vision requests; no
+consumer re-derives from the store on that path.
+
+The contract is
+[ADR-073](../design/decisions/ADR-073-request-audit-bodies-by-reference.md); the rendering is
+ADR-063, the store ADR-056.
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| Audit | kian-llm, kian-loop, kian-cli | reference-rendered request bodies (`body_form`, `body_bytes`) for both append sites and the fallback copy, the verified `session request --expand` reader, export pinning of request references | landed (L1/L2) |
+
+Non-goals recorded with this slice: no rewrite of existing inline events (append-only), no per-image
+dedupe beyond content addressing, no reference-aware GC (retention stays policy), no re-derivation in
+`kian session replay`, no change to the wire bytes or to any gate's reading.
 
 ### Resident rotation (ADR-040)
 
