@@ -50,8 +50,9 @@ already holds, and that rendering is exactly what `body_sha256` (ADR-054) and th
 5. **Reconstruction is one named surface, and it verifies.**
    `kian session request <uuid> --seq <n> [--expand] [--json]` prints the stored payload;
    `--expand` reads each referenced blob, requires `sha256(blob) == id`, rebuilds the exact `data:`
-   URL, and checks the rebuilt body against `body_sha256`. A missing blob is reported by id and the
-   command fails — a reconstruction is never silently partial.
+   URL, and checks the resulting body — rebuilt or already inline — against `body_sha256`, so the
+   command either reproduces the recorded bytes or names why it cannot. A missing blob is reported
+   by id and the command fails — a reconstruction is never silently partial.
 6. **Durability moves to the export.** The live blob store stays disposable (ADR-056 decision 6: no
    reference counts, retention GC reaps). `kian session export --with-artifacts` already pins the
    blobs a stream references (`referenced_artifact_ids`); it now also collects the ids a request

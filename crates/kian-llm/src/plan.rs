@@ -402,7 +402,8 @@ pub struct Expansion {
 /// the recorded size; then the whole result must reproduce `body_sha256`, so a
 /// reconstruction is never silently partial or silently different. Inline
 /// `data:` parts pass through unchanged, which keeps the call safe on a body
-/// that mixes forms.
+/// that mixes forms and still checks the digest of a body stored inline
+/// before ADR-073.
 pub fn expand_audit_body(
     body: &Value,
     body_sha256: Option<&str>,
@@ -465,9 +466,7 @@ pub fn expand_audit_body(
             }
         }
     }
-    if references > 0
-        && let Some(expected) = body_sha256
-    {
+    if let Some(expected) = body_sha256 {
         let bytes = serialize_request_body(&expanded).map_err(|e| AuditError::Malformed {
             part: e.to_string(),
         })?;
@@ -727,6 +726,24 @@ mod tests {
         .unwrap();
         assert_eq!(expansion.references, 1);
         assert_eq!(expansion.body, plan.body);
+    }
+
+    #[test]
+    fn an_inline_body_still_checks_the_recorded_digest() {
+        let plan = vision_plan();
+        let wire = serialize_request_body(&plan.body).unwrap();
+        let digest = sha256_hex(&wire);
+        let expansion = expand_audit_body(&plan.body, Some(&digest), |_| {
+            panic!("an inline body names no blob")
+        })
+        .unwrap();
+        assert_eq!(expansion.references, 0);
+        assert_eq!(expansion.body, plan.body);
+        let err = expand_audit_body(&plan.body, Some("00"), |_| unreachable!()).unwrap_err();
+        match err {
+            AuditError::DigestMismatch { expected, .. } => assert_eq!(expected, "00"),
+            other => panic!("expected a digest mismatch, got {other:?}"),
+        }
     }
 
     #[test]

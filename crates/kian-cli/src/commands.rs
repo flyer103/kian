@@ -428,6 +428,7 @@ pub async fn run_session_request(
     let provider = recorded.get("provider").and_then(Value::as_str);
     let model = recorded.get("model").and_then(Value::as_str);
     let iteration = recorded.get("iteration").and_then(Value::as_u64);
+    let image_parts = stored_image_parts(&body);
     let (shown, references) = if expand {
         let (expanded, references) = expand_request_body(config_path, &body, body_sha256)?;
         (expanded, references)
@@ -435,21 +436,21 @@ pub async fn run_session_request(
         (body, 0)
     };
     if !json {
-        let mut line = format!("kian: request seq {seq} ({})", event.kind.as_str());
-        if let Some(slot) = slot {
-            line.push_str(&format!(", slot {slot}"));
-        }
-        line.push_str(&format!(": stored {stored_bytes} B, wire {wire_bytes} B"));
-        if expand {
-            line.push_str(&format!(
-                ", {references} image part(s) reconstructed from the blob store, body_sha256 verified"
-            ));
-        } else if body_form.is_some() {
-            line.push_str(", images held by reference (--expand rebuilds them)");
-        } else {
-            line.push_str(", no image parts");
-        }
-        eprintln!("{line}");
+        eprintln!(
+            "{}",
+            request_headline(&RequestFacts {
+                seq,
+                kind: event.kind.as_str(),
+                slot,
+                stored_bytes,
+                wire_bytes,
+                expand,
+                references,
+                image_parts,
+                by_reference: body_form.is_some(),
+                digest: body_sha256.is_some(),
+            })
+        );
     }
     if json {
         let report = json!({
@@ -473,6 +474,85 @@ pub async fn run_session_request(
     let mut text = serde_json::to_string_pretty(&shown).map_err(|e| e.to_string())?;
     text.push('\n');
     Ok(text)
+}
+
+/// How many image parts the persisted body holds, whatever form they take.
+fn stored_image_parts(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|m| m.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|part| part.get("image_url").is_some())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// What `session request` reports about one persisted request (ADR-073).
+struct RequestFacts<'a> {
+    seq: u64,
+    kind: &'a str,
+    slot: Option<&'a str>,
+    stored_bytes: u64,
+    wire_bytes: u64,
+    expand: bool,
+    references: usize,
+    image_parts: usize,
+    by_reference: bool,
+    digest: bool,
+}
+
+/// The one-line summary printed on stderr, phrased so it never claims a
+/// verification that did not happen: `--expand` always checks the recorded
+/// digest, and a body stored inline before ADR-073 has nothing to rebuild.
+fn request_headline(facts: &RequestFacts<'_>) -> String {
+    let RequestFacts {
+        seq,
+        kind,
+        slot,
+        stored_bytes,
+        wire_bytes,
+        expand,
+        references,
+        image_parts,
+        by_reference,
+        digest,
+    } = *facts;
+    let mut line = format!("kian: request seq {seq} ({kind})");
+    if let Some(slot) = slot {
+        line.push_str(&format!(", slot {slot}"));
+    }
+    line.push_str(&format!(": stored {stored_bytes} B, wire {wire_bytes} B"));
+    let checked = if digest {
+        ", body_sha256 verified"
+    } else {
+        ", no body_sha256 recorded"
+    };
+    if expand {
+        if references > 0 {
+            line.push_str(&format!(
+                ", {references} image part(s) reconstructed from the blob store{checked}"
+            ));
+        } else if image_parts > 0 {
+            line.push_str(&format!(
+                ", the stored body is inline (stored before ADR-073), nothing to rebuild{checked}"
+            ));
+        } else {
+            line.push_str(&format!(", no image parts{checked}"));
+        }
+    } else if by_reference {
+        line.push_str(", images held by reference (--expand rebuilds them)");
+    } else if image_parts > 0 {
+        line.push_str(&format!(
+            ", {image_parts} image part(s) inline in the stored body"
+        ));
+    } else {
+        line.push_str(", no image parts");
+    }
+    line
 }
 
 /// Rebuilds a request body's wire form from the configured blob store
@@ -3121,7 +3201,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        board_event_kind_names, check_model_context, import_jsonl, is_board_event, run_export,
+        RequestFacts, board_event_kind_names, check_model_context, import_jsonl, is_board_event,
+        request_headline, run_export, stored_image_parts,
     };
 
     /// R9-10: the store-side kind strings, the Rust-side membership
@@ -4275,5 +4356,68 @@ mod tests {
             format!("session             {}\nnotes               0\n", bare.0)
         );
         cleanup(&path);
+    }
+
+    fn headline(facts: (bool, usize, usize, bool, bool)) -> String {
+        let (expand, references, image_parts, by_reference, digest) = facts;
+        request_headline(&RequestFacts {
+            seq: 227,
+            kind: "step/request",
+            slot: Some("router"),
+            stored_bytes: 5123,
+            wire_bytes: 18_986_123,
+            expand,
+            references,
+            image_parts,
+            by_reference,
+            digest,
+        })
+    }
+
+    #[test]
+    fn the_request_headline_says_what_it_actually_checked() {
+        assert_eq!(
+            headline((false, 0, 18, true, true)),
+            "kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, images held by reference (--expand rebuilds them)"
+        );
+        assert_eq!(
+            headline((true, 18, 18, true, true)),
+            "kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, 18 image part(s) reconstructed from the blob store, body_sha256 verified"
+        );
+        assert_eq!(
+            headline((true, 0, 18, false, true)),
+            "kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, the stored body is inline (stored before ADR-073), nothing to rebuild, body_sha256 verified"
+        );
+        assert_eq!(
+            headline((true, 0, 0, false, true)),
+            "kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, no image parts, body_sha256 verified"
+        );
+        assert!(
+            headline((true, 0, 0, false, false))
+                .ends_with(", no image parts, no body_sha256 recorded"),
+            "a request with no recorded digest must not claim a verification"
+        );
+        assert!(
+            headline((false, 0, 18, false, true))
+                .ends_with(", 18 image part(s) inline in the stored body"),
+            "a pre-ADR-073 body keeps its pixels inline; the headline must not call that an empty request"
+        );
+    }
+
+    #[test]
+    fn image_parts_are_counted_wherever_they_appear() {
+        let body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "one"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+            ]},
+            {"role": "user", "content": "plain text"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "artifact:abc", "media_type": "image/png"}},
+            ]},
+        ]});
+        assert_eq!(stored_image_parts(&body), 2);
+        assert_eq!(stored_image_parts(&json!({"messages": []})), 0);
+        assert_eq!(stored_image_parts(&json!({"model": "m"})), 0);
     }
 }

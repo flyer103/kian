@@ -1247,7 +1247,7 @@ picture-heavy session stops writing megabytes into the log on every turn:
 
 ```console
 $ kian session request 0f9c2a11-… --seq 227 --expand > wire.json
-kian: request seq 227 (step/request, slot router): stored 5123 B, wire 18986123 B, 18 image part(s) reconstructed from the blob store, body_sha256 verified
+kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, 18 image part(s) reconstructed from the blob store, body_sha256 verified
 ```
 
 `--expand` reads each referenced blob, re-checks it against its id and verifies the rebuilt body
