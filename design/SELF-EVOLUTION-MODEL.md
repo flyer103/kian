@@ -569,17 +569,12 @@ Non-goals for S1 and S2: automatic merge; deployment; cross-repository changes; 
 to "judge" a patch; rewriting test baselines; editing this document, the gates, the ADRs or
 `kian.yaml`; changing the event vocabulary; training across iterations.
 
-Three limits are recorded rather than deferred, because a reader must not mistake a declaration
-for an enforcement point:
+Two limits are recorded rather than deferred, because a reader must not mistake a declaration for
+an enforcement point:
 
 * the pack is verified at admission only, so a later edit of `dir` is not detected (§4.2);
 * "no network write to the code host" is enforced by the worker's tool grants, not by the plan
-  (§6.2) — a deployment that grants such a tool has weakened SE4 in configuration;
-* no tool in this tree yet turns a child's final message into a `job.artifact` intent
-  (JOB-MODEL §12.1). The conductor's harvest and the checks read such a call when the child stream
-  carries one, so `artifact_within_cap` and `patch_paths_allowed` are evaluable — but an ordinary
-  agent child does not emit the call by itself, and a run without an artifact producer stops at
-  `artifact_within_cap` instead of passing it. Wiring that producer is the next S1 increment.
+  (§6.2) — a deployment that grants such a tool has weakened SE4 in configuration.
 
 Open questions, each with the fact that would answer it:
 

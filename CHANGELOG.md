@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Job artifacts: a step's artifact is its child's final message
+  (`design/JOB-MODEL.md` §12.1).** The conductor derives the ref, `bytes` and `sha256` from the
+  producer's last `assistant/message` that carries text and no tool calls, then records the
+  `job.artifact` pair with `producer {run, step, attempt}` on the run stream — no tool inside the
+  child has to announce an artifact, so `artifact_within_cap`, `patch_paths_allowed` and inline
+  `inputs` read the bytes the producer committed.
 - **iMessage: a multi-attachment row settles before it is admitted (ADR-070).** `chat.db` appends
   one attachment join row at a time, so a scan that lands mid-commit used to admit a prefix and let
   `guid` dedupe swallow the rest; the adapter now holds its read position just before an unsettled

@@ -358,10 +358,31 @@ impl Harness {
 }
 
 fn harness(members: Vec<MemberView>, deliver_error: Option<ChannelError>) -> Harness {
+    harness_for(digest_plan(), members, deliver_error)
+}
+
+fn harness_for(
+    plan: JobPlan,
+    members: Vec<MemberView>,
+    deliver_error: Option<ChannelError>,
+) -> Harness {
     let world = World::new();
-    let plan = digest_plan();
     let run = plan::run_session(JOB, SLOT);
     let now = world.now_ms();
+    // A plan that declares a surface is a self-dev plan, and its marker must
+    // carry the pack facts an admission verified (V24); the probe only needs
+    // the key to exist for the conductor to accept the run.
+    let selfdev = plan.declares_surface().then(|| {
+        json!({
+            "pack": {
+                "dir": "/tmp/evidence",
+                "manifest_sha256": "sha256:00",
+                "files_sha256": "sha256:00",
+            },
+            "base_commit": "0".repeat(40),
+            "kian_version": "0.3.0",
+        })
+    });
     world.run.lock().expect("the run log").push(event(
         run,
         1,
@@ -369,7 +390,7 @@ fn harness(members: Vec<MemberView>, deliver_error: Option<ChannelError>) -> Har
         json!({
             "role": "user",
             "content": "run the digest",
-            "job": status::marker_payload(JOB, SLOT, "manual", &plan),
+            "job": status::marker_payload_with_selfdev(JOB, SLOT, "manual", &plan, selfdev),
         }),
         now,
     ));
@@ -468,6 +489,65 @@ fn child_stream(child: SessionId, ended: EndReason) -> Vec<Event> {
             EventKind::SessionEnded { reason: ended },
             json!({}),
             now + 4,
+        ),
+    ]
+}
+
+const PATCH: &str = "--- a/crates/kian-cli/src/lib.rs
++++ b/crates/kian-cli/src/lib.rs
+` -1 +1 `
+-old
++new
+";
+
+fn proposal_plan() -> JobPlan {
+    serde_json::from_value(json!({
+        "id": JOB,
+        "steps": [{
+            "id": "patch",
+            "prompt": "propose a patch",
+            "requires": ["repo.kian"],
+            "produces": {"name": "patch", "max_bytes": 4096},
+            "verify": [
+                {"check": "artifact_within_cap", "name": "patch"},
+                {
+                    "check": "patch_paths_allowed",
+                    "artifact": "patch",
+                    "allow": ["crates/**"],
+                    "deny": ["design/decisions/**"]
+                }
+            ]
+        }]
+    }))
+    .expect("a valid proposal plan")
+}
+
+/// The child's committed stream for a proposal: one final answer, no tool round.
+fn proposal_child(child: SessionId) -> Vec<Event> {
+    let now = 1_700_000_000_100;
+    vec![
+        event(
+            child,
+            1,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "propose a patch"}),
+            now,
+        ),
+        event(
+            child,
+            2,
+            EventKind::AssistantMessage,
+            json!({"role": "assistant", "content": {"text": PATCH}}),
+            now + 1,
+        ),
+        event(
+            child,
+            3,
+            EventKind::SessionEnded {
+                reason: EndReason::Completed,
+            },
+            json!({}),
+            now + 2,
         ),
     ]
 }
@@ -1168,4 +1248,79 @@ async fn w8_committed_verdicts_without_an_end_settle_the_run_once() {
     assert_eq!(run_verdict_count(&harness), 1);
     assert_eq!(step_verdict_count(&harness), 1);
     assert_eq!(alert_count(&harness), 1);
+}
+
+#[tokio::test]
+async fn a_settled_step_harvests_its_artifact_from_the_final_message() {
+    let harness = harness_for(proposal_plan(), vec![online(WORKER, &["repo.kian"])], None);
+    let mut stream = harness.driver.drive(context(&harness));
+
+    let first = next_outcome(&mut stream).await;
+    assert!(
+        matches!(first, LoopOutcome::TurnDone),
+        "first tick: {first:?}"
+    );
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("children")
+        .insert(child, proposal_child(child));
+
+    // Tick 2: the child's final message is the declared artifact, so the gate
+    // and the harvest read the same committed bytes.
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let events = harness.world.run_events();
+    let harvest = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolCall && event.bytes["tool"] == status::ARTIFACT_TOOL
+        })
+        .expect("one artifact intent on the run stream");
+    assert_eq!(harvest.bytes["call_id"], "job:artifact:patch:1");
+    let artifact = &harvest.bytes["args"]["artifact"];
+    assert_eq!(artifact["step"], "patch");
+    assert_eq!(artifact["name"], "patch");
+    assert_eq!(artifact["media"], "text");
+    assert_eq!(artifact["bytes"].as_u64(), Some(PATCH.len() as u64));
+    assert_eq!(artifact["sha256"], plan::digest_text(PATCH));
+    assert_eq!(artifact["ref"]["session"], child.0.to_string());
+    assert_eq!(artifact["ref"]["seq"].as_u64(), Some(2));
+    assert_eq!(artifact["producer"]["run"], format!("{JOB}@{SLOT}"));
+    assert_eq!(artifact["producer"]["step"], "patch");
+    assert_eq!(artifact["producer"]["attempt"].as_u64(), Some(1));
+
+    let result = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolResult && event.bytes["call_id"] == "job:artifact:patch:1"
+        })
+        .expect("the artifact intent is closed");
+    assert_eq!(result.bytes["ok"], true);
+    assert_eq!(&result.bytes["result"]["artifact"], artifact);
+
+    let verdicts = status::verdicts(&events);
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].step, "patch");
+    assert!(verdicts[0].passed, "{verdicts:#?}");
+
+    // Tick 3: the only step is terminal, so the run settles succeeded.
+    match next_outcome(&mut stream).await {
+        LoopOutcome::Stopped { reason } => assert_eq!(reason, JOB_FINISHED_STOP_REASON),
+        other => panic!("the run must stop, not {other:?}"),
+    }
+    let events = harness.world.run_events();
+    let verdict = status::run_verdict(&events).expect("one run verdict");
+    assert_eq!(
+        verdict.outcome,
+        kian_superagent::job::outcome::RunOutcome::Succeeded
+    );
+    let artifacts = status::artifacts(&events, &proposal_plan());
+    assert_eq!(artifacts.len(), 1, "{artifacts:#?}");
+    assert_eq!(artifacts[0].name, "patch");
+    assert!(artifacts[0].within_cap);
 }
