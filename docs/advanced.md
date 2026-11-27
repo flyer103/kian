@@ -1100,8 +1100,9 @@ target/debug/kian session export <session-id> --out audit.jsonl --with-artifacts
 # audit.jsonl plus audit.jsonl.artifacts/<64-hex sha256> for every referenced blob
 ```
 
-An already-reclaimed blob is reported as missing in the command summary and does not fail the
-export. The same flag works when exporting an archived package. Semantics:
+The same pinning covers the image references a vision request body records (ADR-073), so an audit
+package reproduces the exact wire bytes rather than the reference form. An already-reclaimed blob is
+reported as missing in the command summary and does not fail the export. The same flag works when exporting an archived package. Semantics:
 [ADR-056](../design/decisions/ADR-056-artifacts-and-tool-result-spill.md) and
 [ADR-059](../design/decisions/ADR-059-maintenance-artifact-gc-and-export-pinning.md).
 
@@ -1270,12 +1271,25 @@ kian artifacts put ./invoice.png
 ```
 
 Only messages on a `vision: true` profile attach the bytes; the request body carries the image as
-a `data:` URL content part, so the persisted `step/request` is the exact bytes sent. Limits: 4
-images per message, 8 MiB each, user messages only, and no image pricing — the provider's usage is
-what `kian cost` prices. A blob missing at send time drops that image (a warning, and the text
-still goes) rather than failing the turn; `kian session replay` reports such requests as vision
-requests because offline replay cannot rebuild base64. Semantics:
-[ADR-063](../design/decisions/ADR-063-vision-content-parts.md).
+a `data:` URL content part. The persisted `step/request` keeps the digest of those exact bytes but
+records each image part as a content-addressed reference instead of a second copy of the pixels, so a
+picture-heavy session stops writing megabytes into the log on every turn:
+
+```console
+$ kian session request 0f9c2a11-… --seq 227 --expand > wire.json
+kian: request seq 227 (step/request), slot router: stored 5123 B, wire 18986123 B, 18 image part(s) reconstructed from the blob store, body_sha256 verified
+```
+
+`--expand` reads each referenced blob, re-checks it against its id and verifies the rebuilt body
+against `body_sha256`; a blob that has already aged out fails the command by id rather than
+rendering something else. `kian session export --with-artifacts` pins those blobs beside the export,
+so the package reconstructs the exact bytes without the live store. Limits: 4 images per message, 8
+MiB each, user messages only, and no image pricing — the provider's usage is what `kian cost`
+prices. A blob missing at send time drops that image (a warning, and the text still goes) rather
+than failing the turn; `kian session replay` reports such requests as vision requests because
+offline replay cannot rebuild base64. Semantics:
+[ADR-063](../design/decisions/ADR-063-vision-content-parts.md),
+[ADR-073](../design/decisions/ADR-073-request-audit-bodies-by-reference.md).
 
 ### Channel images
 
@@ -1347,7 +1361,8 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `kian artifacts gc [--json]` | Retention-based GC of the content-addressed tool-result blob tree (`max_bytes` + `retention_days`); serve runs the same collection as a ticker when `artifacts:` is configured |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
 | `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context; `--provider fake --script <file>` re-drives one drain episode on a scripted model and diffs the result (verdict `reproduced` / `diverged` / `incomplete`, always exit 0) |
-| `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids, `--with-artifacts` pins referenced blobs beside the file |
+| `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids, `--with-artifacts` pins referenced blobs (spilled results and request-body image references) beside the file |
+| `kian session request <id> --seq <n> [--expand]` | One request's audit copy: the stored payload as recorded, or the exact wire body rebuilt from its artifact references with `body_sha256` verified |
 | `kian cache-stats [--json]` | Prefix-cache stability report from the durable stream |
 | `kian self inspect [--window <dur>] [--session <uuid>] [--json]` | Windowed read-only diagnostic report (default `1h`): event volume by kind, session ends by reason, turn outcomes and provider error classes, tool failures by tool, media items with and without a transcript (counts, never content), evidence verdicts, store/artifact footprint, plus `findings` that name the session and seq evidencing each one |
 | `kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>]` | Handoff package for one anchor row: the raw ±k envelope slice, session state and end writes, repo commit/branch/dirty and crate map, the `self inspect` projection, and a manifest with every file's sha256 (payload text stays inside the package — never on stdout) |

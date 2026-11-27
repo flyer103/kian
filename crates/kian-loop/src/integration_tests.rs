@@ -2678,6 +2678,77 @@ async fn vision_profile_sends_artifact_images_as_content_parts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// ADR-073 L2: the persisted request body names the image by artifact id
+/// instead of carrying its pixels, while the wire body still carries them;
+/// the stored form expands back to exactly the bytes the provider saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_persisted_request_body_names_images_by_reference() {
+    let dir = std::env::temp_dir().join(format!("kian-loop-audit-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let reference = blobs.put(b"hi", "image/png").expect("put blob");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let (h, provider) = harness_with_artifacts(
+        agent,
+        vec![vec![text_chunk("the invoice total is 42")]],
+        Some(artifacts),
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, image_envelope(&reference.id)).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let events = events_of(&h.store, sid).await;
+    let step = events
+        .iter()
+        .find(|e| e.kind == EventKind::StepRequest)
+        .expect("step/request");
+    assert_eq!(step.bytes["body_form"], json!("artifact_refs"));
+    let body = &step.bytes["body"];
+    let messages = body["messages"].as_array().expect("messages");
+    let part = &messages.last().expect("user message")["content"][1];
+    assert_eq!(
+        part["image_url"],
+        json!({
+            "url": format!("artifact:{}", reference.id),
+            "media_type": "image/png",
+            "size": 2,
+        }),
+        "the stored body must name the blob, never carry the pixels"
+    );
+    let wire = kian_llm::provider::serialize_request_body(&requests[0]).expect("wire bytes");
+    assert_eq!(step.bytes["body_bytes"], json!(wire.len() as u64));
+    assert_eq!(
+        step.bytes["body_sha256"].as_str().map(str::len),
+        Some(64),
+        "body_sha256 is the recorded digest of the wire bytes"
+    );
+    let expansion = kian_llm::expand_audit_body(body, step.bytes["body_sha256"].as_str(), |id| {
+        assert_eq!(id, reference.id);
+        Ok(Some(b"hi".to_vec()))
+    })
+    .expect("the stored body rebuilds");
+    assert_eq!(expansion.references, 1);
+    assert_eq!(&expansion.body, &requests[0]);
+
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// ADR-063 honesty: neither a missing blob nor a non-vision profile changes
 /// the wire shape into content parts — the envelope's text still flies, and
 /// a non-vision target keeps the legacy compact-JSON conversion.

@@ -19,6 +19,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   folds), so a deployment opts in with `recovery.rules: [{class: request_too_large, action:
   compress_then_retry}, …]` — an explicit `rules:` table replaces the defaults, and
   `docs/advanced.md` carries the runnable table.
+- **Request audit bodies store image bytes by reference (ADR-073).** On a vision target the
+  persisted `step/request` — and the `slot/fallback` attempt copy — records each image part as a
+  content-addressed reference with `body_form: "artifact_refs"` and `body_bytes`, while the wire
+  body and its `body_sha256` stay unchanged. `kian session request <id> --seq <n> --expand`
+  rebuilds and verifies the exact bytes, and `kian session export --with-artifacts` pins the
+  referenced blobs, so a picture-heavy turn stops writing megabytes into the log on every turn.
 - **Compaction answers byte pressure, not only token pressure (ADR-072).** With
   `providers.<name>.max_request_bytes` declared, the loop measures the rendered request (artifact
   bytes inlined, tool schemas sorted, plan body serialized) before the turn exists, and folds old

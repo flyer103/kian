@@ -231,9 +231,16 @@ async fn turn_step(
 }
 
 /// Adds the attempt metadata every persisted fallback carries. The body is
-/// included because it is the exact byte copy the retry sends.
+/// included because it identifies the exact byte copy the retry sends — in
+/// the audit form, so a fallback does not duplicate an image-bearing body
+/// either. `body_sha256` covers the wire bytes (ADR-073).
 fn attach_plan(payload: &mut Value, plan: &RequestPlan) {
-    payload["body"] = plan.body.clone();
+    let (body, form) = plan.audit();
+    payload["body"] = body.clone();
+    payload["body_bytes"] = json!(plan.body_bytes);
+    if let Some(form) = form {
+        payload["body_form"] = json!(form);
+    }
     payload["body_version"] = json!(plan.body_version);
     payload["dialect"] = json!(plan.dialect);
     payload["body_sha256"] = json!(plan.body_sha256);
