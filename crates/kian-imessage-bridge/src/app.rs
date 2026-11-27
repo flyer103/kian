@@ -29,7 +29,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::attachment::{AttachmentError, AttachmentSource};
+use crate::attachment::{AttachmentError, AttachmentSource, media_type_of};
 use crate::imsg::{Backend, RpcError};
 use crate::state::CursorStore;
 
@@ -504,13 +504,26 @@ fn project_attachments(rowid: u64, raw: Option<&Value>) -> Vec<Value> {
                     .map(basename)
                     .map(Value::from)
                     .unwrap_or(Value::Null),
-                "mime_type": item.get("mime_type").cloned().unwrap_or(Value::Null),
+                "mime_type": projected_media_type(item),
                 "transfer_name": item.get("transfer_name").cloned().unwrap_or(Value::Null),
                 "total_bytes": item.get("total_bytes").cloned().unwrap_or(Value::Null),
                 "is_sticker": item.get("is_sticker").and_then(Value::as_bool).unwrap_or(false),
             })
         })
         .collect()
+}
+
+/// The row's `mime_type`, else the type its filename implies (ADR-075).
+fn projected_media_type(item: &Value) -> Value {
+    let recorded = item.get("mime_type").and_then(Value::as_str);
+    let filename = item
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match media_type_of(std::path::Path::new(filename), recorded) {
+        Some(media_type) => Value::from(media_type),
+        None => item.get("mime_type").cloned().unwrap_or(Value::Null),
+    }
 }
 
 /// `/a/b/IMG_0001.heic` -> `IMG_0001.heic` (no directory layout leaves
@@ -798,7 +811,7 @@ async fn serve_attachment_at<B: Backend>(
             return error_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_type",
-                "the attachment is not a supported image",
+                "the attachment is not a supported image or audio message",
                 false,
             );
         }
@@ -1451,6 +1464,91 @@ mod tests {
             !wire.contains("internal_hint"),
             "an unknown field left the Mac: {wire}"
         );
+    }
+
+    #[test]
+    fn a_voice_note_is_projected_with_the_type_its_filename_implies() {
+        let mut row = photo_message(41, "+8618521321872");
+        row["attachments"][0]["filename"] =
+            json!("/Users/someone/Library/Messages/Attachments/aa/bb/Audio Message.caf");
+        row["attachments"][0]["transfer_name"] = json!("Audio Message.caf");
+        row["attachments"][0]["mime_type"] = json!("");
+        let reduced = reduce_message(&row, &[]).expect("a voice note is reduced, not dropped");
+        assert_eq!(
+            reduced["attachments"][0]["mime_type"],
+            json!("audio/x-caf"),
+            "the Mac records no type for a voice note (ADR-075)"
+        );
+        assert_eq!(
+            reduced["attachments"][0]["filename"],
+            json!("Audio Message.caf")
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_serves_a_voice_note_with_no_recorded_type() {
+        let dir = temp_dir();
+        let note = dir.join("Audio Message.caf");
+        std::fs::write(&note, b"caf-bytes").unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&note),
+            None,
+            Some(9),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "audio/x-caf");
+        assert_eq!(response.headers()["x-kian-variant"], "original");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"caf-bytes");
+    }
+
+    #[tokio::test]
+    async fn attachment_of_a_type_with_no_tool_is_unsupported() {
+        let dir = temp_dir();
+        let pdf = dir.join("notes.pdf");
+        std::fs::write(&pdf, b"%PDF-1.7").unwrap();
+        seed_attachment(
+            &dir,
+            41,
+            7,
+            Some(&pdf),
+            Some("application/pdf"),
+            Some(8),
+            false,
+            "+14155551212",
+        );
+        let app = app_with_attachment_db(
+            dir,
+            vec!["+14155551212".into()],
+            DEFAULT_MAX_ATTACHMENT_BYTES,
+            PathBuf::from("/usr/bin/sips"),
+        );
+        let response = attachment(
+            State(Arc::clone(&app)),
+            bearer(),
+            attachment_request(&app, "41:0"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body = body(response).await;
+        assert_eq!(body["kind"], "unsupported_type");
     }
 
     #[tokio::test]

@@ -188,6 +188,9 @@ attachments that already arrived, so a burst of photos becomes one input with al
 that never settles is admitted with what arrived plus an audit line, and a row over the eight-item
 media cap loses the excess items with an audit line
 ([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)).
+An inbound voice note is an ordinary audio item on that path even though the Mac records it with no
+MIME type (`Audio Message.caf`): the bridge types it from the filename, so the transcript joins the
+text like a photo's does ([ADR-075](../design/decisions/ADR-075-imessage-inbound-voice-transcription.md)).
 With `voice: true` the channel also *speaks*: the Router gains a `reply_voice` tool and a spoken
 reply arrives as a native voice message where the Mac allows it, an audio attachment otherwise
 ([voice replies](#voice-replies-outbound), [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)).

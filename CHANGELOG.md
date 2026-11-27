@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **An inbound iMessage voice note is transcribed (ADR-075).** The Mac records a voice note as
+  `Audio Message.caf` with an empty `mime_type`, so the bridge now types an attachment from its
+  filename when the row records none and `GET /v1/attachment` serves `audio/*` as the original bytes;
+  the adapter's media filter falls back to the extension the same way. The note reaches
+  `audio_transcribe` and its `[voice message transcript]` line joins the admitted text, while video,
+  PDF and contact cards still answer `415`.
 - **An oversized request folds when the recovery policy says so (ADR-074).** A
   `request_too_large` refusal the byte gate could not predict — the carrier's own limit sits below
   `providers.<name>.max_request_bytes`, no bound is declared, or a fallback target built the body —

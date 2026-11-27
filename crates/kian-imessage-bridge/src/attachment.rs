@@ -22,6 +22,42 @@ pub const LOCATE_RETRIES: usize = 32;
 /// Spacing between two `locate` attempts while waiting for that commit.
 pub const LOCATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// The media type the row records, else the one its filename implies.
+///
+/// A voice note lands in `chat.db` with an empty `mime_type` and an
+/// `Audio Message.caf` filename; without the filename fallback the row is
+/// neither an image nor an audio item and its bytes can never be read
+/// (ADR-075). The table is deliberately small: a format this channel has no
+/// tool for (video, PDF, a contact card) keeps no type and is refused by
+/// `read` instead of being guessed at.
+#[must_use]
+pub fn media_type_of(filename: &Path, recorded: Option<&str>) -> Option<String> {
+    if let Some(media_type) = recorded.map(str::trim).filter(|mime| !mime.is_empty()) {
+        return Some(media_type.to_string());
+    }
+    let extension = filename.extension()?.to_str()?.to_ascii_lowercase();
+    let inferred = match extension.as_str() {
+        "caf" => "audio/x-caf",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "aac" => "audio/aac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "amr" => "audio/amr",
+        "aif" | "aiff" => "audio/aiff",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff",
+        "bmp" => "image/bmp",
+        _ => return None,
+    };
+    Some(inferred.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct AttachmentSource {
     db: PathBuf,
@@ -63,7 +99,7 @@ pub enum AttachmentError {
     },
     #[error("attachment exceeds the configured limit")]
     TooLarge,
-    #[error("attachment type `{0}` is not an image")]
+    #[error("attachment type `{0}` is not an image or an audio message")]
     Unsupported(String),
     #[error("attachment bytes are unavailable")]
     Unavailable,
@@ -135,14 +171,10 @@ impl AttachmentSource {
         if located.is_sticker {
             return Err(AttachmentError::Unsupported("sticker".into()));
         }
-        let media_type = located
-            .mime_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|mime| !mime.is_empty())
-            .ok_or_else(|| AttachmentError::Unsupported("application/octet-stream".into()))?
-            .to_string();
-        if !media_type.to_ascii_lowercase().starts_with("image/") {
+        let media_type = media_type_of(&located.filename, located.mime_type.as_deref())
+            .ok_or_else(|| AttachmentError::Unsupported("application/octet-stream".into()))?;
+        let lowered = media_type.to_ascii_lowercase();
+        if !lowered.starts_with("image/") && !lowered.starts_with("audio/") {
             return Err(AttachmentError::Unsupported(media_type));
         }
 
@@ -430,8 +462,8 @@ fn redacted_prefix(path: &Path, home: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachmentError, LocatedAttachment, locate_when_committed, path_shape, redacted_prefix,
-        resolve_attachment_path,
+        AttachmentError, AttachmentSource, LocatedAttachment, locate_when_committed, media_type_of,
+        path_shape, redacted_prefix, resolve_attachment_path,
     };
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
@@ -474,6 +506,108 @@ mod tests {
         assert!(prefix.starts_with("~/Library/Messages"));
         assert_eq!(prefix.chars().count(), 30);
         assert!(!prefix.contains(HOME));
+    }
+
+    fn temp_file(extension: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kian-attachment-test-{}.{extension}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, bytes).expect("write the fixture");
+        path
+    }
+
+    fn located_audio(path: &Path, mime: Option<&str>) -> LocatedAttachment {
+        LocatedAttachment {
+            filename: path.to_path_buf(),
+            mime_type: mime.map(str::to_string),
+            total_bytes: None,
+            is_sticker: false,
+            sender: Some("+15551234567".into()),
+            is_from_me: false,
+            path_shape: "absolute",
+            redacted_path: "~/Library/Messages/Attachm".into(),
+        }
+    }
+
+    fn source_for(path: &Path) -> AttachmentSource {
+        AttachmentSource::new(
+            PathBuf::from("/nonexistent/chat.db"),
+            path.parent()
+                .unwrap_or(Path::new("/tmp"))
+                .join("kian-cache"),
+        )
+    }
+
+    #[test]
+    fn a_recorded_media_type_wins_and_a_filename_supplies_a_missing_one() {
+        let voice = Path::new("/Users/tester/Library/Messages/Attachments/a/Audio Message.caf");
+        assert_eq!(
+            media_type_of(voice, Some("audio/mp4")).as_deref(),
+            Some("audio/mp4")
+        );
+        assert_eq!(
+            media_type_of(voice, Some("  ")).as_deref(),
+            Some("audio/x-caf"),
+            "an empty recorded type is the voice-note case (ADR-075)"
+        );
+        assert_eq!(media_type_of(voice, None).as_deref(), Some("audio/x-caf"));
+        assert_eq!(
+            media_type_of(Path::new("IMG_0001.HEIC"), None).as_deref(),
+            Some("image/heic")
+        );
+        assert_eq!(media_type_of(Path::new("notes.pdf"), None), None);
+        assert_eq!(
+            media_type_of(Path::new("Audio Message"), None),
+            None,
+            "a filename without an extension proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audio_item_with_no_recorded_type_is_served_as_its_filename_implies() {
+        let path = temp_file("caf", b"caf-bytes");
+        let served = source_for(&path)
+            .read(7, 0, located_audio(&path, Some("")), 1 << 20, false)
+            .await
+            .expect("a voice note is readable");
+        assert_eq!(served.media_type, "audio/x-caf");
+        assert_eq!(served.variant, "original");
+        assert_eq!(served.bytes, b"caf-bytes");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn audio_ignores_the_jpeg_variant_selector() {
+        let path = temp_file("caf", b"caf-bytes");
+        let served = source_for(&path)
+            .read(7, 0, located_audio(&path, None), 1 << 20, true)
+            .await
+            .expect("a voice note is readable");
+        assert_eq!(
+            served.variant, "original",
+            "only image/heic has a jpeg variant"
+        );
+        assert_eq!(served.media_type, "audio/x-caf");
+        assert_eq!(served.bytes, b"caf-bytes");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_type_the_edge_has_no_tool_for_is_refused() {
+        let path = temp_file("pdf", b"%PDF-1.7");
+        let error = source_for(&path)
+            .read(
+                7,
+                0,
+                located_audio(&path, Some("application/pdf")),
+                1 << 20,
+                false,
+            )
+            .await
+            .expect_err("a pdf has no media tool");
+        assert!(matches!(error, AttachmentError::Unsupported(kind) if kind == "application/pdf"));
+        std::fs::remove_file(&path).ok();
     }
 
     fn sample_attachment() -> LocatedAttachment {

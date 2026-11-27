@@ -384,11 +384,16 @@ instead of disappearing from a model's view.
   tables, ordered by attachment ROWID. No path is accepted from the client, so the metadata
   whitelist's "never a path" property holds (§3.2 above).
 - Without `as`, `200` returns the original bytes with the attachment's `mime_type` as
-  `content-type`. `?as=jpeg` returns an `image/jpeg` variant for `image/heic`: the bridge runs
+  `content-type`; an item whose row records no type is typed from its filename extension
+  (`Audio Message.caf` → `audio/x-caf`), because a voice note carries an empty `mime_type`
+  (ADR-075). `?as=jpeg` returns an `image/jpeg` variant for `image/heic`: the bridge runs
   `/usr/bin/sips -s format jpeg -Z 2048` against a temporary file, atomically renames the result
   into its disposable cache, and never modifies the original. JPEG generation is serialized in the
   bridge process; a failed conversion answers `503 attachment_unavailable` and never falls back to
   HEIC bytes.
+- The route serves `image/*` and `audio/*` items. Anything else — a video, a PDF, a contact card —
+  answers `415 unsupported_type`, because the media edge has an OCR tool and a transcription tool
+  and no consumer for other bytes (ADR-075).
 - `200` includes `content-length`, `x-kian-total-bytes` from the attachment row and
   `x-kian-variant: original|jpeg`.
 - `400 bad_request` covers a non-integer or negative position, or an unsupported `as` value.
@@ -520,6 +525,9 @@ The `attachments` items carry `filename`, `mime_type`, `total_bytes` and `is_sti
 model can reason about ("a 2.3 MB HEIC named `IMG_0001.heic`") — and omit `attachment_id`, which
 encodes a per-generation ROWID that must not become durable data. A row without attachments keeps its
 payload bytes exactly as before, so a text-only conversation is unaffected by the field's existence.
+A row that records no MIME type is typed from its filename extension, so a voice note is
+`{"filename": "Audio Message.caf", "mime_type": "audio/x-caf", …}` instead of an untyped item
+(ADR-075).
 
 With `attachments: bytes` and a `media:` section, the adapter additionally fetches the row's
 `image/*` and `audio/*` items — at most eight, never a sticker — through `/v1/attachment` (carrying
@@ -528,7 +536,8 @@ the page's `generation`; an `image/*` item asks for `as=jpeg` because the provid
 the edge the ADR-062 envelope `{"media": [{"kind", "media_type", "base64"}]}`; the edge stores each
 item as an artifact, transcribes it, rewrites the item to an artifact reference plus transcript and
 appends the `[image transcript]`/`[voice message transcript]` line to the admitted text (ADR-062,
-ADR-064). The base64 is consumed before admission, so the durable payload never contains bytes; a
+ADR-064). A voice note is an ordinary audio item on this path: the bridge types it from the filename
+because the row records none (ADR-075). The base64 is consumed before admission, so the durable payload never contains bytes; a
 fetch that fails without bytes leaves the metadata-only payload above and still admits the row. In
 `metadata` mode (default) the route is never called. With `superagent.shaping.vision: true`
 (ADR-065) the admitted content also carries a sibling `images` array of these artifact references,
@@ -950,6 +959,12 @@ question — they stay in §13.
    — the reference Mac reports `sip: enabled`, so only the attachment path has a reachable host.
    The first owner voice reply is the acceptance (§12, ADR-067).
 
+15. **Inbound voice transcription is L1/L2 only.** The `.caf` path — the inferred media type, the
+   audio arm of `/v1/attachment` and the `[voice message transcript]` line — is covered against
+   fakes. A real voice note was admitted with its metadata and no `media` array before this change
+   and has not been replayed since; the first owner voice note after the bridge rebuild is the
+   acceptance (§12, ADR-075).
+
 ## 14. Delivery slices
 
 **1a (the slice, all that phase 1 claims) — landed 2026-11-19; L3 verified 2026-11-20 (§12).** The bridge crate
@@ -984,6 +999,11 @@ L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-067, the runbo
 bullet. No new event kind, no store schema, no core seam change. Estimated write set ≈ bridge 250
 lines, adapter 120 lines, edge + router 350 lines, config/CLI 120 lines, tests ~600 lines, docs
 ~500 lines.
+
+**2c (inbound voice, ADR-075).** The bridge's filename-extension fallback in the attachment
+projection and its audio arm on `GET /v1/attachment`; the adapter's extension fallback in
+`media_kind`; §3.2/§4 increments, ADR-075, one CHANGELOG bullet and L1/L2 tests. No new route, no
+event kind, no store schema, no core seam change.
 
 **Rollback.** Purely config: remove the `type: imessage` channel (or stop the bridge); no event
 kind, no store schema, no wire frame and no core seam changes, so a rollback loses no session data
