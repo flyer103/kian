@@ -1001,19 +1001,21 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed)
+### Self-evolution (S1 landed, S2 specified)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
 proposing. No new session state, event kind, table or daemon: the marking travels as one additive
 key on the admitted row. The normative contract is
-[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision record is
-[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md).
+[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision records are
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md) and
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
 
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
-| S2 publish | one derived worktree and branch, one push, one pull request whose body carries the audit chain; needs the `exec` step action | specified, not implemented |
+| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | specified, not implemented |
+| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | specified, not implemented |
 | S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
@@ -1025,6 +1027,12 @@ An agent step produces its artifact from the child's own stream: the final answe
 `patch_paths_allowed` read the bytes the producer committed
 ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §12.1). A child that never reaches a final answer
 produces no artifact, and the step fails its artifact check instead of passing it.
+
+Publishing is a conductor action, not a general command: the `publish` step's sequence is fixed
+(worktree, apply, commit, gates, and in S2b one non-forced push and one pull request), every step
+leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
+command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
+[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
 
 ### Deferred (unchanged)
 | Item | Reason |
