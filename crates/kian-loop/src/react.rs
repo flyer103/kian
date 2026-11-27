@@ -2579,6 +2579,9 @@ fn error_class(e: &ProviderError) -> &'static str {
         ProviderError::ContextOverflow => "context_overflow",
         ProviderError::Unavailable(_) | ProviderError::Transport(_) => "provider_down",
         ProviderError::EmptyResponse => CLASS_EMPTY_RESPONSE,
+        // ADR-068: its own class, so a journal line never blames
+        // provider_down for a request the provider refused as too large.
+        ProviderError::RequestTooLarge { .. } => "request_too_large",
         ProviderError::InvalidResponse(_) => "validation_failed",
         ProviderError::Other(_) => "internal",
     }

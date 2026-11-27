@@ -112,6 +112,7 @@ fn tuning() -> ConfigTuning {
         heartbeat_interval_ms: HEARTBEAT_MS,
         tools: vec!["exec".into()],
         exec_timeout_ms: 120_000,
+        max_request_bytes: None,
     }
 }
 

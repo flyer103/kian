@@ -897,6 +897,31 @@ while waiting). No L3 claim in phase 1 (no UI card; the `pending` read is its se
 Non-goals recorded with phase 1: no hook `ask`, no channel answering, no automatic expiry, no
 `ask` on worker/resident agents, no new session state, no `LoopDriver`/`LoopOutcome` change, no
 outbox row for the request.
+### Oversized requests (ADR-068)
+
+Scope: make a request the upstream cannot accept a classified, non-retryable failure instead of a
+transport error that reads as an outage.
+
+Semantics: `providers.<name>.max_request_bytes` (optional, absent = no pre-flight check, floor
+1024) is compared against the serialized body before the POST; over the bound the call fails
+`request_too_large` naming the body size and the bound and stating that no request byte left the
+process. An HTTP 413 answer is classified `request_too_large` as well, carrying the status, the
+size that was sent and a bounded snippet. `request_too_large` is a closed policy-table class: the
+default table maps it to `fail` because re-sending identical bytes cannot succeed, and a deployment
+that wants compaction to shrink the history opts into `compress_then_retry` explicitly. Without a
+declared bound a mid-upload connection close stays `provider_down` — no transport heuristics. The
+persisted `step/request` remains the audit record of the bytes that were not sent.
+
+The contract is
+[ADR-068](../design/decisions/ADR-068-oversized-request-classification.md).
+
+| Phase | Module | Contents | Status |
+|-------|--------|----------|--------|
+| Provider | kian-llm, kian-orchestrator, kian-cli | the `request_too_large` class, 413 classification, the pre-flight `max_request_bytes` bound, default `fail` | landed |
+
+Non-goals recorded with this slice: no automatic history shrinking, no body splitting, no discovery
+of the carrier's own inbound bound.
+
 ### Scheduled turns (cron, P0–P1 landed)
 
 Scope: wall-clock scheduled work executes as ordinary durable turns — no schedule-execution

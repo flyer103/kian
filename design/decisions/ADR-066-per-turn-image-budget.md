@@ -65,7 +65,7 @@ soft-failed. Two facts make the fix small:
 
 - No retroactive eviction: images already in history are re-sent every turn, so cost and body size
   grow with the number of image-bearing turns. The hard stop is the provider's `max_request_bytes`
-  (ADR-067), which fails honestly instead of letting the carrier drop the connection.
+  (ADR-068), which fails honestly instead of letting the carrier drop the connection.
 - No downscale, no dedupe, no per-image cache, no per-turn token or pricing accounting.
 - The follow-up that bounds history is eliding pixels at the ADR-058 compaction point — the only
   sanctioned prefix invalidation — keeping the transcript in the folded summary.

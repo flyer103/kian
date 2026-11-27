@@ -83,6 +83,21 @@ pub enum ProviderError {
     /// A soft failure (constraint 7): never mappable onto `completed`.
     #[error("empty response")]
     EmptyResponse,
+    /// The request itself is too large (ADR-068): an operator
+    /// `max_request_bytes` bound refused it before sending, or the
+    /// provider answered HTTP 413. Re-sending the same bytes cannot
+    /// succeed, so this is its own class — never `provider_down`.
+    #[error("request too large: {detail}")]
+    RequestTooLarge {
+        /// Serialized body size, in bytes.
+        size: usize,
+        /// The configured outbound bound; `None` when no local bound is
+        /// configured and the verdict came from the provider's 413.
+        limit: Option<u64>,
+        /// Operator-facing detail: bound or status, snippet, and whether
+        /// any request byte left this process.
+        detail: String,
+    },
     #[error("invalid response: {0}")]
     InvalidResponse(String),
     #[error("{0}")]

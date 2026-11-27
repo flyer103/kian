@@ -8,6 +8,12 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Provider failures: an oversized request is a classified, non-retryable error
+  (`providers.<name>.max_request_bytes`, the `request_too_large` policy class, ADR-068).** The
+  openai-compatible seam compares the serialized body against the optional bound before the POST
+  and fails `request_too_large` with both sizes and nothing sent; an HTTP 413 answer classifies the
+  same way with the status and a bounded snippet. The class joins the closed policy vocabulary and
+  defaults to `fail`, because resending identical bytes cannot succeed.
 - **iMessage voice: a spoken reply arrives as a voice message, and inbound voice notes are
   config-complete (CHANNEL-IMESSAGE §2.5, §3.2, §5, §7, ADR-067, P5b slice 2b).** `imessage.voice:
   true` (refused without `media:` and `artifacts:`) mounts one extra Router tool,

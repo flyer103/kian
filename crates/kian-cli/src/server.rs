@@ -300,6 +300,7 @@ impl Server {
                 chat_completions_path: pcfg.chat_completions_path.clone(),
                 connect_timeout_ms: pcfg.connect_timeout_ms,
                 idle_timeout_ms: pcfg.idle_timeout_ms,
+                max_request_bytes: pcfg.max_request_bytes,
             });
         }
 

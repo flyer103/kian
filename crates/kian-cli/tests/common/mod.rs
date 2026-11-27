@@ -219,6 +219,9 @@ pub struct ConfigTuning {
     pub heartbeat_interval_ms: u64,
     pub tools: Vec<String>,
     pub exec_timeout_ms: u64,
+    /// ADR-068: the provider's own request-size bound (None = the
+    /// provider config carries no key, the default today).
+    pub max_request_bytes: Option<u64>,
 }
 
 impl Default for ConfigTuning {
@@ -228,6 +231,7 @@ impl Default for ConfigTuning {
             heartbeat_interval_ms: 10_000,
             tools: Vec::new(),
             exec_timeout_ms: 30_000,
+            max_request_bytes: None,
         }
     }
 }
@@ -243,6 +247,10 @@ pub fn write_config_with(
     listen: &str,
     tuning: &ConfigTuning,
 ) -> PathBuf {
+    let provider_bound = tuning
+        .max_request_bytes
+        .map(|limit| format!("    max_request_bytes: {limit}\n"))
+        .unwrap_or_default();
     let yaml = format!(
         r#"listen: "{listen}"
 storage:
@@ -258,7 +266,7 @@ providers:
   mock:
     base_url: "{provider_base}"
     api_key_env: {KEY_ENV}
-drain:
+{provider_bound}drain:
   max_iterations: 8
   lease_ttl_ms: {}
   heartbeat_interval_ms: {}

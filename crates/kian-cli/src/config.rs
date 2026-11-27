@@ -323,6 +323,12 @@ pub struct ProviderConfig {
     /// request. `0` disables the bound (ADR-041).
     #[serde(default = "default_provider_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
+    /// Largest serialized request body this provider accepts, in bytes
+    /// (ADR-068). Absent = no local bound; an HTTP 413 is still its own
+    /// class either way. A configured bound refuses before the first byte
+    /// leaves the process; floor 1024.
+    #[serde(default)]
+    pub max_request_bytes: Option<u64>,
 }
 
 fn default_chat_path() -> String {
@@ -4154,6 +4160,17 @@ impl ServeConfig {
         if self.providers.is_empty() {
             return Err(invalid("providers must list at least one endpoint"));
         }
+        // providers.<name>.max_request_bytes (ADR-068): a bound below the
+        // floor bounds nothing a real request could ever hit.
+        for (name, p) in &self.providers {
+            if let Some(limit) = p.max_request_bytes
+                && limit < 1024
+            {
+                return Err(invalid(format!(
+                    "providers.{name}.max_request_bytes {limit} is below the 1024-byte floor (ADR-068)",
+                )));
+            }
+        }
         if self.agent.model_slots.is_empty() {
             return Err(invalid("agent.model_slots must define at least one slot"));
         }
@@ -6728,6 +6745,48 @@ recovery:
             ServeConfig::parse(&unknown).is_err(),
             "an unknown provider key is still refused"
         );
+    }
+
+    /// ADR-068: `providers.<name>.max_request_bytes` is optional (absent =
+    /// no local bound), parses, and refuses below the 1024-byte floor.
+    #[test]
+    fn provider_max_request_bytes_is_optional_and_bounded() {
+        let cfg = ServeConfig::parse(&valid_yaml()).expect("defaults");
+        assert_eq!(
+            cfg.providers
+                .get("openai")
+                .expect("provider")
+                .max_request_bytes,
+            None,
+            "absent = no local bound"
+        );
+
+        let explicit = valid_yaml().replace(
+            "    api_key_env: KIAN_API_KEY
+",
+            "    api_key_env: KIAN_API_KEY
+    max_request_bytes: 33554432
+",
+        );
+        let cfg = ServeConfig::parse(&explicit).expect("explicit bound parses");
+        assert_eq!(
+            cfg.providers
+                .get("openai")
+                .expect("provider")
+                .max_request_bytes,
+            Some(33_554_432)
+        );
+
+        let too_small = valid_yaml().replace(
+            "    api_key_env: KIAN_API_KEY
+",
+            "    api_key_env: KIAN_API_KEY
+    max_request_bytes: 512
+",
+        );
+        let err = ServeConfig::parse(&too_small).unwrap_err().to_string();
+        assert!(err.contains("max_request_bytes"), "{err}");
+        assert!(err.contains("1024"), "{err}");
     }
 
     // -- workers: (R12, C1–C6) -------------------------------------

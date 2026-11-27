@@ -260,6 +260,11 @@ pub struct OpenAiCompatConfig {
     /// Idle bound in milliseconds: the wait for headers and each gap between
     /// body chunks, never the total request (ADR-041). `0` = disabled.
     pub idle_timeout_ms: u64,
+    /// Largest serialized request body this provider accepts, in bytes
+    /// (ADR-068). `None` = no local bound: an oversized request is then
+    /// discovered only from the provider's HTTP status. A configured bound
+    /// refuses before the first byte leaves the process.
+    pub max_request_bytes: Option<u64>,
 }
 
 struct Inner {
@@ -273,6 +278,22 @@ struct Inner {
 impl Inner {
     async fn post(&self, body: Vec<u8>) -> Result<reqwest::Response, ProviderError> {
         let cfg = &self.config;
+        // ADR-068: a configured outbound bound refuses here, before the
+        // client is even asked to write — the error names both numbers and
+        // states that no byte left the process.
+        if let Some(limit) = cfg.max_request_bytes
+            && body.len() as u64 > limit
+        {
+            return Err(ProviderError::RequestTooLarge {
+                size: body.len(),
+                limit: Some(limit),
+                detail: format!(
+                    "the serialized request is {} bytes, over providers.{}.max_request_bytes {limit}; nothing was sent (no request byte left this process, ADR-068)",
+                    body.len(),
+                    cfg.name
+                ),
+            });
+        }
         let url = format!(
             "{}{}",
             cfg.base_url.trim_end_matches('/'),
@@ -345,6 +366,9 @@ impl ModelProvider for OpenAiCompatProvider {
                 model,
                 body: body.clone(),
             };
+            // The exact byte count that will cross the wire: the 413
+            // detail reports it (ADR-068).
+            let sent_bytes = body.len();
             // A2: persist-what-you-send. The persist hook completes before
             // the request is issued; on failure the request is never sent.
             if let Err(e) = inner.sink.persist_request(record).await {
@@ -365,7 +389,12 @@ impl ModelProvider for OpenAiCompatProvider {
                 None => inner.post(body).await,
             };
             match posted {
-                Ok(resp) => response_stream(resp, inner.idle_timeout),
+                Ok(resp) => response_stream(
+                    resp,
+                    inner.idle_timeout,
+                    sent_bytes,
+                    inner.config.max_request_bytes,
+                ),
                 Err(e) => error_stream(e),
             }
         })
@@ -430,12 +459,19 @@ where
 fn response_stream(
     resp: reqwest::Response,
     idle: Option<Duration>,
+    sent_bytes: usize,
+    max_request_bytes: Option<u64>,
 ) -> BoxStream<'static, Result<ModelChunk, ProviderError>> {
     let status = resp.status();
     if !status.is_success() {
         return futures::stream::once(async move {
             let body = resp.text().await.unwrap_or_default();
-            Err(map_error_status(status, &body))
+            Err(map_error_status(
+                status,
+                &body,
+                sent_bytes,
+                max_request_bytes,
+            ))
         })
         .boxed();
     }
@@ -551,18 +587,36 @@ fn decode_data(data: &str, flags: &StreamFlags) -> Vec<Result<ModelChunk, Provid
 
 /// Map an HTTP error status (with body) onto the classifier-friendly
 /// [`ProviderError`] classes.
-fn map_error_status(status: reqwest::StatusCode, body: &str) -> ProviderError {
+fn map_error_status(
+    status: reqwest::StatusCode,
+    body: &str,
+    sent_bytes: usize,
+    max_request_bytes: Option<u64>,
+) -> ProviderError {
     let snippet: String = body.trim().chars().take(512).collect();
     let code = status.as_u16();
     match code {
         429 => ProviderError::RateLimited,
         408 => ProviderError::Transport(format!("HTTP {code}: {snippet}")),
-        // 400/413/422 are request-shape failures: failover to another
-        // provider would send the same rejected bytes and burn budget.
-        // The context markers are the one recoverable shape (route to
+        // ADR-068: 413 is the provider saying "these bytes are too many".
+        // Its own class (never provider_down): a failover would resend the
+        // same bytes, and a raw transport retry would re-upload them.
+        413 => ProviderError::RequestTooLarge {
+            size: sent_bytes,
+            limit: max_request_bytes,
+            detail: format!(
+                "the provider answered HTTP 413 for a {sent_bytes}-byte request{bound};                  the same context cannot succeed on a retry (ADR-068): {snippet}",
+                bound = max_request_bytes
+                    .map(|limit| format!(" (local bound {limit})"))
+                    .unwrap_or_default(),
+            ),
+        },
+        // 400/422 are request-shape failures: failover to another provider
+        // would send the same rejected bytes and burn budget. The context
+        // markers are the one recoverable shape (route to
         // compress_then_retry, never to failover).
-        400 | 413 | 422 if is_context_overflow(body) => ProviderError::ContextOverflow,
-        400 | 413 | 422 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
+        400 | 422 if is_context_overflow(body) => ProviderError::ContextOverflow,
+        400 | 422 => ProviderError::InvalidResponse(format!("HTTP {code}: {snippet}")),
         _ => ProviderError::Unavailable(format!("HTTP {code}: {snippet}")),
     }
 }
@@ -778,6 +832,7 @@ mod tests {
             chat_completions_path: chat_path.into(),
             connect_timeout_ms: DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
             idle_timeout_ms: DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+            max_request_bytes: None,
         }
     }
 
@@ -827,6 +882,7 @@ mod tests {
             chat_completions_path: chat_path.into(),
             connect_timeout_ms: connect_ms,
             idle_timeout_ms: idle_ms,
+            max_request_bytes: None,
         }
     }
 
@@ -1081,6 +1137,99 @@ mod tests {
             other => panic!("expected Other error, got {other:?}"),
         }
         assert_eq!(server.received_requests().await.unwrap().len(), 0);
+    }
+
+    /// ADR-068: a configured outbound bound refuses before the client is
+    /// handed the bytes — zero requests reach the server, and the error
+    /// says so.
+    #[tokio::test]
+    async fn a_configured_max_request_bytes_refuses_before_any_byte_crosses_the_wire() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_ok(&["[DONE]"]))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cfg = config(&server.uri(), "/chat/completions");
+        cfg.max_request_bytes = Some(1024);
+        let provider = OpenAiCompatProvider::new(
+            cfg,
+            Arc::new(RecordingSink {
+                log: Arc::new(Mutex::new(Vec::new())),
+                bodies: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let request = ModelRequest {
+            slot: SlotName("main".into()),
+            body: build_chat_body("m1", &[ChatMessage::plain("user", "x".repeat(4096))], &[]),
+        };
+        let out = collect(provider.complete(request).boxed()).await;
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Err(ProviderError::RequestTooLarge {
+                size,
+                limit,
+                detail,
+            }) => {
+                assert!(*size > 1024, "size must report the serialized body: {size}");
+                assert_eq!(*limit, Some(1024));
+                assert!(detail.contains("1024"), "{detail}");
+                assert!(
+                    detail.contains("no request byte left this process"),
+                    "must state that nothing was sent: {detail}"
+                );
+            }
+            other => panic!("expected RequestTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "a refused request must not reach the wire"
+        );
+    }
+
+    /// ADR-068: HTTP 413 is its own class, carrying the sent size — never
+    /// `provider_down` (which the old transport path produced) and never
+    /// the 400/422 request-shape verdict.
+    #[tokio::test]
+    async fn an_http_413_is_request_too_large_with_the_sent_size() {
+        ensure_no_proxy();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_string(r#"{"error":{"message":"request entity too large"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatProvider::new(
+            config(&server.uri(), "/chat/completions"),
+            Arc::new(RecordingSink {
+                log: Arc::new(Mutex::new(Vec::new())),
+                bodies: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+        let out = collect(provider.complete(sample_request("m1")).boxed()).await;
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Err(ProviderError::RequestTooLarge {
+                size,
+                limit,
+                detail,
+            }) => {
+                assert!(*size > 0);
+                assert_eq!(*limit, None, "no local bound was configured");
+                assert!(detail.contains("HTTP 413"), "{detail}");
+                assert!(detail.contains("request entity too large"), "{detail}");
+            }
+            other => panic!("expected RequestTooLarge, got {other:?}"),
+        }
     }
 
     /// SSE deltas stream as chunks in arrival order; the wire body is the

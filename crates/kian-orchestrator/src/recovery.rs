@@ -43,6 +43,10 @@ pub enum ErrorClass {
     ProviderDown,
     RateLimited,
     ContextOverflow,
+    /// The request itself is too large (ADR-068): refused locally by
+    /// `providers.<name>.max_request_bytes` or by the provider's 413.
+    /// Never retried implicitly — the same bytes cannot succeed.
+    RequestTooLarge,
     ToolFailed,
     StoreFailure,
     BudgetExhausted,
@@ -56,10 +60,11 @@ pub enum ErrorClass {
 impl ErrorClass {
     /// Every class — the one-shot guard's worst-case bound is one fire
     /// per class, so any recovery loop is bounded by `ALL.len()`.
-    pub const ALL: [ErrorClass; 9] = [
+    pub const ALL: [ErrorClass; 10] = [
         ErrorClass::ProviderDown,
         ErrorClass::RateLimited,
         ErrorClass::ContextOverflow,
+        ErrorClass::RequestTooLarge,
         ErrorClass::ToolFailed,
         ErrorClass::StoreFailure,
         ErrorClass::BudgetExhausted,
@@ -74,6 +79,7 @@ impl ErrorClass {
             ErrorClass::ProviderDown => "provider_down",
             ErrorClass::RateLimited => "rate_limited",
             ErrorClass::ContextOverflow => "context_overflow",
+            ErrorClass::RequestTooLarge => "request_too_large",
             ErrorClass::ToolFailed => "tool_failed",
             ErrorClass::StoreFailure => "store_failure",
             ErrorClass::BudgetExhausted => "budget_exhausted",
@@ -131,6 +137,7 @@ pub fn classify(error: &RecoveryError, _ctx: &ClassifyCtx) -> ErrorClass {
         RecoveryError::Provider(e) => match e {
             ProviderError::RateLimited => ErrorClass::RateLimited,
             ProviderError::ContextOverflow => ErrorClass::ContextOverflow,
+            ProviderError::RequestTooLarge { .. } => ErrorClass::RequestTooLarge,
             ProviderError::Unavailable(_) | ProviderError::Transport(_) => ErrorClass::ProviderDown,
             ProviderError::EmptyResponse => ErrorClass::EmptyResponse,
             ProviderError::InvalidResponse(_) => ErrorClass::ValidationFailed,
@@ -243,6 +250,7 @@ impl PolicyConfig {
                 rule("store_failure", RecoveryAction::Fail),
                 rule("budget_exhausted", RecoveryAction::Fail),
                 rule("validation_failed", RecoveryAction::Fail),
+                rule("request_too_large", RecoveryAction::Fail),
                 rule("unknown", RecoveryAction::Fail),
             ],
         }
@@ -790,6 +798,12 @@ mod tests {
             ErrorClass::ProviderDown => ProviderError::Transport("conn reset".into()).into(),
             ErrorClass::RateLimited => ProviderError::RateLimited.into(),
             ErrorClass::ContextOverflow => ProviderError::ContextOverflow.into(),
+            ErrorClass::RequestTooLarge => ProviderError::RequestTooLarge {
+                size: 18_235_916,
+                limit: Some(33_554_432),
+                detail: "over the outbound bound; nothing was sent".into(),
+            }
+            .into(),
             ErrorClass::ToolFailed => ToolError::Execution("boom".into()).into(),
             ErrorClass::StoreFailure => StoreError::GuardMismatch("test").into(),
             ErrorClass::BudgetExhausted => RecoveryError::BudgetExhausted,
@@ -967,6 +981,15 @@ mod tests {
             (
                 ProviderError::ContextOverflow.into(),
                 ErrorClass::ContextOverflow,
+            ),
+            (
+                ProviderError::RequestTooLarge {
+                    size: 18_235_916,
+                    limit: Some(33_554_432),
+                    detail: "over providers.vadis.max_request_bytes".into(),
+                }
+                .into(),
+                ErrorClass::RequestTooLarge,
             ),
             (
                 ProviderError::EmptyResponse.into(),
@@ -1172,6 +1195,12 @@ rules:
         );
         assert_eq!(
             table.resolve(ErrorClass::StoreFailure),
+            Some(&RecoveryAction::Fail)
+        );
+        // ADR-068: the same bytes cannot succeed on a retry, and a failover
+        // would resend them — the default is an honest fail.
+        assert_eq!(
+            table.resolve(ErrorClass::RequestTooLarge),
             Some(&RecoveryAction::Fail)
         );
     }
