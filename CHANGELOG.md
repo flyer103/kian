@@ -8,6 +8,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage voice replies are opt-in per request (ADR-067).** `reply_voice`'s description now
+  states the default: the Router speaks only when the user asked for a spoken reply — in that
+  message or as a standing instruction in the conversation — and replies with text otherwise; the
+  channel never mirrors the inbound modality.
 - **Provider failures: an oversized request is a classified, non-retryable error
   (`providers.<name>.max_request_bytes`, the `request_too_large` policy class, ADR-068).** The
   openai-compatible seam compares the serialized body against the optional bound before the POST
