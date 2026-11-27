@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage: a multi-attachment row settles before it is admitted (ADR-070).** `chat.db` appends
+  one attachment join row at a time, so a scan that lands mid-commit used to admit a prefix and let
+  `guid` dedupe swallow the rest; the adapter now holds its read position just before an unsettled
+  row for at most five seconds and admits it whole. The per-row media cap rises to eight, and both an
+  expired wait and a truncation over the cap write an audit line instead of dropping silently.
 - **Self-dev runs: a proposal is admitted from a verified evidence pack
   (`design/SELF-EVOLUTION-MODEL.md` §4–§5, ADR-069).**
   `kian job run <job> --pack <dir> [--base <commit>] [--force]` verifies the package before
