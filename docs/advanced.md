@@ -889,9 +889,33 @@ providers:
 `providers.<name>.max_request_bytes` (bytes, floor 1024, absent = off) is checked against the
 serialized body; over it the turn fails `request_too_large` naming both sizes with nothing sent, and
 an HTTP 413 from the upstream classifies the same way. The class is non-retryable by default — the
-same bytes cannot succeed; a deployment that wants compaction to shrink the history first adds
-`request_too_large: compress_then_retry` to its `recovery:` table. Semantics:
-[ADR-068](../design/decisions/ADR-068-oversized-request-classification.md).
+same bytes cannot succeed. A deployment that wants compaction to shrink the history first opts in:
+
+```yaml
+recovery:
+  rules: # an explicit table replaces the defaults, so keep the rules this deployment relies on
+    - class: rate_limited
+      action: { backoff_retry: { delay_ms: 500 } }
+    - class: empty_response
+      action: { backoff_retry: { delay_ms: 250 } }
+    - class: context_overflow
+      action: compress_then_retry
+    - class: provider_down
+      action: failover
+    - class: tool_failed
+      action: interrupt_ask
+    - class: request_too_large
+      action: compress_then_retry # fold once, then retry the smaller request
+```
+
+The refusal then folds the old turns into a summary — one ordinary maintenance turn, the most
+recent turns kept verbatim, at most twice per drain episode — and the retry carries the smaller
+request. When no fold can reclaim anything the turn settles failed as before. The classes left out
+above (`store_failure`, `budget_exhausted`, `validation_failed`, `unknown`) carry a `fail` rule in
+the default table; omitting them here matches it, because a class with no rule runs no recovery
+action and the turn settles failed. Semantics:
+[ADR-068](../design/decisions/ADR-068-oversized-request-classification.md) and
+[ADR-070](../design/decisions/ADR-070-oversized-request-folds-under-policy.md).
 
 ## Session budgets
 
@@ -985,9 +1009,12 @@ instant is already off peak, the admission runs immediately and records the reas
 When the bound model profile declares a `context_window`, the loop keeps a long session inside it
 by folding old turns behind one summary instead of dying at the limit. Folding is the only action
 that invalidates the provider prefix cache, so it is triggered by evidence only: the next request's
-worst case (projected context plus the declared `max_output`) reaching 90% of the window, or the
-provider itself answering a context-overflow error. Nothing is compacted for cost, and a session
-whose profile declares no window never folds preventively.
+worst case (projected context plus the declared `max_output`) reaching 90% of the window, the
+provider itself answering a context-overflow error, or — only when the recovery table resolves the
+class to `compress_then_retry` — the provider refusing the request as too large
+([ADR-070](../design/decisions/ADR-070-oversized-request-folds-under-policy.md)). Nothing is
+compacted for cost, and a session whose profile declares no window never folds preventively; a byte
+refusal with no policy opt-in still fails the turn.
 
 ```yaml
 model_profiles:

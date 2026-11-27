@@ -511,24 +511,32 @@ trimming or synthesis is performed (constraint 2/3).
 pure planner, `kian-orchestrator::compaction`. `plan_compaction(events, settings, trigger)` reads
 only the stream: it keeps the most recent `keep_recent_turns` turn/start boundaries verbatim,
 starts after the last `compact` event, requires a minimum reclaim (`min_reclaim_tokens`) and
-returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Two triggers exist and
-both are evidence: a declared `profile.context_window` whose worst-case next request (projected
-context plus the declared output cap) reaches `trigger_percent`, or the provider's own
-`ContextOverflow` answer. The loop never compacts for cost — folding is the only deliberate
-prefix invalidation (constraint 3), so it must answer a measured pressure. The fold itself is an
-ordinary persisted maintenance turn: `turn/start`, `step/request` with `purpose: "compact"`, then
-the summary, then `compact` only on success; the summarizer uses the session's bound
-slot/provider, one request, no fallback traversal and no `turn/request`/`turn/response` hook ports
-(it is not a model turn). The compact payload keeps its frozen `{from_seq,to_seq,summary}` keys
-and adds audit-only `produced_by.step_seq`, `reason`, `folded_messages` and `reclaimed_tokens`;
-projection and `context_to_bytes` are untouched. At most two folds run per drain episode. The
-ordinary turn gate reserves ten percent of the budget allowance (`kian-core::budget`) for these
-maintenance requests, so a session cannot spend itself into being unable to compact; the reserve
-is what makes the `awaiting_budget` park recoverable instead of a deadlock. CLI observability
-follows the `purpose`: the cache checker pairs only ordinary requests (a maintenance body never
-reads as an unexpected prefix change) and `kian cost` reports maintenance requests and their
-priced subtotal apart from turns. Limits: no price-aware planner, no `compact_slot`, no
-maintenance fallback; wall-clock budgets remain ungated.
+returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Three triggers exist and
+all are evidence: a declared `profile.context_window` whose worst-case next request (projected
+context plus the declared output cap) reaches `trigger_percent`; the provider's own
+`ContextOverflow` answer; or its `request_too_large` refusal (ADR-068) against the declared
+`max_request_bytes` bound. The last two are reactive, and both fold only when the deployment's
+recovery policy table resolves the class to `compress_then_retry` (ADR-070) — the loop reads the
+action it already persisted in the audit, so an operator who maps the class to `fail` still gets a
+failed turn, and the class only selects the trigger whose name the `compact` reason reports. The
+loop never compacts for cost — folding is the only deliberate prefix invalidation (constraint 3),
+so it must answer a measured pressure or a verdict the provider already delivered. The fold itself
+is an ordinary persisted maintenance turn: `turn/start`, `step/request` with
+`purpose: "compact"`, then the summary, then `compact` only on success; the summarizer uses the
+session's bound slot/provider, one request, no fallback traversal and no
+`turn/request`/`turn/response` hook ports (it is not a model turn). The compact payload keeps its
+frozen `{from_seq,to_seq,summary}` keys and adds audit-only `produced_by.step_seq`, `reason`,
+`folded_messages` and `reclaimed_tokens`; projection and `context_to_bytes` are untouched. At most
+two folds run per drain episode. The ordinary turn gate reserves ten percent of the budget
+allowance (`kian-core::budget`) for these maintenance requests, so a session cannot spend itself
+into being unable to compact; the reserve is what makes the `awaiting_budget` park recoverable
+instead of a deadlock. CLI observability follows the `purpose`: the cache checker pairs only
+ordinary requests (a maintenance body never reads as an unexpected prefix change) and `kian cost`
+reports maintenance requests and their priced subtotal apart from turns. Limits: no price-aware
+planner, no `compact_slot`, no maintenance fallback, no byte-aware preventive estimate — pixels can
+grow the serialized request faster than the token estimate grows, so such a session folds only
+after the refusal and then oscillates near the declared bound (ADR-070); wall-clock budgets
+remain ungated.
 
 **Vision inputs (ADR-063, P5c — landed):** the one capability that changes the request dialect
 rather than adding a surface beside it. A user input payload may carry its content object as

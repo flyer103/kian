@@ -65,6 +65,15 @@ impl RecoveryPolicySource for NoopPolicy {
     }
 }
 
+/// A fixed recovery policy table: lets a test choose the disposition a class
+/// resolves to without dragging in the deployment's defaults.
+pub struct TablePolicy(pub Vec<PolicyRule>);
+impl RecoveryPolicySource for TablePolicy {
+    fn table(&self) -> Vec<PolicyRule> {
+        self.0.clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scripted provider
 // ---------------------------------------------------------------------------

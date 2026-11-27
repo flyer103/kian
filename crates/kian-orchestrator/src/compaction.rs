@@ -111,6 +111,10 @@ pub enum CompactionTrigger {
     Pressure(CompactionPressure),
     /// The provider already rejected a request as context overflow.
     Overflow,
+    /// The provider refused a request as too large for its byte bound
+    /// (ADR-068). Distinct from `Overflow` so the fold's reason names the
+    /// byte verdict instead of claiming a window overflow.
+    Oversized,
 }
 
 impl CompactionTrigger {
@@ -119,7 +123,7 @@ impl CompactionTrigger {
     pub fn authorizes(&self, settings: &CompactionSettings) -> bool {
         match self {
             Self::Pressure(pressure) => pressure.triggers(settings),
-            Self::Overflow => true,
+            Self::Overflow | Self::Oversized => true,
         }
     }
 
@@ -132,6 +136,7 @@ impl CompactionTrigger {
                 pressure.context_window_tokens
             ),
             Self::Overflow => "provider reported context overflow".to_string(),
+            Self::Oversized => "provider refused the request as too large (ADR-068)".to_string(),
         }
     }
 }
@@ -472,6 +477,31 @@ mod tests {
         .unwrap()
         .expect("overflow authorizes a fold");
         assert_eq!(plan.reason, "provider reported context overflow");
+        assert_eq!(plan.folded_messages, 10);
+    }
+
+    #[test]
+    fn oversized_refusal_authorizes_a_fold_and_names_the_byte_verdict() {
+        let mut stream = Stream::new();
+        for i in 0..8 {
+            stream.turn(&format!("turn {i}"));
+        }
+        let settings = CompactionSettings {
+            keep_recent_turns: 3,
+            min_reclaim_tokens: 1,
+            trigger_percent: 50,
+        };
+        let plan = plan_compaction(
+            &stream.events,
+            &settings,
+            Some(&CompactionTrigger::Oversized),
+        )
+        .unwrap()
+        .expect("a byte refusal authorizes a fold");
+        assert_eq!(
+            plan.reason,
+            "provider refused the request as too large (ADR-068)"
+        );
         assert_eq!(plan.folded_messages, 10);
     }
 

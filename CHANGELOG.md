@@ -8,6 +8,16 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **An oversized request folds when the recovery policy says so (ADR-070).** A
+  `request_too_large` refusal — the serialized request crossed
+  `providers.<name>.max_request_bytes` — now runs the same maintenance fold as a
+  `context_overflow` answer when the recovery table resolves the class to `compress_then_retry`:
+  the older turns fold behind a summary under the byte trigger and the retry carries the smaller
+  request, bounded by the per-episode fold cap. The gate covers `context_overflow` as well, so the
+  table is authoritative for both reactive folds; both defaults are unchanged (`request_too_large`
+  still fails, a window overflow still folds), so a deployment opts in with
+  `recovery.rules: [{class: request_too_large, action: compress_then_retry}, …]` — an explicit
+  `rules:` table replaces the defaults, and `docs/advanced.md` carries the runnable table.
 - **Self-dev runs: a proposal is admitted from a verified evidence pack
   (`design/SELF-EVOLUTION-MODEL.md` §4–§5, ADR-069).**
   `kian job run <job> --pack <dir> [--base <commit>] [--force]` verifies the package before

@@ -133,13 +133,13 @@ sessions:
     recovery_budget: { tokens: 500k, wall_clock: 30m }
 
 recovery: # A4/A5: pure-function classification + declarative policy table
-  policies:
-    - match: { error_class: rate_limited }
-      action: backoff_retry { max: 5, base: 2s }
-    - match: { error_class: context_overflow }
-      policy: compress_then_retry
-    - match: { error_class: provider_down }
-      action: failover { slots: [main], to: fallback }
+  rules: # an explicit table replaces the defaults, so list every class this deployment governs
+    - class: rate_limited
+      action: { backoff_retry: { delay_ms: 500 } }
+    - class: context_overflow
+      action: compress_then_retry
+    - class: provider_down
+      action: failover
 
 control_plane: # P5 protocoled control plane
   steer: enabled
@@ -682,16 +682,21 @@ never a cost optimization.
 Semantics: `kian-orchestrator::compaction` exposes a pure planner
 (`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
 after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
-with an explicit reason. The loop folds under two triggers only: a declared
-`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90),
-or the provider's authoritative `ContextOverflow` answer. The summary is produced by an ordinary
-persisted maintenance turn - `turn/start`, `step/request` with `purpose: "compact"`, the
-summary, then `compact` - using the session's bound slot/provider with one request and no
-fallback; the summarizer is not routed through `turn/request` / `turn/response` hook ports. The
-`compact` event is appended only after the summary exists; a failed summarizer leaves the
-projection untouched and its request is still persisted and priced. Ordinary turns reserve ten
-percent of the budget allowance for maintenance requests, so the session can always pay for the
-compaction that prevents the overflow deadlock. At most two folds run per drain episode.
+with an explicit reason. The loop folds under three triggers: a declared
+`profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90);
+the provider's authoritative `ContextOverflow` answer; or its `request_too_large` refusal
+against the declared byte bound (ADR-068). The two reactive triggers fold only when the
+deployment's recovery policy table resolves the class to `compress_then_retry` (ADR-070), so
+the default table — which maps `request_too_large` to `fail` — keeps a byte refusal terminal,
+and the class selects the trigger whose name the `compact` reason reports. The summary is
+produced by an ordinary persisted maintenance turn - `turn/start`, `step/request` with
+`purpose: "compact"`, the summary, then `compact` - using the session's bound slot/provider with
+one request and no fallback; the summarizer is not routed through `turn/request` /
+`turn/response` hook ports. The `compact` event is appended only after the summary exists; a
+failed summarizer leaves the projection untouched and its request is still persisted and priced.
+Ordinary turns reserve ten percent of the budget allowance for maintenance requests, so the
+session can always pay for the compaction that prevents the overflow deadlock. At most two folds
+run per drain episode.
 Observability follows the purpose: cache metrics pair only ordinary requests, and `kian cost`
 reports maintenance requests apart from turns.
 
@@ -931,9 +936,11 @@ Semantics: `providers.<name>.max_request_bytes` (optional, absent = no pre-fligh
 process. An HTTP 413 answer is classified `request_too_large` as well, carrying the status, the
 size that was sent and a bounded snippet. `request_too_large` is a closed policy-table class: the
 default table maps it to `fail` because re-sending identical bytes cannot succeed, and a deployment
-that wants compaction to shrink the history opts into `compress_then_retry` explicitly. Without a
-declared bound a mid-upload connection close stays `provider_down` — no transport heuristics. The
-persisted `step/request` remains the audit record of the bytes that were not sent.
+that wants compaction to shrink the history opts into `compress_then_retry` explicitly — the loop
+then folds the old turns under the byte trigger and retries the smaller request (ADR-070), bounded
+by the per-episode fold cap; when no fold can reclaim anything the turn settles failed as before.
+Without a declared bound a mid-upload connection close stays `provider_down` — no transport
+heuristics. The persisted `step/request` remains the audit record of the bytes that were not sent.
 
 The contract is
 [ADR-068](../design/decisions/ADR-068-oversized-request-classification.md).

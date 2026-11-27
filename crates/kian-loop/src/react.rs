@@ -941,22 +941,17 @@ impl Inner {
                     payload["usage"] = u.clone();
                 }
                 let _ = ctx.end_turn_with(payload).await;
-                // ADR-058 reactive arm: a provider context overflow is the
-                // authoritative pressure reading — fold the old turns and
-                // let the next iteration retry the (now smaller) request.
-                // The failed request above is already accounted and stays
-                // in the stream; nothing about it is rewritten.
-                let overflow = audit.get("class").and_then(Value::as_str)
-                    == Some(kian_orchestrator::recovery::ErrorClass::ContextOverflow.name());
-                if overflow
+                // ADR-058/ADR-070 reactive arm: when the recovery policy
+                // resolved this failure to `compress_then_retry`, fold the old
+                // turns and let the next iteration retry the (now smaller)
+                // request. Keying on the resolved action rather than on the
+                // class keeps the audit and the fold in agreement — an
+                // operator who maps a class to `fail` still gets a failed
+                // turn. The failed request above is already accounted and
+                // stays in the stream; nothing about it is rewritten.
+                if let Some(trigger) = fold_trigger(&audit)
                     && let Some(flow) = self
-                        .compact_now(
-                            ctx,
-                            &binding,
-                            iteration,
-                            CompactionTrigger::Overflow,
-                            compactions,
-                        )
+                        .compact_now(ctx, &binding, iteration, trigger, compactions)
                         .await?
                 {
                     return Ok(flow);
@@ -2088,6 +2083,26 @@ fn action_name(action: Option<&RecoveryAction>) -> &'static str {
         Some(RecoveryAction::InterruptAsk) => "interrupt_ask",
         Some(RecoveryAction::Fail) => "fail",
     }
+}
+
+/// The fold a soft failure authorizes: only when the declarative policy
+/// resolved the class to `compress_then_retry` (ADR-070), and then the class
+/// picks the trigger so the `compact` event's reason names the verdict that
+/// actually arrived.
+fn fold_trigger(audit: &Value) -> Option<CompactionTrigger> {
+    if audit.get("action").and_then(Value::as_str)
+        != Some(action_name(Some(&RecoveryAction::CompressThenRetry)))
+    {
+        return None;
+    }
+    let class = audit.get("class").and_then(Value::as_str)?;
+    if class == kian_orchestrator::recovery::ErrorClass::ContextOverflow.name() {
+        return Some(CompactionTrigger::Overflow);
+    }
+    if class == kian_orchestrator::recovery::ErrorClass::RequestTooLarge.name() {
+        return Some(CompactionTrigger::Oversized);
+    }
+    None
 }
 
 /// Persists `slot/fallback` payloads through the drain ctx (one durable
