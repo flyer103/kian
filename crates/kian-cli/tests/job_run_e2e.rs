@@ -148,6 +148,9 @@ async fn a_deliver_only_run_ends_completed_with_a_real_receipt() {
     let admitted = kian_cli::job_cli::execute(&JobCommand::Run {
         job: JOB.to_string(),
         slot: Some(SLOT.to_string()),
+        pack: None,
+        base: None,
+        force: false,
         config: config.clone(),
         json: true,
     })

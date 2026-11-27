@@ -50,6 +50,11 @@ pub struct JobMarker {
     pub plan_digest: String,
     /// The frozen plan itself.
     pub plan: JobPlan,
+    /// The verified evidence pack a self-dev run was admitted over
+    /// (SELF-EVOLUTION-MODEL §4, A11). Frozen with the marker, so every child
+    /// of that run reads the same pack identity and no step can substitute a
+    /// different one.
+    pub selfdev: Option<Value>,
 }
 
 /// Why a frozen marker could not be trusted.
@@ -117,6 +122,7 @@ fn parse_marker(value: &Value) -> Result<JobMarker, MarkerError> {
         trigger: text_field(value, "trigger")?,
         plan_digest: declared,
         plan,
+        selfdev: value.get("selfdev").cloned(),
     })
 }
 
@@ -131,6 +137,22 @@ fn text_field(value: &Value, key: &str) -> Result<String, MarkerError> {
 /// The frozen marker a trigger writes into a run's first input row (§5.2).
 #[must_use]
 pub fn marker_payload(job_id: &str, slot: &str, trigger: &str, plan: &JobPlan) -> Value {
+    marker_payload_with_selfdev(job_id, slot, trigger, plan, None)
+}
+
+/// The frozen marker of a run that carries self-dev facts alongside its plan.
+///
+/// The selfdev value was verified before admission, so anything that reads it
+/// later reads a fact, not a claim. Its canonical bytes are what every child
+/// of the run sees in its task text, so a re-drive builds identical input.
+#[must_use]
+pub fn marker_payload_with_selfdev(
+    job_id: &str,
+    slot: &str,
+    trigger: &str,
+    plan: &JobPlan,
+    selfdev: Option<Value>,
+) -> Value {
     let mut map = Map::new();
     map.insert(
         "run_id".into(),
@@ -141,6 +163,9 @@ pub fn marker_payload(job_id: &str, slot: &str, trigger: &str, plan: &JobPlan) -
     map.insert("trigger".into(), Value::String(trigger.to_string()));
     map.insert("plan_digest".into(), Value::String(plan.digest()));
     map.insert("plan".into(), plan.frozen_json());
+    if let Some(selfdev) = selfdev {
+        map.insert("selfdev".into(), selfdev);
+    }
     Value::Object(map)
 }
 
@@ -872,6 +897,46 @@ mod tests {
         assert_eq!(marker.run_id, crate::job::plan::run_id("digest", "slot"));
         assert_eq!(marker.plan_digest, plan.digest());
         assert_eq!(marker.plan, plan);
+    }
+
+    #[test]
+    fn a_selfdev_marker_round_trips_its_frozen_value() {
+        let plan = plan();
+        let selfdev = json!({
+            "pack": {"dir": "/tmp/pack", "manifest_sha256": "sha256:aa", "files_sha256": "sha256:bb"},
+            "base_commit": "0".repeat(40),
+            "kian_version": "0.3.0",
+        });
+        let payload =
+            marker_payload_with_selfdev("digest", "slot", "manual", &plan, Some(selfdev.clone()));
+        let events = vec![event(
+            1,
+            10,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "[kian-job] run=digest@slot", "job": payload}),
+        )];
+        let parsed = match marker(&events) {
+            Some(Ok(parsed)) => parsed,
+            other => panic!("a valid marker: {other:?}"),
+        };
+        assert_eq!(parsed.selfdev, Some(selfdev));
+
+        let plain = marker_payload("digest", "slot", "cron", &plan);
+        assert!(
+            plain.get("selfdev").is_none(),
+            "a plan-only marker carries no selfdev key"
+        );
+        let events = vec![event(
+            1,
+            10,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "[kian-job] run=digest@slot", "job": plain}),
+        )];
+        let parsed = match marker(&events) {
+            Some(Ok(parsed)) => parsed,
+            other => panic!("a valid marker: {other:?}"),
+        };
+        assert_eq!(parsed.selfdev, None);
     }
 
     #[test]

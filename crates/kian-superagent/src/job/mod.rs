@@ -15,3 +15,4 @@ pub mod outcome;
 pub mod placement;
 pub mod plan;
 pub mod status;
+pub mod surface;

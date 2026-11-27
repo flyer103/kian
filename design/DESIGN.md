@@ -1774,6 +1774,31 @@ providers, executing tools, vision re-materialization, compaction, postgres, hoo
 cross-session fan-out; the replay runs with the current config's agent, permissions and gate, and
 the fork is deleted unless `--keep-fork` is passed.
 
+ Refinement (self-dev admission, as implemented by `kian-cli`): a job whose plan declares a
+`patch_paths_allowed` check is a **self-dev job**, and its manual trigger must carry an evidence
+pack (SELF-EVOLUTION-MODEL §4). `kian job run <job> --pack <dir> [--base <commit>] [--force]`
+verifies the pack in-process with `kian_cli::self_evidence::verify_pack` **before** the inbox store
+is opened, so a refusal (wrong `format_version`, a missing file, a byte-length or sha256 mismatch,
+a bad aggregate digest, an `events.ndjson` line that is not an `Event`) exits 2 and leaves no row.
+The verified facts are re-derived in the trigger, never trusted from the command line, and frozen
+into one additive key on the admitted row (`InputRow.payload.job.selfdev`): `pack.dir` (at most
+1024 bytes), `pack.manifest_sha256` = `sha256:` + the manifest file bytes,
+`pack.files_sha256` = `sha256:` + the manifest's per-file digest fold, `base_commit` (the `--base`
+override or the manifest's `repo.commit`, refused when neither exists), and `kian_version`. The
+whole value is bounded at 4 KiB — an over-long value is a refusal, not a truncation. The
+conductor appends the frozen value to the child's deterministic task header
+(`child_task_text`) before the prompt, so a re-drive rebuilds identical bytes; a self-dev job
+admitted without the key fails the run as `invalid_job_input` (V24). The check stays evidence:
+`patch_paths_allowed` resolves the patch artifact's target event out of the **child** stream (the
+gate runs before `harvest`), parses the unified diff's path headers, normalises them, and names
+`outside allow` / `denied` / `test-only` / `unparsable` in the verdict detail (at most 20 paths).
+The breaker is a trigger rule over the operator projection: the last
+`limits.consecutive_failures` (default 3, 0 disables, V25 bounds it at 10) settled
+`evidence/verdict`s of gate `run` for that job must not all be `failed`; an open circuit writes
+nothing and exits 2, and `--force` admits one run and records `circuit_overridden: true` in the
+frozen value. `kian job run` returns exit 2 for every admission refusal and exit 1 only for a
+store failure.
+
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session
 replay <id>`, `kian session export <id> [--since/--until]`, `kian lease inspect`) open the sqlite
