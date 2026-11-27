@@ -123,8 +123,11 @@ fn the_job_runtime_only_names_catalogued_kinds() {
     // The deliberate set. A new entry here is a design change: the
     // conductor may only write the existing carrier facts (a child
     // dispatch, a delivery, a verdict, an end) plus the admission rows
-    // the alert path builds — never a new kind (JOB-MODEL §14).
+    // the alert path builds — never a new kind (JOB-MODEL §14). The one
+    // read-only entry is the child's final message: the artifact a step
+    // harvests is the producer's last `assistant/message` (JOB-MODEL §12.1).
     let expected: BTreeSet<String> = [
+        "AssistantMessage",
         "ChannelDelivered",
         "ControlInterrupt",
         "EvidenceVerdict",
