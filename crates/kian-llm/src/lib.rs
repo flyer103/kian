@@ -24,8 +24,8 @@ pub mod turn;
 pub use kian_core::seams::{ModelChunk, ModelProvider, ModelRequest, ProviderError, ToolSchema};
 
 pub use plan::{
-    BodyVersion, ESTIMATOR_SOURCE, ESTIMATOR_VERSION, RequestPlan, TokenEstimate,
-    build_request_plan,
+    AuditError, BodyForm, BodyVersion, ESTIMATOR_SOURCE, ESTIMATOR_VERSION, Expansion, RequestPlan,
+    TokenEstimate, build_request_plan, expand_audit_body,
 };
 pub use provider::{
     ChatMessage, FROZEN_CHAT_BODY_SHA256, OpenAiCompatConfig, OpenAiCompatProvider, PersistError,

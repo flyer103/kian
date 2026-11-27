@@ -542,14 +542,19 @@ same artifact store the spill path uses (a new DrainCtx::artifact_bytes accessor
 the bytes to the derived ChatMessage only when the bound target declares vision: true. The V2
 plan builder then rewrites exactly those messages into OpenAI content parts
 ([{type: text}, {type: image_url, image_url: {url: data:<media_type>;base64,<bytes>}}]) inside the
-single place that produces the persisted and sent bytes, so persist-what-you-send holds and the
-estimate band already prices the image bytes. The image field is serde-skipped, so the frozen V1
+single place that produces the sent and the persisted rendering, so persist-what-you-send holds and
+the estimate band already prices the image bytes. The image field is serde-skipped, so the frozen V1
 body and every image-free V2 body keep their exact bytes (constraint 3); the capability is
 per-target, like thinking and effort. Bounds: at most four images per message and eight MiB per
 image, user messages only; a missing, oversized or malformed reference drops that image with a
 warning and the text envelope still flies (an artifact reclaimed by GC degrades the answer, never
-fails the turn). Replay honesty: the persisted step/request body is still the exact bytes sent,
-but offline replay cannot rebuild base64 from the stream alone, so kian session replay counts a
+fails the turn). Audit honesty: the persisted step/request body proves the exact bytes without
+storing the pixels twice — body_sha256 covers the wire body, and every image part is a
+content-addressed reference (ADR-073: body_form, body_bytes; kian session request --expand rebuilds
+the data: URLs and verifies the digest) whose blob is the same one the admission named. The log alone
+therefore identifies the bytes but is not sufficient to render them; a durable copy comes from kian
+session export --with-artifacts, which pins every blob a request body references beside the JSONL.
+Offline replay still cannot rebuild base64 from the stream alone, so kian session replay counts a
 request whose recorded messages carry content parts as a vision request instead of a byte-identity
 mismatch. Limits: no real vision provider is wired in the tree (the L2 evidence is a scripted
 provider), no per-image pricing, no replay re-derivation from the artifact store. Channel media

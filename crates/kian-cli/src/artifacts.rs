@@ -172,22 +172,59 @@ impl ToolProvider for ArtifactReadTool {
 /// The artifact ids a JSONL export references, sorted and de-duplicated
 /// (P3b, ADR-059). A spill-shaped `tool/result` carries its reference at
 /// `content.output.artifact.id`; inline results and errors carry none,
-/// so an export from a spill-off assembly pins nothing.
+/// so an export from a spill-off assembly pins nothing. A persisted model
+/// request carries the ids of its image references (ADR-073), so an export
+/// that pins blobs can still rebuild those bodies after the pixels are
+/// reclaimed.
 pub fn referenced_artifact_ids<'a>(
     events: impl IntoIterator<Item = &'a Event>,
 ) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     for event in events {
-        if !matches!(event.kind, EventKind::ToolResult) {
-            continue;
-        }
-        if let Some(id) = event.bytes["content"]["output"]["artifact"]["id"].as_str()
-            && !id.is_empty()
-        {
-            ids.insert(id.to_string());
+        match event.kind {
+            EventKind::ToolResult => {
+                if let Some(id) = event.bytes["content"]["output"]["artifact"]["id"].as_str()
+                    && !id.is_empty()
+                {
+                    ids.insert(id.to_string());
+                }
+            }
+            EventKind::StepRequest | EventKind::SlotFallback => {
+                let body = event.bytes.get("body").unwrap_or(&event.bytes);
+                collect_image_references(body, &mut ids);
+            }
+            _ => {}
         }
     }
     ids
+}
+
+/// Collects `artifact:` image references out of a request body
+/// (ADR-073). Bodies persisted before that rendering carry inline
+/// `data:` URLs and contribute nothing.
+fn collect_image_references(body: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            let Some(url) = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if let Some(id) = url.strip_prefix("artifact:")
+                && !id.is_empty()
+            {
+                ids.insert(id.to_string());
+            }
+        }
+    }
 }
 
 /// What an export pinned: blobs copied beside the JSONL, plus ids whose
@@ -562,6 +599,25 @@ mod tests {
         }
     }
 
+    fn request_event(seq: u64, kind: EventKind, url: &str) -> Event {
+        Event {
+            seq,
+            session: kian_core::model::SessionId(uuid::Uuid::nil()),
+            epoch: kian_core::model::Epoch(1),
+            ts: 1_761_900_000_000,
+            kind,
+            bytes: json!({"body": {"messages": [{"content": [
+                {"type": "text", "text": "what is on this invoice?"},
+                {"type": "image_url", "image_url": {
+                    "url": url,
+                    "media_type": "image/png",
+                    "size": 2,
+                }},
+            ]}]}}),
+            version: kian_core::events::Event::current_version(),
+        }
+    }
+
     #[test]
     fn referenced_ids_come_only_from_spill_shaped_results() {
         let event = tool_result_event(2, Some(&"a".repeat(64)));
@@ -569,6 +625,18 @@ mod tests {
         let ids = referenced_artifact_ids([&event, &inline]);
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn referenced_ids_include_request_bodies_that_name_blobs() {
+        let id = "c".repeat(64);
+        let request = request_event(4, EventKind::StepRequest, &format!("artifact:{id}"));
+        // A body persisted before ADR-073 carries an inline data URL: its
+        // pixels are already in the stream, so it pins nothing.
+        let legacy = request_event(5, EventKind::SlotFallback, "data:image/png;base64,aGk=");
+        let ids = referenced_artifact_ids([&request, &legacy]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&id));
     }
 
     #[test]
