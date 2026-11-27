@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Compaction answers byte pressure, not only token pressure (ADR-071).** With
+  `providers.<name>.max_request_bytes` declared, the loop measures the rendered request (artifact
+  bytes inlined, tool schemas sorted, plan body serialized) before the turn exists, and folds old
+  turns instead of persisting and sending a body over the bound. A byte-triggered fold skips the
+  minimum-reclaim rule, which counts projected text and cannot see the pixels it removes, and
+  records both byte readings as the fold's reason. The refusal of ADR-068 stays the last defense;
+  this is what makes the next turn sendable instead of wedging the session.
 - **iMessage: a multi-attachment row settles before it is admitted (ADR-070).** `chat.db` appends
   one attachment join row at a time, so a scan that lands mid-commit used to admit a prefix and let
   `guid` dedupe swallow the rest; the adapter now holds its read position just before an unsettled

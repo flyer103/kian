@@ -682,9 +682,14 @@ never a cost optimization.
 Semantics: `kian-orchestrator::compaction` exposes a pure planner
 (`plan_compaction(events, settings, trigger)`) that keeps the most recent turns verbatim, starts
 after the previous compact, requires a minimum reclaim and returns a strictly-past disjoint range
-with an explicit reason. The loop folds under two triggers only: a declared
+with an explicit reason. The loop folds under three triggers only: a declared
 `profile.context_window` whose worst-case next request reaches `trigger_percent` (default 90),
-or the provider's authoritative `ContextOverflow` answer. The summary is produced by an ordinary
+the provider's authoritative `ContextOverflow` answer, or a declared request-byte bound that the
+rendered request itself would exceed (ADR-071). The byte trigger is measured on the exact body the
+send would use - artifact bytes inlined, tool schemas sorted, plan body serialized - and it is
+checked before `turn/start`: an oversized body is never persisted and never sent. It skips the
+minimum-reclaim rule, which counts projected text and cannot see the pixels the fold removes, and
+records both byte readings in the fold's reason. The summary is produced by an ordinary
 persisted maintenance turn - `turn/start`, `step/request` with `purpose: "compact"`, the
 summary, then `compact` - using the session's bound slot/provider with one request and no
 fallback; the summarizer is not routed through `turn/request` / `turn/response` hook ports. The
@@ -702,10 +707,12 @@ The normative event contract is [design/EVENT-MODEL.md](../design/EVENT-MODEL.md
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P3 | kian-orchestrator, kian-loop, kian-core, kian-cli | the pure compaction planner (settings/pressure/trigger/plan, keep-recent-turns fold, minimum reclaim, strictly-past disjoint ranges); preventive and reactive folds in the ReAct loop as persisted maintenance turns (`purpose: "compact"`, summary request, `compact` on success only); per-episode fold bound; the maintenance budget reserve; purpose-aware cache metrics and cost reporting | landed |
+| P3b | kian-orchestrator, kian-loop, kian-cli | byte pressure as a fold trigger: `CompactionTrigger::Bytes` measured on the rendered request against `providers.<name>.max_request_bytes`, the pre-turn gate that folds instead of persisting an oversized body, the per-slot bound delivered into the loop ([ADR-071](../design/decisions/ADR-071-request-byte-pressure-folds-history.md)) | landed |
 
 Non-goals recorded with the phase: no price-aware break-even planner, no separate compaction
 scheduler, no `compact_slot` override, no fallback traversal for the summarizer, no wall-clock
-enforcement of the reserve.
+enforcement of the reserve. Byte pressure adds no downscale, no per-request image cap, no
+retroactive eviction outside a fold, and no automatic raising of the provider bound.
 
 ### Off-peak deferral (ADR-060, P4 landed)
 
@@ -902,7 +909,7 @@ The contract is
 
 Non-goals recorded with this slice: no retroactive eviction of history pixels, no downscale, no
 dedupe, no per-image cache. Growth across turns is stopped by the provider's `max_request_bytes`
-(ADR-067), not here.
+(ADR-068) and the byte-pressure fold it authorizes (ADR-071), not here.
 
 ### Resident rotation (ADR-040)
 

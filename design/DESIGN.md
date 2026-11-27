@@ -511,12 +511,17 @@ trimming or synthesis is performed (constraint 2/3).
 pure planner, `kian-orchestrator::compaction`. `plan_compaction(events, settings, trigger)` reads
 only the stream: it keeps the most recent `keep_recent_turns` turn/start boundaries verbatim,
 starts after the last `compact` event, requires a minimum reclaim (`min_reclaim_tokens`) and
-returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Two triggers exist and
-both are evidence: a declared `profile.context_window` whose worst-case next request (projected
-context plus the declared output cap) reaches `trigger_percent`, or the provider's own
-`ContextOverflow` answer. The loop never compacts for cost — folding is the only deliberate
-prefix invalidation (constraint 3), so it must answer a measured pressure. The fold itself is an
-ordinary persisted maintenance turn: `turn/start`, `step/request` with `purpose: "compact"`, then
+returns a strictly-past, disjoint `CompactionPlan` with an explicit reason. Three triggers exist
+and all are evidence: a declared `profile.context_window` whose worst-case next request (projected
+context plus the declared output cap) reaches `trigger_percent`, the provider's own
+`ContextOverflow` answer, or a declared `providers.<name>.max_request_bytes` that the rendered
+request would exceed. The last reading is taken on the body the send would use — chat messages with
+the artifact bytes inlined, the sorted tool schemas and the plan body — before `turn/start`, so a
+body over the bound is neither persisted nor sent; the fold it authorizes skips
+`min_reclaim_tokens` (that rule counts projected text and is blind to the pixels the fold removes)
+and its two byte readings become the fold's reason. The loop never compacts for cost — folding is
+the only deliberate prefix invalidation (constraint 3), so it must answer a measured pressure. The
+fold itself is an ordinary persisted maintenance turn: `turn/start`, `step/request` with `purpose: "compact"`, then
 the summary, then `compact` only on success; the summarizer uses the session's bound
 slot/provider, one request, no fallback traversal and no `turn/request`/`turn/response` hook ports
 (it is not a model turn). The compact payload keeps its frozen `{from_seq,to_seq,summary}` keys

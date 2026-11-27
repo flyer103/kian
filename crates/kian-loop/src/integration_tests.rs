@@ -803,6 +803,7 @@ async fn iteration_budget_stops_the_loop_after_max_turns() {
             max_iterations: 2,
             budget_scope: crate::react::BudgetScope::Lifetime,
             vision: crate::react::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: std::collections::BTreeMap::new(),
         },
     )
@@ -1224,6 +1225,7 @@ async fn allow_path_invokes_tool_and_records_provenance_default_vs_configured() 
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
         vision: crate::react::VisionBudget::default(),
+        max_request_bytes: Default::default(),
         permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
         ..ReActConfig::default()
     };
@@ -1279,6 +1281,7 @@ async fn deny_path_does_not_invoke_and_emits_honest_error_result() {
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
         vision: crate::react::VisionBudget::default(),
+        max_request_bytes: Default::default(),
         permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
         ..ReActConfig::default()
     };
@@ -1673,6 +1676,7 @@ async fn request_bytes_identical_with_hook_mounted_observing_vs_absent() {
         let (tools, _seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
         let config = ReActConfig {
             vision: crate::react::VisionBudget::default(),
+            max_request_bytes: Default::default(),
             permissions: BTreeMap::from([("fs_read".to_string(), Permission::Allow)]),
             ..ReActConfig::default()
         };
@@ -1764,6 +1768,7 @@ async fn tool_pre_and_post_cover_executed_and_declared_denied_arms() {
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
         vision: crate::react::VisionBudget::default(),
+        max_request_bytes: Default::default(),
         permissions: BTreeMap::from([
             ("fs_read".to_string(), Permission::Allow),
             ("fs_write".to_string(), Permission::Deny),
@@ -1864,6 +1869,7 @@ async fn coincident_declared_and_hook_deny_name_one_denier() {
     let (tools, seen) = crate::test_support::HookTools::ok(json!({"ok": true}));
     let config = ReActConfig {
         vision: crate::react::VisionBudget::default(),
+        max_request_bytes: Default::default(),
         permissions: BTreeMap::from([("fs_write".to_string(), Permission::Deny)]),
         ..ReActConfig::default()
     };
@@ -2339,6 +2345,17 @@ async fn harness_with_artifacts(
     turns: Vec<ScriptedChunksArgs>,
     artifacts: Option<ArtifactRuntime>,
 ) -> (Harness, Arc<ScriptedProvider>) {
+    harness_with_artifacts_config(agent, turns, artifacts, ReActConfig::default()).await
+}
+
+/// The same harness with an explicit loop configuration, for the ADR-071
+/// byte-bound tests that mount `max_request_bytes` on the mock provider.
+async fn harness_with_artifacts_config(
+    agent: AgentDef,
+    turns: Vec<ScriptedChunksArgs>,
+    artifacts: Option<ArtifactRuntime>,
+    config: ReActConfig,
+) -> (Harness, Arc<ScriptedProvider>) {
     let db_path = temp_db_path();
     let store = EventStore::open(&db_path).await.expect("open store");
     let provider = Arc::new(ScriptedProvider::new(turns));
@@ -2349,7 +2366,7 @@ async fn harness_with_artifacts(
         Arc::new(registry),
         Arc::new(NoopTools),
         Arc::new(NoopPolicy),
-        ReActConfig::default(),
+        config,
     );
     let engine = Engine::new_with_read_model_and_artifacts(
         store.clone(),
@@ -2655,6 +2672,94 @@ async fn a_channel_wrapper_with_image_references_fills_the_vision_parts() {
         None,
         "the carrier never reaches the wire"
     );
+    cleanup_db(&h.db_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// How many `image_url` parts the serialized request carries.
+fn image_parts(body: &Value) -> usize {
+    body["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+                .filter(|part| part["type"] == "image_url")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// ADR-071 Limits: a request over the declared bound with nothing left to
+/// fold is sent anyway. The gate warns once, the turn settles honestly, and
+/// the refusal stays with the provider bound (ADR-068) — the new door never
+/// spins, parks or silently drops the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_bound_request_without_a_foldable_range_is_sent_anyway() {
+    const BOUND: u64 = 1024;
+    let dir = std::env::temp_dir().join(format!("kian-loop-byte-pressure-{}", Uuid::new_v4()));
+    let blobs = kian_store::ArtifactStore::open(&dir).expect("open artifacts");
+    let reference = blobs
+        .put(&vec![7u8; 100_000], "image/png")
+        .expect("put blob");
+    let artifacts = ArtifactRuntime::new(
+        kian_store::ArtifactStore::open(&dir).expect("open artifacts"),
+        1024,
+    );
+    let agent = profiled_agent_def(
+        Some(vision_profile()),
+        Budgets {
+            tokens: None,
+            wall_clock_ms: None,
+        },
+        vec![],
+    );
+    let config = ReActConfig {
+        max_request_bytes: BTreeMap::from([("mock".to_string(), BOUND)]),
+        ..ReActConfig::default()
+    };
+    let (h, provider) = harness_with_artifacts_config(
+        agent,
+        vec![vec![text_chunk("sent with pixels")]],
+        Some(artifacts),
+        config,
+    )
+    .await;
+    let sid = h.engine.create_session().await.expect("create");
+    let mut content = json!({
+        "kian": {
+            "type": "channel_event",
+            "channel": "imessage",
+            "topic": "imessage",
+            "event_id": "evt-byte-pressure",
+            "raw": {"text": "[image]"}
+        }
+    });
+    content["images"] = json!([{"artifact": reference.id, "media_type": "image/png"}]);
+    assert_eq!(
+        submit_and_wait(&h, sid, content).await,
+        EndReason::Completed
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "the turn is one request, not a spin");
+    assert_eq!(image_parts(&requests[0]), 1, "the pixels still ride");
+
+    let events = events_of(&h.store, sid).await;
+    assert!(
+        !kinds(&events).contains(&"compact"),
+        "nothing was foldable, so nothing was compacted"
+    );
+    let requests_logged: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == EventKind::StepRequest)
+        .collect();
+    assert_eq!(
+        requests_logged.len(),
+        1,
+        "one audited request, over the bound"
+    );
+
     cleanup_db(&h.db_path);
     let _ = std::fs::remove_dir_all(&dir);
 }
