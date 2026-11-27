@@ -1237,10 +1237,11 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `kian cost [--json]` | Read-only cost projection over the config `pricing:` book: priced/unpriced requests, peak/off-peak split, exact micro-currency total |
 | `kian artifacts gc [--json]` | Retention-based GC of the content-addressed tool-result blob tree (`max_bytes` + `retention_days`); serve runs the same collection as a ticker when `artifacts:` is configured |
 | `kian session inspect <id>` | Projected state, counters, usage lines, pending control intents |
-| `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context |
+| `kian session replay <id>` | Replay the stream and verify invariants and byte-identical context; `--provider fake --script <file>` re-drives one drain episode on a scripted model and diffs the result (verdict `reproduced` / `diverged` / `incomplete`, always exit 0) |
 | `kian session export <id> --out audit.jsonl` | Audit package; `--with-event-ids` adds deterministic derived event ids, `--with-artifacts` pins referenced blobs beside the file |
 | `kian cache-stats [--json]` | Prefix-cache stability report from the durable stream |
 | `kian self inspect [--window <dur>] [--session <uuid>] [--json]` | Windowed read-only diagnostic report (default `1h`): event volume by kind, session ends by reason, turn outcomes and provider error classes, tool failures by tool, media items with and without a transcript (counts, never content), evidence verdicts, store/artifact footprint, plus `findings` that name the session and seq evidencing each one |
+| `kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>]` | Handoff package for one anchor row: the raw ±k envelope slice, session state and end writes, repo commit/branch/dirty and crate map, the `self inspect` projection, and a manifest with every file's sha256 (payload text stays inside the package — never on stdout) |
 | `kian wake-now`, `kian lease inspect`, `kian recovery budget reset` | Operational actions |
 | `GET /metrics` | Engine, cache, usage and super-agent counters |
 
@@ -1264,4 +1265,38 @@ payload string or a transcript — content is counted, not shown — and every f
 session and seq that evidence it. Finding codes: `media_error`, `turn_error`, `tool_error`,
 `session_failed`, `evidence_failed`. A uuid this store never saw is refused, not reported as
 zeros; an empty window is reported as zeros.
+
+When the aggregate view names the row but the diagnosis needs the rows themselves, `kian self
+evidence` writes a handoff package for one anchor row instead:
+
+```bash
+target/debug/kian self evidence --config kian.yaml \
+  --session <uuid> --seq 42 --context 10 --out ./evidence-42
+```
+
+`--out` is required and must not already hold data: the package is built in a temp sibling,
+re-read and re-verified, then renamed into place. The directory holds `events.ndjson` (the raw
+slice), `session.json`, `repo.json`, `inspect.json` and `manifest.json`; the manifest's
+`files_sha256` folds the per-file digests and can be re-derived from disk. `--context` defaults to
+10 rows either side and is refused above 200. Payload text is the point of a package, so it is
+written under `--out` and never to stdout: the terminal prints a summary, `--json` prints the
+manifest.
+
+When the question is what a prompt, tool-schema or loop change would do to one recorded episode,
+replay it against a script instead of only re-projecting the stream:
+
+```bash
+target/debug/kian session replay <uuid> --config kian.yaml \
+  --provider fake --script ./turns.ndjson --keep-fork
+```
+
+`turns.ndjson` holds one JSON object per line, one per provider call, in order — `{"text":
+"hello"}`, `{"tool_calls": [{"id": "call-1", "name": "fs.read", "arguments": {"path":
+"a"}}]}`, `{"error": "provider_down"}` or `{"empty": true}` (an empty answer, which the loop
+records as a soft failure); any turn may also carry `{"usage": {...}}`. The episode re-runs through the production loop against a temp fork
+of the prefix, with tools answering from the recorded `tool/result` rows. The verdict is
+`reproduced`, `diverged` (first differing row: kind, JSON-pointer path and bounded excerpts) or
+`incomplete` (the recording did not cover a call the run made — the notes say which); all three
+exit 0. `--from-seq <n>` picks an earlier `drain/claimed` boundary; `--keep-fork` keeps the temp
+store for inspection.
 

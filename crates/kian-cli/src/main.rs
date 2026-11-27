@@ -55,6 +55,8 @@ const USAGE: &str = "usage:
                                          projection + counters
   kian session replay <uuid> [--db <sqlite>] [--url <base>] [--config <path>] [--json]
                                          re-derive everything from events
+  kian session replay <uuid> --provider fake --script <file> [--from-seq <n>] [--keep-fork]
+                                         fork one drain episode, re-drive it on a scripted model, diff
   kian session export <uuid> [--since S] [--until U] [--out <file>] [--with-event-ids] [--with-artifacts] [--db <sqlite>] [--config <path>]
                                          event interval → JSONL audit package (--with-event-ids adds the derived event id; --with-artifacts pins spilled blobs)
   kian session import <package-dir> [--db <sqlite>] [--config <path>] [--json]
@@ -84,6 +86,9 @@ const USAGE: &str = "usage:
   kian self inspect [--db <sqlite>] [--config <path>] [--window <dur>] [--session <uuid>] [--json]
                                          one window of the durable stream (default 1h):
                                          what the runtime did and where it is failing
+  kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>] [--db <sqlite>] [--config <path>] [--json]
+                                         one anchor row -> a handoff package: raw slice,
+                                         session/repo identity, inspect projection, sha256s
   kian tickets [--db <sqlite>] [--config <path>] [--json]
                                          Ticket stage board: every worker session's
                                          'what is it waiting for' stage
@@ -637,6 +642,12 @@ struct SessionArgs {
     /// `session export --with-artifacts` — pins every spilled blob the
     /// exported events reference beside the JSONL (requires --out).
     with_artifacts: bool,
+    /// `session replay --provider fake` — re-drives one episode on a scripted
+    /// model instead of only re-deriving the recorded stream.
+    provider: Option<String>,
+    script: Option<std::path::PathBuf>,
+    from_seq: Option<u64>,
+    keep_fork: bool,
 }
 
 impl Default for SessionArgs {
@@ -653,6 +664,10 @@ impl Default for SessionArgs {
             json: false,
             with_event_ids: false,
             with_artifacts: false,
+            provider: None,
+            script: None,
+            from_seq: None,
+            keep_fork: false,
         }
     }
 }
@@ -698,6 +713,23 @@ fn parse_session_args(args: &[String], usage_for: &str) -> Result<SessionArgs, S
                 Some(r) => out.reason = Some(r.to_string()),
                 None => return Err(format!("--reason requires a text ({usage_for})")),
             },
+            "--provider" => match iter.next() {
+                Some(p) => out.provider = Some(p.to_string()),
+                None => return Err(format!("--provider requires a name ({usage_for})")),
+            },
+            "--script" => match iter.next() {
+                Some(p) => out.script = Some(p.into()),
+                None => return Err(format!("--script requires a path ({usage_for})")),
+            },
+            "--from-seq" => match iter.next() {
+                Some(raw) => {
+                    out.from_seq = Some(raw.parse().map_err(|_| {
+                        format!("--from-seq requires an event seq, got `{raw}` ({usage_for})")
+                    })?)
+                }
+                None => return Err(format!("--from-seq requires a seq number ({usage_for})")),
+            },
+            "--keep-fork" => out.keep_fork = true,
             "--json" => out.json = true,
             "--with-event-ids" => out.with_event_ids = true,
             "--with-artifacts" => out.with_artifacts = true,
@@ -810,16 +842,58 @@ fn session(args: &[String]) -> ExitCode {
             ),
             "session inspect",
         ),
-        "replay" => run_command(
-            kian_cli::commands::run_replay(
-                &parsed.config,
-                parsed.db.as_deref(),
-                parsed.url.as_deref(),
-                session,
-                parsed.json,
-            ),
-            "session replay",
-        ),
+        "replay" => match parsed.provider.as_deref() {
+            None => {
+                if parsed.script.is_some() || parsed.from_seq.is_some() || parsed.keep_fork {
+                    eprintln!(
+                        "kian: --script, --from-seq and --keep-fork belong to the scripted replay (`--provider fake`)\n{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+                run_command(
+                    kian_cli::commands::run_replay(
+                        &parsed.config,
+                        parsed.db.as_deref(),
+                        parsed.url.as_deref(),
+                        session,
+                        parsed.json,
+                    ),
+                    "session replay",
+                )
+            }
+            Some("fake") => {
+                if parsed.url.is_some() {
+                    eprintln!(
+                        "kian: --url is the recorded-stream diff; a scripted replay never calls a provider, so the two cannot be combined\n{USAGE}"
+                    );
+                    return ExitCode::from(2);
+                }
+                let Some(script) = parsed.script.as_deref() else {
+                    eprintln!("kian: --provider fake requires --script <file>\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                run_command(
+                    kian_cli::replay_fork::run(
+                        kian_cli::replay_fork::Options {
+                            config_path: &parsed.config,
+                            db: parsed.db.as_deref(),
+                            session,
+                            script,
+                            from_seq: parsed.from_seq,
+                            keep_fork: parsed.keep_fork,
+                        },
+                        parsed.json,
+                    ),
+                    "session replay (scripted)",
+                )
+            }
+            Some(other) => {
+                eprintln!(
+                    "kian: --provider `{other}` is not supported (only `fake`; the default is the recorded-stream diff)\n{USAGE}"
+                );
+                ExitCode::from(2)
+            }
+        },
         "export" => {
             if parsed.with_artifacts && parsed.out.is_none() {
                 eprintln!(
@@ -1660,31 +1734,39 @@ fn lease(args: &[String]) -> ExitCode {
     )
 }
 
-/// `kian self inspect [--db <sqlite>] [--config <path>] [--window <dur>]
-/// [--session <uuid>] [--json]` — one window of the durable stream
-/// (read-only embedded; SPEC §3.1). `--window` takes a unit
-/// (`30m`, `24h`); a bare number is refused rather than guessed.
+/// `kian self` — the read-only self-inspection family (SPEC §3.1).
 fn self_cmd(args: &[String]) -> ExitCode {
     let Some(sub) = args.first() else {
         eprintln!(
-            "kian: `kian self` needs a subcommand (`inspect`)
+            "kian: `kian self` needs a subcommand (`inspect`, `evidence`)
 {USAGE}"
         );
         return ExitCode::from(2);
     };
-    if sub != "inspect" {
-        eprintln!(
-            "kian: unknown self subcommand `{sub}`
+    match sub.as_str() {
+        "inspect" => self_inspect_cmd(&args[1..]),
+        "evidence" => self_evidence_cmd(&args[1..]),
+        other => {
+            eprintln!(
+                "kian: unknown self subcommand `{other}`
 {USAGE}"
-        );
-        return ExitCode::from(2);
+            );
+            ExitCode::from(2)
+        }
     }
+}
+
+/// `kian self inspect [--db <sqlite>] [--config <path>] [--window <dur>]
+/// [--session <uuid>] [--json]` — one window of the durable stream
+/// (read-only embedded; SPEC §3.1). `--window` takes a unit
+/// (`30m`, `24h`); a bare number is refused rather than guessed.
+fn self_inspect_cmd(args: &[String]) -> ExitCode {
     let mut config = std::path::PathBuf::from("kian.yaml");
     let mut db: Option<std::path::PathBuf> = None;
     let mut window = kian_cli::self_inspect::DEFAULT_WINDOW_MS;
     let mut session = None;
     let mut json = false;
-    let mut iter = args[1..].iter();
+    let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--config" => match iter.next() {
@@ -1768,6 +1850,105 @@ fn self_cmd(args: &[String]) -> ExitCode {
         session,
     };
     run_command(kian_cli::self_inspect::run(opts, json), "self inspect")
+}
+
+/// `kian self evidence --session <uuid> --seq <n> --out <dir>` — one anchor
+/// row becomes a handoff package (read-only embedded; SPEC §3.1). `--out` is
+/// required: the package carries payload text, so it is written where the
+/// caller names it and never to stdout.
+fn self_evidence_cmd(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut db: Option<std::path::PathBuf> = None;
+    let mut session = None;
+    let mut seq: Option<u64> = None;
+    let mut context = kian_cli::self_evidence::DEFAULT_CONTEXT;
+    let mut out: Option<std::path::PathBuf> = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--db" => match iter.next() {
+                Some(p) => db = Some(p.into()),
+                None => {
+                    eprintln!("kian: --db requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--session" => match iter.next() {
+                Some(raw) => match kian_cli::commands::parse_session(raw) {
+                    Ok(id) => session = Some(id),
+                    Err(e) => {
+                        eprintln!("kian: {e}\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --session requires a uuid\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--seq" => match iter.next() {
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(n) => seq = Some(n),
+                    Err(_) => {
+                        eprintln!(
+                            "kian: --seq `{raw}` is not an event seq (a positive integer)\n{USAGE}"
+                        );
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --seq requires an event seq\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--context" => match iter.next() {
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(n) => context = n,
+                    Err(_) => {
+                        eprintln!("kian: --context `{raw}` is not a row count\n{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => {
+                    eprintln!("kian: --context requires a row count\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--out" => match iter.next() {
+                Some(p) => out = Some(p.into()),
+                None => {
+                    eprintln!("kian: --out requires a directory\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => json = true,
+            other => {
+                eprintln!("kian: unknown self evidence option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(session), Some(seq), Some(out)) = (session, seq, out) else {
+        eprintln!("kian: `kian self evidence` needs --session, --seq and --out\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let opts = kian_cli::self_evidence::Options {
+        config_path: &config,
+        db: db.as_deref(),
+        session,
+        seq,
+        context,
+        out: &out,
+    };
+    run_command(kian_cli::self_evidence::run(opts, json), "self evidence")
 }
 
 /// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the

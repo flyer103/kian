@@ -207,12 +207,33 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
   unknown keys); it runs offline against `--db` without a server, and it never writes, starts or
   stops execution. Content-bearing payloads are counted, never printed; every finding names the
   session and seq that evidence it.
+- Evidence pack: `kian self evidence --session <uuid> --seq <n> --out <dir>` names one anchor row
+  and writes a handoff package a reviewer — human or agent — can read without the store: the raw
+  envelope slice (±`--context` rows, default 10, refused above 200), `session.json` (projected
+  state and the end writes), `repo.json` (checkout commit/branch/dirty and the crate map),
+  `inspect.json` (the same self-inspection projection over the session's whole stream) and a
+  `manifest.json` carrying the store/config/repo identity plus the sha256 of every file. Payload
+  text travels only inside the package and never to stdout — the terminal gets a summary and
+  `--json` the manifest. A pack is complete or absent: it is built in a temp sibling, re-read and
+  re-verified, then renamed into a path that did not already hold data.
+- Scripted replay: `kian session replay <uuid> --provider fake --script <file>` re-drives one
+  recorded drain episode on a scripted model instead of only re-projecting it, so a prompt, tool
+  schema or loop change can be compared against what the recorded bytes actually did. The anchor is
+  a `drain/claimed` seq — the last episode by default, `--from-seq` selects an earlier boundary;
+  the prefix is forked into a temp store, the episode's admitted rows are re-entered as inbox rows,
+  and the built-in loop runs against a tool surface that replays the recorded results. The diff is
+  `reproduced`, `diverged` (the first row that differs in kind or payload, with a bounded excerpt)
+  or `incomplete` (a recording gap the run improvised around, always with its notes); every verdict
+  exits 0, because a divergence is a finding, not a failed command. It refuses a live lease, a
+  mid-episode steer, a spilled input pair and an input shape it cannot invert; the fork is a temp
+  store, `--keep-fork` leaves it for inspection, and the source store is only ever read.
 
 ### 3.2 Operational actions
 - `kian` CLI: serve (single machine), session inspect/replay/export (`--with-event-ids`),
-  wake-now, lease inspect, self inspect, recovery budget reset, cache-stats, usage-stats, cost,
-  raise-budget, tickets, channel credentials (`kian wechat login` — the QR flow writes the WeChat
-  channel's credential file; no other channel needs an interactive login).
+  wake-now, lease inspect, self inspect, self evidence, scripted replay (`--provider fake`),
+  recovery budget reset, cache-stats, usage-stats, cost, raise-budget, tickets, channel credentials
+  (`kian wechat login` — the QR flow writes the WeChat channel's credential file; no other channel
+  needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
 
 ### 3.3 Operational flows

@@ -30,6 +30,22 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   one message; a refused synthesis or a missing artifact is an honest delivery failure, never an
   empty send.
 
+- **Scripted replay: `kian session replay --provider fake --script <file>` re-drives one drain
+  episode and diffs the result (SPEC §3.1, §3.2).** The anchor is a `drain/claimed` boundary (the
+  last one by default, `--from-seq` for an earlier one); the prefix is forked into a temp store,
+  the episode's inputs are re-admitted and the production loop runs against a scripted model and
+  the recorded tool results. The verdict is `reproduced`, `diverged` (first differing row: kind,
+  JSON-pointer path, bounded excerpts) or `incomplete` (a recording gap, with its notes) — all
+  exit 0. A live lease, a mid-episode steer, a spilled input pair and an un-invertible input shape
+  are refused; the source store is never written.
+- **Self evidence: `kian self evidence` writes a handoff package for one anchor row (SPEC §3.1,
+  §3.2).** Naming `--session` and `--seq` slices the raw envelope stream ±`--context` rows (default
+  10, refused above 200) into `events.ndjson`, next to `session.json` (projected state and the end
+  writes), `repo.json` (commit, branch, dirty flag and crate map), `inspect.json` (the `kian self
+  inspect` projection over the session's whole stream) and a `manifest.json` carrying the
+  store/config/repo identity and every file's sha256. The package is built in a temp sibling,
+  re-verified, then renamed; `--out` is required and a non-empty one is refused; payload text
+  travels only inside the package, never on stdout.
 - **Self inspection: `kian self inspect` answers one window of the durable stream (SPEC §3.1,
   §3.2).** A read-only, offline projection over `--db` with a default one-hour `--window`
   (`s`/`m`/`h`/`d` units; a bare number is refused) or one `--session`: event volume by kind,

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::SessionId;
+use kian_store::EventStore;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -88,15 +89,30 @@ pub struct Options<'a> {
     pub session: Option<SessionId>,
 }
 
+/// Everything the report is a pure function of, plus the slice it folds.
+pub struct Loaded {
+    pub facts: Facts,
+    pub events: Vec<Event>,
+    pub counts: Vec<(String, u64)>,
+}
+
 /// `kian self inspect` — assembles the report (read-only embedded).
 pub async fn run(opts: Options<'_>, json_out: bool) -> CmdResult<String> {
+    let loaded = load(&opts).await?;
+    let report = build_report(&loaded.facts, &loaded.events, &loaded.counts);
+    if json_out {
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    Ok(render(&report))
+}
+
+/// The read half of [`run`]: open read-only, take the slice, close. The
+/// evidence pack (SPEC §3.1) folds the same `Facts` over the same store, so
+/// the aggregate view and the package cannot disagree about what the stream
+/// says.
+pub async fn load(opts: &Options<'_>) -> CmdResult<Loaded> {
     let db = commands::resolve_db(opts.db, opts.config_path)?;
     let cfg = ServeConfig::load(opts.config_path).ok();
-    let views_enabled = cfg
-        .as_ref()
-        .map(|c| c.read_model.views.enabled)
-        .unwrap_or(false);
-
     let store = crate::commands::open_reader(&db).await?;
 
     let (events, counts) = match opts.session {
@@ -115,11 +131,8 @@ pub async fn run(opts: Options<'_>, json_out: bool) -> CmdResult<String> {
                 .into_iter()
                 .filter(|e| e.ts >= opts.since_ms && e.ts <= opts.until_ms)
                 .collect();
-            let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
-            for event in &window {
-                *by_kind.entry(event.kind.as_str().to_string()).or_default() += 1;
-            }
-            (window, by_kind.into_iter().collect::<Vec<_>>())
+            let counts = kind_counts(&window);
+            (window, counts)
         }
         None => {
             let events = store
@@ -134,22 +147,61 @@ pub async fn run(opts: Options<'_>, json_out: bool) -> CmdResult<String> {
         }
     };
 
-    let usage = match usage_metrics::usage_stats_report(&store, opts.session, views_enabled).await {
-        Ok(report) => {
-            serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()}))
-        }
-        Err(e) => json!({"error": e.to_string()}),
-    };
-    let cache = match cache_metrics::cache_stats_report(&store, opts.session, views_enabled).await {
-        Ok(report) => {
-            serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()}))
-        }
-        Err(e) => json!({"error": e.to_string()}),
-    };
+    let facts = facts_for(
+        &store,
+        &db,
+        opts.config_path,
+        cfg.as_ref(),
+        opts.session,
+        opts.since_ms,
+        opts.until_ms,
+    )
+    .await;
     store.close().await;
+    Ok(Loaded {
+        facts,
+        events,
+        counts,
+    })
+}
+
+/// The kind volume of one event slice, in key order — `by_kind` in the
+/// report, derived from the schema's own kind names.
+pub fn kind_counts(events: &[Event]) -> Vec<(String, u64)> {
+    let mut by_kind: BTreeMap<String, u64> = BTreeMap::new();
+    for event in events {
+        *by_kind.entry(event.kind.as_str().to_string()).or_default() += 1;
+    }
+    by_kind.into_iter().collect()
+}
+
+/// The facts a report is pure over: store/config identity, the window bounds
+/// and the usage/cache projections. The caller keeps the store open across
+/// the call and closes it afterwards.
+pub async fn facts_for(
+    store: &EventStore,
+    db: &Path,
+    config_path: &Path,
+    cfg: Option<&ServeConfig>,
+    session: Option<SessionId>,
+    since_ms: u64,
+    until_ms: u64,
+) -> Facts {
+    let views_enabled = cfg.map(|c| c.read_model.views.enabled).unwrap_or(false);
+    let usage = match usage_metrics::usage_stats_report(store, session, views_enabled).await {
+        Ok(report) => {
+            serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()}))
+        }
+        Err(e) => json!({"error": e.to_string()}),
+    };
+    let cache = match cache_metrics::cache_stats_report(store, session, views_enabled).await {
+        Ok(report) => {
+            serde_json::to_value(&report).unwrap_or_else(|e| json!({"error": e.to_string()}))
+        }
+        Err(e) => json!({"error": e.to_string()}),
+    };
 
     let artifacts = cfg
-        .as_ref()
         .and_then(|c| {
             c.artifacts
                 .as_ref()
@@ -165,30 +217,24 @@ pub async fn run(opts: Options<'_>, json_out: bool) -> CmdResult<String> {
             }
         });
 
-    let facts = Facts {
+    Facts {
         version: env!("CARGO_PKG_VERSION").to_string(),
         store: "sqlite".to_string(),
         db_path: db.display().to_string(),
-        config_path: opts.config_path.display().to_string(),
-        config_sha256: std::fs::read(opts.config_path)
+        config_path: config_path.display().to_string(),
+        config_sha256: std::fs::read(config_path)
             .ok()
             .map(|bytes| hex(Sha256::digest(&bytes).as_slice())),
-        since_ms: opts.since_ms,
-        until_ms: opts.until_ms,
+        since_ms,
+        until_ms,
         storage: StorageSec {
-            db_bytes: file_len(&db),
-            wal_bytes: file_len(&wal_path(&db)),
+            db_bytes: file_len(db),
+            wal_bytes: file_len(&wal_path(db)),
             artifacts,
         },
         usage,
         cache,
-    };
-    let report = build_report(&facts, &events, &counts);
-
-    if json_out {
-        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
     }
-    Ok(render(&report))
 }
 
 fn wal_path(db: &Path) -> PathBuf {
@@ -626,7 +672,7 @@ fn severity_rank(severity: &str) -> u8 {
     }
 }
 
-fn end_reason_str(reason: &EndReason) -> &'static str {
+pub(crate) fn end_reason_str(reason: &EndReason) -> &'static str {
     match reason {
         EndReason::Completed => "completed",
         EndReason::Cancelled => "cancelled",
@@ -700,7 +746,7 @@ fn truncate(raw: &str) -> String {
     format!("{head}…")
 }
 
-fn iso(ms: u64) -> String {
+pub(crate) fn iso(ms: u64) -> String {
     let millis = i64::try_from(ms).unwrap_or(i64::MAX);
     match DateTime::<Utc>::from_timestamp_millis(millis) {
         Some(at) => at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -708,7 +754,7 @@ fn iso(ms: u64) -> String {
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     let raw = bytes as f64;
     if raw >= KIB * KIB * KIB {
