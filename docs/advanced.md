@@ -921,7 +921,7 @@ above (`store_failure`, `budget_exhausted`, `validation_failed`, `unknown`) carr
 the default table; omitting them here matches it, because a class with no rule runs no recovery
 action and the turn settles failed. Semantics:
 [ADR-068](../design/decisions/ADR-068-oversized-request-classification.md) and
-[ADR-071](../design/decisions/ADR-071-oversized-request-folds-under-policy.md).
+[ADR-073](../design/decisions/ADR-073-oversized-request-folds-under-policy.md).
 
 ## Session budgets
 
@@ -1018,7 +1018,7 @@ that invalidates the provider prefix cache, so it is triggered by evidence only:
 worst case (projected context plus the declared `max_output`) reaching 90% of the window, the
 provider itself answering a context-overflow error, or — only when the recovery table resolves the
 class to `compress_then_retry` — the provider refusing the request as too large
-([ADR-071](../design/decisions/ADR-071-oversized-request-folds-under-policy.md)). Nothing is
+([ADR-073](../design/decisions/ADR-073-oversized-request-folds-under-policy.md)). Nothing is
 compacted for cost, and a session whose profile declares no window never folds preventively; a byte
 refusal with no policy opt-in still fails the turn.
 
