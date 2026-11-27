@@ -251,7 +251,7 @@ pub fn plan_compaction(
     }
 
     let reclaimed_tokens = folded_bytes / BYTES_PER_TOKEN;
-    // ADR-072/ADR-073: a byte-pressure fold — preventive, or the answer to a
+    // ADR-072/ADR-074: a byte-pressure fold — preventive, or the answer to a
     // refusal — exists to remove payload the token arithmetic cannot see
     // (inlined artifact bytes), so the minimum-reclaim rule, which counts
     // projected text, would refuse the only fold that can make the request

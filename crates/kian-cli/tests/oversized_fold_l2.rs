@@ -1,4 +1,4 @@
-//! L2 for ADR-073: a request the carrier refuses as too large folds the old
+//! L2 for ADR-074: a request the carrier refuses as too large folds the old
 //! turns under the recovery policy's `compress_then_retry`, against a real
 //! assembled server.
 //!

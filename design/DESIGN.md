@@ -516,13 +516,13 @@ and all are evidence: a declared `profile.context_window` whose worst-case next 
 context plus the declared output cap) reaches `trigger_percent`, the provider's own
 `ContextOverflow` answer, a declared `providers.<name>.max_request_bytes` that the rendered
 request would exceed (ADR-072), or the provider's `request_too_large` refusal (ADR-068) when the
-bound that refused is not the one the gate compared (ADR-073). The preventive byte reading is taken
+bound that refused is not the one the gate compared (ADR-074). The preventive byte reading is taken
 on the body the send would use — chat messages with the artifact bytes inlined, the sorted tool
 schemas and the plan body — before `turn/start`, so a body over the bound is neither persisted nor
 sent; the fold it authorizes skips `min_reclaim_tokens` (that rule counts projected text and is
 blind to the pixels the fold removes) and its two byte readings become the fold's reason. The two
 reactive triggers fold only when the deployment's recovery policy table resolves the class to
-`compress_then_retry` (ADR-073) — the loop reads the action it already persisted in the audit, so
+`compress_then_retry` (ADR-074) — the loop reads the action it already persisted in the audit, so
 an operator who maps the class to `fail` still gets a failed turn, and the class only selects the
 trigger whose name the `compact` reason reports. The loop never compacts for cost — folding is the
 only deliberate prefix invalidation (constraint 3), so it must answer a measured pressure or a
@@ -539,7 +539,7 @@ so a session cannot spend itself into being unable to compact; the reserve is wh
 `purpose`: the cache checker pairs only ordinary requests (a maintenance body never reads as an
 unexpected prefix change) and `kian cost` reports maintenance requests and their priced subtotal
 apart from turns. Limits: no price-aware planner, no `compact_slot`, no maintenance fallback; a
-refusal the byte gate did not predict folds once under ADR-073, and a smaller body that still
+refusal the byte gate did not predict folds once under ADR-074, and a smaller body that still
 exceeds the carrier ends the turn failed; wall-clock budgets remain ungated.
 
 **Vision inputs (ADR-063, P5c — landed):** the one capability that changes the request dialect

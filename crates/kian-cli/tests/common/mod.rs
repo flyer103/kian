@@ -181,7 +181,7 @@ pub async fn spawn_scripted_provider_gated_at(
         gate_at,
         released: AtomicBool::new(false),
     });
-    // The mock speaks the whole request body: the ADR-073 L2 grows the
+    // The mock speaks the whole request body: the ADR-074 L2 grows the
     // context past a few MiB on purpose, and axum's default extractor
     // limit (2 MiB) would otherwise turn the mock itself into a 413.
     let app = Router::new()
