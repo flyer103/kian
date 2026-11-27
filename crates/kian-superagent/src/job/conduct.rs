@@ -806,7 +806,7 @@ fn extra_check(
                 .as_ref()
                 .filter(|produces| &produces.name == name)
                 .map(|produces| produces.max_bytes);
-            let (passed, detail) = match (cap, produced_artifact(events, name)) {
+            let (passed, detail) = match (cap, artifact_of(step, events)) {
                 (None, _) => (
                     false,
                     format!(
@@ -846,12 +846,15 @@ fn extra_check(
             allow,
             deny,
         } => {
-            let (passed, detail) = match produced_artifact(events, artifact) {
+            let produced = artifact_of(step, events).filter(|value| {
+                value.get("name").and_then(Value::as_str) == Some(artifact.as_str())
+            });
+            let (passed, detail) = match produced {
                 None => (
                     false,
                     format!("artifact {artifact} was not produced, so no paths can be read"),
                 ),
-                Some(value) => match artifact_text(events, artifact, value) {
+                Some(value) => match artifact_text(events, artifact, &value) {
                     Err(reason) => (false, reason),
                     Ok(diff) => {
                         let verdict = crate::job::surface::check_surface(&diff, allow, deny);
@@ -893,20 +896,39 @@ fn artifact_text(events: &[Event], name: &str, artifact: &Value) -> Result<Strin
         .ok_or_else(|| format!("artifact {name} points at seq {seq}, which is not a text message"))
 }
 
-/// The artifact a stream reports under the given name, if any (§12.1). A child
-/// records it as a job.artifact tool/call whose args carry the ref, digest and
-/// size; the run stream carries only refs, never the bytes.
-fn produced_artifact<'a>(events: &'a [Event], name: &str) -> Option<&'a Value> {
-    events.iter().rev().find_map(|event| {
-        if event.kind != EventKind::ToolCall {
-            return None;
-        }
-        if event.bytes.get("tool").and_then(Value::as_str) != Some(status::ARTIFACT_TOOL) {
-            return None;
-        }
-        let artifact = event.bytes.get("args")?.get("artifact")?;
-        (artifact.get("name").and_then(Value::as_str) == Some(name)).then_some(artifact)
-    })
+/// The artifact a step's child produced, derived from the child's own stream
+/// (§12.1): a text artifact is the committed bytes of the producer's final
+/// `assistant/message` — the last assistant message that carries text and no
+/// tool calls. The ref names that event and the digest covers its exact text,
+/// so a reader detects divergence instead of trusting a copy.
+fn artifact_of(step: &StepPlan, events: &[Event]) -> Option<Value> {
+    let produces = step.produces.as_ref()?;
+    let event = events.iter().rev().find(|event| {
+        event.kind == EventKind::AssistantMessage
+            && closes_turn(&event.bytes)
+            && message_text(event).is_some_and(|text| !text.is_empty())
+    })?;
+    let text = message_text(event)?;
+    Some(json!({
+        "step": &step.id,
+        "name": &produces.name,
+        "media": "text",
+        "bytes": text.len(),
+        "sha256": crate::job::plan::digest_text(&text),
+        "ref": {"session": event.session.0.to_string(), "seq": event.seq},
+    }))
+}
+
+/// A final-answer message carries no tool calls; a tool round does (§4.3).
+fn closes_turn(bytes: &Value) -> bool {
+    match bytes
+        .get("content")
+        .and_then(|content| content.get("tool_calls"))
+    {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(calls)) => calls.is_empty(),
+        Some(_) => false,
+    }
 }
 
 /// Settle a run that cannot even be read as a job (§5.2): one run verdict,
@@ -1116,34 +1138,29 @@ async fn settle_agent(
     if outcome.is_retryable() && effect_gate(step, signals) == EffectGate::NeedsOperator {
         outcome = AttemptOutcome::NeedsOperator;
     }
-    if let Some(produces) = &step.produces {
-        harvest(port, marker, step, attempt, &produces.name, child).await;
+    if step.produces.is_some() {
+        harvest(port, marker, step, attempt, child).await;
     }
     settle_step(port, step, attempt, gate, outcome).await
 }
 
-/// Copy one artifact ref from the child's stream onto the run's (§12.1):
-/// refs and digests only, never the bytes.
+/// Record one artifact ref on the run's stream (§12.1): the ref, the digest
+/// and the producer, never the bytes.
 async fn harvest(
     port: &Arc<dyn RunPort>,
-    _marker: &status::JobMarker,
+    marker: &status::JobMarker,
     step: &StepPlan,
     attempt: u32,
-    name: &str,
     child: &[Event],
 ) {
-    let Some(artifact) = child.iter().rev().find_map(|event| {
-        if event.kind != EventKind::ToolCall {
-            return None;
-        }
-        if event.bytes.get("tool").and_then(Value::as_str) != Some(status::ARTIFACT_TOOL) {
-            return None;
-        }
-        let artifact = event.bytes.get("args")?.get("artifact")?;
-        (artifact.get("name").and_then(Value::as_str) == Some(name)).then(|| artifact.clone())
-    }) else {
+    let Some(mut artifact) = artifact_of(step, child) else {
         return;
     };
+    artifact["producer"] = json!({
+        "run": &marker.run_id,
+        "step": &step.id,
+        "attempt": attempt,
+    });
     let call_id = format!("{ARTIFACT_CALL_PREFIX}{}:{attempt}", step.id);
     let call = json!({
         "tool": status::ARTIFACT_TOOL,
@@ -1952,32 +1969,28 @@ mod tests {
             deny: vec!["design/decisions/**".to_string()],
         }];
         let stream = |diff: &str| {
-            vec![
-                event(3, EventKind::AssistantMessage, json!({"content": diff})),
-                event(
-                    4,
-                    EventKind::ToolCall,
-                    json!({
-                        "tool": status::ARTIFACT_TOOL,
-                        "call_id": "job:artifact:fetch:1",
-                        "args": {"artifact": {
-                            "step": "fetch",
-                            "name": "raw",
-                            "media": "text",
-                            "bytes": diff.len(),
-                            "sha256": "sha256:00",
-                            "ref": {"session": Uuid::from_u128(1).to_string(), "seq": 3},
-                        }},
-                    }),
-                ),
-            ]
+            vec![event(
+                3,
+                EventKind::AssistantMessage,
+                json!({"role": "assistant", "content": {"text": diff}}),
+            )]
         };
-        let inside = "--- a/crates/kian-cli/src/lib.rs\n+++ b/crates/kian-cli/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let inside = "--- a/crates/kian-cli/src/lib.rs
++++ b/crates/kian-cli/src/lib.rs
+` -1 +1 `
+-old
++new
+";
         let (specs, extra) = declared_checks(&patched, &stream(inside));
         assert!(specs.is_empty(), "patch_paths_allowed is a job-owned check");
         assert!(extra[0].passed, "{:?}", extra[0].detail);
 
-        let denied = "--- a/design/decisions/ADR-069-x.md\n+++ b/design/decisions/ADR-069-x.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let denied = "--- a/design/decisions/ADR-069-x.md
++++ b/design/decisions/ADR-069-x.md
+` -1 +1 `
+-old
++new
+";
         let (_, extra) = declared_checks(&patched, &stream(denied));
         assert!(!extra[0].passed);
         assert!(
@@ -2002,60 +2015,54 @@ mod tests {
             extra[0].detail
         );
 
-        let orphan = vec![event(
+        // A child that ends on a tool round never reached a final answer, so
+        // its message is not an artifact (JOB-MODEL §4.3).
+        let calling = vec![event(
             4,
-            EventKind::ToolCall,
+            EventKind::AssistantMessage,
             json!({
-                "tool": status::ARTIFACT_TOOL,
-                "call_id": "job:artifact:fetch:1",
-                "args": {"artifact": {
-                    "step": "fetch",
-                    "name": "raw",
-                    "media": "text",
-                    "bytes": 10,
-                    "sha256": "sha256:00",
-                    "ref": {"session": Uuid::from_u128(1).to_string(), "seq": 3},
-                }},
+                "role": "assistant",
+                "content": {
+                    "text": "calling the fetch tool",
+                    "tool_calls": [{"id": "c1", "name": "fetch", "arguments": "{}"}],
+                },
             }),
         )];
-        let (_, extra) = declared_checks(&patched, &orphan);
+        let (_, extra) = declared_checks(&patched, &calling);
         assert!(!extra[0].passed);
         assert!(
             extra[0]
                 .detail
                 .as_deref()
                 .unwrap_or("")
-                .contains("not on this stream"),
+                .contains("was not produced"),
             "{:?}",
             extra[0].detail
         );
     }
 
     #[test]
-    fn an_artifact_cap_check_reads_the_reported_size() {
+    fn an_artifact_cap_check_reads_the_committed_text() {
         let plan = plan();
         let fetch = plan.step("fetch").expect("the fetch step");
         let artifact = |bytes: u64| {
             vec![event(
-                4,
-                EventKind::ToolCall,
+                3,
+                EventKind::AssistantMessage,
                 json!({
-                    "tool": status::ARTIFACT_TOOL,
-                    "call_id": "job:artifact:fetch:1",
-                    "args": {"artifact": {
-                        "step": "fetch",
-                        "name": "raw",
-                        "media": "text",
-                        "bytes": bytes,
-                        "sha256": "sha256:00",
-                        "ref": {"session": Uuid::from_u128(1).to_string(), "seq": 3},
-                    }},
+                    "role": "assistant",
+                    "content": {"text": "x".repeat(bytes as usize)},
                 }),
             )]
         };
         let small = artifact(512);
-        let within = produced_artifact(&small, "raw").expect("the artifact");
+        let within = artifact_of(fetch, &small).expect("the artifact");
         assert_eq!(within.get("bytes").and_then(Value::as_u64), Some(512));
+        assert_eq!(within["ref"]["seq"].as_u64(), Some(3));
+        assert_eq!(
+            within["sha256"].as_str(),
+            Some(crate::job::plan::digest_text(&"x".repeat(512)).as_str())
+        );
 
         let mut capped = fetch.clone();
         capped.verify = vec![crate::job::plan::JobCheck::ArtifactWithinCap {

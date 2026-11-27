@@ -298,7 +298,7 @@ only status is recorded here.
 | Untrusted-input marking | `"untrusted": true` in the provenance wrapper for configured channels (real channels default untrusted); judge-prompt and recall-hop hygiene | landed |
 | Real lark channel adapter | Feishu IM receive/send over the open APIs; env-only credentials (`KIAN_LARK_*`), fail-closed startup; default-untrusted | landed |
 | WeChat iLink channel | `type: wechat`, **best-effort by contract** ([CHANNEL-WECHAT.md](../design/CHANNEL-WECHAT.md), [ADR-018](../design/decisions/ADR-018-wechat-ilink-channel.md)): one long-poll loop per channel over Tencent's reverse-documented ClawBot iLink API (`getupdates` ~35 s hold), `message_id` → `event_id`, the config `topics` table as the receive allowlist, reply-only sends echoing the latest inbound `context_token`, QR-issued bot token in a `0600` credential file written by `kian wechat login` (no env var), `errcode -14` → pause + resume on file change, empty cursor with no position table, text-only/single-account phase 1, forced untrusted; reply tokens additionally persist **best-effort** in a TTL-bounded `0600` state file beside the credential file ([ADR-026](../design/decisions/ADR-026-wechat-context-token-state.md)) so a restart can still reply; no new surface, no new event kind | landed |
-| iMessage channel (macOS bridge) | `type: imessage`, **best-effort by construction** ([CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md), [ADR-042](../design/decisions/ADR-042-imessage-channel.md)): iMessage has no API, so the channel long-polls a Mac-side `kian-imessage-bridge` (`imsg rpc` under Full Disk Access + Automation) over a loopback HTTP ABI; `guid` → `event_id`, `topics` is both allowlists, the bridge's `participants` is a privacy filter, text-bearing direct chats (attachment metadata is mapped into the payload; with `attachments: bytes` plus a `media:` section, image and audio bytes become OCR/ASR transcripts — [ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md); `voice: true` adds a spoken reply path — [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)), one channel per config, forced untrusted; sends are **not** reply-only (any allowlisted handle) with a deterministic `client_id` that makes the outbox retry effectively once; revoked Full Disk Access pauses receive but sends continue, `-1743` denies sends but receive continues; no new surface, no new event kind, no kian-side position table. L1/L2 landed; a first live L3 round trip (real Mac + iPhone) is recorded 2026-11-20; the attachment-bytes path is L1/L2 ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)) | landed (L1/L2/L3) |
+| iMessage channel (macOS bridge) | `type: imessage`, **best-effort by construction** ([CHANNEL-IMESSAGE.md](../design/CHANNEL-IMESSAGE.md), [ADR-042](../design/decisions/ADR-042-imessage-channel.md)): iMessage has no API, so the channel long-polls a Mac-side `kian-imessage-bridge` (`imsg rpc` under Full Disk Access + Automation) over a loopback HTTP ABI; `guid` → `event_id`, `topics` is both allowlists, the bridge's `participants` is a privacy filter, text-bearing direct chats (attachment metadata is mapped into the payload; with `attachments: bytes` plus a `media:` section, image and audio bytes become OCR/ASR transcripts — [ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md); `voice: true` adds a spoken reply path — [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)), one channel per config, forced untrusted; sends are **not** reply-only (any allowlisted handle) with a deterministic `client_id` that makes the outbox retry effectively once; revoked Full Disk Access pauses receive but sends continue, `-1743` denies sends but receive continues; a multi-attachment row settles before admission, bounded by a five-second wait, and a row over the eight-item media cap loses the excess with an audit line ([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)); no new surface, no new event kind, no kian-side position table. L1/L2 landed; a first live L3 round trip (real Mac + iPhone) is recorded 2026-11-20; the attachment-bytes path is L1/L2 ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)) | landed (L1/L2/L3) |
 | Plugin SDK + Footprint Ladder | Static plugin system + Footprint Ladder landed across the capability sets; SDK extraction → the hosted set (below) | partial |
 | Audit export/replay tooling | `session export`/re-import (byte-identical) + delegation-audit replay assertions — demonstrated by earlier work, recorded here; no new work | **Demonstrated** |
 
@@ -800,12 +800,23 @@ rewrites the delivery into bytes, and every other channel still answers in text.
 path does not change the default: the tool is used only when the user asks for a spoken reply, and
 every other turn is text.
 
+Admission is per row, not per attachment: on the iMessage channel a page that renders more attachment
+placeholders than the attachments it delivered is a row mid-commit, and the adapter parks its
+in-process read position immediately before that row (`rowid - 1`) instead of admitting a prefix, so
+the input it eventually admits carries every attachment `chat.db` committed meanwhile. The hold is
+bounded by `ROW_SETTLE_WINDOW` (five seconds); a row that never settles is admitted with what arrived
+plus one audit line naming the placeholder and attachment counts, the per-row media cap is eight, and
+a row over the cap loses the excess items with an audit line ([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)).
+Nothing durable is added: the cursor is process state and a restart re-reads through the bridge's
+bounded replay.
+
 The edge contract is [ADR-062](../design/decisions/ADR-062-channel-edge-media.md); the tool protocol is
 ADR-061; the blobs are ADR-056; the placement is [design/DESIGN.md](../design/DESIGN.md) §4.2.
 
 | Phase | Module | Contents | Status |
 |-------|--------|----------|--------|
 | P5b | kian-cli | the channel-pump media edge: the typed inbound media envelope, artifact-backed OCR/ASR transcripts appended to the admitted text, honest per-item failures | landed |
+| P5b | kian-superagent | whole-row attachment settling on the iMessage adapter: a mid-commit row parks the read position for a bounded window instead of admitting an attachment prefix, the per-row media cap is eight, and both the expired wait and the truncation are audited ([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)) | landed (L1/L2) |
 | P5b | kian-cli, kian-imessage-bridge | the outbound voice path: `imessage.voice` mounts `reply_voice`, the channel-edge voice decorator synthesizes and rewrites the delivery, and the bridge sends it as a native voice message or an audio attachment ([ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)) | landed (L1/L2) |
 
 Non-goals recorded with the phase: no real-adapter media ingestion in phase 5b itself (WeChat CDN
@@ -1016,10 +1027,11 @@ A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` 
 patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and
 the merge is the owner's decision on the pull request.
 
-An agent child does not yet turn its final message into a `job.artifact` intent (the record a
-step's artifact checks read), so a live self-dev run today stops at `artifact_within_cap` rather
-than passing it; the admission surface, the surface check and the breaker are landed and tested.
-Wiring the artifact producer is the next increment and changes no contract here.
+An agent step produces its artifact from the child's own stream: the final answer — the last
+`assistant/message` carrying text and no `tool_calls` — is the artifact, so `artifact_within_cap` and
+`patch_paths_allowed` read the bytes the producer committed
+([design/JOB-MODEL.md](../design/JOB-MODEL.md) §12.1). A child that never reaches a final answer
+produces no artifact, and the step fails its artifact check instead of passing it.
 
 ### Deferred (unchanged)
 | Item | Reason |

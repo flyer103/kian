@@ -539,6 +539,16 @@ pub fn digest_json(value: &Value) -> String {
     format!("{DIGEST_PREFIX}{}", hex(digest.as_ref()))
 }
 
+/// `sha256:<hex>` over the raw bytes of `text`. An artifact digest covers the
+/// exact bytes its producer committed, never a re-serialization (§12.1).
+#[must_use]
+pub fn digest_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    format!("{DIGEST_PREFIX}{}", hex(digest.as_ref()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1322,6 +1332,19 @@ mod tests {
         let value = json!({"b": {"d": 1, "c": 2}, "a": [1, 2, {"z": 0, "y": 1}]});
         let once = canonical_json(&value);
         assert_eq!(once, canonical_json(&sorted_value(&value)));
+    }
+
+    #[test]
+    fn digest_text_hashes_the_raw_bytes() {
+        assert_eq!(
+            digest_text("abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(
+            digest_text("abc"),
+            digest_json(&json!("abc")),
+            "an artifact digest covers its bytes, not their JSON encoding"
+        );
     }
 
     #[test]

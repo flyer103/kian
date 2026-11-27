@@ -1800,6 +1800,9 @@ admitted without the key fails the run as `invalid_job_input` (V24). The check s
 `patch_paths_allowed` resolves the patch artifact's target event out of the **child** stream (the
 gate runs before `harvest`), parses the unified diff's path headers, normalises them, and names
 `outside allow` / `denied` / `test-only` / `unparsable` in the verdict detail (at most 20 paths).
+The artifact itself is derived, not announced: `artifact_of` reads the producer's last
+`assistant/message` that carries text and no `tool_calls`, digests those exact bytes and records the
+`job:artifact:<step>:<attempt>` pair with `producer {run, step, attempt}` on the run stream.
 The breaker is a trigger rule over the operator projection: the last
 `limits.consecutive_failures` (default 3, 0 disables, V25 bounds it at 10) settled
 `evidence/verdict`s of gate `run` for that job must not all be `failed`; an open circuit writes

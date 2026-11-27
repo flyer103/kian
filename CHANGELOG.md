@@ -18,6 +18,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   still fails, a window overflow still folds), so a deployment opts in with
   `recovery.rules: [{class: request_too_large, action: compress_then_retry}, …]` — an explicit
   `rules:` table replaces the defaults, and `docs/advanced.md` carries the runnable table.
+- **Job artifacts: a step's artifact is its child's final message
+  (`design/JOB-MODEL.md` §12.1).** The conductor derives the ref, `bytes` and `sha256` from the
+  producer's last `assistant/message` that carries text and no tool calls, then records the
+  `job.artifact` pair with `producer {run, step, attempt}` on the run stream — no tool inside the
+  child has to announce an artifact, so `artifact_within_cap`, `patch_paths_allowed` and inline
+  `inputs` read the bytes the producer committed.
+- **iMessage: a multi-attachment row settles before it is admitted (ADR-070).** `chat.db` appends
+  one attachment join row at a time, so a scan that lands mid-commit used to admit a prefix and let
+  `guid` dedupe swallow the rest; the adapter now holds its read position just before an unsettled
+  row for at most five seconds and admits it whole. The per-row media cap rises to eight, and both an
+  expired wait and a truncation over the cap write an audit line instead of dropping silently.
 - **Self-dev runs: a proposal is admitted from a verified evidence pack
   (`design/SELF-EVOLUTION-MODEL.md` §4–§5, ADR-069).**
   `kian job run <job> --pack <dir> [--base <commit>] [--force]` verifies the package before

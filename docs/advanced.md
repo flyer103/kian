@@ -182,6 +182,12 @@ attachment arrives as `[image]`/`[attachment]` marker text plus its name, MIME t
 With `attachments: bytes` (which needs a `media:` section) the adapter also fetches image and audio items
 through the bridge and hands them to the media edge, so their transcripts join the text; the bytes
 never enter the event log ([ADR-064](../design/decisions/ADR-064-imessage-attachment-bytes.md)).
+A row is admitted whole: while `chat.db` is still appending one message's attachments the adapter
+holds its read position just before that row (at most five seconds) instead of admitting the
+attachments that already arrived, so a burst of photos becomes one input with all of them. A row
+that never settles is admitted with what arrived plus an audit line, and a row over the eight-item
+media cap loses the excess items with an audit line
+([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)).
 With `voice: true` the channel also *speaks*: the Router gains a `reply_voice` tool and a spoken
 reply arrives as a native voice message where the Mac allows it, an audio attachment otherwise
 ([voice replies](#voice-replies-outbound), [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)).
