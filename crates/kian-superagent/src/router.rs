@@ -2699,7 +2699,8 @@ changes, verification)."
             schemas.push(ToolSchema {
                 name: REPLY_VOICE_TOOL.to_string(),
                 description: "Reply with a spoken voice message on a channel (word-limit shaped \
-                    by policy)."
+                    by policy). Use it only when the user asked for a spoken reply — in this \
+                    message or as a standing instruction in the conversation; default to `reply`."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -3964,6 +3965,20 @@ mod tests {
         assert!(
             names.contains(&REPLY_VOICE_TOOL),
             "a voice channel mounts it"
+        );
+        let spec = mounted
+            .iter()
+            .find(|s| s.name == REPLY_VOICE_TOOL)
+            .expect("mounted above");
+        assert!(
+            spec.description.contains("only when the user asked"),
+            "the description must carry the default-text rule: {}",
+            spec.description
+        );
+        assert!(
+            spec.description.contains("default to `reply`"),
+            "and name the text tool as the default: {}",
+            spec.description
         );
     }
 

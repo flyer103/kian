@@ -8,6 +8,10 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **iMessage voice replies are opt-in per request (ADR-067).** `reply_voice`'s description now
+  states the default: the Router speaks only when the user asked for a spoken reply — in that
+  message or as a standing instruction in the conversation — and replies with text otherwise; the
+  channel never mirrors the inbound modality.
 - **Self-evolution contract: a proposal pipeline, not an autonomous engineer
   (`design/SELF-EVOLUTION-MODEL.md`, ADR-069).** A self-dev run is an ordinary job run whose subject
   is a verified evidence pack: the trigger verifies before admitting and records the pack digests,
