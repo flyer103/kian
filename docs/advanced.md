@@ -868,7 +868,7 @@ selfdev:
     repo: /Users/you/src/kian        # the checkout the worktree is derived from
     gate: ./scripts/selfcheck.sh     # the one command that judges the proposal
     author: { name: kian-bot, email: kian-bot@example.com }
-    target_dir: /Users/you/src/kian/target   # optional: CARGO_TARGET_DIR for the gate
+    target_dir: /Users/you/.cache/kian-publish-target   # optional: CARGO_TARGET_DIR for the gate
 ```
 
 The conductor derives `branch = selfdev/<run_session>` and
@@ -880,13 +880,16 @@ retried (`retries: 0`): a worktree that already exists, or an attempt whose rece
 written, settles `needs_operator` and leaves the worktree for a human; a patch that does not apply
 fails the step with git's own stderr; a gate that exits non-zero fails the step with its exit code
 in the receipt. `kian job status <run>` prints the branch, the commit and the gate's exit code.
-Nothing is pushed: the commit is local until S2b.
+The gate inherits `CARGO_TARGET_DIR` from `target_dir`; point it at a directory no other working tree
+builds into, or each tree's build replaces the other's artifacts. Nothing is pushed: the commit is
+local until S2b.
 
 `succeeded` means a proposal exists. It does not mean the bug is fixed, that the patch applies to
 a newer `main`, or that anyone reviewed it — landing stays with the owner.
 
-Semantics: [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); decision:
-[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md).
+Semantics: [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); decisions:
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
 
 ## Model profiles
 
