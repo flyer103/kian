@@ -988,6 +988,25 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
+### Self-evolution (S1 specified, not implemented)
+
+Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
+whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
+proposing. No new session state, event kind, table or daemon: the marking travels as one additive
+key on the admitted row. The normative contract is
+[design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision record is
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md).
+
+| Phase | Contents | Status |
+|-------|----------|--------|
+| S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | specified |
+| S2 publish | one derived worktree and branch, one push, one pull request whose body carries the audit chain; needs the `exec` step action | specified, not implemented |
+| S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
+
+A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
+patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and
+the merge is the owner's decision on the pull request.
+
 ### Deferred (unchanged)
 | Item | Reason |
 |------|--------|

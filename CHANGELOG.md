@@ -8,6 +8,13 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Self-evolution contract: a proposal pipeline, not an autonomous engineer
+  (`design/SELF-EVOLUTION-MODEL.md`, ADR-069).** A self-dev run is an ordinary job run whose subject
+  is a verified evidence pack: the trigger verifies before admitting and records the pack digests,
+  the denial surface (`patch_paths_allowed`) is frozen in the plan so a run cannot widen it, and
+  S1 propose / S2 publish / S3 land carry different authority — no run merges, deploys or holds a
+  credential while proposing. Specification only in this change: the `job.selfdev` key, the
+  `--pack` flag, the check and the breaker land with S1.
 - **Provider failures: an oversized request is a classified, non-retryable error
   (`providers.<name>.max_request_bytes`, the `request_too_large` policy class, ADR-068).** The
   openai-compatible seam compares the serialized body against the optional bound before the POST
