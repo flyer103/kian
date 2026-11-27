@@ -654,7 +654,7 @@ pub struct SuperAgentPlugin {
     /// plugin carries: newest-first over the unsent tail, default 4
     /// references / 4 MiB when the section configures neither key.
     pub vision_budget: kian_loop::VisionBudget,
-    /// (ADR-071) the declared request-byte bound per provider
+    /// (ADR-072) the declared request-byte bound per provider
     /// (`providers.<name>.max_request_bytes`), handed to every loop
     /// built from this plugin. Empty = no byte-pressure gate anywhere.
     pub max_request_bytes: BTreeMap<String, u64>,

@@ -112,7 +112,7 @@ pub enum CompactionTrigger {
     /// The provider already rejected a request as context overflow.
     Overflow,
     /// The rendered request would exceed the provider's declared byte bound
-    /// (ADR-071). Both numbers are the ones the pre-flight compares, so the
+    /// (ADR-072). Both numbers are the ones the pre-flight compares, so the
     /// fold answers a bound the send would otherwise be refused for.
     Bytes {
         /// Serialized length of the body this turn would send.
@@ -246,7 +246,7 @@ pub fn plan_compaction(
     }
 
     let reclaimed_tokens = folded_bytes / BYTES_PER_TOKEN;
-    // ADR-071: a byte-pressure fold exists to remove payload the token
+    // ADR-072: a byte-pressure fold exists to remove payload the token
     // arithmetic cannot see (inlined artifact bytes), so the minimum-reclaim
     // rule — which counts projected text — would refuse the only fold that can
     // make the request sendable.

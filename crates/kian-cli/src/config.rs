@@ -3995,7 +3995,7 @@ impl ServeConfig {
             .collect()
     }
 
-    /// (ADR-071): the declared request-byte bound per provider, for the
+    /// (ADR-072): the declared request-byte bound per provider, for the
     /// loop's byte-pressure gate. Only providers that declare
     /// `max_request_bytes` appear; an absent entry means no gate (the
     /// provider's own bound, ADR-068, stays the last line of defense).

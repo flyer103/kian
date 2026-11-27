@@ -188,7 +188,7 @@ pub struct ReActConfig {
     /// The per-turn image budget (ADR-066). Applies only to the unsent
     /// tail; the default (4 references, 4 MiB) needs no configuration.
     pub vision: VisionBudget,
-    /// Declared byte bounds per provider name (ADR-071): the loop renders
+    /// Declared byte bounds per provider name (ADR-072): the loop renders
     /// the request the send would use and folds old turns when it would
     /// exceed the bound, instead of persisting and sending a body the
     /// provider seam (ADR-068) would refuse. **Absent = no byte gate**, so a
@@ -239,7 +239,7 @@ struct Inner {
 /// The primary request rendered exactly as a send would build it: sorted tool
 /// schemas, the chat messages (artifact bytes inlined for a vision target) and
 /// the plan that carries the persisted body. Rendering it before `turn/start`
-/// lets the byte-pressure gate (ADR-071) measure the bytes the wire would
+/// lets the byte-pressure gate (ADR-072) measure the bytes the wire would
 /// carry, and the provider turn reuses the same value instead of rebuilding it.
 struct PreparedRequest {
     schemas: Vec<ToolSchema>,
@@ -918,7 +918,7 @@ impl Inner {
             return Ok(flow);
         }
 
-        // 4b. Request byte pressure (ADR-071): render the request the send
+        // 4b. Request byte pressure (ADR-072): render the request the send
         //     would use and fold old turns when it would exceed a declared
         //     provider bound. The gate runs before the turn exists, so an
         //     over-bound body is never persisted and never sent; ADR-068
@@ -956,7 +956,7 @@ impl Inner {
                     limit_bytes = limit,
                     compactions = *compactions,
                     keep_recent_turns = self.compaction.keep_recent_turns,
-                    "request byte pressure: no fold relieved the request; sending it for the provider bound to refuse (ADR-071)"
+                    "request byte pressure: no fold relieved the request; sending it for the provider bound to refuse (ADR-072)"
                 );
             }
         }
@@ -1276,7 +1276,7 @@ impl Inner {
     /// deterministic tool order, the chat messages with artifact bytes
     /// inlined for a vision target, and the plan that carries the persisted
     /// body. The request is built before `turn/start` so the byte-pressure
-    /// gate (ADR-071) can measure the bytes the wire would carry without
+    /// gate (ADR-072) can measure the bytes the wire would carry without
     /// starting a turn it may not send.
     async fn prepare_request(
         &self,

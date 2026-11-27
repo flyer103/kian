@@ -1,4 +1,4 @@
-//! integration (ADR-071): a request over the declared provider byte bound
+//! integration (ADR-072): a request over the declared provider byte bound
 //! folds its oldest turns and only then flies.
 //!
 //! Real `kian serve` assembly, real sqlite event store, real HTTP router,

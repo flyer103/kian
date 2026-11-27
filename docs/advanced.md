@@ -904,7 +904,7 @@ inlined, tool schemas sorted, plan body serialized) is measured before the turn 
 over the bound makes the loop fold old turns instead of persisting and sending an oversized one.
 Read the bound as a retention knob — history older than `keep_recent_turns` is summarized earlier
 than the context window alone would require. Semantics:
-[ADR-071](../design/decisions/ADR-071-request-byte-pressure-folds-history.md).
+[ADR-072](../design/decisions/ADR-072-request-byte-pressure-folds-history.md).
 
 ## Session budgets
 

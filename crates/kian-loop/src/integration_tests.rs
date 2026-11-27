@@ -2348,7 +2348,7 @@ async fn harness_with_artifacts(
     harness_with_artifacts_config(agent, turns, artifacts, ReActConfig::default()).await
 }
 
-/// The same harness with an explicit loop configuration, for the ADR-071
+/// The same harness with an explicit loop configuration, for the ADR-072
 /// byte-bound tests that mount `max_request_bytes` on the mock provider.
 async fn harness_with_artifacts_config(
     agent: AgentDef,
@@ -2690,7 +2690,7 @@ fn image_parts(body: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// ADR-071 Limits: a request over the declared bound with nothing left to
+/// ADR-072 Limits: a request over the declared bound with nothing left to
 /// fold is sent anyway. The gate warns once, the turn settles honestly, and
 /// the refusal stays with the provider bound (ADR-068) — the new door never
 /// spins, parks or silently drops the turn.

@@ -1,4 +1,4 @@
-# ADR-071 — Request byte pressure folds history before the turn exists
+# ADR-072 — Request byte pressure folds history before the turn exists
 
 - Status: accepted (2026-11-27)
 - Amends: ADR-058 (production compaction)
