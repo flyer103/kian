@@ -349,7 +349,10 @@ startup inbox scan cannot see those sessions — without the takeover re-drive t
 `running` forever while the sweep churned). Honesty is preserved end to end: the killed session
 never projects `completed`/`failed` across the kill window (only `running`, overlaid
 `recoverable` by the lease query), and the final end write lands exactly once, after the re-drive
-actually settles.
+actually settles. One stream that cannot be read does not blind the sweep: the expired-lease query
+reports such a session under `unreadable` and the tick skips it with an audit line naming the
+session and the decode failure, while every readable expired lease is still woken — a corrupt row
+costs its own session's recovery, never every other session's.
 
  Refinement (crash containment, ADR-041): detection only helps if a dead drain *looks* dead. The
 drain task's bookkeeping is unwound on every exit — a drop guard removes the in-process `drains`

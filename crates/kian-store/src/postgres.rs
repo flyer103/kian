@@ -30,7 +30,10 @@ use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
 use crate::event_store::{AppendGuard, Head, StoreError, classify_cas_rejection, to_i64 as se_i64};
-use crate::inbox::{AdmitOutcome, InboxError, SessionInbox, decode_input, to_i64 as ie_i64};
+use crate::inbox::{
+    AdmitOutcome, ExpiredLeases, InboxError, SessionInbox, UnreadableLease, decode_input,
+    to_i64 as ie_i64,
+};
 
 // -- events -----------------------------------------------------------------
 
@@ -625,12 +628,13 @@ pub(crate) async fn heartbeat(
 pub(crate) async fn expired_leases(
     pool: &PgPool,
     now_ms: u64,
-) -> Result<Vec<LeaseRecord>, InboxError> {
+) -> Result<ExpiredLeases, InboxError> {
     let rows: Vec<(String, i64, String, i64, i64)> = sqlx::query_as(EXPIRED_SQL)
         .bind(ie_i64(now_ms, "now_ms")?)
         .fetch_all(pool)
         .await?;
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for (session_key, epoch, holder, ttl_ms, last_heartbeat) in rows {
         let sid = Uuid::parse_str(&session_key)
             .map_err(|e| InboxError::CorruptRow {
@@ -639,11 +643,33 @@ pub(crate) async fn expired_leases(
                 reason: format!("claims row session id: {e}"),
             })
             .map(SessionId)?;
-        let events = scan(pool, sid, 0..i64::MAX as u64).await?;
-        let state = project(&events).map_err(|source| InboxError::Projection {
-            session: sid,
-            source,
-        })?;
+        // State comes from the event projection only (constraint 1). A
+        // session whose stream cannot be read is skipped, not fatal: one
+        // corrupt row must not stop recovery for every other session.
+        let events = match scan(pool, sid, 0..i64::MAX as u64).await {
+            Ok(events) => events,
+            Err(err) => {
+                let err = InboxError::from(err);
+                if crate::inbox::is_backend_failure(&err) {
+                    return Err(err);
+                }
+                unreadable.push(UnreadableLease {
+                    session: sid,
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let state = match project(&events) {
+            Ok(state) => state,
+            Err(source) => {
+                unreadable.push(UnreadableLease {
+                    session: sid,
+                    reason: source.to_string(),
+                });
+                continue;
+            }
+        };
         if state != SessionState::Running {
             continue;
         }
@@ -655,7 +681,10 @@ pub(crate) async fn expired_leases(
             last_heartbeat: last_heartbeat as u64,
         });
     }
-    Ok(out)
+    Ok(ExpiredLeases {
+        expired: out,
+        unreadable,
+    })
 }
 
 pub(crate) async fn leases(pool: &PgPool) -> Result<Vec<LeaseRecord>, InboxError> {

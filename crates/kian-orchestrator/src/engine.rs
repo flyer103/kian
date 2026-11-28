@@ -2295,8 +2295,20 @@ where
     /// killed-mid-turn sessions whose inbox is already empty. Returns
     /// the woken session ids.
     pub async fn recovery_sweep(&self) -> Result<Vec<SessionId>, EngineError> {
-        let expired = self.store.expired_leases(self.clock.now_ms()).await?;
-        let sessions: Vec<SessionId> = expired.iter().map(|l| l.session).collect();
+        let sweep = self.store.expired_leases(self.clock.now_ms()).await?;
+        if !sweep.unreadable.is_empty() {
+            let skipped: Vec<String> = sweep
+                .unreadable
+                .iter()
+                .map(|claim| format!("{} ({})", claim.session.0, claim.reason))
+                .collect();
+            tracing::warn!(
+                sessions = %skipped.join(", "),
+                count = sweep.unreadable.len(),
+                "recovery sweep skipped sessions whose stream could not be read"
+            );
+        }
+        let sessions: Vec<SessionId> = sweep.expired.iter().map(|l| l.session).collect();
         for s in &sessions {
             self.wake(*s);
         }
@@ -5917,6 +5929,7 @@ mod tests {
                     .expired_leases(frozen_now)
                     .await
                     .unwrap()
+                    .expired
                     .iter()
                     .any(|l| l.session == control)
             })
@@ -5926,11 +5939,11 @@ mod tests {
         let now = clock.now_ms();
         let expired = store.expired_leases(now).await.unwrap();
         assert!(
-            !expired.iter().any(|l| l.session == sid),
+            !expired.expired.iter().any(|l| l.session == sid),
             "heartbeat kept the live drain's lease fresh: {expired:?}"
         );
         assert!(
-            expired.iter().any(|l| l.session == control),
+            expired.expired.iter().any(|l| l.session == control),
             "un-heartbeated control session expired"
         );
 
@@ -6572,6 +6585,74 @@ mod tests {
         sid
     }
 
+    /// One unreadable stream must not stop the recovery tick: the sweep
+    /// wakes the healthy expired lease, reports the corrupt session and
+    /// still returns the woken ids instead of failing the whole tick.
+    #[tokio::test]
+    async fn recovery_sweep_wakes_healthy_sessions_past_an_unreadable_stream() {
+        let (store, path) = open_store().await;
+        let clock = Arc::new(ManualClock::new(T0));
+        let eng = Engine::with_clock(
+            store.clone(),
+            Arc::new(ScriptedDriver::default_happy()),
+            EngineConfig {
+                holder: "sweeper".into(),
+                lease_ttl_ms: 100,
+                heartbeat_interval_ms: 10,
+            },
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+
+        let healthy = SessionId::new();
+        seed_append(
+            &store,
+            healthy,
+            1,
+            Epoch::GENESIS,
+            EventKind::SessionCreated,
+            json!({}),
+        )
+        .await;
+        let lease = store.claim(healthy, "dead-holder", 100, T0).await.unwrap();
+        seed_append(
+            &store,
+            healthy,
+            2,
+            lease.epoch,
+            EventKind::DrainClaimed,
+            json!({"holder": "dead-holder"}),
+        )
+        .await;
+
+        let corrupt = SessionId::new();
+        store.claim(corrupt, "dead-holder", 100, T0).await.unwrap();
+        sqlx::query(
+            "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope) \
+             VALUES (?1, 1, 1, 1, 'session/created', ?2, '{not json')",
+        )
+        .bind(corrupt.0.to_string())
+        .bind(i64::from(SCHEMA_VERSION))
+        .execute(store.pool())
+        .await
+        .expect("seed a corrupt event row");
+
+        clock.advance(101);
+        let woken = eng
+            .recovery_sweep()
+            .await
+            .expect("a corrupt stream must not fail the sweep");
+        assert_eq!(woken, vec![healthy], "the healthy lease is still woken");
+        assert!(
+            wait_for(5_000, || async {
+                projection_of(&store, healthy).await == SessionState::Completed
+            })
+            .await,
+            "the woken session drains to completion"
+        );
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A panicking drain unwinds its bookkeeping: the in-process handle is
     /// released (so a wake can start a drain again), the heartbeat stops
     /// (so the lease can expire) and the recovery sweep takes over — and
@@ -6621,7 +6702,7 @@ mod tests {
             .await
             .expect("expired leases");
         assert!(
-            expired.iter().any(|lease| lease.session == sid),
+            expired.expired.iter().any(|lease| lease.session == sid),
             "the panicked drain must stop refreshing its lease"
         );
 

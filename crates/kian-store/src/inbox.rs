@@ -46,6 +46,31 @@ pub struct SessionInbox {
     pub eligible: Vec<InputRow>,
 }
 
+/// The lease-expiry sweep's read: the expired claims whose session still
+/// projects `running`, plus the claims whose stream could not be read at
+/// all. One unreadable session must not blind the sweep to every other
+/// one — the recovery tick would otherwise fail as a whole, forever.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExpiredLeases {
+    pub expired: Vec<LeaseRecord>,
+    pub unreadable: Vec<UnreadableLease>,
+}
+
+/// A claim the sweep could not evaluate: the session's stream failed to
+/// project, so its liveness is unknown. It is skipped — not woken, not
+/// erased — and named by the caller's audit line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableLease {
+    pub session: SessionId,
+    pub reason: String,
+}
+
+/// A backend failure (the pool, or the store's own SQL) aborts the whole
+/// read; a per-session decode/projection failure does not.
+pub(crate) fn is_backend_failure(err: &InboxError) -> bool {
+    matches!(err, InboxError::Sql(_)) || matches!(err, InboxError::Store(StoreError::Sql(_)))
+}
+
 /// Typed inbox/lease failures (mirrors the discipline: a rejected
 /// operation is a matchable fact, not an opaque string).
 #[derive(Debug, thiserror::Error)]
@@ -269,8 +294,10 @@ impl EventStore {
     /// `recoverable` detection — explicitly not a safety mechanism
     /// (ADR-005): expiry never grants permission to accept stale
     /// writes. `running` is derived from the event projection
-    /// (constraint 1), never from a column.
-    pub async fn expired_leases(&self, now_ms: u64) -> Result<Vec<LeaseRecord>, InboxError> {
+    /// (constraint 1), never from a column. A session whose stream
+    /// cannot be read is returned under
+    /// [`ExpiredLeases::unreadable`] instead of failing the sweep.
+    pub async fn expired_leases(&self, now_ms: u64) -> Result<ExpiredLeases, InboxError> {
         match self {
             EventStore::Sqlite(pool) => crate::sqlite::expired_leases(pool, now_ms).await,
             EventStore::Postgres(pool) => crate::postgres::expired_leases(pool, now_ms).await,
@@ -985,13 +1012,14 @@ mod tests {
         seed_running(&store, nolease, Epoch(1)).await;
 
         let expired = store.expired_leases(now).await.unwrap();
+        assert!(expired.unreadable.is_empty(), "{expired:?}");
         assert_eq!(
-            expired.len(),
+            expired.expired.len(),
             1,
             "exactly the running+expired lease: {expired:?}"
         );
         assert_eq!(
-            expired[0],
+            expired.expired[0],
             LeaseRecord {
                 session: running,
                 epoch: Epoch(2), // claim floor = seeded stream epoch 1
@@ -999,6 +1027,53 @@ mod tests {
                 ttl_ms: ttl,
                 last_heartbeat: T0,
             }
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// One unreadable session must not blind the sweep: its claim is
+    /// reported under `unreadable` while every healthy expired lease
+    /// still surfaces (the recovery tick keeps working on a corrupt
+    /// stream).
+    #[tokio::test]
+    async fn expired_leases_skip_an_unreadable_session_and_report_the_rest() {
+        let (store, path) = test_store().await;
+        let ttl = 1_000u64;
+        let now = T0 + 2_000;
+
+        let readable = SessionId::new();
+        seed_running(&store, readable, Epoch(1)).await;
+        store.claim(readable, "zombie", ttl, T0).await.unwrap();
+
+        // The same claim for a session whose stream cannot decode: a raw
+        // insert bypasses append's encoding fence.
+        let corrupt = SessionId::new();
+        store.claim(corrupt, "zombie", ttl, T0).await.unwrap();
+        sqlx::query(
+            "INSERT INTO events (session, seq, epoch, ts, kind, version, envelope) \
+             VALUES (?1, 1, 1, 1, 'session/created', ?2, '{not json')",
+        )
+        .bind(corrupt.0.to_string())
+        .bind(i64::from(SCHEMA_VERSION))
+        .execute(store.pool())
+        .await
+        .expect("seed a corrupt event row");
+
+        let sweep = store
+            .expired_leases(now)
+            .await
+            .expect("a corrupt session must not fail the sweep");
+        assert_eq!(
+            sweep.expired.iter().map(|l| l.session).collect::<Vec<_>>(),
+            vec![readable],
+            "the healthy expired lease still surfaces: {sweep:?}"
+        );
+        assert_eq!(sweep.unreadable.len(), 1, "{sweep:?}");
+        assert_eq!(sweep.unreadable[0].session, corrupt);
+        assert!(
+            !sweep.unreadable[0].reason.is_empty(),
+            "the skipped session names why: {sweep:?}"
         );
         store.close().await;
         cleanup(&path);
@@ -1014,14 +1089,44 @@ mod tests {
         store.claim(sid, "holder", 1_000, T0).await.unwrap();
 
         // Inside the TTL window nothing is expired (elapsed 500 < 1000)...
-        assert!(store.expired_leases(T0 + 500).await.unwrap().is_empty());
+        assert!(
+            store
+                .expired_leases(T0 + 500)
+                .await
+                .unwrap()
+                .expired
+                .is_empty()
+        );
         // ...past it the lease is expired (elapsed 1500 > 1000)...
-        assert_eq!(store.expired_leases(T0 + 1_500).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .expired_leases(T0 + 1_500)
+                .await
+                .unwrap()
+                .expired
+                .len(),
+            1
+        );
         // ...and a heartbeat pushes the deadline out again (elapsed from
         // the new heartbeat: 600 < 1000).
         store.heartbeat(sid, T0 + 1_400).await.unwrap();
-        assert!(store.expired_leases(T0 + 2_000).await.unwrap().is_empty());
-        assert_eq!(store.expired_leases(T0 + 2_600).await.unwrap().len(), 1);
+        assert!(
+            store
+                .expired_leases(T0 + 2_000)
+                .await
+                .unwrap()
+                .expired
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .expired_leases(T0 + 2_600)
+                .await
+                .unwrap()
+                .expired
+                .len(),
+            1
+        );
 
         // Heartbeat without a claims row: typed NoLease.
         let other = SessionId::new();
