@@ -49,6 +49,33 @@ use kian_superagent::{
     MockChannel, RouterInbox, RouterProfile, RouterTools, SubscriptionService, WorkerSpawner,
 };
 
+/// Installs the store-wide worker binding authority on a spawner the
+/// assembly just built. Job conductors and Router dispatch allocate through
+/// the same spawner, so admission must consult every committed binding fact,
+/// not the caller's own stream. A deployment without remote execution has no
+/// bindable worker and installs nothing.
+fn install_worker_binding_admission(
+    spawner: &WorkerSpawner,
+    store: &kian_store::EventStore,
+    remote: Option<&RemoteExecServices>,
+) {
+    let Some(remote) = remote else { return };
+    let timeouts = remote
+        .endpoints
+        .iter()
+        .map(|endpoint| (endpoint.id.clone(), endpoint.queue_timeout_ms))
+        .collect();
+    let default_timeout = remote.workers.as_ref().map_or(
+        kian_superagent::DEFAULT_WORKER_QUEUE_TIMEOUT_MS,
+        |workers| workers.queue_timeout_ms,
+    );
+    spawner.install_binding_admission_with_default(
+        crate::worker_binding::StoreBindingAdmission::new(store.clone()),
+        timeouts,
+        default_timeout,
+    );
+}
+
 /// An apply-phase failure with the plugin name pre-filled.
 fn apply_error(msg: impl Into<String>) -> PluginError {
     PluginError::Apply {
@@ -258,6 +285,9 @@ pub struct WorkersServices {
     /// The registration listener (started by the superagent assembly's
     /// service start — after the inbox rebuild, like the watchdog).
     pub listener: Arc<RegistrationListener>,
+    /// `workers.queue_timeout_ms` — the never-started reservation bound for
+    /// dynamically registered workers (spawn binding admission).
+    pub queue_timeout_ms: u64,
     /// The runtime membership directory (shared with the backend's
     /// dynamic default resolution; snapshots + `member_state` live
     /// there).
@@ -466,7 +496,11 @@ impl Plugin for RemoteExecPlugin {
                     allow_public: workers.allow_public,
                     ..registration
                 };
-                Some((registration, workers.offline_after_ms))
+                Some((
+                    registration,
+                    workers.offline_after_ms,
+                    workers.queue_timeout_ms,
+                ))
             }
             None => None,
         };
@@ -476,12 +510,13 @@ impl Plugin for RemoteExecPlugin {
         // backend. The untracked `exec` path defaults to the first
         // static pin when one exists, else the dynamic resolution.
         let directory = WorkerDirectory::new();
-        let membership = workers_services
-            .as_ref()
-            .map(|(_, offline_after_ms)| MembershipConfig {
-                directory: Arc::clone(&directory),
-                offline_after_ms: *offline_after_ms,
-            });
+        let membership =
+            workers_services
+                .as_ref()
+                .map(|(_, offline_after_ms, _)| MembershipConfig {
+                    directory: Arc::clone(&directory),
+                    offline_after_ms: *offline_after_ms,
+                });
         let default_route = match self.endpoints.first() {
             Some(ep) => DefaultRoute::Static(ep.id.clone()),
             None => DefaultRoute::Dynamic,
@@ -499,17 +534,20 @@ impl Plugin for RemoteExecPlugin {
             )
             .map_err(apply_error)?,
         );
-        let workers = workers_services.map(|(registration, offline_after_ms)| WorkersServices {
-            listener: Arc::new(RegistrationListener::new(
-                registration,
-                Arc::new(SystemClock),
-                Arc::new(ExecRegistrationSink {
-                    backend: Arc::clone(&backend),
-                }),
-                Arc::clone(&directory),
-            )),
-            directory,
-            offline_after_ms,
+        let workers = workers_services.map(|(registration, offline_after_ms, queue_timeout_ms)| {
+            WorkersServices {
+                queue_timeout_ms,
+                listener: Arc::new(RegistrationListener::new(
+                    registration,
+                    Arc::new(SystemClock),
+                    Arc::new(ExecRegistrationSink {
+                        backend: Arc::clone(&backend),
+                    }),
+                    Arc::clone(&directory),
+                )),
+                directory,
+                offline_after_ms,
+            }
         });
         let services = Arc::new(RemoteExecServices {
             backend,
@@ -548,6 +586,8 @@ fn backend_queue_timeout(
 /// (`Server::from_config` opens the stores, installs the engine,
 /// starts the services after the inbox rebuild).
 pub struct SuperAgentPlugin {
+    /// Whether the resident Router is part of this assembly.
+    pub router_enabled: bool,
     /// The Router's compiled agent definition (`agents.<superagent.router.agent>`).
     pub router_agent: AgentDef,
     /// The Worker's compiled agent definition.
@@ -634,9 +674,9 @@ pub struct SuperAgentPlugin {
     /// worker template). Empty when the roster is off.
     pub roster_agent_defs: BTreeMap<String, AgentDef>,
     /// (SELF-EVOLUTION-MODEL §13 A18) the selfdev.publish section: the
-    /// repository a publish writes into, its one gate command and the commit
-    /// author. None = no publish configured: a publish step is admitted and
-    /// fails honestly without writing.
+    /// repository a frozen publish replay writes into, its one gate command and
+    /// the commit author. None = no publish configured: a frozen publish step is
+    /// admitted and fails honestly without writing.
     pub selfdev_publish: Option<crate::config::SelfdevPublishSection>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
@@ -743,6 +783,347 @@ pub struct SuperAgentPlugin {
     pub voice_channels: std::collections::BTreeSet<String>,
 }
 
+impl SuperAgentPlugin {
+    fn apply_job_only(self, ctx: &mut Ctx) -> Result<Disposer, PluginError> {
+        let registry = ctx
+            .resolve::<ProviderRegistry>()
+            .ok_or_else(|| apply_error("superagent: ProviderRegistry not registered"))?;
+        let local_tools = ctx
+            .resolve::<dyn ToolProvider>()
+            .ok_or_else(|| apply_error("superagent: ToolProvider not registered"))?;
+        let remote = if self.has_remote {
+            Some(
+                ctx.resolve::<RemoteExecServices>()
+                    .ok_or_else(|| apply_error("superagent: RemoteExecServices not registered"))?,
+            )
+        } else {
+            None
+        };
+
+        let parent = kian_superagent::ResidentBinding::new(SessionId(uuid::Uuid::nil()));
+        let spawner = Arc::new(
+            WorkerSpawner::new(
+                Arc::clone(&parent),
+                &self.worker_agent,
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+            )
+            .with_session_creation(
+                Arc::clone(&self.inbox) as Arc<dyn kian_superagent::SpawnSessionWriter>
+            ),
+        );
+        install_worker_binding_admission(&spawner, &self.event_store, remote.as_deref());
+
+        let mut channels = kian_superagent::ChannelRegistry::new();
+        for (name, mock) in &self.mock_channels {
+            channels.register(name.clone(), Arc::clone(mock) as Arc<dyn ChannelAdapter>);
+        }
+        for (name, lark) in &self.lark_channels {
+            channels.register(name.clone(), Arc::clone(lark) as Arc<dyn ChannelAdapter>);
+        }
+        for (name, github) in &self.github_channels {
+            channels.register(name.clone(), Arc::clone(github) as Arc<dyn ChannelAdapter>);
+        }
+        for (name, wechat) in &self.wechat_channels {
+            channels.register(name.clone(), Arc::clone(wechat) as Arc<dyn ChannelAdapter>);
+        }
+        for (name, imessage) in &self.imessage_channels {
+            channels.register(
+                name.clone(),
+                Arc::clone(imessage) as Arc<dyn ChannelAdapter>,
+            );
+        }
+
+        let mut worker_mounted = Vec::new();
+        let mut worker_tools: Vec<Arc<dyn ToolProvider>> = Vec::new();
+        if let Some(remote) = &remote {
+            for tool in remote.tools() {
+                let endpoint_id = tool.endpoint_id().to_string();
+                worker_mounted.extend(tool.schemas());
+                let provider: Arc<dyn ToolProvider> = tool;
+                worker_tools.push(provider);
+                let fs = Arc::new(RemoteFsTool::new(Arc::clone(&remote.backend), endpoint_id));
+                worker_mounted.extend(fs.schemas());
+                worker_tools.push(Arc::new(FilteredTools::new(fs, &self.worker_agent.tools)));
+            }
+        }
+        worker_mounted.extend(local_tools.schemas());
+        let unmatched = unmatched_tool_names(&self.worker_agent.tools, &worker_mounted);
+        if !unmatched.is_empty() {
+            return Err(apply_error(format!(
+                "superagent worker agent `{}` lists tools not mounted in the job-only worker loop: {unmatched:?}",
+                self.worker_agent.id
+            )));
+        }
+        worker_tools.push(Arc::new(FilteredTools::new(
+            local_tools.clone(),
+            &self.worker_agent.tools,
+        )));
+        let worker_provider: Arc<dyn ToolProvider> =
+            Arc::new(crate::superagent::CombinedTools::new(worker_tools));
+        let worker_react = ReActLoop::with_config(
+            self.worker_agent.clone(),
+            registry.clone(),
+            Arc::clone(&worker_provider),
+            Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+            ReActConfig {
+                slot: kian_core::model::SlotName("main".into()),
+                max_iterations: self.max_iterations,
+                budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
+                max_request_bytes: self.max_request_bytes.clone(),
+                permissions: self.worker_permissions.clone(),
+            },
+        );
+        let worker_react = match &self.selfdev_publish {
+            Some(publish) => {
+                worker_react.with_tool_scope(Arc::new(crate::selfdev_tool::SelfdevToolScope::new(
+                    Arc::clone(&worker_provider),
+                    self.event_store.clone(),
+                    publish.clone(),
+                )))
+            }
+            None => worker_react,
+        };
+        let worker_loop = Arc::new(worker_react);
+        let worker_harness = self.harness_mounts.worker;
+        let worker_inner = Arc::new(
+            self.harness_mounts
+                .bridged_inner(worker_harness)
+                .unwrap_or_else(|| {
+                    crate::superagent::WorkerInnerDriver::React(Arc::clone(&worker_loop))
+                }),
+        );
+        let worker_side = kian_superagent::WorkerLoopDriver::new(
+            worker_inner,
+            Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+            kian_superagent::WorkerLoopConfig {
+                router: Arc::clone(&parent),
+                worker_version: self.worker_agent.version,
+                gate: crate::superagent::clone_gate(&self.worker_gate),
+                multiagent: self.multiagent,
+                board_gating: self.board_gating,
+            },
+            crate::superagent::port_for_ctx(),
+        );
+
+        let default_agent = self.default_agent.clone();
+        let unmatched = unmatched_tool_names(&default_agent.tools, &local_tools.schemas());
+        if !unmatched.is_empty() {
+            return Err(apply_error(format!(
+                "superagent default agent `{}` lists tools not mounted in the job-only default loop: {unmatched:?}",
+                default_agent.id
+            )));
+        }
+        let default_loop = Arc::new(ReActLoop::with_evidence_gate(
+            default_agent.clone(),
+            registry.clone(),
+            Arc::new(FilteredTools::new(
+                local_tools.clone(),
+                &default_agent.tools,
+            )),
+            Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
+            ReActConfig {
+                slot: kian_core::model::SlotName("main".into()),
+                max_iterations: self.max_iterations,
+                budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
+                max_request_bytes: self.max_request_bytes.clone(),
+                permissions: self.default_permissions.clone(),
+            },
+            self.default_gate.clone(),
+        ));
+        let resident_inbox = kian_superagent::RouterInbox::new(
+            Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>,
+            Arc::clone(&parent),
+        );
+        let unused_router_side = kian_superagent::RouterDriver::new(
+            Arc::clone(&default_loop),
+            kian_superagent::RouterHold::shared(),
+            crate::superagent::port_for_ctx(),
+            resident_inbox,
+        );
+
+        let job_alerts = crate::job_runtime::JobAlertPort::new(
+            Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>
+        );
+        let directory: Arc<dyn kian_superagent::WorkerDirectoryPort> = match &remote {
+            Some(remote) => crate::superagent::StoreWorkerDirectory::new(
+                Arc::clone(&remote.backend),
+                remote
+                    .workers
+                    .as_ref()
+                    .map(|workers| Arc::clone(&workers.directory))
+                    .unwrap_or_else(kian_exec::WorkerDirectory::new),
+                remote.endpoints.clone(),
+                remote
+                    .workers
+                    .as_ref()
+                    .map(|workers| workers.offline_after_ms)
+                    .unwrap_or(30_000),
+            ),
+            None => Arc::new(crate::job_runtime::EmptyDirectory),
+        };
+        let publish: Arc<dyn kian_superagent::job::conduct::PublishPort> = match &self
+            .selfdev_publish
+        {
+            Some(publish) => Arc::new(crate::selfdev_publish::GitPublishPort::from_config(publish)),
+            None => Arc::new(kian_superagent::job::conduct::UnconfiguredPublish),
+        };
+        let job_deps = Arc::new(
+            kian_superagent::job::conduct::JobDeps::new(
+                crate::superagent::StoreWorkerStreams::new(self.event_store.clone()),
+                Arc::clone(&spawner),
+                Arc::clone(&directory),
+                crate::job_runtime::deliver_port(&channels),
+                Arc::clone(&job_alerts) as Arc<dyn kian_superagent::job::conduct::AlertPort>,
+                Arc::new(crate::job_runtime::JobClock::new(Arc::new(
+                    kian_orchestrator::SystemClock,
+                ))),
+            )
+            .with_publish(publish),
+        );
+        let mut driver = crate::superagent::SuperAgentDriver::new(
+            Arc::clone(&parent),
+            self.worker_agent.version,
+            unused_router_side,
+            worker_side,
+            default_loop,
+        )
+        .with_job_runs(kian_superagent::job::conduct::JobLoopDriver::new(
+            crate::job_runtime::run_port_for_ctx(),
+            job_deps,
+        ));
+        if let Some(remote) = &remote {
+            let side_backend = Arc::clone(&remote.backend);
+            let side_registry = registry.clone();
+            let side_agent = self.worker_agent.clone();
+            let side_policy: Arc<dyn RecoveryPolicySource> =
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>;
+            let side_config = ReActConfig {
+                slot: kian_core::model::SlotName("main".into()),
+                max_iterations: self.max_iterations,
+                budget_scope: kian_loop::BudgetScope::Lifetime,
+                vision: self.vision_budget,
+                max_request_bytes: self.max_request_bytes.clone(),
+                permissions: self.worker_permissions.clone(),
+            };
+            let refuse_config = side_config.clone();
+            let side_local = local_tools.clone();
+            let side_inbox = Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>;
+            let side_session = Arc::clone(&parent);
+            let side_gate = crate::superagent::clone_gate(&self.worker_gate);
+            let side_multiagent = self.multiagent;
+            let side_board_gating = self.board_gating;
+            let side_harness = self.harness_mounts.clone();
+            let side_factory: crate::superagent::WorkerSideFactory =
+                Arc::new(move |id: &str, _description: Option<&str>| {
+                    let tools: Vec<Arc<dyn ToolProvider>> = vec![
+                        Arc::new(kian_exec::RemoteExecTool::new(
+                            Arc::clone(&side_backend),
+                            id.to_string(),
+                        )),
+                        Arc::new(FilteredTools::new(
+                            Arc::new(kian_exec::RemoteFsTool::new(
+                                Arc::clone(&side_backend),
+                                id.to_string(),
+                            )),
+                            &side_agent.tools,
+                        )),
+                        Arc::new(FilteredTools::new(side_local.clone(), &side_agent.tools)),
+                    ];
+                    let loop_ = Arc::new(ReActLoop::with_config(
+                        side_agent.clone(),
+                        side_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&side_policy),
+                        side_config.clone(),
+                    ));
+                    let inner = Arc::new(
+                        side_harness
+                            .bridged_inner(worker_harness)
+                            .unwrap_or_else(|| crate::superagent::WorkerInnerDriver::React(loop_)),
+                    );
+                    kian_superagent::WorkerLoopDriver::new(
+                        inner,
+                        Arc::clone(&side_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: Arc::clone(&side_session),
+                            worker_version: side_agent.version,
+                            gate: crate::superagent::clone_gate(&side_gate),
+                            multiagent: side_multiagent,
+                            board_gating: side_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                    )
+                });
+
+            let refuse_registry = registry.clone();
+            let refuse_agent = self.worker_agent.clone();
+            let refuse_policy: Arc<dyn RecoveryPolicySource> =
+                Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>;
+            let refuse_local = local_tools.clone();
+            let refuse_inbox = Arc::clone(&self.inbox) as Arc<dyn kian_superagent::InboxWriter>;
+            let refuse_session = Arc::clone(&parent);
+            let refuse_gate = crate::superagent::clone_gate(&self.worker_gate);
+            let refuse_version = self.worker_agent.version;
+            let refuse_multiagent = self.multiagent;
+            let refuse_board_gating = self.board_gating;
+            let refuse_factory: crate::superagent::RefuseSideFactory =
+                Arc::new(move |refusal: &crate::superagent::Refusal| {
+                    let tools: Vec<Arc<dyn ToolProvider>> = vec![
+                        Arc::new(crate::superagent::RefusingExecTool::new(refusal.clone())),
+                        Arc::new(FilteredTools::new(
+                            Arc::new(crate::superagent::RefusingFsTool::new(refusal.clone())),
+                            &refuse_agent.tools,
+                        )),
+                        Arc::new(FilteredTools::new(
+                            refuse_local.clone(),
+                            &refuse_agent.tools,
+                        )),
+                    ];
+                    let loop_ = Arc::new(ReActLoop::with_config(
+                        refuse_agent.clone(),
+                        refuse_registry.clone(),
+                        Arc::new(crate::superagent::CombinedTools::new(tools)),
+                        Arc::clone(&refuse_policy),
+                        refuse_config.clone(),
+                    ));
+                    kian_superagent::WorkerLoopDriver::new(
+                        Arc::new(crate::superagent::WorkerInnerDriver::React(loop_)),
+                        Arc::clone(&refuse_inbox),
+                        kian_superagent::WorkerLoopConfig {
+                            router: Arc::clone(&refuse_session),
+                            worker_version: refuse_version,
+                            gate: crate::superagent::clone_gate(&refuse_gate),
+                            multiagent: refuse_multiagent,
+                            board_gating: refuse_board_gating,
+                        },
+                        crate::superagent::port_for_ctx(),
+                    )
+                });
+            driver = driver.with_lazy_worker_sides(
+                side_factory,
+                remote
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.id.clone())
+                    .collect(),
+                refuse_factory,
+                Some(Arc::clone(&directory)),
+            );
+        }
+        let services = Arc::new(crate::superagent::JobOnlyServices {
+            driver: Arc::new(driver),
+            inbox: self.inbox,
+            spawner,
+            job_alerts,
+            remote,
+            exec_watchdog: std::sync::OnceLock::new(),
+        });
+        ctx.provide::<crate::superagent::JobOnlyServices>(services)
+    }
+}
+
 impl Plugin for SuperAgentPlugin {
     fn name(&self) -> String {
         "superagent".into()
@@ -757,6 +1138,9 @@ impl Plugin for SuperAgentPlugin {
     }
 
     fn apply(self, ctx: &mut Ctx) -> Result<Disposer, PluginError> {
+        if !self.router_enabled {
+            return self.apply_job_only(ctx);
+        }
         let registry = ctx
             .resolve::<ProviderRegistry>()
             .ok_or_else(|| apply_error("superagent: ProviderRegistry not registered"))?;
@@ -915,6 +1299,7 @@ impl Plugin for SuperAgentPlugin {
                 Arc::clone(&self.inbox) as Arc<dyn kian_superagent::SpawnSessionWriter>
             ),
         );
+        install_worker_binding_admission(&spawner, &self.event_store, remote.as_deref());
         let mut channels = kian_superagent::ChannelRegistry::new();
         let mut adapters = Vec::with_capacity(
             self.mock_channels.len()
@@ -1232,11 +1617,13 @@ impl Plugin for SuperAgentPlugin {
         let hook_bus = ctx
             .resolve::<kian_plugin::hooks::HookBus>()
             .map(|bus| bus.as_ref().clone());
-        let worker_loop = match &hook_bus {
-            Some(bus) => Arc::new(ReActLoop::with_hooks(
+        let worker_provider: Arc<dyn ToolProvider> =
+            Arc::new(crate::superagent::CombinedTools::new(worker_tools));
+        let worker_react = match &hook_bus {
+            Some(bus) => ReActLoop::with_hooks(
                 self.worker_agent.clone(),
                 registry.clone(),
-                Arc::new(crate::superagent::CombinedTools::new(worker_tools)),
+                Arc::clone(&worker_provider),
                 Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
                 ReActConfig {
                     slot: kian_core::model::SlotName("main".into()),
@@ -1248,11 +1635,11 @@ impl Plugin for SuperAgentPlugin {
                 },
                 EvidenceGateConfig::default(),
                 Some(Arc::new(bus.clone()) as Arc<dyn kian_plugin::hooks::HookPorts>),
-            )),
-            None => Arc::new(ReActLoop::with_config(
+            ),
+            None => ReActLoop::with_config(
                 self.worker_agent.clone(),
                 registry.clone(),
-                Arc::new(crate::superagent::CombinedTools::new(worker_tools)),
+                Arc::clone(&worker_provider),
                 Arc::clone(&self.policy) as Arc<dyn RecoveryPolicySource>,
                 ReActConfig {
                     slot: kian_core::model::SlotName("main".into()),
@@ -1262,8 +1649,19 @@ impl Plugin for SuperAgentPlugin {
                     max_request_bytes: self.max_request_bytes.clone(),
                     permissions: self.worker_permissions.clone(),
                 },
-            )),
+            ),
         };
+        let worker_react = match &self.selfdev_publish {
+            Some(publish) => {
+                worker_react.with_tool_scope(Arc::new(crate::selfdev_tool::SelfdevToolScope::new(
+                    Arc::clone(&worker_provider),
+                    self.event_store.clone(),
+                    publish.clone(),
+                )))
+            }
+            None => worker_react,
+        };
+        let worker_loop = Arc::new(worker_react);
         // (ADR-049) every worker side resolves its inner loop from the assembled mounts: the
         // default template's choice here, each roster entry's own choice in the assignee factory
         // below. Absent a selection the built-in loop (`kian`) is used, byte-compatible.

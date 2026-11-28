@@ -447,12 +447,24 @@ async fn a_crashed_bound_worker_is_reclaimed_without_an_operator() {
             json!({}),
         )
         .await;
+        // A live thread is an admitted child: liveness keys on the
+        // input/admitted fact, never on creation alone.
+        seed_append(
+            &store,
+            sid,
+            2,
+            kian_core::model::Epoch::GENESIS,
+            now_ms - 60_000,
+            EventKind::InputAdmitted,
+            json!({"content": "delegated task"}),
+        )
+        .await;
         // The worker-side lineage: this is what the 1:1 check and the
         // reclaim tick key the worker id on.
         seed_append(
             &store,
             sid,
-            2,
+            3,
             kian_core::model::Epoch::GENESIS,
             now_ms - 60_000,
             EventKind::ThreadStarted,
@@ -466,7 +478,7 @@ async fn a_crashed_bound_worker_is_reclaimed_without_an_operator() {
             }),
         )
         .await;
-        for (seq, i) in (3u64..).zip(0..2u64) {
+        for (seq, i) in (4u64..).zip(0..2u64) {
             let lease = store
                 .claim(sid, "dead-holder", 100, now_ms - 60_000 + i * 1_000)
                 .await

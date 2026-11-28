@@ -93,8 +93,8 @@ suffix.
 | -32602 | invalid_params | Missing/ill-typed required param; non-UUID `session`; non-empty params for `create_session` | both RPC |
 | -32000 | internal | Server-side failure. For ops, the message may carry diagnostics (e.g. the configured mock channels) | both RPC |
 | -32001 | unknown_session | No event stream / inbox row for the UUID | both RPC |
-| -32002 | session_busy | An ops action requires an idle session; a drain holds it. `release_worker` also answers it for a thread still holding eligible input or a live command row (the message says which) | ops |
-| -32003 | session_terminal | The session is terminal (completed/cancelled/archived) | ops |
+| -32002 | session_busy | An ops action requires an idle session; a drain holds it. `release_worker` also answers it for a thread still holding any unconsumed input row, whether eligible or future-ineligible, or a live command row (the message says which) | ops |
+| -32003 | session_terminal | A NEW `submit`/`steer`/`queue`/deferred input row is refused because the session is terminal (completed/cancelled/rotated); an already-committed idempotent row is instead deduplicated. A new `memory_dream` range also uses this code. Archived stays `-32007` | control + ops |
 | -32004 | session_idle | `recovery_budget_reset` on a session whose recovery budget was never consumed | ops |
 | -32005 | memory_not_configured | `memory_dream` on a server without a `memory:` section — a closed refusal, never a silent no-op | ops |
 | -32006 | dream_range_too_large | `memory_dream` over a source range whose transcript exceeds `memory.dreamer.max_bytes_read` — refused, not truncated | ops |
@@ -151,12 +151,16 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
 - `create_session` takes no params; the default agent, model slots and tools come from `kian.yaml`.
   The new session is `idle`.
 - `submit` admits one durable input row before any wake fires (admit-before-wake). The result only
-  reports idempotency; progress is observed on the event stream. A `content` that is a reserved
-  row-envelope key set (§2.3) is refused with `-32602` before anything is admitted.
-- `steer` uses the same admit path as `submit` but carries the strippable synthetic marker; it lands
-  at the next provider-turn safe boundary and never inside an in-flight provider turn.
-- `queue` uses the same admit path; the input is promoted at the next safe boundary and never
-  interrupts the current turn.
+  reports idempotency; progress is observed on the event stream. If `(session, idempotency_key)`
+  already identifies a committed row, the request is deduplicated: `deduplicated:true`, no write,
+  and no terminal-state refusal. Otherwise a NEW row for a terminal session is refused `-32003`.
+  A `content` that is a reserved row-envelope key set (§2.3) is refused with `-32602` before
+  anything is admitted. An unknown session remains `-32001`.
+- `steer` uses the same admit path and the same dedupe-before-new-row rule as `submit`, but carries
+  the strippable synthetic marker; it lands at the next provider-turn safe boundary and never
+  inside an in-flight provider turn.
+- `queue` uses the same admit path and dedupe-before-new-row rule; the input is promoted at the next
+  safe boundary and never interrupts the current turn.
 - `defer` (ADR-060) is opt-in and additive. The closed value `off_peak` plans the admission
   against the configured `pricing.peak_windows`/`pricing.holidays` calendar and admits the
   durable row with a future `eligible_at`, so no drain consumes it before an off-peak instant.
@@ -165,8 +169,11 @@ AGENTS.md constraint 9). It never starts, steers or stops execution directly.
   immediately with `deferred:false` and the recorded reason says why. Deferral requires a
   configured `defer:` section; without one the request is refused `-32602` (it is never
   silently run now). A request without `defer` keeps the byte-identical result above.
-  `eligible_at` is a not-before gate, not a promise that a drain starts at that instant;
-  `steer` never defers — interactive steering is never delayed.
+  Deferred admission applies the same rule as the immediate path: an already-committed
+  `(session, idempotency_key)` row is deduplicated with no write even after the session becomes
+  terminal; only a NEW row is refused `-32003` when the session is terminal. `eligible_at` is a
+  not-before gate, not a promise that a drain starts at that instant; `steer` never defers —
+  interactive steering is never delayed.
 - `interrupt` requests an abort. The intent is durable (ADR-014): whenever work may still be in
   flight the server also admits a control-envelope inbox row that the owning drain consumes into a
   `control/interrupt` event, so the intent survives a drain crash and crosses replicas.
@@ -260,13 +267,15 @@ mounted outside the control-plane handler module and obeys the same iron rule.
 - `release_worker` (ADR-035) closes the live thread bound to one worker id and thereby frees the
   1:1 slot. The server resolves the binding from the committed streams (the caller never supplies a
   session id) and requires all of: the owner's projection is `idle`, its last event is
-  `session/ended{interrupted|failed}`, its inbox has no eligible row, no drain holds it, and the
+  `session/ended{interrupted|failed}`, its inbox has no unconsumed row (eligible or
+  future-ineligible), no drain holds it, and the
   worker's durable queue has no `pending`/`inflight` row. It then appends one atomic
   `drain/claimed` + `session/ended{cancelled}` batch (claim epoch, one transaction) — the end
   payload carries the additive `released` object (`worker`, `thread`, `by`, `reason`) —
   and answers `released` with the end's `seq`. A thread that is already terminal answers
   `already_released` (idempotent; `seq` is the existing terminal end's). A running/recoverable
-  owner, an owner still holding eligible inbox input, and a worker still owing a `pending`/
+  owner, an owner still holding any unconsumed inbox input (eligible or future-ineligible), and a
+  worker still owing a `pending`/
   `inflight` command row are all refused with `-32002` (the message says which; a claim lost to a
   live lease is the same retryable code); an unknown id, no live binding, or a never-started
   reservation is `-32008`. It never rebinds, reroutes or moves a command, and never touches a
@@ -388,13 +397,18 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 | `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}`, an unavailable projection as `{"degraded": "views_unavailable", ...}` |
 | `usage` | object | Provider token-usage aggregate projected from `turn/end`, with the same degraded/error spellings as `cache`; the provider's own numbers, no pricing or normalization. Nested counters are additive: the cache-miss count is always reported (an explicit miss spelling wins; otherwise it is derived from the hit spelling's billing convention, and with no cache spelling all input is miss), and the CLI derives a hit rate at render. Pricing is a separate CLI projection over a config book and never appears here |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `channels.imessage.<name>` publishes each adapter's receive pause (`paused`, `paused_reason`), because a paused loop emits no event to project; `null` when no `superagent:` section assembled |
+| `jobs` | object | Job-run and step-attempt projections over committed verdicts; present even when no `superagent:` section assembled. `job_runs_total` is keyed by run `outcome` (`succeeded`, `unverified`, `failed`, `cancelled`); `job_step_attempts_total` is keyed by step `action` (`agent`, `deliver`) and step-attempt `outcome`. `truncated` is `true` when a bounded projection read hit its scan bound |
 | `memory` | object or `null` | Counters of the memory assembly: dream counters (dreams, read/parse/append failures, notes appended/deduped) and, when `memory.session` is configured (P2), the injection counters `injected_sessions`/`injected_items`/`injected_bytes`/`injected_truncations`/`injected_skips`; `null` when no `memory:` section assembled |
 | `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |
 
-The seven top-level keys are stable; nested counters are additive. Consumers must ignore unknown
+The eight top-level keys are stable; nested counters are additive. Consumers must ignore unknown
 keys and unknown nested fields. `engine` and `pending_wake_depth` are process-local, while `cache`
 and `usage` are pure projections over durable events — a restart resets the former and not the
 latter. `event_stream` is process-local like `engine`.
+
+The exported job metric names are `job_runs_total{outcome}` and
+`job_step_attempts_total{action,outcome}`. They are emitted from committed run and step verdicts,
+are observability only, and are never truth. They carry no job-id or run-id label.
 
 `cache` and `usage` are the two keys whose derivation is proportional to the store's byte size, so
 neither is ever computed inline on a plain scrape. They are served from the fresh read-model views

@@ -384,7 +384,15 @@ async fn max_children_refusal_names_the_bound_and_the_current_count() {
         .map(|child| {
             (
                 *child,
-                vec![ev(*child, 1, EventKind::SessionCreated, json!({}))],
+                vec![
+                    ev(*child, 1, EventKind::SessionCreated, json!({})),
+                    ev(
+                        *child,
+                        2,
+                        EventKind::InputAdmitted,
+                        json!({"content": "hold"}),
+                    ),
+                ],
             )
         })
         .collect();
@@ -424,12 +432,15 @@ async fn a_released_child_frees_its_max_children_slot() {
         .iter()
         .enumerate()
         .map(|(i, child)| {
-            let mut stream = vec![ev(*child, 1, EventKind::SessionCreated, json!({}))];
+            let mut stream = vec![
+                ev(*child, 1, EventKind::SessionCreated, json!({})),
+                ev(*child, 2, EventKind::InputAdmitted, json!({"content": "hold"})),
+            ];
             if i == 1 {
                 // One child completed: its slot is released.
                 stream.push(ev(
                     *child,
-                    2,
+                    3,
                     EventKind::ThreadCompleted,
                     json!({"thread_id": Uuid::new_v4().to_string(), "status": "completed", "summary": {}}),
                 ));

@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt, once};
-use kian_core::events::{Event, EventKind};
-use kian_core::model::{InputRow, SessionId};
+use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
+use kian_core::model::{Epoch, InputRow, SessionId};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelChunk, ModelProvider, ModelRequest, PolicyRule,
     RecoveryPolicySource, ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema,
@@ -29,11 +29,14 @@ use kian_llm::turn::ProviderRegistry;
 use kian_loop::{CheckSpec, EvidenceGateConfig, ReActConfig, ReActLoop};
 use kian_orchestrator::{Clock, DrainCtx, Engine, EngineConfig, ManualClock, WakeOutcome};
 use kian_store::EventStore;
+use kian_superagent::worker::{BindingAdmissionPort, SpawnError};
 use kian_superagent::{
-    AdmitReceipt, DelegationPair, InboxWriteError, InboxWriter, PortFor, SpawnedWorker, StreamPort,
-    StreamPortError, SuperAgentProfile, WorkerLoopConfig, WorkerLoopDriver, WorkerSpawner,
-    delegation_pairs, parse_thread_report, router_template, thread_started_payload,
-    worker_template,
+    AdmitReceipt, ChannelRegistry, DelegationPair, InboxWriteError, InboxWriter, MemberState,
+    MemberView, PortFor, RouterHold, RouterProfile, RouterTools, SPAWN_WORKER_TOOL,
+    SessionBootstrap, SpawnRequest, SpawnSessionWriter, SpawnedWorker, StreamPort, StreamPortError,
+    SuperAgentProfile, WorkerDirectoryError, WorkerDirectoryPort, WorkerLoopConfig,
+    WorkerLoopDriver, WorkerSpawner, WorkerStreamsError, WorkerStreamsPort, delegation_pairs,
+    parse_thread_report, router_template, thread_liveness, thread_started_payload, worker_template,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1174,6 +1177,10 @@ async fn delegation_pair_discoverable_by_scanning_both_streams() {
         EvidenceGateConfig::default(),
     )
     .await;
+    // The Router must still hold its turn when the worker's report lands:
+    // a report into an already-ended Router is refused (ADR-083), so this
+    // fixture keeps the resident live instead of relying on resurrection.
+    hold_router_turn_until_worker_settles(&h);
 
     h.engine
         .admit(h.router, json!("please build the thing"), None)
@@ -1194,12 +1201,16 @@ async fn delegation_pair_discoverable_by_scanning_both_streams() {
 
     // Default-off: no verdicts anywhere.
     assert_eq!(count_kind(&worker_events, EventKind::EvidenceVerdict), 0);
-    assert!(matches!(
-        worker_events.last().unwrap().kind,
-        EventKind::SessionEnded {
-            reason: kian_core::events::EndReason::Completed
-        }
-    ));
+    assert!(
+        matches!(
+            worker_events.last().unwrap().kind,
+            EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Completed
+            }
+        ),
+        "last worker event must be the completed end, got {:?}",
+        worker_events.last().map(|event| (event.seq, &event.kind))
+    );
 
     // The pair is derivable from the logs alone.
     let pairs = delegation_pairs(&router_events, &worker_events);
@@ -1209,4 +1220,753 @@ async fn delegation_pair_discoverable_by_scanning_both_streams() {
     assert_eq!(pairs[0].worker, worker);
     // The delegated task rides verbatim inside the pair.
     assert_eq!(pairs[0].task["content"]["task"], json!("build the thing"));
+}
+
+struct AdmissionPort {
+    session: SessionId,
+    ts: u64,
+    events: Mutex<Vec<Event>>,
+    emitted: Mutex<Vec<Event>>,
+}
+
+impl AdmissionPort {
+    fn shared(session: SessionId) -> (Arc<Self>, Arc<dyn StreamPort>) {
+        Self::shared_at(session, now_ms())
+    }
+
+    fn shared_at(session: SessionId, ts: u64) -> (Arc<Self>, Arc<dyn StreamPort>) {
+        let port = Arc::new(Self {
+            session,
+            ts,
+            events: Mutex::new(Vec::new()),
+            emitted: Mutex::new(Vec::new()),
+        });
+        let dynamic = Arc::clone(&port) as Arc<dyn StreamPort>;
+        (port, dynamic)
+    }
+}
+
+impl StreamPort for AdmissionPort {
+    fn session(&self) -> SessionId {
+        self.session
+    }
+
+    fn emit(
+        &self,
+        kind: EventKind,
+        bytes: Value,
+    ) -> BoxFuture<'static, Result<(), StreamPortError>> {
+        let seq = self.events.lock().unwrap().len() as u64 + 1;
+        let event = Event {
+            seq,
+            session: self.session,
+            epoch: Epoch(0),
+            ts: self.ts,
+            kind,
+            bytes,
+            version: SCHEMA_VERSION,
+        };
+        self.events.lock().unwrap().push(event.clone());
+        self.emitted.lock().unwrap().push(event);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, StreamPortError>> {
+        let events = self.events.lock().unwrap().clone();
+        Box::pin(async move { Ok(events) })
+    }
+}
+
+#[derive(Default)]
+struct AdmissionInbox {
+    admits: Mutex<Vec<(SessionId, Value)>>,
+}
+
+impl InboxWriter for AdmissionInbox {
+    fn admit(
+        &self,
+        session: SessionId,
+        payload: Value,
+        _idempotency_key: Option<String>,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        self.admits.lock().unwrap().push((session, payload));
+        Box::pin(async {
+            Ok(AdmitReceipt {
+                deduplicated: false,
+            })
+        })
+    }
+
+    fn wake(&self, _session: SessionId) -> WakeOutcome {
+        WakeOutcome::Folded
+    }
+}
+
+struct EmptyWorkerStreams;
+
+impl WorkerStreamsPort for EmptyWorkerStreams {
+    fn read_stream(
+        &self,
+        _session: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<Event>, WorkerStreamsError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Two concurrent Router spawns for one worker cross one serialized
+/// admission point: exactly one lineage and one child row land, while the
+/// loser receives the owner refusal.
+#[tokio::test]
+async fn concurrent_spawns_for_one_worker_commit_exactly_one_binding() {
+    let router = SessionId::new();
+    let (port, dynamic_port) = AdmissionPort::shared(router);
+    let inbox = Arc::new(AdmissionInbox::default());
+    let spawner = Arc::new(WorkerSpawner::new(
+        kian_superagent::ResidentBinding::new(router),
+        &worker_template("mock", "mock-worker", 7),
+        Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+    ));
+    let hold = RouterHold::shared();
+    hold.install(dynamic_port);
+    let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+    profile.worker_membership = true;
+    let tools = Arc::new(
+        RouterTools::new(
+            spawner,
+            ChannelRegistry::new(),
+            &profile,
+            hold,
+            kian_superagent::ResidentBinding::new(router),
+        )
+        .with_worker_membership(
+            vec!["builder-1".into()],
+            std::collections::BTreeMap::from([("builder-1".into(), 60_000)]),
+            None,
+        )
+        .with_worker_streams(Arc::new(EmptyWorkerStreams)),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let launch = |call_id: &'static str| {
+        let tools = Arc::clone(&tools);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            tools
+                .invoke(ToolCall {
+                    id: call_id.into(),
+                    name: SPAWN_WORKER_TOOL.into(),
+                    arguments: json!({
+                        "task": format!("task-{call_id}"),
+                        "exec_worker": "builder-1",
+                    }),
+                })
+                .await
+        })
+    };
+    let first = launch("call-a");
+    let second = launch("call-b");
+    barrier.wait().await;
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+
+    let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(successes, 1, "exactly one spawn wins");
+    let refusal = first.err().or_else(|| second.err()).expect("loser refusal");
+    assert!(refusal.to_string().contains("worker `builder-1` is busy"));
+    assert_eq!(
+        port.emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == EventKind::ThreadStarted)
+            .count(),
+        1
+    );
+    assert_eq!(inbox.admits.lock().unwrap().len(), 1);
+}
+
+#[derive(Default)]
+struct ReservationState {
+    workers: Mutex<std::collections::BTreeMap<SessionId, Vec<Event>>>,
+    created: Mutex<Vec<SessionId>>,
+}
+
+struct EagerCreate(Arc<ReservationState>);
+
+impl SpawnSessionWriter for EagerCreate {
+    fn create_session(
+        &self,
+        session: SessionId,
+        _assignee: Option<&str>,
+    ) -> BoxFuture<'static, Result<(), InboxWriteError>> {
+        self.0.created.lock().unwrap().push(session);
+        self.0.workers.lock().unwrap().insert(
+            session,
+            vec![Event {
+                seq: 1,
+                session,
+                epoch: Epoch(0),
+                ts: 1,
+                kind: EventKind::SessionCreated,
+                bytes: json!({}),
+                version: SCHEMA_VERSION,
+            }],
+        );
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct FailingInbox;
+
+impl InboxWriter for FailingInbox {
+    fn admit(
+        &self,
+        _session: SessionId,
+        _payload: Value,
+        _idempotency_key: Option<String>,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        Box::pin(async { Err(InboxWriteError::Write("injected admit failure".into())) })
+    }
+
+    fn wake(&self, _session: SessionId) -> WakeOutcome {
+        WakeOutcome::Folded
+    }
+}
+
+struct ReservationStreams(Arc<ReservationState>);
+
+impl WorkerStreamsPort for ReservationStreams {
+    fn read_stream(
+        &self,
+        session: SessionId,
+    ) -> BoxFuture<'static, Result<Vec<Event>, WorkerStreamsError>> {
+        let events = self
+            .0
+            .workers
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(events) })
+    }
+}
+
+struct ReservedDirectory;
+
+impl WorkerDirectoryPort for ReservedDirectory {
+    fn known_ids(&self) -> BoxFuture<'static, Result<Vec<String>, WorkerDirectoryError>> {
+        Box::pin(async { Ok(vec!["builder-1".into()]) })
+    }
+
+    fn members(&self) -> BoxFuture<'static, Result<Vec<MemberView>, WorkerDirectoryError>> {
+        Box::pin(async {
+            Ok(vec![MemberView {
+                id: "builder-1".into(),
+                description: None,
+                version: Some(3),
+                capabilities: Vec::new(),
+                declaration_stale: false,
+                state: MemberState::Online,
+                last_seen_ms: 1,
+            }])
+        })
+    }
+
+    fn member(
+        &self,
+        id: &str,
+    ) -> BoxFuture<'static, Result<Option<MemberView>, WorkerDirectoryError>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            Ok((id == "builder-1").then_some(MemberView {
+                id,
+                description: None,
+                version: Some(3),
+                capabilities: Vec::new(),
+                declaration_stale: false,
+                state: MemberState::Online,
+                last_seen_ms: 1,
+            }))
+        })
+    }
+}
+
+/// Eager `session/created` success followed by child-admit failure remains
+/// a never-started reservation: it is not listed as bound, holds the slot
+/// only for its lease, and then expires.
+#[tokio::test]
+async fn create_success_then_admit_failure_is_only_a_bounded_reservation() {
+    let router = SessionId::new();
+    let (parent, dynamic_parent) = AdmissionPort::shared_at(router, 1);
+    let state = Arc::new(ReservationState::default());
+    let spawner = Arc::new(
+        WorkerSpawner::new(
+            kian_superagent::ResidentBinding::new(router),
+            &worker_template("mock", "mock-worker", 7),
+            Arc::new(FailingInbox),
+        )
+        .with_session_creation(Arc::new(EagerCreate(Arc::clone(&state)))),
+    );
+    let hold = RouterHold::shared();
+    hold.install(dynamic_parent);
+    let mut profile = RouterProfile::new(router, router_template("mock", "mock-router"));
+    profile.worker_membership = true;
+    let streams = Arc::new(ReservationStreams(Arc::clone(&state)));
+    let tools = Arc::new(
+        RouterTools::new(
+            spawner,
+            ChannelRegistry::new(),
+            &profile,
+            hold,
+            kian_superagent::ResidentBinding::new(router),
+        )
+        .with_worker_membership(
+            Vec::new(),
+            std::collections::BTreeMap::from([("builder-1".into(), 60_000)]),
+            Some(Arc::new(ReservedDirectory)),
+        )
+        .with_worker_streams(Arc::clone(&streams) as Arc<dyn WorkerStreamsPort>),
+    );
+
+    let error = tools
+        .invoke(ToolCall {
+            id: "call-failing-admit".into(),
+            name: SPAWN_WORKER_TOOL.into(),
+            arguments: json!({
+                "task": "fails admission",
+                "exec_worker": "builder-1",
+            }),
+        })
+        .await
+        .expect_err("admit failure propagates");
+    assert!(error.to_string().contains("injected admit failure"));
+    let child = *state
+        .created
+        .lock()
+        .unwrap()
+        .first()
+        .expect("created child");
+    let child_events = streams.read_stream(child).await.unwrap();
+    assert_eq!(
+        thread_liveness(&child_events),
+        kian_superagent::ThreadLiveness::NeverStarted
+    );
+
+    let listed = tools
+        .invoke(ToolCall {
+            id: "call-list".into(),
+            name: kian_superagent::LIST_WORKERS_TOOL.into(),
+            arguments: json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(listed.output["workers"][0].get("bound_session").is_none());
+
+    let parent_events = parent.read_stream().await.unwrap();
+    let owner =
+        kian_superagent::busy_owner(&parent_events, streams.as_ref(), "builder-1", 1, 60_000)
+            .await
+            .unwrap();
+    assert_eq!(owner.expect("reserved").worker_session, child);
+    assert!(
+        kian_superagent::busy_owner(
+            &parent_events,
+            streams.as_ref(),
+            "builder-1",
+            60_001,
+            60_000,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the never-started reservation expires at its lease"
+    );
+}
+
+struct BindingCheck {
+    worker_id: String,
+    now_ms: u64,
+    ttl_ms: u64,
+}
+
+#[derive(Default)]
+struct AdmissionEffectState {
+    binding: Mutex<Option<kian_superagent::BusyOwner>>,
+    checks: Mutex<Vec<BindingCheck>>,
+    creates: Mutex<Vec<SessionId>>,
+    bootstraps: Mutex<Vec<SessionId>>,
+    admits: Mutex<Vec<(SessionId, Value)>>,
+    wakes: Mutex<Vec<SessionId>>,
+}
+
+struct PortBarriers {
+    entered: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
+}
+
+struct FakeBindingPort {
+    state: Arc<AdmissionEffectState>,
+    error: Option<WorkerStreamsError>,
+    barriers: Option<Arc<PortBarriers>>,
+    first_check: std::sync::atomic::AtomicBool,
+}
+
+impl FakeBindingPort {
+    fn answering(state: Arc<AdmissionEffectState>) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            error: None,
+            barriers: None,
+            first_check: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn failing(state: Arc<AdmissionEffectState>) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            error: Some(WorkerStreamsError("injected binding read failure".into())),
+            barriers: None,
+            first_check: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn with_barriers(state: Arc<AdmissionEffectState>, barriers: Arc<PortBarriers>) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            error: None,
+            barriers: Some(barriers),
+            first_check: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+impl BindingAdmissionPort for FakeBindingPort {
+    fn check_binding(
+        &self,
+        worker_id: &str,
+        _candidate_thread: Uuid,
+        _candidate_session: SessionId,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> BoxFuture<'static, Result<Option<kian_superagent::BusyOwner>, WorkerStreamsError>> {
+        let worker_id = worker_id.to_string();
+        let state = Arc::clone(&self.state);
+        let error = self.error.clone();
+        let barriers = self.barriers.clone();
+        let first = !self
+            .first_check
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if first && let Some(barriers) = barriers {
+                barriers.entered.wait().await;
+                barriers.release.wait().await;
+            }
+            state.checks.lock().unwrap().push(BindingCheck {
+                worker_id,
+                now_ms,
+                ttl_ms,
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+            Ok(state.binding.lock().unwrap().clone())
+        })
+    }
+}
+
+struct RecordingCreate(Arc<AdmissionEffectState>);
+
+impl SpawnSessionWriter for RecordingCreate {
+    fn create_session(
+        &self,
+        session: SessionId,
+        _assignee: Option<&str>,
+    ) -> BoxFuture<'static, Result<(), InboxWriteError>> {
+        self.0.creates.lock().unwrap().push(session);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct RecordingBootstrap(Arc<AdmissionEffectState>);
+
+impl SessionBootstrap for RecordingBootstrap {
+    fn bootstrap(&self, session: SessionId) -> BoxFuture<'static, Result<(), String>> {
+        self.0.bootstraps.lock().unwrap().push(session);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct RecordingInbox {
+    state: Arc<AdmissionEffectState>,
+    bind_on_admit: bool,
+}
+
+impl InboxWriter for RecordingInbox {
+    fn admit(
+        &self,
+        session: SessionId,
+        payload: Value,
+        _idempotency_key: Option<String>,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        if self.bind_on_admit {
+            let thread_id = payload["thread_id"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .expect("delegation thread id");
+            *self.state.binding.lock().unwrap() = Some(kian_superagent::BusyOwner {
+                thread_id,
+                worker_session: session,
+                reason: "live worker session",
+            });
+        }
+        self.state.admits.lock().unwrap().push((session, payload));
+        Box::pin(async {
+            Ok(AdmitReceipt {
+                deduplicated: false,
+            })
+        })
+    }
+
+    fn wake(&self, session: SessionId) -> WakeOutcome {
+        self.state.wakes.lock().unwrap().push(session);
+        WakeOutcome::Folded
+    }
+}
+
+fn bound_request(task: &str) -> SpawnRequest {
+    SpawnRequest {
+        task: json!(task),
+        exec_worker: Some("builder-1".into()),
+        ..SpawnRequest::default()
+    }
+}
+
+fn admission_spawner(
+    router: SessionId,
+    state: Arc<AdmissionEffectState>,
+    port: Option<Arc<FakeBindingPort>>,
+    bind_on_admit: bool,
+    ttl_ms: u64,
+) -> WorkerSpawner {
+    let spawner = WorkerSpawner::new(
+        kian_superagent::ResidentBinding::new(router),
+        &worker_template("mock", "mock-worker", 7),
+        Arc::new(RecordingInbox {
+            state: Arc::clone(&state),
+            bind_on_admit,
+        }) as Arc<dyn InboxWriter>,
+    )
+    .with_session_creation(Arc::new(RecordingCreate(Arc::clone(&state))));
+    let spawner = match port {
+        Some(port) => spawner.with_binding_admission(
+            port,
+            std::collections::BTreeMap::from([("builder-1".into(), ttl_ms)]),
+        ),
+        None => spawner,
+    };
+    spawner.install_bootstrap(Arc::new(RecordingBootstrap(state)));
+    spawner
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_bound_admits_share_one_serialized_authority() {
+    let state = Arc::new(AdmissionEffectState::default());
+    let port_barriers = Arc::new(PortBarriers {
+        entered: tokio::sync::Barrier::new(2),
+        release: tokio::sync::Barrier::new(2),
+    });
+    let port = FakeBindingPort::with_barriers(Arc::clone(&state), Arc::clone(&port_barriers));
+    let spawner = Arc::new(admission_spawner(
+        SessionId::new(),
+        Arc::clone(&state),
+        Some(port),
+        true,
+        12_345,
+    ));
+    let first = spawner.prepare(&bound_request("first"));
+    let first_session = first.worker_session;
+    let first_thread = first.thread.id;
+    let second = spawner.prepare(&bound_request("second"));
+    let second_session = second.worker_session;
+    let second_thread = second.thread.id;
+
+    let first_task = tokio::spawn({
+        let spawner = Arc::clone(&spawner);
+        async move { spawner.admit(&first).await }
+    });
+    port_barriers.entered.wait().await;
+    let second_started = Arc::new(tokio::sync::Notify::new());
+    let second_task = tokio::spawn({
+        let spawner = Arc::clone(&spawner);
+        let second_started = Arc::clone(&second_started);
+        async move {
+            second_started.notify_one();
+            spawner.admit(&second).await
+        }
+    });
+    second_started.notified().await;
+    port_barriers.release.wait().await;
+
+    let first_result = first_task.await.unwrap();
+    let second_result = second_task.await.unwrap();
+    let (loser, winner_session, winner_thread) = match (first_result, second_result) {
+        (Ok(()), Err(error)) => (error, first_session, first_thread),
+        (Err(error), Ok(())) => (error, second_session, second_thread),
+        (ours, theirs) => panic!(
+            "exactly one admit must win, got first={:?} second={:?}",
+            ours.as_ref().err().map(ToString::to_string),
+            theirs.as_ref().err().map(ToString::to_string)
+        ),
+    };
+    match loser {
+        SpawnError::BindingConflict {
+            worker,
+            owner_session,
+            owner_thread,
+        } => {
+            assert_eq!(worker, "builder-1");
+            assert_eq!(owner_session, winner_session);
+            assert_eq!(owner_thread, winner_thread);
+        }
+        other => panic!("expected binding conflict, got {other}"),
+    }
+
+    assert_eq!(
+        state.creates.lock().unwrap().as_slice(),
+        std::slice::from_ref(&winner_session)
+    );
+    assert_eq!(
+        state.bootstraps.lock().unwrap().as_slice(),
+        std::slice::from_ref(&winner_session)
+    );
+    assert_eq!(
+        state
+            .admits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, _)| *session)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        std::slice::from_ref(&winner_session)
+    );
+    assert_eq!(
+        state.wakes.lock().unwrap().as_slice(),
+        std::slice::from_ref(&winner_session)
+    );
+    let checks = state.checks.lock().unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().all(|check| check.worker_id == "builder-1"));
+    assert!(checks.iter().all(|check| check.ttl_ms == 12_345));
+    assert!(checks.iter().all(|check| check.now_ms > 0));
+}
+
+#[tokio::test]
+async fn binding_port_error_is_a_typed_side_effect_free_refusal() {
+    let state = Arc::new(AdmissionEffectState::default());
+    let spawner = admission_spawner(
+        SessionId::new(),
+        Arc::clone(&state),
+        Some(FakeBindingPort::failing(Arc::clone(&state))),
+        true,
+        60_000,
+    );
+    let spawned = spawner.prepare(&bound_request("port failure"));
+    let error = spawner.admit(&spawned).await.expect_err("fail closed");
+
+    match error {
+        SpawnError::BindingAdmission { worker, error } => {
+            assert_eq!(worker, "builder-1");
+            assert!(error.to_string().contains("injected binding read failure"));
+        }
+        other => panic!("expected binding admission error, got {other}"),
+    }
+    assert_eq!(state.checks.lock().unwrap().len(), 1);
+    assert!(state.creates.lock().unwrap().is_empty());
+    assert!(state.bootstraps.lock().unwrap().is_empty());
+    assert!(state.admits.lock().unwrap().is_empty());
+    assert!(state.wakes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unbound_spawns_and_spawners_without_a_port_keep_legacy_behavior() {
+    let state = Arc::new(AdmissionEffectState::default());
+    *state.binding.lock().unwrap() = Some(kian_superagent::BusyOwner {
+        thread_id: Uuid::new_v4(),
+        worker_session: SessionId::new(),
+        reason: "live worker session",
+    });
+    let spawner = admission_spawner(
+        SessionId::new(),
+        Arc::clone(&state),
+        Some(FakeBindingPort::answering(Arc::clone(&state))),
+        false,
+        60_000,
+    );
+    let unbound = spawner.prepare(&SpawnRequest {
+        task: json!("unbound"),
+        ..SpawnRequest::default()
+    });
+    assert_eq!(unbound.exec_worker, None);
+    spawner.admit(&unbound).await.unwrap();
+    assert!(state.checks.lock().unwrap().is_empty());
+
+    let unwired_state = Arc::new(AdmissionEffectState::default());
+    let unwired = admission_spawner(
+        SessionId::new(),
+        Arc::clone(&unwired_state),
+        None,
+        false,
+        60_000,
+    );
+    for task in ["first", "second"] {
+        let request = bound_request(task);
+        let spawned = unwired.prepare(&request);
+        assert_eq!(spawned.exec_worker.as_deref(), Some("builder-1"));
+        unwired.admit(&spawned).await.unwrap();
+    }
+    assert_eq!(state.creates.lock().unwrap().len(), 1);
+    assert_eq!(state.admits.lock().unwrap().len(), 1);
+    assert_eq!(state.wakes.lock().unwrap().len(), 1);
+    assert_eq!(unwired_state.creates.lock().unwrap().len(), 2);
+    assert_eq!(unwired_state.admits.lock().unwrap().len(), 2);
+    assert_eq!(unwired_state.wakes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn bound_admission_conflicts_until_the_release_view_changes() {
+    let state = Arc::new(AdmissionEffectState::default());
+    let spawner = admission_spawner(
+        SessionId::new(),
+        Arc::clone(&state),
+        Some(FakeBindingPort::answering(Arc::clone(&state))),
+        true,
+        60_000,
+    );
+    let first = spawner.prepare(&bound_request("first"));
+    spawner.admit(&first).await.unwrap();
+
+    let second = spawner.prepare(&bound_request("second"));
+    let conflict = spawner.admit(&second).await.expect_err("still bound");
+    match conflict {
+        SpawnError::BindingConflict {
+            worker,
+            owner_session,
+            owner_thread,
+        } => {
+            assert_eq!(worker, "builder-1");
+            assert_eq!(owner_session, first.worker_session);
+            assert_eq!(owner_thread, first.thread.id);
+        }
+        other => panic!("expected binding conflict, got {other}"),
+    }
+
+    *state.binding.lock().unwrap() = None;
+    let third = spawner.prepare(&bound_request("third"));
+    spawner.admit(&third).await.unwrap();
+    assert_eq!(state.creates.lock().unwrap().len(), 2);
+    assert_eq!(state.admits.lock().unwrap().len(), 2);
+    assert_eq!(state.wakes.lock().unwrap().len(), 2);
 }

@@ -857,6 +857,10 @@ pub struct RouterTools {
     /// without the wiring) = no exclusivity check: `spawn_worker`
     /// behaves as before.
     worker_streams: Option<Arc<dyn WorkerStreamsPort>>,
+    /// Per-worker spawn admission locks. The map is shared by every
+    /// clone of this tool surface; the async mutex is held across the
+    /// authoritative binding re-read, lineage append and child admit.
+    spawn_admission_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// (R15-C3, §7.1): the multiagent delegation bounds, mirrored
     /// from the profile. `None` (the default) is off: every
     /// multiagent branch below `spawn_worker` is skipped and the
@@ -941,6 +945,7 @@ impl RouterTools {
             worker_queue_timeouts: BTreeMap::new(),
             directory: None,
             worker_streams: None,
+            spawn_admission_locks: Arc::new(Mutex::new(BTreeMap::new())),
             multiagent: profile.multiagent,
             board_gating: BoardGating::default(),
             roster: None,
@@ -977,6 +982,25 @@ impl RouterTools {
     pub fn with_worker_streams(mut self, port: Arc<dyn WorkerStreamsPort>) -> Self {
         self.worker_streams = Some(port);
         self
+    }
+
+    async fn acquire_spawn_admission(
+        &self,
+        worker: Option<&str>,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let worker = worker?;
+        let lock = {
+            let mut locks = self
+                .spawn_admission_locks
+                .lock()
+                .expect("spawn admission lock map");
+            Arc::clone(
+                locks
+                    .entry(worker.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        Some(lock.lock_owned().await)
     }
 
     /// (R17-C6, pin P4-1): installs the `superagent.board.gating`
@@ -1781,6 +1805,7 @@ impl RouterTools {
         // view). An offline-known worker is allowed here — the result
         // and audit carry the queue note (step 5).
         let (exec_worker, worker_state) = self.resolve_exec_worker(&call.arguments).await?;
+        let _worker_admission = self.acquire_spawn_admission(exec_worker.as_deref()).await;
         // (ADR-049) a bridged roster entry owns its tools inside the harness child: binding it to
         // an execution worker would record a kian exec route that never runs (audit fiction).
         // Refused before the busy/ownership checks and before any mint/lineage/admit.
@@ -2173,10 +2198,13 @@ impl RouterTools {
         }
         // Offline-known is allowed (step 5): the state rides back for
         // the result echo and the queue note.
-        let state = snapshot
-            .iter()
-            .find(|view| view.id == id)
-            .map(|view| view.state);
+        let state = snapshot.iter().find(|view| view.id == id).map(|view| {
+            if view.declaration_stale {
+                MemberState::Offline
+            } else {
+                view.state
+            }
+        });
         Ok((Some(id), state))
     }
 
@@ -2265,12 +2293,20 @@ impl RouterTools {
         let rows: Vec<Value> = views
             .iter()
             .map(|view| {
+                let state = if view.declaration_stale {
+                    MemberState::Offline
+                } else {
+                    view.state
+                };
                 let mut row = json!({
                     "id": view.id,
-                    "state": view.state.as_str(),
+                    "state": state.as_str(),
                 });
                 if let Some(description) = &view.description {
                     row["description"] = json!(description);
+                }
+                if let Some(version) = view.version {
+                    row["protocol_version"] = json!(version);
                 }
                 if !view.capabilities.is_empty() {
                     // The worker-declared, sanitized list (v3, ADR-029),
@@ -2796,6 +2832,7 @@ impl Clone for RouterTools {
             worker_queue_timeouts: self.worker_queue_timeouts.clone(),
             directory: self.directory.clone(),
             worker_streams: self.worker_streams.clone(),
+            spawn_admission_locks: Arc::clone(&self.spawn_admission_locks),
             multiagent: self.multiagent,
             board_gating: self.board_gating,
             roster: self.roster.clone(),
@@ -6314,7 +6351,7 @@ mod tests {
         });
         let directory = FakeDirectory::with(vec![
             FakeDirectory::view("mac-mini", crate::directory::MemberState::Online),
-            FakeDirectory::view("builder-1", crate::directory::MemberState::Offline),
+            FakeDirectory::view("builder-1", crate::directory::MemberState::Online),
         ]);
         // a description rides only when known; the offline row carries
         // the durable last-declared cache (ADR-025) and is marked stale.
@@ -6345,11 +6382,13 @@ mod tests {
         assert_eq!(ids, vec!["builder-1", "mac-mini"]);
         assert_eq!(rows[0]["state"], json!("offline"));
         assert_eq!(rows[0]["description"], json!("cached builder"));
+        assert_eq!(rows[0]["protocol_version"], json!(1));
         assert_eq!(rows[0]["declaration_stale"], json!(true));
         assert_eq!(rows[0]["bound_session"], json!(owner_session.0.to_string()));
         assert_eq!(rows[0]["bound_thread"], json!(tid(0xb2).to_string()));
         assert_eq!(rows[1]["state"], json!("online"));
         assert_eq!(rows[1]["description"], json!("local macOS dev machine"));
+        assert_eq!(rows[1]["protocol_version"], json!(1));
         assert!(rows[1].get("declaration_stale").is_none());
         assert!(rows[1].get("bound_session").is_none());
         // Deterministic: same snapshot ⇒ same result bytes.

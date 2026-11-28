@@ -44,8 +44,8 @@ pub struct AlertSpec {
 pub struct AlertFacts<'a> {
     /// The failed run id.
     pub failed_run: &'a str,
-    /// The run outcome — `failed` or `unverified` (§13.3); a cancelled run
-    /// is deliberate and never alerts.
+    /// The run outcome. Only `failed` alerts; unverified and cancelled are
+    /// deliberate terminal outcomes that never alert.
     pub outcome: RunOutcome,
     /// The step that failed, when one did.
     pub failed_step: Option<&'a str>,

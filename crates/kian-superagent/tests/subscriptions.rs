@@ -87,6 +87,7 @@ impl LoopDriver for TestDriver {
     fn drive(&self, ctx: DrainCtx) -> futures::stream::BoxStream<'static, LoopOutcome> {
         let behavior = self.behaviors.lock().unwrap().get(&ctx.session()).cloned();
         once(async move {
+            let dispatched = behavior.is_some();
             if let Some(Behavior::Dispatch {
                 worker,
                 thread_id,
@@ -115,7 +116,11 @@ impl LoopDriver for TestDriver {
                 .await
                 .expect("append thread/started");
             }
-            LoopOutcome::Settled
+            if dispatched {
+                LoopOutcome::TurnDone
+            } else {
+                LoopOutcome::Settled
+            }
         })
         .boxed()
     }

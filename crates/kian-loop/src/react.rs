@@ -57,7 +57,7 @@ use kian_core::confirmation::{PendingCall, confirmable, confirmations, pending_c
 use kian_core::context::{Message, context_provenance, derive_model_context};
 use kian_core::control::{ConfirmDecision, ConfirmIntent};
 use kian_core::events::{Event, EventKind};
-use kian_core::model::{AgentDef, ModelProfile, Permission, SlotName};
+use kian_core::model::{AgentDef, ModelProfile, Permission, SessionId, SlotName};
 use kian_core::seams::{
     LoopDriver, LoopOutcome, ModelRequest, ProviderError, RecoveryAction, RecoveryPolicySource,
     ToolCall, ToolProvider, ToolResult, ToolSchema,
@@ -210,10 +210,26 @@ impl Default for ReActConfig {
     }
 }
 
+/// The session-scoped tool resolver a loop may mount.
+///
+/// A tool that binds its authority to the calling session (SELF-EVOLUTION-MODEL
+/// §9.4: the publish tool derives its run, step, attempt and patch from the
+/// committed streams, never from model-supplied coordinates) cannot be a
+/// process-wide [`ToolProvider`]: the provider seam carries no caller. The loop
+/// resolves `tools_for` once per drive — the drain is the one session boundary
+/// — and uses the returned provider for every tool dispatch of that drive.
+/// `None` (every legacy constructor) leaves the mounted provider untouched and
+/// is byte-identical.
+pub trait ToolScope: Send + Sync {
+    fn tools_for(&self, session: SessionId) -> Arc<dyn ToolProvider>;
+}
+
 #[derive(Clone)]
 struct Inner {
     registry: Arc<ProviderRegistry>,
     tools: Arc<dyn ToolProvider>,
+    /// Resolved once per drive; `None` keeps `tools` for every session.
+    tool_scope: Option<Arc<dyn ToolScope>>,
     policy: Arc<dyn RecoveryPolicySource>,
     agent: AgentDef,
     config: ReActConfig,
@@ -336,6 +352,7 @@ impl ReActLoop {
         Self(Arc::new(Inner {
             registry,
             tools,
+            tool_scope: None,
             policy,
             agent,
             config,
@@ -344,6 +361,17 @@ impl ReActLoop {
             set_guard,
             compaction: CompactionSettings::default(),
         }))
+    }
+
+    /// Mounts a session-scoped tool resolver (§9.4): the drive's session
+    /// selects the provider every tool dispatch of that drive uses. The
+    /// resolver runs once per drive, so a tool that reads the caller's own
+    /// stream cannot observe another session's.
+    #[must_use]
+    pub fn with_tool_scope(self, scope: Arc<dyn ToolScope>) -> Self {
+        let mut inner = (*self.0).clone();
+        inner.tool_scope = Some(scope);
+        Self(Arc::new(inner))
     }
 
     /// Replaces the compaction tuning (ADR-058). The default keeps the
@@ -400,7 +428,17 @@ impl LoopDriver for ReActLoop {
     type Ctx = DrainCtx;
 
     fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
-        let inner = Arc::clone(&self.0);
+        // One resolution per drive: the drain is the session boundary the
+        // provider seam does not carry, and every tool dispatch below reads
+        // the same provider the resolver chose for it.
+        let inner = match &self.0.tool_scope {
+            Some(scope) => {
+                let mut inner = (*self.0).clone();
+                inner.tools = scope.tools_for(ctx.session());
+                Arc::new(inner)
+            }
+            None => Arc::clone(&self.0),
+        };
         futures::stream::unfold(
             LoopState {
                 ctx,

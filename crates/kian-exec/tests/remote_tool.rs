@@ -14,8 +14,8 @@ use kian_endpoint::Endpoint;
 use kian_exec::proto::CommandId;
 use kian_exec::store::ExecStore;
 use kian_exec::{
-    BackoffConfig, ConnectionConfig, ConnectionManager, RemoteExecBackend, RemoteExecConfig,
-    RemoteExecTool,
+    BackoffConfig, ConnectionConfig, ConnectionManager, DefaultRoute, MembershipConfig,
+    RemoteExecBackend, RemoteExecConfig, RemoteExecTool, WorkerDirectory,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -217,10 +217,130 @@ async fn exec_timeout_reports_the_worker_still_running() {
     assert_eq!(result.output["timed_out"], serde_json::json!(true));
     assert_eq!(result.output["row_state"], serde_json::json!("inflight"));
     assert_eq!(result.output["still_running"], serde_json::json!(true));
-    assert_eq!(result.output["row_abandoned"], serde_json::json!(true));
+    assert_eq!(result.output["row_abandoned"], serde_json::json!(false));
     assert_eq!(result.output["wait_bound_ms"], serde_json::json!(600));
+    assert_eq!(
+        store.get(command_id).await.unwrap().unwrap().status,
+        kian_exec::QueueStatus::Inflight,
+        "an execution wait expiry never mutates the live row"
+    );
 
     backend.shutdown().await;
+}
+
+/// The same phase-specific result without sockets: a pre-existing
+/// `inflight` row cannot be abandoned by the caller's dispatch wait.
+#[tokio::test]
+async fn inflight_caller_timeout_leaves_the_row_and_reports_still_running() {
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let command_id = kian_exec::tool::command_id_for_tool_call("call-pre-inflight");
+    store
+        .enqueue(
+            command_id,
+            "dev-box",
+            ExecCommand {
+                argv: vec!["sleep".into(), "3".into()],
+                env: Default::default(),
+                cwd: None,
+                timeout_ms: None,
+            },
+            Some("call-pre-inflight"),
+        )
+        .await
+        .unwrap();
+    store.mark_inflight(command_id).await.unwrap();
+    let backend = Arc::new(
+        RemoteExecBackend::with_membership(
+            store.clone(),
+            Vec::new(),
+            DefaultRoute::Dynamic,
+            RemoteExecConfig {
+                queue_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                max_redrives: 1,
+                redrive_grace: Duration::ZERO,
+            },
+            "test-holder",
+            Duration::from_secs(30),
+            kian_core::secrets::SecretRedactor::patterns_only(),
+            Some(MembershipConfig {
+                directory: WorkerDirectory::new(),
+                offline_after_ms: 30_000,
+            }),
+        )
+        .unwrap(),
+    );
+    backend.await_initial_orphan_sweep().await;
+    let tool = RemoteExecTool::new(Arc::clone(&backend), "dev-box");
+    let result = tool
+        .invoke(call(
+            "call-pre-inflight",
+            serde_json::json!({"argv": ["sleep", "3"]}),
+        ))
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.output["row_state"], serde_json::json!("inflight"));
+    assert_eq!(result.output["still_running"], serde_json::json!(true));
+    assert_eq!(result.output["row_abandoned"], serde_json::json!(false));
+    assert_eq!(
+        store.get(command_id).await.unwrap().unwrap().status,
+        kian_exec::QueueStatus::Inflight
+    );
+    backend.shutdown().await;
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A pending row at the caller's dispatch bound still converges to
+/// `abandoned` and reports that exact state.
+#[tokio::test]
+async fn pending_caller_timeout_still_abandons_the_row() {
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let backend = Arc::new(
+        RemoteExecBackend::with_membership(
+            store.clone(),
+            Vec::new(),
+            DefaultRoute::Dynamic,
+            RemoteExecConfig {
+                queue_timeout: Duration::ZERO,
+                poll_interval: Duration::from_secs(3_600),
+                max_redrives: 1,
+                redrive_grace: Duration::ZERO,
+            },
+            "test-holder",
+            Duration::from_secs(30),
+            kian_core::secrets::SecretRedactor::patterns_only(),
+            Some(MembershipConfig {
+                directory: WorkerDirectory::new(),
+                offline_after_ms: 30_000,
+            }),
+        )
+        .unwrap(),
+    );
+    backend.await_initial_orphan_sweep().await;
+    let tool = RemoteExecTool::new(Arc::clone(&backend), "dev-box");
+    let result = tool
+        .invoke(call(
+            "call-pending-timeout",
+            serde_json::json!({"argv": ["echo", "never"]}),
+        ))
+        .await
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.output["row_state"], serde_json::json!("pending"));
+    assert_eq!(result.output["still_running"], serde_json::json!(false));
+    assert_eq!(result.output["row_abandoned"], serde_json::json!(true));
+    let id = kian_exec::tool::command_id_for_tool_call("call-pending-timeout");
+    assert_eq!(
+        store.get(id).await.unwrap().unwrap().status,
+        kian_exec::QueueStatus::Abandoned
+    );
+    backend.shutdown().await;
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
 }
 
 /// Happy path over real TCP: invoke resolves with the tool-call id echoed

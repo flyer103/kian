@@ -1,7 +1,8 @@
-//! The declarative-jobs example in the usage guide is a loadable declaration: the fenced
-//! jobs block in docs/advanced.md parses into the real config types and resolves into one
-//! job-targeted trigger plus one alert. A docs snippet that no longer loads is a doc bug, so this
-//! is the drift gate for it (README policy: YAML snippets stay parseable).
+//! The declarative-jobs examples in the usage guide are loadable declarations: the fenced
+//! jobs block in docs/advanced.md parses into the real config types, resolves into one
+//! job-targeted trigger plus one alert, and the self-dev block resolves into a plan that ends at
+//! deliver — publish is not a job action (ADR-084). A docs snippet that no longer loads is a doc
+//! bug, so this is the drift gate for it (README policy: YAML snippets stay parseable).
 
 use std::collections::BTreeMap;
 
@@ -84,4 +85,55 @@ fn the_usage_guide_job_example_is_a_loadable_declaration() {
     assert_eq!(alerts.len(), 1, "one alert is declared for the job");
     assert_eq!(alerts[0].id, "digest-failed");
     assert_eq!(alerts[0].channel, "lark");
+}
+
+#[test]
+fn the_self_dev_example_is_a_loadable_declaration_without_the_retired_publish_action() {
+    let yaml = yaml_example("## Self-dev proposals");
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&yaml).expect("the guide's self-dev block is valid yaml");
+    let jobs: JobsSection = serde_yaml::from_value(value["superagent"]["jobs"].clone())
+        .expect("the guide's self-dev block matches the config schema");
+
+    let resolved = jobs
+        .resolve(
+            &channels(&["imessage", "lark"]),
+            &Default::default(),
+            chrono::Utc::now(),
+        )
+        .expect("the guide's self-dev block resolves");
+
+    assert!(
+        resolved.schedules.is_empty(),
+        "a self-dev run is manual-only: no trigger is declared"
+    );
+    let job = resolved
+        .catalog
+        .job("self-dev")
+        .expect("self-dev is declared");
+    assert_eq!(job.plan.steps.len(), 2, "patch, deliver");
+    assert_eq!(
+        job.plan.steps[0].action,
+        kian_superagent::job::plan::StepAction::Agent,
+        "the patch step is an agent step"
+    );
+    assert_eq!(
+        job.plan.steps[1].action,
+        kian_superagent::job::plan::StepAction::Deliver,
+        "the summary step is a deliver step"
+    );
+    for step in &job.plan.steps {
+        assert!(
+            !matches!(step.action, kian_superagent::job::plan::StepAction::Publish),
+            "a new plan cannot declare the retired publish action"
+        );
+        assert!(
+            step.publish.is_none(),
+            "a new plan cannot carry the retired publish field"
+        );
+    }
+    assert!(
+        !yaml.contains("action: publish"),
+        "the loadable example must not declare the retired action"
+    );
 }

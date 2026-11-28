@@ -17,8 +17,8 @@ use kian_store::EventStore;
 use kian_superagent::job::{outcome::RunOutcome, plan, status};
 use serde_json::{Value, json};
 
-/// How many firings `status <job>` shows per trigger.
-pub const DEFAULT_FIRINGS: u64 = 5;
+#[path = "job_status.rs"]
+mod job_status;
 
 /// The cancel row's content. The conductor treats a promoted row whose
 /// content is this word as a cancel request (§5.4); any other message is an
@@ -413,18 +413,6 @@ pub fn split_run_id(raw: &str) -> Option<(&str, &str)> {
     Some((job, slot))
 }
 
-/// Which trigger a slot token came from, for the marker a cancel row carries
-/// when the run has not started yet and has no stream to read one from.
-fn trigger_of_slot(slot: &str) -> &'static str {
-    if slot.starts_with("manual:") {
-        crate::job_config::TRIGGER_MANUAL
-    } else if slot.starts_with(plan::ALERT_SLOT_PREFIX) {
-        crate::job_config::TRIGGER_ALERT
-    } else {
-        crate::job_config::TRIGGER_CRON
-    }
-}
-
 /// Why an admitted manual run may not start immediately.
 const MANUAL_NOTE: &str = "the row is durable; a serving process starts the \
 run when its drain sees it (boot rebuilds the inbox, and a parked conductor \
@@ -438,10 +426,24 @@ serving the run, the request waits for the next boot";
 async fn list(path: &Path, json_output: bool) -> Result<String, String> {
     let config = load_config(path)?;
     let (_schedules, catalog) = resolved(&config)?;
+    let index = if catalog.is_empty() {
+        job_status::RunIndex::default()
+    } else {
+        let store = open_store(&config, true).await?;
+        let index = job_status::rebuild(&store).await?;
+        store.close().await;
+        index
+    };
     if json_output {
-        let jobs: Vec<Value> = catalog.iter().map(|job| job_json(&catalog, job)).collect();
-        return serde_json::to_string_pretty(&json!({ "jobs": jobs }))
-            .map_err(|error| error.to_string());
+        let jobs: Vec<Value> = catalog
+            .iter()
+            .map(|job| job_json(&catalog, job, index.last_run(&job.id)))
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "jobs": jobs,
+            "index_truncated": index.truncated,
+        }))
+        .map_err(|error| error.to_string());
     }
     if catalog.is_empty() {
         return Ok("no jobs declared under superagent.jobs\n".to_string());
@@ -458,8 +460,12 @@ async fn list(path: &Path, json_output: bool) -> Result<String, String> {
             .iter()
             .map(|alert| alert.id.clone())
             .collect();
+        let last_run = index.last_run(&job.id).map_or_else(
+            || "last_run=-".to_string(),
+            |run| format!("last_run={} status={}", run.run_id, run.status.as_str()),
+        );
         out.push_str(&format!(
-            "job={} steps={} plan={} triggers={} alerts={}\n",
+            "job={} steps={} plan={} triggers={} alerts={} {}\n",
             job.id,
             job.plan.steps.len(),
             job.digest,
@@ -468,8 +474,12 @@ async fn list(path: &Path, json_output: bool) -> Result<String, String> {
                 "-".to_string()
             } else {
                 alerts.join(",")
-            }
+            },
+            last_run,
         ));
+    }
+    if index.truncated {
+        out.push_str("note=run index scan reached its bound; older runs may be omitted\n");
     }
     Ok(out)
 }
@@ -477,6 +487,7 @@ async fn list(path: &Path, json_output: bool) -> Result<String, String> {
 fn job_json(
     catalog: &crate::job_config::JobCatalog,
     job: &crate::job_config::ResolvedJob,
+    last_run: Option<&job_status::RunIndexEntry>,
 ) -> Value {
     let alerts: Vec<String> = catalog
         .alerts_for(&job.id)
@@ -489,12 +500,18 @@ fn job_json(
         "steps": job.plan.steps.len(),
         "triggers": job.triggers,
         "alerts": alerts,
+        "last_run": last_run.map(|run| json!({
+            "run_id": run.run_id,
+            "slot": run.slot,
+            "started_ms": run.started_ms,
+            "status": run.status.as_str(),
+        })),
     })
 }
 
 async fn status_command(target: &str, path: &Path, json_output: bool) -> Result<String, String> {
     let config = load_config(path)?;
-    let (schedules, catalog) = resolved(&config)?;
+    let (_schedules, catalog) = resolved(&config)?;
     if let Some((job, slot)) = split_run_id(target) {
         let session = plan::run_session(job, slot);
         let store = open_store(&config, true).await?;
@@ -520,31 +537,37 @@ async fn status_command(target: &str, path: &Path, json_output: bool) -> Result<
         };
         store.close().await;
         if events.is_empty() {
-            if pending_row.is_none() {
+            let Some(row) = pending_row else {
                 return Err(format!(
                     "run {target} was never admitted: no inbox row carries its key                      (kian job run {job} admits one)"
                 ));
+            };
+            let Some(marker_value) = row.payload.get(status::JOB_KEY) else {
+                return Err(format!(
+                    "run {target} carries no job marker: it is not a job run (session {})",
+                    session.0
+                ));
+            };
+            let marker = status::parse_marker(marker_value)
+                .map_err(|error| format!("run {target} carries an invalid job marker: {error}"))?;
+            if marker.run_id != target || marker.job_id != job || marker.slot != slot {
+                return Err(run_identity_conflict(target, session));
             }
+            let plan_source = marker_value
+                .get("plan_source")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let plan_author = marker_value
+                .get("plan_author")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let view = status::pending_view(&marker, plan_source, plan_author, row.admitted_at);
             if json_output {
-                return serde_json::to_string_pretty(&json!({
-                    "run_id": target,
-                    "job_id": job,
-                    "slot": slot,
-                    "session": session.0.to_string(),
-                    "plan_digest": catalog.job(job).map(|job| job.digest.clone()),
-                    "state": "pending",
-                    "note": MANUAL_NOTE,
-                }))
-                .map_err(|error| error.to_string());
+                let mut value = view_json(&view);
+                value["note"] = json!(MANUAL_NOTE);
+                return serde_json::to_string_pretty(&value).map_err(|error| error.to_string());
             }
-            return Ok(format!(
-                "run={target}\njob={job}\nslot={slot}\nsession={}\nplan={}\nstate=pending\nnote={MANUAL_NOTE}\n",
-                session.0,
-                catalog
-                    .job(job)
-                    .map(|job| job.digest.clone())
-                    .unwrap_or_else(|| "-".to_string())
-            ));
+            return Ok(format!("{}\nnote={MANUAL_NOTE}\n", status::render(&view)));
         }
         let Some(view) = status::view(&events) else {
             return Err(format!(
@@ -558,91 +581,81 @@ async fn status_command(target: &str, path: &Path, json_output: bool) -> Result<
         }
         return Ok(status::render(&view));
     }
-    // A bare token is a job id: show what could run, and the firings that
-    // did. There is no run table to enumerate, so the schedule cursor rows
-    // are the index (§15).
     let Some(job) = catalog.job(target) else {
         return Err(unknown_job(&catalog, target));
     };
-    let triggers: Vec<String> = if job.triggers.is_empty() {
-        schedules
-            .iter()
-            .filter(|schedule| {
-                matches!(&schedule.target, crate::config::CronTarget::Job { job } if job == target)
-            })
-            .map(|schedule| schedule.id.clone())
-            .collect()
-    } else {
-        job.triggers.clone()
-    };
-    if triggers.is_empty() {
+    let store = open_store(&config, true).await?;
+    let index = job_status::rebuild(&store).await?;
+    let Some(entry) = index.last_run(&job.id) else {
+        store.close().await;
         if json_output {
             return serde_json::to_string_pretty(&json!({
                 "job": job.id,
-                "plan_digest": job.digest,
-                "steps": job.plan.steps.len(),
-                "triggers": Vec::<String>::new(),
-                "firings": Vec::<Value>::new(),
-                "note": format!("manual-only: run it with kian job run {}", job.id),
+                "status": "no_runs",
             }))
             .map_err(|error| error.to_string());
         }
-        return Ok(format!(
-            "job={}\nplan={}\nsteps={}\ntriggers=-\nnote=manual-only: run it with kian job run {}\n",
-            job.id,
-            job.digest,
-            job.plan.steps.len(),
-            job.id
-        ));
-    }
-    let store = open_store(&config, true).await?;
-    let mut firings: Vec<Value> = Vec::new();
-    let mut text = format!(
-        "job={}\nplan={}\nsteps={}\ntriggers={}\n",
-        job.id,
-        job.digest,
-        job.plan.steps.len(),
-        triggers.join(",")
-    );
-    for trigger in &triggers {
+        return Ok(format!("job={}\nstatus=no_runs\n", job.id));
+    };
+    let session = entry.session;
+    let events = store
+        .rebuild(session)
+        .await
+        .map_err(|error| format!("run {}: {error}", entry.run_id))?;
+    let pending = if events.is_empty() {
         let rows = store
-            .list_firings(Some(trigger), DEFAULT_FIRINGS)
+            .input_rows(session)
             .await
-            .map_err(|error| format!("cron firings for {trigger}: {error}"))?;
-        if rows.is_empty() {
-            text.push_str(&format!("  {trigger} (no firings recorded)\n"));
-        }
-        for row in &rows {
-            text.push_str(&format!(
-                "  {} {} state={} session={} error={}\n",
-                trigger,
-                row.firing_id,
-                row.state.as_str(),
-                row.session.as_deref().unwrap_or("-"),
-                row.error.as_deref().unwrap_or("-")
-            ));
-            firings.push(json!({
-                "trigger": trigger,
-                "firing_id": row.firing_id,
-                "state": row.state.as_str(),
-                "session": row.session,
-                "error": row.error,
-            }));
-        }
-    }
+            .map_err(|error| format!("run {}: {error}", entry.run_id))?;
+        let key = plan::run_input_key(&entry.run_id);
+        let row = rows
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
+            .ok_or_else(|| format!("run {} was never admitted", entry.run_id))?;
+        let marker_value = row.payload.get(status::JOB_KEY).ok_or_else(|| {
+            format!(
+                "run {} carries no job marker (session {})",
+                entry.run_id, session.0
+            )
+        })?;
+        let marker = status::parse_marker(marker_value).map_err(|error| {
+            format!(
+                "run {} carries an invalid job marker: {error}",
+                entry.run_id
+            )
+        })?;
+        let plan_source = marker_value
+            .get("plan_source")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let plan_author = marker_value
+            .get("plan_author")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(status::pending_view(
+            &marker,
+            plan_source,
+            plan_author,
+            row.admitted_at,
+        ))
+    } else {
+        None
+    };
     store.close().await;
-    text.push_str("note=a run id is <job>@<slot>; kian job status <run id> shows its steps\n");
+    let view = if let Some(view) = pending {
+        view
+    } else if let Some(view) = status::view(&events) {
+        view
+    } else {
+        return Err(format!(
+            "run {} carries no valid job marker (session {})",
+            entry.run_id, session.0
+        ));
+    };
     if json_output {
-        return serde_json::to_string_pretty(&json!({
-            "job": job.id,
-            "plan_digest": job.digest,
-            "steps": job.plan.steps.len(),
-            "triggers": triggers,
-            "firings": firings,
-        }))
-        .map_err(|error| error.to_string());
+        return serde_json::to_string_pretty(&view_json(&view)).map_err(|error| error.to_string());
     }
-    Ok(text)
+    Ok(status::render(&view))
 }
 
 fn unknown_job(catalog: &crate::job_config::JobCatalog, target: &str) -> String {
@@ -659,28 +672,53 @@ fn unknown_job(catalog: &crate::job_config::JobCatalog, target: &str) -> String 
 }
 
 fn view_json(view: &status::RunView) -> Value {
-    json!({
-        "run_id": view.run_id,
-        "job_id": view.job_id,
-        "slot": view.slot,
-        "trigger": view.trigger,
-        "plan_digest": view.plan_digest,
-        "outcome": view.outcome.as_ref().map(|outcome| outcome.as_str()),
-        "started_ms": view.started_ms,
-        "ended_ms": view.ended_ms,
-        "steps": view.steps.iter().map(|step| json!({
-            "id": step.id,
-            "action": step.action,
-            "state": step.state.as_str(),
-            "attempts": step.attempts.iter().map(|attempt| json!({
-                "attempt": attempt.attempt,
-                "worker": attempt.worker,
-                "started_ms": attempt.started_ms,
-                "ended_ms": attempt.ended_ms,
-                "outcome": attempt.outcome.as_ref().map(|outcome| outcome.as_str()),
-            })).collect::<Vec<Value>>(),
-        })).collect::<Vec<Value>>(),
-    })
+    let mut object = serde_json::Map::new();
+    object.insert("run_id".into(), json!(view.run_id));
+    object.insert("job_id".into(), json!(view.job_id));
+    object.insert("slot".into(), json!(view.slot));
+    object.insert("trigger".into(), json!(view.trigger));
+    if let Some(source) = &view.plan_source {
+        object.insert("plan_source".into(), json!(source));
+    }
+    if let Some(author) = &view.plan_author {
+        object.insert("plan_author".into(), json!(author));
+    }
+    object.insert("plan_digest".into(), json!(view.plan_digest));
+    object.insert("status".into(), json!(view.status.as_str()));
+    object.insert("status_basis".into(), json!(view.status_basis.as_str()));
+    object.insert("reason".into(), json!(view.reason));
+    object.insert(
+        "outcome".into(),
+        json!(view.outcome.as_ref().map(|outcome| outcome.as_str())),
+    );
+    object.insert("started_ms".into(), json!(view.started_ms));
+    object.insert("ended_ms".into(), json!(view.ended_ms));
+    object.insert(
+        "steps".into(),
+        json!(
+            view.steps
+                .iter()
+                .map(|step| json!({
+                    "id": step.id,
+                    "action": step.action,
+                    "state": step.state.as_str(),
+                    "next_due_ms": step.next_due_ms,
+                    "gate": step.gate,
+                    "checks": step.checks,
+                    "attempts": step.attempts.iter().map(|attempt| json!({
+                        "attempt": attempt.attempt,
+                        "worker": attempt.worker,
+                        "started_ms": attempt.started_ms,
+                        "ended_ms": attempt.ended_ms,
+                        "outcome": attempt.outcome.as_ref().map(|outcome| outcome.as_str()),
+                        "gate": attempt.gate,
+                        "checks": attempt.checks,
+                    })).collect::<Vec<Value>>(),
+                }))
+                .collect::<Vec<Value>>()
+        ),
+    );
+    json!(object)
 }
 
 async fn run_job(
@@ -778,6 +816,10 @@ async fn run_job(
         &job.plan,
         selfdev,
     );
+    if let Err(error) = ensure_run_identity(&store, session, &run, &marker).await {
+        store.close().await;
+        return Err(refused(error));
+    }
     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
     let admitted = store
         .admit(InputRow {
@@ -808,6 +850,48 @@ async fn run_job(
         "run={run}\njob={}\nslot={slot}\nsession={}\nplan={}\nstate=admitted\ndeduplicated={}\nnote={MANUAL_NOTE}\n",
         job.id, session.0, job.digest, admitted.deduplicated
     ))
+}
+
+async fn ensure_run_identity(
+    store: &EventStore,
+    session: kian_core::model::SessionId,
+    run: &str,
+    expected: &Value,
+) -> Result<(), String> {
+    let expected = status::parse_marker(expected)
+        .map_err(|error| format!("invalid admitted marker for {run}: {error}"))?;
+    let events = store
+        .rebuild(session)
+        .await
+        .map_err(|error| format!("run identity read {run}: {error}"))?;
+    if !events.is_empty() {
+        return match status::marker(&events) {
+            Some(Ok(found)) if found.same_frozen_identity(&expected) => Ok(()),
+            Some(Ok(_)) => Err(run_identity_conflict(run, session)),
+            Some(Err(error)) => Err(format!(
+                "run_identity_conflict: {run} carries an invalid marker: {error}"
+            )),
+            None => Err(run_identity_conflict(run, session)),
+        };
+    }
+    let rows = store
+        .input_rows(session)
+        .await
+        .map_err(|error| format!("run identity inbox read {run}: {error}"))?;
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let Some(marker) = row.payload.get(status::JOB_KEY) else {
+        return Err(run_identity_conflict(run, session));
+    };
+    let found = status::parse_marker(marker).map_err(|error| {
+        format!("run_identity_conflict: {run} carries an invalid marker: {error}")
+    })?;
+    if found.same_frozen_identity(&expected) {
+        Ok(())
+    } else {
+        Err(run_identity_conflict(run, session))
+    }
 }
 
 /// The frozen selfdev value an admitted row carries (4.2), built from facts
@@ -912,37 +996,81 @@ async fn cancel(run: &str, path: &Path, json_output: bool) -> Result<String, Str
     };
     let session = plan::run_session(job, slot);
     let catalog = resolved(&config)?.1;
+    if catalog.job(job).is_none() {
+        return Err(unknown_job(&catalog, job));
+    }
     let store = open_store(&config, false).await?;
     // Only a run session may receive a cancel row: a row into an arbitrary
     // session would be an unexplained input, so the marker gates it. A run
-    // admitted but not started has no stream to read that marker from, so the
-    // declared plan supplies one and the cancel row carries it (§15.3).
+    // admitted but not started is evidenced by its durable run row.
     let events = store
         .rebuild(session)
         .await
         .map_err(|error| format!("run {run}: {error}"))?;
-    let payload = if events.is_empty() {
-        let Some(declared) = catalog.job(job) else {
+    let pending_marker = if events.is_empty() {
+        let rows = store
+            .input_rows(session)
+            .await
+            .map_err(|error| format!("cancel run {run}: {error}"))?;
+        let key = plan::run_input_key(run);
+        let Some(row) = rows
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
+        else {
             store.close().await;
-            return Err(unknown_job(&catalog, job));
+            return Err(format!("run {run} was never admitted"));
         };
-        json!({
-            "role": "user",
-            "content": CANCEL_CONTENT,
-            "job": status::marker_payload(job, slot, trigger_of_slot(slot), &declared.plan),
-        })
+        let Some(marker) = row.payload.get(status::JOB_KEY) else {
+            store.close().await;
+            return Err(run_identity_conflict(run, session));
+        };
+        let found = status::parse_marker(marker)
+            .map_err(|error| format!("run {run} carries an invalid job marker: {error}"))?;
+        Some(found)
     } else {
-        if status::marker(&events).is_none() {
+        None
+    };
+    let found = if let Some(marker) = pending_marker {
+        marker
+    } else {
+        let Some(first) = events
+            .iter()
+            .find(|event| {
+                event.kind == kian_core::events::EventKind::InputAdmitted
+                    && event.bytes.get(status::JOB_KEY).is_some()
+            })
+            .and_then(|event| event.bytes.get(status::JOB_KEY))
+        else {
             store.close().await;
             return Err(format!(
                 "run {run} carries no job marker: it is not a job run (session {})",
                 session.0
             ));
+        };
+        match status::parse_marker(first) {
+            Ok(marker) => marker,
+            Err(error) => {
+                store.close().await;
+                return Err(format!("run {run} carries an invalid job marker: {error}"));
+            }
         }
-        json!({"role": "user", "content": CANCEL_CONTENT})
     };
+    if found.run_id != run || found.job_id != job || found.slot != slot {
+        store.close().await;
+        return Err(run_identity_conflict(run, session));
+    }
+    if let Some(outcome) = terminal_run_outcome(&events) {
+        store.close().await;
+        return Ok(already_terminal_output(
+            run,
+            session,
+            Some(outcome),
+            json_output,
+        ));
+    }
+    let payload = json!({"role": "user", "content": CANCEL_CONTENT});
     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-    let admitted = store
+    let admitted = match store
         .admit(InputRow {
             id: uuid::Uuid::new_v4(),
             session,
@@ -952,7 +1080,20 @@ async fn cancel(run: &str, path: &Path, json_output: bool) -> Result<String, Str
             idempotency_key: Some(format!("kian job:cancel:{run}")),
         })
         .await
-        .map_err(|error| format!("cancel run {run}: {error}"))?;
+    {
+        Ok(admitted) => admitted,
+        Err(kian_store::InboxError::SessionTerminal { .. }) => {
+            let outcome = status::run_verdict(&events)
+                .map(|verdict| verdict.outcome)
+                .or(Some(RunOutcome::Failed));
+            store.close().await;
+            return Ok(already_terminal_output(run, session, outcome, json_output));
+        }
+        Err(error) => {
+            store.close().await;
+            return Err(format!("cancel run {run}: {error}"));
+        }
+    };
     store.close().await;
     if json_output {
         return serde_json::to_string_pretty(&json!({
@@ -969,9 +1110,63 @@ async fn cancel(run: &str, path: &Path, json_output: bool) -> Result<String, Str
         session.0, admitted.deduplicated
     ))
 }
+
+fn terminal_run_outcome(events: &[kian_core::events::Event]) -> Option<RunOutcome> {
+    if let Some(verdict) = status::run_verdict(events) {
+        return Some(verdict.outcome);
+    }
+    events
+        .iter()
+        .any(|event| {
+            matches!(
+                event.kind,
+                kian_core::events::EventKind::SessionEnded { .. }
+            )
+        })
+        .then_some(RunOutcome::Failed)
+}
+
+fn already_terminal_output(
+    run: &str,
+    session: kian_core::model::SessionId,
+    outcome: Option<RunOutcome>,
+    json_output: bool,
+) -> String {
+    if json_output {
+        return serde_json::to_string_pretty(&json!({
+            "run_id": run,
+            "session": session.0.to_string(),
+            "state": "already_terminal",
+            "outcome": outcome.map(|outcome| outcome.as_str()),
+        }))
+        .expect("static terminal result serializes");
+    }
+    format!(
+        "run={run}\nsession={}\nstate=already_terminal\noutcome={}\n",
+        session.0,
+        outcome.map_or("-", RunOutcome::as_str)
+    )
+}
+
+fn run_identity_conflict(run: &str, session: kian_core::model::SessionId) -> String {
+    format!(
+        "run_identity_conflict: {run} derives session {} but that stream does not carry the same job marker",
+        session.0
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trigger_of_slot(slot: &str) -> &'static str {
+        if slot.starts_with("manual:") {
+            crate::job_config::TRIGGER_MANUAL
+        } else if slot.starts_with(plan::ALERT_SLOT_PREFIX) {
+            crate::job_config::TRIGGER_ALERT
+        } else {
+            crate::job_config::TRIGGER_CRON
+        }
+    }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
@@ -1321,6 +1516,7 @@ superagent:
         assert!(out.contains("plan=sha256:"), "{out}");
         assert!(out.contains("triggers=digest"), "{out}");
         assert!(out.contains("alerts=ops"), "{out}");
+        assert!(out.contains("last_run=-"), "{out}");
     }
 
     #[test]
@@ -1406,8 +1602,8 @@ superagent:
         let path = config_arg(&config);
         run_cli(&["run", "digest", "--slot", "manual:PEND", "--config", &path]).expect("run");
         let out = run_cli(&["status", "digest@manual:PEND", "--config", &path]).expect("status");
-        assert!(out.contains("state=pending"), "{out}");
-        assert!(out.contains("plan=sha256:"), "{out}");
+        assert!(out.contains("status   pending (stream_only)"), "{out}");
+        assert!(out.contains("plan sha256:"), "{out}");
     }
 
     #[test]
@@ -1420,13 +1616,11 @@ superagent:
     }
 
     #[test]
-    fn status_of_a_job_shows_its_trigger_before_any_firing() {
+    fn status_of_a_job_without_a_run_reports_no_runs() {
         let (_temp, config) = fixture("status-job");
         let path = config_arg(&config);
         let out = run_cli(&["status", "digest", "--config", &path]).expect("status");
-        assert!(out.contains("job=digest"), "{out}");
-        assert!(out.contains("triggers=digest"), "{out}");
-        assert!(out.contains("(no firings recorded)"), "{out}");
+        assert_eq!(out, "job=digest\nstatus=no_runs\n");
     }
 
     #[test]
@@ -1442,7 +1636,7 @@ superagent:
     }
 
     #[test]
-    fn cancel_of_a_pending_run_admits_a_marker_carrying_row() {
+    fn cancel_of_a_pending_run_admits_one_ordinary_cancel_row() {
         let (_temp, config) = fixture("cancel-pending");
         let path = config_arg(&config);
         run_cli(&[
@@ -1470,15 +1664,18 @@ superagent:
         let rows = block_on(store.input_rows(session)).expect("rows");
         block_on(store.close());
         assert_eq!(rows.len(), 2, "the run row and the cancel row");
+        let cancel_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.payload.get("content").and_then(Value::as_str) == Some(CANCEL_CONTENT)
+            })
+            .collect();
+        assert_eq!(cancel_rows.len(), 1, "exactly one cancel row");
         assert!(
-            rows.iter().any(|row| {
-                row.payload
-                    .get("job")
-                    .and_then(|job| job.get("run_id"))
-                    .and_then(Value::as_str)
-                    == Some("digest@manual:CANCEL")
-            }),
-            "the cancel row carries the marker"
+            cancel_rows
+                .iter()
+                .all(|row| row.payload.get("job").is_none()),
+            "a control row is never a second job-marked input"
         );
     }
 
@@ -1494,5 +1691,83 @@ superagent:
             undeclared.message().contains("unknown job nope"),
             "{undeclared:?}"
         );
+    }
+
+    #[test]
+    fn cancel_of_a_terminal_run_reports_already_terminal() {
+        let (_temp, config) = fixture("cancel-terminal");
+        let path = config_arg(&config);
+        run_cli(&[
+            "run",
+            "digest",
+            "--slot",
+            "manual:TERMINAL",
+            "--config",
+            &path,
+        ])
+        .expect("run");
+        let run = "digest@manual:TERMINAL";
+        let session = plan::run_session("digest", "manual:TERMINAL");
+        let loaded = crate::config::ServeConfig::load(&config).expect("config");
+        let (_, catalog) = resolved(&loaded).expect("jobs");
+        let declared = catalog.job("digest").expect("declared job");
+        let marker = status::marker_payload(
+            "digest",
+            "manual:TERMINAL",
+            crate::job_config::TRIGGER_MANUAL,
+            &declared.plan,
+        );
+        let store = block_on(open_store(&loaded, false)).expect("store");
+        block_on(async {
+            for event in [
+                kian_core::events::Event {
+                    seq: 1,
+                    session,
+                    epoch: kian_core::model::Epoch(1),
+                    ts: 1,
+                    kind: kian_core::events::EventKind::SessionCreated,
+                    bytes: json!({}),
+                    version: 0,
+                },
+                kian_core::events::Event {
+                    seq: 2,
+                    session,
+                    epoch: kian_core::model::Epoch(1),
+                    ts: 2,
+                    kind: kian_core::events::EventKind::InputAdmitted,
+                    bytes: json!({"role": "user", "content": "run", "job": marker}),
+                    version: 0,
+                },
+                kian_core::events::Event {
+                    seq: 3,
+                    session,
+                    epoch: kian_core::model::Epoch(1),
+                    ts: 3,
+                    kind: kian_core::events::EventKind::SessionEnded {
+                        reason: kian_core::events::EndReason::Failed,
+                    },
+                    bytes: json!({}),
+                    version: 0,
+                },
+            ] {
+                let seq = event.seq;
+                store
+                    .append(
+                        session,
+                        event,
+                        kian_store::AppendGuard {
+                            epoch: kian_core::model::Epoch(1),
+                            expected_seq: seq,
+                        },
+                    )
+                    .await
+                    .expect("seed terminal run");
+            }
+        });
+        block_on(store.close());
+
+        let output = run_cli(&["cancel", run, "--config", &path]).expect("already terminal");
+        assert!(output.contains("state=already_terminal"), "{output}");
+        assert!(output.contains("outcome=failed"), "{output}");
     }
 }

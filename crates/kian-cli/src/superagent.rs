@@ -226,6 +226,47 @@ impl InboxWriter for EngineInbox {
     }
 }
 
+impl kian_superagent::job::inbox::InboxWriter for EngineInbox {
+    fn admit(
+        &self,
+        session: SessionId,
+        payload: serde_json::Value,
+        idempotency_key: Option<String>,
+    ) -> BoxFuture<
+        'static,
+        Result<
+            kian_superagent::job::inbox::AdmitReceipt,
+            kian_superagent::job::inbox::InboxWriteError,
+        >,
+    > {
+        let engine = self
+            .engine
+            .get()
+            .expect("engine installed before the first job admit")
+            .clone();
+        Box::pin(async move {
+            let outcome = engine
+                .admit(session, payload, idempotency_key)
+                .await
+                .map_err(map_job_admit_error)?;
+            Ok(kian_superagent::job::inbox::AdmitReceipt {
+                deduplicated: outcome.deduplicated,
+            })
+        })
+    }
+}
+
+fn map_job_admit_error(
+    error: kian_orchestrator::EngineError,
+) -> kian_superagent::job::inbox::InboxWriteError {
+    match error {
+        kian_orchestrator::EngineError::SessionTerminal { session } => {
+            kian_superagent::job::inbox::InboxWriteError::SessionTerminal { session }
+        }
+        other => kian_superagent::job::inbox::InboxWriteError::Write(other.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The per-hold StreamPort over DrainCtx (the shape)
 // ---------------------------------------------------------------------------
@@ -1256,14 +1297,14 @@ pub struct SuperAgentDriver {
     /// drive, so a rotation routes the successor to the Router side).
     router: Arc<kian_superagent::ResidentBinding>,
     worker_version: u64,
-    router_side: RouterDriver<ReActLoop>,
+    router_side: Arc<RouterDriver<ReActLoop>>,
     worker_side: WorkerLoopDriver<crate::superagent::WorkerInnerDriver>,
     default_side: Arc<ReActLoop>,
     /// The resident watchdog session, when configured: routed to
     /// its own driver (the same residency shape as the Router's) so
     /// each admitted tick is one judge turn.
     watchdog: Option<SessionId>,
-    watchdog_side: Option<RouterDriver<ReActLoop>>,
+    watchdog_side: Option<Arc<RouterDriver<ReActLoop>>>,
     /// (R12, S1 — supersedes ADR-020 D8's boot-prebuilt map) the lazy
     /// per-worker-id side cache: built on first use from the factory,
     /// selected per drive from the stream's binding, and **never
@@ -1332,7 +1373,7 @@ impl SuperAgentDriver {
         Self {
             router,
             worker_version,
-            router_side,
+            router_side: Arc::new(router_side),
             worker_side,
             default_side,
             watchdog: None,
@@ -1368,7 +1409,7 @@ impl SuperAgentDriver {
     #[must_use]
     pub fn with_watchdog(mut self, session: SessionId, side: RouterDriver<ReActLoop>) -> Self {
         self.watchdog = Some(session);
-        self.watchdog_side = Some(side);
+        self.watchdog_side = Some(Arc::new(side));
         self
     }
 
@@ -1422,14 +1463,9 @@ impl LoopDriver for SuperAgentDriver {
     type Ctx = DrainCtx;
 
     fn drive(&self, ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
-        if ctx.session() == self.router.load() {
-            return self.router_side.drive(ctx);
-        }
-        if let (Some(watchdog), Some(side)) = (self.watchdog, &self.watchdog_side)
-            && ctx.session() == watchdog
-        {
-            return side.drive(ctx);
-        }
+        let router_side = Arc::clone(&self.router_side);
+        let watchdog_side = self.watchdog_side.clone();
+        let watchdog = self.watchdog;
         // Classify by stream content before the first provider turn:
         // worker streams carry the delegation wrapper (or already carry
         // thread/started); plain sessions see the default agent.
@@ -1474,12 +1510,22 @@ impl LoopDriver for SuperAgentDriver {
             // A malformed marker (`Err`) is still a run: the conductor owns
             // the honest `invalid_job_input` failure, so it must not fall
             // through to the agent loop either.
-            if let Some(marker) = kian_superagent::job::status::marker(&events) {
-                let digest = marker.ok().map(|marker| marker.plan_digest);
+            if kian_superagent::job::status::has_job_marker(&events) {
+                let digest = kian_superagent::job::status::marker(&events)
+                    .and_then(Result::ok)
+                    .map(|marker| marker.plan_digest);
                 return match job {
                     Some(side) => side.drive(ctx).boxed(),
                     None => crate::job_runtime::unmounted_run(ctx, digest),
                 };
+            }
+            if session == router {
+                return router_side.drive(ctx).boxed();
+            }
+            if let (Some(watchdog), Some(side)) = (watchdog, watchdog_side)
+                && session == watchdog
+            {
+                return side.drive(ctx).boxed();
             }
             match lineage_plan(
                 &events,
@@ -2446,6 +2492,76 @@ pub struct SuperAgentServices {
     /// run through it. Mounted empty by the plugin; the config-resolved
     /// catalogue is installed here at boot by [`crate::server::Server::from_config`].
     pub job_alerts: Arc<crate::job_runtime::JobAlertPort>,
+}
+
+/// The Router-free job runtime: the same conductor/worker/plain routing
+/// without a resident Router, subscriptions, or Router bootstrap.
+pub struct JobOnlyServices {
+    /// The assembled job-capable driver.
+    pub driver: Arc<SuperAgentDriver>,
+    /// The late-bound engine inbox shared by child admission and alerts.
+    pub inbox: Arc<EngineInbox>,
+    /// The job-step spawner.
+    pub spawner: Arc<WorkerSpawner>,
+    /// The alert port, filled with the resolved catalog at boot.
+    pub job_alerts: Arc<crate::job_runtime::JobAlertPort>,
+    /// Remote-exec services, when endpoints or workers are configured.
+    pub remote: Option<Arc<crate::plugins::RemoteExecServices>>,
+    /// Keeps the remote-worker heartbeat task alive for the process.
+    pub exec_watchdog: OnceLock<Arc<HeartbeatWatchdog>>,
+}
+
+/// Starts the non-Router services a job-only deployment needs after the
+/// inbox rebuild: the spawner bootstrap seam and remote worker liveness.
+pub async fn start_job_services(
+    services: Arc<JobOnlyServices>,
+    store: EventStore,
+    session_bootstrap: Option<Arc<dyn kian_superagent::SessionBootstrap>>,
+) -> Result<(), String> {
+    if let Some(bootstrap) = session_bootstrap.as_ref() {
+        services.spawner.install_bootstrap(Arc::clone(bootstrap));
+    }
+    let Some(remote) = &services.remote else {
+        return Ok(());
+    };
+    seed_endpoint_registry(remote.backend.store(), &remote.endpoints).await?;
+    let offline_after = remote
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.offline_after_ms)
+        .min()
+        .or_else(|| {
+            remote
+                .workers
+                .as_ref()
+                .map(|workers| workers.offline_after_ms)
+        })
+        .unwrap_or(30_000);
+    let poll = (offline_after / 4).clamp(50, 1_000);
+    let watchdog = HeartbeatWatchdog::start(
+        remote.backend.store().clone(),
+        WatchdogConfig {
+            offline_after: Duration::from_millis(offline_after),
+            poll_interval: Duration::from_millis(poll),
+        },
+        Arc::new(ExecSystemClock),
+    );
+    let _ = services.exec_watchdog.set(Arc::clone(&watchdog));
+    let _bridge = tokio::spawn(spawn_watchdog_bridge(
+        Arc::clone(&watchdog),
+        remote.backend.store().clone(),
+        store,
+        Arc::clone(&services.inbox) as Arc<dyn InboxWriter>,
+    ));
+    if let Some(workers) = &remote.workers {
+        let listener = Arc::clone(&workers.listener);
+        tokio::spawn(async move {
+            if let Err(error) = listener.run().await {
+                tracing::error!(%error, "worker registration listener failed");
+            }
+        });
+    }
+    Ok(())
 }
 
 /// Post-`startup_rebuild` services start (the load-bearing
@@ -3869,5 +3985,179 @@ mod assignee_selection_tests {
         assert_eq!(a_inbox.count(), 1, "idempotent: the surface is unchanged");
         assert_eq!(b_inbox.count(), 0, "the flipped live entry never served");
         assert_eq!(worker_inbox.count(), 0);
+    }
+
+    fn job_route_plan() -> kian_superagent::job::plan::JobPlan {
+        serde_json::from_value(serde_json::json!({
+            "id": "route-check",
+            "steps": [{
+                "id": "work",
+                "prompt": "do the work",
+                "verify": [{"check": "final_message_present"}]
+            }]
+        }))
+        .expect("route plan")
+    }
+
+    async fn job_route_store() -> (EventStore, SessionId) {
+        let dir = std::env::temp_dir().join(format!("kian-job-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = EventStore::open(&dir.join("kian.sqlite"))
+            .await
+            .expect("open store");
+        let session = SessionId::new();
+        let plan = job_route_plan();
+        let marker =
+            kian_superagent::job::status::marker_payload("route-check", "slot", "manual", &plan);
+        for (seq, kind, bytes) in [
+            (1, EventKind::SessionCreated, serde_json::json!({})),
+            (
+                2,
+                EventKind::InputAdmitted,
+                serde_json::json!({"role": "user", "content": "run", "job": marker}),
+            ),
+        ] {
+            store
+                .append(
+                    session,
+                    Event {
+                        seq,
+                        session,
+                        epoch: Epoch(1),
+                        ts: seq,
+                        kind,
+                        bytes,
+                        version: 0,
+                    },
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("seed route");
+        }
+        (store, session)
+    }
+
+    fn plain_route_driver(router_session: SessionId) -> Arc<SuperAgentDriver> {
+        let loop_ = minimal_loop();
+        let router_side = RouterDriver::new(
+            loop_,
+            RouterHold::shared(),
+            crate::superagent::port_for_ctx(),
+            RouterInbox::new(
+                Arc::new(NoopInbox) as Arc<dyn InboxWriter>,
+                kian_superagent::ResidentBinding::new(router_session),
+            ),
+        );
+        Arc::new(SuperAgentDriver::new(
+            kian_superagent::ResidentBinding::new(router_session),
+            1,
+            router_side,
+            tagged_side(TaggedInbox::shared("worker")),
+            minimal_loop(),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_marker_preempts_the_router_driver() {
+        let (store, session) = job_route_store().await;
+        let driver = plain_route_driver(session);
+        let ctx = DrainCtx::new(
+            store.clone(),
+            session,
+            Epoch(2),
+            Arc::new(SystemClock),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .expect("ctx");
+        let outcomes = driver.drive(ctx).collect::<Vec<_>>().await;
+        assert!(matches!(
+            outcomes.first(),
+            Some(LoopOutcome::SoftFailed { reason })
+                if reason.contains("job runs are not mounted")
+        ));
+        let events = store.rebuild(session).await.expect("events");
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::EvidenceVerdict
+                && event.bytes.get("gate").and_then(serde_json::Value::as_str) == Some("run")
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_job_marker_still_preempts_a_plain_stream() {
+        let dir = std::env::temp_dir().join(format!("kian-job-late-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = EventStore::open(&dir.join("kian.sqlite"))
+            .await
+            .expect("open store");
+        let session = SessionId::new();
+        let plan = job_route_plan();
+        let marker =
+            kian_superagent::job::status::marker_payload("route-check", "slot", "manual", &plan);
+        for (seq, kind, bytes) in [
+            (1, EventKind::SessionCreated, serde_json::json!({})),
+            (
+                2,
+                EventKind::InputAdmitted,
+                serde_json::json!({"role": "user", "content": "plain first"}),
+            ),
+            (
+                3,
+                EventKind::InputAdmitted,
+                serde_json::json!({"role": "user", "content": "run", "job": marker}),
+            ),
+        ] {
+            store
+                .append(
+                    session,
+                    Event {
+                        seq,
+                        session,
+                        epoch: Epoch(1),
+                        ts: seq,
+                        kind,
+                        bytes,
+                        version: 0,
+                    },
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("seed late marker");
+        }
+        let driver = plain_route_driver(SessionId::new());
+        let ctx = DrainCtx::new(
+            store.clone(),
+            session,
+            Epoch(2),
+            Arc::new(SystemClock),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .expect("ctx");
+        let outcomes = driver.drive(ctx).collect::<Vec<_>>().await;
+        assert!(matches!(
+            outcomes.first(),
+            Some(LoopOutcome::SoftFailed { reason })
+                if reason.contains("job runs are not mounted")
+        ));
+    }
+
+    #[test]
+    fn terminal_admission_keeps_its_typed_refusal() {
+        use crate::superagent::map_job_admit_error;
+        use kian_core::model::SessionId;
+        use kian_superagent::job::inbox::InboxWriteError;
+
+        let session = SessionId::new();
+        assert_eq!(
+            map_job_admit_error(kian_orchestrator::EngineError::SessionTerminal { session }),
+            InboxWriteError::SessionTerminal { session }
+        );
     }
 }

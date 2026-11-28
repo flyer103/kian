@@ -85,16 +85,20 @@ async fn offline_detected_within_offline_after_plus_poll() {
     no_proxy();
     let store = ExecStore::open(temp_db()).await.unwrap();
     let clock = Arc::new(ManualClock::new(10_000));
-    heartbeat(&store, "dev-box", 10_000, "online").await;
+    heartbeat(&store, "dev-box", 10_001, "online").await;
 
     let watchdog = HeartbeatWatchdog::start(
         store.clone(),
         config(),
         clock.clone() as Arc<dyn kian_exec::Clock>,
     );
+    let mut observed = watchdog.subscribe();
+    if observed.borrow().is_empty() {
+        observed.changed().await.unwrap();
+    }
     let mut health = watchdog.health();
 
-    // Deadline is 10_000 + 1_000 = 11_000. Advance in poll-sized steps,
+    // Deadline is 10_001 + 1_000 = 11_001. Advance in poll-sized steps,
     // mimicking real time, until the deadline is crossed.
     let event = advance_until_event(&clock, config().poll_interval, &mut health, "offline").await;
 
@@ -102,7 +106,7 @@ async fn offline_detected_within_offline_after_plus_poll() {
     assert_eq!(event.status, EndpointHealth::Offline);
     // Detection clock is within one poll of the deadline.
     assert!(
-        event.ts_ms <= 11_000 + config().poll_interval.as_millis() as u64,
+        event.ts_ms <= 11_001 + config().poll_interval.as_millis() as u64,
         "detection at {} ran past the deadline + poll bound",
         event.ts_ms
     );
@@ -128,7 +132,7 @@ async fn reconnect_emits_online_exactly_once() {
     no_proxy();
     let store = ExecStore::open(temp_db()).await.unwrap();
     let clock = Arc::new(ManualClock::new(10_000));
-    heartbeat(&store, "dev-box", 10_000, "online").await;
+    heartbeat(&store, "dev-box", 10_001, "online").await;
 
     let watchdog = HeartbeatWatchdog::start(
         store.clone(),
@@ -177,7 +181,7 @@ async fn silent_but_connected_endpoint_goes_offline() {
     let clock = Arc::new(ManualClock::new(10_000));
     // The registry says "online" (transport up) with a heartbeat at the
     // current clock; from here on the endpoint stays connected but silent.
-    heartbeat(&store, "dev-box", 10_000, "online").await;
+    heartbeat(&store, "dev-box", 10_001, "online").await;
 
     let watchdog = HeartbeatWatchdog::start(
         store.clone(),
@@ -190,7 +194,7 @@ async fn silent_but_connected_endpoint_goes_offline() {
     // row's state column as "online" (its transport view).
     for _ in 0..3 {
         clock.advance_by(400);
-        heartbeat(&store, "dev-box", 10_000, "online").await;
+        heartbeat(&store, "dev-box", 10_001, "online").await;
     }
     let event = advance_until_event(&clock, config().poll_interval, &mut health, "offline").await;
     assert_eq!(event.endpoint_id, "dev-box");
@@ -210,8 +214,8 @@ async fn healthy_endpoint_never_emits() {
     no_proxy();
     let store = ExecStore::open(temp_db()).await.unwrap();
     let clock = Arc::new(ManualClock::new(10_000));
-    heartbeat(&store, "dev-box", 10_000, "online").await;
-    heartbeat(&store, "ci-runner", 9_900, "online").await;
+    heartbeat(&store, "dev-box", 10_001, "online").await;
+    heartbeat(&store, "ci-runner", 10_001, "online").await;
 
     let watchdog = HeartbeatWatchdog::start(
         store.clone(),
@@ -246,6 +250,46 @@ async fn healthy_endpoint_never_emits() {
     watchdog.shutdown().await;
 }
 
+/// A registry-only row cached before this boot cannot become online from
+/// its cached heartbeat alone. Only a heartbeat observed after boot does.
+#[tokio::test]
+async fn cold_start_cached_heartbeat_is_offline_until_a_live_observation() {
+    no_proxy();
+    let store = ExecStore::open(temp_db()).await.unwrap();
+    let clock = Arc::new(ManualClock::new(10_000));
+    heartbeat(&store, "cached-box", 9_999, "online").await;
+
+    let watchdog = HeartbeatWatchdog::start(
+        store.clone(),
+        config(),
+        clock.clone() as Arc<dyn kian_exec::Clock>,
+    );
+    let mut observed = watchdog.subscribe();
+    if observed.borrow().is_empty() {
+        observed.changed().await.unwrap();
+    }
+    let mut health = watchdog.health();
+    let cold = next_event(&mut health, "cold-start cached row").await;
+    assert_eq!(cold.endpoint_id, "cached-box");
+    assert_eq!(cold.status, EndpointHealth::Offline);
+    assert_eq!(
+        watchdog.snapshot().get("cached-box"),
+        Some(&EndpointHealth::Offline)
+    );
+
+    clock.advance_by(1);
+    heartbeat(&store, "cached-box", clock.now_ms(), "online").await;
+    let live = next_event(&mut health, "first observed heartbeat").await;
+    assert_eq!(live.endpoint_id, "cached-box");
+    assert_eq!(live.status, EndpointHealth::Online);
+    assert_eq!(
+        watchdog.snapshot().get("cached-box"),
+        Some(&EndpointHealth::Online)
+    );
+
+    watchdog.shutdown().await;
+}
+
 /// The stream is live: a subscriber that arrives late sees the current
 /// state (offline endpoints reported; healthy ones silent).
 #[tokio::test]
@@ -256,7 +300,7 @@ async fn late_subscriber_sees_current_state() {
     // Only dev-box exists during detection (registry rows are read in
     // endpoint-id order; a same-deadline second endpoint would win the
     // first edge). ci-runner registers fresh only after dev-box is offline.
-    heartbeat(&store, "dev-box", 10_000, "online").await;
+    heartbeat(&store, "dev-box", 10_001, "online").await;
 
     let watchdog = HeartbeatWatchdog::start(
         store.clone(),

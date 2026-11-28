@@ -12,7 +12,7 @@ use kian_core::events::{Event, EventKind};
 use kian_core::model::SessionId;
 use kian_store::EventStore;
 use kian_superagent::job::conduct::{
-    ARTIFACT_CALL_PREFIX, PUBLISH_CALL_PREFIX, PUBLISH_TOOL, publish_branch,
+    ARTIFACT_CALL_PREFIX, PUBLISH_CALL_PREFIX, PUBLISH_TOOL, publish_branch, publish_tool_calls,
 };
 use kian_superagent::job::{plan, status};
 use serde_json::{Map, Value, json};
@@ -91,6 +91,7 @@ pub async fn run(options: Options, json_output: bool) -> CmdResult<Report> {
         &run,
         session,
         &events,
+        publish,
         options.merged,
         &mut links,
     )
@@ -133,6 +134,7 @@ async fn check(
     run: &str,
     session: SessionId,
     events: &[Event],
+    publish: &crate::config::SelfdevPublishSection,
     require_merged: bool,
     links: &mut Vec<Link>,
 ) -> Result<(), Broken> {
@@ -239,13 +241,23 @@ async fn check(
             format!("the frozen plan hashes to {computed}, not {plan_digest}"),
         ));
     }
-    let Some(publish_step) = plan.steps.iter().find(|step| step.is_publish()) else {
-        return Err(broken(
-            links,
-            "plan",
-            "the frozen plan declares no publish step",
-        ));
+    // ADR-084: a frozen plan may still carry the conductor's publish step (the
+    // replay of a run that predates the retirement); a tool-based plan declares
+    // publish_ok on an agent step whose child calls the publish tool.
+    let publish_step = match plan.steps.iter().find(|step| step.is_publish()) {
+        Some(step) => step,
+        None => match publish_tool_step(&plan) {
+            Some(step) => step,
+            None => {
+                return Err(broken(
+                    links,
+                    "plan",
+                    "the frozen plan declares no publish step",
+                ));
+            }
+        },
     };
+    let frozen_publish = publish_step.is_publish();
     let Some(input) = publish_step.inputs.first() else {
         return Err(broken(
             links,
@@ -253,13 +265,14 @@ async fn check(
             "the publish step names no input artifact",
         ));
     };
-    let Some(spec) = publish_step.publish() else {
+    let spec = publish_step.publish();
+    if frozen_publish && spec.is_none() {
         return Err(broken(
             links,
             "plan",
             "the publish step carries no publish block",
         ));
-    };
+    }
     links.push(Link {
         link: "plan",
         ok: true,
@@ -372,121 +385,68 @@ async fn check(
     });
 
     let branch = publish_branch(session);
-    let (intent, call_id) = match publish_intent(events, &publish_step.id) {
-        Ok(pair) => pair,
-        Err(detail) => return Err(broken(links, "publish", detail)),
-    };
-    let intent_from = intent.get("from");
-    if intent_from != Some(&artifact) {
-        return Err(broken(
-            links,
-            "publish",
-            "the publish intent names a different artifact than the harvested receipt",
-        ));
-    }
-    if intent.get("base_commit").and_then(Value::as_str) != Some(base_commit) {
-        return Err(broken(
-            links,
-            "publish",
-            format!("the publish intent does not freeze the base {base_commit}"),
-        ));
-    }
-    if intent.get("branch").and_then(Value::as_str) != Some(branch.as_str()) {
-        return Err(broken(
-            links,
-            "publish",
-            format!("the publish intent does not name {branch}"),
-        ));
-    }
-    let receipt = match publish_receipt(events, call_id) {
-        Ok(receipt) => receipt,
-        Err(detail) => return Err(broken(links, "publish", detail)),
-    };
-    if receipt.get("branch").and_then(Value::as_str) != Some(branch.as_str()) {
-        return Err(broken(
-            links,
-            "publish",
-            format!(
-                "the publish receipt names branch {}, not {branch}",
-                receipt
-                    .get("branch")
-                    .and_then(Value::as_str)
-                    .unwrap_or("(none)")
-            ),
-        ));
-    }
-    let Some(commit) = receipt.get("commit").and_then(Value::as_str) else {
-        return Err(broken(
-            links,
-            "publish",
-            "the publish receipt names no commit",
-        ));
-    };
-    if !is_full_commit(commit) {
-        return Err(broken(
-            links,
-            "publish",
-            format!("the publish commit {commit} is not a full 40-hex commit"),
-        ));
-    }
-    if spec.gates {
-        let Some(exit_code) = receipt
-            .get("gate")
-            .and_then(|gate| gate.get("exit_code"))
-            .and_then(Value::as_i64)
-        else {
+    let commit = if frozen_publish {
+        let spec = spec.expect("a frozen publish step carries a publish block");
+        let Some((intent, call_id)) = publish_intent(events, &publish_step.id) else {
             return Err(broken(
                 links,
                 "publish",
-                "the plan ran a gate but the publish receipt carries none",
+                format!(
+                    "the run carries no job.publish intent for step {}",
+                    publish_step.id
+                ),
             ));
         };
-        if exit_code != 0 {
+        if intent.get("from") != Some(&artifact) {
             return Err(broken(
                 links,
                 "publish",
-                format!("the gate exited {exit_code}, not 0"),
+                "the publish intent names a different artifact than the harvested receipt",
             ));
         }
-    }
-    if spec.push {
-        let reference = receipt
-            .get("push")
-            .and_then(|push| push.get("ref"))
-            .and_then(Value::as_str);
-        let want = format!("refs/heads/{branch}");
-        if reference != Some(want.as_str()) {
+        if intent.get("base_commit").and_then(Value::as_str) != Some(base_commit) {
             return Err(broken(
                 links,
                 "publish",
-                format!(
-                    "the publish receipt pushed {}, not {want}",
-                    reference.unwrap_or("nothing")
-                ),
+                format!("the publish intent does not freeze the base {base_commit}"),
             ));
         }
-    }
-    if spec.pull_request {
-        let head = receipt
-            .get("pull_request")
-            .and_then(|pull_request| pull_request.get("head"))
-            .and_then(Value::as_str);
-        if head != Some(branch.as_str()) {
+        if intent.get("branch").and_then(Value::as_str) != Some(branch.as_str()) {
             return Err(broken(
                 links,
                 "publish",
-                format!(
-                    "the pull request names head {}, not {branch}",
-                    head.unwrap_or("(none)")
-                ),
+                format!("the publish intent does not name {branch}"),
             ));
         }
-    }
-    links.push(Link {
-        link: "publish",
-        ok: true,
-        detail: format!("{branch} at {commit}"),
-    });
+        let Some(receipt) = publish_receipt(events, call_id) else {
+            return Err(broken(
+                links,
+                "publish",
+                format!("the run carries no job.publish receipt for {call_id}"),
+            ));
+        };
+        validate_publish_receipt(
+            links,
+            &receipt,
+            &branch,
+            spec.gates,
+            spec.push,
+            spec.pull_request,
+        )?
+    } else {
+        let receipt = match publish_tool_receipt(store, events, &publish_step.id).await {
+            Ok(receipt) => receipt,
+            Err(detail) => return Err(broken(links, "publish", detail)),
+        };
+        validate_publish_receipt(
+            links,
+            &receipt,
+            &branch,
+            publish.gates,
+            publish.push,
+            publish.pull_request,
+        )?
+    };
 
     let exists = format!("{commit}^{{commit}}");
     if git_bytes(repo, &["cat-file", "-e", &exists]).is_err() {
@@ -496,7 +456,7 @@ async fn check(
             format!("{commit} is not in the local object database (the verifier does not fetch)"),
         ));
     }
-    let parents = match git_text(repo, &["rev-list", "--parents", "-n", "1", commit]) {
+    let parents = match git_text(repo, &["rev-list", "--parents", "-n", "1", commit.as_str()]) {
         Ok(parents) => parents,
         Err(error) => return Err(broken(links, "commit", error)),
     };
@@ -525,7 +485,13 @@ async fn check(
     }
     let diff = match git_bytes(
         repo,
-        &["diff", "--no-ext-diff", "--no-color", base_commit, commit],
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            base_commit,
+            commit.as_str(),
+        ],
     ) {
         Ok(diff) => diff,
         Err(error) => return Err(broken(links, "commit", error)),
@@ -541,7 +507,7 @@ async fn check(
             ),
         ));
     }
-    let message = match git_text(repo, &["log", "-1", "--format=%B", commit]) {
+    let message = match git_text(repo, &["log", "-1", "--format=%B", commit.as_str()]) {
         Ok(message) => message,
         Err(error) => return Err(broken(links, "commit", error)),
     };
@@ -636,7 +602,10 @@ async fn check(
     if !require_merged {
         return Ok(());
     }
-    match git_code(repo, &["merge-base", "--is-ancestor", commit, base]) {
+    match git_code(
+        repo,
+        &["merge-base", "--is-ancestor", commit.as_str(), base],
+    ) {
         Ok(0) => links.push(Link {
             link: "merged",
             ok: true,
@@ -730,6 +699,172 @@ fn message_text(event: &Event) -> Option<&str> {
     content.get("text").and_then(Value::as_str)
 }
 
+fn publish_tool_step(plan: &plan::JobPlan) -> Option<&plan::StepPlan> {
+    plan.steps.iter().find(|step| {
+        step.verify
+            .iter()
+            .any(|check| matches!(check, plan::JobCheck::PublishOk))
+    })
+}
+
+/// The receipt a tool-based publish child committed (ADR-084): the call names no
+/// coordinates, so the step, attempt and patch all come from the committed
+/// streams, and the run's dispatch record names the child that called it.
+async fn publish_tool_receipt(
+    store: &EventStore,
+    events: &[Event],
+    step: &str,
+) -> Result<Value, String> {
+    let Some(dispatch) = status::dispatches(events)
+        .into_iter()
+        .rev()
+        .find(|record| record.step == step)
+    else {
+        return Err(format!(
+            "the run carries no dispatch record for the publish step {step}"
+        ));
+    };
+    let child = store
+        .rebuild(dispatch.child)
+        .await
+        .map_err(|error| format!("the publish child {}: {error}", dispatch.child.0))?;
+    let calls = publish_tool_calls(&child);
+    match calls.as_slice() {
+        [] => Err("the publish child never called the publish tool".to_string()),
+        [call] => {
+            if !call
+                .arguments
+                .as_object()
+                .is_some_and(|arguments| arguments.is_empty())
+            {
+                return Err(
+                    "the publish tool call carries arguments; the tool derives every coordinate from the streams"
+                        .to_string(),
+                );
+            }
+            let Some(result) = &call.result else {
+                return Err(
+                    "the publish call has no receipt: the worktree may exist and an operator must inspect"
+                        .to_string(),
+                );
+            };
+            if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                return Err(format!(
+                    "the publish tool did not succeed: {}",
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no receipt")
+                ));
+            }
+            match result.get("result") {
+                Some(receipt) => Ok(receipt.clone()),
+                None => Err("the publish tool receipt carries no result body".to_string()),
+            }
+        }
+        _ => Err(format!(
+            "the publish child called the publish tool {} times; a run publishes once",
+            calls.len()
+        )),
+    }
+}
+
+fn validate_publish_receipt(
+    links: &mut Vec<Link>,
+    receipt: &Value,
+    branch: &str,
+    gates: bool,
+    push: bool,
+    pull_request: bool,
+) -> Result<String, Broken> {
+    if receipt.get("branch").and_then(Value::as_str) != Some(branch) {
+        return Err(broken(
+            links,
+            "publish",
+            format!(
+                "the publish receipt names branch {}, not {branch}",
+                receipt
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none)")
+            ),
+        ));
+    }
+    let Some(commit) = receipt.get("commit").and_then(Value::as_str) else {
+        return Err(broken(
+            links,
+            "publish",
+            "the publish receipt names no commit",
+        ));
+    };
+    if !is_full_commit(commit) {
+        return Err(broken(
+            links,
+            "publish",
+            format!("the publish commit {commit} is not a full 40-hex commit"),
+        ));
+    }
+    if gates {
+        let Some(exit_code) = receipt
+            .get("gate")
+            .and_then(|gate| gate.get("exit_code"))
+            .and_then(Value::as_i64)
+        else {
+            return Err(broken(
+                links,
+                "publish",
+                "a gate was required but the publish receipt carries none",
+            ));
+        };
+        if exit_code != 0 {
+            return Err(broken(
+                links,
+                "publish",
+                format!("the gate exited {exit_code}, not 0"),
+            ));
+        }
+    }
+    if push {
+        let reference = receipt
+            .get("push")
+            .and_then(|push| push.get("ref"))
+            .and_then(Value::as_str);
+        let want = format!("refs/heads/{branch}");
+        if reference != Some(want.as_str()) {
+            return Err(broken(
+                links,
+                "publish",
+                format!(
+                    "the publish receipt pushed {}, not {want}",
+                    reference.unwrap_or("nothing")
+                ),
+            ));
+        }
+    }
+    if pull_request {
+        let head = receipt
+            .get("pull_request")
+            .and_then(|pull_request| pull_request.get("head"))
+            .and_then(Value::as_str);
+        if head != Some(branch) {
+            return Err(broken(
+                links,
+                "publish",
+                format!(
+                    "the pull request names head {}, not {branch}",
+                    head.unwrap_or("(none)")
+                ),
+            ));
+        }
+    }
+    links.push(Link {
+        link: "publish",
+        ok: true,
+        detail: format!("{branch} at {commit}"),
+    });
+    Ok(commit.to_string())
+}
+
 fn artifact_receipt(events: &[Event], step: &str, name: &str) -> Result<Value, String> {
     let prefix = format!("{ARTIFACT_CALL_PREFIX}{step}:");
     for event in events.iter().rev() {
@@ -765,7 +900,7 @@ fn artifact_receipt(events: &[Event], step: &str, name: &str) -> Result<Value, S
     ))
 }
 
-fn publish_intent<'a>(events: &'a [Event], step: &str) -> Result<(&'a Value, &'a str), String> {
+fn publish_intent<'a>(events: &'a [Event], step: &str) -> Option<(&'a Value, &'a str)> {
     let prefix = format!("{PUBLISH_CALL_PREFIX}{step}:");
     for event in events.iter().rev() {
         if event.kind != EventKind::ToolCall {
@@ -783,14 +918,12 @@ fn publish_intent<'a>(events: &'a [Event], step: &str) -> Result<(&'a Value, &'a
         let Some(args) = event.bytes.get("args") else {
             continue;
         };
-        return Ok((args, call_id));
+        return Some((args, call_id));
     }
-    Err(format!(
-        "the run carries no job.publish intent for step {step}"
-    ))
+    None
 }
 
-fn publish_receipt(events: &[Event], call_id: &str) -> Result<Value, String> {
+fn publish_receipt(events: &[Event], call_id: &str) -> Option<Value> {
     let mut failure = None;
     for event in events.iter().rev() {
         if event.kind != EventKind::ToolResult {
@@ -800,11 +933,7 @@ fn publish_receipt(events: &[Event], call_id: &str) -> Result<Value, String> {
             continue;
         }
         if event.bytes.get("ok").and_then(Value::as_bool) == Some(true) {
-            return event
-                .bytes
-                .get("result")
-                .cloned()
-                .ok_or_else(|| "the publish receipt carries no result body".to_string());
+            return event.bytes.get("result").cloned();
         }
         failure = Some(
             event
@@ -815,10 +944,8 @@ fn publish_receipt(events: &[Event], call_id: &str) -> Result<Value, String> {
                 .to_string(),
         );
     }
-    Err(match failure {
-        Some(error) => format!("the publish attempt did not succeed: {error}"),
-        None => format!("the run carries no job.publish receipt for {call_id}"),
-    })
+    let _ = failure;
+    None
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -877,6 +1004,7 @@ mod tests {
     use kian_core::events::SCHEMA_VERSION;
     use kian_core::model::Epoch;
     use kian_store::AppendGuard;
+    use kian_superagent::job::conduct::PUBLISH_AGENT_TOOL;
     use kian_superagent::job::plan::{self, JobPlan};
     use serde_json::Value;
 
@@ -905,6 +1033,8 @@ mod tests {
         selfdev: Option<Value>,
         producer_text: String,
         intent: bool,
+        child: Option<SessionId>,
+        tool_receipt: Option<Value>,
     }
 
     fn temp_root(name: &str) -> PathBuf {
@@ -972,6 +1102,43 @@ mod tests {
     }
 
     fn fixture(name: &str, gates: bool) -> Fixture {
+        build(name, gates, false)
+    }
+
+    fn tool_fixture(name: &str) -> Fixture {
+        build(name, true, true)
+    }
+
+    fn tool_plan() -> JobPlan {
+        serde_json::from_value(json!({
+            "id": JOB,
+            "steps": [{
+                "id": "patch",
+                "prompt": "propose a patch",
+                "produces": {"name": "patch", "max_bytes": 65536},
+                "verify": [
+                    {"check": "artifact_within_cap", "name": "patch"},
+                    {
+                        "check": "patch_paths_allowed",
+                        "artifact": "patch",
+                        "allow": ["src/**"],
+                        "deny": []
+                    }
+                ]
+            }, {
+                "id": "publish",
+                "prompt": "call the publish tool once; it takes no arguments",
+                "depends_on": ["patch"],
+                "inputs": [{"step": "patch", "name": "patch"}],
+                "effect": "write",
+                "retries": 0,
+                "verify": [{"check": "publish_ok"}]
+            }]
+        }))
+        .expect("a valid tool publish plan")
+    }
+
+    fn build(name: &str, gates: bool, tool: bool) -> Fixture {
         let root = temp_root(name);
         let repo = root.join("repo");
         std::fs::create_dir_all(repo.join("src")).expect("create repo");
@@ -1005,6 +1172,7 @@ mod tests {
                     }
                 ]
             }, {
+                // ADR-084: a frozen replay fixture; new plans cannot declare this action.
                 "id": "publish",
                 "action": "publish",
                 "depends_on": ["patch"],
@@ -1015,6 +1183,7 @@ mod tests {
             }]
         }))
         .expect("a valid publish plan");
+        let plan = if tool { tool_plan() } else { plan };
 
         let run = plan::run_session(JOB, SLOT);
         let producer = SessionId(uuid::Uuid::new_v4());
@@ -1107,6 +1276,18 @@ selfdev:
         );
         std::fs::write(&config, yaml).expect("write config");
 
+        let tool_receipt = if tool {
+            Some(json!({"ok": true, "result": receipt.clone()}))
+        } else {
+            None
+        };
+        let child = if tool {
+            Some(SessionId(uuid::Uuid::new_v4()))
+        } else {
+            None
+        };
+        let receipt = if tool { None } else { Some(receipt) };
+
         Fixture {
             repo,
             worktree,
@@ -1121,10 +1302,12 @@ selfdev:
             plan_digest: None,
             patch: patch.clone(),
             artifact,
-            receipt: Some(receipt),
+            receipt,
             selfdev: Some(selfdev),
             producer_text: patch,
-            intent: true,
+            intent: !tool,
+            child,
+            tool_receipt,
         }
     }
 
@@ -1224,6 +1407,61 @@ selfdev:
             )
             .await
             .expect("seed artifact result");
+
+        if let Some(child) = fixture.child {
+            store
+                .append(
+                    fixture.run,
+                    event(
+                        fixture.run,
+                        4,
+                        EventKind::ThreadStarted,
+                        json!({
+                            "thread_id": uuid::Uuid::new_v4().to_string(),
+                            "worker": child.0.to_string(),
+                            "job": {
+                                "run": plan::run_id(JOB, SLOT),
+                                "step": "publish",
+                                "attempt": 1
+                            }
+                        }),
+                    ),
+                    guard(4),
+                )
+                .await
+                .expect("seed dispatch record");
+            store
+                .append(
+                    child,
+                    event(
+                        child,
+                        1,
+                        EventKind::ToolCall,
+                        json!({
+                            "role": "assistant",
+                            "content": {"id": "call-1", "name": PUBLISH_AGENT_TOOL, "arguments": {}}
+                        }),
+                    ),
+                    guard(1),
+                )
+                .await
+                .expect("seed publish call");
+            if let Some(output) = &fixture.tool_receipt {
+                store
+                    .append(
+                        child,
+                        event(
+                            child,
+                            2,
+                            EventKind::ToolResult,
+                            json!({"role": "tool", "content": {"call_id": "call-1", "output": output, "is_error": false}}),
+                        ),
+                        guard(2),
+                    )
+                    .await
+                    .expect("seed publish receipt");
+            }
+        }
 
         if fixture.intent {
             store
@@ -1556,5 +1794,28 @@ selfdev:
             .await
             .expect_err("landing is not configured");
         assert_eq!(error, "landing is not configured");
+    }
+
+    #[tokio::test]
+    async fn a_tool_published_run_verifies_from_the_child_receipt() {
+        let fixture = tool_fixture("tool-complete");
+        let report = verify(&fixture, false).await;
+        assert!(report.ok, "{}", report.stderr);
+        assert!(report.stdout.contains("publish: ok ("), "{}", report.stdout);
+        assert!(!report.stdout.contains("job.publish"));
+    }
+
+    #[tokio::test]
+    async fn a_tool_run_without_a_receipt_breaks_the_publish_link() {
+        let mut fixture = tool_fixture("tool-no-receipt");
+        fixture.tool_receipt = None;
+        let report = verify(&fixture, false).await;
+        assert_eq!(
+            broken(&report),
+            (
+                "publish",
+                "the publish call has no receipt: the worktree may exist and an operator must inspect"
+            )
+        );
     }
 }

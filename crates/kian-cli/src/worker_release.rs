@@ -13,11 +13,10 @@
 //! 2. the thread's projection is `idle` (running/recoverable is busy);
 //! 3. its last event is `session/ended{interrupted|failed}` (a thread that
 //!    never ended is not releasable);
-//! 4. the worker's durable queue has no `pending`/`inflight` row (the
-//!    machine is not still executing or owing a command);
-//! 5. the engine's own gates add: no eligible inbox row, no live drain, a
-//!    fresh claim (the close is one atomic claim + `session/ended{cancelled}`
-//!    batch).
+//! 4. the engine re-evaluates no unconsumed inbox row, no live drain, the
+//!    worker queue gate, and a fresh claim inside one per-session write
+//!    transaction (the close is one atomic claim +
+//!    `session/ended{cancelled}` batch).
 //!
 //! The earlier honest end is preserved; the close is terminal, so the thread
 //! can never resume into the slot a newer thread now holds.
@@ -205,42 +204,18 @@ where
         });
     }
 
-    // Eligible work is resumable work: a release never discards it.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let eligible = store
-        .eligible_inputs(thread.worker_session, now_ms)
+    // Unconsumed work is resumable work, including future-eligible rows.
+    let has_unconsumed = store
+        .has_unconsumed_inputs(thread.worker_session)
         .await
         .map_err(|e| OpsError::Internal(format!("release_worker: inbox read failed: {e}")))?;
-    if !eligible.is_empty() {
+    if has_unconsumed {
         return Err(OpsError::WorkerBusy {
             worker: worker.to_string(),
             session: thread.worker_session,
-            detail: format!(
-                "its inbox still holds {} eligible input row(s); the thread is resumable, \
-                 so releasing it would discard queued work",
-                eligible.len()
-            ),
-        });
-    }
-
-    // The machine must not still be executing (or owing) a command from the
-    // thread: free the slot only when the durable queue is idle.
-    let live_rows = exec_store
-        .drivable(worker)
-        .await
-        .map_err(|e| OpsError::Internal(format!("release_worker: queue read failed: {e}")))?;
-    if !live_rows.is_empty() {
-        return Err(OpsError::WorkerBusy {
-            worker: worker.to_string(),
-            session: thread.worker_session,
-            detail: format!(
-                "its durable queue still holds {} live command row(s); wait for them to \
-                 settle (the queue's own bound converges them), then release",
-                live_rows.len()
-            ),
+            detail: "its inbox still holds unconsumed input row(s); the thread is resumable, \
+                     so releasing it would discard queued work"
+                .to_string(),
         });
     }
 
@@ -252,7 +227,21 @@ where
             "reason": reason.unwrap_or_else(|| "operator release".to_string()),
         }
     });
-    match engine.release_idle(thread.worker_session, payload).await {
+    let queue_gate = async {
+        exec_store
+            .drivable(worker)
+            .await
+            .map(|rows| rows.is_empty())
+            .map_err(|e| {
+                kian_orchestrator::EngineError::ReleaseQueueGate(format!(
+                    "durable queue read failed: {e}"
+                ))
+            })
+    };
+    match engine
+        .release_idle_guarded(thread.worker_session, payload, queue_gate)
+        .await
+    {
         Ok(ReleaseOutcome::Released { seq, .. }) => Ok(ReleaseWorkerReceipt {
             worker: worker.to_string(),
             outcome: ReleaseWorkerOutcome::Released,
@@ -277,6 +266,13 @@ where
             session: thread.worker_session,
             detail: "the session moved while releasing (a drain/wake or new input); retry once \
                      it is idle again"
+                .to_string(),
+        }),
+        Ok(ReleaseOutcome::QueueBusy) => Err(OpsError::WorkerBusy {
+            worker: worker.to_string(),
+            session: thread.worker_session,
+            detail: "its durable queue still holds a live command row; wait for it to settle, \
+                     then release"
                 .to_string(),
         }),
         Ok(ReleaseOutcome::Unknown) => Err(OpsError::WorkerNotBound {
@@ -643,9 +639,9 @@ mod tests {
         fx.cleanup();
     }
 
-    /// Eligible input is resumable work: never discarded by a release.
+    /// Unconsumed input is resumable work: never discarded by a release.
     #[tokio::test]
-    async fn release_worker_refuses_eligible_input() {
+    async fn release_worker_refuses_unconsumed_input() {
         let fx = Fixture::new(|store, worker_session| async move {
             seed_ended_worker(&store, worker_session, EndReason::Interrupted).await;
         })
@@ -657,9 +653,9 @@ mod tests {
         let before = fx.store.head(fx.worker_session).await.expect("head");
         let err = release_worker(&*fx.engine, &fx.store, &fx.exec, "mac-mini", None)
             .await
-            .expect_err("eligible input");
+            .expect_err("unconsumed input");
         assert!(
-            matches!(err, OpsError::WorkerBusy { ref detail, .. } if detail.contains("eligible")),
+            matches!(err, OpsError::WorkerBusy { ref detail, .. } if detail.contains("unconsumed")),
             "{err:?}"
         );
         assert_eq!(
@@ -677,38 +673,7 @@ mod tests {
     #[tokio::test]
     async fn release_worker_reports_a_terminal_thread_as_already_released() {
         let fx = Fixture::new(|store, worker_session| async move {
-            append(
-                &store,
-                worker_session,
-                1,
-                0,
-                T0,
-                EventKind::SessionCreated,
-                json!({}),
-            )
-            .await;
-            append(
-                &store,
-                worker_session,
-                2,
-                1,
-                T0,
-                EventKind::DrainClaimed,
-                json!({"holder": "test-holder"}),
-            )
-            .await;
-            append(
-                &store,
-                worker_session,
-                3,
-                1,
-                T0,
-                EventKind::SessionEnded {
-                    reason: EndReason::Completed,
-                },
-                json!({}),
-            )
-            .await;
+            seed_ended_worker(&store, worker_session, EndReason::Completed).await;
         })
         .await;
         let before = fx.store.head(fx.worker_session).await.expect("head");

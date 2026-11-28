@@ -87,14 +87,24 @@ pub struct JobDef {
 #[serde(deny_unknown_fields)]
 pub struct JobTriggerDef {
     /// The schedule id — the durable cursor key. Defaults to the job id, so
-    /// the one-trigger case needs no extra key; a second trigger for the
-    /// same job must name itself (§7.4 V2).
+    /// v1's one allowed trigger needs no extra key unless the job id also
+    /// needs a schedule-shaped alias (§7.4 V2/V15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// The job this trigger fires.
     pub job: String,
+    /// The trigger kind; absent means `cron`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The cron expression (§7.4 V13: the cron contract's grammar).
+    #[serde(default)]
     pub expr: String,
+    /// A future event-trigger declaration (refused as phase-unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Value>,
+    /// A future parent-trigger declaration (refused as phase-unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Value>,
     /// The IANA timezone; absent = the host timezone frozen at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tz: Option<String>,
@@ -404,6 +414,48 @@ fn is_deliver_target(target: &Value) -> bool {
     }
 }
 
+fn validate_channel_target(channel: &ChannelConfig, target: &Value) -> Result<(), String> {
+    match channel.channel_type.as_str() {
+        kian_superagent::IMESSAGE_CHANNEL_TYPE => nonempty_string_field(target, "handle")
+            .map(|_| ())
+            .ok_or_else(|| "imessage requires {\"handle\": \"<recipient>\"}".to_string()),
+        kian_superagent::WECHAT_CHANNEL_TYPE => nonempty_string_field(target, "user_id")
+            .map(|_| ())
+            .ok_or_else(|| "wechat requires {\"user_id\": \"<recipient>\"}".to_string()),
+        kian_superagent::LARK_CHANNEL_TYPE => {
+            let object = target
+                .as_object()
+                .ok_or_else(|| "lark requires an object target".to_string())?;
+            let ids = ["chat_id", "open_id", "union_id", "user_id", "email"]
+                .into_iter()
+                .filter(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+                .count();
+            if ids == 1 {
+                Ok(())
+            } else {
+                Err(
+                    "lark requires exactly one non-empty receive id: chat_id | open_id | union_id | user_id | email"
+                        .to_string(),
+                )
+            }
+        }
+        _ if is_deliver_target(target) => Ok(()),
+        _ => Err("target must be a non-empty object or string".to_string()),
+    }
+}
+
+fn nonempty_string_field<'a>(target: &'a Value, key: &str) -> Option<&'a str> {
+    target
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// §7.4 V18: does any prompt or schema carry a secret-shaped literal?
 ///
 /// Uses the same redactor the runtime uses for exec output
@@ -460,6 +512,11 @@ impl JobsSection {
                     "id must match [a-z0-9][a-z0-9._-]{0,63} (V1: the capability-name shape)"
                         .to_string(),
                 );
+            } else if def.id.starts_with("alert.") {
+                messages.push(
+                    "job ids may not use the `alert.` prefix, which is reserved for synthetic alert jobs (V31)"
+                        .to_string(),
+                );
             } else if jobs.contains_key(&def.id) {
                 messages.push("duplicate job id (V2: a job id is unique)".to_string());
             }
@@ -473,16 +530,17 @@ impl JobsSection {
                 let Some(spec) = step.deliver() else {
                     continue;
                 };
-                if !channels.contains_key(spec.channel) {
+                if let Some(channel) = channels.get(spec.channel) {
+                    if let Err(detail) = validate_channel_target(channel, spec.target) {
+                        messages.push(format!(
+                            "step `{}`: target is invalid for channel `{}`: {detail} (V16)",
+                            step.id, spec.channel
+                        ));
+                    }
+                } else {
                     messages.push(format!(
                         "step `{}`: channel `{}` is not declared in superagent.channels (V16)",
                         step.id, spec.channel
-                    ));
-                }
-                if !is_deliver_target(spec.target) {
-                    messages.push(format!(
-                        "step `{}`: target must be a non-empty object or string (V16)",
-                        step.id
                     ));
                 }
             }
@@ -513,6 +571,10 @@ impl JobsSection {
         // ---- triggers (§7.1a: lowered, never a second scheduler) ----
         let mut schedules: Vec<CronRuntimeSchedule> = Vec::new();
         let mut seen: BTreeSet<String> = taken.clone();
+        let mut trigger_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for trigger in &self.triggers {
+            *trigger_counts.entry(trigger.job.as_str()).or_default() += 1;
+        }
         for (i, def) in self.triggers.iter().enumerate() {
             let mut messages: Vec<String> = Vec::new();
             if !jobs.contains_key(&def.job) {
@@ -520,6 +582,12 @@ impl JobsSection {
                     "job `{}` is not declared in superagent.jobs.jobs (V13)",
                     def.job
                 ));
+            }
+            if trigger_counts.get(def.job.as_str()).copied().unwrap_or(0) > 1 {
+                messages.push(
+                    "a job declares at most one trigger in v1; exactly one trigger schedule (V15)"
+                        .to_string(),
+                );
             }
             let schedule_id = def.id.clone().unwrap_or_else(|| def.job.clone());
             if !is_cron_shaped(&schedule_id) {
@@ -556,27 +624,50 @@ impl JobsSection {
                     }
                 }
             };
-            let expr = match kian_cron::CronExpr::parse(&def.expr) {
-                Ok(expr) => match expr.next_fire_after(&tz, now) {
-                    Ok(_) => Some(expr),
+            let kind = def.kind.as_deref().map(str::trim).unwrap_or(TRIGGER_CRON);
+            let later_phase = match kind {
+                TRIGGER_CRON => def.event.is_some() || def.parent.is_some(),
+                "event" => true,
+                "parent" => true,
+                other => {
+                    messages.push(format!(
+                        "trigger kind `{other}` is not recognized; v1 accepts cron only (V13)"
+                    ));
+                    false
+                }
+            };
+            if later_phase {
+                messages.push(
+                    "phase_unavailable: event and parent triggers are not available in v1 (V30)"
+                        .to_string(),
+                );
+            }
+            let is_cron = kind == TRIGGER_CRON && !later_phase;
+            let expr = if is_cron {
+                match kian_cron::CronExpr::parse(&def.expr) {
+                    Ok(expr) => match expr.next_fire_after(&tz, now) {
+                        Ok(_) => Some(expr),
+                        Err(e) => {
+                            messages.push(format!(
+                                "expr `{}` yields no fire time within the {} day horizon: {e}",
+                                def.expr.trim(),
+                                kian_cron::MAX_SCAN_DAYS
+                            ));
+                            None
+                        }
+                    },
                     Err(e) => {
-                        messages.push(format!(
-                            "expr `{}` yields no fire time within the {} day horizon: {e}",
-                            def.expr.trim(),
-                            kian_cron::MAX_SCAN_DAYS
-                        ));
+                        messages.push(format!("expr `{}` is invalid: {e}", def.expr.trim()));
                         None
                     }
-                },
-                Err(e) => {
-                    messages.push(format!("expr `{}` is invalid: {e}", def.expr.trim()));
-                    None
                 }
+            } else {
+                None
             };
             let overlap = def.overlap.unwrap_or_default();
             if overlap != CronOverlap::Skip {
                 messages.push(
-                    "overlap: only `skip` is implemented in v1 (V15: one run per slot)".to_string(),
+                    "overlap: only `skip` is implemented in v1; one run per slot (V15)".to_string(),
                 );
             }
             let catch_up = match def.catch_up.unwrap_or_default() {
@@ -588,8 +679,10 @@ impl JobsSection {
                 messages.push("coalesce_ms must be > 0".to_string());
             }
             let max_concurrent = def.max_concurrent.unwrap_or(DEFAULT_CRON_MAX_CONCURRENT);
-            if max_concurrent == 0 {
-                messages.push("max_concurrent must be >= 1".to_string());
+            if max_concurrent != 1 {
+                messages.push(format!(
+                    "max_concurrent must be 1 in v1; found {max_concurrent} (V15)"
+                ));
             }
             let before = errors.len();
             errors.extend(
@@ -627,10 +720,27 @@ impl JobsSection {
         // ---- alerts (§13.3: an independent channel, never a chain) ----
         let declared: BTreeSet<&str> = self.jobs.iter().map(|j| j.id.as_str()).collect();
         let mut alerts: BTreeMap<String, Vec<ResolvedAlert>> = BTreeMap::new();
+        let mut alert_ids = BTreeSet::new();
+        let mut alerted_jobs = BTreeSet::new();
         for (i, def) in self.alerts.iter().enumerate() {
             let mut messages: Vec<String> = Vec::new();
             if !kian_core::worker::valid_capability_name(&def.id) {
                 messages.push("id must match [a-z0-9][a-z0-9._-]{0,63} (V1)".to_string());
+            }
+            if def.id.len() > 58 {
+                messages.push(
+                    "alert id must be at most 58 bytes so `alert.` plus the id fits the job-id shape (V31)"
+                        .to_string(),
+                );
+            }
+            if !alert_ids.insert(def.id.clone()) {
+                messages.push(format!("duplicate alert id `{}` (V31)", def.id));
+            }
+            if !alerted_jobs.insert(def.on_failure_of.clone()) {
+                messages.push(format!(
+                    "job `{}` already has an alert declaration; v1 allows at most one (V31)",
+                    def.on_failure_of
+                ));
             }
             if !declared.contains(def.on_failure_of.as_str()) {
                 messages.push(format!(
@@ -640,12 +750,16 @@ impl JobsSection {
             }
             if !channels.contains_key(&def.channel) {
                 messages.push(format!(
-                    "channel `{}` is not declared in superagent.channels (V16)",
+                    "channel `{}` is not declared in superagent.channels (V31)",
                     def.channel
                 ));
-            }
-            if !is_deliver_target(&def.target) {
-                messages.push("target must be a non-empty object or string (V16)".to_string());
+            } else if let Some(channel) = channels.get(&def.channel)
+                && let Err(detail) = validate_channel_target(channel, &def.target)
+            {
+                messages.push(format!(
+                    "target is invalid for channel `{}`: {detail} (V31)",
+                    def.channel
+                ));
             }
             if let Some(job) = jobs.get(&def.on_failure_of) {
                 let collides = job
@@ -706,6 +820,35 @@ mod tests {
         map
     }
 
+    fn typed_channels() -> BTreeMap<String, ChannelConfig> {
+        serde_yaml::from_str(
+            r#"
+imessage:
+  type: imessage
+  imessage:
+    bridge_url: http://127.0.0.1:7420
+    topics:
+      "+1": imessage
+lark:
+  type: lark
+  lark:
+    topics:
+      chat-1: lark
+wechat:
+  type: wechat
+  wechat:
+    credentials_file: ./wechat.json
+    topics:
+      user-1: wechat
+mail:
+  type: timer
+  timer:
+    interval_ms: 60000
+"#,
+        )
+        .expect("typed channel fixtures parse")
+    }
+
     fn resolve_with(
         yaml: &str,
         channels: &BTreeMap<String, ChannelConfig>,
@@ -745,6 +888,7 @@ jobs:
         verify:
           - check: delivery_receipt
             channel: imessage
+            target: { handle: owner }
 triggers:
   - job: digest
     expr: "0 9 * * *"
@@ -793,7 +937,7 @@ triggers:
     }
 
     #[test]
-    fn an_explicit_trigger_id_lowers_under_its_own_name() {
+    fn one_trigger_per_job_is_enforced_at_load() {
         let yaml = r#"
 jobs:
   - id: digest
@@ -809,17 +953,8 @@ triggers:
     job: digest
     expr: "0 18 * * *"
 "#;
-        let resolved = resolve(yaml).expect("two triggers resolve");
-        assert_eq!(
-            resolved
-                .schedules
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["digest", "digest-evening"]
-        );
-        let job = resolved.catalog.job("digest").unwrap();
-        assert_eq!(job.triggers, vec!["digest", "digest-evening"]);
+        let text = error_text(resolve(yaml));
+        assert!(text.contains("(V15)"), "{text}");
     }
 
     #[test]
@@ -1100,6 +1235,254 @@ jobs:
     retries: 3
 "#;
         assert!(serde_yaml::from_str::<JobsSection>(yaml).is_err());
+    }
+
+    #[test]
+    fn the_normative_limit_surface_parses_and_resolves() {
+        let yaml = r#"
+jobs:
+  - id: digest
+    limits:
+      deadline_ms: 900000
+      max_parallel: 1
+      prefer: [mac]
+      accept_unverified: []
+      defer_budget_ms: 300000
+      inline_max_bytes: 65536
+      max_plan_bytes: 1048576
+      max_prompt_bytes: 65536
+    plan:
+      - id: gather
+        prompt: gather
+        produces: {name: sources, media: text, max_bytes: 24576}
+      - id: compose
+        depends_on: [gather]
+        inputs: [{step: gather, name: sources}]
+        prompt: compose
+        verify:
+          - {check: artifact_within_cap, name: sources}
+      - id: send
+        action: deliver
+        depends_on: [compose]
+        channel: imessage
+        target: {handle: owner}
+        content: {text: done}
+        verify:
+          - {check: delivery_receipt, channel: imessage, target: {handle: owner}}
+triggers:
+  - id: digest-morning
+    job: digest
+    kind: cron
+    expr: "0 9 * * *"
+    overlap: skip
+    max_concurrent: 1
+alerts:
+  - id: digest-failed
+    on_failure_of: digest
+    channel: mail
+    target: {to: owner@example.com}
+"#;
+        let resolved = resolve(yaml).expect("the normative surface resolves");
+        let job = resolved.catalog.job("digest").expect("digest");
+        assert_eq!(job.plan.limits.max_plan_bytes, 1_048_576);
+        assert_eq!(job.plan.limits.max_prompt_bytes, 65_536);
+        assert_eq!(job.plan.limits.inline_max_bytes, 65_536);
+        assert_eq!(job.plan.limits.prefer, vec!["mac"]);
+        assert_eq!(resolved.schedules.len(), 1);
+        assert_eq!(resolved.schedules[0].max_concurrent, 1);
+        assert_eq!(resolved.catalog.alerts_for("digest").len(), 1);
+    }
+
+    #[test]
+    fn v15_requires_one_trigger_and_max_concurrency_one() {
+        let one = r#"
+jobs:
+  - id: digest
+    plan:
+      - id: fetch
+        prompt: gather
+triggers:
+  - id: digest-morning
+    job: digest
+    expr: "0 9 * * *"
+    overlap: skip
+    max_concurrent: 1
+"#;
+        assert!(resolve(one).is_ok());
+
+        let two = r#"
+jobs:
+  - id: digest
+    plan:
+      - id: fetch
+        prompt: gather
+triggers:
+  - id: digest-morning
+    job: digest
+    expr: "0 9 * * *"
+  - id: digest-evening
+    job: digest
+    expr: "0 18 * * *"
+"#;
+        let text = error_text(resolve(two));
+        assert!(text.contains("(V15)"), "{text}");
+
+        let parallel = one.replace("max_concurrent: 1", "max_concurrent: 2");
+        let text = error_text(resolve(&parallel));
+        assert!(text.contains("(V15)"), "{text}");
+
+        let queue = one.replace("overlap: skip", "overlap: queue");
+        let text = error_text(resolve(&queue));
+        assert!(text.contains("(V15)"), "{text}");
+    }
+
+    #[test]
+    fn v30_refuses_event_and_parent_triggers() {
+        for trigger in [
+            "    kind: event\n",
+            "    parent: {job: digest}\n",
+            "    event: {topic: news}\n",
+        ] {
+            let yaml = format!(
+                r#"
+jobs:
+  - id: digest
+    plan:
+      - id: fetch
+        prompt: gather
+triggers:
+  - id: digest-future
+    job: digest
+{trigger}"#
+            );
+            let text = error_text(resolve(&yaml));
+            assert!(text.contains("phase_unavailable"), "{text}");
+            assert!(text.contains("(V30)"), "{text}");
+        }
+
+        let report = r#"
+jobs:
+  - id: digest
+    plan:
+      - id: fetch
+        prompt: gather
+        verify:
+          - check: report_matches_schema
+            schema: {type: object}
+"#;
+        let error = serde_yaml::from_str::<JobsSection>(report)
+            .expect_err("the P2 schema check is not declarable in v1");
+        assert!(error.to_string().contains("phase_unavailable"), "{error}");
+    }
+
+    #[test]
+    fn publish_is_refused_as_an_action_at_config_load() {
+        let yaml = r#"
+jobs:
+  - id: self-dev
+    plan:
+      - id: patch
+        prompt: patch
+        produces: {name: patch}
+      - id: publish
+        action: publish
+        depends_on: [patch]
+        inputs: [{step: patch, name: patch}]
+        publish: {base: main}
+        effect: write
+        verify: [{check: publish_ok}]
+"#;
+        let text = error_text(resolve(yaml));
+        assert!(text.contains("invalid action"), "{text}");
+        assert!(text.contains("(V32)"), "{text}");
+    }
+
+    #[test]
+    fn v31_validates_alert_namespace_uniqueness_and_channel_target_shape() {
+        let typed = typed_channels();
+        let resolve_typed = |yaml: &str| resolve_with(yaml, &typed);
+
+        let valid = r#"
+jobs:
+  - id: digest
+    plan:
+      - id: fetch
+        prompt: gather
+alerts:
+  - id: digest-failed
+    on_failure_of: digest
+    channel: imessage
+    target: {handle: "+1"}
+"#;
+        assert!(resolve_typed(valid).is_ok());
+
+        let long_ok = valid.replace("digest-failed", &"x".repeat(58));
+        assert!(resolve_typed(&long_ok).is_ok());
+        let long_bad = valid.replace("digest-failed", &"x".repeat(59));
+        assert!(error_text(resolve_typed(&long_bad)).contains("(V31)"));
+
+        let invalid_id = valid.replace("digest-failed", "Digest_failed");
+        assert!(
+            error_text(resolve_typed(&invalid_id)).contains("id must match"),
+            "the alert id uses the job-id shape"
+        );
+
+        let reserved = valid
+            .replace("- id: digest\n", "- id: alert.digest\n")
+            .replace("on_failure_of: digest", "on_failure_of: alert.digest");
+        let text = error_text(resolve_typed(&reserved));
+        assert!(text.contains("reserved"), "{text}");
+        assert!(text.contains("(V31)"), "{text}");
+
+        let duplicate_id = r#"
+jobs:
+  - id: digest
+    plan: [{id: fetch, prompt: gather}]
+  - id: other
+    plan: [{id: fetch, prompt: gather}]
+alerts:
+  - {id: same, on_failure_of: digest, channel: imessage, target: {handle: "+1"}}
+  - {id: same, on_failure_of: other, channel: imessage, target: {handle: "+1"}}
+"#;
+        assert!(error_text(resolve_typed(duplicate_id)).contains("duplicate alert id"));
+
+        let two_for_one = r#"
+jobs:
+  - id: digest
+    plan: [{id: fetch, prompt: gather}]
+alerts:
+  - {id: first, on_failure_of: digest, channel: imessage, target: {handle: "+1"}}
+  - {id: second, on_failure_of: digest, channel: mail, target: {to: owner}}
+"#;
+        assert!(error_text(resolve_typed(two_for_one)).contains("at most one"));
+
+        let unknown_channel = r#"
+jobs:
+  - id: digest
+    plan: [{id: fetch, prompt: gather}]
+alerts:
+  - {id: failed, on_failure_of: digest, channel: ghost, target: {to: owner}}
+"#;
+        assert!(error_text(resolve_typed(unknown_channel)).contains("(V31)"));
+
+        for (channel, target) in [
+            ("imessage", "{user_id: user-1}"),
+            ("wechat", "{handle: \"+1\"}"),
+            ("lark", "{topic: ops}"),
+        ] {
+            let yaml = format!(
+                r#"
+jobs:
+  - id: digest
+    plan: [{{id: fetch, prompt: gather}}]
+alerts:
+  - {{id: failed, on_failure_of: digest, channel: {channel}, target: {target}}}
+"#
+            );
+            let text = error_text(resolve_typed(&yaml));
+            assert!(text.contains("target is invalid for channel"), "{text}");
+            assert!(text.contains("(V31)"), "{text}");
+        }
     }
 
     #[test]

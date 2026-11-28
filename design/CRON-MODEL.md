@@ -171,6 +171,12 @@ firing runs the plain session's default agent. The channel must be declared
 `superagent.subscriptions[*].channel` enforces. `{session}` targets are validated for shape; an
 id that does not exist yet is bootstrapped on first admit like any control-plane session.
 
+`{job: <job-id>}` is the runtime target produced when a `superagent.jobs.triggers` entry is lowered
+into the schedule vector ([JOB-MODEL](JOB-MODEL.md) §7.1); it is not a second declared cron target
+shape. Its firing admits that job run's first input row in the deterministic run session. The
+firing is not settled by the schedule event or by `session/ended`: its terminal state is the
+committed run verdict, and a cancelled job run is terminal.
+
 **The target is a delivery anchor, not a permanent sink.** A plain session ends `completed` after
 its turn (terminal, frozen), so a recurring schedule cannot keep delivering there. Resolution at
 dispatch time (§5.1): an empty or non-terminal target receives the firing (an idle session keeps its
@@ -396,7 +402,9 @@ session, with the firing proof as an additive, non-context payload key
 future `eligible_at` (ADR-060, DESIGN §2.3) — the model request is still the prompt alone. The
 session's harness is whatever
 `superagent.harness.dsh` configures ([ADR-010](decisions/ADR-010-dsh-session-mapping.md)); the
-engine runs the turn and the firing settles from the session's end (§9.1).
+engine runs the turn and an ordinary session firing settles from the session's end (§9.1). A job
+target instead admits the run input row and settles only from that run's committed
+`evidence/verdict{job, gate:"run"}`.
 
 **Worktree arm** (`worktree:`) is an **isolated external job** ([ADR-039](decisions/ADR-039-cron-worktree-firing-is-an-external-job.md)), not a session turn: the
 scheduler does not create a session or events for it. This is deliberate isolation (a scheduled
@@ -575,7 +583,7 @@ non-context `cron: {schedule_id, firing_id, fire_time, target}` key plus the ide
 | `schedule_id`, `fire_time` | logical identity; `fire_time` is UTC RFC 3339 whole seconds |
 | `session` | the session the firing was dispatched to: the configured target while it was live/empty, or the derived firing session when the target was frozen at dispatch (§3.2). Written before the admit, so a failed delivery names the session it tried. NULL on rows recorded before this column existed (v8) — those settle from the target's stream |
 | `admitted_at` | epoch ms the slot was recorded (it is the slot, not `now`: admission may be late) |
-| `state` | `admitted`\|`running`\|`succeeded`\|`failed`\|`skipped` (settled by the worktree arm's known outcome, by the resident-arm settlement sweep reading the recorded session's end, or `failed` by the resident sink's race refusal) |
+| `state` | `admitted`\|`running`\|`succeeded`\|`unverified`\|`failed`\|`cancelled`\|`skipped` (ordinary session firings are settled by the resident-arm sweep reading the recorded session's end; job-target firings are settled by the committed run verdict; worktree firings by their known outcome; or `failed` by the resident sink's race refusal) |
 | `skip_reason` | machine token for `skipped`: `skipped_overlap`, `superseded`, `outside_coalesce`, `policy_skip`, `queue_starved`, `disk_cap`, … |
 | `worktree_path` | the per-firing tree, when one was created (§6.2) |
 | `finished_at` | epoch ms at settlement; absent while `admitted`/`running` |
@@ -583,13 +591,18 @@ non-context `cron: {schedule_id, firing_id, fire_time, target}` key plus the ide
 
 **The resident-arm settlement rule.** The sweep reads the session recorded on the firing (§9.1):
 the configured target for a live-target firing, or the derived firing session for a succession.
-It settles from the **first** `session/ended` after the firing's `input/admitted` whose reason is
-not `awaiting_input`. `awaiting_input` is the resumable end — the answer resumes the same turn — so
-the scan continues across it; the first *settling* end wins, and a later episode's end (a retry's
-new input) is never attributed to the firing. Two firings consumed in one drain batch share that
-batch's end (one turn served both) and both settle from it. `finished_at` is the settlement
-observation: a refusal records the tick instant, the stranded heal records the freeze instant
-floored at `admitted_at` (never a negative duration).
+For an ordinary session firing it settles from the **first** `session/ended` after the firing's
+`input/admitted` whose reason is not `awaiting_input`. `awaiting_input` is the resumable end — the
+answer resumes the same turn — so the scan continues across it; the first *settling* end wins, and
+a later episode's end (a retry's new input) is never attributed to the firing. Two firings consumed
+in one drain batch share that batch's end (one turn served both) and both settle from it.
+
+For a job-target firing, settlement is the run verdict: the firing row takes the run verdict's
+`outcome` (`succeeded`, `unverified`, `failed`, or `cancelled`) and its `finished_at` from that
+committed verdict. `session/ended` and the schedule event are never settlement evidence for a job
+run, and a cancelled run is terminal with no resume or rerun. `finished_at` for a refusal records
+the tick instant; the stranded heal records the freeze instant floored at `admitted_at` (never a
+negative duration).
 
 Records without a `session` (pre-v8 rows) fall back to the target's stream. A row that was never
 consumed and whose target is frozen — or whose recorded session exists but never took the row (a
@@ -727,7 +740,7 @@ document does not trigger that path.
 | Integration (sandbox) | prompt calling a non-allowlisted `exec` | designed, not v1 (§8.2) |
 | Integration (coexist) | cron + timer + watchdog in one config | all three fire; a cron target naming the watchdog session rejected at load |
 | Unit (overlap) | busy target session, `overlap: skip` | one `skipped_overlap` row with its reason; the payload never reaches the session (`a_busy_target_session_skips_the_slot_instead_of_queueing_it`) |
-| Unit (settlement) | resident firing, target session ends `completed` | the firing row settles `succeeded` with `finished_at` (`the_settlement_sweep_records_the_target_sessions_end`) |
+| Unit (settlement) | ordinary resident firing ends `completed`; job-target firing commits a run verdict | the ordinary firing row settles from the session end; the job firing row settles to the run verdict outcome with `finished_at`, never from `session/ended` |
 | Unit (settlement ends) | `awaiting_input` then `completed`; `failed` then a later episode's `completed` | the first **settling** end after the admission decides (the resumable end is skipped); a later episode's end is never attributed to the firing (`the_settlement_sweep_skips_the_resumable_awaiting_input_end`, `the_settlement_sweep_stops_at_the_first_settling_end`) |
 | Unit (resolution) | empty / live target; terminal target (`completed`/`cancelled`/`rotated`) | empty/live resolves to the target; terminal resolves to `uuid5(target, "kian:cron:firing:<firing_id>")` (golden-pinned frozen name), deterministic across calls and distinct per slot; a frozen target's leftover rows are still not "open work" (`firing_session_is_deterministic_and_distinct_per_slot`, `resolve_keeps_a_live_target_and_moves_a_terminal_one`, `a_frozen_target_runs_in_its_firing_session_instead_of_skipping`) |
 | Unit (admit guard) | session becomes busy between resolution and admit | `deliver` refuses `skipped_overlap` instead of queueing a duplicate; the slot's recorded session is kept as "the session it tried" (`a_session_busy_at_the_admit_guard_is_refused`) |

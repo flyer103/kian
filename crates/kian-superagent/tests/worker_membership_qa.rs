@@ -618,6 +618,12 @@ async fn qa_list_workers_bound_fields_follow_live_sessions() {
                 EventKind::ThreadStarted,
                 json!({"thread_id": thread_uuid, "worker": worker_uuid, EXEC_WORKER_KEY: "qa-live"}),
             ),
+            ev(
+                worker_sid,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "qa occupy"}),
+            ),
         ]),
     );
 
@@ -644,6 +650,12 @@ async fn qa_list_workers_bound_fields_follow_live_sessions() {
             ev(
                 worker_sid,
                 2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "qa occupy"}),
+            ),
+            ev(
+                worker_sid,
+                3,
                 EventKind::SessionEnded { reason: EndReason::Completed },
                 Value::Null,
             ),
@@ -767,6 +779,12 @@ async fn qa_busy_offline_worker_still_refuses() {
                 1,
                 EventKind::ThreadStarted,
                 json!({"thread_id": owner_thread, "worker": owner_session, EXEC_WORKER_KEY: "qa-busy"}),
+            ),
+            ev(
+                worker_sid,
+                2,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "qa occupy"}),
             ),
         ]),
     );

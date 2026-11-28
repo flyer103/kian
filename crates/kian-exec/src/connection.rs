@@ -291,7 +291,27 @@ impl ConnectionManager {
         cmd: ExecCommand,
     ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
         match self
-            .dispatch_frame(id, ServerFrame::Command { id, cmd })
+            .dispatch_frame(id, ServerFrame::Command { id, cmd }, None)
+            .await?
+        {
+            DispatchReply::Exec(outcome) => Ok(outcome),
+            DispatchReply::Fs(_) => Err(ConnectionError::Protocol(
+                "fs result on an exec command id".into(),
+            )),
+        }
+    }
+
+    /// [`ConnectionManager::dispatch_with_id`] plus a one-shot signal after
+    /// the command frame was accepted by the live writer. The queue uses it
+    /// to commit a dispatch attempt only after the frame actually left.
+    pub async fn dispatch_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: ExecCommand,
+        written: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::Command { id, cmd }, Some(written))
             .await?
         {
             DispatchReply::Exec(outcome) => Ok(outcome),
@@ -310,7 +330,26 @@ impl ConnectionManager {
         cmd: FsCommand,
     ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
         match self
-            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd })
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd }, None)
+            .await?
+        {
+            DispatchReply::Fs(outcome) => Ok(outcome),
+            DispatchReply::Exec(_) => Err(ConnectionError::Protocol(
+                "exec result on an fs command id".into(),
+            )),
+        }
+    }
+
+    /// Filesystem-command twin of
+    /// [`ConnectionManager::dispatch_with_id_after_write`].
+    pub async fn dispatch_fs_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+        written: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd }, Some(written))
             .await?
         {
             DispatchReply::Fs(outcome) => Ok(outcome),
@@ -322,7 +361,12 @@ impl ConnectionManager {
 
     /// Park the correlation slot, write one frame, await its correlated
     /// reply (or the transport's honest failure).
-    async fn dispatch_frame(&self, id: CommandId, frame: ServerFrame) -> DispatchOutcome {
+    async fn dispatch_frame(
+        &self,
+        id: CommandId,
+        frame: ServerFrame,
+        written: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> DispatchOutcome {
         let handle = self.live_conn().await?;
         // Hold a permit for the whole flight: caps our in-flight count at
         // the endpoint's announced concurrency.
@@ -347,6 +391,9 @@ impl ConnectionManager {
                 .status
                 .send_modify(|status| status.connected = false);
             return Err(ConnectionError::NotWritten);
+        }
+        if let Some(written) = written {
+            let _ = written.send(());
         }
         // The sender is resolved with the correlated result, or dropped
         // (mapped to a transport error) when the connection dies.

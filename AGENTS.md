@@ -124,7 +124,7 @@ when the owner asks. Negative results commit documentation only — never broken
 - `design/DESIGN.md` — the blueprint (HOW). Any crate/seam/invariant change updates it in the same
   change.
 - `design/EVENT-MODEL.md` — the normative event contract (source of truth): envelope, the complete
-  23-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
+  24-kind catalog, payload schemas and the event-change protocol. **Any Event change starts here**
   and updates this file first; code/tests must be reconciled in the same change.
 - `design/API-CONTRACT.md` — the normative external API contract (source of truth): endpoints,
   JSON-RPC methods/params/results, error codes, SSE frames, metrics keys, the webhook status matrix
@@ -161,7 +161,7 @@ when the owner asks. Negative results commit documentation only — never broken
   lifecycle, binding/dispatch, catalog/discovery, security boundary, version policy and
   degradation. **Any worker-membership semantic change starts here**; wire shapes stay in
   API-CONTRACT, event kinds in EVENT-MODEL, placement in DESIGN.
-- `design/JOB-MODEL.md` — the normative declarative-plan contract (source of truth, P0/P1 landed): the
+- `design/JOB-MODEL.md` — the normative declarative-plan contract (source of truth): the
   four axes (trigger / plan / placement / evidence) and their isolation rule, a run as an ordinary
   session whose driver is a stateless conductor that parks, the plan frozen at admit with its digest,
   the identity derivations, the `jobs:` declaration and its validation, readiness / dispatch /
@@ -174,8 +174,9 @@ when the owner asks. Negative results commit documentation only — never broken
   phase S1 landed, S2a landed, S2b landed, S3 landed): a self-dev run as an ordinary job run over
   a verified evidence pack, the proposal plan and its patch artifact, the `patch_paths_allowed` denial surface
   frozen in the plan, the S1 propose / S2a publish-local / S2b publish-remote / S3 land authority
-  ladder, write isolation by derivation, the `consecutive_failures` breaker, the publish step's fixed
-  sequence and receipt, the digest audit chain and the additive surface A11–A21. **Any
+  ladder, write isolation by derivation, the `consecutive_failures` breaker, the publish tool's
+  step-by-step contract and its child-stream receipt, the frozen conductor publish path retained
+  for old plans, the digest audit chain and the additive surface A11–A26. **Any
   self-evolution semantic change starts here**; job/plan semantics stay in JOB-MODEL, the pack
   format in SPEC, event kinds in EVENT-MODEL and wire shapes in API-CONTRACT.
 - `design/PLUGIN-SPEC.md` — the normative hook-plugin contract (source of truth): the two-tier
@@ -260,4 +261,3 @@ conflict on it.
   logs/runbooks, and the SPEC / overview status tables.
 - **Published notes are append-only.** A later change gets a new release; a published body is not
   rewritten to absorb it.
-

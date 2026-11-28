@@ -167,6 +167,22 @@ async fn seed_bound_thread(
         json!({}),
     )
     .await;
+    // A live thread is a started child: the admitted task row is the
+    // fact liveness keys on, creation alone is a reservation.
+    let seq = store
+        .head(worker_session)
+        .await
+        .expect("worker head")
+        .next_seq;
+    append(
+        store,
+        worker_session,
+        seq,
+        ts,
+        EventKind::InputAdmitted,
+        json!({"content": format!("job-{worker}")}),
+    )
+    .await;
     if let Some(reason) = ended {
         let seq = store
             .head(worker_session)

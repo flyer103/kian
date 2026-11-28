@@ -330,7 +330,8 @@ it now: one atomic claim + `session/ended{cancelled}` batch preserves the earlie
 frees the slot, and makes the thread terminal (it can never resume into the slot a newer thread
 holds). The same close runs automatically when the thread has been idle-ended for
 `workers.release_after_ms` (default five minutes, `0` disables). A running thread, a thread with
-eligible input, or a worker still owing a queued command refuses the release honestly
+any unconsumed input row (eligible or future-ineligible), or a worker still owing a queued command
+refuses the release honestly
 ([ADR-035](../design/decisions/ADR-035-worker-release-and-idle-reclaim.md)).
 
 ```bash
@@ -791,6 +792,12 @@ target/debug/kian job run    digest --config kian.yaml      # a manual slot (nev
 target/debug/kian job cancel digest@manual:01JBQ4Z7Q9K3YV6N8M2X0T5R4E
 ```
 
+`kian job status --json` emits the projection fields defined by [JOB-MODEL §15](../design/JOB-MODEL.md#15-status-and-the-cli):
+run `status`, `reason`, `plan_source`, `plan_author` and `status_basis`, plus each step's
+`next_due_ms` and the settled attempt's `gate` and `checks`. Legacy A1 rows omit the provenance
+fields instead of fabricating them; `status_basis: "stream_only"` marks a read without the runtime
+liveness input.
+
 What the contract guarantees: a run's plan is frozen at admit, so editing `jobs:` never changes a
 run in flight; a retry is a new attempt on a fresh child (never a rebind); an unwritable effect is
 refused rather than repeated; a step that is not proven done makes the run `unverified`, never
@@ -800,7 +807,7 @@ and `kian job status` all read the same fact.
 Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
 [ADR-052](../design/decisions/ADR-052-job-model.md).
 
-## Self-dev proposals (propose, publish, review)
+## Self-dev proposals (propose, review)
 
 A self-dev run turns one verified evidence pack into a reviewable patch proposal. It is an
 ordinary job run: the pack is frozen into the run's `job.selfdev` key at admit, the patch is a
@@ -823,34 +830,40 @@ The plan declares the denial surface, and it is frozen with the plan digest, so 
 widen it:
 
 ```yaml
-jobs:
+superagent:
   jobs:
-    - id: self-dev
-      limits: { deadline_ms: 3600000, max_parallel: 1, consecutive_failures: 3 }
-      plan:
-        steps:
+    jobs:
+      - id: self-dev
+        limits: { deadline_ms: 3600000, max_parallel: 1, consecutive_failures: 3 }
+        plan:
           - id: patch
             action: agent
             requires: [repo.kian]
+            prompt: |
+              Read the evidence pack and the repository, then reply with a unified diff.
+              The diff is the proposal; no prose after it.
             produces: { name: patch, media: text, max_bytes: 262144 }
             verify:
               - check: artifact_within_cap
                 name: patch
               - check: patch_paths_allowed
                 artifact: patch
-                allow: ["crates/**", "docs/**"]
-                deny: ["design/decisions/**", "AGENTS.md", "scripts/**"]
-            prompt: |
-              Read the evidence pack and the repository, then reply with a unified diff.
-          - id: publish
-            action: publish
+                allow: ["crates/**", "docs/**", "design/**", "README.md"]
+                deny: ["design/decisions/**", "kian.yaml", "scripts/**", "AGENTS.md"]
+          - id: deliver
+            action: deliver
             depends_on: [patch]
-            inputs: [{ step: patch, name: patch }]
-            publish: { base: main, gates: true, push: true, pull_request: true }
-            effect: write
+            optional: true
+            on_failure: continue
+            channel: imessage
+            target: { handle: "+8613800000000" }
+            content:
+              text: |
+                A self-dev proposal is ready in the kian stream; read it with kian job status.
             verify:
-              - check: publish_ok
-          # the canonical plan also declares a deliver step that posts the proposal summary
+              - check: delivery_receipt
+                channel: imessage
+                target: { handle: "+8613800000000" }
 ```
 
 `patch_paths_allowed` parses the diff the step produced: every path must be repository-relative
@@ -863,37 +876,72 @@ The breaker refuses a run when the last `consecutive_failures` run verdicts of t
 `failed`: nothing is written and the command exits 2 with `selfdev_circuit_open`. `--force` admits
 once and records `circuit_overridden: true` inside `job.selfdev`.
 
-The `publish` step turns the artifact into a branch on the code host, and the operator's
-configuration decides where:
+Publishing is a tool call, not a job action. A plan that publishes adds one agent step whose
+evidence is `publish_ok` (JOB-MODEL V33): the step consumes exactly one input, the patch artifact,
+and calls the tool once with no arguments, and the tool derives the run, the step, the base commit,
+the branch, the worktree and the patch bytes from the committed streams. Add it after `patch`:
+
+```yaml
+          - id: publish
+            action: agent
+            depends_on: [patch]
+            inputs: [{ step: patch, name: patch }]
+            prompt: |
+              Call the publish tool exactly once, with no arguments. If it refuses, report the
+              refusal verbatim; do not work around it.
+            timeout_ms: 3900000
+            retries: 0
+            effect: write
+            verify:
+              - check: publish_ok
+```
+
+The step names no capability and no credential: the deployment mounts the tool, and the operator's
+`selfdev.publish` block is the only authority over where a publish writes. A new plan still cannot
+declare `action: publish` (JOB-MODEL V32); that shape exists only to replay a plan frozen before
+the tool landed ([ADR-084](../design/decisions/ADR-084-publishing-is-a-tool-not-a-job-action.md)).
+
+The operator configuration is the whole authority surface: `gates` decides whether the scoped gate
+must pass, `push` and `pull_request` decide whether the tool may write to the remote, and the
+credential is read from the named environment variable only when a push is requested.
 
 ```yaml
 selfdev:
   publish:
-    repo: /Users/you/src/kian        # the checkout the worktree is derived from
+    repo: /Users/you/src/kian        # the checkout the derived worktree is built from
     remote: origin                   # the remote the branch is pushed to once
     base: main                       # the branch the pull request targets
     gate: ./scripts/selfcheck.sh     # the one command that judges the proposal
+    gates: true                      # run the gate; refuse the publish when it fails
+    push: false                      # S2a: local commit only
+    pull_request: false              # requires push; opens one PR with the audit chain
     token_env: KIAN_PUBLISH_TOKEN    # read at publish time, never written down
     author: { name: kian-bot, email: kian-bot@example.com }
     target_dir: /Users/you/.cache/kian-publish-target   # optional: CARGO_TARGET_DIR for the gate
 ```
 
-`gh` must be on `PATH` and authenticated. The token named by `token_env` is exported only into the
-`git push` and `gh pr create` child processes — every other child runs with the variable removed —
-and never reaches an event, a log or a plan.
+`push: true` requires `token_env`; `pull_request: true` requires `push: true`. `gh` must be on
+`PATH` and authenticated for a pull request. The token is exported only into the `git push` and
+`gh pr create` child processes — every other child runs with the variable removed — and never
+reaches an event, a log or a plan argument.
 
-The conductor derives `branch = selfdev/<run_session>` and
-`worktree = <repo>/.agents/worktrees/selfdev-<run_session>`, re-reads the patch artifact from the
-producer's stream and re-verifies its digest, creates the worktree at the frozen base commit, applies
-the patch, commits it with `Kian-Run` / `Kian-Plan-Digest` / `Kian-Patch-Sha256` / `Kian-Pack`
-trailers, and runs the gate inside the worktree. A `push: true` publish then pushes the branch once,
-never forced, and a `pull_request: true` publish opens one pull request whose body carries the audit
-chain; the receipt records `push {remote, ref}` and `pull_request {base, head, url}`. A publish is
-never retried (`retries: 0`): a worktree that already exists, or an attempt whose receipt was never
-written, settles `needs_operator` and leaves the worktree for a human; a patch that does not apply
-fails the step with git's own stderr; a gate that exits non-zero fails the step with its exit code
-in the receipt and nothing is pushed. `kian job status <run>` prints the branch, the commit, the
-gate's exit code, `pushed` and the pull request URL.
+For the tool path the sequence is the same as the frozen conductor's, with the tool doing the
+writing: it re-reads the patch artifact from the producer's stream and re-verifies its digest,
+derives `branch = selfdev/<run_session>` and
+`worktree = <repo>/.agents/worktrees/selfdev-<run_session>`, creates the worktree at the frozen
+base commit, applies the patch, commits it with `Kian-Run` / `Kian-Plan-Digest` /
+`Kian-Patch-Sha256` / `Kian-Pack` trailers, and runs the gate inside the worktree. With
+`push: true` it pushes the branch once, never forced; with `pull_request: true` it opens one pull
+request whose body carries the audit chain, and the receipt records `push {remote, ref}` and
+`pull_request {base, head, url}`. A publish is never retried (`retries: 0`): a worktree that
+already exists, or an attempt whose receipt was never written, settles `needs_operator` and leaves
+the worktree for a human; a patch that does not apply fails the step with git's own stderr; a gate
+that exits non-zero fails the step with its exit code in the receipt and nothing is pushed.
+The child stream's receipt carries the branch, the commit, the gate's exit code, `push` and the
+pull request URL; the step's `publish_ok` check judges it, `kian job status` shows that verdict, and
+`kian self verify` recomputes the chain from the same receipt. A plan frozen before the tool landed
+still replays the conductor copy, and `kian self verify` reads whichever receipt its run produced.
+
 The gate inherits `CARGO_TARGET_DIR` from `target_dir`; point it at a directory no other working tree
 builds into, or each tree's build replaces the other's artifacts. A branch already on the remote
 refuses the push instead of being overwritten, and a push that landed while the pull request failed
@@ -920,8 +968,10 @@ a newer `main`, or that anyone reviewed it — landing stays with the owner.
 
 Semantics: [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); decisions:
 [ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
-[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md),
-[ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md).
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md) (superseded for new plans),
+[ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md),
+[ADR-084](../design/decisions/ADR-084-publishing-is-a-tool-not-a-job-action.md),
+[ADR-085](../design/decisions/ADR-085-the-publish-tool.md).
 
 ## Model profiles
 
@@ -1499,4 +1549,3 @@ of the prefix, with tools answering from the recorded `tool/result` rows. The ve
 `incomplete` (the recording did not cover a call the run made — the notes say which); all three
 exit 0. `--from-seq <n>` picks an earlier `drain/claimed` boundary; `--keep-fork` keeps the temp
 store for inspection.
-

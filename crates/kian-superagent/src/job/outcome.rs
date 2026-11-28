@@ -63,12 +63,13 @@ impl AttemptOutcome {
     #[must_use]
     pub fn is_success(self, accepted_unverified: bool) -> bool {
         match self {
-            Self::Succeeded | Self::Skipped => true,
+            Self::Succeeded => true,
             Self::Unverified => accepted_unverified,
             Self::InvalidOutput
             | Self::TimedOut
             | Self::Interrupted
             | Self::NeedsOperator
+            | Self::Skipped
             | Self::Failed => false,
         }
     }
@@ -243,8 +244,8 @@ impl StepFacts {
         self.in_flight.is_none() && self.outcome().is_some()
     }
 
-    /// The workers already tried and not succeeded — a retry must not
-    /// repeat them (§9.2 repeat-exclusion).
+    /// The workers already tried and not succeeded. They remain admissible;
+    /// placement ranks them after untried workers (§9.2).
     #[must_use]
     pub fn exhausted_workers(&self) -> Vec<&str> {
         self.settled
@@ -557,7 +558,11 @@ pub fn run_outcome(plan: &JobPlan, facts: &RunFacts<'_>, cancelled: bool) -> Run
                 }
             }
             Some(AttemptOutcome::Succeeded) => {}
-            Some(AttemptOutcome::Skipped) => {}
+            Some(AttemptOutcome::Skipped) => {
+                if !step.optional {
+                    return RunOutcome::Failed;
+                }
+            }
             Some(AttemptOutcome::Unverified) => {
                 if accepted || step.optional {
                     unverified = true;
@@ -565,11 +570,11 @@ pub fn run_outcome(plan: &JobPlan, facts: &RunFacts<'_>, cancelled: bool) -> Run
                     return RunOutcome::Failed;
                 }
             }
+            Some(AttemptOutcome::NeedsOperator) => return RunOutcome::Failed,
             Some(_) => {
                 if !step.optional {
                     return RunOutcome::Failed;
                 }
-                unverified = true;
             }
         }
         if known.is_some_and(|known| known.in_flight.is_some()) {
@@ -681,7 +686,7 @@ mod tests {
     #[test]
     fn unverified_satisfies_a_dependency_only_when_accepted() {
         assert!(AttemptOutcome::Succeeded.is_success(false));
-        assert!(AttemptOutcome::Skipped.is_success(false));
+        assert!(!AttemptOutcome::Skipped.is_success(false));
         assert!(!AttemptOutcome::Unverified.is_success(false));
         assert!(AttemptOutcome::Unverified.is_success(true));
         assert!(!AttemptOutcome::Failed.is_success(true));
@@ -1052,8 +1057,38 @@ mod tests {
         };
         assert_eq!(
             run_outcome(&optional_plan, &facts, false),
-            RunOutcome::Unverified
+            RunOutcome::Succeeded
         );
+    }
+
+    #[test]
+    fn skipped_is_a_step_state_not_a_successful_dependency() {
+        let plan = plan();
+        let fetch = settled("fetch", 1, AttemptOutcome::Skipped);
+        let summarise = settled("summarise", 1, AttemptOutcome::Succeeded);
+        let facts = RunFacts {
+            steps: &[fetch, summarise],
+            ..RunFacts::default()
+        };
+        assert_eq!(run_outcome(&plan, &facts, false), RunOutcome::Failed);
+    }
+
+    #[test]
+    fn needs_operator_is_fatal_even_when_its_step_is_optional() {
+        let plan = JobPlan {
+            id: "digest".into(),
+            limits: Default::default(),
+            steps: vec![step(
+                json!({"id": "fetch", "action": "agent", "prompt": "a", "optional": true,
+                        "on_failure": "continue",
+                        "verify": [{"check": "final_message_present"}]}),
+            )],
+        };
+        let facts = RunFacts {
+            steps: &[settled("fetch", 1, AttemptOutcome::NeedsOperator)],
+            ..RunFacts::default()
+        };
+        assert_eq!(run_outcome(&plan, &facts, false), RunOutcome::Failed);
     }
 
     #[test]

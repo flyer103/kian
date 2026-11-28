@@ -36,7 +36,7 @@ pub use evidence::{
 pub use kian_core::seams::{LoopDriver, LoopOutcome};
 pub use react::{
     BudgetScope, CLASS_EMPTY_RESPONSE, DEFAULT_MAX_IMAGES_PER_TURN, DEFAULT_MAX_ITERATIONS,
-    DEFAULT_MAX_VISION_BYTES_PER_TURN, LoopError, ReActConfig, ReActLoop, VisionBudget,
+    DEFAULT_MAX_VISION_BYTES_PER_TURN, LoopError, ReActConfig, ReActLoop, ToolScope, VisionBudget,
     to_chat_message,
 };
 pub use tools::{

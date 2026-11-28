@@ -756,8 +756,8 @@ semantics are [design/CRON-MODEL.md](../design/CRON-MODEL.md) §3.1/§3.3/§6.1;
 | P4 | kian-cli, kian-orchestrator | the pure off-peak planner over `pricing.peak_windows`/holidays (bounded by `defer.max_wait_ms`, immediate when already off peak or the bound is exceeded); `Engine::admit_at` over the existing `eligible_at` hard gate; the serve due-wake sweep; the optional `defer:` config section with boot validation; `defer: off_peak` on cron resident schedules; additive `defer` on `submit`/`queue` and the non-context payload decision | landed |
 
 Non-goals recorded with the phase: no second scheduler or per-row timer, no deferral of
-interactive inputs or steering, no job deferral (the job runtime is not in this tree), no
-`overlap`/queue policy change, no cost guarantee from deferring.
+interactive inputs or steering, no job deferral, no `overlap`/queue policy change, no cost
+guarantee from deferring.
 
 ### Client-side media tools (ADR-061, P5a landed)
 
@@ -1066,13 +1066,14 @@ proposing. No new session state, event kind, table or daemon: the marking travel
 key on the admitted row. The normative contract is
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision records are
 [ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
-[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md) and
+[ADR-084](../design/decisions/ADR-084-publishing-is-a-tool-not-a-job-action.md),
+[ADR-085](../design/decisions/ADR-085-the-publish-tool.md) and
 [ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md).
 
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
-| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
+| S2a publish-local | a publish step is an agent step declaring `publish_ok`; its child calls the mounted publish tool, which prepares one derived worktree and branch at the frozen base, applies and commits the patch artifact with the audit trailers, and re-runs the configured scoped gates inside the worktree — no credential | landed |
 | S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | landed |
 | S3 land | the owner merges the reviewed pull request; `kian self verify <run>` recomputes the audit chain (read-only) and `--merged` reports the merge | landed |
 
@@ -1086,26 +1087,30 @@ An agent step produces its artifact from the child's own stream: the final answe
 ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §12.1). A child that never reaches a final answer
 produces no artifact, and the step fails its artifact check instead of passing it.
 
-Publishing is a conductor action, not a general command: the `publish` step's sequence is fixed
-(worktree, apply, commit, gates, one non-forced push and one pull request), every step
-leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
-command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
+Publishing is a tool call, not a job action: a publishing step is an ordinary agent step that
+declares `publish_ok`, and its child calls a publish tool mounted only for a self-dev job child. The
+tool's sequence is fixed (worktree, apply, commit, gates, one non-forced push and one pull request),
+the receipt is a `tool/call` / `tool/result` pair on the child's own stream, and a plan can ask for a
+publish but never for an arbitrary command. The plan names neither the credential nor the gate: the
+tool derives both from committed events and the operator's configuration
+([design/JOB-MODEL.md](../design/JOB-MODEL.md) §7.2 and §11.2,
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
 
-S2a lands that sequence with no credential and no network write: the receipt carries the branch,
-the commit and the gate's exit code, `kian job status <run>` renders it, an operator whose
-configuration has no `selfdev.publish` section sees the step fail honestly with
-`publish is not configured` before anything is written, and the gate is the operator's
-configuration — a plan cannot choose the evidence that judges its own proposal. A worktree already
-on disk, or an intent whose receipt was never written, settles the attempt `needs_operator`: the
-worktree stays as the evidence and the attempt is never retried.
+S2a lands that sequence with no credential and no network write: the child receipt carries the
+branch, the commit and the gate's exit code; the step's `publish_ok` check judges it and
+`kian self verify` recomputes the chain from it. An operator whose configuration has no
+`selfdev.publish` section never mounts the tool, so the step fails its check instead of writing
+anything, and the gate is the operator's configuration — a plan cannot choose the evidence that
+judges its own proposal. A worktree already on disk, or an intent whose receipt was never written,
+settles the attempt `needs_operator`: the worktree stays as the evidence and the attempt is never
+retried.
 
 S2b carries that receipt to the code host: one non-forced push of `selfdev/<run_session>` and one
 pull request whose body carries the audit chain, with the credential read from
-`selfdev.publish.token_env` at publish time and exported only into those two child processes. A
+`selfdev.publish.token_env` at publish time and exported only into the tool's git processes. A
 push that landed while its pull request failed settles `needs_operator` with the branch on the
-remote, and `kian job status <run>` renders `pushed` and the pull request URL alongside the
-commit.
+remote; the child receipt and `kian self verify` carry `pushed` and the pull request URL alongside
+the commit.
 
 S3 keeps the merge with the owner: no `land` verb, no auto-merge, no credential. `kian self verify
 <run>` reads the run streams and the local repository and recomputes the chain — the frozen plan,
