@@ -67,6 +67,8 @@ const USAGE: &str = "usage:
                                          one opt-in retention pass (write → verify → commit per terminal session)
   kian archive verify <uuid> [--db <sqlite>] [--config <path>] [--json]
                                          verify a session's archive package (hashes, replay, counts)
+  kian archive receipts [--db <sqlite>] [--config <path>] [--json]
+                                         rebuild the channel receipt ledger from the packages
   kian wake-now <uuid> [--url <base>] [--config <path>] [--json]
                                          operator wake via the running server
   kian pending <uuid> [--url <base>] [--config <path>] [--json]
@@ -1017,12 +1019,13 @@ fn session(args: &[String]) -> ExitCode {
     }
 }
 
-/// `kian archive run|verify [flags]` — the retention commands
+/// `kian archive run|verify|receipts [flags]` — the retention commands
 /// (READ-MODEL §7, P2b). `run` is one opt-in retention pass; `verify`
-/// re-checks a session's package.
+/// re-checks a session's package; `receipts` rebuilds the replay ledger
+/// the packages are the truth of.
 fn archive(args: &[String]) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("kian: `archive` requires a subcommand (run, verify)\n{USAGE}");
+        eprintln!("kian: `archive` requires a subcommand (run, verify, receipts)\n{USAGE}");
         return ExitCode::from(2);
     };
     let usage_for = format!("kian archive {sub}");
@@ -1053,6 +1056,14 @@ fn archive(args: &[String]) -> ExitCode {
                 "archive verify",
             )
         }
+        "receipts" => run_command(
+            kian_cli::archive::run_archive_receipts(
+                &parsed.config,
+                parsed.db.as_deref(),
+                parsed.json,
+            ),
+            "archive receipts",
+        ),
         other => {
             eprintln!("kian: unknown archive subcommand `{other}`\n{USAGE}");
             ExitCode::from(2)

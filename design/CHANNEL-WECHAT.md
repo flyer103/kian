@@ -351,7 +351,9 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
   `message_id` and the admission key is `chan:<channel>:<event_id>`, so an admission is idempotent
   across polls, restarts and resident incarnations — a replay produces `deduplicated` admissions and
   zero duplicate rows; on the Router route the guard additionally spans sessions, refusing a key
-  that is already consumed anywhere (ADR-081).
+  that is already consumed anywhere (ADR-081), and the archive commit materializes those consumed
+  keys into the `channel_receipts` ledger before retention deletes the rows, so archiving cannot
+  reopen the replay (ADR-082).
 - **Bounded in-memory ring** (4096 ids) in front of the durable guard: a repeated id inside the
   window is dropped without a fan-out or a second admission attempt. The ring is a cache, not
   state; losing it on restart costs nothing (the durable guard still holds).

@@ -612,6 +612,86 @@ pub async fn run_archive_verify(
     ))
 }
 
+/// \`kian archive receipts [--db] [--config] [--json]\`: rebuild the
+/// channel receipt ledger from the archived packages. The ledger is a
+/// projection — the packages hold the consumed channel rows it is derived
+/// from — so this command is how a store rebuilt from packages, or a
+/// ledger damaged by a torn archive, gets its replay guard back.
+pub async fn run_archive_receipts(
+    config_path: &Path,
+    db: Option<&Path>,
+    json: bool,
+) -> CmdResult<String> {
+    let db = resolve_db(db, config_path)?;
+    let store = EventStore::open(&db)
+        .await
+        .map_err(|e| format!("open {}: {e}", db.display()))?;
+    let markers = store
+        .archived_session_list()
+        .await
+        .map_err(|e| format!("marker list: {e}"))?;
+    let mut rebuilt = Vec::new();
+    let mut failed = Vec::new();
+    let mut total = 0u64;
+    for marker in &markers {
+        let dir = PathBuf::from(&marker.package_path);
+        let outcome = match verify_package(&dir, Some(marker.session)).await {
+            Ok(pkg) => store
+                .channel_receipts_insert(&pkg.inputs, marker.archived_at)
+                .await
+                .map_err(|e| e.to_string())
+                .map(|inserted| (pkg.inputs.len(), inserted)),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok((inputs, inserted)) => {
+                total += inserted;
+                rebuilt.push(json!({
+                    "session": marker.session.0.to_string(),
+                    "package": marker.package_path,
+                    "inputs": inputs,
+                    "receipts": inserted,
+                }));
+            }
+            Err(e) => failed.push(json!({
+                "session": marker.session.0.to_string(),
+                "package": marker.package_path,
+                "error": e,
+            })),
+        }
+    }
+    store.close().await;
+
+    let report = json!({
+        "packages": markers.len(),
+        "rebuilt": rebuilt,
+        "failed": failed,
+        "receipts_written": total,
+    });
+    if json {
+        return serde_json::to_string_pretty(&report).map_err(|e| e.to_string());
+    }
+    let mut out = format!(
+        "receipt rebuild: {} package(s), {} receipt(s) written, {} failed\n",
+        markers.len(),
+        total,
+        failed.len()
+    );
+    for r in &rebuilt {
+        out.push_str(&format!(
+            "  {} ({} inputs, {} receipts)\n",
+            r["session"], r["inputs"], r["receipts"]
+        ));
+    }
+    for f in &failed {
+        out.push_str(&format!("  FAILED {}: {}\n", f["session"], f["error"]));
+    }
+    if !failed.is_empty() {
+        return Err(out);
+    }
+    Ok(out)
+}
+
 /// `kian session import <package> [--db <sqlite>] [--json]`: verify the
 /// package's manifest and restore the session into a store for
 /// replay/forensics. A corrupt package or an existing session id is

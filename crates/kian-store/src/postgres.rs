@@ -301,13 +301,18 @@ const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligib
 
 /// Channel-scoped admit (ADR-081): dialect-identical to sqlite's
 /// `ADMIT_CHANNEL_SQL` — refused when a row with this key is already
-/// *consumed* in any session, one statement, `NOT EXISTS` probe served by
-/// `idx_inputs_channel_key` (migration v9).
-const ADMIT_CHANNEL_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nSELECT $1::text, $2::text, $3::text, $4::bigint, $5::bigint, $6::text\nWHERE NOT EXISTS (SELECT 1 FROM inputs p WHERE p.idempotency_key = $6::text AND p.consumed_by_seq IS NOT NULL)\nON CONFLICT (session, idempotency_key) DO NOTHING";
+/// *consumed* in any session or the receipts ledger holds it (ADR-082),
+/// one statement, `NOT EXISTS` probes served by `idx_inputs_channel_key`
+/// (migration v9) and the receipts primary key (migration v10).
+const ADMIT_CHANNEL_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key)\nSELECT $1::text, $2::text, $3::text, $4::bigint, $5::bigint, $6::text\nWHERE NOT EXISTS (SELECT 1 FROM inputs p WHERE p.idempotency_key = $6::text AND p.consumed_by_seq IS NOT NULL)\n  AND NOT EXISTS (SELECT 1 FROM channel_receipts r WHERE r.idempotency_key = $6::text)\nON CONFLICT (session, idempotency_key) DO NOTHING";
 
 /// The suppressing row of a refused channel admit: the consumed row with
 /// this key in *any* session (ADR-081 decision 6).
 const CONSUMED_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE idempotency_key = $1::text AND consumed_by_seq IS NOT NULL ORDER BY admitted_at ASC LIMIT 1";
+
+/// The suppressing row after the consuming session was archived
+/// (ADR-082); column order matches `InputCols`.
+const RECEIPT_BY_KEY_SQL: &str = "SELECT input_id, session, payload, admitted_at, eligible_at, idempotency_key FROM channel_receipts WHERE idempotency_key = $1::text";
 
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = $1::text AND consumed_by_seq IS NULL AND eligible_at <= $2::bigint ORDER BY eligible_at ASC, admitted_seq ASC";
 
@@ -397,9 +402,10 @@ pub(crate) async fn admit(pool: &PgPool, input: InputRow) -> Result<AdmitOutcome
 
 /// The cross-incarnation channel admission (ADR-081). Identical to
 /// [`admit`] except the insert additionally refuses a key that is already
-/// consumed in any session; `deduplicated: true` then names the consumed
-/// row (this session's row is read back first, the suppressing row
-/// second).
+/// consumed in any session, or that the receipts ledger already holds
+/// (ADR-082); `deduplicated: true` then names the consumed row (this
+/// session's row is read back first, the suppressing row second, the
+/// archived receipt last).
 pub(crate) async fn admit_channel(
     pool: &PgPool,
     input: InputRow,
@@ -445,7 +451,17 @@ pub(crate) async fn admit_channel(
         .bind(&key)
         .fetch_optional(pool)
         .await?;
-    suppressed
+    if let Some(suppressed) = suppressed {
+        return decode_input(suppressed).map(|input| AdmitOutcome {
+            input,
+            deduplicated: true,
+        });
+    }
+    let receipt: Option<InputCols> = sqlx::query_as(RECEIPT_BY_KEY_SQL)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    receipt
         .map(decode_input)
         .transpose()?
         .map(|input| AdmitOutcome {
@@ -455,7 +471,7 @@ pub(crate) async fn admit_channel(
         .ok_or(InboxError::CorruptRow {
             session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
             input_id: Uuid::nil(),
-            reason: "channel admit was refused but neither this session's row nor a consumed row was found".into(),
+            reason: "channel admit was refused but neither this session's row, a consumed row nor an archived receipt was found".into(),
         })
 }
 

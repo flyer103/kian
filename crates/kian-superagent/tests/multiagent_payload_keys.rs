@@ -1182,13 +1182,13 @@ fn no_new_event_kind_route_table_or_migration() {
     let chain = kian_store::migrations::chain();
     assert_eq!(
         chain.len(),
-        10,
-        "the migration chain is v0..=v9 (channel dedupe)"
+        11,
+        "the migration chain is v0..=v10 (channel receipts)"
     );
     for (index, migration) in chain.iter().enumerate() {
         assert_eq!(
             migration.version, index as u32,
-            "versions stay v0..=v9, adjacent and unedited"
+            "versions stay v0..=v10, adjacent and unedited"
         );
     }
 }

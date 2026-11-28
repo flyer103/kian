@@ -742,6 +742,11 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
   been **consumed** in any session, so a restart, a rotation or a re-pinned `router.session_id`
   cannot re-admit — and the Router cannot re-answer — a processed message (ADR-081). Passthrough
   subscribers keep one row per subscriber, and an admitted-but-unconsumed row is never swallowed.
+- **Archival keeps the evidence.** Retention deletes the consumed input rows a verified package
+  supersedes, so the archive commit first copies every consumed `chan:%` key into the
+  `channel_receipts` ledger in the same transaction, and the guard refuses a key found there exactly
+  as it refuses one consumed online. The ledger is a projection of the packages — `kian archive
+  receipts` rebuilds it, the packages are the truth (ADR-082).
 - **Bounded in-memory ring** (4096 guids) in front of the durable guard: a repeated guid inside the
   window is dropped without a fan-out. The ring is a cache; losing it costs nothing.
 - **Two cursors, two owners.** The bridge owns a `rowid` read position (persisted best-effort,

@@ -335,6 +335,46 @@ impl EventStore {
         Ok((to_u64(row.0, "count")?, to_u64(row.1, "bytes")?))
     }
 
+    /// Every archived marker, oldest archive first — the ledger rebuild
+    /// (`kian archive receipts`) walks these packages. An absent v5 table
+    /// reads as empty on a read-only store, like [`archived_session`].
+    pub async fn archived_session_list(&self) -> Result<Vec<ArchivedMarker>, ArchiveError> {
+        type MarkerCols = (String, i64, i64, i64, i64, String, String, String, String);
+        const MARKER_SQL: &str = "SELECT session, last_seq, event_count, input_count, \
+             archived_at, package_path, events_sha256, inputs_sha256, manifest_sha256 \
+             FROM archived_sessions ORDER BY archived_at ASC, session ASC";
+        let rows: Result<Vec<MarkerCols>, StoreError> = match self {
+            EventStore::Sqlite(pool) => sqlx::query_as(MARKER_SQL)
+                .fetch_all(pool)
+                .await
+                .map_err(StoreError::Sql),
+            EventStore::Postgres(pool) => sqlx::query_as(MARKER_SQL)
+                .fetch_all(pool)
+                .await
+                .map_err(StoreError::Sql),
+        };
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) if marker_table_absent(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(ArchiveError::Store(e)),
+        };
+        rows.into_iter()
+            .map(|row| {
+                let session =
+                    SessionId(
+                        Uuid::parse_str(&row.0).map_err(|e| ArchiveError::CorruptInput {
+                            session: SessionId(Uuid::nil()),
+                            reason: format!("archived marker session id: {e}"),
+                        })?,
+                    );
+                Ok(decode_marker(
+                    session,
+                    (row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8),
+                ))
+            })
+            .collect()
+    }
+
     /// Every input row of the session — the full table row, including
     /// the audit columns — in admission order. This is the package
     /// writer's source; the read is also legal on a read-only store.
@@ -424,6 +464,77 @@ impl EventStore {
                 }
             }
             inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    /// Re-derives the receipts ledger from verified package rows (ADR-082).
+    /// A receipt is the archived input row of a consumed `chan:%` key; the
+    /// ledger is a projection of the packages, so this is the rebuild
+    /// path (`kian archive receipts`) and it is idempotent: an existing
+    /// receipt wins over a re-read package, and re-running after a later
+    /// archive only adds what is missing.
+    pub async fn channel_receipts_insert(
+        &self,
+        rows: &[ArchivedInput],
+        archived_at: u64,
+    ) -> Result<u64, ArchiveError> {
+        let archived_at = to_i64(archived_at, "archived_at")?;
+        let mut inserted = 0u64;
+        for r in rows {
+            let Some(key) = r.idempotency_key.as_deref() else {
+                continue;
+            };
+            if !key.starts_with("chan:") {
+                continue;
+            }
+            let Some(consumed) = r.consumed_by_seq else {
+                continue;
+            };
+            let payload = serde_json::to_string(&r.payload)
+                .map_err(|e| ArchiveError::Store(StoreError::Serde(e)))?;
+            let session = r.session.0.to_string();
+            let id = r.id.to_string();
+            let admitted_at = to_i64(r.admitted_at, "admitted_at")?;
+            let eligible_at = to_i64(r.eligible_at, "eligible_at")?;
+            let consumed = to_i64(consumed, "consumed_by_seq")?;
+            const SQL: &str = "INSERT INTO channel_receipts (idempotency_key, session, input_id, \
+                 payload, admitted_at, eligible_at, consumed_by_seq, archived_at) VALUES (";
+            let affected = match self {
+                EventStore::Sqlite(pool) => sqlx::query(
+                    &(SQL.to_string()
+                        + "?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(idempotency_key) DO NOTHING"),
+                )
+                .bind(key)
+                .bind(&session)
+                .bind(&id)
+                .bind(&payload)
+                .bind(admitted_at)
+                .bind(eligible_at)
+                .bind(consumed)
+                .bind(archived_at)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+                EventStore::Postgres(pool) => sqlx::query(
+                    &(SQL.to_string()
+                        + "$1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT(idempotency_key) DO NOTHING"),
+                )
+                .bind(key)
+                .bind(&session)
+                .bind(&id)
+                .bind(&payload)
+                .bind(admitted_at)
+                .bind(eligible_at)
+                .bind(consumed)
+                .bind(archived_at)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+            };
+            inserted += affected;
         }
         Ok(inserted)
     }
@@ -578,6 +689,7 @@ async fn commit_sqlite(
         // commit finished — fall through and complete the delete.
         marker_matches_sqlite(&mut tx, a).await?;
     }
+    materialize_channel_receipts_sqlite(&mut tx, a).await?;
     delete_online_rows_sqlite(&mut tx, a.key).await?;
     tx.commit().await?;
     Ok(ArchiveCommitOutcome::Committed)
@@ -626,6 +738,7 @@ async fn commit_pg(
     if inserted == 0 {
         marker_matches_pg(&mut tx, a).await?;
     }
+    materialize_channel_receipts_pg(&mut tx, a).await?;
     delete_online_rows_pg(&mut tx, a.key).await?;
     tx.commit().await?;
     Ok(ArchiveCommitOutcome::Committed)
@@ -673,6 +786,57 @@ async fn marker_matches_pg(
         }),
         None => Err(ArchiveError::NothingToCommit { session: a.session }),
     }
+}
+
+/// Carry the session's consumed channel rows into the receipts ledger
+/// (ADR-082) before the delete below removes them: the cross-incarnation
+/// guard (ADR-081) reads the consumed row, and an archived session has
+/// none left. Reachable ONLY from the two commit functions, after the
+/// marker CAS and inside the same transaction — the ledger and the
+/// delete commit together, so a crash leaves either both or neither.
+/// The ledger stores the whole row (channel payloads are small), which
+/// keeps a refused admit able to name the row that answered the event.
+/// `kian archive receipts` re-derives these rows from the packages.
+async fn materialize_channel_receipts_sqlite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    a: &CommitArgs<'_>,
+) -> Result<(), ArchiveError> {
+    sqlx::query(
+        "INSERT INTO channel_receipts (idempotency_key, session, input_id, payload, \
+         admitted_at, eligible_at, consumed_by_seq, archived_at) \
+         SELECT idempotency_key, session, id, payload, admitted_at, eligible_at, \
+                consumed_by_seq, ?2 \
+         FROM inputs \
+         WHERE session = ?1 AND consumed_by_seq IS NOT NULL \
+           AND idempotency_key LIKE 'chan:%' \
+         ON CONFLICT(idempotency_key) DO NOTHING",
+    )
+    .bind(a.key)
+    .bind(a.archived_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn materialize_channel_receipts_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    a: &CommitArgs<'_>,
+) -> Result<(), ArchiveError> {
+    sqlx::query(
+        "INSERT INTO channel_receipts (idempotency_key, session, input_id, payload, \
+         admitted_at, eligible_at, consumed_by_seq, archived_at) \
+         SELECT idempotency_key, session, id, payload, admitted_at, eligible_at, \
+                consumed_by_seq, $2::bigint \
+         FROM inputs \
+         WHERE session = $1::text AND consumed_by_seq IS NOT NULL \
+           AND idempotency_key LIKE 'chan:%' \
+         ON CONFLICT(idempotency_key) DO NOTHING",
+    )
+    .bind(a.key)
+    .bind(a.archived_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// The online-row delete. Reachable ONLY from the two commit functions
@@ -794,7 +958,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{ArchiveCommitOutcome, ArchiveError, ArchivedMarker, EventStore};
+    use super::{ArchiveCommitOutcome, ArchiveError, ArchivedInput, ArchivedMarker, EventStore};
 
     fn temp_db_path() -> PathBuf {
         std::env::temp_dir().join(format!("kian-arch-{}.sqlite", Uuid::new_v4()))
@@ -1021,6 +1185,183 @@ mod tests {
             1,
             "another session's claim row is untouched"
         );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A consumed channel row is the durable evidence a replay must be
+    /// refused; archiving deletes the row, so the commit must first copy
+    /// the fact into the receipt ledger — and only consumed channel keys.
+    #[tokio::test]
+    async fn commit_materializes_consumed_channel_receipts_into_the_ledger() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_terminal(&store, sid).await;
+
+        let consumed = InputRow {
+            id: Uuid::new_v4(),
+            session: sid,
+            payload: json!({ "kian": { "type": "channel_event" } }),
+            admitted_at: 1_761_900_000_010,
+            eligible_at: 1_761_900_000_010,
+            idempotency_key: Some("chan:imessage:guid-consumed".to_owned()),
+        };
+        let unconsumed = InputRow {
+            id: Uuid::new_v4(),
+            payload: json!({ "kian": { "type": "channel_event" } }),
+            idempotency_key: Some("chan:imessage:guid-unconsumed".to_owned()),
+            ..consumed.clone()
+        };
+        let not_a_channel = InputRow {
+            id: Uuid::new_v4(),
+            payload: json!({ "text": "steer" }),
+            idempotency_key: Some("steer:1".to_owned()),
+            ..consumed.clone()
+        };
+        for row in [&consumed, &unconsumed, &not_a_channel] {
+            store.admit(row.clone()).await.expect("admit");
+        }
+        store.mark_consumed(sid, consumed.id, 2).await.unwrap();
+        store.mark_consumed(sid, not_a_channel.id, 2).await.unwrap();
+
+        assert_eq!(
+            store.archive_commit(&marker(sid, "aa"), 3).await.unwrap(),
+            ArchiveCommitOutcome::Committed
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM channel_receipts WHERE idempotency_key = ?1",
+                "chan:imessage:guid-consumed"
+            )
+            .await,
+            1,
+            "the consumed channel key survives as a receipt"
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM channel_receipts WHERE session = ?1",
+                &sid.0.to_string()
+            )
+            .await,
+            1,
+            "an unconsumed row never becomes a receipt"
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM channel_receipts WHERE idempotency_key = ?1",
+                "chan:imessage:guid-unconsumed"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM channel_receipts WHERE idempotency_key = ?1",
+                "steer:1"
+            )
+            .await,
+            0,
+            "only channel keys enter the ledger"
+        );
+
+        let fresh = SessionId::new();
+        let replay = InputRow {
+            id: Uuid::new_v4(),
+            session: fresh,
+            payload: json!({ "kian": { "type": "channel_event" } }),
+            admitted_at: 1_761_900_000_500,
+            eligible_at: 1_761_900_000_500,
+            idempotency_key: Some("chan:imessage:guid-consumed".to_owned()),
+        };
+        let out = store.admit_channel(replay).await.unwrap();
+        assert!(out.deduplicated, "the archived receipt refuses the replay");
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM inputs WHERE session = ?1",
+                &fresh.0.to_string()
+            )
+            .await,
+            0
+        );
+
+        let unconsumed_replay = InputRow {
+            id: Uuid::new_v4(),
+            session: fresh,
+            payload: json!({ "kian": { "type": "channel_event" } }),
+            admitted_at: 1_761_900_000_600,
+            eligible_at: 1_761_900_000_600,
+            idempotency_key: Some("chan:imessage:guid-unconsumed".to_owned()),
+        };
+        let out = store.admit_channel(unconsumed_replay).await.unwrap();
+        assert!(
+            !out.deduplicated,
+            "an unconsumed row never blocks a later admission"
+        );
+
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// The ledger is a projection of the packages: the CLI rebuild replays
+    /// them through this insert and lands the same rows, idempotently.
+    #[tokio::test]
+    async fn archived_session_list_and_receipts_insert_rebuild_the_ledger() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_terminal(&store, sid).await;
+        assert!(store.archived_session_list().await.unwrap().is_empty());
+
+        store.archive_commit(&marker(sid, "aa"), 3).await.unwrap();
+        let markers = store.archived_session_list().await.unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].session, sid);
+        assert_eq!(markers[0].manifest_sha256, "aa");
+
+        let input = |key: &str, consumed: Option<u64>| ArchivedInput {
+            id: Uuid::new_v4(),
+            session: sid,
+            payload: json!({ "kian": { "type": "channel_event" } }),
+            admitted_at: 1_761_900_000_010,
+            eligible_at: 1_761_900_000_010,
+            idempotency_key: Some(key.to_owned()),
+            consumed_by_seq: consumed,
+            admitted_seq: 1,
+        };
+        let rows = vec![
+            input("chan:imessage:a", Some(2)),
+            input("chan:imessage:b", None),
+            input("steer:9", Some(2)),
+        ];
+        assert_eq!(
+            store
+                .channel_receipts_insert(&rows, 1_761_900_000_700)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .channel_receipts_insert(&rows, 1_761_900_000_700)
+                .await
+                .unwrap(),
+            0,
+            "the rebuild is idempotent"
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM channel_receipts WHERE idempotency_key = ?1",
+                "chan:imessage:a"
+            )
+            .await,
+            1
+        );
+
         store.close().await;
         cleanup(&path);
     }

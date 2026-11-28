@@ -189,6 +189,21 @@ const V9_CHANNEL_DEDUPE: Migration = Migration {
     up: "CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;\nUPDATE inputs SET idempotency_key = 'chan:' || COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.kian.type'), json_extract(payload, '$.content.kian.type')) = 'channel_event' AND COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(json_extract(inputs.payload, '$.kian.channel'), json_extract(inputs.payload, '$.content.kian.channel'), json_extract(inputs.payload, '$.spill.channel')) || ':' || inputs.idempotency_key)",
 };
 
+/// v10 — the channel receipts ledger (ADR-082). Retention deletes a
+/// session's online rows, including the consumed `chan:%` input that
+/// ADR-081's cross-incarnation guard reads; without a durable trace the
+/// first restart after an archive re-admits the archived session's tail
+/// into its successor. A receipt is the archived input row itself
+/// (identity + payload, the channel rows are small), so admit can still
+/// name the row that answered the event after the row is gone. The
+/// ledger is a projection of the archive packages and is rebuildable
+/// with `kian archive receipts`.
+const V10_CHANNEL_RECEIPTS: Migration = Migration {
+    version: 10,
+    name: "v10_channel_receipts",
+    up: "CREATE TABLE IF NOT EXISTS channel_receipts (\n    idempotency_key TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    admitted_at INTEGER NOT NULL,\n    eligible_at INTEGER NOT NULL,\n    consumed_by_seq INTEGER NOT NULL,\n    archived_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_channel_receipts_session ON channel_receipts (session)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -203,6 +218,7 @@ pub fn chain() -> &'static [Migration] {
         V7_CRON_STATE,
         V8_CRON_FIRING_SESSION,
         V9_CHANNEL_DEDUPE,
+        V10_CHANNEL_RECEIPTS,
     ]
 }
 
@@ -343,6 +359,15 @@ const PG_V9_CHANNEL_DEDUPE: Migration = Migration {
     up: "CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;\nUPDATE inputs SET idempotency_key = 'chan:' || COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND COALESCE(payload::jsonb #>> '{kian,type}', payload::jsonb #>> '{content,kian,type}') = 'channel_event' AND COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(inputs.payload::jsonb #>> '{kian,channel}', inputs.payload::jsonb #>> '{content,kian,channel}', inputs.payload::jsonb #>> '{spill,channel}') || ':' || inputs.idempotency_key)",
 };
 
+/// v10 (postgres chain) — the channel receipts ledger, pg DDL (same
+/// version, name and shape as the sqlite generation; `TEXT`/BIGINT are
+/// the shared column types).
+const PG_V10_CHANNEL_RECEIPTS: Migration = Migration {
+    version: 10,
+    name: "v10_channel_receipts",
+    up: "CREATE TABLE IF NOT EXISTS channel_receipts (\n    idempotency_key TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    admitted_at BIGINT NOT NULL,\n    eligible_at BIGINT NOT NULL,\n    consumed_by_seq BIGINT NOT NULL,\n    archived_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_channel_receipts_session ON channel_receipts (session)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -359,6 +384,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V7_CRON_STATE,
         PG_V8_CRON_FIRING_SESSION,
         PG_V9_CHANNEL_DEDUPE,
+        PG_V10_CHANNEL_RECEIPTS,
     ]
 }
 
@@ -532,6 +558,27 @@ UPDATE inputs SET idempotency_key = 'chan:' || COALESCE(json_extract(payload, '$
             pg_v9.up,
             r##"CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;
 UPDATE inputs SET idempotency_key = 'chan:' || COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND COALESCE(payload::jsonb #>> '{kian,type}', payload::jsonb #>> '{content,kian,type}') = 'channel_event' AND COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(inputs.payload::jsonb #>> '{kian,channel}', inputs.payload::jsonb #>> '{content,kian,channel}', inputs.payload::jsonb #>> '{spill,channel}') || ':' || inputs.idempotency_key)"##
+        );
+    }
+
+    /// v10 is a committed generation: its SQL is pinned byte-for-byte so a
+    /// rewrite of the receipts table trips this test instead of silently
+    /// diverging from every already-migrated database.
+    #[test]
+    fn v10_generation_sql_is_frozen() {
+        let sqlite_v10: &Migration = &chain()[10];
+        assert_eq!(sqlite_v10.version, 10);
+        assert_eq!(sqlite_v10.name, "v10_channel_receipts");
+        assert_eq!(
+            sqlite_v10.up,
+            "CREATE TABLE IF NOT EXISTS channel_receipts (\n    idempotency_key TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    admitted_at INTEGER NOT NULL,\n    eligible_at INTEGER NOT NULL,\n    consumed_by_seq INTEGER NOT NULL,\n    archived_at INTEGER NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_channel_receipts_session ON channel_receipts (session)"
+        );
+        let pg_v10: &Migration = &pg_chain()[10];
+        assert_eq!(pg_v10.version, 10);
+        assert_eq!(pg_v10.name, "v10_channel_receipts");
+        assert_eq!(
+            pg_v10.up,
+            "CREATE TABLE IF NOT EXISTS channel_receipts (\n    idempotency_key TEXT PRIMARY KEY,\n    session TEXT NOT NULL,\n    input_id TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    admitted_at BIGINT NOT NULL,\n    eligible_at BIGINT NOT NULL,\n    consumed_by_seq BIGINT NOT NULL,\n    archived_at BIGINT NOT NULL\n);\nCREATE INDEX IF NOT EXISTS idx_channel_receipts_session ON channel_receipts (session)"
         );
     }
 

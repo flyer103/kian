@@ -147,6 +147,48 @@ async fn seed_terminal(store: &EventStore, with_input: bool) -> SessionId {
     sid
 }
 
+/// A terminal session whose single consumed input is a channel row under
+/// \`key\` — the receipt-ledger seeding shape.
+async fn seed_terminal_channel(store: &EventStore, key: &str) -> (SessionId, uuid::Uuid) {
+    let sid = SessionId::new();
+    let row = InputRow {
+        id: uuid::Uuid::new_v4(),
+        session: sid,
+        payload: json!({"kian": {"type": "channel_event", "channel": "imessage"}}),
+        admitted_at: 100,
+        eligible_at: 100,
+        idempotency_key: Some(key.to_owned()),
+    };
+    store.admit(row.clone()).await.expect("admit channel row");
+    push(store, sid, 1, Epoch::GENESIS, EventKind::SessionCreated).await;
+    push(store, sid, 2, Epoch::GENESIS, EventKind::InputAdmitted).await;
+    push(store, sid, 3, Epoch(1), EventKind::DrainClaimed).await;
+    push(store, sid, 4, Epoch(1), EventKind::TurnStart).await;
+    store
+        .append_end(
+            sid,
+            Event {
+                seq: 5,
+                session: sid,
+                epoch: Epoch(1),
+                ts: 1_762_000_000_005,
+                kind: EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+                bytes: json!({}),
+                version: SCHEMA_VERSION,
+            },
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: 5,
+            },
+        )
+        .await
+        .expect("end write");
+    store.mark_consumed(sid, row.id, 2).await.expect("consume");
+    (sid, row.id)
+}
+
 /// Retention enabled with the given thresholds and archive dir.
 fn retention_yaml(archive_dir: &std::path::Path, min_age_ms: u64) -> String {
     format!(
@@ -160,6 +202,71 @@ async fn online_events(db: &std::path::Path, sid: SessionId) -> Vec<Event> {
     let events = reader.rebuild(sid).await.expect("rebuild");
     reader.close().await;
     events
+}
+
+/// The receipt ledger is a projection of the packages: wipe it (a store
+/// rebuilt from packages, or a torn archive) and the rebuild restores the
+/// replay guard — the archived guid is refused again, idempotently.
+#[tokio::test]
+async fn receipts_rebuild_restores_the_replay_guard_from_the_package() {
+    let db = temp_db("receipts");
+    let archive_root = temp_dir("receipts-root");
+    let config = write_config(
+        &temp_dir("receipts-cfg"),
+        &db,
+        &retention_yaml(&archive_root, 0),
+    );
+    let key = "chan:imessage:guid-receipts-e2e";
+    let store = EventStore::open(&db).await.expect("store");
+    let (_sid, _) = seed_terminal_channel(&store, key).await;
+    store.close().await;
+
+    let run = kian_cli::archive::run_archive_run(&config, Some(&db), true)
+        .await
+        .expect("archive run");
+    assert!(run.contains("\"failed\": []"), "{run}");
+
+    let store = EventStore::open(&db).await.expect("store");
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_receipts WHERE idempotency_key = ?1")
+            .bind(key)
+            .fetch_one(store.pool())
+            .await
+            .expect("receipt count");
+    assert_eq!(receipts, 1, "the commit materialized the consumed key");
+    sqlx::query("DELETE FROM channel_receipts")
+        .execute(store.pool())
+        .await
+        .expect("wipe ledger");
+    store.close().await;
+
+    let rebuilt = kian_cli::archive::run_archive_receipts(&config, Some(&db), true)
+        .await
+        .expect("receipts rebuild");
+    assert!(rebuilt.contains("\"receipts_written\": 1"), "{rebuilt}");
+    let again = kian_cli::archive::run_archive_receipts(&config, Some(&db), true)
+        .await
+        .expect("second rebuild");
+    assert!(
+        again.contains("\"receipts_written\": 0"),
+        "the rebuild is idempotent: {again}"
+    );
+
+    let store = EventStore::open(&db).await.expect("store");
+    let replayed = InputRow {
+        id: uuid::Uuid::new_v4(),
+        session: SessionId::new(),
+        payload: json!({"kian": {"type": "channel_event", "channel": "imessage"}}),
+        admitted_at: 200,
+        eligible_at: 200,
+        idempotency_key: Some(key.to_owned()),
+    };
+    let out = store.admit_channel(replayed).await.expect("admit");
+    assert!(out.deduplicated, "the rebuilt receipt refuses the replay");
+    store.close().await;
+
+    cleanup_db(&db);
+    let _ = std::fs::remove_dir_all(&archive_root);
 }
 
 /// The full L2 flow: archive → verify → delete → inspect, with the

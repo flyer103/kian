@@ -266,8 +266,10 @@ episode.
 
 - Ordering is `seq` per session; drains append under `expectedSeq` CAS + epoch fence.
 - Channel admission is idempotent per `chan:<channel>:<event_id>`, and on the Router route it is
-  suppressed when that key is already consumed in any session
-  ([ADR-081](decisions/ADR-081-channel-dedupe-across-session-incarnations.md)); inbox admission is
+  suppressed when that key is already consumed in any session — including when the consuming
+  session was archived and the fact survives only in the `channel_receipts` ledger
+  ([ADR-081](decisions/ADR-081-channel-dedupe-across-session-incarnations.md),
+  [ADR-082](decisions/ADR-082-retention-preserves-replay-evidence.md)); inbox admission is
   otherwise idempotent per `(session, idempotency_key)`; `control/interrupt` is idempotent per
   `interrupt:<session>:<target_epoch>`; `budget/raised` per
   `budget:<session>:<tokens>:<wall_clock_ms>:<requested_at_ms>` (a caller key wins, ADR-055).

@@ -341,6 +341,13 @@ Rules:
 - **Invariant amendment.** The inbox is audit-visible via the online store **or a verified
   archive package** — superseding the current "audit-visible forever in the store" wording
   (`crates/kian-store/src/inbox.rs`, `migrations.rs` comments) in the same change.
+- **Channel receipt ledger.** The commit materializes every consumed `chan:%` row into
+  `channel_receipts` in the same transaction, before the online rows are deleted, because channel
+  admission refuses a key already consumed in any session and the archived row would otherwise be
+  the guard's lost evidence ([ADR-081](decisions/ADR-081-channel-dedupe-across-session-incarnations.md)).
+  The ledger is a projection of the packages — `kian archive receipts` verifies each marker's
+  package and re-inserts its consumed channel rows — never a second truth
+  ([ADR-082](decisions/ADR-082-retention-preserves-replay-evidence.md)).
 - **Audit invariance.** Exporting from `(online store + archive packages)` equals the
   pre-archive export byte-for-byte.
 
@@ -365,7 +372,9 @@ Landed shape (P2b):
   delete in ONE transaction, fenced on the online event count the package was verified
   against — a resumed session aborts `OnlineMoved` and nothing is deleted). The events/inputs
   delete exists in exactly one guarded site (`kian-store`'s archive module; the crate's
-  append-only review assertion carves out that file alone).
+  append-only review assertion carves out that file alone). The same transaction materializes the
+  session's consumed `chan:%` rows into `channel_receipts` (migration v10) before the inputs are
+  deleted, so the channel guard keeps its evidence across the retirement.
 - **Reads.** `projection` and the SSE stream answer `-32007 archived` (API-CONTRACT §2.2;
   the planned `-32005` had been taken by the memory registry) with package guidance.
   `session inspect` reports archived + the package path; `session export` serves the package
@@ -378,6 +387,11 @@ Landed shape (P2b):
   identity is a first-class check), or an existing session id, and restores the events (under
   their own epoch/seq) and the full input rows — exactly the rows verification replayed, never a
   re-read — into the target store; the restored stream projects and re-exports identically.
+- **Ledger rebuild.** `kian archive receipts` walks the markers, verifies each package, and
+  upserts its consumed channel rows into `channel_receipts` (migration v10), idempotently. A store
+  restored from packages, or a ledger lost with a torn commit, recovers the wire-level replay
+  guard by running it; a missing or corrupt package is reported per session and never silently
+  drops its keys.
 - **Cadence.** No automatic retention loop: `kian archive run` is an explicit operator pass.
   Wall-clock scheduling — retention cadence, dream cadence and every other cadence — is owned by
   [CRON-MODEL.md](CRON-MODEL.md) (ADR-033), which supersedes the earlier "cadence out of scope"

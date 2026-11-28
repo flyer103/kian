@@ -691,6 +691,7 @@ NO_PROXY=127.0.0.1,localhost curl -s localhost:7433/rpc -H 'content-type: applic
 #   min_age_ms: 2592000000        # terminal ≥ 30 days
 target/debug/kian archive run    --config kian.yaml          # verify → marker → delete, idempotent
 target/debug/kian archive verify <uuid> --config kian.yaml   # re-check hashes + replay offline
+target/debug/kian archive receipts --config kian.yaml        # rebuild the channel replay ledger
 ```
 
 ## Scheduled turns (`superagent.cron`)
