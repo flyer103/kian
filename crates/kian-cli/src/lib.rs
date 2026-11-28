@@ -87,6 +87,7 @@ pub mod replay_fork;
 pub mod rotation;
 pub mod self_evidence;
 pub mod self_inspect;
+pub mod self_verify;
 mod selfdev_publish;
 pub mod server;
 pub mod sidecars;

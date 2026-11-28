@@ -899,12 +899,28 @@ refuses the push instead of being overwritten, and a push that landed while the 
 settles `needs_operator` with the branch on the remote: open the pull request by hand or delete the
 branch.
 
+The chain survives the merge, and `kian self verify` checks it without writing or fetching:
+
+```bash
+target/debug/kian self verify self-dev@manual --config kian.yaml
+target/debug/kian self verify self-dev@manual --merged --base main --json
+```
+
+It recomputes the frozen plan digest, the artifact bytes through their producer ref, the publish
+receipt, the commit's parent, diff and `Kian-*` trailers, and the branch; `--merged` also requires
+the commit to be an ancestor of the base. Each link prints one line on success, and the first broken
+link exits 2 as `audit chain broken at <link>: <detail>`. It reads local git only — fetch a branch
+that exists only on the remote before verifying — and reports a squash or rebase merge as
+`not merged into <base>`, because the artifact commit is no longer in history. Merge with a merge
+commit ([ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md)).
+
 `succeeded` means a proposal exists. It does not mean the bug is fixed, that the patch applies to
 a newer `main`, or that anyone reviewed it — landing stays with the owner.
 
 Semantics: [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); decisions:
 [ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
-[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md),
+[ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md).
 
 ## Model profiles
 

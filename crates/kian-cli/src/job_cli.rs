@@ -325,7 +325,7 @@ fn resolved(
     Ok((cron, jobs.catalog))
 }
 
-async fn open_store(
+pub(crate) async fn open_store(
     config: &crate::config::ServeConfig,
     read_only: bool,
 ) -> Result<EventStore, String> {

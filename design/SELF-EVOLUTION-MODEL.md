@@ -57,9 +57,9 @@ symptom (pack) —► trigger (manual) —► job run (frozen plan, conductor)
   conductor (crates/kian-superagent/src/job/conduct.rs) drives it; the plan is frozen at admit (J2);
   the run verdict is an `evidence/verdict` at gate `run` written before the final outcome
   (JOB-MODEL §5.5).
-* **The trigger is manual in S1 and S2.** A cron trigger for a self-dev job is an S3 decision, taken
-  only after S2 has produced review-throughput numbers; an unattended proposal stream with no merge
-  lane produces review debt, not evolution.
+* **The trigger is manual in S1 and S2.** A cron trigger for a self-dev job is a later decision,
+  taken only after S2 has produced review-throughput numbers; an unattended proposal stream with no
+  merge lane produces review debt, not evolution.
 * **The job is an ordinary declaration** in `jobs.jobs` (crates/kian-cli/src/job_config.rs:51).
   The denial surface lives inside the plan as a check parameter (§5.4), so it is covered by
   `plan_digest` and cannot be edited by a run.
@@ -354,7 +354,7 @@ worker act at all: it is the conductor's, bounded by §9.4 and one push-scoped c
 | **S1 propose** (this contract) | read committed streams; read the pack; produce artifacts in a worker's scratch space; notify the owner | write a repository; push; open a pull request; hold a credential; deploy |
 | **S2a publish-local** (landed) | create one derived worktree and branch; apply the patch artifact; commit with the audit trailers; re-run the configured scoped gates as a step | push; open a pull request; hold any credential; write `main`; merge; edit another run's branch |
 | **S2b publish-remote** (landed) | push that branch once (never forced); open one pull request whose body carries the audit chain | force-push; write `main`; merge; edit another run's branch; read the credential from anything but the configured environment variable |
-| **S3 land** (specified: owner merge, verified) | nothing beyond S2b; the owner merges the reviewed pull request and the runtime verifies it | auto-merge; force-push; tag; deploy; land without review; write the merge on the run's behalf |
+| **S3 land** (landed) | nothing beyond S2b; the owner merges the reviewed pull request and the runtime verifies it | auto-merge; force-push; tag; deploy; land without review; write the merge on the run's behalf |
 
 **S2's enabling amendment** is a conductor-owned `publish` step action (JOB-MODEL §7.2 and §13.5),
 not a general-purpose `exec`: the sequence — worktree, apply, commit, gates, push, pull request —
@@ -694,7 +694,7 @@ Acceptance, by level:
 * **L3** — one real publish against the operator's remote and an authenticated `gh`; the local
   acceptance uses a bare remote and a stub.
 
-### S3 — land (specified, not implemented)
+### S3 — land (landed)
 
 The phase has one slice: a read-only verifier. The merge stays the owner's, and no `land` verb
 exists (ADR-075). The S2 numbers still gate any write automation; they do not gate the verifier,
