@@ -1373,6 +1373,15 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `GET /metrics` | Engine, cache, usage and super-agent counters |
 | `GET /healthz` | Liveness: `200` from process state alone — no projection, no token — the probe a supervisor points at ([ADR-076](../design/decisions/ADR-076-liveness-is-a-probe.md)) |
 
+A `kian serve` stop is graceful by contract
+([ADR-077](../design/decisions/ADR-077-a-stop-releases-its-drain.md)): `SIGTERM` (a deploy,
+`systemctl restart`, the supervisor) or `SIGINT` stops the engine from claiming, cuts every
+in-flight drain at its next yield — a provider call that has not returned included — and each
+interrupted drain writes its own `session/ended{interrupted}`. The process exits 0 once they
+release ownership (bounded at 5 s), so an ordinary restart no longer adds the un-ended claims that
+[ADR-041](../design/decisions/ADR-041-bounded-model-calls-and-crash-containment.md) counts toward
+closing a crash-looping session.
+
 Interrupt is durable: it admits a control-envelope inbox row (idempotent per epoch), so the intent
 survives a drain crash and the takeover settles `interrupted`
 ([ADR-014](../design/decisions/ADR-014-durable-interrupt-intent.md)).

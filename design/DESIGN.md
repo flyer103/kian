@@ -368,6 +368,18 @@ the POST when `providers.<name>.max_request_bytes` is declared, so a request the
 becomes a `request_too_large` failure naming both sizes instead of a transport error that looks like
 an outage (ADR-068).
 
+ Refinement (a stop releases its claims, ADR-077): a restart is not a crash, but it looked
+like one — a supervisor's SIGTERM killed the process mid-drain and left an un-ended
+`drain/claimed`, so the third restart closed the resident session `failed`. `kian serve` now stops
+itself: the engine latches a one-way stop signal (no new drain starts, and a wake folds while its
+row stays durable for the next start's inbox rebuild), every in-flight drain is cut at its next
+yield — `supervise` races the stop latch against the driver stream, so a provider call that never
+returns cannot hold the process — and the claimed episode settles in its own
+`session/ended{interrupted}`, the honest end it already writes (no new event kind, no counter
+change). The listener drains, the process waits at most 5 s for the cut drains to release
+ownership, and exits 0; a kill -9 still leaves the un-ended claim, which is exactly what the ADR-041
+bound is for.
+
  Refinement (multi-replica claim admission, ADR-009): claiming is *conditional* — the claim lands only when no
 claims row exists, the row's lease is expired, or the claiming holder already owns the row; a fresh lease held by a
 different holder is refused with the typed `InboxError::ClaimRejected` (nothing written, epoch floor unchanged) and the

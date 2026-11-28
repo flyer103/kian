@@ -238,6 +238,7 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
   (`kian wechat login` — the QR flow writes the WeChat channel's credential file; no other channel
   needs an interactive login).
 - Endpoint: `kiand` daemon install/pair/heartbeat/reconnect.
+- Process lifecycle: `kian serve` handles `SIGTERM`/`SIGINT` as a release, not a crash — no new drain starts, in-flight drains are cut and each writes `session/ended{interrupted}`, and the process exits 0 once they release ownership (bounded at 5 s) — [ADR-077](../design/decisions/ADR-077-a-stop-releases-its-drain.md).
 
 ### 3.3 Operational flows
 - Version upgrades: event schema versioning + adjacent migrations (borrowed from dsh session

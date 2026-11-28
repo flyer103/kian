@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **A stop releases the drain it interrupts (ADR-077).** `kian serve` handles SIGTERM/SIGINT
+  itself: the engine stops claiming, every in-flight drain is cut and settles in its own
+  `session/ended{interrupted}`, and the process exits 0 once they release ownership (bounded at
+  5 s) — so an ordinary restart no longer feeds the ADR-041 counter that closes the third un-ended
+  claim as `failed`.
 - **Liveness is a probe, not the metrics surface (ADR-076).** `kian serve` mounts
   `GET /healthz`, which answers `200` with `{"ok":true,"version":…}` from process state alone —
   no store read, no projection, no token — so a supervisor never pays the `/metrics` derivation

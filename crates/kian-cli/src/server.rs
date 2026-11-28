@@ -1512,6 +1512,32 @@ impl Server {
     /// on the timing: the takeover claim's epoch fences any lingering
     /// old owner's writes (NoSplitBrainWrite, ADR-005).
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) -> Result<(), ServeError> {
+        self.serve_with_shutdown(addr, std::future::pending()).await
+    }
+
+    /// How long a shutdown waits for every in-flight drain to write its own
+    /// end (ADR-077). The cut itself is immediate; the bound only covers the
+    /// end-write append and one heartbeat step, and stays far below systemd's
+    /// default TimeoutStopSec (90 s) so a stuck drain cannot delay the stop.
+    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// [`Server::serve`] with a stop future (ADR-077): once `shutdown`
+    /// resolves, the engine stops claiming, every in-flight drain is cut and
+    /// settles in its own end write, the listener stops accepting, and the
+    /// call returns after every drain released its ownership (bounded by
+    /// [`Self::SHUTDOWN_GRACE`]).
+    ///
+    /// The drain cut happens before the last connection closes so the process
+    /// never exits holding an un-ended claim: the crash-loop counter (ADR-041)
+    /// must only see real crashes.
+    pub async fn serve_with_shutdown<F>(
+        self: Arc<Self>,
+        addr: std::net::SocketAddr,
+        shutdown: F,
+    ) -> Result<(), ServeError>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| ServeError::Assembly(format!("cannot bind {addr}: {e}")))?;
@@ -1921,7 +1947,36 @@ impl Server {
                 }
             });
         }
-        axum::serve(
+        use std::future::IntoFuture as _;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                shutdown.await;
+                engine.begin_shutdown();
+                tracing::info!("shutdown: interrupting every in-flight drain");
+                let _ = stop_tx.send(true);
+            });
+        }
+        let mut http_stop = stop_rx.clone();
+        let http_graceful = async move {
+            while !*http_stop.borrow() {
+                if http_stop.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let mut drain_stop = stop_rx;
+        let engine = Arc::clone(&self.engine);
+        let drains_settled = async move {
+            while !*drain_stop.borrow() {
+                if drain_stop.changed().await.is_err() {
+                    break;
+                }
+            }
+            engine.wait_drained(Self::SHUTDOWN_GRACE).await
+        };
+        let serving = axum::serve(
             listener,
             self.router()
                 // peer connect info feeds the webhook receiver's
@@ -1929,8 +1984,35 @@ impl Server {
                 // other surface ignores it).
                 .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .await
-        .map_err(|e| ServeError::Assembly(format!("server error: {e}")))
+        .with_graceful_shutdown(http_graceful)
+        .into_future();
+        tokio::pin!(serving);
+        let server_stopped = tokio::select! {
+            served = &mut serving => Some(served),
+            remaining = drains_settled => {
+                match remaining {
+                    0 => tracing::info!("shutdown: every drain released its ownership"),
+                    n => tracing::warn!(
+                        remaining = n,
+                        "shutdown: drains still in flight at the grace bound; their leases will expire"
+                    ),
+                }
+                None
+            }
+        };
+        if let Some(served) = server_stopped {
+            served.map_err(|e| ServeError::Assembly(format!("server error: {e}")))?;
+            // The listener stopped first (an error, or its own graceful
+            // path); whatever still drains settles before the process ends.
+            let remaining = self.engine.wait_drained(Self::SHUTDOWN_GRACE).await;
+            if remaining > 0 {
+                tracing::warn!(
+                    remaining,
+                    "shutdown: drains still in flight at the grace bound; their leases will expire"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
