@@ -103,6 +103,6 @@ env -u KIAN_PG_URL cargo test --workspace
 - **2026-11-01**: executed against Homebrew postgres 17.11 on macOS (database `kian_e2e`,
   trust auth). `kian-cli --tests` under the gate: all suites green including `postgres_serve`
   (ran, passed) and `postgres_multi_replica` (ran, passed, ~16 s wall). During the same work a genuine bug
-  was found and fixed in the async `stop` path (see CHANGELOG / `kian-exec` async tools
+  was found and fixed in the async `stop` path (the `kian-exec` async tools
   regression test); the multi-replica/pg suites themselves needed no code changes. Per-suite counts are in
   the handoff.

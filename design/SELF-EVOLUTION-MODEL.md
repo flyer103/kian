@@ -242,7 +242,7 @@ jobs:
           verify:
             - {check: artifact_within_cap, name: patch}
             - {check: patch_paths_allowed, artifact: patch,
-               allow: ["crates/**", "docs/**", "design/**", "CHANGELOG.md", "README.md",
+               allow: ["crates/**", "docs/**", "design/**", "README.md",
                        "examples/**", "site/**"],
                deny:  ["design/decisions/**", "kian.yaml", "scripts/**", ".github/**",
                        "AGENTS.md", "design/SELF-EVOLUTION-MODEL.md",

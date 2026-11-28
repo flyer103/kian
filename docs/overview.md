@@ -3,7 +3,7 @@
 > An external reader's map of Kian: the problem it solves, the execution model, the shape of the
 > code, and what has actually been demonstrated. The contract is [SPEC.md](SPEC.md); the blueprint
 > is [DESIGN.md](../design/DESIGN.md); the decisions are [design/decisions/](../design/decisions/);
-> the changelog is [../CHANGELOG.md](../CHANGELOG.md).
+> the release notes are [GitHub Releases](https://github.com/flyer103/kian-runtime/releases).
 
 ## 1. The problem: a single-session agent does not survive
 
@@ -166,7 +166,7 @@ long name list at `v0.1.0` buys.
 
 ## 5. What has been demonstrated
 
-Status is recorded here and in the [CHANGELOG](../CHANGELOG.md). "Default-green" means it runs in
+Status is recorded here. "Default-green" means it runs in
 `cargo test --workspace` on any machine with no credentials and no services.
 
 | Capability | Status | One-line proof |
@@ -222,5 +222,5 @@ Router/Worker architecture, the channels, the dsh harness and the endpoint daemo
 | know what the system promises | [SPEC.md](SPEC.md) (WHAT) |
 | know how it is built | [DESIGN.md](../design/DESIGN.md) (HOW) |
 | know why a choice was made | [design/decisions/](../design/decisions/) (WHY) |
-| see what landed when | [../CHANGELOG.md](../CHANGELOG.md) |
+| see what each release contains | [GitHub Releases](https://github.com/flyer103/kian-runtime/releases) |
 | see what a run looks like | [../docs/advanced.md](advanced.md) |

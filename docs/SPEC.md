@@ -173,7 +173,7 @@ KiandProto. This section keeps the interface sketch.
 ### 2.5 Acceptance capabilities
 
 Each capability below is proven by named tests; the executed evidence is recorded in
-[CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md).
+[overview.md](overview.md) §5.
 
 | Capability | Demonstrates | Input | Output |
 |------------|--------------|-------|--------|
@@ -187,7 +187,7 @@ Each capability below is proven by named tests; the executed evidence is recorde
 | Multi-replica takeover | Crash recovery at multi-process scale | Two `kian serve` replicas over one postgres DB; the drain owner is `kill -9`'d mid-drain | The survivor's recovery sweep takes over the expired lease and completes: zero lost work, exactly one end write, a stale-epoch probe write from the dead replica rejected (NoSplitBrainWrite between processes) |
 
 The multi-replica takeover is demonstrated by the env-gated postgres e2e (`KIAN_PG_URL`); the proof
-is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §5.
+is recorded in [overview.md](overview.md) §5.
 
 ## 3. Operations Interface
 
@@ -395,7 +395,7 @@ surfaces: the README's operator-surface section.
 | Durable interrupt intent | The 21st kind `control/interrupt` (drain-activity, non-context; [ADR-014](../design/decisions/ADR-014-durable-interrupt-intent.md)): `interrupt` admits a reserved control-envelope inbox row (idempotent per `(session, target_epoch)`) alongside the in-memory flag; the owning drain consumes it at a safe boundary, appends the audit event and settles `interrupted` — so the intent survives a drain crash and crosses replicas best-effort. Stale rule: a row whose target episode already settled appends `"stale": true` and ends nothing; idle/terminal sessions keep `not_draining`/`unknown_session` and admit nothing. Tests: `durable_interrupt_intent_survives_crash_and_takeover_settles_interrupted`, `repeated_interrupts_in_one_epoch_dedupe_to_one_row_and_one_event`, `stale_epoch_control_row_is_audit_only_and_does_not_end_the_session`, `control_row_racing_the_settle_flips_the_end_write_to_interrupted`, `interrupt_of_idle_or_terminal_session_admits_no_control_row`, `control_interrupt_leaves_model_context_unchanged`, `additions_only_regression_all_kind_bytes_are_frozen` (+ golden count 21) | landed |
 | Derived event id + redaction provenance | `kian_core::events::event_id` = `"evt_" + uuid5(session, "kian:event:<seq>")` (pure, never stored, never an envelope field), mirrored dependency-free in the SDK; `kian session export --with-event-ids` (opt-in, default export bytes unchanged, re-import round-trips). `SecretRedactor::redact_with_report` emits `{kind, name, count}` provenance; the report rides the additive `redactions` key on `tool/result` payloads outside `content` — what was redacted, never the values. Tests: `event_id_golden_vectors_match_rfc4122_v5`, `event_id_is_deterministic_and_distinct_per_seq_and_session`, `event_id_matches_the_core_golden_vectors`, `default_export_bytes_are_unchanged_without_the_flag`, `with_event_ids_export_adds_stable_ids_and_round_trips`, `report_counts_all_three_kinds_and_text_matches_plain_redact`, `remote_exec_result_and_row_carry_the_redaction_report`, `tool_result_payload_carries_redactions_outside_content`, `redactions_payload_key_never_enters_the_model_context` | landed |
 | Per-call tool permission provenance | `agent.permissions` (tool name → `allow\|deny`, closed vocabulary, fail-closed parse: unknown value / key ∉ `tools` / table on a judge agent refuse boot; [ADR-015](../design/decisions/ADR-015-tool-permission-provenance.md)): evaluated once per call **before** the `tool/call` append (log-before-execute holds on both arms), recorded as the additive top-level `permission: {evaluated, policy, matched}` key — allows are audited exactly like denials; a deny never invokes and appends an honest-error `tool/result` the model reacts to; absent table = payload byte-identical. Tests: `permission_is_a_closed_vocabulary_fail_closed`, `permissions_unknown_value_refuses_boot`, `permissions_key_absent_from_agent_tools_refuse_boot`, `permissions_on_judge_agents_refuse_boot`, `allow_path_invokes_tool_and_records_provenance_default_vs_configured`, `deny_path_does_not_invoke_and_emits_honest_error_result`, `absent_permissions_keep_tool_call_payload_byte_identical_to_today`, `permission_payload_key_never_enters_the_model_context` | landed |
-| Final record | This record + DESIGN/README/CHANGELOG alignment + docs-map link check | landed |
+| Final record | This record + DESIGN/README alignment + docs-map link check | landed |
 
 Out of scope (recorded, not silently dropped): the `ask` permission/confirmation plane
 (ADR-015 records the shape; blocking confirmation is a separate design decision), CMA wire
@@ -523,7 +523,7 @@ ops method; one wire bump (v1 → v2) and one additive queue migration (v3 `kind
 | Queue v3 | `exec_queue.kind TEXT NOT NULL DEFAULT 'exec'`; pre-v3 rows decode as exec and re-drive unchanged; fs rows share the queue, command-id dedupe and `queue_timeout`; no cross-worker dispatch | landed |
 | Per-drive routing + schemas | A bound worker side mounts `RemoteFsTool` (filtered by the agent's `tools:`) and the refusing side mounts the same three names with an honest refusal; schemas/result shapes are byte-identical to the local built-ins (golden parity) | landed |
 | Root + limits | `kiand --workspace-root` (default cwd, must exist); lexical `..` guard on both sides; 1 MiB read/write bounds; non-UTF-8 read is a typed `io` error surfaced as the local `{"error": …}` result; root is a guard, not a sandbox | landed |
-| Live deployment | Owner deployment (Vultr + local worker + WeChat) redeployed at v2; the L3 fs round-trip through the WeChat Router path is recorded in CHANGELOG | landed (owner L3) |
+| Live deployment | Owner deployment (Vultr + local worker + WeChat) redeployed at v2; the L3 fs round-trip through the WeChat Router path is an owner-run result | landed (owner L3) |
 | Binary/streaming/fs_edit/glob, symlink-proof sandbox | Out of scope (WORKER-MODEL §9) | deferred |
 
 ### Thinking-mode reasoning replay (ADR-022)

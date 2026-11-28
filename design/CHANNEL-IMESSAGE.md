@@ -957,7 +957,7 @@ question — they stay in §13.
 cursor file, `client_id` cache, loopback + token, LaunchAgent packaging); the `imessage` adapter
 (§4 receive, §5 send, §6 normalization); config + validation + assembly + `kian imessage check`;
 the router-target sentence; L1 + L2 suites; this document, ADR-042, the runbook, the SPEC row, the
-README entries and one CHANGELOG bullet. Text-only direct chats, iMessage service only, one channel;
+README entries and one release-note entry. Text-only direct chats, iMessage service only, one channel;
 an attachment row carries its marker text plus metadata (§3.2, §4); its bytes are slice 2a.
 Estimated write set ≈ adapter 700 lines, bridge 800 lines, config/CLI 250 lines, tests ~1200 lines,
 docs ~900 lines.
@@ -972,7 +972,7 @@ guard and `watch.max_attachment_bytes`; the adapter's `attachments: bytes` mode 
 `image/*`/`audio/*` and hands the edge the ADR-062 `media` envelope; the config coupling that
 refuses `bytes` without a `media:` section plus the pump strip that keeps an unconsumable `media`
 key out of the prompt; L1 suites on both sides; §3.2/§3.4/§4/§7 increments, ADR-064, the runbook and
-one CHANGELOG bullet. No event kind, no store schema and no core seam change.
+one release-note entry. No event kind, no store schema and no core seam change.
 
 **2b (outbound voice, ADR-067).** The bridge's additive `voice` field on `/v1/send` with the
 native/attachment choice, its `0600` staging file and the `voice_mode`/health report; the
@@ -980,8 +980,8 @@ adapter's single-part voice send with a text-derived `client_id`; the `kian-cli`
 synthesizes an utterance, reads its artifact and rewrites the delivery; the router's `reply_voice`
 tool, mounted only when a voice-capable channel is assembled; the config coupling that refuses
 `voice: true` without `media:`/`artifacts:`; the `"voice": true` key on `channel/delivered`;
-L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-067, the runbook and one CHANGELOG
-bullet. No new event kind, no store schema, no core seam change. Estimated write set ≈ bridge 250
+L1 suites on both sides; §2.5/§3.2/§5/§7/§11 increments, ADR-067, the runbook and one release-note
+entry. No new event kind, no store schema, no core seam change. Estimated write set ≈ bridge 250
 lines, adapter 120 lines, edge + router 350 lines, config/CLI 120 lines, tests ~600 lines, docs
 ~500 lines.
 
@@ -998,4 +998,4 @@ the allowlist/privacy semantics (§3.3, §8), the dedupe and cursor discipline (
 shapes (§7) also start here. A change that would add a kian-side position table, a new event kind,
 a new server surface, a public bridge bind, multi-account or channel media bytes needs an ADR, not an
 edit to this file (inbound channel media bytes: ADR-064; outbound voice: ADR-067). An `imsg`/macOS break is recorded as a dated note in this section plus a
-CHANGELOG entry, and parks the channel honestly rather than guessing.
+release note, and parks the channel honestly rather than guessing.

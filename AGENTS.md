@@ -192,7 +192,7 @@ when the owner asks. Negative results commit documentation only — never broken
 **The docs are timeless.** A design or contract document states what the system does and why, not
 how it got there: never cite iteration rounds, work-item ids, board/ticket paths, gate dates or
 review stamps as authority. Cite the decision record for the why and the observable behavior for
-the what; progress narrative belongs in the pull request or `CHANGELOG.md`. Labels that identify an
+the what; progress narrative belongs in the pull request and the release notes. Labels that identify an
 object inside the document itself (goals G1–G6, invariants M1–M10, phases P0/P1, kind ids) stay —
 they are its own vocabulary, not process provenance.
 
@@ -219,7 +219,7 @@ runnable snippet per capability; the document map is this file's §Docs map and
 
 - status tables, test counts, event-kind/ADR counts, acceptance checklists, four-gate records —
   [docs/SPEC.md](docs/SPEC.md), [docs/overview.md](docs/overview.md), the pull request;
-- release history and internal work-plan narratives — [CHANGELOG.md](CHANGELOG.md), SPEC §5;
+- release history and internal work-plan narratives — [GitHub Releases](https://github.com/flyer103/kian-runtime/releases), SPEC §5;
 - verbose live-run logs and benchmark methodology — runbooks, SPEC, the pull request;
 - semantic detail already owned by SPEC / DESIGN / EVENT-MODEL — link to it, never restate it;
 - positioning-by-analogy ("the X of Y") or comparisons with other products — describe what the
@@ -242,18 +242,20 @@ runnable snippet per capability; the document map is this file's §Docs map and
    the same change, or the two drift and the landing page starts promising what the runtime no
    longer does.
 
-## CHANGELOG policy
+## Release notes policy
 
-`CHANGELOG.md` records **what changed, when, and in which capability** — nothing else.
+A release is the only record of change: the GitHub Release body for each `v*` tag states what
+changed, in which capability, what to do on upgrade, and what stays out of scope. The repository
+keeps no changelog file, so parallel branches never edit one shared log and a pull request cannot
+conflict on it.
 
-- **Newest first.** The newest entry is at the top; the file reads as a reverse-chronological log.
-- **Concurrent branches merge without conflict.** `.gitattributes` gives this file the built-in
-  `union` driver, so two branches adding bullets under `## Unreleased` both survive. The driver
-  concatenates the two sides in file order, so the resulting order is not chronological: reorder
-  the bullets newest-first when the entry is published.
+- **Written at release time** from the merged pull requests since the previous tag. The pull request
+  carries the narrative and the verification; it does not edit a notes file.
 - **One bullet per functional change** — capability, contract, behavior — naming the owning
-  doc/ADR. A change with no functional delta (a verification-only round, a log edit) gets no entry.
+  doc/ADR. A change with no functional delta (a verification-only round, a log edit) gets no bullet.
 - **No acceptance results**: no gates, test counts, "verified / unverified / live-run / L2-L3
   evidence" bullets, QA verdicts, or deployment status. Those belong to the pull request, the run
   logs/runbooks, and the SPEC / overview status tables.
+- **Published notes are append-only.** A later change gets a new release; a published body is not
+  rewritten to absorb it.
 

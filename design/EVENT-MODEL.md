@@ -318,7 +318,7 @@ strippable marker.
 3. If the change is semantic (new kind, envelope shape, state effect, context effect, version),
    write an ADR (append-only; supersede by linking, never edit).
 4. Implement in `kian-core` (+ owner crate) and update the golden tests.
-5. Update the docs map and every count/claim (`README` status table, `CHANGELOG`, SPEC capability record);
+5. Update the docs map and every count/claim (`README` claims, SPEC capability record, overview status table);
    `docs_map` must stay green.
 6. Run the full four gates.
 
