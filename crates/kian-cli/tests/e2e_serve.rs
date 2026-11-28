@@ -347,3 +347,32 @@ async fn malformed_config_refuses_to_start_with_clear_error() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// API-CONTRACT §1.1 (ADR-076): the liveness probe answers from the
+/// process alone — 200, `ok`, the crate version — with no token and no
+/// store read, so a supervisor never pays the `/metrics` derivation to
+/// learn that the listener is serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn healthz_answers_from_the_process_alone() {
+    force_no_proxy();
+    let dir = temp_dir("healthz");
+    let sqlite = dir.join("kian.sqlite");
+    let (provider_base, _mock) = spawn_mock_provider(0).await;
+    let config = write_config(&dir, &sqlite, &provider_base, "127.0.0.1:7334");
+
+    let (base, _server) = spawn_server(&config).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .expect("healthz send");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("healthz json");
+    assert_eq!(body["ok"], serde_json::json!(true));
+    assert_eq!(
+        body["version"],
+        serde_json::json!(env!("CARGO_PKG_VERSION"))
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

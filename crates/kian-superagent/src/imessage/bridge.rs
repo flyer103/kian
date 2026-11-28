@@ -289,8 +289,23 @@ impl BridgeAttachment {
         match self.mime_type.as_deref() {
             Some(mime) if mime.starts_with("image/") => Some("image"),
             Some(mime) if mime.starts_with("audio/") => Some("audio"),
-            _ => None,
+            _ => media_kind_from_filename(self.filename.as_deref()),
         }
+    }
+}
+
+/// The filename fallback for an item that records no MIME type: a voice note
+/// arrives as `Audio Message.caf` with an empty `mime_type`, and a bridge
+/// built before ADR-078 still projects it that way.
+fn media_kind_from_filename(filename: Option<&str>) -> Option<&'static str> {
+    let extension = filename?.rsplit_once('.')?.1.to_ascii_lowercase();
+    match extension.as_str() {
+        "caf" | "m4a" | "mp3" | "wav" | "aac" | "ogg" | "oga" | "opus" | "amr" | "aif" | "aiff"
+        | "flac" => Some("audio"),
+        "heic" | "heif" | "jpg" | "jpeg" | "png" | "gif" | "webp" | "tif" | "tiff" | "bmp" => {
+            Some("image")
+        }
+        _ => None,
     }
 }
 
@@ -650,24 +665,53 @@ mod tests {
 
     #[test]
     fn only_image_and_audio_items_are_eligible_for_the_envelope() {
-        let item = |mime: Option<&str>, is_sticker: bool| BridgeAttachment {
-            attachment_id: Some("1:0".into()),
-            filename: None,
-            mime_type: mime.map(str::to_string),
-            transfer_name: None,
-            total_bytes: None,
-            is_sticker,
-        };
-        assert_eq!(item(Some("image/heic"), false).media_kind(), Some("image"));
-        assert_eq!(item(Some("audio/x-caf"), false).media_kind(), Some("audio"));
-        assert_eq!(item(Some("video/mp4"), false).media_kind(), None);
-        assert_eq!(item(Some("application/pdf"), false).media_kind(), None);
+        let item =
+            |mime: Option<&str>, filename: Option<&str>, is_sticker: bool| BridgeAttachment {
+                attachment_id: Some("1:0".into()),
+                filename: filename.map(str::to_string),
+                mime_type: mime.map(str::to_string),
+                transfer_name: None,
+                total_bytes: None,
+                is_sticker,
+            };
         assert_eq!(
-            item(Some("image/png"), true).media_kind(),
+            item(Some("image/heic"), None, false).media_kind(),
+            Some("image")
+        );
+        assert_eq!(
+            item(Some("audio/x-caf"), None, false).media_kind(),
+            Some("audio")
+        );
+        assert_eq!(item(Some("video/mp4"), None, false).media_kind(), None);
+        assert_eq!(
+            item(Some("application/pdf"), Some("a.pdf"), false).media_kind(),
+            None
+        );
+        assert_eq!(
+            item(Some("image/png"), None, true).media_kind(),
             None,
             "a sticker is decorative: it never costs a provider call"
         );
-        assert_eq!(item(None, false).media_kind(), None);
+        assert_eq!(
+            item(None, None, false).media_kind(),
+            None,
+            "no type and no filename is no tool"
+        );
+        assert_eq!(
+            item(Some(""), Some("Audio Message.caf"), false).media_kind(),
+            Some("audio"),
+            "a voice note records no MIME type; its filename is the second signal (ADR-078)"
+        );
+        assert_eq!(
+            item(Some(""), Some("clip.HEIC"), false).media_kind(),
+            Some("image")
+        );
+        assert_eq!(item(Some(""), Some("report.pdf"), false).media_kind(), None);
+        assert_eq!(
+            item(Some(""), Some("Audio Message"), false).media_kind(),
+            None,
+            "a filename without an extension proves nothing"
+        );
     }
 
     #[test]

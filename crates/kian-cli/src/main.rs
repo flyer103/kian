@@ -292,12 +292,45 @@ fn serve(args: &[String]) -> ExitCode {
                 std::process::exit(2);
             }
         };
-        if let Err(e) = std::sync::Arc::new(server).serve(addr).await {
+        if let Err(e) = std::sync::Arc::new(server)
+            .serve_with_shutdown(addr, shutdown_signal())
+            .await
+        {
             eprintln!("kian: {e}");
             std::process::exit(1);
         }
     });
     ExitCode::SUCCESS
+}
+
+/// Resolves on the first SIGTERM or SIGINT (ADR-077): the supervisor's stop
+/// and the operator's Ctrl-C take the same path, so a restart releases the
+/// drains it interrupts instead of leaving un-ended claims for the crash
+/// counter.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => tracing::info!("SIGTERM received; stopping"),
+                    _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received; stopping"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot listen for SIGTERM; SIGINT still stops the server"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// `kian cache-stats [--config <path>] [--session <uuid>] [--json]` —

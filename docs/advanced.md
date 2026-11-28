@@ -188,6 +188,9 @@ attachments that already arrived, so a burst of photos becomes one input with al
 that never settles is admitted with what arrived plus an audit line, and a row over the eight-item
 media cap loses the excess items with an audit line
 ([ADR-070](../design/decisions/ADR-070-imessage-multi-attachment-settling.md)).
+An inbound voice note is an ordinary audio item on that path even though the Mac records it with no
+MIME type (`Audio Message.caf`): the bridge types it from the filename, so the transcript joins the
+text like a photo's does ([ADR-078](../design/decisions/ADR-078-imessage-inbound-voice-transcription.md)).
 With `voice: true` the channel also *speaks*: the Router gains a `reply_voice` tool and a spoken
 reply arrives as a native voice message where the Mac allows it, an audio attachment otherwise
 ([voice replies](#voice-replies-outbound), [ADR-067](../design/decisions/ADR-067-imessage-voice-io.md)).
@@ -1414,6 +1417,16 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>]` | Handoff package for one anchor row: the raw ±k envelope slice, session state and end writes, repo commit/branch/dirty and crate map, the `self inspect` projection, and a manifest with every file's sha256 (payload text stays inside the package — never on stdout) |
 | `kian wake-now`, `kian lease inspect`, `kian recovery budget reset` | Operational actions |
 | `GET /metrics` | Engine, cache, usage and super-agent counters |
+| `GET /healthz` | Liveness: `200` from process state alone — no projection, no token — the probe a supervisor points at ([ADR-076](../design/decisions/ADR-076-liveness-is-a-probe.md)) |
+
+A `kian serve` stop is graceful by contract
+([ADR-077](../design/decisions/ADR-077-a-stop-releases-its-drain.md)): `SIGTERM` (a deploy,
+`systemctl restart`, the supervisor) or `SIGINT` stops the engine from claiming, cuts every
+in-flight drain at its next yield — a provider call that has not returned included — and each
+interrupted drain writes its own `session/ended{interrupted}`. The process exits 0 once they
+release ownership (bounded at 5 s), so an ordinary restart no longer adds the un-ended claims that
+[ADR-041](../design/decisions/ADR-041-bounded-model-calls-and-crash-containment.md) counts toward
+closing a crash-looping session.
 
 Interrupt is durable: it admits a control-envelope inbox row (idempotent per epoch), so the intent
 survives a drain crash and the takeover settles `interrupted`

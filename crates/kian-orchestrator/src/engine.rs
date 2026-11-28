@@ -56,7 +56,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, Entry};
 use futures::stream::BoxStream;
@@ -392,6 +392,42 @@ struct HeartbeatStop(Arc<Notify>);
 impl Drop for HeartbeatStop {
     fn drop(&mut self) {
         self.0.notify_one();
+    }
+}
+
+/// The engine-wide stop latch (ADR-077): a stopping process cuts its
+/// in-flight drains instead of leaving their claims un-ended.
+///
+/// One-way by construction — a stopping engine never starts work again, so
+/// a process that fails to exit inside the quiesce bound must be restarted
+/// rather than served from the same engine.
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    set: AtomicBool,
+    notify: Notify,
+}
+
+impl ShutdownSignal {
+    fn trigger(&self) {
+        self.set.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the latch is set, immediately when it was set before
+    /// the first poll (the listener is registered before the re-read, so a
+    /// concurrent trigger is never lost).
+    async fn signalled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_set() {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -1138,6 +1174,8 @@ pub struct Engine<D: LoopDriver> {
     /// One entry per draining session: per-session serial,
     /// cross-session concurrent.
     drains: DashMap<SessionId, DrainHandle>,
+    /// ADR-077: the process-wide stop latch the shutdown path triggers.
+    shutdown: Arc<ShutdownSignal>,
     metrics: Arc<Metrics>,
     weak: std::sync::OnceLock<Weak<Engine<D>>>,
     /// READ-MODEL §5 (P1): whether projection/recovery state reads may
@@ -1236,6 +1274,7 @@ where
             clock,
             wakes: WakeRegistry::with_metrics(Arc::clone(&metrics)),
             drains: DashMap::new(),
+            shutdown: Arc::new(ShutdownSignal::default()),
             metrics,
             weak: std::sync::OnceLock::new(),
             read_model,
@@ -1773,11 +1812,57 @@ where
         .await
     }
 
+    /// In-flight drains — one per draining session.
+    #[must_use]
+    pub fn drain_count(&self) -> usize {
+        self.drains.len()
+    }
+
+    /// Latches the stop signal (ADR-077): no new drain starts and every
+    /// in-flight drain is cut at its next yield — a parked provider turn
+    /// included — so it settles in its own session/ended write.
+    ///
+    /// Synchronous and idempotent: a supervisor's signal handler calls it
+    /// directly, and Engine::wait_drained only observes the result.
+    pub fn begin_shutdown(&self) {
+        self.shutdown.trigger();
+    }
+
+    /// Waits until every in-flight drain released its ownership (or the
+    /// timeout elapsed) and returns the number still in flight. Zero means
+    /// each interrupted drain wrote its own end, so the next process's
+    /// takeover sees no un-ended claim. A stopping engine starts no new
+    /// drain, so an empty map stays empty.
+    pub async fn wait_drained(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.drains.is_empty() {
+                return 0;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return self.drains.len();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// begin_shutdown followed by wait_drained.
+    pub async fn quiesce(&self, timeout: Duration) -> usize {
+        self.begin_shutdown();
+        self.wait_drained(timeout).await
+    }
+
     /// Wakes the session. If a drain is in flight the wake folds onto
     /// pendingWake (the drain re-evaluates the inbox before releasing);
     /// otherwise a drain task is spawned. Concurrency-safe: racing
     /// wakes yield exactly one `Started`.
     pub fn wake(&self, session: SessionId) -> WakeOutcome {
+        // ADR-077: a stopping engine starts nothing. The admitted row stays
+        // durable either way — folded reads as absorbed, not started, and
+        // the next process's inbox rebuild re-derives the work (NoLostWork).
+        if self.shutdown.is_set() {
+            return WakeOutcome::Folded;
+        }
         match self.drains.entry(session) {
             Entry::Occupied(_) => {
                 self.wakes.register(&session);
@@ -2230,7 +2315,7 @@ where
                 // spurious (its inputs stay explicitly pending).
                 self.wakes.take(&session);
             }
-            if interrupt.load(Ordering::Acquire) {
+            if interrupt.load(Ordering::Acquire) || self.shutdown.is_set() {
                 break; // keep pendingWake registered for the resumer
             }
             if claim_rejected {
@@ -2349,6 +2434,17 @@ where
         let mut takeover = false;
         let mut end_reason: EndReason;
         'episodes: loop {
+            // ADR-077: a stopping engine claims nothing new and cuts a
+            // claimed episode before the takeover/repair work, so the drain
+            // settles in its own end write instead of leaving an un-ended
+            // claim for the next process's crash counter.
+            if self.shutdown.is_set() {
+                if !claimed {
+                    return Ok(DrainOutcome::ReleasedClean);
+                }
+                end_reason = EndReason::Interrupted;
+                break 'episodes;
+            }
             if interrupt.load(Ordering::Acquire) && claimed {
                 end_reason = EndReason::Interrupted;
                 break 'episodes;
@@ -2382,7 +2478,7 @@ where
                 )
                 .await?;
                 claimed = true;
-                if interrupt.load(Ordering::Acquire) {
+                if interrupt.load(Ordering::Acquire) || self.shutdown.is_set() {
                     end_reason = EndReason::Interrupted;
                     break 'episodes;
                 }
@@ -2557,14 +2653,26 @@ where
     }
 
     /// Consumes driver outcomes; the interrupt flag is honored at every
-    /// outcome (each is a safe boundary by construction).
+    /// outcome (each is a safe boundary by construction). An engine
+    /// shutdown (ADR-077) is honored immediately: the listener is stopping
+    /// and must not wait out a provider turn, so the in-flight turn is cut
+    /// the same way a crash cuts it — the drain's own end write is what
+    /// makes that interruption honest.
     async fn supervise(
         &self,
         mut stream: BoxStream<'static, LoopOutcome>,
         interrupt: &AtomicBool,
     ) -> Supervised {
         let interrupted = || interrupt.load(Ordering::Acquire);
-        while let Some(outcome) = stream.next().await {
+        loop {
+            let outcome = tokio::select! {
+                biased;
+                () = self.shutdown.signalled() => return Supervised::Interrupted,
+                next = stream.next() => match next {
+                    Some(outcome) => outcome,
+                    None => return Supervised::StreamEnded,
+                },
+            };
             let supervised = match outcome {
                 LoopOutcome::TurnDone => {
                     if interrupted() {
@@ -2604,7 +2712,6 @@ where
             };
             return supervised;
         }
-        Supervised::StreamEnded
     }
 }
 
@@ -6889,5 +6996,75 @@ mod tests {
 
         cleanup(&path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- ADR-077: a stop releases the drains it interrupts ------------------
+
+    /// A stop signal cuts a drain parked mid-turn (the provider call never
+    /// returns) and the drain writes its own interrupted end, so the next
+    /// process's takeover sees no un-ended claim.
+    #[tokio::test]
+    async fn quiesce_cuts_a_parked_drain_and_ends_interrupted() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let driver = Arc::new(ScriptedDriver::scripted(vec![vec![
+            Step::TakeInputs,
+            Step::BeginTurn,
+            Step::Gate(Arc::new(Notify::new())), // never opened
+        ]]));
+        let eng = engine(&store, Arc::clone(&driver));
+        eng.admit(sid, json!("task"), Some("q1".into()))
+            .await
+            .expect("admit");
+        // The gate follows BeginTurn, so reaching the turn means the drain is
+        // parked at the gate (a registered drain may still be pre-claim).
+        assert!(
+            wait_for(2_000, || {
+                let driver = Arc::clone(&driver);
+                async move { driver.log().iter().any(|l| l.starts_with("begin:")) }
+            })
+            .await,
+            "the drain must be parked inside the turn"
+        );
+
+        let remaining = eng.quiesce(Duration::from_secs(5)).await;
+
+        assert_eq!(remaining, 0, "the cut drain must release its ownership");
+        assert!(!eng.is_draining(&sid));
+        let events = events_of(&store, sid).await;
+        match events.last().map(|e| e.kind) {
+            Some(EventKind::SessionEnded { reason }) => {
+                assert_eq!(reason, EndReason::Interrupted, "honest interrupted end");
+            }
+            other => panic!(
+                "expected the interrupted end last, got {other:?}; kinds: {:?}",
+                events.iter().map(|e| e.kind).collect::<Vec<_>>()
+            ),
+        }
+        let claims = events
+            .iter()
+            .filter(|e| e.kind == EventKind::DrainClaimed)
+            .count();
+        assert_eq!(claims, 1, "the claim was ended in its own episode");
+        assert_eq!(projection_of(&store, sid).await, SessionState::Idle);
+        cleanup(&path);
+    }
+
+    /// After the stop latch is set nothing new starts: a wake is folded
+    /// (the row stays durable for the next process's inbox rebuild) and no
+    /// claim is written.
+    #[tokio::test]
+    async fn a_wake_after_shutdown_is_folded_and_claims_nothing() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+
+        eng.begin_shutdown();
+        let outcome = eng.wake(sid);
+
+        assert_eq!(outcome, WakeOutcome::Folded);
+        assert_eq!(eng.drain_count(), 0);
+        assert!(events_of(&store, sid).await.is_empty());
+        cleanup(&path);
     }
 }

@@ -540,6 +540,42 @@ async fn an_audio_attachment_never_asks_for_a_jpeg_variant() {
 }
 
 #[tokio::test]
+async fn an_untyped_voice_note_page_still_reaches_the_media_edge() {
+    let mut row: Value = serde_json::from_str(
+        &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),
+    )
+    .expect("the fixture is JSON");
+    row["attachments"][0]["filename"] = json!("Audio Message.caf");
+    row["attachments"][0]["transfer_name"] = json!("Audio Message.caf");
+    row["attachments"][0]["mime_type"] = json!("");
+    let rowid = row["rowid"].as_u64().expect("a row carries its rowid");
+    let mock = BridgeMock::new();
+    mock.push_attachment("48211:0", "audio/x-caf", b"caf-bytes");
+    mock.push_updates(updates_page(vec![row], rowid));
+    let url = mock.serve().await;
+    let adapter = ImessageChannel::new(
+        "imessage",
+        attachment_config(url, kian_superagent::ImessageAttachments::Bytes),
+    )
+    .expect("channel builds");
+    let mut stream = adapter.subscribe().boxed();
+    let event = next_event(&mut stream).await;
+    assert_eq!(
+        event.payload["media"],
+        json!([{
+            "kind": "audio",
+            "media_type": "audio/x-caf",
+            "base64": "Y2FmLWJ5dGVz",
+        }]),
+        "a bridge built before ADR-078 projects an empty type; the filename still classifies it"
+    );
+    let queries = mock.attachment_queries();
+    assert_eq!(queries.len(), 1, "{queries:?}");
+    assert!(!queries[0].contains("as="), "{queries:?}");
+    adapter.shutdown();
+}
+
+#[tokio::test]
 async fn metadata_mode_never_asks_for_bytes() {
     let row: Value = serde_json::from_str(
         &std::fs::read_to_string(ABI_ROW).expect("the shared ABI fixture is in the tree"),

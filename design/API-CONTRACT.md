@@ -29,10 +29,29 @@
 | Fan-in event stream | `GET /events` (SSE, §5.4) | `api.event_stream.enabled` (default true); otherwise the path 404s | none |
 | Operational plane | `POST /ops/rpc` (JSON-RPC 2.0) | always | none |
 | Metrics | `GET /metrics` (JSON) | always | none |
+| Liveness | `GET /healthz` (JSON, §1.1) | always | none |
 | GitHub webhook | `POST /webhooks/github` | only when a `type: github` channel is configured; otherwise the path 404s | HMAC-SHA256 |
 | KiandProto | TCP, one JSON frame per line | when `endpoints:` is configured and an endpoint dials | none (v0) |
 
 All HTTP surfaces share the `listen` address from `kian.yaml`.
+
+### 1.1 Liveness — `GET /healthz`
+
+The supervisor's probe. It answers from process state alone — no store read, no projection, no
+token — so "the listener is serving" is observable without paying the `/metrics` derivation cost
+([ADR-076](decisions/ADR-076-liveness-is-a-probe.md)).
+
+Response (HTTP 200, always):
+
+```json
+{"ok":true,"version":"0.3.0"}
+```
+
+- `200` is the only status; there is no error body and no partial answer.
+- `ok` is the only stable field. The body is additive-only (§9.2): a client must not fail on an
+  extra key, and `version` is the serving binary's crate version — never a protocol version.
+- Liveness only: a wedged store or an unreachable provider still answers `200`. `/metrics` stays
+  the observability surface and is never a liveness signal.
 
 ## 2. Common conventions
 
@@ -629,6 +648,7 @@ Window consequences:
 - JSON-RPC method names, required param names, result field names, and the error-code registry.
 - SSE frame names (`kian`, `done`, `error`) and their `data` shape.
 - `/metrics` top-level keys and their meaning (nested fields additive).
+- `/healthz` status (always `200`) and its `ok` field (every other key is additive).
 - Webhook required headers and the status matrix.
 - KiandProto frame `type` values and payload field names within a `PROTOCOL_VERSION`; the v3
   register (including `capabilities`)/rejected/fs frames and the closed five-reason set, pinned by
@@ -679,6 +699,7 @@ pin the current bytes. KiandProto carries its own `PROTOCOL_VERSION`. There is n
 | SSE frames and termination | `kian-sdk` SSE parser tests, `kian-cli/tests/e2e_serve.rs` |
 | Fan-in frames, caps, filters, tail-only start | `kian-cli/tests/fan_in_e2e.rs`, `kian-sdk` SSE parser tests (`KianFanIn`) |
 | Webhook verification order and status matrix | `kian-cli/tests/webhook_receiver.rs` |
+| Liveness response (always 200, `ok` stable) | `kian-cli/tests/e2e_serve.rs` |
 | Ops error mapping | `kian-cli/tests/ops_commands.rs` |
 | Iron rule (no execution symbols in handler modules) | `kian-cli/tests/iron_rule.rs` |
 | KiandProto frames | `kian-exec` and `kian-endpoint` golden tests (dual, same commit) |
